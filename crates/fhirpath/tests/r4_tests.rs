@@ -428,6 +428,12 @@ fn test_r4_test_suite() {
 
     let loader = R4ResourceLoader;
 
+    // The documentFunctions group's entryIn()/resourcesIn() cases check value-set
+    // membership, which needs a terminology server. The suite must not depend on a
+    // public one, so they use an in-process stub (FHIRPATH_TERMINOLOGY_SERVER still
+    // wins when set).
+    let tx_stub_uri = common::document_tx::start_document_tx_stub();
+
     // Find all test groups
     let test_groups = find_test_groups(&doc.root_element());
     println!("Found {} test groups", test_groups.len());
@@ -544,6 +550,12 @@ fn test_r4_test_suite() {
 
             // Set up common variables
             setup_common_variables(&mut context);
+
+            if common::document_tx::needs_terminology(&group_name, &test.mode)
+                && std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err()
+            {
+                context.set_terminology_server(tx_stub_uri.clone());
+            }
 
             // Special handling for extension tests
             if test.name.starts_with("testExtension") || test.expression.contains("extension(") {
