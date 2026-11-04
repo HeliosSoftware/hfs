@@ -185,9 +185,14 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/io" -w /io \
             -e CARGO_TERM_COLOR -e RUSTUP_TOOLCHAIN -e CARGO_BUILD_JOBS=4 \
             quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
-              # openssl-src (vendored OpenSSL) needs Perl core modules
-              # (IPC::Cmd) the image does not ship.
-              dnf install -y -q perl-core >/dev/null
+              # perl-core: openssl-src (the vendored OpenSSL the shipped
+              # binaries link) needs Perl modules such as IPC::Cmd.
+              # openssl-devel: a second openssl-sys, built for the build
+              # machine (resolver-2 build-time features), does not get the
+              # aarch64-only "vendored" feature and looks for a system
+              # OpenSSL. On the Mac it found Homebrew. It is not shipped;
+              # "Check the binaries" below fails if libssl is linked.
+              dnf install -y -q perl-core openssl-devel >/dev/null
               curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain stable
               . "$HOME/.cargo/env"
               export PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
@@ -205,12 +210,16 @@ jobs:
             '
           df -h / ; free -h
 
-      - name: Check the glibc floor
+      - name: Check the binaries (glibc floor, vendored OpenSSL)
         run: |
           set -euo pipefail
           mkdir -p trial/bin
           for b in $RELEASE_BINS; do
             cp "target/release/$b" trial/bin/
+            if objdump -p "trial/bin/$b" | grep -E 'NEEDED +lib(ssl|crypto)\.so'; then
+              echo "::error::$b links the system OpenSSL; the ARM64 release vendors it"
+              exit 1
+            fi
             need=$(objdump -T "trial/bin/$b" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
             echo "$b needs $need"
             if [ "$(printf '%s\n' "$need" GLIBC_2.28 | sort -V | tail -1)" != GLIBC_2.28 ]; then
