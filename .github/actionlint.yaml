@@ -1,0 +1,35 @@
+# actionlint configuration. Read by the "FHIR benchmark scripts" workflow
+# (.github/workflows/fhir-bench-tests.yml), which runs actionlint 1.7.12 with
+# shellcheck 0.11.0 on fhir-benchmark.yml, hts-benchmark.yml and itself.
+#
+# Why these are ignored instead of fixed: this PR leaves fhir-benchmark.yml
+# untouched, so it does not have to coordinate edits to that file with the open
+# PRs that also change it (#2299, and #2440 for #1914). The five sites below are
+# left for a follow-up, which fixes them and deletes these entries (#2041).
+#
+# Each ignore is scoped to one file and one shellcheck code, not to a line. So
+# until the follow-up removes them, a NEW SC2193, SC2012 or SC2086 finding
+# anywhere else in fhir-benchmark.yml is hidden too. The findings they cover,
+# as of bd2b1df07, are these five (file:line):
+#
+#   .github/workflows/fhir-benchmark.yml:1136   SC2193
+#   .github/workflows/fhir-benchmark.yml:1164   SC2012
+#   .github/workflows/fhir-benchmark.yml:1208   SC2193
+#   .github/workflows/fhir-benchmark.yml:1620   SC2086
+#   .github/workflows/fhir-benchmark.yml:1621   SC2086
+paths:
+  .github/workflows/fhir-benchmark.yml:
+    ignore:
+      # SC2193 x2: [[ "${{ matrix.backend }}" == *-elasticsearch ]] in "Start
+      # HFS server" and "Assert search parameters loaded". actionlint replaces
+      # ${{ }} with underscores before running shellcheck, so the test looks
+      # constant; GitHub substitutes the value first, so it works. Fix: pass
+      # BACKEND: ${{ matrix.backend }} through env: and test "$BACKEND".
+      - 'shellcheck reported issue in this script: SC2193:'
+      # SC2012 x1: ls -l "/proc/$HFS_PID/fd" in the "Start HFS server"
+      # startup-failure diagnostics (a human-readable listing, output only).
+      - 'shellcheck reported issue in this script: SC2012:'
+      # SC2086 x2: $POINTS_ARG $EXTRA_ARGS on the k6 command line in "Run
+      # benchmark suites", unquoted on purpose so they split into flags.
+      # Fix: build both as bash arrays and pass "${arr[@]}".
+      - 'shellcheck reported issue in this script: SC2086:'

@@ -29,6 +29,8 @@ use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::StoredResource;
 
+use crate::seeding::SeedingStorage;
+
 const WRITERS: usize = 8;
 
 fn tenant(base: &str, label: &str) -> TenantContext {
@@ -57,7 +59,7 @@ fn family(stored: &StoredResource) -> String {
 /// control: every writer below holds exactly this `StoredResource`.
 async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext, id: &str) -> StoredResource {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             patient(id, "Seed"),
@@ -403,7 +405,7 @@ pub async fn concurrent_puts_onto_a_tombstone_all_succeed<S>(
         let id = format!("race-{round}");
         seed(backend.as_ref(), &t, &id).await;
         backend
-            .delete(&t, "Patient", &id)
+            .seed_delete(&t, "Patient", &id)
             .await
             .expect("delete seeded patient");
         assert_eq!(
@@ -500,7 +502,7 @@ where
     let t = tenant(base, "delete-cas");
     let v1 = seed(backend, &t, "cas").await;
     let v2 = backend
-        .update(&t, &v1, patient("cas", "Updated"))
+        .seed_update(&t, &v1, patient("cas", "Updated"))
         .await
         .expect("update to v2");
     assert_eq!(v2.version_id(), "2");

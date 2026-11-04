@@ -6622,6 +6622,13 @@ fn call_function(
             // Delegate to the reference key functions module
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
+        "section" | "entry" | "entryIn" | "resources" | "resourcesIn" | "sameSubject"
+        | "hasCoding" => {
+            // FHIR document functions: an extension of the HL7 Java reference
+            // implementation, not FHIRPath or the FHIR specification. See
+            // document_functions.rs.
+            crate::document_functions::call_document_function(name, invocation_base, args, context)
+        }
         "resolve" => {
             // Dereference a Reference (or reference string) to the resource it points
             // to, searching resources in scope (context + contained).
@@ -6872,6 +6879,13 @@ fn call_function(
                 "getResourceKey",
                 "getReferenceKey",
                 "resolve",
+                "section",
+                "entry",
+                "entryIn",
+                "resources",
+                "resourcesIn",
+                "sameSubject",
+                "hasCoding",
                 "sum",
                 "min",
                 "max",

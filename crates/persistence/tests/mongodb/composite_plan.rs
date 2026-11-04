@@ -46,7 +46,7 @@ async fn create_observation(
     resource: serde_json::Value,
 ) {
     backend
-        .create(tenant, "Observation", resource, FhirVersion::default())
+        .seed_create(tenant, "Observation", resource, FhirVersion::default())
         .await
         .unwrap();
 }
@@ -327,13 +327,13 @@ async fn mongodb_composite_pages_and_totals_match_expected_on_every_route() {
     }
     for number in 10..15 {
         backend
-            .delete(&tenant, "Observation", &format!("panel-{number:03}"))
+            .seed_delete(&tenant, "Observation", &format!("panel-{number:03}"))
             .await
             .unwrap();
     }
     for number in 30..35 {
         backend
-            .delete(&tenant, "Observation", &format!("height-{number:03}"))
+            .seed_delete(&tenant, "Observation", &format!("height-{number:03}"))
             .await
             .unwrap();
     }
@@ -697,7 +697,7 @@ async fn mongodb_identifier_and_compartment_searches_plan_from_the_index() {
     let tenant = create_tenant("composite-plan-refs");
     for (id, identifier) in [("p1", "A1"), ("p2", "B2")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id,

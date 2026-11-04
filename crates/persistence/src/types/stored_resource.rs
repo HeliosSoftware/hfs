@@ -80,6 +80,12 @@ pub struct StoredResource {
 
     /// HTTP method that created this version.
     method: Option<ResourceMethod>,
+
+    /// Set by a backend on a resource it read from its own store to rebuild
+    /// its own search index; see [`Self::with_local_reindex_origin`]. Never
+    /// serialized.
+    #[serde(skip)]
+    local_reindex_origin: bool,
 }
 
 /// HTTP method that created a resource version.
@@ -126,6 +132,7 @@ impl StoredResource {
             deleted_at: None,
             etag,
             method: Some(ResourceMethod::Post),
+            local_reindex_origin: false,
         }
     }
 
@@ -157,6 +164,7 @@ impl StoredResource {
             deleted_at,
             etag,
             method: None,
+            local_reindex_origin: false,
         }
     }
 
@@ -293,6 +301,29 @@ impl StoredResource {
         )
     }
 
+    /// Marks this resource as read by a backend from its own store for a
+    /// rebuild of its own search index.
+    ///
+    /// A reindex target can be handed resources that came from another store,
+    /// and then a resource the target does not hold is simply not indexed
+    /// locally. A page a backend reads from its own store is different: a
+    /// resource of it that is gone from the store when the page is written was
+    /// removed after the read (a hard purge), and the rows the page wrote for it
+    /// are orphans. A backend sets this only where it builds such a page, and
+    /// reads it back in its own page writer. It is not serialized, and no
+    /// constructor sets it.
+    #[doc(hidden)]
+    pub fn with_local_reindex_origin(mut self) -> Self {
+        self.local_reindex_origin = true;
+        self
+    }
+
+    /// Whether [`Self::with_local_reindex_origin`] was called.
+    #[doc(hidden)]
+    pub fn has_local_reindex_origin(&self) -> bool {
+        self.local_reindex_origin
+    }
+
     /// Creates a new version of this resource with updated content.
     ///
     /// The new version will have:
@@ -317,6 +348,7 @@ impl StoredResource {
             deleted_at: None,
             etag,
             method: Some(method),
+            local_reindex_origin: false,
         }
     }
 
@@ -341,6 +373,7 @@ impl StoredResource {
             deleted_at: Some(now),
             etag,
             method: Some(ResourceMethod::Delete),
+            local_reindex_origin: false,
         }
     }
 
@@ -500,6 +533,7 @@ impl StoredResourceBuilder {
             deleted_at: self.deleted_at,
             etag,
             method: self.method,
+            local_reindex_origin: false,
         }
     }
 }
@@ -508,6 +542,40 @@ impl StoredResourceBuilder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_local_reindex_origin_is_set_only_on_request_and_never_serialized() {
+        let tenant = TenantId::new("tenant-1");
+        let content = json!({"resourceType": "Patient", "id": "123"});
+        let created = StoredResource::new(
+            "Patient",
+            "123",
+            tenant.clone(),
+            content.clone(),
+            FhirVersion::default(),
+        );
+        assert!(!created.has_local_reindex_origin());
+        let stored = StoredResource::from_storage(
+            "Patient",
+            "123",
+            "1",
+            tenant,
+            content,
+            Utc::now(),
+            Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+        assert!(!stored.has_local_reindex_origin());
+
+        let tagged = stored.with_local_reindex_origin();
+        assert!(tagged.has_local_reindex_origin());
+        assert!(tagged.clone().has_local_reindex_origin());
+        let json = serde_json::to_value(&tagged).unwrap();
+        assert!(json.get("local_reindex_origin").is_none(), "{json}");
+        let round_trip: StoredResource = serde_json::from_value(json).unwrap();
+        assert!(!round_trip.has_local_reindex_origin());
+    }
 
     #[test]
     fn test_new_stored_resource() {

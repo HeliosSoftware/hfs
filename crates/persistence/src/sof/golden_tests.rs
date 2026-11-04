@@ -181,6 +181,7 @@ fn cases() -> Vec<Case> {
             group: vec!["g1".into()],
             patient: vec!["Patient/explicit".into()],
             limit: Some(50),
+            fhir_version: None,
         },
         paged: false,
     });

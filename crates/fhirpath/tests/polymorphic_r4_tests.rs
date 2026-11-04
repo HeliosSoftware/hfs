@@ -79,3 +79,101 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
     Ok(context)
 }
+
+/// Builds an R4 evaluation context from inline resource JSON.
+fn context_from_json(json: serde_json::Value) -> EvaluationContext {
+    let resource: r4::Resource = serde_json::from_value(json).expect("valid R4 resource");
+    EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))])
+}
+
+/// Issue #2477: an absent element must not resolve to a camelCase sibling.
+///
+/// Choice lookup used to fire for any missing member, matching every field
+/// named `<name><Uppercase>…`, so `conclusion` returned `conclusionCode`,
+/// `status` returned `statusReason`, and the non-element `birth` returned
+/// `birthDate`. Only declared `[x]` elements may resolve through a typed
+/// variant.
+#[test]
+fn missing_element_does_not_resolve_to_a_camel_case_sibling() {
+    let report = context_from_json(serde_json::json!({
+        "resourceType": "DiagnosticReport",
+        "id": "mri",
+        "status": "final",
+        "code": {"text": "MRI HEAD ORBITS"},
+        "conclusionCode": [
+            {"coding": [{"system": "http://snomed.info/sct", "code": "128208008"}]},
+            {"coding": [{"system": "http://snomed.info/sct", "code": "1234"}]}
+        ]
+    }));
+    assert_eq!(
+        run_expression(&report, "conclusion"),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        run_expression(&report, "DiagnosticReport.conclusion"),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        run_expression(&report, "conclusion.exists()"),
+        EvaluationResult::boolean(false)
+    );
+    // Control: the sibling itself is still reachable by its own name.
+    assert_eq!(
+        run_expression(&report, "conclusionCode.count()"),
+        EvaluationResult::integer(2)
+    );
+
+    let patient = context_from_json(serde_json::json!({
+        "resourceType": "Patient",
+        "id": "p",
+        "birthDate": "2000-01-01"
+    }));
+    assert_eq!(run_expression(&patient, "birth"), EvaluationResult::Empty);
+
+    let no_status = context_from_json(serde_json::json!({
+        "resourceType": "Procedure",
+        "id": "proc",
+        "subject": {"reference": "Patient/p"},
+        "statusReason": {"text": "patient declined"}
+    }));
+    assert_eq!(
+        run_expression(&no_status, "status"),
+        EvaluationResult::Empty
+    );
+}
+
+/// Control for #2477: real choice elements still resolve by their base name.
+#[test]
+fn declared_choice_elements_still_resolve() {
+    let patient = context_from_json(serde_json::json!({
+        "resourceType": "Patient",
+        "id": "p",
+        "deceasedBoolean": true,
+        "multipleBirthInteger": 2
+    }));
+    assert_eq!(
+        run_expression(&patient, "deceased"),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&patient, "multipleBirth"),
+        EvaluationResult::integer(2)
+    );
+
+    let obs = context_from_json(serde_json::json!({
+        "resourceType": "Observation",
+        "id": "o",
+        "status": "final",
+        "code": {"text": "x"},
+        "effectiveDateTime": "2020-01-01",
+        "component": [{"code": {"text": "c"}, "valueString": "nested"}]
+    }));
+    assert_eq!(
+        run_expression(&obs, "effective.exists()"),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(
+        run_expression(&obs, "component.value"),
+        EvaluationResult::string("nested".to_string())
+    );
+}

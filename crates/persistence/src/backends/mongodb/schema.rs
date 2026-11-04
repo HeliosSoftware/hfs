@@ -3,7 +3,7 @@
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Bson, Document, doc},
-    options::{ClientOptions, IndexOptions},
+    options::IndexOptions,
 };
 use tokio::runtime::RuntimeFlavor;
 
@@ -120,28 +120,11 @@ pub async fn migrate_schema_async(
     Ok(())
 }
 
+/// Builds a client through the same path as the backend, so URI options are
+/// honoured identically (explicit variable, then URI, then HFS default).
 #[allow(dead_code)]
 async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    let mut options = ClientOptions::parse(&config.connection_string)
-        .await
-        .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "mongodb".to_string(),
-                message: e.to_string(),
-            })
-        })?;
-
-    options.max_pool_size = Some(config.max_connections);
-    options.connect_timeout = Some(std::time::Duration::from_millis(config.connect_timeout_ms));
-    options.app_name = Some("helios-persistence".to_string());
-
-    Client::with_options(options).map_err(|e| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message: format!("Failed to create MongoDB client: {}", e),
-            source: None,
-        })
-    })
+    super::backend::connect_client(config, None).await
 }
 
 /// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
@@ -346,7 +329,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     // and hinted it must FETCH every live document to re-check `is_deleted`.
     // Not hinted by the aggregate either, so a store still building it falls
     // back to the scan under the `maxTimeMS` budget instead of failing.
-    // Rollout and build cost: `docs/mongodb/tenant-count-index.md`.
+    // Rollout and build cost: `crates/persistence/mongodb/tenant-count-index.md`.
     create_index(
         &resources,
         doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
@@ -430,7 +413,7 @@ async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageRe
 /// `idx_history_type_updated` (type history, `count_deltas_by_bucket`) and
 /// `idx_history_system_updated` (system history, `count_deltas_by_type_and_bucket`,
 /// the activity histogram, the write marker). The plans the planner chooses are
-/// recorded in `docs/mongodb/history-indexes.md`.
+/// recorded in `crates/persistence/mongodb/history-indexes.md`.
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     let history = database.collection::<Document>("resource_history");
 
@@ -478,7 +461,7 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     // without a version gate, an older build that recreates the index is
     // harmless, and a bump would make a build with the newer-version guard
     // refuse to start on the database, which makes a rollback much harder for
-    // an index change this small. See `docs/mongodb/history-indexes.md`.
+    // an index change this small. See `crates/persistence/mongodb/history-indexes.md`.
     drop_index_if_present(&history, "idx_history_resource_updated").await?;
 
     Ok(())

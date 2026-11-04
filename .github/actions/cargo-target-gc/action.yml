@@ -86,8 +86,11 @@ description: >
 inputs:
   maxsize:
     description: >
-      Size ceiling for `target/`. cargo-sweep evicts oldest-first until the
-      directory is under this. ALWAYS pass an explicit unit: a bare number is
+      Size ceiling for `target/`, as disk space. cargo-sweep evicts
+      oldest-first until the directory is under this. cargo-sweep itself counts
+      apparent file sizes, so on Linux sweep.sh scales this by the directory's
+      measured apparent-to-disk ratio (ZFS compression makes it ~3x on the
+      Linux agents). ALWAYS pass an explicit unit: a bare number is
       interpreted as MEGABYTES, so `100` means 100MB and would evict essentially
       the entire warm cache on every run.
 
@@ -140,7 +143,7 @@ inputs:
   cargo-sweep-version:
     description: >
       Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
-      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.90).
+      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.91.1).
     required: false
     default: 0.8.0
 

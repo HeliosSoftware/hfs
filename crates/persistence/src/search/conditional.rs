@@ -293,14 +293,18 @@ pub fn build_conditional_parameters(
             _ => Vec::new(),
         };
 
-        parameters.push(SearchParameter {
+        let mut parameter = SearchParameter {
             name: name.to_string(),
             param_type,
             modifier,
             values,
             chain: vec![],
             components,
-        });
+        };
+        // A `system|code` naming another system than a `code` element's
+        // implied one matches nothing, as in a direct search (#1395).
+        super::narrow_parameter_implied_code_systems(registry, resource_type, &mut parameter);
+        parameters.push(parameter);
     }
 
     Ok(parameters)

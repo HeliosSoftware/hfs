@@ -8,6 +8,8 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 use serde_json::json;
 
+use crate::seeding::SeedingStorage;
+
 pub async fn assert_scoped_clear<B: ResourceStorage + SearchProvider + ReindexTarget>(backend: &B) {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let tenant = TenantContext::new(
@@ -30,7 +32,7 @@ pub async fn assert_scoped_clear<B: ResourceStorage + SearchProvider + ReindexTa
             ),
         ] {
             backend
-                .create(tenant, resource_type, resource, FhirVersion::default())
+                .seed_create(tenant, resource_type, resource, FhirVersion::default())
                 .await
                 .unwrap();
         }

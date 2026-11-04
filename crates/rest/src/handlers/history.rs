@@ -22,6 +22,11 @@
 //! `TypeHistoryProvider`, and `SystemHistoryProvider` traits, which every
 //! first-class storage backend (SQLite, PostgreSQL, MongoDB, S3) implements
 //! and which `CompositeStorage` delegates to its primary.
+//!
+//! The three handlers are thin wrappers around `execute_history_bundle`. The
+//! same reads in a batch or transaction `GET` entry (`Patient/1/_history`,
+//! `Patient/_history`, `_history`) go through it too, so an entry and the
+//! direct request answer alike (#2380).
 
 use std::collections::HashSet;
 use std::num::IntErrorKind;
@@ -35,7 +40,7 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use helios_persistence::core::{
     HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
-    SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
+    SearchProvider, SystemHistoryProvider,
 };
 use helios_persistence::types::{PageCursor, PageInfo, PaginationMode};
 use serde_json::{Value, json};
@@ -73,6 +78,44 @@ pub(crate) struct HistoryQuery {
     pub cursor: Option<PageCursor>,
 }
 
+/// The level a history read addresses: the URL shape, not the query.
+///
+/// [`execute_history_bundle`] takes it so the three history handlers and the
+/// `GET` entries of a batch or transaction Bundle (#2380) share one code path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryLevel {
+    /// `[type]/[id]/_history`
+    Instance { resource_type: String, id: String },
+    /// `[type]/_history`
+    Type { resource_type: String },
+    /// `_history`
+    System,
+}
+
+impl HistoryLevel {
+    /// The path segments of the equivalent direct URL, which the Bundle's
+    /// `self` and `next` links are built from.
+    fn segments(&self) -> Vec<&str> {
+        match self {
+            Self::Instance { resource_type, id } => {
+                vec![resource_type.as_str(), id.as_str(), "_history"]
+            }
+            Self::Type { resource_type } => vec![resource_type.as_str(), "_history"],
+            Self::System => vec!["_history"],
+        }
+    }
+}
+
+/// A history read's Bundle and the response format it asked for.
+pub(crate) struct HistoryBundle {
+    /// The `history` Bundle.
+    pub bundle: Value,
+
+    /// The request's `_format`, for the direct handlers' content negotiation.
+    /// A Bundle entry ignores it: its Bundle is always JSON.
+    pub format: Option<String>,
+}
+
 /// The `issue[0].details.text` of a refused `_at` (#2374).
 const AT_NOT_SUPPORTED: &str = "The _at history parameter is not supported: HFS cannot select the \
      resource versions that were current at a point in time. Use _since to limit the history \
@@ -100,9 +143,11 @@ const SORT_NOT_SUPPORTED: &str = "The _sort history parameter is not supported: 
 //   a refused parameter out, but a client is not expected to diff its request
 //   against the link, so the refusal stance stays. An absent `Prefer` is
 //   lenient.
-// - They are checked first, so all three handlers refuse before any
-//   compartment check or storage read, and one of them on a missing instance
-//   is this 400, not a 404.
+// - They are checked first, so every history read, the three handlers and the
+//   `GET` entries of a Bundle (#2380) alike, refuses before any compartment
+//   check or storage read, and one of them on a missing instance is this 400,
+//   not a 404. The one exception is a confined type or system history entry,
+//   which is a 403 first, as the authz middleware makes it for direct requests.
 const REFUSED_HISTORY_PARAMS: &[(&str, &str)] = &[
     ("_at", AT_NOT_SUPPORTED),
     ("_list", LIST_NOT_SUPPORTED),
@@ -289,19 +334,6 @@ pub(crate) fn parse_history_query(
         format: format.map(str::to_string),
         cursor,
     })
-}
-
-/// Reads the history query from the raw query string and the `Prefer` header.
-///
-/// Runs first in every history handler, before any compartment check or
-/// storage read.
-fn history_query_from_request(
-    raw_query: Option<&str>,
-    headers: &HeaderMap,
-) -> RestResult<HistoryQuery> {
-    let pairs = parse_query_pairs(raw_query);
-    let strict = PreferHeader::from_headers(headers).is_strict();
-    parse_history_query(&pairs, strict)
 }
 
 /// Builds [`HistoryParams`] from the parsed query, applying the configured
@@ -494,6 +526,197 @@ fn respond_with_bundle(
         .unwrap_or_else(|refusal| refusal.into_response())
 }
 
+/// Reads one history Bundle: the work of all three history handlers and of the
+/// `GET` entries of a batch or transaction Bundle (#2380).
+///
+/// `pairs` are the URL's query pairs and `strict` is whether the request sent
+/// `Prefer: handling=strict` (a Bundle entry takes the Bundle request's). The
+/// order is the handlers' own: [`parse_history_query`] first (so its refusals
+/// win over everything below), then the compartment check, storage, the
+/// instance `404` rule and the compartment filter.
+///
+/// # Errors
+///
+/// - `400` from [`parse_history_query`]
+/// - `403` under a `patient/` scope ([`PatientCompartment::is_confined`]) for a
+///   type or system history, or an instance outside the launch patient's
+///   compartment
+/// - `404` for an instance that never existed
+pub(crate) async fn execute_history_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    level: &HistoryLevel,
+    pairs: &[(String, String)],
+    strict: bool,
+) -> RestResult<HistoryBundle>
+where
+    S: ResourceStorage + SystemHistoryProvider + SearchProvider + Send + Sync,
+{
+    // A type or system history cannot be confined to a compartment. The authz
+    // middleware (`patient_compartment_path_check`) refuses both before a
+    // direct handler runs; a Bundle entry reaches here without it, so the
+    // refusal is made here, before the query is parsed, with the middleware's
+    // wording.
+    if compartment.is_confined() {
+        match level {
+            HistoryLevel::Type { .. } => {
+                return Err(compartment.outside_compartment(
+                    "type-level history is not available under a patient/ scope: it cannot be confined to the launch patient's compartment".to_string(),
+                ));
+            }
+            HistoryLevel::System => {
+                return Err(compartment.outside_compartment(
+                    "system history is not available under a patient/ scope: it cannot be confined to the launch patient's compartment".to_string(),
+                ));
+            }
+            HistoryLevel::Instance { .. } => {}
+        }
+    }
+
+    let params = parse_history_query(pairs, strict)?;
+    let history_params = build_history_params(&params, state);
+
+    let (items, page_info): (Vec<HistoryEntry>, PageInfo) = match level {
+        HistoryLevel::Instance { resource_type, id } => {
+            // A `patient/` scope sees the history of the launch patient's
+            // resources only (#1618): the resource must currently be in the
+            // compartment — a deleted or absent one has no payload to prove it
+            // with — and versions from before it joined are left out of the
+            // page below.
+            if compartment.is_confined() {
+                let current = match state
+                    .storage()
+                    .read(tenant.context(), resource_type, id)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(helios_persistence::error::StorageError::Resource(
+                        helios_persistence::error::ResourceError::Gone { .. },
+                    )) => None,
+                    Err(e) => return Err(e.into()),
+                };
+                let Some(current) = current else {
+                    return Err(compartment.outside_compartment(format!(
+                        "history of {resource_type}/{id} is not available under a patient/ scope: the resource has no current version in the launch patient's compartment"
+                    )));
+                };
+                compartment.assert_member(
+                    || state.storage().search_param_registry(tenant.context()),
+                    current.fhir_version(),
+                    current.content(),
+                    "history",
+                )?;
+            }
+
+            let page = state
+                .storage()
+                .history_instance(tenant.context(), resource_type, id, &history_params)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "Instance history failed");
+                    RestError::from(e)
+                })?;
+
+            // An existing resource always has at least its current version in
+            // history, so an empty *unfiltered* first page means the resource
+            // never existed. When a `_since` filter is in play, an empty page
+            // just means nothing matched, so we return an empty history Bundle
+            // rather than a 404. An empty page after a `_cursor` means the walk
+            // ran past the end (for example because versions were deleted
+            // between pages), not that the resource never existed, so that is
+            // an empty Bundle too.
+            //
+            // A `_count=0` page is empty whether or not the resource exists, so
+            // it proves nothing. Only then is storage asked how many versions
+            // the resource has: none means it never existed (404), anything
+            // else is the empty 200 Bundle. Every other request keeps the rule
+            // above and makes no extra call.
+            if params.since.is_none() && params.cursor.is_none() {
+                let never_existed = if history_params.pagination.count == 0 {
+                    state
+                        .storage()
+                        .history_instance_count(tenant.context(), resource_type, id)
+                        .await
+                        .map_err(|e| {
+                            warn!(error = %e, "Instance history count failed");
+                            RestError::from(e)
+                        })?
+                        == 0
+                } else {
+                    page.items.is_empty()
+                };
+                if never_existed {
+                    return Err(RestError::NotFound {
+                        resource_type: resource_type.clone(),
+                        id: id.clone(),
+                    });
+                }
+            }
+
+            // Under a confined grant, keep the versions that are in the
+            // compartment and the delete markers (no payload to judge); drop
+            // the rest (#1618).
+            let items: Vec<HistoryEntry> = if compartment.is_confined() {
+                let registry = state.storage().search_param_registry(tenant.context());
+                page.items
+                    .iter()
+                    .filter(|entry| {
+                        entry.resource.is_deleted()
+                            || compartment.is_member(
+                                || registry.clone(),
+                                entry.resource.fhir_version(),
+                                entry.resource.content(),
+                            )
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                page.items
+            };
+            (items, page.page_info)
+        }
+        HistoryLevel::Type { resource_type } => {
+            let page = state
+                .storage()
+                .history_type(tenant.context(), resource_type, &history_params)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "Type history failed");
+                    RestError::from(e)
+                })?;
+            (page.items, page.page_info)
+        }
+        HistoryLevel::System => {
+            let page = state
+                .storage()
+                .history_system(tenant.context(), &history_params)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "System history failed");
+                    RestError::from(e)
+                })?;
+            (page.items, page.page_info)
+        }
+    };
+
+    let total = page_info.total.unwrap_or(items.len() as u64);
+    let links = history_links(
+        state,
+        tenant,
+        &level.segments(),
+        &params,
+        history_params.pagination.count,
+        &page_info,
+    );
+    let bundle = build_history_bundle(&items, state, tenant, total, links);
+
+    Ok(HistoryBundle {
+        bundle,
+        format: params.format,
+    })
+}
+
 /// Handler for instance history.
 ///
 /// Returns the version history for a specific resource instance.
@@ -530,7 +753,7 @@ pub async fn history_instance_handler<S>(
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + InstanceHistoryProvider + SearchProvider + Send + Sync,
+    S: ResourceStorage + SystemHistoryProvider + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -539,112 +762,22 @@ where
         "Processing instance history request"
     );
 
-    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
-    let history_params = build_history_params(&params, &state);
-
-    // A `patient/` scope sees the history of the launch patient's resources
-    // only (#1618): the resource must currently be in the compartment — a
-    // deleted or absent one has no payload to prove it with — and versions from
-    // before it joined are left out of the page below.
-    if compartment.is_confined() {
-        let current = match state
-            .storage()
-            .read(tenant.context(), &resource_type, &id)
-            .await
-        {
-            Ok(current) => current,
-            Err(helios_persistence::error::StorageError::Resource(
-                helios_persistence::error::ResourceError::Gone { .. },
-            )) => None,
-            Err(e) => return Err(e.into()),
-        };
-        let Some(current) = current else {
-            return Err(compartment.outside_compartment(format!(
-                "history of {resource_type}/{id} is not available under a patient/ scope: the resource has no current version in the launch patient's compartment"
-            )));
-        };
-        compartment.assert_member(
-            || state.storage().search_param_registry(tenant.context()),
-            current.fhir_version(),
-            current.content(),
-            "history",
-        )?;
-    }
-
-    let page = state
-        .storage()
-        .history_instance(tenant.context(), &resource_type, &id, &history_params)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Instance history failed");
-            RestError::from(e)
-        })?;
-
-    // An existing resource always has at least its current version in history,
-    // so an empty *unfiltered* first page means the resource never existed. When
-    // a `_since` filter is in play, an empty page just means nothing matched, so
-    // we return an empty history Bundle rather than a 404. An empty page after a
-    // `_cursor` means the walk ran past the end (for example because versions
-    // were deleted between pages), not that the resource never existed, so that
-    // is an empty Bundle too.
-    //
-    // A `_count=0` page is empty whether or not the resource exists, so it
-    // proves nothing. Only then is storage asked how many versions the resource
-    // has: none means it never existed (404), anything else is the empty 200
-    // Bundle. Every other request keeps the rule above and makes no extra call.
-    if params.since.is_none() && params.cursor.is_none() {
-        let never_existed = if history_params.pagination.count == 0 {
-            state
-                .storage()
-                .history_instance_count(tenant.context(), &resource_type, &id)
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "Instance history count failed");
-                    RestError::from(e)
-                })?
-                == 0
-        } else {
-            page.items.is_empty()
-        };
-        if never_existed {
-            return Err(RestError::NotFound { resource_type, id });
-        }
-    }
-
-    // Under a confined grant, keep the versions that are in the compartment and
-    // the delete markers (no payload to judge); drop the rest (#1618).
-    let items: Vec<HistoryEntry> = if compartment.is_confined() {
-        let registry = state.storage().search_param_registry(tenant.context());
-        page.items
-            .iter()
-            .filter(|entry| {
-                entry.resource.is_deleted()
-                    || compartment.is_member(
-                        || registry.clone(),
-                        entry.resource.fhir_version(),
-                        entry.resource.content(),
-                    )
-            })
-            .cloned()
-            .collect()
-    } else {
-        page.items
-    };
-    let total = page.page_info.total.unwrap_or(items.len() as u64);
-    let links = history_links(
+    let pairs = parse_query_pairs(raw_query.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let history = execute_history_bundle(
         &state,
         &tenant,
-        &[resource_type.as_str(), id.as_str(), "_history"],
-        &params,
-        history_params.pagination.count,
-        &page.page_info,
-    );
-    let bundle = build_history_bundle(&items, &state, &tenant, total, links);
+        &compartment,
+        &HistoryLevel::Instance { resource_type, id },
+        &pairs,
+        strict,
+    )
+    .await?;
 
     Ok(respond_with_bundle(
-        &bundle,
+        &history.bundle,
         &req_headers,
-        params.format.as_deref(),
+        history.format.as_deref(),
     ))
 }
 
@@ -661,15 +794,19 @@ where
 /// `Prefer: handling=strict` and ignored otherwise (#2374, #2381). The Bundle
 /// carries a `self` link and, when there is another page, a `next` link
 /// (#2382).
+///
+/// The authz middleware refuses this path under a `patient/` scope before the
+/// handler runs, so the compartment is always unconfined here.
 pub async fn history_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + TypeHistoryProvider + Send + Sync,
+    S: ResourceStorage + SystemHistoryProvider + SearchProvider + Send + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -677,33 +814,22 @@ where
         "Processing type history request"
     );
 
-    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
-    let history_params = build_history_params(&params, &state);
-
-    let page = state
-        .storage()
-        .history_type(tenant.context(), &resource_type, &history_params)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Type history failed");
-            RestError::from(e)
-        })?;
-
-    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let links = history_links(
+    let pairs = parse_query_pairs(raw_query.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let history = execute_history_bundle(
         &state,
         &tenant,
-        &[resource_type.as_str(), "_history"],
-        &params,
-        history_params.pagination.count,
-        &page.page_info,
-    );
-    let bundle = build_history_bundle(&page.items, &state, &tenant, total, links);
+        &compartment,
+        &HistoryLevel::Type { resource_type },
+        &pairs,
+        strict,
+    )
+    .await?;
 
     Ok(respond_with_bundle(
-        &bundle,
+        &history.bundle,
         &req_headers,
-        params.format.as_deref(),
+        history.format.as_deref(),
     ))
 }
 
@@ -720,47 +846,40 @@ where
 /// `Prefer: handling=strict` and ignored otherwise (#2374, #2381). The Bundle
 /// carries a `self` link and, when there is another page, a `next` link
 /// (#2382).
+///
+/// The authz middleware refuses this path under a `patient/` scope before the
+/// handler runs, so the compartment is always unconfined here.
 pub async fn history_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SystemHistoryProvider + Send + Sync,
+    S: ResourceStorage + SystemHistoryProvider + SearchProvider + Send + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
         "Processing system history request"
     );
 
-    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
-    let history_params = build_history_params(&params, &state);
-
-    let page = state
-        .storage()
-        .history_system(tenant.context(), &history_params)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "System history failed");
-            RestError::from(e)
-        })?;
-
-    let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let links = history_links(
+    let pairs = parse_query_pairs(raw_query.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
+    let history = execute_history_bundle(
         &state,
         &tenant,
-        &["_history"],
-        &params,
-        history_params.pagination.count,
-        &page.page_info,
-    );
-    let bundle = build_history_bundle(&page.items, &state, &tenant, total, links);
+        &compartment,
+        &HistoryLevel::System,
+        &pairs,
+        strict,
+    )
+    .await?;
 
     Ok(respond_with_bundle(
-        &bundle,
+        &history.bundle,
         &req_headers,
-        params.format.as_deref(),
+        history.format.as_deref(),
     ))
 }
 

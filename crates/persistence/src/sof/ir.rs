@@ -442,6 +442,9 @@ pub enum PathStep {
 pub struct ResourceFilter {
     /// Parameter holding the inclusive last-modified lower bound.
     pub since: Option<usize>,
+    /// Parameter holding the stored FHIR version (`"4.0"`, `"5.0"`, …) every
+    /// scanned resource must carry (#2254).
+    pub fhir_version: Option<usize>,
     /// Resolved compartment membership, when requested.
     pub compartment: Option<CompartmentFilter>,
     /// Slots holding the exclusive lower and inclusive upper resource-id

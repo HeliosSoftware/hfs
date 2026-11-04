@@ -1,6 +1,6 @@
 //! History & Versions diff rendering (#236).
 //!
-//! The decision is recorded in `docs/history-diff-rendering.md`; this is the
+//! The decision is recorded in `crates/ui/docs/history-diff-rendering.md`; this is the
 //! prototype Steve asked for on PR #246. It renders the difference between two
 //! versions of a resource — from `_history` — **server-side, in two layers**,
 //! into an Askama template. No client-side diff library, and the essence (the
