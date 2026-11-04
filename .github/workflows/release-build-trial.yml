@@ -59,7 +59,11 @@ jobs:
       # Its own dir next to the checkout: the Windows target shares nothing
       # with the native Linux builds in `${{ github.workspace }}-target`.
       CARGO_TARGET_DIR: ${{ github.workspace }}-target-xwin
-      CARGO_BUILD_JOBS: 4
+      # 2, not ci.yml's 4. At 4, run 41744976492 exhausted github-agent3
+      # (32 GB) while helios-rest, helios-hfs and pysof compiled together,
+      # and took the runner itself offline. At 2 the same build peaked at
+      # ~17.5 GB locally (one rustc: helios-fhir) and took 39 min.
+      CARGO_BUILD_JOBS: 2
       # cargo-xwin downloads the MSVC CRT and Windows SDK from Microsoft and
       # needs their license accepted. Setting this accepts it for this repo's
       # CI: https://go.microsoft.com/fwlink/?LinkId=2086102
@@ -166,13 +170,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # 4 cores and 16 GB, against a ~17.5 GB peak in one rustc process.
+      # 4 cores and 16 GB, against a ~17.5 GB peak in one rustc process. Run
+      # 41744976492 had 16 GB of swap and 4 jobs, and was still OOM-killed
+      # 18 min in (exit 137, runner lost). The runner has ~105 GB free disk.
       - name: Add swap
         run: |
           set -euo pipefail
           df -h / ; free -h
           avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
-          size=$(( avail > 60 ? 16 : 8 ))
+          size=$(( avail > 80 ? 32 : 8 ))
           sudo fallocate -l "${size}G" /trial-swap
           sudo chmod 600 /trial-swap
           sudo mkswap /trial-swap >/dev/null
@@ -183,7 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm -v "$GITHUB_WORKSPACE:/io" -w /io \
-            -e CARGO_TERM_COLOR -e RUSTUP_TOOLCHAIN -e CARGO_BUILD_JOBS=4 \
+            -e CARGO_TERM_COLOR -e RUSTUP_TOOLCHAIN -e CARGO_BUILD_JOBS=2 \
             quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
               # perl-core: openssl-src (the vendored OpenSSL the shipped
               # binaries link) needs Perl modules such as IPC::Cmd.
