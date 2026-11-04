@@ -535,6 +535,50 @@ Not re-measured with this final code: insert, search and the `_contained`
 searches of 8.2 (the lock and the removal of the repair do not touch the read
 path; the lazy check of 8.2 is what the last `_contained` numbers measure).
 
+### 8.5 Chaos campaigns
+
+Three campaigns against a real Elasticsearch, to try to break the design
+(tests `elasticsearch_contained_chaos_*_real.rs`):
+
+- **Random operations with faults** (`..._random_real`). A model of the truth
+  for 12 resources (3 container types, ids 1 to 4, so ids repeat across types),
+  400 to 450 operations with 4 to 8 at a time, some on the same resource:
+  upserts with 0 to 3 children, updates, sync writes with rising numeric
+  versions, deletes, purges and pages. A proxy in front of Elasticsearch drops
+  the answer after the request was applied, answers 503 or 429 without
+  forwarding, delays `_bulk`, and forwards only part of a `_bulk` answering the
+  rest with item 429s (the only way found to leave real orphans). Faults come in
+  bursts of up to 8 requests so the client's retries run out. Checked after the
+  run: searches never fail (also while it runs); no visible child of a missing
+  or deleted container; a resource whose last write is certain shows exactly its
+  children; after one clean write per resource everything is exact; after a
+  purge nothing is left. With versions assigned by a primary (the server's
+  mode): 10 runs (seeds 1 to 5, fault rates 20 and 60 per thousand),
+  **0 violations** of any invariant, with 130 to 270 operations per run
+  returning an error to the caller. Before the healing write, 1 to 8 of the 12
+  resources were uncertain and showed the transient forms (hidden current child,
+  container without children, extra child, a deleted container back); one clean
+  write fixed all of them. Up to 23 children physically present against 16
+  visible: the rest hidden by the filter.
+- **Hand corruption** (`..._corrupt_real`, 36 cases): malformed lists, ids of
+  another container, another container type or another tenant, a container
+  deleted by hand, hand-edited versions, closed and missing indices, old-format
+  ids. It found one serious bug, now fixed (d6a508a21): a list naming the
+  children of another container made an update or delete of this container
+  delete them. Three cases remain as ignored tests, each documenting a limit
+  that needs a primary that reuses a version.
+- **Two processes** (`..._multiprocess_real`): a late resend after a 429 from one
+  instance hides the current child written by another (3.6). Reproduced; about
+  5 % of resources under 35 % injected 429s on children with two instances;
+  cured by any write of the resource; the in-process lock removes it for one
+  process.
+
+**Found only with a standalone Elasticsearch** (no primary, versions numbered
+by Elasticsearch itself; not a mode of the server binary): a failed update
+leaves a child at version N+1, and a retry computes the same version, so the
+child becomes visible under a container that does not list it. Kept as an
+ignored test (`..._standalone_...`).
+
 ## 9. Residual risks and follow-ups
 
 - **Hidden garbage.** The filter hides orphaned and stale contained
