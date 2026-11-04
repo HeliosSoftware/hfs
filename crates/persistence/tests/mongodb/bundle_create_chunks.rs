@@ -53,8 +53,6 @@ use super::*;
 use std::collections::{BTreeMap, HashMap};
 
 use futures::TryStreamExt;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::mongo::Mongo;
 
 use crate::bulk_submit::FailPoint;
@@ -145,54 +143,29 @@ async fn backend_or_skip(test: &str, mode: Mode) -> Option<MongoBackend> {
 const OWN_MONGOD_WT_CACHE_GB: &str = "1";
 
 /// A mongo:7.0 single-member replica set (`rs0`) for `test` alone, with a cache
-/// of [`OWN_MONGOD_WT_CACHE_GB`] (the replica-set setup of
-/// `transaction_bundle_load.rs` and `v1_history_ceiling.rs`; the skip when no
-/// container starts follows `single_write_topology.rs`), and its URL. `None`, after
-/// `skip_or_fail_unavailable`, when no container starts. The container is
-/// removed when the first element is dropped.
+/// of [`OWN_MONGOD_WT_CACHE_GB`] (`shared_mongo::start_dedicated_replica_set`;
+/// the skip when no container starts follows `single_write_topology.rs`), and
+/// its URL. `None`, after `skip_or_fail_unavailable`, when no container starts.
+/// The container is removed when the first element is dropped.
 async fn own_mongod(test: &str) -> Option<(testcontainers::ContainerAsync<Mongo>, String)> {
-    let started = super::container_cleanup::with_cleanup_label(
-        Mongo::default()
-            .with_tag("7.0")
-            .with_cmd([
-                "mongod",
-                "--bind_ip_all",
-                "--wiredTigerCacheSizeGB",
-                OWN_MONGOD_WT_CACHE_GB,
-                "--replSet",
-                "rs0",
-                "--oplogSize",
-                "128",
-            ])
-            .with_ulimit("nofile", 64000, Some(64000))
-            .with_startup_timeout(std::time::Duration::from_secs(120)),
-    )
-    .start()
-    .await;
-    let container = match started {
-        Ok(container) => container,
-        Err(error) => {
+    let started =
+        shared_mongo::start_dedicated_replica_set(OWN_MONGOD_WT_CACHE_GB, &["--oplogSize", "128"])
+            .await;
+    let (container, url) = match started {
+        Ok(started) => started,
+        Err(shared_mongo::DedicatedMongodError::NotStarted(error)) => {
             skip_or_fail_unavailable(&format!(
                 "{test}: its own Mongo container did not start ({error})"
             ));
             return None;
         }
-    };
-    shared_mongo::initiate_replica_set(&container).await;
-    shared_mongo::wait_for_writable_primary(&container).await;
-    let (host, port) = match (
-        container.get_host().await,
-        container.get_host_port_ipv4(27017).await,
-    ) {
-        (Ok(host), Ok(port)) => (host, port),
-        (Err(error), _) | (_, Err(error)) => {
+        Err(shared_mongo::DedicatedMongodError::NoAddress(error)) => {
             skip_or_fail_unavailable(&format!(
                 "{test}: its own Mongo container has no reachable address ({error})"
             ));
             return None;
         }
     };
-    let url = format!("mongodb://{host}:{port}/?directConnection=true");
     eprintln!(
         "{test}: on a mongod of its own ({OWN_MONGOD_WT_CACHE_GB} GB WiredTiger cache) at {url}"
     );

@@ -163,6 +163,43 @@ if ! printf '%s' "$MAXSIZE" | grep -qiE '^[0-9]+(\.[0-9]+)?[[:space:]]*(k|m|g|t)
   exit 0
 fi
 
+# MAXSIZE in whole GB.
+maxsize_gb() {
+  printf '%s' "$MAXSIZE" | awk '{ n = $0 + 0; u = tolower($0);
+    if (u ~ /t/) n *= 1024; else if (u ~ /m/) n /= 1024; else if (u ~ /k/) n /= 1048576;
+    printf "%d", n }'
+}
+
+# The `--maxsize` to give cargo-sweep for a ceiling of $1 GB *on disk*.
+#
+# cargo-sweep adds up apparent file lengths (`metadata.len()`), not the blocks
+# a file occupies. On the Linux agents target/ sits on a ZFS dataset with
+# compression on, where build artifacts take about a third of their length
+# on disk: a sweep there reports "Cleaned 68 GiB" and `du` sees 22GB go.
+# Passed straight through, the 100GB cap held about 30GB of real disk, less
+# than one all-features test build (~52GB), so the end-of-job sweep evicted
+# everything not touched in the last ~18 minutes, the dependency and
+# helios-fhir artifacts included, and every test-rust run started cold
+# (2026-11-02, every Linux run after #2466).
+#
+# So measure this directory's apparent-to-disk ratio and scale the ceiling by
+# it. Only where GNU du can measure both (Linux): APFS and NTFS don't compress
+# build output by default, and `du` is far too slow on NTFS (see dir_size).
+sweep_maxsize() {
+  local gb="$1" apparent disk
+  if [ "${RUNNER_OS:-}" = "Linux" ] && command -v timeout >/dev/null 2>&1; then
+    apparent="$(timeout 180 du -s --apparent-size -BM "$TARGET_DIR" 2>/dev/null | cut -f1 | tr -d M)"
+    disk="$(timeout 180 du -s -BM "$TARGET_DIR" 2>/dev/null | cut -f1 | tr -d M)"
+    # Under 1GB on disk the ratio is noise; under 1 there is nothing to scale.
+    if [ -n "$apparent" ] && [ -n "$disk" ] && [ "$disk" -ge 1024 ] && [ "$apparent" -gt "$disk" ]; then
+      echo "${TARGET_DIR}: $((apparent / 1024))GB of files in $((disk / 1024))GB on disk; capping at ${gb}GB on disk = $((gb * apparent / disk))GB for cargo-sweep." >&2
+      echo "$((gb * apparent / disk))GB"
+      return
+    fi
+  fi
+  echo "${gb}GB"
+}
+
 if [ "$MODE" = "preflight" ]; then
   prune_incremental
   free="$(free_gb)"
@@ -180,16 +217,14 @@ if [ "$MODE" = "preflight" ]; then
   # counts hardlinked outputs twice, so sweeping N "GiB" can free less than N on
   # disk. Starting from the post-job cap is right because the previous job's
   # post sweep left target/ there.
-  ceiling="$(printf '%s' "$MAXSIZE" | awk '{ n = $0 + 0; u = tolower($0);
-    if (u ~ /t/) n *= 1024; else if (u ~ /m/) n /= 1024; else if (u ~ /k/) n /= 1048576;
-    printf "%d", n }')"
+  ceiling="$(maxsize_gb)"
   if ensure_cargo_sweep; then
     for _ in 1 2 3 4; do
       [ "$free" -ge "$MIN_FREE_GB" ] && break
       ceiling=$(( ceiling - (MIN_FREE_GB - free) ))
       [ "$ceiling" -lt 10 ] && break
-      echo "Sweeping target/ to ${ceiling}GB..."
-      cargo sweep --maxsize "${ceiling}GB" || true
+      echo "Sweeping target/ to ${ceiling}GB on disk..."
+      cargo sweep --maxsize "$(sweep_maxsize "$ceiling")" || true
       free="$(free_gb)"
       echo "  ${free}GB free."
     done
@@ -214,12 +249,15 @@ fi
 
 before="$(dir_size "$TARGET_DIR")"
 prune_incremental
-cargo sweep --maxsize "$MAXSIZE" || true
+# A sub-GB cap (only ever a test value) goes through unscaled.
+cap="$(maxsize_gb)"
+if [ "$cap" -ge 1 ]; then cap="$(sweep_maxsize "$cap")"; else cap="$MAXSIZE"; fi
+cargo sweep --maxsize "$cap" || true
 after="$(dir_size "$TARGET_DIR")"
 if [ "${RUNNER_OS:-}" = "Windows" ]; then
   echo "${TARGET_DIR}: swept to ceiling ${MAXSIZE} (size not measured on Windows; see cargo-sweep's 'Cleaned' line above)."
 else
-  echo "${TARGET_DIR}: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
+  echo "${TARGET_DIR}: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE} on disk)."
 fi
 df -h . 2>/dev/null | tail -2 || true
 

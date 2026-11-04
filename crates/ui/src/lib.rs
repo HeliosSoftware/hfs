@@ -17,7 +17,7 @@
 //!
 //! All user-visible text is resolved from the Fluent catalogs in `locales/`
 //! against the locale negotiated per request by [`i18n::negotiate_locale`]
-//! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
+//! (see `crates/ui/docs/multi-language.md`); templates hold catalog keys, not prose.
 //!
 //! ## Dashboard data
 //!
@@ -1840,7 +1840,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui/status", get(status))
         .route("/ui/history", get(history_page))
         // The diff is computed server-side (the decision in
-        // docs/history-diff-rendering.md); the browser posts the two versions
+        // crates/ui/docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route(

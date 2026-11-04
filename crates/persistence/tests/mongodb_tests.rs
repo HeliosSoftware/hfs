@@ -417,6 +417,66 @@ mod shared_mongo {
         }
     }
 
+    /// Why [`start_dedicated_replica_set`] returned no server. The two cases are
+    /// separate because its callers do not treat them alike.
+    pub(super) enum DedicatedMongodError {
+        /// The container did not start, which is what a host without Docker gets.
+        NotStarted(testcontainers::TestcontainersError),
+        /// The container runs, but its host or mapped port could not be read.
+        NoAddress(testcontainers::TestcontainersError),
+    }
+
+    /// Starts a mongo:7.0 single-member replica set (`rs0`) for one test or
+    /// harness alone, and returns it with its URL. It has a writable primary when
+    /// this returns. The container is removed when the first element is dropped.
+    ///
+    /// The command is `mongod --bind_ip_all --wiredTigerCacheSizeGB <wt_cache_gb>
+    /// --replSet rs0` followed by `extra_flags`, in that order. Callers pass
+    /// `--oplogSize` there too: without it mongod sizes the oplog from the free
+    /// disk.
+    ///
+    /// What a failure means is the caller's choice: this neither skips nor reads
+    /// `HFS_TEST_REQUIRE_MONGODB`. `initiate_replica_set` and
+    /// `wait_for_writable_primary` still panic on a broken container.
+    pub(super) async fn start_dedicated_replica_set(
+        wt_cache_gb: &str,
+        extra_flags: &[&str],
+    ) -> Result<(testcontainers::ContainerAsync<Mongo>, String), DedicatedMongodError> {
+        let command = [
+            "mongod",
+            "--bind_ip_all",
+            "--wiredTigerCacheSizeGB",
+            wt_cache_gb,
+            "--replSet",
+            "rs0",
+        ]
+        .into_iter()
+        .chain(extra_flags.iter().copied());
+        let container = super::container_cleanup::with_cleanup_label(
+            Mongo::default()
+                .with_tag("7.0")
+                .with_cmd(command)
+                .with_ulimit("nofile", 64000, Some(64000))
+                .with_startup_timeout(Duration::from_secs(120)),
+        )
+        .start()
+        .await
+        .map_err(DedicatedMongodError::NotStarted)?;
+        initiate_replica_set(&container).await;
+        wait_for_writable_primary(&container).await;
+        let (host, port) = match (
+            container.get_host().await,
+            container.get_host_port_ipv4(27017).await,
+        ) {
+            (Ok(host), Ok(port)) => (host, port),
+            (Err(error), _) | (_, Err(error)) => {
+                return Err(DedicatedMongodError::NoAddress(error));
+            }
+        };
+        let url = format!("mongodb://{host}:{port}/?directConnection=true");
+        Ok((container, url))
+    }
+
     async fn shared() -> Option<&'static SharedMongo> {
         SHARED
             .get_or_init(|| async {

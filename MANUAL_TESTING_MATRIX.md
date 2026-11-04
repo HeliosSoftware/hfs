@@ -457,11 +457,11 @@ references; 6.4 gives the exact messages. On `s3`/`s3-es` run 6.2 and 6.4 only.
 ## 7. T3 — Import the Synthea corpus from the Import page
 
 For issue #1086 development measurements, use the bounded 2,000-resource
-[PostgreSQL reindex benchmark](docs/postgres-reindex-benchmark.md). That protocol
+[PostgreSQL reindex benchmark](crates/hfs/tests/bulk_submit/POSTGRES_REINDEX_BENCHMARK.md). That protocol
 does not replace this full-corpus release-matrix test or change its pass criteria.
 
 For issue #1087 coordination measurements, use the focused
-[deferred reindex coordination benchmark](docs/deferred-reindex-coordination-benchmark.md).
+[deferred reindex coordination benchmark](crates/hfs/tests/bulk_submit/REINDEX_COORDINATION_BENCHMARK.md).
 It submits combined, consecutive, overlapping, and burst manifests against a
 dedicated PostgreSQL instance. The controller records physical reindex jobs,
 summed job totals, processed resources, created index entries, observed overlap,
