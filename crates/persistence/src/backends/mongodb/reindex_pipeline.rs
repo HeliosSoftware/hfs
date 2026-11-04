@@ -26,7 +26,7 @@ use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_e
 use crate::search::reindex::ReindexPageStats;
 use crate::types::StoredResource;
 
-use super::retry::{REINDEX_PAGE_BUDGET, REINDEX_PAGE_RETRY, full_jitter, jitter_fraction};
+use super::retry::{REINDEX_PAGE_RETRY, full_jitter, jitter_fraction};
 use super::storage::{ExtractionReport, SearchIndexDocuments, internal_error};
 
 /// A type's first page: too little is known yet to size from observation (#1403).
@@ -1906,7 +1906,9 @@ impl super::MongoBackend {
                     // A run can wait out a server-selection or socket timeout,
                     // so the sleep alone is no bound: give up when the next run,
                     // taken as long as this one, would end past the budget.
-                    if started.elapsed() + pause + run_started.elapsed() > REINDEX_PAGE_BUDGET {
+                    if started.elapsed() + pause + run_started.elapsed()
+                        > self.config().reindex_page_budget
+                    {
                         return Err(failure);
                     }
                     tracing::warn!(
