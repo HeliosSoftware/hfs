@@ -680,15 +680,15 @@ fn reindex_activity_of(
     // rebuild before it, not that rebuild's permanent ones: look past it.
     let mut retried_cleanly = false;
     for job in finished {
-        let clean = job.status == ReindexStatus::Completed && job.errors.is_empty();
+        let clean = job.status == ReindexStatus::Completed && job.error_count() == 0;
         if job.resource_scoped && clean {
             retried_cleanly = true;
             continue;
         }
         let errors = if retried_cleanly {
-            job.errors.iter().filter(|error| !error.retryable).count()
+            job.permanent_error_count()
         } else {
-            job.errors.len()
+            job.error_count()
         };
         let unindexed = match job.status {
             ReindexStatus::Failed => true,
@@ -697,7 +697,7 @@ fn reindex_activity_of(
         };
         return unindexed.then(|| ReindexActivity::Failed {
             job_id: job.job_id.clone(),
-            errors: errors as u64,
+            errors,
         });
     }
     None
