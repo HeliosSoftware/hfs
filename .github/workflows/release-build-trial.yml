@@ -1,0 +1,374 @@
+name: Release build trial
+
+# Builds the release artifacts a second way, without the self-hosted Windows
+# (agent4, agent9) and macOS (agent5) runners, and smoke-tests each one on a
+# machine of its own platform. It publishes nothing. `ci.yml`'s `build` job
+# still makes every artifact a release ships.
+#
+# When these legs have passed on a release tag, `build` can switch to them
+# and the agents can be retired:
+#
+#   * Windows: cross-compiled on a self-hosted Linux agent with cargo-xwin
+#     against Microsoft's MSVC CRT and Windows SDK, same target
+#     (x86_64-pc-windows-msvc) and same 16 MB main-thread stack as the native
+#     build. Smoke-tested on GitHub's `windows-latest`.
+#   * Linux ARM64: built natively on GitHub's `ubuntu-24.04-arm`, inside the
+#     manylinux_2_28 image so the binaries and wheels keep the glibc 2.28
+#     floor the Mac's cross-compile gives them today. A plain 24.04 build
+#     would need glibc 2.39 and stop running on RHEL 9, Debian 12 and
+#     Amazon Linux 2023.
+#   * macOS: GitHub's `macos-latest` (M1, 3 cores, 7 GB) building natively,
+#     and `macos-15-intel` (4 cores, 14 GB) cross-compiling to Apple Silicon.
+#     Both are trials. The full release build peaks at ~17.5 GB in a single
+#     rustc process (`helios-fhir`, all four FHIR versions), so either runner
+#     may swap past GitHub's 6-hour job limit.
+#
+# Standard GitHub-hosted runners are free for public repositories.
+#
+# Runs on every `v*` tag (called from `ci.yml`), on pull requests that change
+# it, and by hand: Actions -> Release build trial -> Run workflow.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  # A change to the trial itself is tried on its pull request. (A workflow
+  # has to be on the default branch before it can be dispatched by hand.)
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release-build-trial.yml
+      - .github/scripts/release-smoke.sh
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  # The shipped binaries, as `release` in ci.yml packages them.
+  RELEASE_BINS: hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor hts
+
+jobs:
+  windows-cross:
+    name: Windows (cross-compiled on Linux)
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 300
+    # A trial: a failure here must not turn a release tag's run red.
+    continue-on-error: true
+    env:
+      # Its own dir next to the checkout: the Windows target shares nothing
+      # with the native Linux builds in `${{ github.workspace }}-target`.
+      CARGO_TARGET_DIR: ${{ github.workspace }}-target-xwin
+      CARGO_BUILD_JOBS: 4
+      # cargo-xwin downloads the MSVC CRT and Windows SDK from Microsoft and
+      # needs their license accepted. Setting this accepts it for this repo's
+      # CI: https://go.microsoft.com/fwlink/?LinkId=2086102
+      XWIN_ACCEPT_LICENSE: "1"
+      # The native Windows build links with a 16 MB main-thread stack (see
+      # "Configure Rust to use LLD (Windows)" in ci.yml). cargo-xwin appends
+      # its own flags to this variable rather than replacing it.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/STACK:16777216"
+      # `--workspace` includes pysof, and PyO3 cannot ask a Windows Python for
+      # its version while cross-compiling. The wheels below are built per
+      # interpreter regardless.
+      PYO3_CROSS_PYTHON_VERSION: "3.12"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      # clang 19 or newer: the MSVC C++ headers reject older clang (STL1000),
+      # which `mimalloc` (pysof) hits. The agents' distro clang is 18.
+      - name: Install LLVM 19
+        run: |
+          set -euo pipefail
+          ver=19.1.7
+          sha=4a5ec53951a584ed36f80240f6fbf8fdd46b4cf6c7ee87cc2d5018dc37caf679
+          dir="$RUNNER_TOOL_CACHE/llvm-$ver"
+          if [ ! -x "$dir/bin/clang-cl" ]; then
+            tmp=$(mktemp -d)
+            curl -sSfL -o "$tmp/llvm.tar.xz" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-Linux-X64.tar.xz"
+            echo "$sha  $tmp/llvm.tar.xz" | sha256sum -c -
+            rm -rf "$dir.partial"
+            mkdir -p "$dir.partial"
+            tar -xJf "$tmp/llvm.tar.xz" --strip-components=1 -C "$dir.partial"
+            rm -rf "$dir" "$tmp"
+            mv "$dir.partial" "$dir"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/clang-cl" --version | head -1
+
+      - name: Install cargo-xwin
+        run: |
+          set -euo pipefail
+          want=0.23.1
+          if ! cargo xwin --version 2>/dev/null | grep -q " $want$"; then
+            cargo install --locked cargo-xwin --version "$want"
+          fi
+          cargo xwin --version
+
+      - name: Build release binaries
+        run: cargo xwin build --workspace --all-features --release --target x86_64-pc-windows-msvc
+
+      - name: Build pysof wheels
+        working-directory: crates/pysof
+        run: uv run maturin build --release -o "$GITHUB_WORKSPACE/trial/pysof" --target x86_64-pc-windows-msvc -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      - name: Check the binaries match the native build's linking
+        run: |
+          set -euo pipefail
+          out="$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release"
+          mkdir -p trial/bin
+          for b in $RELEASE_BINS; do
+            stack=$(llvm-objdump -p "$out/$b.exe" | awk '/SizeOfStackReserve/ {print $2}')
+            echo "$b.exe: stack reserve 0x$stack"
+            if [ "$stack" != "0000000001000000" ]; then
+              echo "::error::$b.exe has stack reserve 0x$stack, expected 16 MB (0x1000000) like the native Windows build"
+              exit 1
+            fi
+            cp "$out/$b.exe" trial/bin/
+          done
+          cp -r data trial/bin/
+          ls -l trial/bin trial/pysof
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-windows-bin
+          path: trial/bin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload pysof wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-windows-pysof
+          path: trial/pysof
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  linux-arm64:
+    name: Linux ARM64 (GitHub-hosted, manylinux_2_28)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # 4 cores and 16 GB, against a ~17.5 GB peak in one rustc process.
+      - name: Add swap
+        run: |
+          set -euo pipefail
+          df -h / ; free -h
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          size=$(( avail > 60 ? 16 : 8 ))
+          sudo fallocate -l "${size}G" /trial-swap
+          sudo chmod 600 /trial-swap
+          sudo mkswap /trial-swap >/dev/null
+          sudo swapon /trial-swap
+          free -h
+
+      - name: Build release binaries and pysof wheels (manylinux_2_28)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE:/io" -w /io \
+            -e CARGO_TERM_COLOR -e RUSTUP_TOOLCHAIN -e CARGO_BUILD_JOBS=4 \
+            quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
+              # openssl-src (vendored OpenSSL) needs Perl core modules
+              # (IPC::Cmd) the image does not ship.
+              dnf install -y -q perl-core >/dev/null
+              curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              export PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
+              start=$(date +%s)
+              cargo build --workspace --all-features --release
+              echo "cargo build: $(( ($(date +%s) - start) / 60 )) min"
+              py=/opt/python/cp312-cp312/bin/python
+              "$py" -m pip install -q "maturin>=1.9.5,<2.0"
+              cd crates/pysof
+              "$py" -m maturin build --release -o /io/trial/pysof --compatibility manylinux_2_28 \
+                -i /opt/python/cp310-cp310/bin/python -i /opt/python/cp311-cp311/bin/python \
+                -i /opt/python/cp312-cp312/bin/python -i /opt/python/cp313-cp313/bin/python \
+                -i /opt/python/cp314-cp314/bin/python
+              chown -R "$(stat -c %u:%g /io)" /io/target /io/trial
+            '
+          df -h / ; free -h
+
+      - name: Check the glibc floor
+        run: |
+          set -euo pipefail
+          mkdir -p trial/bin
+          for b in $RELEASE_BINS; do
+            cp "target/release/$b" trial/bin/
+            need=$(objdump -T "trial/bin/$b" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            echo "$b needs $need"
+            if [ "$(printf '%s\n' "$need" GLIBC_2.28 | sort -V | tail -1)" != GLIBC_2.28 ]; then
+              echo "::error::$b needs $need, newer than the glibc 2.28 the current ARM64 release supports"
+              exit 1
+            fi
+          done
+          cp -r data trial/bin/
+          ls -l trial/bin trial/pysof
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-linux-arm64-bin
+          path: trial/bin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload pysof wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-linux-arm64-pysof
+          path: trial/pysof
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            leg: macos-arm
+          - runner: macos-15-intel
+            leg: macos-intel-cross
+    env:
+      CARGO_BUILD_JOBS: 2
+      # Same as the native release leg's ~/.cargo/config.toml in ci.yml.
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: "-A linker_messages"
+      # The Intel leg cross-compiles; PyO3 then cannot run the target's Python.
+      PYO3_CROSS_PYTHON_VERSION: "3.12"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.12
+
+      - name: Runner resources
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h /
+
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          # `-l` reports the peak RSS of the largest process.
+          /usr/bin/time -l cargo build --workspace --all-features --release --target aarch64-apple-darwin
+          echo "cargo build: $(( ($(date +%s) - start) / 60 )) min"
+          sysctl vm.swapusage
+
+      - name: Build pysof wheels
+        working-directory: crates/pysof
+        run: |
+          set -euo pipefail
+          python -m pip install -q "maturin>=1.9.5,<2.0"
+          python -m maturin build --release -o "$GITHUB_WORKSPACE/trial/pysof" --target aarch64-apple-darwin \
+            -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      - name: Collect binaries
+        run: |
+          set -euo pipefail
+          mkdir -p trial/bin
+          for b in $RELEASE_BINS; do
+            cp "target/aarch64-apple-darwin/release/$b" trial/bin/
+          done
+          cp -r data trial/bin/
+          file trial/bin/hfs
+          ls -l trial/bin trial/pysof
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-${{ matrix.leg }}-bin
+          path: trial/bin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload pysof wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: trial-${{ matrix.leg }}-pysof
+          path: trial/pysof
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Smoke test ${{ matrix.leg }} on ${{ matrix.runner }}
+    needs: [windows-cross, linux-arm64, macos]
+    # Each leg is tested if it uploaded, whatever the others did.
+    if: always()
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: windows
+            runner: windows-latest
+          - leg: linux-arm64
+            runner: ubuntu-24.04-arm
+          - leg: macos-arm
+            runner: macos-latest
+          # Apple Silicon binaries built on Intel: run them on an M1.
+          - leg: macos-intel-cross
+            runner: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: trial-${{ matrix.leg }}-bin
+          path: trial/bin
+
+      - name: Download pysof wheels
+        uses: actions/download-artifact@v8
+        with:
+          name: trial-${{ matrix.leg }}-pysof
+          path: trial/pysof
+
+      - name: Smoke test
+        shell: bash
+        run: bash .github/scripts/release-smoke.sh trial/bin trial/pysof
