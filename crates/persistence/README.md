@@ -949,11 +949,11 @@ set or a sharded cluster. These are the answers for its failures:
   112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
   retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
 - **An abort that is not a lost race** runs the write again from its first read, up to 4
-  attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
-  `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
-  `search_index` rows. Other writers touch those rows without changing the resource's version (a
-  large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
-  won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
+  attempts with pauses of 100, 200 and 400 ms (some aborts get more; see below). That covers a
+  chunk migration (`StaleConfig`), a `WriteConflict` that names a catalog change and, since #2269,
+  a `WriteConflict` on the resource's `search_index` rows. Other writers touch those rows without
+  changing the resource's version (a large Bundle's deferred-rows batch, `$reindex`), so that
+  conflict does not say another write won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
   commit and on a restore's history row or commit, which used to answer `500`, and since #2342 one
   on an update's or a delete's history row or commit, which used to answer `409` for a resource that
   had not moved: a create carries no version to lose, and a restore, an update or a delete already
@@ -963,6 +963,20 @@ set or a sharded cluster. These are the answers for its failures:
   and updates it. When the attempts run out the answer is `503` with `Retry-After`. A create or a
   PUT to a new id also runs out of them when another write of the same id stays uncommitted
   through every attempt.
+
+  Aborts that only time can end get more attempts (#2267): a `WriteConflict` that names a catalog
+  change and `SnapshotUnavailable` (246), which a `background` index build's catalog changes
+  cause, and `LockTimeout` (24), which names no lock holder, so that a build causes it is
+  inferred. After the fourth attempt such a write goes on, up to 12 attempts, with pauses of 400
+  to 800 ms and then 500 to 1000 ms drawn at random. It starts no further attempt if a run as
+  long as the last one would end more than 12 s after the write started, or past
+  `single_write_deadline`. Up to 8.5 s of that is pause, so a server that answers each attempt in
+  100 ms ends such a write within about 10 s. A DELETE without `If-Match` counts its extra try
+  inside the same 12 s. The 12 s and the deadline count per create, update, delete or restore
+  call, not per request. A PUT without `If-Match` that loses a race makes a new call with a new
+  budget (up to 4 calls, so in theory up to 48 s), and each entry of a batch Bundle has its own
+  budget, so a long enough run of these aborts can end such a request in `408`. Every other abort
+  keeps the 4 attempts.
 - **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
@@ -1021,7 +1035,10 @@ set or a sharded cluster. These are the answers for its failures:
   bounded by the deadline. `hfs` sets no write concern of its own, so the first commit waits as long
   as the connection string's write concern or the server's default allows. And a re-send that is
   slower than every commit before it (waiting for a server during a failover, up to
-  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun.
+  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun. The same deadline stops the extra
+  attempts of a catalog-change or lock-timeout abort (#2267), so with a shorter
+  `HFS_REQUEST_TIMEOUT` those attempts end in `503` instead of running on to a `408`. It does not
+  cut a write's first four attempts or an attempt already running.
 
   A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
   as before and reports none of its entries' write events, but a Bundle with a SearchParameter

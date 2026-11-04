@@ -50,8 +50,8 @@ use super::deferred_index::{
     SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
 };
 use super::retry::{
-    BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, is_transient_mongo_error,
-    is_transient_read_server_error, jitter_fraction,
+    BUNDLE_TRANSACTION_RETRY, is_transient_mongo_error, is_transient_read_server_error,
+    jitter_fraction, next_write_replay_delay,
 };
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_impl::MissingSupport;
@@ -312,6 +312,21 @@ const CACHE_OVERFLOW_ROLLBACK_REASON: &str = "rolled back because of cache overf
 /// write at once. Nobody won a race on the document, so it is retried like any
 /// other replayable abort ([`replayable_abort`]), not reported as a lost race.
 const CATALOG_CHANGE_REASON: &str = "due to catalog changes";
+
+/// The server's `SnapshotUnavailable` code: the transaction's snapshot predates
+/// a catalog change on a collection it reads ("Unable to read from a snapshot
+/// due to pending collection catalog changes"). MongoDB 5.0 fails a write that
+/// overlaps an index build this way; 7.0 mostly answers a catalog-change
+/// `WriteConflict` ([`CATALOG_CHANGE_REASON`]) instead. Sent labelled
+/// `TransientTransactionError`, and decided by the code, never by the message
+/// text.
+const SNAPSHOT_UNAVAILABLE_CODE: i32 = 246;
+
+/// The server's `LockTimeout` code: the transaction waited for a lock that
+/// another operation held for longer than `maxTransactionLockRequestTimeoutMillis`
+/// (5 ms by default). Sent labelled `TransientTransactionError`, and decided by
+/// the code, never by the message text.
+const LOCK_TIMEOUT_CODE: i32 = 24;
 
 /// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
 /// transaction back because its own write set will not fit in the cache
@@ -594,7 +609,8 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
     kept_driver_error(err).filter(|driver| is_eviction_rollback(driver))
 }
 
-/// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
+/// Runs one single-resource write again, up to
+/// [`super::retry::WRITE_ABORT_RETRY`], while
 /// the server aborts its transaction for a reason other than a lost race
 /// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in a
 /// [`ReplayedStep`] is one (#2269, #2300, #2342). Every attempt starts its own
@@ -612,18 +628,42 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 /// its caller answers it as `Unavailable`
 /// ([`MongoBackend::unavailable_write_error`], #2308).
 ///
+/// An abort that only time ends gets more attempts (#2267): a `WriteConflict`
+/// that names a catalog change, `SnapshotUnavailable` or `LockTimeout`
+/// ([`is_catalog_or_lock_abort`]), which the database's own index builds can
+/// cause by changing the catalog of a collection the write touches (that a
+/// given `LockTimeout` comes from a build is inferred). After the fourth
+/// attempt such a write goes on, up to
+/// [`super::retry::CATALOG_OR_LOCK_ABORT_RETRY`], with half-jittered pauses,
+/// and starts no further attempt that could end past
+/// [`super::retry::CATALOG_OR_LOCK_ABORT_BUDGET`] (12 s) or past the write's
+/// deadline (`single_write_deadline`, so `HFS_REQUEST_TIMEOUT` still comes
+/// first). The first four attempts and their pauses are the same for every
+/// abort. Every other abort keeps exactly four attempts, in particular a plain
+/// `WriteConflict` of a [`ReplayedStep`] (#2300), which must not get slower, and
+/// `StaleConfig`. A lost race, an eviction rollback and a commit of unknown
+/// outcome are decided before any of this and are not run again.
+///
 /// The 503 after the last attempt names the write and how many times it was
 /// aborted, not why: a create or a `PUT` to a new id also runs out of attempts
 /// when another write of the same id stays uncommitted through all of them
 /// (#2300). The eviction 503 names the write and its cause. The driver error,
-/// its code and the step of an aborted attempt go to the log only.
+/// its code, the step of an aborted attempt and the time the write took go to
+/// the log only.
 async fn replay_aborted_writes<T, F, Fut>(what: &str, mut attempt: F) -> StorageResult<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = StorageResult<T>>,
 {
+    let started = tokio::time::Instant::now();
+    // The time left until the write's deadline, counted from `started` like the
+    // elapsed time below. Only the attempts past the fourth of a catalog-change
+    // or lock-timeout abort look at it (`next_write_replay_delay`).
+    let deadline =
+        commit_deadline::single_write_deadline_at().map(|at| at.saturating_duration_since(started));
     let mut attempts = 1;
     loop {
+        let attempt_started = tokio::time::Instant::now();
         let err = match attempt().await {
             Err(err) if no_usable_server(&err).is_some() => return Err(err),
             Err(err) if aborted_without_conflicting_writer(&err).is_some() => err,
@@ -638,9 +678,18 @@ where
             }
             outcome => return outcome,
         };
-        if attempts >= WRITE_ABORT_RETRY.max_attempts {
+        let elapsed = started.elapsed();
+        let Some(backoff) = next_write_replay_delay(
+            aborted_without_conflicting_writer(&err).is_some_and(is_catalog_or_lock_abort),
+            attempts,
+            elapsed,
+            attempt_started.elapsed(),
+            deadline,
+            jitter_fraction(),
+        ) else {
             tracing::warn!(
                 attempts,
+                elapsed_ms = elapsed.as_millis() as u64,
                 error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
                 step = replayed_step(&err).map(ReplayedStep::name),
                 "mongodb aborted the {what} transaction {attempts} times; giving up: {err}"
@@ -648,13 +697,13 @@ where
             return Err(write_unavailable(format!(
                 "The {what} was aborted by the database {attempts} times; retry the request"
             )));
-        }
-        let backoff = WRITE_ABORT_RETRY.backoff(attempts);
+        };
         tracing::warn!(
             attempt = attempts,
             error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
             step = replayed_step(&err).map(ReplayedStep::name),
             backoff_ms = backoff.as_millis() as u64,
+            elapsed_ms = elapsed.as_millis() as u64,
             "mongodb aborted the {what} transaction; running it again: {err}"
         );
         tokio::time::sleep(backoff).await;
@@ -872,6 +921,27 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
 fn is_catalog_change_conflict(err: &MongoError) -> bool {
     server_error_message(err, WRITE_CONFLICT_CODE)
         .is_some_and(|message| message.contains(CATALOG_CHANGE_REASON))
+}
+
+/// True when `err` is an abort that only time ends: a `WriteConflict` that
+/// names a catalog change ([`is_catalog_change_conflict`]),
+/// `SnapshotUnavailable` ([`SNAPSHOT_UNAVAILABLE_CODE`]) or `LockTimeout`
+/// ([`LOCK_TIMEOUT_CODE`]). Each says the transaction met catalog or lock
+/// state that a later attempt may not meet, and none says another writer won
+/// anything. A plain `WriteConflict`, which another write of the same id that
+/// stays uncommitted raises (#2300), and `StaleConfig` are not one.
+///
+/// It decides only how long a write that [`aborted_without_conflicting_writer`]
+/// already judged replayable keeps trying
+/// ([`CATALOG_OR_LOCK_ABORT_RETRY`](super::retry::CATALOG_OR_LOCK_ABORT_RETRY),
+/// #2267); it does not decide whether the write is replayed at all. That a
+/// `LockTimeout` comes from the database's own index build is inferred, not
+/// established, for a lock timeout names no holder; a wait is what ends any of
+/// them.
+fn is_catalog_or_lock_abort(err: &MongoError) -> bool {
+    is_catalog_change_conflict(err)
+        || has_server_code(err, SNAPSHOT_UNAVAILABLE_CODE)
+        || has_server_code(err, LOCK_TIMEOUT_CODE)
 }
 
 /// True when `err` is `TransactionTooLargeForCache` (388): as a failed command
@@ -4467,8 +4537,12 @@ impl MongoBackend {
     /// `WriteConflict` on its history row or at its commit is one, #2342), and
     /// inside each of those runs an unconditional delete that lost a race gets
     /// its one extra attempt. So an unconditional delete makes at most
-    /// `2 * WRITE_ABORT_RETRY.max_attempts` attempts, which needs a lost race
-    /// and an abort on every run.
+    /// `2 * WRITE_ABORT_RETRY.max_attempts` attempts, or
+    /// `2 * CATALOG_OR_LOCK_ABORT_RETRY.max_attempts` when the aborts are
+    /// catalog changes or lock timeouts (#2267), which needs a lost race and an
+    /// abort on every run. The 12 s clock of those aborts counts a run's inner
+    /// attempts and the 25 ms between them as the run's own time, so the
+    /// nesting does not lengthen the bound.
     async fn soft_delete(
         &self,
         tenant: &TenantContext,
@@ -13906,6 +13980,394 @@ mod transient_abort_tests {
             std::error::Error::source(&after).is_some(),
             "the typed error survives as the source"
         );
+    }
+
+    // --- The longer budget of a catalog-change or lock-timeout abort (#2267) ---
+
+    /// The part of the message of the catalog-change `WriteConflict` mongod 7.0
+    /// sends when an index build changes a collection under a transaction.
+    const CATALOG_112: &str = "Caused by :: Unable to write to collection 'db.resources' due to catalog changes; please retry the operation :: Please retry your operation or multi-document transaction.";
+
+    /// [`insert_many_error_with_labels`] with one label.
+    ///
+    /// The driver offers no public way to attach an error label to a command or
+    /// a write error. It does copy the labels of an `InsertMany` error's
+    /// `writeConcernError` onto the error (mongodb 3.7 `error.rs`; the tests of
+    /// `retry.rs` rely on it), and that is the only way to put a label on a
+    /// constructed error. A real write does not arrive in this shape with a
+    /// catalog-change `WriteConflict` and a write-concern error together; the
+    /// loop under test reads only the code, the message and the labels.
+    fn labelled_insert_many_error(code: i32, errmsg: &str, label: &str) -> MongoError {
+        insert_many_error_with_labels(code, errmsg, &[label])
+    }
+
+    fn insert_many_error_with_labels(code: i32, errmsg: &str, labels: &[&str]) -> MongoError {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{ "index": 0, "code": code, "errmsg": errmsg }],
+            "writeConcernError": {
+                "code": 64,
+                "errmsg": "carries the label",
+                "errorLabels": labels.to_vec(),
+            },
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::InsertMany(insert_many))
+    }
+
+    /// A `LockTimeout` or any other failed command with `code`, as a per-write
+    /// error.
+    fn write_failure(code: i32, errmsg: &str) -> MongoError {
+        let write: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": code,
+            "codeName": "Test",
+            "errmsg": errmsg,
+        })
+        .expect("a WriteError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteError(write),
+        ))
+    }
+
+    /// Runs [`replay_aborted_writes`] for a `what` write whose every attempt
+    /// fails with `abort(attempt)`, `attempt` counting from 1, until `abort`
+    /// returns `None`, which commits. Returns the result and the attempts made.
+    /// Under a paused clock the pauses cost no real time; only counts are
+    /// asserted, never elapsed time.
+    async fn replay_with(
+        what: &str,
+        mut abort: impl FnMut(u32) -> Option<StorageError>,
+    ) -> (StorageResult<&'static str>, u32) {
+        let mut attempts = 0;
+        let result = replay_aborted_writes(what, || {
+            attempts += 1;
+            std::future::ready(match abort(attempts) {
+                Some(err) => Err(err),
+                None => Ok("committed"),
+            })
+        })
+        .await;
+        (result, attempts)
+    }
+
+    fn assert_gave_up_after(result: &StorageResult<&'static str>, what: &str, attempts: u32) {
+        let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert_eq!(
+            *message,
+            format!("The {what} was aborted by the database {attempts} times; retry the request")
+        );
+        assert!(
+            !message.contains("112")
+                && !message.contains("WriteConflict")
+                && !message.contains("246")
+                && !message.contains("SnapshotUnavailable")
+                && !message.contains("LockTimeout")
+                && !message.contains("catalog"),
+            "the client-facing message leaves the driver error to the log: {message}"
+        );
+    }
+
+    #[test]
+    fn only_a_catalog_change_snapshot_unavailable_or_lock_timeout_gets_the_longer_budget() {
+        let label = mongodb::error::TRANSIENT_TRANSACTION_ERROR;
+        let cases = [
+            (
+                "a catalog-change 112 as a failed command",
+                command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CATALOG_112),
+                true,
+            ),
+            (
+                "a catalog-change 112 as a per-write error",
+                write_conflict_write_error(CATALOG_112),
+                true,
+            ),
+            (
+                "a catalog-change 112 in an insert-many",
+                labelled_insert_many_error(WRITE_CONFLICT_CODE, CATALOG_112, label),
+                true,
+            ),
+            (
+                "SnapshotUnavailable as a failed command",
+                command_error(246, "SnapshotUnavailable"),
+                true,
+            ),
+            (
+                "SnapshotUnavailable in an insert-many",
+                labelled_insert_many_error(246, "Unable to read from a snapshot", label),
+                true,
+            ),
+            (
+                "LockTimeout as a failed command",
+                command_error(24, "LockTimeout"),
+                true,
+            ),
+            (
+                "LockTimeout as a per-write error",
+                write_failure(24, "Unable to acquire lock"),
+                true,
+            ),
+            (
+                "LockTimeout in an insert-many",
+                labelled_insert_many_error(24, "Unable to acquire lock", label),
+                true,
+            ),
+            (
+                "a plain 112, which another write of the same id can raise (#2300)",
+                command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+                false,
+            ),
+            (
+                "a plain 112 in an insert-many",
+                labelled_insert_many_error(
+                    WRITE_CONFLICT_CODE,
+                    "Write conflict during plan execution",
+                    label,
+                ),
+                false,
+            ),
+            ("StaleConfig", command_error(13388, "StaleConfig"), false),
+            (
+                "TemporarilyUnavailable (365)",
+                command_error(365, "TemporarilyUnavailable"),
+                false,
+            ),
+            (
+                "an eviction 112 as a failed command",
+                command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+                false,
+            ),
+            (
+                "an eviction 112 in an insert-many",
+                labelled_insert_many_error(WRITE_CONFLICT_CODE, EVICTION_112, label),
+                false,
+            ),
+            (
+                "TransactionTooLargeForCache",
+                too_large_write_error(),
+                false,
+            ),
+            ("not a server error", MongoError::custom("boom"), false),
+        ];
+        for (what, driver, expected) in cases {
+            assert_eq!(is_catalog_or_lock_abort(&driver), expected, "{what}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_catalog_change_that_never_ends_is_given_twelve_attempts_before_the_503() {
+        let (result, attempts) = replay_with("create", |_| {
+            Some(internal_driver_error(
+                "Failed to delete search index entries",
+                labelled_insert_many_error(
+                    WRITE_CONFLICT_CODE,
+                    CATALOG_112,
+                    mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                ),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 12);
+        assert_gave_up_after(&result, "create", 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_unavailable_and_lock_timeout_are_given_twelve_attempts_too() {
+        for code in [246, 24] {
+            let (result, attempts) = replay_with("create", |_| {
+                Some(internal_driver_error(
+                    "Failed to insert resource history (session)",
+                    labelled_insert_many_error(
+                        code,
+                        "an abort that time ends",
+                        mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                    ),
+                ))
+            })
+            .await;
+            assert_eq!(attempts, 12, "code {code}");
+            assert_gave_up_after(&result, "create", 12);
+        }
+    }
+
+    /// #2300: a plain `WriteConflict` on a create's resource insert, which
+    /// another write of the same id that stays uncommitted keeps raising, keeps
+    /// the four attempts.
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_write_conflict_in_a_replayed_step_keeps_four_attempts() {
+        let (result, attempts) = replay_with("create", |_| {
+            Some(in_replayed_step(
+                ReplayedStep::ResourceInsert,
+                internal_driver_error(
+                    "Failed to insert resource (session)",
+                    labelled_insert_many_error(
+                        WRITE_CONFLICT_CODE,
+                        "Write conflict during plan execution",
+                        mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                    ),
+                ),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 4);
+        assert_gave_up_after(&result, "create", 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_placement_change_keeps_four_attempts() {
+        let (result, attempts) = replay_with("update", |_| {
+            Some(internal_driver_error(
+                "Failed to delete search index entries",
+                labelled_insert_many_error(
+                    13388,
+                    "StaleConfig",
+                    mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                ),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 4);
+        assert_gave_up_after(&result, "update", 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_outlasts_the_old_budget_commits_once_the_catalog_change_ends() {
+        let (result, attempts) = replay_with("create", |attempt| {
+            (attempt <= 5).then(|| {
+                internal_driver_error(
+                    "Failed to delete search index entries",
+                    labelled_insert_many_error(
+                        WRITE_CONFLICT_CODE,
+                        CATALOG_112,
+                        mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                    ),
+                )
+            })
+        })
+        .await;
+        assert_eq!(result.expect("the sixth attempt commits"), "committed");
+        assert_eq!(attempts, 6);
+    }
+
+    /// The class of the most recent abort decides: after the fourth attempt an
+    /// abort that is not a catalog change or lock timeout ends the write at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_placement_change_after_the_fourth_attempt_ends_a_catalog_change_run() {
+        let (result, attempts) = replay_with("create", |attempt| {
+            Some(internal_driver_error(
+                "Failed to delete search index entries",
+                if attempt <= 5 {
+                    labelled_insert_many_error(
+                        WRITE_CONFLICT_CODE,
+                        CATALOG_112,
+                        mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                    )
+                } else {
+                    labelled_insert_many_error(
+                        13388,
+                        "StaleConfig",
+                        mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                    )
+                },
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 6);
+        assert_gave_up_after(&result, "create", 6);
+    }
+
+    /// A commit whose outcome is unknown is never run again, whatever its
+    /// message says: the write may have applied.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_commit_result_on_catalog_text_is_not_run_again() {
+        let (result, attempts) = replay_with("create", |_| {
+            Some(in_replayed_step(
+                ReplayedStep::Commit,
+                internal_driver_error(
+                    "Failed to commit MongoDB transaction after create",
+                    insert_many_error_with_labels(
+                        WRITE_CONFLICT_CODE,
+                        CATALOG_112,
+                        &[
+                            mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                            mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT,
+                        ],
+                    ),
+                ),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 1);
+        let Err(err) = result else {
+            panic!("an unknown commit does not commit");
+        };
+        assert!(
+            !matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+            "the error passes through as it was, not as a retryable 503: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Failed to commit MongoDB transaction"),
+            "{err}"
+        );
+    }
+
+    /// An eviction rollback stays a 503 with no second attempt (#1895), even
+    /// when its message also names a catalog change.
+    #[tokio::test(start_paused = true)]
+    async fn an_eviction_rollback_naming_a_catalog_change_is_not_run_again() {
+        let message = format!("{CATALOG_112} {EVICTION_112}");
+        let (result, attempts) = replay_with("create", |_| {
+            Some(internal_driver_error(
+                "Failed to delete search index entries",
+                labelled_insert_many_error(
+                    WRITE_CONFLICT_CODE,
+                    &message,
+                    mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                ),
+            ))
+        })
+        .await;
+        assert_eq!(attempts, 1);
+        let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert_eq!(
+            message,
+            "The create was rolled back by the database under cache pressure; retry the request"
+        );
+    }
+
+    /// `single_write_deadline`: a write with no time left until its deadline
+    /// gets the four attempts and nothing more, and one with a far deadline
+    /// gets all twelve.
+    #[tokio::test(start_paused = true)]
+    async fn the_write_deadline_bounds_the_extra_attempts() {
+        let catalog_abort = |_attempt: u32| {
+            Some(internal_driver_error(
+                "Failed to delete search index entries",
+                labelled_insert_many_error(
+                    WRITE_CONFLICT_CODE,
+                    CATALOG_112,
+                    mongodb::error::TRANSIENT_TRANSACTION_ERROR,
+                ),
+            ))
+        };
+        let (result, attempts) = commit_deadline::single_write_scope(
+            Some(std::time::Duration::ZERO),
+            replay_with("create", catalog_abort),
+        )
+        .await;
+        assert_eq!(attempts, 4);
+        assert_gave_up_after(&result, "create", 4);
+
+        let (result, attempts) = commit_deadline::single_write_scope(
+            Some(std::time::Duration::from_secs(3600)),
+            replay_with("create", catalog_abort),
+        )
+        .await;
+        assert_eq!(attempts, 12);
+        assert_gave_up_after(&result, "create", 12);
     }
 }
 
