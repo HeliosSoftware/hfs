@@ -19,19 +19,34 @@ Evidence behind the recommendation:
   `backends/elasticsearch/` has no fix for a stale or resurrected document.
 - **The tests prove possibility, not frequency.** The 12 tests force the order
   by hand; on the baseline 9 of them fail (bench record, section 1).
-- **The window is narrow.**
-  - Async mode: one worker drains a single queue in order and waits for every
-    write; a retry with back-off runs inside the worker, so it blocks the
-    queue instead of overtaking a later write (`sync.rs` `async_worker`,
-    `process_page`, `sync_event_to_backend`). The only gap is before the queue:
-    the primary commits, then each request handler enqueues, so two requests
-    that update the same id within milliseconds can enqueue out of commit
-    order.
-  - Sync mode: each request syncs by itself, so the gap is the Elasticsearch
-    round trip, and a v2 retried after a transient failure can land after a
-    v3.
-  - Both need two writers on the same id at nearly the same moment. Imports
-    write each resource once and a single client does not race itself.
+- **It needs a concurrent write to the same id, in one of these situations.**
+  Nothing in the stale case happens when each resource is written once or
+  when one client writes it at a time.
+  1. *Two live requests update (or update and delete) the same resource at
+     nearly the same moment.* Sync mode: each request syncs on its own, so the
+     gap is the Elasticsearch round trip. Async mode: one worker drains a
+     single queue in order and waits for every write, but each request enqueues
+     after its own primary commit, so two requests can enqueue out of commit
+     order (wider when the 1000-slot queue is full).
+  2. *A sync that fails and is retried.* In sync mode the retry runs inside the
+     request, with back-off, and re-sends the old body, so a v2 can land after
+     a v3. In async mode the retry blocks the worker, so it does not overtake.
+  3. *`$reindex` while the server takes live writes.* The reindex reads a page
+     from the primary and writes it to Elasticsearch later (and prefetches the
+     next page while writing the current one). A resource updated or deleted in
+     between is overwritten with its older copy. The gap is the page latency,
+     longer than in (1), and it lasts as long as the reindex runs.
+  4. *`$bulk-submit` ingest sync.* It reads ingested rows and syncs them to the
+     secondaries afterwards, so a live update to the same ids in between is
+     overwritten the same way.
+  5. *Failed-sync repair running next to live traffic.* The repair rereads the
+     primary and pushes again if it changed, which narrows the gap but does not
+     close it.
+  6. *Several HFS processes on one index,* where queue order is not shared.
+  A normal import writes each resource once, and a single client does not race
+  itself, so none of these happens there; (3) and (4) need live writes to the
+  same ids during the operation, and (1), (2) and (5) need two writers on one
+  id.
 - **The cost is real.** 14 source files (+675/-111 lines) across the three
   primaries and the composite, a mapping change (`container_version`, schema
   v3), tombstones that accumulate, and a 409 recheck whose first version
