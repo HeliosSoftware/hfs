@@ -440,7 +440,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
   may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
   matching: standalone SQLite reads a `_has` hop's references from its index in one statement
-  (`search_reference_values`), and PostgreSQL evaluates
+  (`search_reference_values`), MongoDB reads only projected ids (`search_ids`) and the indexed
+  reference rows (`search_reference_values`) instead of loading resource bodies, and PostgreSQL evaluates
   `Patient?_has:Observation:patient:code=system|code` inside `search()`
   on R4 with the denormalized index layout (`supports_native_reverse_chains`).
 - **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values

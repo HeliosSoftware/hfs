@@ -230,6 +230,9 @@ fn start_tx_stub() -> String {
             .mount(&server)
             .await;
 
+        // documentFunctions: entryIn() and resourcesIn() value-set membership.
+        common::document_tx::mount_document_function_mocks(&server).await;
+
         let uri = server.uri();
         std::mem::forget(server);
         uri
@@ -405,7 +408,12 @@ fn test_r5_test_suite() {
             // blind to the type. The .NET harness checks the type and still sees
             // `code` returned as `string`. This assertion covers the $translate value
             // path only -- output type fidelity is tracked separately.
-            if test.mode == "tx" && std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            //
+            // The documentFunctions group's entryIn()/resourcesIn() cases need the
+            // server too, for value-set membership.
+            if common::document_tx::needs_terminology(&group_name, &test.mode)
+                && std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err()
+            {
                 context.set_terminology_server(tx_stub_uri.clone());
             }
 
