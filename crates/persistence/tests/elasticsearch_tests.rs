@@ -2244,30 +2244,15 @@ mod es_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` runs one reference search per resource, which does
-    /// not match absolute references; reported, not fixed, in this change.
+    /// #2296 / #2394: `_revinclude` matches relative and absolute reference
+    /// forms alike; no divergence from the shared expectation remains.
     #[tokio::test]
     async fn es_revinclude_matches_every_reference_form() {
-        use super::revinclude_reference_forms_suite::Divergence;
-
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             "revinclude-forms-2296",
-            &[
-                Divergence {
-                    id: "prov-abs",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-abs-ver",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-dot-abs",
-                    included: false,
-                },
-            ],
+            &[],
         )
         .await;
     }
@@ -2325,11 +2310,11 @@ mod es_integration {
                 },
                 Divergence {
                     label: "Observation?subject:Patient=Patient/p1",
-                    expect: Expect::Ids(&["ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=Patient/p1/_history/2",
-                    expect: Expect::Ids(&["ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=p1,nobody",

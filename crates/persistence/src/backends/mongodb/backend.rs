@@ -1730,21 +1730,18 @@ impl MongoBackend {
     /// `value_reference_target` arm is usable. Only then may a reader drop
     /// the `_history` and absolute-URL regex arms for exact `$in` matches;
     /// otherwise it must keep the legacy arms, which answer both shapes.
-    #[allow(dead_code)]
     pub(super) fn references_normalized(&self) -> bool {
         self.references_marker_set() && self.search_indexes_ready()
     }
 
     /// Whether the completion marker is set, regardless of index readiness.
     /// Enough for `search_index_contained`, which has no reference index.
-    #[allow(dead_code)]
     pub(super) fn references_marker_set(&self) -> bool {
         self.references_normalized
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Shared handle the `search_index` builder uses to publish the marker.
-    #[allow(dead_code)]
     pub(super) fn references_normalized_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.references_normalized)
     }

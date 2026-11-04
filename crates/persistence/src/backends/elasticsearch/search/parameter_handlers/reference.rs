@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 
 use crate::types::{SearchModifier, SearchParameter, strip_reference_version};
 
+/// Whether `value` is itself an absolute `http(s)` URL.
+fn is_absolute_http(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
 /// Builds an ES query clause for a reference search parameter.
 pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     let name = &param.name;
@@ -110,14 +115,17 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     let base = strip_reference_version(value);
     if base.contains('/') {
         // Type/id format (e.g., "Patient/123") or full URL
+        let mut should = vec![
+            json!({ "term": { "search_params.reference.reference": base } }),
+            json!({ "prefix": { "search_params.reference.reference": format!("{}/_history/", base) } }),
+        ];
+        // A relative `Type/id` also matches a reference indexed as an absolute
+        // URL, through the `Type/id` the writer stores for those (#2394).
+        if !is_absolute_http(base) {
+            should.push(json!({ "term": { "search_params.reference.reference_target": base } }));
+        }
         must_conditions.push(json!({
-            "bool": {
-                "should": [
-                    { "term": { "search_params.reference.reference": base } },
-                    { "prefix": { "search_params.reference.reference": format!("{}/_history/", base) } }
-                ],
-                "minimum_should_match": 1
-            }
+            "bool": { "should": should, "minimum_should_match": 1 }
         }));
     } else {
         // Just an ID - match either resource_id or reference ending with /id
@@ -197,6 +205,21 @@ mod tests {
         let clause = build_clause(&param, "Patient/123").unwrap();
         let s = serde_json::to_string(&clause).unwrap();
         assert!(s.contains("Patient/123"));
+    }
+
+    /// #2394: a relative `Type/id` also matches the `Type/id` stored for an
+    /// absolute reference; a value that is itself absolute does not.
+    #[test]
+    fn test_relative_reference_matches_absolute_target() {
+        let param = make_param("subject", None);
+        let s = serde_json::to_string(&build_clause(&param, "Patient/123/_history/2").unwrap())
+            .unwrap();
+        assert!(
+            s.contains(r#"{"term":{"search_params.reference.reference_target":"Patient/123"}}"#)
+        );
+        let s = serde_json::to_string(&build_clause(&param, "http://h/fhir/Patient/123").unwrap())
+            .unwrap();
+        assert!(!s.contains("reference_target"));
     }
 
     #[test]

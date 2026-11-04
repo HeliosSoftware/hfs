@@ -8,6 +8,31 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 pub struct ReferenceHandler;
 
 impl ReferenceHandler {
+    /// The `Type/id` a relative reference search value is matched against in
+    /// `value_reference_target` (schema v48), the column that holds the
+    /// `Type/id` of a reference stored as an absolute http(s) URL. The version
+    /// is stripped, and a `:Type` modifier qualifies a bare id. `None` when the
+    /// value cannot match an absolute stored reference through that column: an
+    /// absolute search value (it already matches `value_reference` as
+    /// written), a bare id (its `LIKE '%/id'` already spans absolute forms) or
+    /// a modifier that does not compare references.
+    pub(crate) fn target_base(
+        value: &SearchValue,
+        modifier: Option<&SearchModifier>,
+    ) -> Option<String> {
+        let full = match modifier {
+            None | Some(SearchModifier::Not) => value.value.clone(),
+            Some(SearchModifier::Type(type_name)) if !value.value.contains('/') => {
+                format!("{type_name}/{}", value.value)
+            }
+            Some(SearchModifier::Type(_)) => value.value.clone(),
+            Some(_) => return None,
+        };
+        let base = strip_reference_version(&full);
+        (base.contains('/') && !base.starts_with("http://") && !base.starts_with("https://"))
+            .then(|| base.to_string())
+    }
+
     /// Builds SQL for a reference parameter value.
     ///
     /// Reference values can be:

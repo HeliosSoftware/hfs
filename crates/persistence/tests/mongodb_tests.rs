@@ -1355,7 +1355,43 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
-        &[],
+        &[
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1/_history/2",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1,nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1&code=9999-9",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-ver"]),
+            },
+        ],
     )
     .await;
 }

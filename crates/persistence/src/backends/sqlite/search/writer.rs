@@ -114,7 +114,8 @@ impl SqliteSearchIndexWriter {
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
             resource_key,
-            value_date_end, composite_slot, value_date_start
+            value_date_end, composite_slot, value_date_start,
+            value_reference_target
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -126,14 +127,15 @@ impl SqliteSearchIndexWriter {
             ?22, ?23,
             ?24,
             ?25,
-            ?26, ?27, ?28
+            ?26, ?27, ?28,
+            ?29
         )
         "#
     }
 
-    /// INSERT SQL for a contained index entry: the same 28 base columns as
+    /// INSERT SQL for a contained index entry: the same 29 base columns as
     /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
-    /// `contained_local_id` (`?29..?31`). The base columns' `resource_type` /
+    /// `contained_local_id` (`?30..?32`). The base columns' `resource_type` /
     /// `resource_id` / `resource_key` identify the *container*; `contained_type`
     /// is the nested resource's type. Bind the base params from
     /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
@@ -152,6 +154,7 @@ impl SqliteSearchIndexWriter {
             value_string_folded,
             resource_key,
             value_date_end, composite_slot, value_date_start,
+            value_reference_target,
             is_contained, contained_type, contained_local_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
@@ -165,7 +168,8 @@ impl SqliteSearchIndexWriter {
             ?24,
             ?25,
             ?26, ?27, ?28,
-            ?29, ?30, ?31
+            ?29,
+            ?30, ?31, ?32
         )
         "#
     }
@@ -181,7 +185,7 @@ impl SqliteSearchIndexWriter {
     }
 
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
-    /// rows (8 x 28 positional parameters). Bulk indexing executes this once
+    /// rows (8 x 29 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
     pub fn insert_sql_rows8() -> &'static str {
         static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -193,7 +197,7 @@ impl SqliteSearchIndexWriter {
         })
     }
 
-    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 28 = 14,336
+    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 29 = 14,848
     /// parameters, well under SQLite's variable limit.
     pub const MAX_ROWS_PER_INSERT: usize = 512;
 
@@ -221,7 +225,7 @@ impl SqliteSearchIndexWriter {
 
     /// Number of base columns [`Self::insert_sql`] writes, and so the length of
     /// every vector [`Self::to_sql_params`] returns.
-    pub const COLUMNS: usize = 28;
+    pub const COLUMNS: usize = 29;
 
     /// Converts an ExtractedValue to SQL parameters.
     ///
@@ -246,6 +250,13 @@ impl SqliteSearchIndexWriter {
         params.push(SqlValue::OptString(stored_date_start_text(
             &extracted.value,
         )));
+        // `value_reference_target`: `Type/id` of an absolute reference only.
+        params.push(SqlValue::OptString(match &extracted.value {
+            IndexValue::Reference { reference, .. } => {
+                crate::types::absolute_reference_target(reference)
+            }
+            _ => None,
+        }));
         params
     }
 
@@ -541,15 +552,16 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(rows[0].len(), 28);
+        assert_eq!(rows[0].len(), 29);
         assert!(matches!(
             rows[0][SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX],
             SqlValue::Int(1)
         ));
         assert!(rows[0][25].is_null());
         assert!(matches!(rows[0][26], SqlValue::OptInt(Some(2))));
-        // value_date_start is the last base column; a token row has none.
+        // value_date_start precedes value_reference_target; a token row has neither.
         assert!(rows[0][27].is_null());
+        assert!(rows[0][28].is_null());
         let bind = |value: &SqlValue| -> rusqlite::types::Value {
             match value {
                 SqlValue::String(s) | SqlValue::OptString(Some(s)) => s.clone().into(),
@@ -574,7 +586,7 @@ mod tests {
             SqlValue::String("Patient".into()),
             SqlValue::String("local".into()),
         ]);
-        assert_eq!(contained.len(), 31);
+        assert_eq!(contained.len(), 32);
         conn.execute(
             SqliteSearchIndexWriter::insert_contained_sql(),
             rusqlite::params_from_iter(contained.iter().map(bind)),

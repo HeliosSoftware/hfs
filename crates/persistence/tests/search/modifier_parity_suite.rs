@@ -340,14 +340,16 @@ fn cases() -> Vec<Case> {
             Ids(&["p1", "p2", "p3"]),
         ),
         // ---- reference -----------------------------------------------
-        // `subject:Patient=p1` is `subject=Patient/p1`: not `Group/p1`.
+        // `subject:Patient=p1` is `subject=Patient/p1`: not `Group/p1`. A
+        // relative `Type/id` also matches an absolute URL to the same resource
+        // (`ob-abs`, #2394).
         case(
             "Observation",
             "subject",
             T::Reference,
             patient(),
             "p1",
-            Ids(&["ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -363,7 +365,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "Patient/p1",
-            Ids(&["ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -371,7 +373,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "Patient/p1/_history/2",
-            Ids(&["ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -406,7 +408,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "p1,nobody",
-            Ids(&["ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
         ),
         // `:identifier`: the reference's target has the identifier.
         case(
@@ -524,7 +526,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "p1",
-            Ids(&["ob-ver"]),
+            Ids(&["ob-abs", "ob-ver"]),
         )
         .and("code", "9999-9"),
         case(
@@ -892,18 +894,11 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
     // uses. Polled because Elasticsearch is near-real-time. A failure here
     // means the parameter did not index — a backend built without the spec
     // search parameters — not that a modifier is wrong.
-    let controls: [(&str, &str, SearchParamType, &str, &[&str]); 9] = [
+    let controls: [(&str, &str, SearchParamType, &str, &[&str]); 8] = [
         ("Patient", "identifier", T::Token, "12345", &["p1", "p2"]),
         ("Patient", "family", T::String, "smiths", &["p2"]),
         ("Patient", "birthdate", T::Date, "1980-01-01", &["p1"]),
         ("Observation", "code", T::Token, "1234-5", &["ob-pat"]),
-        (
-            "Observation",
-            "subject",
-            T::Reference,
-            "Patient/p1",
-            &["ob-pat", "ob-ver"],
-        ),
         (
             "Observation",
             "subject",

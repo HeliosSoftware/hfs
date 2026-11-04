@@ -674,9 +674,10 @@ impl QueryBuilder {
                 let base = strip_reference_version(&comp.reference);
                 branches.push((
                     format!(
-                        "(param_name IN ({in_list}) AND value_reference IS NOT NULL \
+                        "((param_name IN ({in_list}) AND value_reference IS NOT NULL \
                          AND value_reference >= ?{0} AND value_reference < ?{1} || '/_history0' \
-                         AND (value_reference = ?{0} OR value_reference >= ?{1} || '/_history/'))",
+                         AND (value_reference = ?{0} OR value_reference >= ?{1} || '/_history/')) \
+                         OR (param_name IN ({in_list}) AND value_reference_target IS NOT NULL AND value_reference_target = ?{0}))",
                         offset + 1,
                         offset + 2
                     ),
@@ -883,13 +884,19 @@ impl QueryBuilder {
         let p1 = param_offset + 1;
         let p2 = param_offset + 2;
 
+        // The absolute-URL form is a second select, `UNION ALL`-ed: an `OR`
+        // arm would not repeat the tenant/type/param tests and SQLite would
+        // walk every row of the type (see `build_parameter_condition`).
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
                  AND value_reference IS NOT NULL \
                  AND value_reference >= ?{p1} AND value_reference < ?{p2} || '/_history0' \
-                 AND (value_reference = ?{p1} OR value_reference >= ?{p2} || '/_history/'))"
+                 AND (value_reference = ?{p1} OR value_reference >= ?{p2} || '/_history/') \
+                 UNION ALL SELECT resource_key FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
+                 AND value_reference_target IS NOT NULL AND value_reference_target = ?{p1})"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],
         ))
@@ -1037,8 +1044,39 @@ impl QueryBuilder {
             combined
         };
 
-        let rows =
-            SqlFragment::with_params(parameter_rows(&param.name, &combined.sql), combined.params);
+        // A reference stored as an absolute URL is matched through
+        // `value_reference_target` (schema v48). It is a second select,
+        // `UNION ALL`-ed, rather than an `OR` arm: SQLite plans an `OR` as a
+        // multi-index lookup only when every arm repeats the tenant, type and
+        // parameter tests, and otherwise falls back to walking every row of
+        // the type (#1955).
+        let targets: Vec<String> = if param.param_type == SearchParamType::Reference {
+            param
+                .values
+                .iter()
+                .filter_map(|v| ReferenceHandler::target_base(v, param.modifier.as_ref()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut sql = parameter_rows(&param.name, &combined.sql);
+        let mut params = combined.params;
+        if !targets.is_empty() {
+            let first = param_offset + params.len() + 1;
+            let placeholders: Vec<String> = (0..targets.len())
+                .map(|i| format!("?{}", first + i))
+                .collect();
+            sql.push_str(" UNION ALL ");
+            sql.push_str(&parameter_rows(
+                &param.name,
+                &format!(
+                    "value_reference_target IS NOT NULL AND value_reference_target IN ({})",
+                    placeholders.join(", ")
+                ),
+            ));
+            params.extend(targets.iter().map(|t| SqlParam::string(t)));
+        }
+        let rows = SqlFragment::with_params(sql, params);
         Some(Self::membership(param, rows))
     }
 
@@ -2363,7 +2401,10 @@ mod tests {
 
         let fragment = builder.build(&query);
         assert!(
-            fragment.sql.contains("value_reference IN (?3, ?4, ?5)"),
+            fragment.sql.contains("value_reference IN (?3, ?4, ?5)")
+                && fragment
+                    .sql
+                    .contains("value_reference_target IN (?6, ?7, ?8)"),
             "expected a flat IN list, got: {}",
             fragment.sql
         );
@@ -2378,8 +2419,9 @@ mod tests {
             "multi-value IN path is exact-base only: {}",
             fragment.sql
         );
-        // tenant, resource_type, + one base per value
-        assert_eq!(fragment.params.len(), 5);
+        // tenant, resource_type, + one base per value, + the same bases again
+        // for the `value_reference_target` select
+        assert_eq!(fragment.params.len(), 8);
     }
 
     #[test]
@@ -2655,16 +2697,17 @@ mod tests {
         let frag = builder.build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
         // The compartment test reuses its own two (#1955): the bounded
-        // reference range and the exact test inside it.
+        // reference range and the exact test inside it, plus the
+        // `value_reference_target` arm (schema v48).
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5, 4, 5]);
+        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5, 4, 5, 4]);
         assert_eq!(frag.params.len(), 3);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
         assert!(!having.contains("COUNT(DISTINCT"), "{having}");
         assert!(
             having.contains(
-                "MAX(CASE WHEN (param_name IN ('subject', 'performer') AND value_reference IS NOT NULL"
+                "MAX(CASE WHEN ((param_name IN ('subject', 'performer') AND value_reference IS NOT NULL"
             ),
             "{having}"
         );

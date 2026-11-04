@@ -731,6 +731,13 @@ impl SqlFragment {
 /// PostgreSQL search query builder.
 pub struct PostgresQueryBuilder;
 
+/// True for a relative `Type/id` search value (not an absolute URL), the only
+/// form that can match a stored absolute reference through
+/// `value_reference_target` (#2394).
+fn is_relative_type_id(value: &str) -> bool {
+    !value.starts_with("http://") && !value.starts_with("https://")
+}
+
 impl PostgresQueryBuilder {
     /// Builds a search query for finding matching resource IDs.
     ///
@@ -1173,7 +1180,7 @@ impl PostgresQueryBuilder {
             format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
-                 AND value_reference = ${p1})"
+                 AND (value_reference = ${p1} OR value_reference_target = ${p1}))"
             ),
             vec![SqlParam::text(&base)],
         ))
@@ -1422,7 +1429,10 @@ impl PostgresQueryBuilder {
                     .join(", ");
                 offset += 1;
                 branches.push((
-                    format!("(param_name IN ({in_list}) AND value_reference = ${offset})"),
+                    format!(
+                        "(param_name IN ({in_list}) AND (value_reference = ${offset} \
+                         OR value_reference_target = ${offset}))"
+                    ),
                     false,
                 ));
                 params.push(SqlParam::text(strip_reference_version(&comp.reference)));
@@ -3395,7 +3405,13 @@ impl PostgresQueryBuilder {
                     let exact = *param_num + 1;
                     *param_num += 1;
                     params.push(SqlParam::text(&base));
-                    format!("value_reference = ${exact}")
+                    if is_relative_type_id(&base) {
+                        // A relative `Type/id` also matches the absolute
+                        // reference stored with that target (#2394).
+                        format!("(value_reference = ${exact} OR value_reference_target = ${exact})")
+                    } else {
+                        format!("value_reference = ${exact}")
+                    }
                 } else {
                     // Bare logical id: compare with the final reference segment.
                     // The explicit NULL check matches the v42 partial index.
@@ -6182,14 +6198,15 @@ mod tests {
         let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(placeholders(filter), vec![1, 2, 3, 4]);
+        assert_eq!(placeholders(filter), vec![1, 2, 3, 4, 4]);
         assert_eq!(frag.params.len(), 2);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
         assert_eq!(
             having,
             "bool_or(param_name = 'code' AND (value_token_code = $3)) AND \
-             bool_or(param_name IN ('subject', 'performer') AND value_reference = $4)"
+             bool_or(param_name IN ('subject', 'performer') AND \
+             (value_reference = $4 OR value_reference_target = $4))"
         );
         assert!(
             matches!(&frag.params[1], SqlParam::Text(s) if s == "Patient/p1"),
@@ -6426,7 +6443,8 @@ mod tests {
                 "p1"
             )),
             (
-                "(param_name = 'subject' AND ((value_reference = $3)))".to_string(),
+                "(param_name = 'subject' AND (((value_reference = $3 OR value_reference_target = $3))))"
+                    .to_string(),
                 1
             )
         );
@@ -7761,7 +7779,7 @@ mod tests {
         );
         assert!(
             frag.sql.contains(&format!(
-                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR value_reference = $4"
+                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR (value_reference = $4 OR value_reference_target = $4)"
             )),
             "each OR arm must use its assigned placeholder: {}",
             frag.sql
@@ -7878,14 +7896,14 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
 
         assert!(
-            frag.sql.contains("value_reference = $3"),
+            frag.sql
+                .contains("(value_reference = $3 OR value_reference_target = $3)"),
             "must be an equality on the bound base: {}",
             frag.sql
         );
         assert!(
-            !frag.sql.contains("LIKE") && !frag.sql.contains(" OR "),
-            "no disjunction: an OR is index-usable only when every arm is, and \
-             the `/_history/%` arm was the one that never matched: {}",
+            !frag.sql.contains("LIKE") && frag.sql.matches(" OR ").count() == 1,
+            "only the two-column OR (both arms indexed, #2394), no LIKE arm: {}",
             frag.sql
         );
         assert_eq!(frag.params.len(), 1);

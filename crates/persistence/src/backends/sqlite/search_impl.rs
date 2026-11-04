@@ -3368,7 +3368,8 @@ mod tests {
                     && (line.contains("value_reference=?")
                         || (line.contains("value_reference>")
                             && line.contains("value_reference<")))),
-                "{plan:#?}"
+                "{}\n{plan:#?}",
+                fragment.sql
             );
         }
     }
