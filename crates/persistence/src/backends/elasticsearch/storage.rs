@@ -1566,7 +1566,7 @@ impl ElasticsearchBackend {
                 let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
 
                 prior = Some(match &existing {
-                    Some(body) => Prior::from_hit(body, tenant_id),
+                    Some(body) => Prior::from_hit(body, tenant_id, resource_type, id),
                     None => Prior::Absent,
                 });
                 let (version_id, is_new) = match existing {
@@ -1773,7 +1773,7 @@ enum Prior {
 
 impl Prior {
     /// Classifies one document of a GET or `_mget` response.
-    fn from_hit(hit: &Value, tenant_id: &str) -> Prior {
+    fn from_hit(hit: &Value, tenant_id: &str, container_type: &str, container_id: &str) -> Prior {
         if hit.get("found").and_then(Value::as_bool) == Some(false) {
             return Prior::Absent;
         }
@@ -1793,13 +1793,17 @@ impl Prior {
             (Some(seq_no), Some(primary_term)) => Some((seq_no, primary_term)),
             _ => None,
         };
-        // A list that does not read as `{Type}_..#..` ids cannot be trusted
-        // to name what exists: treat it as unknown, which a sweep resolves,
-        // rather than skip entries it cannot read.
+        // A list that does not read as this container's contained-document
+        // ids cannot be trusted to name what exists: treat it as unknown,
+        // which a sweep resolves, rather than skip the entries it cannot read
+        // or, worse, delete by id a document of another container that the
+        // list names (#2291).
         let mut listed = Vec::with_capacity(ids.len());
         for id in ids {
             match id.as_str() {
-                Some(id) if is_contained_doc_id(id) => listed.push(id.to_string()),
+                Some(id) if is_contained_doc_id(id, container_type, container_id) => {
+                    listed.push(id.to_string())
+                }
                 _ => return Prior::Legacy,
             }
         }
@@ -1819,11 +1823,20 @@ impl Prior {
     }
 }
 
-/// Whether `id` has the shape of a contained document's `_id`: a type name,
-/// `_`, and a synthetic id that carries a `#`.
-fn is_contained_doc_id(id: &str) -> bool {
-    id.split_once('_')
-        .is_some_and(|(contained_type, rest)| !contained_type.is_empty() && rest.contains('#'))
+/// Whether `id` is the `_id` of a contained document of the container
+/// `container_type`/`container_id`: `{Type}_{ContainerType}_{ContainerId}#{local}`,
+/// or the form written before #2291, `{Type}_{ContainerId}#{local}`. Neither
+/// FHIR type names nor ids contain `_`, so a prefix is enough to tell the
+/// containers apart.
+fn is_contained_doc_id(id: &str, container_type: &str, container_id: &str) -> bool {
+    let Some((contained_type, rest)) = id.split_once('_') else {
+        return false;
+    };
+    if contained_type.is_empty() {
+        return false;
+    }
+    let local_of = |prefix: String| rest.strip_prefix(&prefix).is_some_and(|l| !l.is_empty());
+    local_of(format!("{container_type}_{container_id}#")) || local_of(format!("{container_id}#"))
 }
 
 /// One contained document of a container, ready to index.
@@ -1988,7 +2001,7 @@ impl ElasticsearchBackend {
         }
         let hit: Value = serde_json::from_str(&text)
             .map_err(|e| internal_error(format!("Failed to {what}: unreadable response: {e}")))?;
-        Ok(Prior::from_hit(&hit, tenant_id))
+        Ok(Prior::from_hit(&hit, tenant_id, resource_type, id))
     }
 
     /// [`Self::fetch_prior`] for many containers, in `_mget` requests; answers
@@ -2031,7 +2044,7 @@ impl ElasticsearchBackend {
                 .ok_or_else(|| {
                     internal_error(format!("Failed to {what}: unexpected response: {text}"))
                 })?;
-            for hit in hits {
+            for (hit, (resource_type, id)) in hits.iter().zip(chunk) {
                 if let Some(error) = hit.get("error") {
                     // A type that was never written has no index: nothing there.
                     if error.get("type").and_then(Value::as_str)
@@ -2045,7 +2058,7 @@ impl ElasticsearchBackend {
                         describe_item_error(error)
                     )));
                 }
-                priors.push(Prior::from_hit(hit, tenant_id));
+                priors.push(Prior::from_hit(hit, tenant_id, resource_type, id));
             }
         }
         Ok(priors)
@@ -4858,21 +4871,24 @@ mod tests {
     #[test]
     fn a_missing_document_or_one_of_another_tenant_is_absent() {
         assert_eq!(
-            Prior::from_hit(&json!({ "found": false }), "t"),
+            Prior::from_hit(&json!({ "found": false }), "t", "Observation", "o1"),
             Prior::Absent
         );
         assert_eq!(
-            Prior::from_hit(&json!({ "found": true }), "t"),
+            Prior::from_hit(&json!({ "found": true }), "t", "Observation", "o1"),
             Prior::Absent
         );
         let other = hit(json!({ "tenant_id": "other", "contained_doc_ids": ["Medication_o1#m1"] }));
-        assert_eq!(Prior::from_hit(&other, "t"), Prior::Absent);
+        assert_eq!(
+            Prior::from_hit(&other, "t", "Observation", "o1"),
+            Prior::Absent
+        );
     }
 
     #[test]
     fn a_document_without_the_field_is_legacy() {
         assert_eq!(
-            Prior::from_hit(&hit(json!({ "tenant_id": "t" })), "t"),
+            Prior::from_hit(&hit(json!({ "tenant_id": "t" })), "t", "Observation", "o1"),
             Prior::Legacy
         );
     }
@@ -4882,6 +4898,8 @@ mod tests {
         let known = Prior::from_hit(
             &hit(json!({ "tenant_id": "t", "contained_doc_ids": ["Medication_o1#m1"] })),
             "t",
+            "Observation",
+            "o1",
         );
         assert_eq!(
             known,
@@ -4899,11 +4917,18 @@ mod tests {
             json!(["no-underscore#m1"]),
             json!(["Medication_without-hash"]),
             json!(["_o1#m1"]),
+            // The id of another container's contained document (#2291).
+            json!(["Medication_o2#m1"]),
+            json!(["Medication_Observation_o2#m1"]),
+            json!(["Medication_Patient_o1#m1"]),
+            json!(["Medication_o1#"]),
         ] {
             assert_eq!(
                 Prior::from_hit(
                     &hit(json!({ "tenant_id": "t", "contained_doc_ids": bad })),
-                    "t"
+                    "t",
+                    "Observation",
+                    "o1"
                 ),
                 Prior::Legacy,
                 "{bad}"
@@ -4914,6 +4939,8 @@ mod tests {
         let empty = Prior::from_hit(
             &hit(json!({ "tenant_id": "t", "contained_doc_ids": [] })),
             "t",
+            "Observation",
+            "o1",
         );
         assert!(matches!(empty, Prior::Known { ref ids, .. } if ids.is_empty()));
     }
