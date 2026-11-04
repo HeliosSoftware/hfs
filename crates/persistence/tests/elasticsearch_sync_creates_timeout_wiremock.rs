@@ -15,6 +15,7 @@
 #![cfg(feature = "elasticsearch")]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
 use helios_persistence::composite::{SyncManager, config::SyncConfig, config::SyncMode};
 use helios_persistence::core::ResourceStorage;
+use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::TenantId;
 use helios_persistence::types::StoredResource;
 use serde_json::json;
@@ -36,9 +38,40 @@ struct Measured {
     bulk: usize,
     single: usize,
     failed: usize,
+    sweeps: usize,
+}
+
+/// A backend with the full R4 search parameter set, so that a contained
+/// Organization really is extracted into a contained document.
+fn full_backend(server: &MockServer) -> ElasticsearchBackend {
+    let config = ElasticsearchConfig {
+        nodes: vec![server.uri()],
+        request_timeout_ms: TIMEOUT_MS,
+        ..Default::default()
+    };
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let loader = SearchParameterLoader::new(FhirVersion::default());
+    let registries = Arc::new(TenantSearchRegistries::base_only());
+    {
+        let mut registry = registries.base().write();
+        let embedded = loader.load_embedded().expect("embedded search parameters");
+        let spec = loader
+            .load_from_spec_file(&data_dir)
+            .expect("data/search-parameters-r4.json");
+        assert!(spec.len() > 1000, "the full parameter set must be loaded");
+        for param in embedded.into_iter().chain(spec) {
+            let _ = registry.register(param);
+        }
+    }
+    ElasticsearchBackend::with_shared_registry(config, registries)
+        .expect("client construction is lazy")
 }
 
 async fn run(n: usize, singles_hang: bool) -> Measured {
+    run_with(n, singles_hang, false).await
+}
+
+async fn run_with(n: usize, singles_hang: bool, contained: bool) -> Measured {
     let server = MockServer::start().await;
     Mock::given(method("HEAD"))
         .respond_with(ResponseTemplate::new(200))
@@ -97,12 +130,16 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
         .mount(&server)
         .await;
 
-    let backend = ElasticsearchBackend::new(ElasticsearchConfig {
-        nodes: vec![server.uri()],
-        request_timeout_ms: TIMEOUT_MS,
-        ..Default::default()
-    })
-    .expect("client construction is lazy");
+    let backend = if contained {
+        full_backend(&server)
+    } else {
+        ElasticsearchBackend::new(ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: TIMEOUT_MS,
+            ..Default::default()
+        })
+        .expect("client construction is lazy")
+    };
     let mut backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>> = HashMap::new();
     backends.insert("es".to_string(), Arc::new(backend));
 
@@ -118,7 +155,15 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
                 "Patient",
                 id.clone(),
                 tenant.clone(),
-                json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]}),
+                if contained {
+                    json!({
+                        "resourceType": "Patient", "id": id, "name": [{"family": "X"}],
+                        "contained": [{"resourceType": "Organization", "id": "org1", "name": "Acme"}],
+                        "managingOrganization": {"reference": "#org1"}
+                    })
+                } else {
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]})
+                },
                 FhirVersion::default(),
             )
         })
@@ -137,8 +182,13 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
         .iter()
         .filter(|r| r.method.as_str() == "POST" && r.url.path().contains("/_doc/"))
         .count();
+    let sweeps = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/_delete_by_query"))
+        .count();
     Measured {
         elapsed,
+        sweeps,
         bulk,
         single,
         failed: statuses.iter().map(|s| s.failed_resource_ids.len()).sum(),
@@ -175,5 +225,24 @@ async fn bulk_timeout_still_retries_each_resource_when_singles_succeed() {
         let m = run(n, false).await;
         assert_eq!(m.single, n, "N={n}: one single POST each");
         assert_eq!(m.failed, 0, "N={n}");
+    }
+}
+
+/// The same hanging cluster with resources that carry `contained` documents:
+/// the page ends within the same bound and never launches a
+/// `_delete_by_query` (a sweep after a transient failure would wait out its
+/// own retries per resource).
+#[tokio::test]
+async fn bulk_timeout_with_contained_documents_is_bounded_and_launches_no_sweep() {
+    for n in [5usize, 10, 20] {
+        let m = run_with(n, true, true).await;
+        assert_eq!(m.failed, n, "N={n}: every resource is reported failed");
+        assert_eq!(m.sweeps, 0, "N={n}: no _delete_by_query");
+        let one_by_one = Duration::from_millis(n as u64 * (4 * TIMEOUT_MS + 700));
+        assert!(
+            m.elapsed < one_by_one / 2 + Duration::from_secs(3),
+            "N={n}: took {:?}",
+            m.elapsed
+        );
     }
 }

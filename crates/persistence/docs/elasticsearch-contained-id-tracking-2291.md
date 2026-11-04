@@ -206,11 +206,23 @@ container/key, and the container still appears once.
 
 In the counterexample, `y` was written with the version of the write that A
 started; the container is now at the version of C's write, so `y` is a version
-behind and never matches. Whatever the interleaving, a document left behind by
-a write that is no longer the container's current one has a different
-`version_id`, so it is invisible without anyone having to know it exists. The
-list remains useful to delete such documents cheaply on the next rewrite; it
-no longer decides what a search shows.
+behind and never matches. A document left behind by a write that is no longer
+the container's current one has a different `version_id`, so it is invisible
+without anyone having to know it exists. The list remains useful to delete such
+documents cheaply on the next rewrite; it no longer decides what a search
+shows.
+
+**What the filter does not give: protection against false negatives.** It
+protects against showing what should not be shown, not against hiding what
+should be shown. If a *late resend* of an older writer's item (for example a
+`index x` of version 2 that was throttled and is resent after version 3 wrote
+`x`) overwrites a current child, that child now carries version 2 under a
+version-3 container and is hidden until the container is rewritten. It needs
+two writers on the same resource, which the composite serializes in the usual
+case (one sync per resource) but not between the sync worker and the
+sync-failure repair task. Closing it needs `version_type=external_gte` with the
+numeric version on children and container, treating a child's 409 as a no-op;
+that is a follow-up, not part of this change.
 
 ### 3.7 Id format and container-type collisions
 
@@ -240,9 +252,17 @@ when:
 | `Legacy` container | Written before v3; swept once, then the field exists. |
 | `Absent` or `Legacy` container on **delete** | No usable ids to read; keeps `delete_of_an_absent_document_still_sweeps_its_contained_documents`, a repeated delete, and the exhausted-sweep test. An `Absent` container is **not** swept on `update`/`upsert`: there is nothing recorded to clean. |
 | Unreadable or malformed list | Classified `Legacy` (3.2). |
-| 409 on the container (`if_seq_no`) | Concurrent write; sweep, then rewrite without the check. If that second send fails, repair as in the next row. |
-| Failed `_bulk` item of an owner that had obsolete **or new** contained documents | `_bulk` is not atomic: the container may list documents that were not written, or omit ones that exist. Sweep best-effort, then return the error. (Before, only owners with obsolete ids were repaired.) |
-| Sweep also fails | Try to rewrite the container without `contained_doc_ids`, so the next write sees `Legacy` and sweeps; return the error. |
+| 409 on the container (`if_seq_no`) | Concurrent write; sweep, then rewrite without the check. If that second send fails permanently, repair as in the next row; a transient failure is only reported. |
+| **Permanently** failed `_bulk` item of an owner that had recorded ids the write no longer lists | `_bulk` is not atomic: the container may list documents that were deleted, or omit ones that still exist. Sweep best-effort, then return the error. **Never after a transient failure** (503, exhausted 429, timeout): the cluster is not answering, each sweep would wait out its retries while a sync page is held (#1749), and under saturation it would add a scroll-context sweep per failed write, the failure mode of #2180 E-01. The retry rewrites the state, and the filter hides the documents meanwhile. |
+| Sweep finds the cluster unavailable | A page stops repairing its remaining owners, and the container is not rewritten without its list (that write would fail too). |
+| Sweep fails for another reason | Try to rewrite the container without `contained_doc_ids`, so the next write sees `Legacy` and sweeps; return the error. |
+| `purge` | Always sweeps after `delete`, also for a container whose list is `[]` or that no longer exists: a purge must leave nothing, and a child the list does not name would come back visible if the resource is recreated under the same version (a primary that restarts its versions after a purge). |
+| `delete` of a container with recorded ids whose `_bulk` fails permanently | Sweeps once before returning the error. After a transient failure it does not: a repeated delete finds the container absent and sweeps. |
+
+The repair is clean-up, not correctness. A contained document the container no
+longer lists was written by a write that is not the container's current one, so
+it carries another `version_id` and the filter (3.6) keeps it out of search
+results.
 
 Even if every repair fails, the read-side filter (3.6) keeps what the repair
 would have removed out of search results.
@@ -388,3 +408,26 @@ rounds (+40 to +86 %). Insert did not change; search did not worsen.
   them.
 - **Cost of the extra `_mget`** on `_contained` searches: to be measured in the
   search leg of the repeated ABAB; no number is claimed here.
+- **Writers racing on one resource** can leave a current child hidden (see the
+  end of 3.6); follow-up: external versioning of children and container.
+- **A transient failure leaves recorded stale ids unswept.** If a delete of an
+  obsolete id fails transiently after the container got the new list, no
+  repair runs (4). The document has the previous version, so the filter hides
+  it, unless the version did not change, which for a changed `contained`
+  array means a primary that repeats a `version_id` for different content.
+- **Mapping.** If the additive reconcile of `contained_doc_ids` fails
+  transiently (`reconcile_index` only logs), the field is mapped dynamically
+  (`text` + `keyword`) by the first document, and the later
+  `keyword`/`index:false` mapping would be rejected as a conflict, leaving the
+  index at the old schema version. A `dynamic_templates` entry for the field,
+  or writing it only once the index is reconciled, would remove this; not done
+  here.
+- **Migration.** Contained documents written by releases where `update` did
+  not re-index children (#1382) may carry a `version_id` different from their
+  container's and are now hidden, where before they were shown. A
+  `$reindex` of the affected types restores them; not verified against real
+  data.
+- **Cost and fragility of the container lookup.** `container_versions` issues
+  one `_mget` per 500 containers, in sequence, before a page is cut, also for
+  a small `_count`; an item error other than a missing index (a closed index)
+  fails the search. To be measured, and parallelized if it shows.

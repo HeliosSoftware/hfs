@@ -2198,13 +2198,15 @@ impl ElasticsearchBackend {
             return match send(None, false).await {
                 None => Ok(()),
                 Some(failure) => {
-                    self.repair_unrecorded_stale(
-                        tenant_id,
-                        container_type,
-                        container_id,
-                        &container_doc,
-                    )
-                    .await;
+                    if !failure.transient {
+                        self.repair_unrecorded_stale(
+                            tenant_id,
+                            container_type,
+                            container_id,
+                            &container_doc,
+                        )
+                        .await;
+                    }
                     Err(bulk_failure_error(
                         failure,
                         what,
@@ -2214,10 +2216,11 @@ impl ElasticsearchBackend {
                 }
             };
         }
-        // The bulk is not atomic: contained documents may exist that the
-        // container, which failed, does not list. Nothing else would find
-        // them (the next write reads the old list).
-        if !stale.is_empty() || !contained.is_empty() {
+        // The bulk is not atomic: a recorded document may have been deleted
+        // while the container, which failed, still lists it, or the reverse.
+        // Only a permanent failure is worth a sweep; see
+        // [`Self::repair_unrecorded_stale`].
+        if !stale.is_empty() && !failure.transient {
             self.repair_unrecorded_stale(tenant_id, container_type, container_id, &container_doc)
                 .await;
         }
@@ -2229,23 +2232,34 @@ impl ElasticsearchBackend {
         ))
     }
 
-    /// After a failed write that was to delete recorded documents: the
-    /// container may now list only the new documents while an old one still
-    /// exists. Sweep them; if the sweep fails too, rewrite the container
-    /// without its list, which makes the next write sweep ([`Prior::Legacy`]).
-    /// Best effort — the write's own error is what the caller returns.
+    /// After a *permanently* failed write that was to delete recorded
+    /// documents: the container may now list only the new documents while an
+    /// old one still exists. Sweep them; if the sweep fails too, rewrite the
+    /// container without its list, which makes the next write sweep
+    /// ([`Prior::Legacy`]). Best effort — the write's own error is what the
+    /// caller returns.
+    ///
+    /// This is clean-up, not correctness: a contained document the container
+    /// no longer lists carries an older version than the container, and a
+    /// `_contained` search leaves it out (#2291). So it is never run after a
+    /// transient failure (the cluster is not answering, and each sweep would
+    /// wait out its retries while the write path is blocked, #1749), and it
+    /// answers `true` when the sweep found the cluster unavailable so that a
+    /// caller with more work stops repairing.
     async fn repair_unrecorded_stale(
         &self,
         tenant_id: &str,
         container_type: &str,
         container_id: &str,
         container_doc: &Value,
-    ) {
+    ) -> bool {
         let swept = self
             .delete_contained_docs(tenant_id, container_type, container_id)
             .await;
-        if swept.is_ok() {
-            return;
+        match &swept {
+            Ok(_) => return false,
+            Err(e) if is_unavailable(e) => return true,
+            Err(_) => {}
         }
         let mut unlisted = container_doc.clone();
         if let Some(obj) = unlisted.as_object_mut() {
@@ -2269,6 +2283,7 @@ impl ElasticsearchBackend {
                 "Could not sweep or unlist stale contained documents; reindex the resource to remove them"
             );
         }
+        false
     }
 }
 
@@ -2522,10 +2537,14 @@ impl ResourceStorage for ElasticsearchBackend {
                 None => Ok(()),
                 Some(failure) => {
                     // The container may be gone while a contained document
-                    // is not, and a repeat would then find nothing recorded.
-                    let _ = self
-                        .delete_contained_docs(tenant_id, resource_type, id)
-                        .await;
+                    // is not. A repeat finds the container absent and sweeps
+                    // (below), so a transient failure, when the cluster is
+                    // not answering, is left to that repeat.
+                    if !failure.transient {
+                        let _ = self
+                            .delete_contained_docs(tenant_id, resource_type, id)
+                            .await;
+                    }
                     Err(bulk_failure_error(
                         failure,
                         "delete document",
@@ -2869,14 +2888,22 @@ impl PurgableStorage for ElasticsearchBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        // ResourceStorage::delete already removes the document outright and
-        // sweeps its contained-resource docs, which is exactly purge semantics
-        // for a backend with no history.
+        // ResourceStorage::delete removes the document outright and, for a
+        // container whose list names its contained documents, those too. A
+        // purge must leave nothing behind, and a contained document the list
+        // does not name (a write cut short, a rebuild over a legacy container)
+        // would come back visible once the resource is recreated under the same
+        // version, as it is after a purge on a primary that restarts its
+        // versions (#2291). So it always sweeps.
         match ResourceStorage::delete(self, tenant, resource_type, id).await {
             // A purge whose document is already absent has nothing to undo. The
             // composite fan-out retries a failed purge, so this must be
             // idempotent or the retry would fail on the backend that succeeded.
-            Err(StorageError::Resource(ResourceError::NotFound { .. })) => Ok(()),
+            Ok(()) | Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
+                self.delete_contained_docs(tenant.tenant_id().as_str(), resource_type, id)
+                    .await?;
+                Ok(())
+            }
             other => other,
         }
     }
@@ -3630,13 +3657,22 @@ impl ElasticsearchBackend {
         let failures = self.send_bulk(&ops, prepared.len(), refresh).await;
         // A resource whose write failed after its deletes were attempted may
         // now record fewer documents than exist: sweep or unlist them.
+        // Only for permanent failures, and not once the cluster has been
+        // found unavailable: each sweep would wait out its retries while the
+        // page, and the sync worker behind it, is held (#1749).
+        let mut cluster_unavailable = false;
         for (i, failure) in failures.iter().enumerate() {
-            if failure.is_some()
-                && (!stale[i].is_empty() || prepared[i].docs.len() > 1)
+            if cluster_unavailable {
+                break;
+            }
+            if let Some(failure) = failure
+                && !failure.transient
+                && !stale[i].is_empty()
                 && let Some((_, _, container)) = prepared[i].docs.first()
             {
                 let r = &resources[i];
-                self.repair_unrecorded_stale(tenant_id, r.resource_type(), r.id(), container)
+                cluster_unavailable = self
+                    .repair_unrecorded_stale(tenant_id, r.resource_type(), r.id(), container)
                     .await;
             }
         }

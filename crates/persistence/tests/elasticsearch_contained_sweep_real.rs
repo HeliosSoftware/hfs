@@ -48,7 +48,7 @@ use helios_persistence::composite::{
 };
 use helios_persistence::core::{
     Backend, BackendKind, ConditionalDeleteResult, ConditionalStorage, EntityTagPrecondition,
-    ResourceStorage, SearchProvider,
+    PurgableStorage, ResourceStorage, SearchProvider,
 };
 use helios_persistence::search::{ReindexTarget, SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -1458,6 +1458,90 @@ async fn a_rebuild_page_over_a_legacy_container_does_not_surface_its_obsolete_co
             .is_empty()
     );
     assert_eq!(containers_of(&es, &t, "Acme").await, vec!["Patient/rb"]);
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+/// Risk: a purge that trusts the container's id list leaves a child the list
+/// never named alive with the same version, and it resurfaces when the resource
+/// is recreated in that version (a primary that restarts its versions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purge_removes_a_contained_document_the_list_does_not_name() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let t = tenant("sweep-purge-orphan");
+
+    let v1 = es
+        .create(
+            &t,
+            "Observation",
+            holder("Observation", "o1", Some("Acme")),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+
+    let live = raw_contained_orgs(&prefix, "Acme").await;
+    assert_eq!(live.len(), 1, "precondition: one registered child");
+    let (index, _, live_source) = live[0].clone();
+    let (_, _, container) = find_container(&prefix, "Observation", "o1").await;
+    assert_eq!(
+        container["contained_doc_ids"].as_array().map(Vec::len),
+        Some(1),
+        "precondition: the list names only the registered child"
+    );
+
+    // The orphan carries the container's current version; the list omits it.
+    let orphan_id = "Organization_Observation_o1#orphan";
+    let mut orphan = live_source.clone();
+    orphan["contained_local_id"] = json!("orphan");
+    orphan["resource_id"] = json!("Observation_o1#orphan");
+    assert_eq!(orphan["version_id"], json!(v1.version_id()));
+    index_raw(&index, orphan_id, orphan).await;
+    assert_eq!(
+        contained_hits(&es, &t, "Acme", ContainedReturn::Contained)
+            .await
+            .len(),
+        2,
+        "precondition: the orphan is visible while its container is live"
+    );
+
+    es.purge(&t, "Observation", "o1").await.expect("purge");
+
+    // Recreated in version 1, without contained.
+    let again = es
+        .create(
+            &t,
+            "Observation",
+            holder("Observation", "o1", None),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("recreate");
+    assert_eq!(again.version_id(), v1.version_id(), "same version again");
+
+    for ret in [ContainedReturn::Contained, ContainedReturn::Container] {
+        assert!(
+            contained_hits(&es, &t, "Acme", ret).await.is_empty(),
+            "the orphan does not resurface ({ret:?})"
+        );
+    }
+    assert!(raw_contained_orgs(&prefix, "Acme").await.is_empty());
+    assert_eq!(
+        contained_doc_count(&prefix).await,
+        0,
+        "none left physically"
+    );
+    let client =
+        Elasticsearch::new(Transport::single_node(&format!("http://{}", es_addr().await)).unwrap());
+    let got = client
+        .get(elasticsearch::GetParts::IndexId(&index, orphan_id))
+        .send()
+        .await
+        .expect("get orphan");
+    assert_eq!(got.status_code().as_u16(), 404, "the orphan is gone by _id");
 
     wire.stop.store(true, Ordering::SeqCst);
     cleanup(&prefix).await;

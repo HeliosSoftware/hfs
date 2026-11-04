@@ -655,7 +655,9 @@ async fn search_ids_asks_for_ids_only_and_no_total() {
     );
     // The control: the regular search still loads the bodies, and counts when
     // `_total` asks it to (#2283).
-    assert!(full_body.get("_source").is_none());
+    // It loads the bodies, trimmed to the fields the parser reads (#2331).
+    assert!(full_body["_source"].is_array());
+    assert_ne!(full_body["_source"], json!(false));
     assert_eq!(full_body["track_total_hits"], json!(true));
     assert_eq!(page.page_info.total, None);
 }
@@ -771,8 +773,8 @@ async fn search_ids_keeps_the_full_path_for_sort_offset_and_total() {
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(
-            sent[0].get("_source").is_none(),
-            "the full body is requested"
+            sent[0]["_source"].is_array(),
+            "the (trimmed) bodies are requested, not ids only (#2331)"
         );
         assert_eq!(sent[0]["track_total_hits"], counts);
     }
