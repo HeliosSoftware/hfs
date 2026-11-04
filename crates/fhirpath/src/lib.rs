@@ -296,6 +296,8 @@ mod set_operations;
 mod subset_functions;
 mod terminology_client;
 mod terminology_functions;
+#[cfg(test)]
+mod terminology_stub;
 mod trace_function;
 mod type_function;
 pub mod type_inference;
