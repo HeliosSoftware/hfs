@@ -31,6 +31,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 /// (id, `performedDateTime`). The first three have no seconds; `mi-control`
 /// is a conformant value, there to show the parameter is indexed at all.
 const SEEDED: &[(&str, &str)] = &[
@@ -129,7 +131,7 @@ where
     for (id, performed) in SEEDED {
         // The write itself must succeed whatever the date looks like.
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Procedure",
                 json!({

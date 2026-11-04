@@ -35,6 +35,8 @@ use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 /// Stored with a fraction, so a second-precision search has something inside
 /// its second to find (#1297). `2013-04-06T03:30:00.123Z`.
 const FRACTION: (&str, &str) = ("dp-fraction", "2013-04-05T23:30:00.123-04:00");
@@ -144,7 +146,7 @@ where
 
     for (id, performed) in [FRACTION, MINUTE] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Procedure",
                 json!({

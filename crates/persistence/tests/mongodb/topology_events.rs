@@ -235,7 +235,7 @@ async fn a_dropped_connection_the_driver_reports_as_unknown_forgets_the_kept_ans
     }
     let tenant = create_tenant("sdam_2411_unknown");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),
@@ -391,7 +391,7 @@ async fn a_replica_set_restarted_as_a_standalone_server_takes_its_next_write_wit
     let admin = admin_client.database("admin");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),

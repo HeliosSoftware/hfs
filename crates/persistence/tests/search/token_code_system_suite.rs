@@ -37,6 +37,8 @@ use helios_persistence::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 const GENDER: &str = "http://hl7.org/fhir/administrative-gender";
 const OBS_STATUS: &str = "http://hl7.org/fhir/observation-status";
 const LOINC: &str = "http://loinc.org";
@@ -286,7 +288,7 @@ where
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {id} failed: {e}"));
     }
@@ -347,7 +349,7 @@ where
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"id": "pt-old", "gender": "female"}),
@@ -435,7 +437,7 @@ where
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {id} failed: {e}"));
     }

@@ -45,6 +45,8 @@ use helios_persistence::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 const V2_0203: &str = "http://terminology.hl7.org/CodeSystem/v2-0203";
 const MRN: &str = "http://example.org/mrn";
 const SSN: &str = "http://example.org/ssn";
@@ -850,7 +852,7 @@ where
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {resource_type}/{id} failed: {e}"));
     }
@@ -877,7 +879,7 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
         TenantPermissions::full_access(),
     );
     backend
-        .create(
+        .seed_create(
             &other,
             "Patient",
             json!({"id": "p1", "identifier": [{"system": MRN, "value": "77777"}]}),
