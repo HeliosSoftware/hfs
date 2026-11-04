@@ -1,29 +1,27 @@
 name: Release build trial
 
-# Builds the release artifacts a second way, without the self-hosted Windows
-# (agent4, agent9) and macOS (agent5) runners, and smoke-tests each one on a
-# machine of its own platform. It publishes nothing. `ci.yml`'s `build` job
-# still makes every artifact a release ships.
+# Builds the Windows and Linux ARM64 release artifacts a second way, without
+# the self-hosted Windows agent (agent4) and without the Mac (agent5), and
+# smoke-tests each on a GitHub-hosted machine of its own platform. It
+# publishes nothing. `ci.yml`'s `build` job still makes every artifact a
+# release ships.
 #
-# When these legs have passed on a release tag, `build` can switch to them
-# and the agents can be retired:
+# When these legs have passed on a release tag, `build` can switch to them:
 #
 #   * Windows: cross-compiled on a self-hosted Linux agent with cargo-xwin
 #     against Microsoft's MSVC CRT and Windows SDK, same target
 #     (x86_64-pc-windows-msvc) and same 16 MB main-thread stack as the native
 #     build. Smoke-tested on GitHub's `windows-latest`.
-#   * Linux ARM64: built natively on GitHub's `ubuntu-24.04-arm`, inside the
-#     manylinux_2_28 image so the binaries and wheels keep the glibc 2.28
-#     floor the Mac's cross-compile gives them today. A plain 24.04 build
-#     would need glibc 2.39 and stop running on RHEL 9, Debian 12 and
-#     Amazon Linux 2023.
-#   * macOS: GitHub's `macos-latest` (M1, 3 cores, 7 GB) building natively,
-#     and `macos-15-intel` (4 cores, 14 GB) cross-compiling to Apple Silicon.
-#     Both are trials. The full release build peaks at ~17.5 GB in a single
-#     rustc process (`helios-fhir`, all four FHIR versions), so either runner
-#     may swap past GitHub's 6-hour job limit.
+#   * Linux ARM64: cross-compiled on a self-hosted Linux agent with
+#     cargo-zigbuild against glibc 2.28, the floor the Mac's cross-compile
+#     gives the binaries and wheels today. Smoke-tested on GitHub's
+#     `ubuntu-24.04-arm`. Off the Mac, the macOS build no longer waits
+#     behind it, which is what bounds a release's wall-clock today.
 #
-# Standard GitHub-hosted runners are free for public repositories.
+# macOS stays on agent5. GitHub's hosted Macs were tried here (`macos-latest`,
+# `macos-15-intel`) and both hit the job time limit still compiling, in runs
+# 41760116963 and 41834525090. A natively built ARM64 leg on GitHub's
+# `ubuntu-24.04-arm` passed (run 41834525090) but took 4h55m of its 6 h limit.
 #
 # Runs on every `v*` tag (called from `ci.yml`), on pull requests that change
 # it, and by hand: Actions -> Release build trial -> Run workflow.
@@ -163,71 +161,94 @@ jobs:
         uses: ./.github/actions/cargo-target-gc
 
   linux-arm64:
-    name: Linux ARM64 (GitHub-hosted, manylinux_2_28)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 350
+    name: Linux ARM64 (cross-compiled on Linux, glibc 2.28)
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 300
     continue-on-error: true
+    env:
+      # Its own dir, like the Windows leg: nothing is shared with the native
+      # x86_64 builds in `${{ github.workspace }}-target`.
+      CARGO_TARGET_DIR: ${{ github.workspace }}-target-zig
+      # 2, like ci.yml's release `build` job; see the Windows leg.
+      CARGO_BUILD_JOBS: 2
+      # `--workspace` includes pysof, and PyO3 cannot run an ARM64 Python
+      # here. The wheels below are built per interpreter regardless.
+      PYO3_CROSS_PYTHON_VERSION: "3.12"
+      # zig, not Docker: ci.yml points DOCKER_HOST at a remote daemon, which
+      # cannot bind-mount this checkout. zig links with lld, which GNU ld's
+      # R_AARCH64_CALL26 overflow on hfs and pysof (run 41760116963) needs.
+      ZIG_VERSION: 0.15.1
+      ZIG_SHA256: c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05
+      # 0.24.1 / 1.16.0 or newer: older cargo-zigbuild (0.20.1, which maturin
+      # 1.10.1 bundles) passes rustc's `--fix-cortex-a53-843419` on to zig,
+      # which rejects it ("unsupported linker arg"). Checked locally.
+      CARGO_ZIGBUILD_VERSION: 0.24.1
+      MATURIN_VERSION: 1.16.0
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # 4 cores and 16 GB, against a ~17.5 GB peak in one rustc process. Run
-      # 41744976492 had 16 GB of swap and 4 jobs, and was still OOM-killed
-      # 18 min in (exit 137, runner lost). The runner has ~105 GB free disk.
-      - name: Add swap
-        run: |
-          set -euo pipefail
-          df -h / ; free -h
-          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
-          size=$(( avail > 80 ? 32 : 8 ))
-          sudo fallocate -l "${size}G" /trial-swap
-          sudo chmod 600 /trial-swap
-          sudo mkswap /trial-swap >/dev/null
-          sudo swapon /trial-swap
-          free -h
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
 
-      - name: Build release binaries and pysof wheels (manylinux_2_28)
+      - name: Install zig
         run: |
           set -euo pipefail
-          docker run --rm -v "$GITHUB_WORKSPACE:/io" -w /io \
-            -e CARGO_TERM_COLOR -e RUSTUP_TOOLCHAIN -e CARGO_BUILD_JOBS=2 \
-            quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
-              # perl-core: openssl-src (the vendored OpenSSL the shipped
-              # binaries link) needs Perl modules such as IPC::Cmd.
-              # openssl-devel: a second openssl-sys, built for the build
-              # machine (resolver-2 build-time features), does not get the
-              # aarch64-only "vendored" feature and looks for a system
-              # OpenSSL. On the Mac it found Homebrew. It is not shipped;
-              # "Check the binaries" below fails if libssl is linked.
-              # lld: GNU ld cannot link hfs or pysof on aarch64; their .text
-              # passes the 128 MB reach of a direct call and ld fails with
-              # "relocation truncated to fit: R_AARCH64_CALL26". The current
-              # ARM64 release links with lld too (ci.yml).
-              dnf install -y -q perl-core openssl-devel lld >/dev/null
-              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
-              curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain stable
-              . "$HOME/.cargo/env"
-              export PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
-              start=$(date +%s)
-              cargo build --workspace --all-features --release
-              echo "cargo build: $(( ($(date +%s) - start) / 60 )) min"
-              py=/opt/python/cp312-cp312/bin/python
-              "$py" -m pip install -q "maturin>=1.9.5,<2.0"
-              cd crates/pysof
-              "$py" -m maturin build --release -o /io/trial/pysof --compatibility manylinux_2_28 \
-                -i /opt/python/cp310-cp310/bin/python -i /opt/python/cp311-cp311/bin/python \
-                -i /opt/python/cp312-cp312/bin/python -i /opt/python/cp313-cp313/bin/python \
-                -i /opt/python/cp314-cp314/bin/python
-              chown -R "$(stat -c %u:%g /io)" /io/target /io/trial
-            '
-          df -h / ; free -h
+          dir="$RUNNER_TOOL_CACHE/zig-$ZIG_VERSION"
+          if [ ! -x "$dir/zig" ]; then
+            tmp=$(mktemp -d)
+            curl -sSfL --retry 5 -o "$tmp/zig.tar.xz" \
+              "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+            echo "$ZIG_SHA256  $tmp/zig.tar.xz" | sha256sum -c -
+            rm -rf "$dir.partial"
+            mkdir -p "$dir.partial"
+            tar -xJf "$tmp/zig.tar.xz" --strip-components=1 -C "$dir.partial"
+            rm -rf "$dir" "$tmp"
+            mv "$dir.partial" "$dir"
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/zig" version
+
+      - name: Install cargo-zigbuild
+        run: |
+          set -euo pipefail
+          if ! cargo install --list | grep -q "^cargo-zigbuild v$CARGO_ZIGBUILD_VERSION:"; then
+            cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+          fi
+          cargo install --list | grep '^cargo-zigbuild'
+
+      # `.2.28` pins the glibc the binaries are linked against. The vendored
+      # OpenSSL comes from crates/hfs and crates/pysof's aarch64-only
+      # `vendored` feature, as on the Mac today.
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo zigbuild --workspace --all-features --release --target aarch64-unknown-linux-gnu.2.28
+          echo "cargo zigbuild: $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Build pysof wheels
+        working-directory: crates/pysof
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          uvx --from "maturin==$MATURIN_VERSION" maturin build --release --zig \
+            -o "$GITHUB_WORKSPACE/trial/pysof" --target aarch64-unknown-linux-gnu \
+            --compatibility manylinux_2_28 \
+            -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+          echo "maturin: $(( ($(date +%s) - start) / 60 )) min"
 
       - name: Check the binaries (glibc floor, vendored OpenSSL)
         run: |
           set -euo pipefail
+          out="$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release"
           mkdir -p trial/bin
           for b in $RELEASE_BINS; do
-            cp "target/release/$b" trial/bin/
+            cp "$out/$b" trial/bin/
+            file "trial/bin/$b" | grep -q 'ARM aarch64' || { echo "::error::$b is not an ARM64 binary"; exit 1; }
             if objdump -p "trial/bin/$b" | grep -E 'NEEDED +lib(ssl|crypto)\.so'; then
               echo "::error::$b links the system OpenSSL; the ARM64 release vendors it"
               exit 1
@@ -258,100 +279,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  macos:
-    name: macOS (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 350
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            leg: macos-arm
-          - runner: macos-15-intel
-            leg: macos-intel-cross
-    env:
-      CARGO_BUILD_JOBS: 2
-      # Same as the native release leg's ~/.cargo/config.toml in ci.yml.
-      CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: "-A linker_messages"
-      # The Intel leg cross-compiles; PyO3 then cannot run the target's Python.
-      PYO3_CROSS_PYTHON_VERSION: "3.12"
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: aarch64-apple-darwin
-
-      - name: Install Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: |
-            3.10
-            3.11
-            3.13
-            3.14
-            3.12
-
-      - name: Runner resources
-        run: |
-          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-          df -h /
-
-      - name: Build release binaries
-        run: |
-          set -euo pipefail
-          start=$(date +%s)
-          # `-l` reports the peak RSS of the largest process.
-          /usr/bin/time -l cargo build --workspace --all-features --release --target aarch64-apple-darwin
-          echo "cargo build: $(( ($(date +%s) - start) / 60 )) min"
-          sysctl vm.swapusage
-
-      - name: Build pysof wheels
-        working-directory: crates/pysof
-        run: |
-          set -euo pipefail
-          python -m pip install -q "maturin>=1.9.5,<2.0"
-          python -m maturin build --release -o "$GITHUB_WORKSPACE/trial/pysof" --target aarch64-apple-darwin \
-            -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
-
-      - name: Collect binaries
-        run: |
-          set -euo pipefail
-          mkdir -p trial/bin
-          for b in $RELEASE_BINS; do
-            cp "target/aarch64-apple-darwin/release/$b" trial/bin/
-          done
-          cp -r data trial/bin/
-          file trial/bin/hfs
-          ls -l trial/bin trial/pysof
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: trial-${{ matrix.leg }}-bin
-          path: trial/bin
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload pysof wheels
-        uses: actions/upload-artifact@v7
-        with:
-          name: trial-${{ matrix.leg }}-pysof
-          path: trial/pysof
-          if-no-files-found: error
-          retention-days: 7
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   smoke:
     name: Smoke test ${{ matrix.leg }} on ${{ matrix.runner }}
-    needs: [windows-cross, linux-arm64, macos]
+    needs: [windows-cross, linux-arm64]
     # Each leg is tested if it uploaded, whatever the others did. Not
     # `always()`: that also runs on a cancelled run, where every download
-    # fails and the PR shows four red smoke tests for a run nobody wanted.
+    # fails and the PR shows red smoke tests for a run nobody wanted.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -364,11 +301,6 @@ jobs:
             runner: windows-latest
           - leg: linux-arm64
             runner: ubuntu-24.04-arm
-          - leg: macos-arm
-            runner: macos-latest
-          # Apple Silicon binaries built on Intel: run them on an M1.
-          - leg: macos-intel-cross
-            runner: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v5

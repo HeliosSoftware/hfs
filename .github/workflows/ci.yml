@@ -2047,9 +2047,10 @@ jobs:
     uses: ./.github/workflows/hts-ig-conformance.yml
     secrets: inherit
 
-  # Builds the Windows, Linux ARM64 and macOS artifacts a second way, without
-  # the self-hosted Windows and macOS agents, and smoke-tests them. Publishes
-  # nothing and gates nothing; see release-build-trial.yml.
+  # Builds the Windows and Linux ARM64 artifacts a second way, cross-compiled
+  # on self-hosted Linux agents instead of the Windows agent and the Mac, and
+  # smoke-tests them on GitHub-hosted machines. Publishes nothing and gates
+  # nothing; see release-build-trial.yml.
   release-build-trial:
     name: Release build trial
     if: startsWith(github.ref, 'refs/tags/v')
