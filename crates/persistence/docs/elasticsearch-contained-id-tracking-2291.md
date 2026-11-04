@@ -420,6 +420,50 @@ better than A.
   runs of the *same* arm was not collected; each arm ran twice only for crud
   (A: 1290 and 1528; B: 2019 and 2244 req/s), and the ranges do not overlap.
 
+### 8.2 Cost of `_contained` searches (the path the filter adds work to)
+
+The k6 workload issues no `_contained` searches, so a direct measurement was
+made (script and raw results: `~/tmp/g-2291/contained-bench/`, not in the
+repository). Corpus: 3000 `Observation`, each with two contained resources (a
+`Medication` and an `Observation`); the searches return 600 (`Medication`) or
+500 (`Observation`) hits. Sequential requests, 30 warm-up and 300 measured per
+variant, `sqlite-es`, `i3es2` settings, under `measurelock.sh`, two passes of
+each arm (load average 1.3 to 2.9 at the start; other sessions were active).
+Every arm returned the same number of results (600, 500 and 429 for the
+control).
+
+p50 / p95 in ms, the two passes of each arm side by side:
+
+| variant | A: main | B: first version (every container checked) | C: final (lazy check) |
+|---|---|---|---|
+| `Medication`, `_count=10` | 8.7/10.7 and 8.4/10.0 | 20.4/24.6 and 30.4/47.9 | 10.2/12.1 and 10.1/12.1 |
+| `Medication`, `_count=100` | 21.1/28.6 and 20.3/27.1 | 32.3/42.3 and 41.7/54.3 | 25.2/30.9 and 25.0/29.7 |
+| `Medication`, `_containedType=contained`, `_count=10` | 9.2/13.2 and 7.5/9.1 | 18.0/23.1 and 19.6/26.4 | 9.1/10.4 and 9.4/11.5 |
+| `Medication`, `_containedType=contained`, `_count=100` | 8.7/12.5 and 9.0/10.6 | 18.9/24.7 and 22.0/29.5 | 13.1/15.2 and 13.3/16.0 |
+| `Observation` as container, `_count=10` | 9.0/14.2 and 8.7/10.9 | 18.8/23.1 and 20.9/28.2 | 10.1/11.7 and 10.5/13.0 |
+| `Observation` as container, `_count=100` | 20.8/28.1 and 20.7/27.1 | 31.3/39.1 and 50.7/100.1 | 24.5/30.1 and 25.5/29.5 |
+| control, no `_contained`, `_count=10` | 1.0/1.4 and 1.1/1.5 | 1.1/1.5 and 1.0/1.4 | 1.0/1.3 and 1.0/1.1 |
+
+- The first version (B) checked the container of every hit before cutting the
+  page: `_contained` searches were 50 % to 260 % slower than main in p50 (10 to
+  20 ms more). That was too much for a read path.
+- The final version (C) checks containers in steps, in order, and stops when
+  `offset + count` entries are found (without `_total`; with `_total` it
+  checks all, because it must count). Against main the p50 is now +12 % to
+  +26 % with `_count=10` (about +1 to +2 ms) and +18 % to +50 % with
+  `_count=100` (about +4 to +5 ms), the same in both passes. It is not free:
+  that is the price of the guarantee, and only `_contained` searches pay it.
+  Searches without `_contained` are unchanged (control within noise).
+- A `_total` request, and `search_count`, still look up every container; they
+  were not measured separately here and keep the cost of B.
+
+### 8.3 429 and WARN counts
+
+From the k6 runs of 8.1 (host log of each run): none of the four runs of the
+branch has a WARN, an ERROR, a 429, a `too_many_scroll_contexts` or a
+"Secondary sync failed" line; the runs of main have 143 to 220 WARN lines
+(retried sweeps) and up to four lines with a 429.
+
 ## 9. Residual risks and follow-ups
 
 - **Hidden garbage, not deleted garbage.** The filter hides orphaned and
@@ -445,8 +489,7 @@ better than A.
   state: a create over an existing document (a re-sent create, a replay) does
   not delete documents the previous incarnation recorded; the filter hides
   them.
-- **Cost of the extra `_mget`** on `_contained` searches: to be measured in the
-  search leg of the repeated ABAB; no number is claimed here.
+- **Cost of the container lookup** on `_contained` searches: measured in 8.2.
 - **Writers racing on one resource** can leave a current child hidden (see the
   end of 3.6); follow-up: external versioning of children and container.
 - **A transient failure leaves recorded stale ids unswept.** If a delete of an
