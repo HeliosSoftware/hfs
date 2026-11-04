@@ -1535,6 +1535,7 @@ impl ElasticsearchBackend {
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
         let tenant_id = tenant.tenant_id().as_str();
+        let _container = self.lock_container(tenant_id, resource_type, id).await;
 
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
@@ -2260,7 +2261,11 @@ impl ElasticsearchBackend {
         // rejected item is usually an `index`, with the deletes applied), and
         // it is not needed for correctness: what the container no longer
         // lists carries an older version than the container, which a
-        // `_contained` search leaves out (#2291).
+        // `_contained` search leaves out (#2291). That holds when the version
+        // comes from a primary (every mode of the server binary): a
+        // standalone Elasticsearch numbers its own versions, and a retry
+        // after a rejected container can reuse the version of the documents
+        // the failed attempt wrote.
         Err(bulk_failure_error(
             failure,
             what,
@@ -2311,6 +2316,7 @@ impl ElasticsearchBackend {
         // `"result": "not_found"` or an `index_not_found_exception`. A bare
         // `404` (a proxy, a wrong base path) used to be taken for it; it is an
         // error now, as it is for `read` (#1364, #1382).
+        let _container = self.lock_container(tenant_id, resource_type, id).await;
         let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
         if let Prior::Known { ids, .. } = &prior
             && !ids.is_empty()
@@ -2537,6 +2543,7 @@ impl ResourceStorage for ElasticsearchBackend {
         // Re-sync contained docs exactly as `create_or_update` does. This path
         // used to skip it, so an update that changed `contained[]` left the old
         // contained documents matching `_contained` searches (#1382).
+        let _container = self.lock_container(tenant_id, resource_type, id).await;
         let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
         let contained = self.contained_documents(
             tenant_id,
@@ -3566,6 +3573,9 @@ impl ElasticsearchBackend {
             .iter()
             .map(|&i| (resources[i].resource_type(), resources[i].id()))
             .collect();
+        // Held until the page's `_bulk` (resends included) is done, so that no
+        // other write of these resources interleaves with it.
+        let _containers = self.lock_containers(tenant_id, items.iter().copied()).await;
         let mut priors: Vec<Prior> = vec![Prior::Absent; n];
         match self.fetch_priors(tenant_id, &items).await {
             Ok(found) => {
@@ -3960,6 +3970,9 @@ impl ReindexTarget for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
+        let _container = self
+            .lock_container(tenant_id, resource_type, resource_id)
+            .await;
         let prior = self
             .fetch_prior(tenant_id, resource_type, resource_id)
             .await?;

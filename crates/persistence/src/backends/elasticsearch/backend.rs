@@ -440,7 +440,15 @@ pub struct ElasticsearchBackend {
     /// Admission gate of the contained-document sweeps; see
     /// [`ElasticsearchConfig::contained_sweep_concurrency`].
     pub(super) contained_sweeps: tokio::sync::Semaphore,
+    /// Serializes the writers of one container within this process; see
+    /// [`Self::lock_container`].
+    container_locks: Box<[tokio::sync::Mutex<()>]>,
 }
+
+/// Locks in [`ElasticsearchBackend::container_locks`]. A container maps to one
+/// by hash, so two containers may share a lock (rarely, and harmlessly: they
+/// only take turns); the table does not grow with the number of resources.
+const CONTAINER_LOCK_STRIPES: usize = 8192;
 
 impl Debug for ElasticsearchBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -495,6 +503,61 @@ impl ElasticsearchBackend {
         ]
     }
 
+    fn new_container_locks() -> Box<[tokio::sync::Mutex<()>]> {
+        (0..CONTAINER_LOCK_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    }
+
+    fn container_lock_stripe(tenant_id: &str, resource_type: &str, id: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (tenant_id, resource_type, id).hash(&mut hasher);
+        (hasher.finish() % CONTAINER_LOCK_STRIPES as u64) as usize
+    }
+
+    /// Takes the lock of one container for the span of a write: from before it
+    /// reads what the container records until its `_bulk`, retries included,
+    /// has finished. Two writes of the same resource in this process therefore
+    /// run one after the other, so a late resend of an older write's item
+    /// (after a `429`) cannot land on top of a newer write's documents and
+    /// leave a current contained document behind an older version, which the
+    /// version filter would hide (#2291). Writes of different resources do not
+    /// wait for each other. It does not order writers in different processes.
+    ///
+    /// Take at most one lock at a time, or use [`Self::lock_containers`].
+    pub(super) async fn lock_container(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.container_locks[Self::container_lock_stripe(tenant_id, resource_type, id)]
+            .lock()
+            .await
+    }
+
+    /// [`Self::lock_container`] for the owners of a page: every distinct lock,
+    /// in ascending order, so that two pages sharing owners in a different
+    /// order cannot wait for each other.
+    pub(super) async fn lock_containers<'a>(
+        &self,
+        tenant_id: &str,
+        owners: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<tokio::sync::MutexGuard<'_, ()>> {
+        let mut stripes: Vec<usize> = owners
+            .into_iter()
+            .map(|(resource_type, id)| Self::container_lock_stripe(tenant_id, resource_type, id))
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let mut guards = Vec::with_capacity(stripes.len());
+        for stripe in stripes {
+            guards.push(self.container_locks[stripe].lock().await);
+        }
+        guards
+    }
+
     /// Creates a new Elasticsearch backend with the given configuration.
     pub fn new(config: ElasticsearchConfig) -> StorageResult<Self> {
         Self::validate_config(&config)?;
@@ -536,6 +599,7 @@ impl ElasticsearchBackend {
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
+            container_locks: Self::new_container_locks(),
         })
     }
 
@@ -561,6 +625,7 @@ impl ElasticsearchBackend {
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
+            container_locks: Self::new_container_locks(),
         })
     }
 

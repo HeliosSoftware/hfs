@@ -2273,3 +2273,223 @@ async fn sqlite_es_transaction_indexes_primary_version_and_accepts_if_match() {
         "{conflict:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The in-process lock per container (#2291): writes of one resource serialize
+// from the read of the previous state to the end of their `_bulk`.
+// ---------------------------------------------------------------------------
+
+const PATIENT_DOC_PREFIX: &str = "/hfs_write-stub_patient/_doc/";
+
+/// A Patient `id` whose contained Organization is named `org_name`.
+fn contained_patient(id: &str, org_name: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "id": id,
+        "contained": [{ "resourceType": "Organization", "id": "org1", "name": org_name }],
+        "managingOrganization": { "reference": "#org1" }
+    })
+}
+
+fn stored_as(id: &str, content: Value) -> StoredResource {
+    let now = chrono::Utc::now();
+    StoredResource::from_storage(
+        "Patient",
+        id,
+        "1",
+        TenantId::new(TENANT),
+        content,
+        now,
+        now,
+        None,
+        FhirVersion::default(),
+    )
+}
+
+/// Mocks for the concurrency tests: any container is absent, `_mget` finds
+/// nothing, and `_bulk` is acknowledged after `bulk_delay` (the first one is
+/// answered `429` when `throttle_first` is set).
+async fn lock_mocks(server: &MockServer, bulk_delay: Duration, throttle_first: bool) {
+    indices_exist(server).await;
+    on_prefix(server, "GET", PATIENT_DOC_PREFIX, |_| container_absent()).await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(mget_nothing_found)
+        .mount(server)
+        .await;
+    let calls = AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/_bulk"))
+        .respond_with(move |request: &Request| {
+            if throttle_first && calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                error_body(429, "es_rejected_execution_exception")
+            } else {
+                bulk_ack(request).set_delay(bulk_delay)
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+/// The requests that matter, in arrival order: `get`, `mget` or `bulk`.
+async fn arrival_order(server: &MockServer) -> Vec<(&'static str, String)> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter_map(|r| {
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            match (r.method.as_str(), r.url.path()) {
+                ("GET", p) if p.starts_with(PATIENT_DOC_PREFIX) => Some(("get", body)),
+                ("POST", "/_mget") => Some(("mget", body)),
+                ("POST", "/_bulk") => Some(("bulk", body)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn kinds(order: &[(&'static str, String)]) -> Vec<&'static str> {
+    order.iter().map(|(kind, _)| *kind).collect()
+}
+
+/// Risk: a late resend of a throttled item of the first writer overwrites a
+/// current child written by the second writer of the same resource.
+#[tokio::test]
+async fn two_concurrent_updates_of_one_resource_do_not_interleave_even_across_a_429_resend() {
+    let server = MockServer::start().await;
+    lock_mocks(&server, Duration::ZERO, true).await;
+    let es = backend(&server);
+    let ctx = tenant();
+    let previous = stored_as("p1", plain_patient());
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            es.update(&ctx, &previous, contained_patient("p1", "first-writer")),
+            es.update(&ctx, &previous, contained_patient("p1", "second-writer")),
+        )
+    })
+    .await
+    .expect("no deadlock");
+    first.expect("first update");
+    second.expect("second update");
+
+    // One writer: read, bulk (429), bulk (resend). The other: read, bulk.
+    let order = arrival_order(&server).await;
+    assert_eq!(
+        kinds(&order),
+        ["get", "bulk", "bulk", "get", "bulk"],
+        "the second write read and wrote before the first finished: {order:?}"
+    );
+    let tag = |body: &str| if body.contains("first-writer") { 1 } else { 2 };
+    assert_eq!(
+        tag(&order[1].1),
+        tag(&order[2].1),
+        "the resend is the first writer's"
+    );
+    assert_ne!(
+        tag(&order[2].1),
+        tag(&order[4].1),
+        "the last bulk is the other writer's"
+    );
+}
+
+/// Risk: the lock is global (or too coarse) and serializes unrelated resources.
+#[tokio::test]
+async fn concurrent_writes_of_different_resources_are_not_serialized() {
+    const DELAY: Duration = Duration::from_millis(300);
+    let server = MockServer::start().await;
+    lock_mocks(&server, DELAY, false).await;
+    let es = backend(&server);
+    let ctx = tenant();
+    let version = FhirVersion::default();
+
+    let started = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        es.create_or_update(&ctx, "Patient", "a", contained_patient("a", "A"), version),
+        es.create_or_update(&ctx, "Patient", "b", contained_patient("b", "B"), version),
+    );
+    let elapsed = started.elapsed();
+    a.expect("write of a");
+    b.expect("write of b");
+
+    assert!(
+        elapsed >= DELAY,
+        "each write waits for its own _bulk: {elapsed:?}"
+    );
+    assert!(
+        elapsed < DELAY.mul_f32(1.6),
+        "writes of different resources ran one after the other: {elapsed:?}"
+    );
+    assert_eq!(bulk_requests(&server).await.len(), 2);
+}
+
+/// Risk: a page and an update of one of its resources interleave their
+/// read-then-write, or wait on each other forever.
+#[tokio::test]
+async fn a_page_and_an_update_of_one_of_its_resources_serialize_without_deadlock() {
+    let server = MockServer::start().await;
+    lock_mocks(&server, Duration::from_millis(200), false).await;
+    let es = backend(&server);
+    let ctx = tenant();
+    let page: Vec<StoredResource> = ["p1", "p2", "p3"]
+        .iter()
+        .map(|id| stored_as(id, contained_patient(id, "paged")))
+        .collect();
+    let previous = stored_as("p1", plain_patient());
+
+    let (results, updated) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            es.write_search_entries_page(&ctx, &page),
+            es.update(&ctx, &previous, contained_patient("p1", "updated")),
+        )
+    })
+    .await
+    .expect("no deadlock");
+    assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+    updated.expect("update");
+
+    let order = arrival_order(&server).await;
+    let page_then_update = ["mget", "bulk", "get", "bulk"];
+    let update_then_page = ["get", "bulk", "mget", "bulk"];
+    let got = kinds(&order);
+    assert!(
+        got == page_then_update || got == update_then_page,
+        "page and update overlapped: {order:?}"
+    );
+}
+
+/// Risk: two pages that share resources in opposite order take their locks
+/// crosswise and deadlock.
+#[tokio::test]
+async fn two_pages_sharing_resources_in_opposite_order_do_not_deadlock() {
+    let server = MockServer::start().await;
+    lock_mocks(&server, Duration::from_millis(100), false).await;
+    let es = backend(&server);
+    let ctx = tenant();
+    let page = |ids: [&str; 2]| -> Vec<StoredResource> {
+        ids.iter()
+            .map(|id| stored_as(id, contained_patient(id, "paged")))
+            .collect()
+    };
+    let (ab, ba) = (page(["a", "b"]), page(["b", "a"]));
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            es.write_search_entries_page(&ctx, &ab),
+            es.write_search_entries_page(&ctx, &ba),
+        )
+    })
+    .await
+    .expect("no deadlock");
+    assert!(first.iter().all(|r| r.is_ok()), "{first:?}");
+    assert!(second.iter().all(|r| r.is_ok()), "{second:?}");
+
+    let order = arrival_order(&server).await;
+    assert_eq!(
+        kinds(&order),
+        ["mget", "bulk", "mget", "bulk"],
+        "pages over the same resources must not interleave: {order:?}"
+    );
+}

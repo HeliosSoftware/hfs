@@ -214,15 +214,30 @@ shows.
 
 **What the filter does not give: protection against false negatives.** It
 protects against showing what should not be shown, not against hiding what
-should be shown. If a *late resend* of an older writer's item (for example a
+should be shown. If a *late resend* of an older writer's item (for example an
 `index x` of version 2 that was throttled and is resent after version 3 wrote
 `x`) overwrites a current child, that child now carries version 2 under a
-version-3 container and is hidden until the container is rewritten. It needs
-two writers on the same resource, which the composite serializes in the usual
-case (one sync per resource) but not between the sync worker and the
-sync-failure repair task. Closing it needs `version_type=external_gte` with the
-numeric version on children and container, treating a child's 409 as a no-op;
-that is a follow-up, not part of this change.
+version-3 container and is hidden until the container is rewritten.
+
+**In-process lock.** Within one HFS process this cannot happen: every write of
+a container (`upsert`, `update`, `write_search_entries`, `delete`/`purge`, and
+each owner of a sync or rebuild page) takes a lock keyed by
+`(tenant, type, id)` before it reads what the container records and keeps it
+until its `_bulk`, resends after a `429` included, is done. The locks are a
+fixed table of 8192 mutexes selected by hash (two containers may share one and
+then only take turns; the table does not grow with the data). A page takes the
+locks of its owners in ascending order without repeats, so two pages sharing
+owners in opposite order cannot wait for each other. Writes of different
+resources do not wait for each other. Tests:
+`two_concurrent_updates_of_one_resource_do_not_interleave_even_across_a_429_resend`,
+`a_page_and_an_update_of_one_of_its_resources_serialize_without_deadlock`
+(both fail with the lock disabled), `concurrent_writes_of_different_resources_are_not_serialized`
+and `two_pages_sharing_resources_in_opposite_order_do_not_deadlock` (this one
+checks only that there is no deadlock).
+
+**Not covered:** writers in different HFS processes. Closing that needs
+`version_type=external_gte` with the numeric version on children and container,
+treating a child's 409 as a no-op; follow-up, not part of this change.
 
 ### 3.7 Id format and container-type collisions
 
@@ -490,20 +505,35 @@ branch has a WARN, an ERROR, a 429, a `too_many_scroll_contexts` or a
   not delete documents the previous incarnation recorded; the filter hides
   them.
 - **Cost of the container lookup** on `_contained` searches: measured in 8.2.
-- **Writers racing on one resource** can leave a current child hidden (see the
-  end of 3.6); follow-up: external versioning of children and container.
+- **Writers in different processes racing on one resource** can leave a current
+  child hidden (see 3.6); the in-process lock covers one process only.
+  Follow-up: external versioning of children and container.
 - **A transient failure leaves recorded stale ids unswept.** If a delete of an
   obsolete id fails transiently after the container got the new list, no
   repair runs (4). The document has the previous version, so the filter hides
   it, unless the version did not change, which for a changed `contained`
   array means a primary that repeats a `version_id` for different content.
 - **Mapping.** If the additive reconcile of `contained_doc_ids` fails
-  transiently (`reconcile_index` only logs), the field is mapped dynamically
-  (`text` + `keyword`) by the first document, and the later
-  `keyword`/`index:false` mapping would be rejected as a conflict, leaving the
-  index at the old schema version. A `dynamic_templates` entry for the field,
-  or writing it only once the index is reconciled, would remove this; not done
-  here.
+  transiently (`reconcile_index` only logs), the first document carrying the
+  field makes Elasticsearch map it dynamically (`text` + `keyword`), and the
+  later `keyword`/`index:false` mapping is rejected as a conflict, leaving the
+  index at the old schema version and rejecting future schema bumps. Reads are
+  not affected (the field is read from `_source`). A `dynamic_templates` entry
+  was tried and removed: it travels in the same `PUT _mapping` as the explicit
+  property, so it does not reach an index whose reconcile failed and protects
+  nothing. The remedy is not to write the field into an index not confirmed at
+  schema 3 (treat it as `Legacy`), or a `$reindex`; neither is done here.
+- **Standalone Elasticsearch without a primary** (library use, tests; no mode
+  of the server binary): versions are numbered by the secondary. A write whose
+  container item is rejected permanently leaves its children at the next
+  version; a retry with different contained content computes the same version
+  and does not delete the first attempt's extra child, which then matches the
+  container's version and shows. With a primary, versions are unique per
+  content and the children are hidden.
+- **A closed container index** is treated like a missing one by the lookup:
+  `_contained` searches silently return fewer results (200) instead of failing.
+  It follows the rule for `index_not_found`, but a closed index is not an
+  absence the cluster states; kept, and noted here.
 - **Migration.** Contained documents written by releases where `update` did
   not re-index children (#1382) may carry a `version_id` different from their
   container's and are now hidden, where before they were shown. A
