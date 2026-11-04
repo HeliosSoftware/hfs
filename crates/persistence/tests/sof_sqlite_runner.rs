@@ -18,6 +18,10 @@ mod sof_pr410_views;
 #[path = "common/sof_columnar.rs"]
 mod sof_columnar;
 
+#[cfg(all(feature = "sqlite", feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
 #[cfg(feature = "sqlite")]
 mod sqlite_runner_tests {
     use futures::StreamExt;
@@ -159,6 +163,20 @@ mod sqlite_runner_tests {
                 assert!(ids.is_empty());
             }
         }
+    }
+
+    /// #2254: a run naming a FHIR version reads only resources stored under it.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[tokio::test]
+    async fn fhir_version_filter_reaches_every_scan() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("runner");
+        super::sof_fhir_version_filter::runner_honors_fhir_version(
+            backend.as_ref(),
+            runner.as_ref(),
+            &test_tenant(),
+        )
+        .await;
     }
 
     #[tokio::test]

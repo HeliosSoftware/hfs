@@ -3997,6 +3997,203 @@ async fn resource_scan_reads_named_resources_by_id() {
     assert!(other_tenant.is_empty(), "reads must not cross tenants");
 }
 
+/// Seeds `per_version` Patients and one ViewDefinition under each of R4 and
+/// R5 (#2254). Patient ids and ViewDefinition ids carry the version.
+#[cfg(feature = "R5")]
+async fn seed_two_versions(backend: &S3Backend, t: &TenantContext, per_version: usize) {
+    for (version, tag) in [(FhirVersion::R4, "r4"), (FhirVersion::R5, "r5")] {
+        for i in 0..per_version {
+            backend
+                .create(
+                    t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("{tag}-p{i}")}),
+                    version,
+                )
+                .await
+                .expect("create Patient");
+        }
+        for i in 0..per_version {
+            backend
+                .create(
+                    t,
+                    "ViewDefinition",
+                    json!({
+                        "resourceType": "ViewDefinition",
+                        "id": format!("{tag}-vd{i}"),
+                        "url": format!("http://example.org/{tag}-vd{i}"),
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{ "column": [{ "path": "id", "name": "id" }] }],
+                    }),
+                    version,
+                )
+                .await
+                .expect("create ViewDefinition");
+        }
+    }
+}
+
+/// #2254: the scan-served definition listing honours a version filter before
+/// paging, so the total and every page describe that version only; without
+/// one, both versions are listed.
+#[cfg(feature = "R5")]
+#[tokio::test]
+async fn definition_listing_filters_by_stored_fhir_version() {
+    use crate::core::search::SearchProvider;
+    use crate::types::SearchQuery;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    seed_two_versions(&backend, &t, 3).await;
+
+    let blind = backend
+        .search(&t, &SearchQuery::new("ViewDefinition"))
+        .await
+        .expect("blind listing");
+    assert_eq!(blind.total, Some(6), "no version named: every version");
+
+    for (version, tag) in [(FhirVersion::R4, "r4"), (FhirVersion::R5, "r5")] {
+        let query = SearchQuery::new("ViewDefinition").with_fhir_version(version);
+        let all = backend.search(&t, &query).await.expect("filtered listing");
+        assert_eq!(all.total, Some(3), "{tag}: total counts one version");
+        assert!(
+            all.resources
+                .items
+                .iter()
+                .all(|r| r.fhir_version() == version && r.id().starts_with(tag)),
+            "{tag}: only that version's definitions"
+        );
+
+        // Pages of two: the first has a next page, the second is the last,
+        // and together they hold the version's three definitions once.
+        let mut ids = Vec::new();
+        for (offset, has_next) in [(0u32, true), (2, false)] {
+            let mut page_query = query.clone();
+            page_query.count = Some(2);
+            page_query.offset = Some(offset);
+            let page = backend.search(&t, &page_query).await.expect("page");
+            assert_eq!(page.total, Some(3), "{tag}: page total");
+            assert_eq!(
+                page.resources.page_info.has_next, has_next,
+                "{tag}: has_next at offset {offset}"
+            );
+            ids.extend(page.resources.items.iter().map(|r| r.id().to_string()));
+        }
+        ids.sort();
+        let expected: Vec<String> = (0..3).map(|i| format!("{tag}-vd{i}")).collect();
+        assert_eq!(ids, expected, "{tag}: pages");
+    }
+}
+
+/// #2254: the scan hook's version-aware methods drop resources stored under
+/// another version; `None` is the version-blind scan.
+#[cfg(feature = "R5")]
+#[tokio::test]
+async fn resource_scan_filters_by_stored_fhir_version() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    seed_two_versions(&backend, &t, 2).await;
+    let scan = backend.resource_scan().expect("scan hook");
+
+    let scanned = |version: Option<FhirVersion>| {
+        let scan = scan.clone();
+        let t = t.clone();
+        async move {
+            let mut ids: Vec<String> = scan
+                .scan_resources_of_version(&t, "Patient", version)
+                .await
+                .expect("scan")
+                .map(|r| r.expect("scanned")["id"].as_str().unwrap().to_string())
+                .collect()
+                .await;
+            ids.sort();
+            ids
+        }
+    };
+    assert_eq!(scanned(None).await, ["r4-p0", "r4-p1", "r5-p0", "r5-p1"]);
+    assert_eq!(scanned(Some(FhirVersion::R4)).await, ["r4-p0", "r4-p1"]);
+    assert_eq!(scanned(Some(FhirVersion::R5)).await, ["r5-p0", "r5-p1"]);
+
+    let ids = ["r4-p0", "r5-p0"].map(str::to_string);
+    for (version, expected) in [
+        (None, vec!["r4-p0", "r5-p0"]),
+        (Some(FhirVersion::R4), vec!["r4-p0"]),
+        (Some(FhirVersion::R5), vec!["r5-p0"]),
+    ] {
+        let mut found: Vec<String> = scan
+            .read_resources_of_version(&t, "Patient", &ids, version)
+            .await
+            .expect("read by id")
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected, "{version:?}");
+    }
+}
+
+/// #2254: the S3 in-process `$sql-run` runner reads only the rows of the
+/// named version, and a `patient` filter naming a Patient stored under
+/// another version finds no such Patient.
+#[cfg(feature = "R5")]
+#[tokio::test]
+async fn sof_runner_reads_only_the_named_fhir_version() {
+    use crate::core::sof_runner::ViewFilters;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    seed_two_versions(&backend, &t, 2).await;
+    let runner = backend.sof_runner().expect("S3 has an in-process runner");
+    let view = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "status": "active",
+        "select": [{ "column": [{ "path": "id", "name": "id" }] }],
+    });
+
+    let run = |filters: ViewFilters| {
+        let runner = runner.clone();
+        let t = t.clone();
+        let view = view.clone();
+        async move {
+            let mut ids: Vec<String> = runner
+                .run_view(&t, view, filters)
+                .await
+                .expect("run_view")
+                .map(|row| row.expect("row")["id"].as_str().unwrap().to_string())
+                .collect()
+                .await;
+            ids.sort();
+            ids
+        }
+    };
+
+    assert_eq!(
+        run(ViewFilters::default()).await,
+        ["r4-p0", "r4-p1", "r5-p0", "r5-p1"],
+        "no version named: every version"
+    );
+    for (version, expected) in [
+        (FhirVersion::R4, ["r4-p0", "r4-p1"]),
+        (FhirVersion::R5, ["r5-p0", "r5-p1"]),
+    ] {
+        let filters = ViewFilters {
+            fhir_version: Some(version),
+            ..Default::default()
+        };
+        assert_eq!(run(filters).await, expected, "{version:?}");
+    }
+
+    // The compartment's Patient is read under the run's version too.
+    let filters = ViewFilters {
+        fhir_version: Some(FhirVersion::R5),
+        patient: vec!["Patient/r5-p1".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(run(filters).await, ["r5-p1"]);
+}
+
 #[tokio::test]
 async fn tenant_registry_unsupported_without_system_bucket() {
     let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));

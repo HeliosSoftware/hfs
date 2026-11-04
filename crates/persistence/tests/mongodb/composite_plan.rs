@@ -327,13 +327,13 @@ async fn mongodb_composite_pages_and_totals_match_expected_on_every_route() {
     }
     for number in 10..15 {
         backend
-            .delete(&tenant, "Observation", &format!("panel-{number:03}"))
+            .seed_delete(&tenant, "Observation", &format!("panel-{number:03}"))
             .await
             .unwrap();
     }
     for number in 30..35 {
         backend
-            .delete(&tenant, "Observation", &format!("height-{number:03}"))
+            .seed_delete(&tenant, "Observation", &format!("height-{number:03}"))
             .await
             .unwrap();
     }

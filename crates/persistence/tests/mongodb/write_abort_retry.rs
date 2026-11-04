@@ -238,7 +238,7 @@ async fn backend_with_observation_configured(
     .await?;
     let tenant = create_tenant(test);
     let (stored, created) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-1",
@@ -259,7 +259,7 @@ async fn backend_with_deleted_observation(
 ) -> Option<(MongoBackend, TenantContext)> {
     let (backend, tenant) = backend_with_observation(test, app).await?;
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .expect("deleting the seeded Observation");
     Some((backend, tenant))
@@ -733,7 +733,7 @@ async fn a_restore_aborted_on_the_index_delete_is_run_again() {
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .unwrap();
     let Some(fail_point) =
@@ -969,7 +969,7 @@ async fn a_restore_that_lost_a_race_on_its_search_index_delete_is_run_again() {
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .unwrap();
     let Some(fail_point) =
@@ -1459,7 +1459,7 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
     else {
         return;
     };
-    mate.create(
+    mate.seed_create(
         &tenant,
         "SearchParameter",
         search_parameter("wcu-mate-sp", "mate-nickname"),
@@ -1971,7 +1971,7 @@ async fn a_restore_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadl
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .expect("deleting the seeded Observation");
     let Some(fail_point) = FailPoint::enable(
@@ -2105,7 +2105,7 @@ async fn a_create_that_hit_a_write_conflict_at_its_commit_is_run_again() {
     };
     let tenant = create_tenant("wc_create_commit");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             new_observation("preliminary"),
@@ -3273,7 +3273,7 @@ async fn a_create_runs_again_only_after_its_failed_attempt_is_aborted() {
     };
     let tenant = create_tenant("abort2307_create");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             new_observation("preliminary"),
@@ -3398,4 +3398,323 @@ async fn a_restore_runs_again_only_after_its_failed_attempt_is_aborted() {
     assert_waited_for_the_abort(elapsed);
     assert_eq!(history_rows(&backend, "obs-1").await, 3);
     assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+// --- Aborts that only time ends get more than four attempts (#2267) ---
+//
+// The server aborts a write that overlaps the database's own background index
+// build with a catalog-change `WriteConflict` (7.0) or `SnapshotUnavailable`
+// (5.0), and it may answer `LockTimeout`, whose holder is not named. The
+// first four attempts and their 700 ms of pauses were shorter than some of
+// those runs. Such a write now goes on, up to 12 attempts, within a wall-clock
+// budget. A failpoint cannot produce the catalog wording of the 7.0
+// `WriteConflict`: an injected 112 is a plain lost race, which
+// `a_lost_race_is_still_a_version_conflict_without_a_second_attempt` pins as
+// one. So 246 and 24 stand in for the class here, and the real catalog text is
+// covered by the unit tests of `replay_aborted_writes` in `storage.rs`. No test
+// below asserts how long a write took. The tests that must commit past the old
+// budget assume an attempt takes well under 2 s; a write already near the 12 s
+// budget at its fourth abort stops there.
+
+/// Attempts a write makes before it gives up when the server keeps aborting it
+/// with a catalog change or a lock timeout (`CATALOG_OR_LOCK_ABORT_RETRY`).
+const CATALOG_OR_LOCK_ABORT_ATTEMPTS: i64 = 12;
+
+/// One abort more than the old budget ([`WRITE_ABORT_ATTEMPTS`]) lets a write
+/// survive.
+const PAST_THE_OLD_BUDGET: i64 = WRITE_ABORT_ATTEMPTS + 1;
+
+/// [`write_conflict_on_insert_into`] for a `LockTimeout` (24) labelled
+/// `TransientTransactionError`: the server's answer to a write that waited for
+/// a collection lock another operation held, as an index build can.
+fn lock_timeout_on_insert_into(backend: &MongoBackend, collection: &str) -> Document {
+    doc! {
+        "failCommands": ["insert"],
+        "errorCode": 24,
+        "errorLabels": ["TransientTransactionError"],
+        "namespace": format!("{}.{collection}", backend.config().database_name),
+    }
+}
+
+/// `PUT` of an existing resource, aborted on the search-index delete by a
+/// catalog change five times, one more than the old budget: the sixth run
+/// commits version 2.
+#[tokio::test]
+async fn an_update_aborted_by_a_catalog_change_past_the_old_budget_commits() {
+    let app = "fp-2267-update-catalog";
+    let Some((backend, tenant)) = backend_with_observation("old_budget_update_catalog", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        snapshot_unavailable_on("delete"),
+        doc! { "times": PAST_THE_OLD_BUDGET },
+    )
+    .await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) =
+        result.expect("a write aborted by a catalog change is run again past four attempts");
+    assert!(!created);
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, PAST_THE_OLD_BUDGET,
+        "one abort per attempt, then a clean one"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, rows_before);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A create whose `resource_history` insert times out on a lock five times, the
+/// shape of the 5th failure of #2267 ("Failed to insert resource history
+/// (session)", `LockTimeout`): the sixth run commits.
+#[tokio::test]
+async fn a_create_aborted_by_a_lock_timeout_past_the_old_budget_commits() {
+    let app = "fp-2267-create-lock-timeout";
+    let Some(backend) = create_backend_with_app_name("old_budget_create_lock_timeout", app).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("old_budget_create_lock_timeout");
+    let failure = lock_timeout_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) =
+        FailPoint::enable(app, failure, doc! { "times": PAST_THE_OLD_BUDGET }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a lock timeout is run again past four attempts");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, PAST_THE_OLD_BUDGET);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
+    assert_status(&backend, &tenant, stored.id(), "final", "amended").await;
+}
+
+/// `DELETE` without `If-Match`, aborted on the search-index delete by a catalog
+/// change five times: the sixth run deletes it.
+#[tokio::test]
+async fn a_plain_delete_aborted_by_a_catalog_change_past_the_old_budget_commits() {
+    let app = "fp-2267-delete-catalog";
+    let Some((backend, tenant)) = backend_with_observation("old_budget_delete_catalog", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        snapshot_unavailable_on("delete"),
+        doc! { "times": PAST_THE_OLD_BUDGET },
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(index_rows(&backend, "obs-1").await > 0);
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a delete aborted by a catalog change is run again past four attempts");
+    assert_eq!(entered, PAST_THE_OLD_BUDGET);
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// A placement change (`StaleConfig`) is not an abort that only time ends, so
+/// it keeps the four attempts: a fifth abort is not waited for.
+#[tokio::test]
+async fn an_update_aborted_by_a_placement_change_past_the_old_budget_still_gives_up() {
+    let app = "fp-2267-update-placement";
+    let Some((backend, tenant)) =
+        backend_with_observation("old_budget_update_placement", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        placement_change_on("delete"),
+        doc! { "times": PAST_THE_OLD_BUDGET },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "The update was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        )
+    );
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one abort per attempt, then give up"
+    );
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(current.version_id(), "1", "nothing committed");
+}
+
+/// A catalog change that outlasts every attempt still gives up as `Unavailable`,
+/// and the 503 says how many times the write was aborted, not why.
+///
+/// The count is a range: the write stops at 12 attempts, or earlier when the
+/// 12 s budget runs out on a slow host before the twelfth (it would then end
+/// at the attempt whose successor could not finish in time). The 12 s budget
+/// can end the write as early as its fourth attempt on a slow host, so the
+/// range starts at four. The message must match the count either way. The
+/// exact count of 12 is pinned by the paused-clock unit test
+/// `a_catalog_change_that_never_ends_is_given_twelve_attempts_before_the_503`
+/// in `storage.rs`, and the commit tests pin going past four against a real
+/// mongod.
+#[tokio::test]
+async fn a_catalog_change_abort_that_persists_past_the_old_budget_gives_up_as_unavailable() {
+    let app = "fp-2267-update-catalog-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("old_budget_update_catalog_exhausted", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        snapshot_unavailable_on("delete"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert!(
+        (WRITE_ABORT_ATTEMPTS..=CATALOG_OR_LOCK_ABORT_ATTEMPTS).contains(&entered),
+        "at least the four attempts, at most the new budget: {entered}"
+    );
+    assert_eq!(
+        *message,
+        format!("The update was aborted by the database {entered} times; retry the request"),
+        "the 503 says how often the write was aborted, not why"
+    );
+    assert!(
+        !message.contains("246") && !message.contains("SnapshotUnavailable"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(current.version_id(), "1", "nothing committed");
+    assert_eq!(index_rows(&backend, "obs-1").await, rows_before);
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
+}
+
+/// A write with no time left until its `single_write_deadline` gets the four
+/// attempts and nothing more, even for a catalog change: the extra attempts
+/// stop before the request timeout does.
+#[tokio::test]
+async fn a_zero_write_deadline_stops_a_catalog_change_abort_at_the_old_budget() {
+    let app = "fp-2267-update-catalog-no-deadline";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("old_budget_zero_deadline", app, |config| {
+            config.single_write_deadline = Some(std::time::Duration::ZERO);
+        })
+        .await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        snapshot_unavailable_on("delete"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "The update was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        )
+    );
+    assert_eq!(entered, WRITE_ABORT_ATTEMPTS);
 }

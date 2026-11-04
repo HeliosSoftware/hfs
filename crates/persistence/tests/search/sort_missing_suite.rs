@@ -33,6 +33,8 @@ use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirection, SortDirective,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// (id, family, gender, birthDate).
 type Seed = (
     &'static str,
@@ -287,7 +289,7 @@ where
             patient["birthDate"] = Value::from(*birth_date);
         }
         backend
-            .create(tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create Patient/{id} failed: {e}"));
     }

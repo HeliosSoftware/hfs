@@ -27,6 +27,8 @@ use helios_persistence::error::{ConcurrencyError, StorageError, ValidationError}
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 const CRITERIA: &str = "identifier=ne123";
 const NOBODY: &str = "identifier=nobody";
 /// Both `twin-a` and `twin-b`.
@@ -88,7 +90,7 @@ where
         ("twin-b", "Twin", "twin"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &t,
                 "Patient",
                 patient(id, family, identifier),

@@ -24,6 +24,8 @@ use helios_persistence::types::{
 };
 use serde_json::json;
 
+use crate::seeding::SeedingStorage;
+
 /// What the source does on a page read.
 #[derive(Clone, Copy)]
 pub enum Interruption {
@@ -164,7 +166,7 @@ async fn try_found<B: SearchProvider>(
 async fn seed<B: ResourceStorage>(backend: &B, tenant: &TenantContext, ids: &[&str]) {
     for id in ids {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id, "gender": "female"}),

@@ -2,6 +2,10 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;
+
 #[path = "reindex/scoped_clear.rs"]
 mod scoped_clear;
 
@@ -97,6 +101,21 @@ mod sql_composite_slots_suite;
 /// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
 #[path = "search/total_mode_suite.rs"]
 mod total_mode_suite;
+
+/// The backend-agnostic FHIR version filter suite (#2254). Same `#[path]`
+/// arrangement; needs R4 and R5.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// #2254: a query naming a FHIR version matches only resources stored
+/// under it, on every pagination path, count, ids and `_contained`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[tokio::test]
+async fn sqlite_search_honors_fhir_version() {
+    let backend = create_backend();
+    fhir_version_filter_suite::search_honors_fhir_version(&backend, "fhir-version-2254").await;
+}
 
 /// #2283: a total is reported only when `_total` asks for one.
 #[tokio::test]

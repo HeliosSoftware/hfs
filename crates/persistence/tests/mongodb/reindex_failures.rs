@@ -56,7 +56,7 @@ async fn failure_fixture(
     for n in 0..40 {
         let id = format!("obs-{n:02}");
         let (resource, _) = backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 &id,
@@ -1375,7 +1375,7 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
     let checked = AssertUnwindSafe(async {
         let target = page[0].id();
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 target,
@@ -1698,12 +1698,12 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
         // Keep the saved page at version 1 while the current resource changes.
         if deleted {
             backend
-                .delete(&tenant, "Observation", target)
+                .seed_delete(&tenant, "Observation", target)
                 .await
                 .unwrap();
         } else {
             let (updated, _) = backend
-                .create_or_update(
+                .seed_put(
                     &tenant,
                     "Observation",
                     target,

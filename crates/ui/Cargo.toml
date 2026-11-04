@@ -140,12 +140,12 @@ axum-embed = "0.1"
 
 # Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
 # embedded at compile time — same no-runtime-dependency stance as the assets.
-# See docs/multi-language.md for the i18n rules of the road.
+# See crates/ui/docs/multi-language.md for the i18n rules of the road.
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 
 # History & Versions diff rendering (#236, decision recorded in
-# docs/history-diff-rendering.md). Two layers, both server-side:
+# crates/ui/docs/history-diff-rendering.md). Two layers, both server-side:
 #  - json-patch: the semantic field-level view. Already in the workspace lock
 #    (a default dep of helios-rest/helios-persistence), so zero new transitive
 #    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
