@@ -526,6 +526,19 @@ pub trait ReindexTarget: Send + Sync {
         .into())
     }
 
+    /// Physically removes the contained-document entries of containers of
+    /// `resource_types` whose container is gone or at another version, and
+    /// returns how many went (#2291). The driver calls it at the end of a
+    /// whole-type run without `clearExisting`; a failure is only logged. The
+    /// default has nothing to collect.
+    async fn collect_contained_orphans(
+        &self,
+        _tenant: &TenantContext,
+        _resource_types: &[String],
+    ) -> StorageResult<u64> {
+        Ok(0)
+    }
+
     /// Whether [`Self::write_search_entries_page`] replaces *all* of a
     /// resource's existing entries (including its contained entries). A
     /// `clearExisting` run no longer empties the index first (#2278), so for a
@@ -4135,6 +4148,39 @@ async fn run_reindex(
                         "Orphan sweep failed; the index is complete but may hold stale rows: {errors}"
                     ),
                 );
+            }
+        }
+    }
+
+    // A whole-type rebuild without `clearExisting` keeps the contained entries
+    // a container no longer has (#2291): collect them. Never fails the run.
+    if !request.clear_existing
+        && !request.clear_only
+        && !request.metadata_only
+        && named_resources.is_none()
+        && request.id_start.is_none()
+        && request.id_end.is_none()
+    {
+        for (index, writer) in writers.iter().enumerate() {
+            match writer
+                .collect_contained_orphans(&tenant, &resource_types)
+                .await
+            {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(
+                    job_id = %job_id,
+                    tenant = %tenant_label,
+                    writer = index,
+                    contained_orphans_removed = removed,
+                    "reindex contained orphan collection finished"
+                ),
+                Err(e) => tracing::warn!(
+                    job_id = %job_id,
+                    tenant = %tenant_label,
+                    writer = index,
+                    error = %e,
+                    "reindex contained orphan collection failed; the run is complete"
+                ),
             }
         }
     }

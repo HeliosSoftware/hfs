@@ -42,6 +42,7 @@
 
 mod backend;
 mod naming;
+mod orphans;
 mod schema;
 pub mod search;
 mod search_impl;
@@ -51,4 +52,5 @@ pub use backend::{
     ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, RefreshInterval,
     WriteRefreshPolicy, parse_refresh_interval,
 };
+pub use orphans::{ORPHAN_PAGE_SIZE, OrphanStats};
 pub use schema::{SCHEMA_VERSION, SCHEMA_VERSION_META_KEY};

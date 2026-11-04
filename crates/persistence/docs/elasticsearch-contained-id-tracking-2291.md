@@ -257,6 +257,32 @@ by id when the container is rewritten or deleted. Old-format documents that no
 container records are covered by the sweep (`Legacy`) or hidden by the version
 filter. A list whose entries do not have that shape is `Legacy` (3.2).
 
+### 3.8 Orphan collector
+
+`ElasticsearchBackend::collect_orphans(tenant, container_type)`
+(`orphans.rs`) physically removes contained documents whose container does not
+exist (or is deleted) or has another `version_id`: the same test as the read
+filter, applied to delete. It never runs a tenant-wide `_delete_by_query`.
+
+Per page of 500 children (`search_after` over `container_type`, `container_id`,
+`resource_type`, `resource_id`, all keyword with doc values): one search under a
+permit of the sweep gate (#2203); one `container_versions` lookup for the
+distinct containers; for the suspects, the locks of their containers (3.6) and
+then a permit, a real-time `_mget` of those containers, and one `_bulk` that
+deletes by id only the children that are still orphans. The real-time re-read
+under the lock is what keeps a child that a running write has just put in
+place before its container, because the container is written last.
+
+It is hooked at the end of a completed whole-type `$reindex` run without
+`clearExisting`, `clear_only`, `metadata_only`, named ids or an id range
+(`ReindexTarget::collect_contained_orphans`, after the `sweep_orphans` of
+#2278, which covers resources the source no longer holds; this covers children
+of containers that are alive). A failure is logged and never fails the run.
+It is idempotent. Limits: writers of other processes do not take the lock (the
+effect is a child hidden until the next write, as in 3.6); `search_after`
+without a point in time can skip or repeat a document, which the next run
+repairs; it walks every child of each reindexed type.
+
 ## 4. The sweep as a repair path
 
 `delete_contained_docs` and the #2203 semaphore stay unchanged. It runs only
@@ -511,11 +537,10 @@ path; the lazy check of 8.2 is what the last `_contained` numbers measure).
 
 ## 9. Residual risks and follow-ups
 
-- **Hidden garbage, not deleted garbage.** The filter hides orphaned and
-  stale contained documents; it does not remove them, so they take disk and
-  count in index statistics until something deletes them. A collector is a
-  separate issue, to hang on `sweep_orphans` of #2278. Until then the
-  documents of a rebuild without `clearExisting` (3.5) stay physically.
+- **Hidden garbage.** The filter hides orphaned and stale contained
+  documents; it does not remove them. A whole-type `$reindex` without
+  `clearExisting` now ends with the orphan collector (3.8), which removes them.
+  Between reindexes they take disk and count in index statistics.
 - **Brief false negatives.** The container lookup is `realtime=false`, so it
   sees the container as of the last refresh. For less than one
   `refresh_interval` after a write, a freshly written contained document can

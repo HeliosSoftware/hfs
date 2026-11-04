@@ -3711,6 +3711,24 @@ impl ElasticsearchBackend {
 
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
+    /// Physically removes the contained documents whose container is gone or
+    /// at another version, for the types a whole-type `$reindex` rebuilt
+    /// (#2291). See [`ElasticsearchBackend::collect_orphans`].
+    async fn collect_contained_orphans(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[String],
+    ) -> StorageResult<u64> {
+        let mut removed = 0;
+        for resource_type in resource_types {
+            removed += self
+                .collect_orphans(tenant, Some(resource_type))
+                .await?
+                .orphans_deleted;
+        }
+        Ok(removed)
+    }
+
     /// Lists the distinct resource ids the type has documents for: top-level
     /// documents by `resource_id`, contained documents by their container's
     /// `container_id`, in id order. The cursor is the last id returned.
