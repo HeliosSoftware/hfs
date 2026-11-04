@@ -25383,3 +25383,137 @@ async fn mongodb_integration_standalone_boot_keeps_search_side_indexes() {
         "Required query index is missing: resources.idx_resources_missing_params"
     );
 }
+
+/// Switching a database from mongo-es to the standalone backend (#2289): the
+/// standalone boot rebuilds the search-side indexes by itself, searches see
+/// nothing until `$reindex` (the offloaded writes never wrote search rows), and
+/// after `$reindex` search and `:missing` answer correctly.
+#[tokio::test]
+async fn mongodb_integration_offloaded_to_standalone_switch_rebuilds_and_reindexes() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("offloaded_to_standalone_switch", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-offloaded-switch");
+    for (id, gender) in [("sw-male", Some("male")), ("sw-nogender", None)] {
+        let mut patient = json!({"resourceType": "Patient", "id": id});
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        offloaded
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let (search, _, resources) = search_side_index_names(&offloaded).await;
+    assert!(search.iter().all(|n| n == "_id_"), "{search:?}");
+    assert!(
+        !resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+
+    // The same database, now booted as the standalone backend.
+    let mut config = offloaded.config().clone();
+    config.search_offloaded = false;
+    drop(offloaded);
+    let Some(standalone) = build_backend(config).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    // The boot recreated every index the standalone backend reads and requires.
+    let (search, contained, resources) = search_side_index_names(&standalone).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(matches!(
+        standalone.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    assert!(matches!(
+        standalone.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    let (_, _, resources_after) = search_side_index_names(&standalone).await;
+    assert!(
+        resources_after.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?} -> {resources_after:?}"
+    );
+    ResourceStorage::readiness_check(&standalone)
+        .await
+        .expect("the standalone node is ready after the switch");
+
+    let gender = |modifier, value: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    // Before `$reindex` the search rows do not exist.
+    let before = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert!(ids(&before).is_empty(), "{:?}", ids(&before));
+
+    let registries = standalone.tenant_registries().clone();
+    let standalone = Arc::new(standalone);
+    let reindex = ReindexOperation::new(standalone.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    let found = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec!["sw-male"]);
+    let missing = standalone
+        .search(&tenant, &gender(Some(SearchModifier::Missing), "true"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&missing), vec!["sw-nogender"]);
+}
