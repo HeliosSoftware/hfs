@@ -624,6 +624,19 @@ fn answer_with(n: usize) -> Value {
     json!({ "hits": { "total": { "value": 99, "relation": "eq" }, "hits": hits } })
 }
 
+/// A resource-returning search asks for the resource body: either the whole
+/// `_source` or a field list (#2286) that includes `content`.
+fn assert_loads_bodies(body: &Value) {
+    match body.get("_source") {
+        None => {}
+        Some(Value::Array(fields)) => assert!(
+            fields.contains(&json!("content")),
+            "the full body is requested: {fields:?}"
+        ),
+        Some(other) => panic!("the full body is requested, got `_source`: {other}"),
+    }
+}
+
 #[tokio::test]
 async fn search_ids_asks_for_ids_only_and_no_total() {
     let server = MockServer::start().await;
@@ -655,7 +668,7 @@ async fn search_ids_asks_for_ids_only_and_no_total() {
     );
     // The control: the regular search still loads the bodies, and counts when
     // `_total` asks it to (#2283).
-    assert!(full_body.get("_source").is_none());
+    assert_loads_bodies(full_body);
     assert_eq!(full_body["track_total_hits"], json!(true));
     assert_eq!(page.page_info.total, None);
 }
@@ -770,10 +783,7 @@ async fn search_ids_keeps_the_full_path_for_sort_offset_and_total() {
         assert_eq!(page.items, ["p-0", "p-1"]);
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert!(
-            sent[0].get("_source").is_none(),
-            "the full body is requested"
-        );
+        assert_loads_bodies(&sent[0]);
         assert_eq!(sent[0]["track_total_hits"], counts);
     }
 }

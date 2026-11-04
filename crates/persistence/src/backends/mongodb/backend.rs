@@ -438,6 +438,12 @@ pub struct MongoBackendConfig {
     /// when search is offloaded.
     #[serde(default = "default_reindex_prefetch")]
     pub reindex_prefetch: bool,
+    /// Wall-clock budget of one `$reindex` page's runs (#2290): no further
+    /// run starts if, taking as long as the last one, it would end past this.
+    /// Default 30 s. No `HFS_*` variable sets it; tests that count runs
+    /// against a failpoint raise it so a slow runner cannot end the page early.
+    #[serde(default = "default_reindex_page_budget")]
+    pub reindex_page_budget: Duration,
 
     /// Wall-clock budget for one transaction Bundle, replays and pauses
     /// included (#1586). When the server aborts a transaction with a
@@ -980,6 +986,10 @@ fn default_missing_metadata() -> bool {
     true
 }
 
+fn default_reindex_page_budget() -> Duration {
+    super::retry::REINDEX_PAGE_BUDGET
+}
+
 fn default_bundle_transaction_budget() -> Duration {
     super::retry::DEFAULT_BUNDLE_TRANSACTION_BUDGET
 }
@@ -1024,6 +1034,7 @@ impl Debug for MongoBackendConfig {
             reindex_overlap,
             reindex_prepare_threads,
             reindex_prefetch,
+            reindex_page_budget,
             bundle_transaction_budget,
             bundle_transaction_deadline,
             single_write_deadline,
@@ -1059,6 +1070,7 @@ impl Debug for MongoBackendConfig {
             .field("reindex_overlap", reindex_overlap)
             .field("reindex_prepare_threads", reindex_prepare_threads)
             .field("reindex_prefetch", reindex_prefetch)
+            .field("reindex_page_budget", reindex_page_budget)
             .field("bundle_transaction_budget", bundle_transaction_budget)
             .field("bundle_transaction_deadline", bundle_transaction_deadline)
             .field("single_write_deadline", single_write_deadline)
@@ -1128,6 +1140,7 @@ impl Default for MongoBackendConfig {
             reindex_overlap: default_reindex_overlap(),
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
+            reindex_page_budget: default_reindex_page_budget(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
             single_write_deadline: None,
@@ -2982,12 +2995,14 @@ mod tests {
         assert!(default.reindex_overlap);
         assert_eq!(default.reindex_prepare_threads, 0);
         assert!(default.reindex_prefetch);
+        assert_eq!(default.reindex_page_budget, Duration::from_secs(30));
 
         let from_empty: MongoBackendConfig =
             serde_json::from_str("{}").expect("every field must have a serde default");
         assert!(from_empty.reindex_overlap);
         assert_eq!(from_empty.reindex_prepare_threads, 0);
         assert!(from_empty.reindex_prefetch);
+        assert_eq!(from_empty.reindex_page_budget, Duration::from_secs(30));
     }
 
     #[test]
