@@ -3046,6 +3046,7 @@ where
 /// `batch_bytes` is `HFS_REINDEX_BATCH_BYTES`, the default page byte cap of a
 /// manual `$reindex`.
 #[cfg(feature = "elasticsearch")]
+#[allow(clippy::too_many_arguments)]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
     source: Arc<dyn helios_persistence::search::ReindexSource>,
