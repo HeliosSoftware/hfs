@@ -381,6 +381,45 @@ rounds (+40 to +86 %). Insert did not change; search did not worsen.
   hit batch, up to `max_result_window`), not by ordinary reads or writes.
 - 429 and WARN counts were not collected for this pair.
 
+### 8.1 Second round, after the review fixes and the merge of main
+
+Same method (one A then one B per pair, no repeats of the same arm), now on the
+code of the branch after the review fixes: arm A `origin/main` `5ec98f887`
+(`hfs-es2291-mainA2`), arm B branch `ffea86c8f` (`hfs-es2291-v3`). Two pairs:
+pair 1 with `insert,crud,search`, pair 2 with `crud` only. All runs
+`complete`, 0 k6 errors. **Host load was high and uneven** (load average 5 to
+19 at the start of the runs: other sessions were working on this machine), so
+read the numbers as direction, not as exact sizes.
+
+| leg | metric | A (main) | B (branch) | change |
+|---|---|---|---|---|
+| crud, pair 1 | req/s | 1290.2 | 2018.7 | +56.5 % |
+| crud, pair 1 | p50 / p95 / p99 ms | 212.4 / 635.2 / 793.4 | 135.5 / 307.1 / 400.5 | -36.2 % / -51.6 % / -49.5 % |
+| crud, pair 2 | req/s | 1528.1 | 2243.6 | +46.8 % |
+| crud, pair 2 | p50 / p95 / p99 ms | 185.7 / 472.2 / 658.1 | 139.5 / 269.5 / 319.6 | -24.9 % / -42.9 % / -51.4 % |
+| crud | ES CPU avg (cores), pair 1 / 2 | 3.66 / 3.86 | 2.15 / 1.95 | -41.5 % / -49.4 % |
+| insert, pair 1 | req/s | 259.4 | 259.9 | +0.2 % |
+| insert, pair 1 | p50 / p95 ms | 214.8 / 241.6 | 219.0 / 232.2 | +2.0 % / -3.9 % |
+| search, pair 1 | req/s | 4884.3 | 6441.3 | +31.9 % |
+| search, pair 1 | p50 / p95 / p99 ms | 5.06 / 11.93 / 18.58 | 4.00 / 9.03 / 12.89 | -20.9 % / -24.3 % / -30.6 % |
+
+Together with the first round (+42.0 % crud req/s), crud improved in all three
+pairs (+42.0 %, +56.5 %, +46.8 %; p95 -41.1 %, -51.6 %, -42.9 %; ES CPU
+roughly halved). That is the path this change targets, and in every pair B is
+better than A.
+
+- **Insert** is unchanged in both rounds (within about 2 %).
+- **Search** is not worse. The +31.9 % in pair 1 is not credited to the change:
+  ordinary searches are not touched by it, and A's search ran while the host
+  load was 19, so it is host noise; the first round saw +5.2 %.
+- **Memory:** HFS RSS peak is 7 to 15 % higher in B in crud and search (for
+  example 192.8 to 210.3 MB); it was +14.7 % in round 1 as well. It is
+  consistent but small in absolute terms, and not explained here.
+- **Not measured, still:** the extra `_mget` of `_contained` searches (the k6
+  workload issues none), and the 429 / WARN counts. The spread between repeated
+  runs of the *same* arm was not collected; each arm ran twice only for crud
+  (A: 1290 and 1528; B: 2019 and 2244 req/s), and the ranges do not overlap.
+
 ## 9. Residual risks and follow-ups
 
 - **Hidden garbage, not deleted garbage.** The filter hides orphaned and
