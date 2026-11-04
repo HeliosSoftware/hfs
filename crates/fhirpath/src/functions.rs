@@ -290,6 +290,16 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: String,
         },
         FunctionInfo {
+            name: "entry",
+            signature: "entry(system, code, [min, max])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "entryIn",
+            signature: "entryIn(valueSet, [min, max])",
+            category: Other,
+        },
+        FunctionInfo {
             name: "escape",
             signature: "escape(target)",
             category: String,
@@ -333,6 +343,11 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             name: "getResourceKey",
             signature: "getResourceKey()",
             category: SqlOnFhir,
+        },
+        FunctionInfo {
+            name: "hasCoding",
+            signature: "hasCoding(system, code, [version])",
+            category: Other,
         },
         FunctionInfo {
             name: "hasValue",
@@ -480,9 +495,29 @@ pub fn builtin_functions() -> &'static [FunctionInfo] {
             category: Other,
         },
         FunctionInfo {
+            name: "resources",
+            signature: "resources(system, code, [type])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "resourcesIn",
+            signature: "resourcesIn(valueSet, [type])",
+            category: Other,
+        },
+        FunctionInfo {
             name: "round",
             signature: "round([precision])",
             category: Math,
+        },
+        FunctionInfo {
+            name: "sameSubject",
+            signature: "sameSubject([other])",
+            category: Other,
+        },
+        FunctionInfo {
+            name: "section",
+            signature: "section(system, code, [min, max])",
+            category: Other,
         },
         FunctionInfo {
             name: "select",

@@ -658,6 +658,7 @@ fn build_translate_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminology_stub::StubServer;
 
     #[tokio::test]
     async fn transport_error_text_redacts_the_url_query() {
@@ -708,14 +709,14 @@ mod tests {
         }
     }
 
-    async fn stub_responses(statuses: Vec<u16>, body: &str) -> wiremock::MockServer {
+    async fn stub_responses(statuses: Vec<u16>, body: &str) -> StubServer {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        use wiremock::{Mock, Request, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         let calls = AtomicUsize::new(0);
         let body = body.to_owned();
-        Mock::given(|_: &Request| true)
+        Mock::given(server.any_path())
             .respond_with(move |_: &Request| {
                 let index = calls.fetch_add(1, Ordering::SeqCst).min(statuses.len() - 1);
                 ResponseTemplate::new(statuses[index]).set_body_string(body.clone())
@@ -744,7 +745,7 @@ mod tests {
                 body,
                 "{operation}"
             );
-            let requests = server.received_requests().await.unwrap();
+            let requests = server.requests().await;
             assert_eq!(requests.len(), 4, "{operation}");
             for request in &requests[1..] {
                 assert_eq!(request.method, requests[0].method);
@@ -774,7 +775,7 @@ mod tests {
                 body,
                 "{operation}"
             );
-            let requests = server.received_requests().await.unwrap();
+            let requests = server.requests().await;
             assert_eq!(requests.len(), 2, "{operation}");
             assert_eq!(requests[1].method, requests[0].method);
             assert_eq!(requests[1].url, requests[0].url);
@@ -797,7 +798,7 @@ mod tests {
             matches!(&error, FhirPathError::TerminologyHttpError { status: 530, message }
             if message.contains("530") && message.contains(body))
         );
-        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        assert_eq!(server.requests().await.len(), 4);
     }
 
     #[tokio::test]
@@ -813,7 +814,7 @@ mod tests {
             matches!(&error, FhirPathError::TerminologyHttpError { status: 504, message }
             if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable"))
         );
-        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        assert_eq!(server.requests().await.len(), 4);
     }
 
     #[tokio::test]
@@ -828,11 +829,7 @@ mod tests {
                     .map_err(|e| e.error),
                 Err(FhirPathError::TerminologyHttpError { status: s, .. }) if s == status
             ));
-            assert_eq!(
-                server.received_requests().await.unwrap().len(),
-                1,
-                "HTTP {status}"
-            );
+            assert_eq!(server.requests().await.len(), 1, "HTTP {status}");
         }
     }
 
@@ -847,7 +844,7 @@ mod tests {
                 .map_err(|e| e.error),
             Err(FhirPathError::ParseError(_))
         ));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(server.requests().await.len(), 1);
     }
 
     #[test]
@@ -919,17 +916,17 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_answers_report_retry_after() {
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
         /// Sends one `expand` to a stub answering `status` with `retry_after` (if any), and
         /// returns the error together with the number of requests the stub saw.
         async fn expand_error(status: u16, retry_after: Option<String>) -> (RequestError, usize) {
-            let server = MockServer::start().await;
+            let server = StubServer::start().await;
             let mut response = ResponseTemplate::new(status).set_body_string("slow down");
             if let Some(value) = retry_after {
                 response = response.insert_header("Retry-After", value.as_str());
             }
-            Mock::given(|_: &Request| true)
+            Mock::given(server.any_path())
                 .respond_with(response)
                 .mount(&server)
                 .await;
@@ -938,7 +935,7 @@ mod tests {
                 .expand("http://example.org/vs", None)
                 .await
                 .unwrap_err();
-            (error, server.received_requests().await.unwrap().len())
+            (error, server.requests().await.len())
         }
 
         let (error, requests) = expand_error(429, Some("7".into())).await;
@@ -1204,15 +1201,15 @@ mod tests {
     /// what hold the wire format under default features.
     async fn translate_param_names(system: &str, code: &str) -> Vec<String> {
         use std::sync::{Arc, Mutex};
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, Request, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let captured = Arc::clone(&seen);
         Mock::given(method("POST"))
-            .and(path("/ConceptMap/$translate"))
+            .and(server.path("/ConceptMap/$translate"))
             .and(move |req: &Request| {
                 if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
                     && let Some(params) = body.get("parameter").and_then(|p| p.as_array())
