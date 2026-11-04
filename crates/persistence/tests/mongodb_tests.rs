@@ -25071,6 +25071,10 @@ mod covered_membership;
 #[path = "mongodb/composite_plan.rs"]
 mod composite_plan;
 
+/// `tuple_code` of token+quantity composites and the one-scan search it enables.
+#[path = "mongodb/composite_tuple.rs"]
+mod composite_tuple;
+
 /// #2254: searches and view runs restricted to one stored FHIR version. The
 /// same type is stored under R4 and R5, so both features are needed.
 #[cfg(all(feature = "R4", feature = "R5"))]

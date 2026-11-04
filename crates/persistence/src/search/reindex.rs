@@ -501,6 +501,21 @@ pub trait ReindexTarget: Send + Sync {
         self.clear_search_index(tenant).await
     }
 
+    /// Called once when a run finished with status `Completed`. `full_tenant`
+    /// is true for an unscoped run (every type, no parameter, resource, id or
+    /// metadata restriction, not clear-only); `clean` is true when it recorded
+    /// no error. A writer whose index rows depend on a complete rebuild (the
+    /// MongoDB `tuple_code` of token+quantity composites) records it here.
+    /// Failures are the writer's to log; the run is already complete.
+    /// Default: nothing.
+    async fn reindex_run_completed(
+        &self,
+        _tenant: &TenantContext,
+        _full_tenant: bool,
+        _clean: bool,
+    ) {
+    }
+
     /// Lists one page of the resource ids this writer holds index entries for,
     /// within one type: the ids of top-level entries and the ids of the
     /// containers of contained entries (those are indexed under the container's
@@ -3619,6 +3634,14 @@ async fn run_reindex(
     // Determine resource types to process, remembering whether the request
     // named them so that clearing stays within that scope.
     let type_scoped = request.resource_types.is_some();
+    let full_tenant_run = request.resource_types.is_none()
+        && request.search_param_urls.is_none()
+        && request.resource_ids.is_none()
+        && request.id_start.is_none()
+        && request.id_end.is_none()
+        && !request.clear_only
+        && !request.metadata_only
+        && !request.bulk_index_rebuild;
     let resource_types = match (&named_resources, request.resource_types) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
@@ -4161,6 +4184,7 @@ async fn run_reindex(
     log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_COMPLETED);
 
     // Mark as completed
+    let mut completed_clean: Option<bool> = None;
     {
         let mut jobs_guard = jobs.write();
         if let Some(progress) = jobs_guard.get_mut(&job_id)
@@ -4169,6 +4193,15 @@ async fn run_reindex(
             progress.status = ReindexStatus::Completed;
             progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
             progress.current_resource_type = None;
+            completed_clean = Some(!progress.has_errors());
+        }
+    }
+
+    if let Some(clean) = completed_clean {
+        for writer in &writers {
+            writer
+                .reindex_run_completed(&tenant, full_tenant_run, clean)
+                .await;
         }
     }
 }

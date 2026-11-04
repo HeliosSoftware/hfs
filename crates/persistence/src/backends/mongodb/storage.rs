@@ -5208,7 +5208,7 @@ impl MongoBackend {
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
-                let own = extraction
+                let mut own = extraction
                     .values
                     .iter()
                     .filter_map(|value| {
@@ -5220,6 +5220,9 @@ impl MongoBackend {
                         )
                     })
                     .collect::<Vec<_>>();
+                // The quantity row of a token+quantity composite group carries
+                // its group's codes (`idx_search_composite_tuple_qty`).
+                super::composite_search::stamp_tuple_codes(&mut own);
                 // A parameter whose values all failed to build a row (an
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
@@ -10140,6 +10143,18 @@ impl ReindexTarget for MongoBackend {
             })?;
 
         Ok(result.deleted_count + contained_result.deleted_count)
+    }
+
+    async fn reindex_run_completed(&self, tenant: &TenantContext, full_tenant: bool, clean: bool) {
+        if !(full_tenant && clean) || self.is_search_offloaded() {
+            return;
+        }
+        if let Err(error) = self
+            .record_composite_tuple_codes_complete(tenant.tenant_id().as_str())
+            .await
+        {
+            tracing::warn!(%error, "could not record the tuple_code marker");
+        }
     }
 
     async fn write_search_entries(

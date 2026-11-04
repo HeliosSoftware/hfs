@@ -860,6 +860,56 @@ impl MongoBackend {
         Ok((arms, membership))
     }
 
+    /// A token+quantity composite with one value, whose token is an equality
+    /// on a code, as a plain predicate over the quantity rows' `tuple_code`
+    /// (`idx_search_composite_tuple_qty`): the row proves the code and the
+    /// value of one group together, so the predicate is exact and needs no
+    /// pair validation. `None` keeps the pair-validation path: another shape
+    /// (several values, a `ne` prefix, `|code`), indexes still building, or a
+    /// tenant whose rows may predate `tuple_code`.
+    async fn composite_tuple_predicate(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        parameter: &SearchParameter,
+        indexes_ready: bool,
+    ) -> StorageResult<Option<IndexPredicate>> {
+        if !indexes_ready
+            || parameter.modifier.is_some()
+            || parameter.values.len() != 1
+            || !super::super::composite_search::is_token_quantity(parameter)
+        {
+            return Ok(None);
+        }
+        let split = crate::search::composite_value::split_composite_value(
+            &parameter.values[0].value,
+            &parameter.components,
+        )?;
+        let Some(code) = split
+            .first()
+            .and_then(|token| super::super::composite_search::tuple_code_condition(&token.value))
+        else {
+            return Ok(None);
+        };
+        let quantity = self
+            .composite_component_filters(tenant_id, resource_type, parameter)?
+            .pop()
+            .and_then(|components| components.into_iter().nth(1));
+        let Some(quantity) = quantity else {
+            return Ok(None);
+        };
+        if quantity.negated || !self.composite_tuple_codes_complete(tenant_id).await {
+            return Ok(None);
+        }
+        let mut filter = quantity.filter;
+        filter.insert(super::super::composite_search::TUPLE_CODE_FIELD, code);
+        let mut predicate =
+            self.planning_predicate(db, tenant_id, resource_type, parameter, filter, true);
+        predicate.access = PredicateAccess::composite_tuple();
+        Ok(Some(predicate))
+    }
+
     /// A composite as one predicate. Its filter discovers candidates through one
     /// component per comma value, chosen by bounded probes like the drivers of
     /// separate parameters; its membership pairs every component by group, so a
@@ -1080,7 +1130,16 @@ impl MongoBackend {
                 Vec::with_capacity(indexed.len() + usize::from(compartment.is_some()));
             for (position, param) in indexed.iter().enumerate() {
                 if param.param_type == SearchParamType::Composite {
-                    slots.push(None);
+                    slots.push(
+                        self.composite_tuple_predicate(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            param,
+                            indexes_ready,
+                        )
+                        .await?,
+                    );
                     continue;
                 }
                 let filter = match identifier_filters.remove(&position) {
