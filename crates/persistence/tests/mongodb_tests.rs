@@ -25041,6 +25041,9 @@ async fn mongodb_integration_unfiltered_param_sort_is_bounded() {
 #[path = "mongodb/reindex_failures.rs"]
 mod reindex_failures;
 
+#[path = "mongodb/tenant_purge_races.rs"]
+mod tenant_purge_races;
+
 // ============================================================================
 // T2 cluster suite — F5 resource version-id race (restore path).
 // ============================================================================

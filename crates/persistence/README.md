@@ -1860,10 +1860,10 @@ unwritten are never written.
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
   fully indexed.
 
-**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its
-`resources`, then its `search_index`, `search_index_contained` and `resource_history` rows, so a
-post-commit step or a repair that runs during the purge leaves none of the tenant's rows behind
-(#2259):
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its Bulk
+Data Submit manifests, then its `resources`, then its `search_index`, `search_index_contained` and
+`resource_history` rows, and the rest of its Bulk Data Submit state after those, so a post-commit
+step or a repair that runs during the purge leaves none of the tenant's rows behind (#2259):
 
 - A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
   that claimed one before it runs its batches, which the next two bullets cover.
@@ -1874,15 +1874,59 @@ post-commit step or a repair that runs during the purge leaves none of the tenan
   write conflict on the deleted document), so it aborts and its retry finds nothing to index.
   Neither the step nor the repair inserts a ledger document or a resource.
 
-Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
-against it. A purge that fails part-way can leave rows, history or ledger documents without their
+Client writes to the tenant during the purge are not ordered against it. Work that is already
+running is covered by a check in the writer: a `$reindex` page, a `$bulk-submit` batch and a submit
+worker's artifact record write without a transaction, and one running on another instance cannot be
+seen from the instance that purges, so each checks after it writes (#2310):
+
+- A reindex page reads `resources` again once its rows are in (its verification or its metadata
+  read, which it makes anyway). For a resource it read from this store and no longer finds, it
+  removes exactly the rows it wrote for it, by `_id`. A page of resources handed over by another
+  store is not affected.
+- A bulk-submit batch reads its manifest once more after its last write. A batch whose manifest is
+  gone removes what it wrote: the `resources` it created (by id and its own `last_updated`), its
+  `resource_history` versions, its search rows by `_id`, and the manifest's rollback log and
+  receipts. It ends with `ManifestNotFound`, the error the next batch of its file gets, and the
+  submit worker ends its run on the lost lease. A submit worker's artifact record does the same
+  for its `bulk_submit_files` row and ends with a lost lease.
+
+A check that finds the document ran before the purge deleted it, so the purge's own deletes remove
+what the writer wrote before the check. That is why the manifests are deleted right after the
+ledger, before anything a batch writes, and `resources` before the row collections. It holds
+whichever instance runs the writer. The purge does not wait for the writer, so rows of the tenant
+can exist until the page or batch in flight at the purge has returned; after that, and after the
+purge, none remain, apart from the failure cases below.
+
+A submit worker drops the batch it has in flight when its lease keeper reports the lease lost, and
+a dropped batch never reaches its check. The purge deletes the manifest, which is what makes the
+keeper's next heartbeat match nothing, so the backend does not report that lease lost while a batch
+or an artifact record of the manifest is running on the same instance: the heartbeat is answered
+as a renewal, and the progress writes that end a file (and so drop its siblings' batches) wait
+until those writes have returned. The batch then ends by itself, with its check. This only
+protects a worker from its own instance's writes. It says nothing about another instance, whose
+writer removes its own rows when its command returns. A fence that another worker moved on a
+manifest that still exists is still reported lost at once. The answer is held back at most five
+minutes after the latest such write began, so a command that hangs cannot keep a purged manifest's
+job open; a batch still running after that is dropped as before.
+
+A process that dies between a write and its check, a check or a removal that fails after its
+retries, and a batch that is still running after those five minutes can leave rows, and repeating
+the purge removes them. So can a reindex page that ends in a command error: it returns before its
+check, so the rows of the sub-batches it had completed can remain if a purge coincided with it. A
+write that begins after the purge has returned is new work for the tenant and is not covered. The
+checks cost no round trip per reindex page, one `find` per batch and one per submit artifact, and
+at most one more `find` on a lease check that has already failed while a write of that manifest is
+running. They read from the primary at read concern `local` whatever read preference the
+connection string names.
+
+A purge that fails part-way can leave rows, history or ledger documents without their
 resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
 endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
 `200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
 first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
 
-**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
-unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
+**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` do not use
+the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
 `500` `too-costly`, as described above.
 
 **Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger
