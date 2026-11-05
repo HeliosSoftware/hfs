@@ -12451,6 +12451,9 @@ mod postgres_integration {
             "https://records.example.test/fhir/Patient/p1",
         )
         .await;
+        // Versioned stored reference: `Patient/p1` matches it positively, so
+        // `:not=Patient/p1` must exclude it.
+        create_subject_observation(&backend, &tenant, "ob-ver", "Patient/p1/_history/3").await;
         backend
             .create(
                 &tenant,
@@ -12484,7 +12487,7 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/p1"])
             )
             .await,
-            vec!["ob-pat"],
+            vec!["ob-pat", "ob-ver"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
@@ -12501,7 +12504,9 @@ mod postgres_integration {
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
-            vec!["ob-abs", "ob-grp", "ob-none", "ob-other", "ob-pat"],
+            vec![
+                "ob-abs", "ob-grp", "ob-none", "ob-other", "ob-pat", "ob-ver"
+            ],
         );
     }
 
