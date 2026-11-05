@@ -3328,14 +3328,24 @@ impl PostgresQueryBuilder {
         // together — see `build_token_condition` for why (an OR'd sublink is left as
         // a re-executable SubPlan instead of being pulled up into a semi-join). The
         // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
-        Some(SqlFragment::with_params(
-            format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
-                sql_string_literal(&param.name),
-                conditions.join(" OR ")
-            ),
-            params,
-        ))
+        let membership = format!(
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
+            sql_string_literal(&param.name),
+            conditions.join(" OR ")
+        );
+        // `:not` negates the whole membership (#2494), as the token builder
+        // does and as SQLite's `resource_key NOT IN (...)` does: resources with
+        // no index row for the parameter match, and a comma list means "not A
+        // and not B". `resource_id` is never NULL, so the negation is safe. The
+        // `NOT (` prefix also keeps the fragment out of the `id IN (` shortcuts
+        // (`simple_membership_arm`, `single_index_predicate`), which would
+        // otherwise treat it as a positive match.
+        let sql = if matches!(param.modifier.as_ref(), Some(SearchModifier::Not)) {
+            format!("NOT ({membership})")
+        } else {
+            membership
+        };
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// The bare row predicate for one value of a reference search (every form
@@ -7721,6 +7731,80 @@ mod tests {
             )
         );
         assert_eq!(frag.params.len(), 2);
+    }
+
+    fn reference_not_sql(values: &[&str]) -> (String, SqlFragment) {
+        let build = |modifier| {
+            let param = SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: values
+                    .iter()
+                    .map(|v| SearchValue::new(SearchPrefix::Eq, *v))
+                    .collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            PostgresQueryBuilder::build_search_query(
+                &SearchQuery::new("Observation").with_parameter(param),
+                2,
+            )
+            .expect("reference condition")
+        };
+        (build(None).sql, build(Some(SearchModifier::Not)))
+    }
+
+    #[test]
+    fn reference_not_negates_the_whole_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    #[test]
+    fn reference_not_comma_list_is_one_negated_sublink() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1", "Group/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.sql.matches("id IN (SELECT").count(), 1);
+        assert_eq!(negated.params.len(), 2);
+    }
+
+    #[test]
+    fn reference_not_bare_id_negates_the_bare_id_predicate() {
+        let (positive, negated) = reference_not_sql(&["p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert!(
+            negated.sql.starts_with("NOT (id IN (SELECT"),
+            "{}",
+            negated.sql
+        );
+    }
+
+    #[test]
+    fn reference_not_is_not_an_index_only_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert!(PostgresQueryBuilder::single_index_predicate(&positive).is_some());
+        assert_eq!(
+            PostgresQueryBuilder::single_index_predicate(&negated.sql),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_reference_not_is_not_folded_into_an_intersect() {
+        let not = |v: &str| reference_param("subject", Some(SearchModifier::Not), v);
+        let query = SearchQuery::new("Observation")
+            .with_parameter(not("Patient/p1"))
+            .with_parameter(not("Patient/p2"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("two :not");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert_eq!(
+            frag.sql.matches("NOT (id IN (SELECT").count(),
+            2,
+            "{}",
+            frag.sql
+        );
     }
 
     #[test]

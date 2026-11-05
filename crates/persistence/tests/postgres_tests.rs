@@ -12421,6 +12421,75 @@ mod postgres_integration {
             .unwrap()
     }
 
+    /// #2494: `:not` on a reference parameter negates the whole membership,
+    /// so resources without the parameter match too, and a comma list means
+    /// "not A and not B" (same as SQLite).
+    ///
+    /// NOTE for #2394: once `feat/2394-perf-mongodb-normalize-reference` lands,
+    /// its three `Observation?subject:not=...` PostgreSQL `Divergence` entries
+    /// in the shared modifier parity suite must be deleted (the suite fails on
+    /// a stale divergence).
+    #[tokio::test]
+    async fn postgres_integration_search_reference_not_modifier_negates_membership() {
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reference-not-2494");
+
+        create_subject_observation(&backend, &tenant, "ob-pat", "Patient/p1").await;
+        create_subject_observation(&backend, &tenant, "ob-other", "Patient/p2").await;
+        create_subject_observation(&backend, &tenant, "ob-grp", "Group/p1").await;
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "ob-none",
+                    "code": {"coding": [{"code": "8867-4"}]},
+                    "status": "final"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let not_query = |values: &[&str]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: Some(SearchModifier::Not),
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["Patient/p1"])
+            )
+            .await,
+            vec!["ob-pat"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
+            vec!["ob-grp", "ob-none", "ob-other"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1", "Group/p1"])).await,
+            vec!["ob-none", "ob-other"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
+            vec!["ob-grp", "ob-none", "ob-other", "ob-pat"],
+        );
+    }
+
     /// Bare ids match the last path segment without losing exact-reference
     /// semantics for `Type/id` searches.
     #[tokio::test]
