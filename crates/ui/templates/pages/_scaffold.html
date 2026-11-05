@@ -1,0 +1,44 @@
+{% extends "layouts/base.html" %}
+
+{#
+  Starting point for a new page (#543). Copy this file, rename it, register the
+  route in src/lib.rs, and add the route to e2e/pages/routes.ts so the
+  cross-page guards (a11y, no-cdn, design-system) cover it from day one.
+
+  Compose the component vocabulary (README.md § Component vocabulary) — the
+  guards fail a page that invents classes or restyles shared primitives. Page-
+  specific styling goes in the `pages` layer of assets/app.css, and only for
+  what no other screen will want.
+
+  This template is not referenced by any handler, so Askama does not compile
+  it; the placeholder i18n keys below don't exist and must be replaced.
+#}
+
+{% block title %}{{ i18n.t("scaffold-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("scaffold-title") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("scaffold-lede") }}</p>
+  </div>
+  <!-- The one primary action, if the page has one. -->
+  <button type="button" class="btn btn--primary">{{ i18n.t("scaffold-action") }}</button>
+</section>
+
+<section class="card table-card">
+  <div class="card-head">
+    <h3>{{ i18n.t("scaffold-section") }}</h3>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr><th>{{ i18n.t("scaffold-col") }}</th></tr>
+      </thead>
+      <tbody>
+        <tr class="data-table__empty"><td>{{ i18n.t("scaffold-empty") }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

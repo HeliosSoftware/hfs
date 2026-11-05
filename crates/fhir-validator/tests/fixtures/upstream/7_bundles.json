@@ -1,0 +1,96 @@
+{
+  "desc": "bundles",
+  "schemas": {
+    "string":  { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "contained": {
+          "array": true,
+          "type": "Resource"
+        }
+      }
+    },
+    "Patient": {
+      "base": "Resource",
+      "elements": {"name":  { "type": "string" }}
+    },
+    "Encounter": {
+      "base": "Resource",
+      "elements": {"type":  { "type": "string" }}
+    },
+    "Bundle": {
+      "base": "Resource",
+      "elements": {
+        "entry": {
+          "array": true,
+          "elements": {
+            "resource": {
+              "type": "Resource"
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "ok bundle",
+      "data": {
+        "resourceType": "Bundle",
+        "entry": [
+          {"resource": {"resourceType": "Patient", "name": "John"}},
+          {"resource": {"resourceType": "Encounter", "type": "in-patient"}}
+        ]
+      }
+    },
+    {
+      "desc": "pt contained",
+      "data": {
+        "resourceType": "Patient",
+        "contained": [
+          {"resourceType": "Encounter", "type": "in-patient"}
+        ]
+      }
+    },
+    {
+      "desc": "enc contained",
+      "data": {
+        "resourceType": "Encounter",
+        "contained": [
+          {"resourceType": "Patient", "name": "John"}
+        ]
+      }
+    },
+    {
+      "desc": "broken bundle",
+      "data": {
+        "resourceType": "Bundle",
+        "entry": [
+          {"resource": {"resourceType": "Patient", "extra": "ups"}}
+        ]
+      },
+      "errors":
+      [{
+        "message": "extra is unknown",
+        "path": "Bundle.entry.0.resource.extra",
+        "type": "unknown-element"
+      }]
+    },
+    {
+      "desc": "broken bundle",
+      "data": {
+        "resourceType": "Bundle",
+        "entry": [
+          {"resource": {"resourceType": "Encounter", "extra": "ups"}}
+        ]
+      },
+      "errors":
+      [{
+        "message": "extra is unknown",
+        "path": "Bundle.entry.0.resource.extra",
+        "type": "unknown-element"
+      }]
+    }
+  ]
+}

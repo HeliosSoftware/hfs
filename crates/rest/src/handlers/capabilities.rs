@@ -20,15 +20,27 @@ use axum::{
     response::Response,
 };
 use helios_fhir::FhirVersion;
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{
+    BundleProvider, ConditionalStorage, ResourceStorage, SearchProvider,
+};
+use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
-use crate::error::{RestError, RestResult};
+use crate::error::RestResult;
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::get_resource_type_names_for_version;
 use crate::middleware::content_type::{FhirContentType, negotiate_format};
 use crate::responses::format_resource_response;
 use crate::state::AppState;
+
+/// Extension URL used to advertise the search modifiers a parameter supports.
+///
+/// FHIR R4/R5 `CapabilityStatement.rest.resource.searchParam` has no native
+/// `modifier` element, so the modifiers a backend actually honors are carried as
+/// repeating `valueCode` extensions on the `searchParam` entry.
+const SEARCH_MODIFIER_EXTENSION_URL: &str =
+    "http://heliossoftware.com/fhir/StructureDefinition/capabilitystatement-search-modifier";
 
 /// Handler for the capabilities interaction.
 ///
@@ -65,10 +77,16 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage
+        + SearchProvider
+        + BundleProvider
+        + ConditionalStorage
+        + Send
+        + Sync
+        + 'static,
 {
     // Determine which version to describe (from Accept header or default)
-    let fhir_version = version.accept_version().unwrap_or_default();
+    let fhir_version = version.accept_version_or(state.config().default_fhir_version);
 
     debug!(
         fhir_version = %fhir_version,
@@ -77,18 +95,10 @@ where
         "Processing capabilities request"
     );
 
-    // Build tenant-aware base URL
-    let base_url = if tenant.is_url_based() {
-        format!(
-            "{}/{}",
-            state.base_url().trim_end_matches('/'),
-            tenant.tenant_id()
-        )
-    } else {
-        state.base_url().to_string()
-    };
+    let base_url = state.public_base_url_for_request(&tenant);
 
-    let capability_statement = build_capability_statement(&state, fhir_version, &base_url);
+    let capability_statement =
+        build_capability_statement(&state, tenant.context(), fhir_version, &base_url);
 
     // Negotiate response format
     let negotiated = negotiate_format(&req_headers, None);
@@ -107,28 +117,78 @@ where
         &capability_statement,
         negotiated.format,
     )
-    .map_err(|_| RestError::InternalError {
-        message: "Failed to serialize response".to_string(),
-    })
 }
 
 /// Builds a CapabilityStatement describing server capabilities for a specific FHIR version.
 fn build_capability_statement<S>(
     state: &AppState<S>,
+    tenant: &helios_persistence::tenant::TenantContext,
     version: FhirVersion,
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage,
+    S: ResourceStorage
+        + SearchProvider
+        + BundleProvider
+        + ConditionalStorage
+        + Send
+        + Sync
+        + 'static,
 {
-    let backend_name = state.storage().backend_name();
-
     // Get resource types for the requested FHIR version
     let resource_types = get_resource_type_names_for_version(version);
 
+    // Advertise each resource type's real search parameters from the loaded
+    // SearchParameter registry (not just the seven common params). The read
+    // guard is held only across this synchronous build (no await).
+    // `_contained` / `_containedType` are only advertised when the backend can
+    // evaluate contained search (others reject them with 501).
+    let supports_contained = state.storage().supports_contained_search();
+
+    // Per-parameter-type modifier sets the backend actually honors. Used to
+    // advertise supported modifiers (as `valueCode` extensions) on each
+    // resource-specific search param.
+    let modifier_map: std::collections::HashMap<SearchParamType, Vec<&'static str>> = [
+        SearchParamType::Number,
+        SearchParamType::Date,
+        SearchParamType::String,
+        SearchParamType::Token,
+        SearchParamType::Reference,
+        SearchParamType::Composite,
+        SearchParamType::Quantity,
+        SearchParamType::Uri,
+        SearchParamType::Special,
+    ]
+    .into_iter()
+    .map(|t| (t, state.storage().modifiers_for_param_type(t)))
+    .collect();
+
+    let registry_arc = state.storage().search_param_registry(tenant);
+    let registry = registry_arc.read();
+
+    // Reverse-include index (target type -> "Source:code" tokens) for advertising
+    // each resource's real `searchRevInclude` targets.
+    let revinclude_by_target = build_revinclude_index(&registry);
+
+    // The conditional interactions are the storage's to declare, not literals:
+    // S3 serves none on its own, and a composite's answer depends on how it
+    // is composed (#1384). The conditional handlers
+    // refuse with `501` from this same source.
+    let conditionals = super::conditional_support::advertised(state.storage(), version);
+
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
-        .map(|rt| build_resource_capability(rt))
+        .map(|rt| {
+            build_resource_capability(
+                rt,
+                &conditionals,
+                &registry,
+                supports_contained,
+                &modifier_map,
+                &revinclude_by_target,
+                version,
+            )
+        })
         .collect();
 
     #[allow(unused_mut)]
@@ -139,51 +199,230 @@ where
         formats.push("application/fhir+xml");
     }
 
-    serde_json::json!({
+    // Advertise `transaction` only when the storage backend can actually
+    // honour all-or-nothing semantics. This was an unconditional literal, so an
+    // s3-elasticsearch deployment published transaction support it had no way
+    // to provide — a bundle that timed out left 466 of 473 entries committed
+    // (#489). `batch` is unconditional: every bundle provider can process
+    // entries independently, which is exactly what design discussion #28
+    // prescribes for a backend without transaction support.
+    let mut system_interactions = Vec::new();
+    if state.storage().supports_atomic_transactions() {
+        system_interactions.push(serde_json::json!({ "code": "transaction" }));
+    }
+    system_interactions.push(serde_json::json!({ "code": "batch" }));
+    system_interactions.push(serde_json::json!({ "code": "history-system" }));
+    // No `search-system`: `GET [base]?params` and `POST [base]/_search` are
+    // refused with `501` (`search_system_not_supported_handler`). It was listed
+    // here unconditionally while no route served it (#1338).
+
+    // Standard operations, extended with the system-level SQL on FHIR
+    // operations. Partial parameter support is advertised through the
+    // OperationDefinitions those entries cite, not through an extension block —
+    // the pre-ballot `sof-capabilities` extension has no counterpart in
+    // 3.0.0-ballot.
+    let mut operations = build_rest_operations(state);
+
+    // When auth is on, a client must be able to discover SMART App Launch from
+    // the CapabilityStatement itself, not only from
+    // `/.well-known/smart-configuration`: SMART's discovery reads both, and the
+    // security block was a `cors`-only literal regardless of auth (#1441). The
+    // endpoints come from the same `AuthConfig` that backs the discovery
+    // document, so the two never disagree. Advertised only when auth is enabled
+    // *and* both required oauth-uris (authorize, token) are configured — a plain
+    // bearer deployment with no SMART endpoints is not SMART-on-FHIR and stays
+    // `cors`-only rather than publishing an incomplete profile.
+    let mut security = serde_json::json!({
+        "cors": state.config().enable_cors,
+        "description": "This server supports CORS for cross-origin requests"
+    });
+    let auth = state.auth_config();
+    if auth.enabled
+        && auth.smart_authorize_endpoint.is_some()
+        && auth.smart_token_endpoint.is_some()
+    {
+        security["service"] = serde_json::json!([{
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/restful-security-service",
+                "code": "SMART-on-FHIR",
+                "display": "SMART-on-FHIR"
+            }],
+            "text": "OAuth2 using SMART-on-FHIR profile (see http://docs.smarthealthit.org)"
+        }]);
+
+        // `oauth-uris` sub-extensions, in SMART's documented order. `authorize`
+        // and `token` are always present here (guarded above); the rest are
+        // added only when configured.
+        let mut oauth_uris = vec![
+            serde_json::json!({
+                "url": "authorize",
+                "valueUri": auth.smart_authorize_endpoint.as_deref().unwrap()
+            }),
+            serde_json::json!({
+                "url": "token",
+                "valueUri": auth.smart_token_endpoint.as_deref().unwrap()
+            }),
+        ];
+        if let Some(uri) = auth.smart_introspection_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "introspect", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_revocation_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "revoke", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_registration_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "register", "valueUri": uri }));
+        }
+        if let Some(uri) = auth.smart_management_endpoint.as_deref() {
+            oauth_uris.push(serde_json::json!({ "url": "manage", "valueUri": uri }));
+        }
+        security["extension"] = serde_json::json!([{
+            "url": "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris",
+            "extension": oauth_uris
+        }]);
+    }
+
+    let rest_entry = serde_json::json!({
+        "mode": "server",
+        "documentation": "Helios FHIR RESTful API",
+        "security": security,
+        "resource": resources,
+        "interaction": system_interactions
+    });
+
+    let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
         "status": "active",
         "date": chrono::Utc::now().to_rfc3339(),
         "kind": "instance",
         "fhirVersion": version.full_version(),
         "format": formats,
+        // `software` names the build a client is talking to; `implementation`
+        // names this deployment of it. Without `software` the only place the
+        // version appeared was `/health`, which FHIR clients do not read (#992).
+        "software": crate::build_info::capability_software(),
         "implementation": {
-            "description": format!("Helios FHIR Server ({})", backend_name),
+            "description": crate::build_info::SOFTWARE_NAME,
             "url": base_url
         },
-        "rest": [{
-            "mode": "server",
-            "documentation": "Helios FHIR RESTful API",
-            "security": {
-                "cors": state.config().enable_cors,
-                "description": "This server supports CORS for cross-origin requests"
-            },
-            "resource": resources,
-            "interaction": [
-                { "code": "transaction" },
-                { "code": "batch" },
-                { "code": "history-system" },
-                { "code": "search-system" }
-            ],
-            "operation": [
-                {
-                    "name": "validate",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
-                },
-                {
-                    "name": "versions",
-                    "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
-                }
-            ]
-        }]
-    })
+        "rest": [rest_entry]
+    });
+
+    // Advertise Bulk Data Export operations when enabled.
+    if state.bulk_export_config().enabled {
+        operations.push(serde_json::json!({
+            "name": "export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
+        }));
+        operations.push(serde_json::json!({
+            "name": "patient-export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+        }));
+        operations.push(serde_json::json!({
+            "name": "group-export",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+        }));
+        statement["instantiates"] =
+            serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
+    }
+
+    // Advertise Bulk Data Submit operations when enabled.
+    if state.bulk_submit_config().enabled {
+        operations.push(serde_json::json!({
+            "name": "bulk-submit",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit"
+        }));
+        operations.push(serde_json::json!({
+            "name": "bulk-submit-status",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit-status"
+        }));
+    }
+
+    statement["rest"][0]["operation"] = serde_json::Value::Array(operations);
+    statement
+}
+
+/// Builds the `rest[0].operation` list, including the SQL on FHIR operations.
+///
+/// Both data operations are invoked at the system level, so they are declared
+/// here rather than under a resource type. `$sql-run` is always declared when
+/// SOF is enabled; `$sql-export` only when an export controller is wired.
+///
+/// `definition` points at *this server's* OperationDefinition rather than the
+/// guide's. Citing the guide's would assert support for every parameter it
+/// declares, and HFS supports a subset (no `context`, no `source`); per
+/// operations-capability.html#partial-operation-support a server in that
+/// position publishes its own definition with `base` naming the guide's. See
+/// [`crate::handlers::sof::capability`].
+fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
+    state: &AppState<S>,
+) -> Vec<serde_json::Value> {
+    use crate::handlers::sof::capability::{
+        REINDEX_DEFINITION_ID, SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID,
+    };
+
+    let mut ops = vec![
+        serde_json::json!({
+            "name": "validate",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
+        }),
+        serde_json::json!({
+            "name": "versions",
+            "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
+        }),
+        serde_json::json!({
+            "name": "sql-run",
+            "definition": format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
+        }),
+    ];
+
+    if state.export_controller().is_some() {
+        ops.push(serde_json::json!({
+            "name": "sql-export",
+            "definition": format!("/OperationDefinition/{SQL_EXPORT_DEFINITION_ID}")
+        }));
+    }
+
+    // `$reindex`, when this deployment has an index to rebuild. It is the
+    // documented recovery for a search index that has fallen behind its
+    // primary, and an operator who cannot find out it exists cannot use it —
+    // which is how a composite deployment whose bulk-loaded data never reached
+    // Elasticsearch had no discoverable way back (#1021). Declared only when
+    // wired: on an S3 primary with no secondary there is no index at all and
+    // the handler answers 501, so advertising it there would be a lie.
+    //
+    // `definition` names this server's own OperationDefinition, like the SQL on
+    // FHIR operations above: `$reindex` is a HFS administrative operation with
+    // no HL7 counterpart to cite.
+    if state.reindex().is_some() {
+        ops.push(serde_json::json!({
+            "name": "reindex",
+            "definition": format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
+        }));
+    }
+
+    ops
 }
 
 /// Builds the capability entry for a resource type.
-fn build_resource_capability(resource_type: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": resource_type,
-        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
-        "interaction": [
+fn build_resource_capability(
+    resource_type: &str,
+    conditionals: &serde_json::Map<String, serde_json::Value>,
+    registry: &SearchParameterRegistry,
+    supports_contained: bool,
+    modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
+    revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    version: FhirVersion,
+) -> serde_json::Value {
+    let interactions = if resource_type == "AuditEvent" {
+        serde_json::json!([
+            { "code": "read" },
+            { "code": "vread" },
+            { "code": "history-instance" },
+            { "code": "history-type" },
+            { "code": "search-type" }
+        ])
+    } else {
+        serde_json::json!([
             { "code": "read" },
             { "code": "vread" },
             { "code": "update" },
@@ -193,23 +432,194 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
             { "code": "history-type" },
             { "code": "create" },
             { "code": "search-type" }
-        ],
+        ])
+    };
+
+    let mut entry = serde_json::json!({
+        "type": resource_type,
+        "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
+        "interaction": interactions,
         "versioning": "versioned",
         "readHistory": true,
-        "updateCreate": true,
-        "conditionalCreate": true,
         "conditionalRead": "full-support",
-        "conditionalUpdate": true,
-        "conditionalDelete": "single",
-        "searchInclude": ["*"],
-        "searchRevInclude": ["*"],
-        "searchParam": build_common_search_params()
-    })
+        "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map, version)
+    });
+
+    if resource_type != "AuditEvent" {
+        entry["updateCreate"] = serde_json::Value::Bool(true);
+        for (element, value) in conditionals {
+            entry[element.as_str()] = value.clone();
+        }
+    }
+
+    // Advertise real `_include` targets: one "Type:code" per reference param on
+    // this type. Omitted entirely when the type has no reference params.
+    let search_include = build_search_includes(resource_type, registry);
+    if !search_include.is_empty() {
+        entry["searchInclude"] = serde_json::Value::Array(search_include);
+    }
+
+    // Advertise real `_revinclude` targets: "Source:code" tokens from other
+    // types' reference params that point at this type.
+    if let Some(rev) = revinclude_by_target.get(resource_type) {
+        if !rev.is_empty() {
+            entry["searchRevInclude"] = serde_json::Value::Array(
+                rev.iter().cloned().map(serde_json::Value::String).collect(),
+            );
+        }
+    }
+    // Bulk Data Access IG: per-resource `$export` operation entries on Patient
+    // and Group, in addition to the system-level `$export` advertised at
+    // `rest[0].operation`.
+    match resource_type {
+        "Patient" => {
+            entry["operation"] = serde_json::json!([
+                {
+                    "name": "export",
+                    "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+                },
+                {
+                    "name": "everything",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"
+                }
+            ]);
+        }
+        "Group" => {
+            entry["operation"] = serde_json::json!([{
+                "name": "export",
+                "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+            }]);
+        }
+        _ => {}
+    }
+    entry
+}
+
+/// Builds the full `searchParam` list for a resource type: the seven common
+/// params plus the resource-specific params from the loaded SearchParameter
+/// registry. Control/common params (those starting with `_`) and duplicates are
+/// skipped.
+fn build_search_params(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+    supports_contained: bool,
+    modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
+    version: FhirVersion,
+) -> Vec<serde_json::Value> {
+    let mut params = build_common_search_params(supports_contained, version);
+    let mut seen: std::collections::HashSet<String> = params
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+
+    for def in registry.get_active_params(resource_type) {
+        if def.code.starts_with('_') || !seen.insert(def.code.clone()) {
+            continue;
+        }
+        let mut param = serde_json::json!({
+            "name": def.code,
+            "type": fhir_search_param_type(def.param_type),
+            "definition": def.url,
+        });
+        if let Some(doc) = &def.description {
+            param["documentation"] = serde_json::Value::String(doc.clone());
+        }
+        // Advertise the modifiers this backend honors for the param's type.
+        // R4/R5 `searchParam` has no `modifier` element, so they ride along as
+        // repeating `valueCode` extensions.
+        if let Some(modifiers) = modifier_map.get(&def.param_type) {
+            if !modifiers.is_empty() {
+                param["extension"] = serde_json::Value::Array(
+                    modifiers
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "url": SEARCH_MODIFIER_EXTENSION_URL,
+                                "valueCode": m,
+                            })
+                        })
+                        .collect(),
+                );
+            }
+        }
+        params.push(param);
+    }
+    params
+}
+
+/// Maps an internal search-parameter type to its FHIR CapabilityStatement
+/// `searchParam.type` code.
+fn fhir_search_param_type(t: SearchParamType) -> &'static str {
+    match t {
+        SearchParamType::Number => "number",
+        SearchParamType::Date => "date",
+        SearchParamType::String => "string",
+        SearchParamType::Token => "token",
+        SearchParamType::Reference => "reference",
+        SearchParamType::Composite => "composite",
+        SearchParamType::Quantity => "quantity",
+        SearchParamType::Uri => "uri",
+        SearchParamType::Special => "special",
+    }
+}
+
+/// Builds the reverse-include index used for `searchRevInclude`: maps each target
+/// resource type to the sorted set of "SourceType:code" tokens from every active
+/// reference search param that targets it.
+fn build_revinclude_index(
+    registry: &SearchParameterRegistry,
+) -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
+    let mut index: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for source_type in registry.resource_types() {
+        for def in registry.get_active_params(&source_type) {
+            if def.param_type != SearchParamType::Reference || def.code.starts_with('_') {
+                continue;
+            }
+            if let Some(targets) = &def.target {
+                let token = format!("{}:{}", source_type, def.code);
+                for target in targets {
+                    index
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(token.clone());
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Returns the `searchInclude` tokens ("Type:code") for a resource type: one per
+/// active reference search param defined on it.
+fn build_search_includes(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> Vec<serde_json::Value> {
+    let mut includes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for def in registry.get_active_params(resource_type) {
+        if def.param_type == SearchParamType::Reference && !def.code.starts_with('_') {
+            includes.insert(format!("{}:{}", resource_type, def.code));
+        }
+    }
+    includes
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect()
 }
 
 /// Builds common search parameters supported by all resources.
-fn build_common_search_params() -> Vec<serde_json::Value> {
-    vec![
+///
+/// `_contained` / `_containedType` are only included when `supports_contained`
+/// is set (the backend can evaluate contained search). `_list` is always
+/// advertised (resolved application-side on every backend). `_in` (List/Group
+/// membership) exists only in R5 and later, so it is advertised only there; it
+/// is likewise resolved application-side.
+fn build_common_search_params(
+    supports_contained: bool,
+    version: FhirVersion,
+) -> Vec<serde_json::Value> {
+    let mut params = vec![
         serde_json::json!({
             "name": "_id",
             "type": "token",
@@ -237,13 +647,287 @@ fn build_common_search_params() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "_text",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the narrative of the resource"
         }),
         serde_json::json!({
             "name": "_content",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the entire content of the resource"
         }),
-    ]
+        serde_json::json!({
+            "name": "_list",
+            "type": "special",
+            "documentation": "Resources referenced by the given List resource"
+        }),
+    ];
+
+    if matches!(version.as_mime_param(), "5.0" | "6.0") {
+        params.push(serde_json::json!({
+            "name": "_in",
+            "type": "reference",
+            "documentation": "Resources that are active members of the given List or Group"
+        }));
+    }
+
+    if supports_contained {
+        params.push(serde_json::json!({
+            "name": "_contained",
+            "type": "token",
+            "documentation": "Whether to search contained resources (false|true|both)"
+        }));
+        params.push(serde_json::json!({
+            "name": "_containedType",
+            "type": "token",
+            "documentation": "Return the container or the contained resource (container|contained)"
+        }));
+    }
+
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn param_names(params: &[serde_json::Value]) -> Vec<String> {
+        params
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// `$reindex` is advertised exactly where it can be served. A deployment
+    /// with no index to rebuild answers 501 from the handler, so advertising it
+    /// there would promise an operation that does not work; a deployment that
+    /// has one had no discoverable way to learn it exists at all (#1021).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reindex_is_advertised_only_where_an_index_can_be_rebuilt() {
+        use crate::config::ServerConfig;
+        use crate::handlers::sof::capability::REINDEX_DEFINITION_ID;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::search::{ReindexOperation, TenantSearchRegistries};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let without = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            !operation_names(&build_rest_operations(&without)).contains(&"reindex".to_string()),
+            "an unwired deployment must not advertise an operation its handler answers 501 to"
+        );
+
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let with = AppState::new(backend.clone(), ServerConfig::default())
+            .with_reindex(Arc::new(ReindexOperation::new(backend, registries)));
+        let names = operation_names(&build_rest_operations(&with));
+        assert!(
+            names.contains(&"reindex".to_string()),
+            "a deployment with an index must advertise the rebuild, got {names:?}"
+        );
+
+        // The cited definition is the one this server actually serves.
+        let reindex = build_rest_operations(&with)
+            .into_iter()
+            .find(|o| o["name"] == "reindex")
+            .expect("just asserted present");
+        assert_eq!(
+            reindex["definition"],
+            format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
+        );
+    }
+
+    /// `CapabilityStatement.software` identifies the build for every FHIR
+    /// version the server can describe: the same binary answers `/metadata`
+    /// for each of them, so the version must not depend on which one was
+    /// asked for (#992).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn software_names_the_build_for_every_enabled_fhir_version() {
+        use crate::build_info::{PKG_VERSION, SOFTWARE_NAME, git_sha};
+        use crate::config::ServerConfig;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+        let state = AppState::new(backend, ServerConfig::default());
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        assert!(!FhirVersion::enabled_versions().is_empty());
+        for version in FhirVersion::enabled_versions() {
+            let statement =
+                build_capability_statement(&state, &tenant, *version, "http://localhost:8080");
+            let software = &statement["software"];
+            assert_eq!(
+                software["name"], SOFTWARE_NAME,
+                "software.name for {version:?}"
+            );
+            assert_eq!(
+                software["version"], PKG_VERSION,
+                "software.version must be the crate version for {version:?}"
+            );
+            assert_eq!(
+                software["extension"][0]["valueString"].as_str(),
+                git_sha(),
+                "git sha rides as an extension exactly when the build knows it"
+            );
+            assert_eq!(statement["implementation"]["description"], SOFTWARE_NAME);
+            assert_eq!(statement["fhirVersion"], version.full_version());
+        }
+    }
+
+    fn operation_names(ops: &[serde_json::Value]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|o| o["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn common_params_always_advertise_list() {
+        let names = param_names(&build_common_search_params(
+            false,
+            FhirVersion::default_enabled(),
+        ));
+        assert!(names.contains(&"_list".to_string()));
+        assert!(names.contains(&"_text".to_string()));
+    }
+
+    #[test]
+    fn membership_param_advertised_only_on_r5_and_later() {
+        for version in FhirVersion::enabled_versions() {
+            let names = param_names(&build_common_search_params(false, *version));
+            let expected = matches!(version.as_mime_param(), "5.0" | "6.0");
+            assert_eq!(
+                names.contains(&"_in".to_string()),
+                expected,
+                "_in advertisement for {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contained_params_gated_on_capability() {
+        let without = param_names(&build_common_search_params(
+            false,
+            FhirVersion::default_enabled(),
+        ));
+        assert!(!without.contains(&"_contained".to_string()));
+        assert!(!without.contains(&"_containedType".to_string()));
+
+        let with = param_names(&build_common_search_params(
+            true,
+            FhirVersion::default_enabled(),
+        ));
+        assert!(with.contains(&"_contained".to_string()));
+        assert!(with.contains(&"_containedType".to_string()));
+    }
+
+    fn ref_param(
+        url: &str,
+        code: &str,
+        base: &str,
+        targets: &[&str],
+    ) -> helios_persistence::search::SearchParameterDefinition {
+        helios_persistence::search::SearchParameterDefinition::new(
+            url,
+            code,
+            SearchParamType::Reference,
+            format!("{base}.{code}"),
+        )
+        .with_base([base])
+        .with_targets(targets.iter().copied())
+    }
+
+    #[test]
+    fn includes_and_revincludes_derived_from_reference_params() {
+        use helios_persistence::search::SearchParameterRegistry;
+
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(ref_param(
+            "http://example.org/Patient-general-practitioner",
+            "general-practitioner",
+            "Patient",
+            &["Practitioner", "Organization"],
+        ))
+        .unwrap();
+        reg.register(ref_param(
+            "http://example.org/Observation-subject",
+            "subject",
+            "Observation",
+            &["Patient"],
+        ))
+        .unwrap();
+
+        // searchInclude for a type = its own reference params as "Type:code".
+        let includes: Vec<String> = build_search_includes("Patient", &reg)
+            .into_iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(includes, vec!["Patient:general-practitioner".to_string()]);
+
+        // searchRevInclude index: each target type maps to the "Source:code"
+        // tokens that point at it.
+        let rev = build_revinclude_index(&reg);
+        assert!(rev.get("Patient").unwrap().contains("Observation:subject"));
+        assert!(
+            rev.get("Practitioner")
+                .unwrap()
+                .contains("Patient:general-practitioner")
+        );
+        // Observation has no reference param pointing at it.
+        assert!(!rev.contains_key("Observation"));
+    }
+
+    #[test]
+    fn resource_specific_params_carry_modifier_extension() {
+        use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
+        use std::collections::HashMap;
+
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(
+            SearchParameterDefinition::new(
+                "http://example.org/Patient-name",
+                "name",
+                SearchParamType::String,
+                "Patient.name",
+            )
+            .with_base(["Patient"]),
+        )
+        .unwrap();
+
+        let mut modifier_map: HashMap<SearchParamType, Vec<&'static str>> = HashMap::new();
+        modifier_map.insert(SearchParamType::String, vec!["exact", "contains"]);
+
+        let params = build_search_params(
+            "Patient",
+            &reg,
+            false,
+            &modifier_map,
+            FhirVersion::default_enabled(),
+        );
+        let name = params
+            .iter()
+            .find(|p| p["name"] == "name")
+            .expect("name param advertised");
+        let ext = name["extension"]
+            .as_array()
+            .expect("modifier extension present");
+        let codes: Vec<&str> = ext
+            .iter()
+            .map(|e| e["valueCode"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, vec!["exact", "contains"]);
+        assert_eq!(ext[0]["url"], SEARCH_MODIFIER_EXTENSION_URL);
+
+        // Common control params (e.g. _id) do not carry the modifier extension.
+        let id = params.iter().find(|p| p["name"] == "_id").unwrap();
+        assert!(id.get("extension").is_none());
+    }
 }

@@ -4,6 +4,12 @@
 //! `concepts` and `concept_hierarchy` tables and returns the matching set of
 //! `(code, display)` pairs.
 //!
+//! Gated on `feature = "sqlite"` because every helper uses `rusqlite`
+//! types directly. A future Postgres-backed evaluator will live alongside
+//! this module and consume the same `EclExpr` AST from `super::parser`.
+//! (The module is declared `#[cfg(feature = "sqlite")]` in `mod.rs`, so no
+//! redundant inner `#![cfg]` is needed here.)
+//!
 //! # Strategy
 //!
 //! Each operator maps to a recursive CTE:

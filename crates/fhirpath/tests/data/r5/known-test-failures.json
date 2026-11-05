@@ -1,11 +1,11 @@
 {
-  "description": "Known test failures for FHIR R5 FhirPath Validator",
+  "description": "Known test failures for the EXTERNAL .NET FhirPath Validator (fhirpath-validator.exe), consumed by the 'Run FhirPath Validation with FHIR Test Cases' and 'Audit conformance coverage' steps in .github/workflows/ci.yml via --known-failures. It describes that harness running against the separately checked-out FHIR/fhir-test-cases@master corpus — NOT the vendored tests-fhir-r5.xml in this directory, and NOT the in-process Rust suite in crates/fhirpath/tests/r5_tests.rs. Those two harnesses have genuinely different pass sets (txTest03 is a declared failure here and passes in-process; the HTMLChecks group does not exist in the vendored corpus at all), so the Rust suite reads its own rust-known-failures.json instead. The schema is identical between the two files so an entry can be copy-pasted when a limitation affects both. See issue #307.",
   "version": "1.0.0",
   "knownFailures": [
     {
-      "groupName": "TerminologyTests", 
+      "groupName": "TerminologyTests",
       "testName": "txTest03",
-      "reason": "ConceptMap cm-address-use-v2 not available on test server"
+      "reason": "Output type fidelity: '.value.code' returns FHIR type 'string' instead of 'code' ('Mismatch at index 0: expected type code, got string'). The translation itself succeeds and returns the expected 'H'. The previous reason ('ConceptMap cm-address-use-v2 not available on test server') was wrong on both servers: tx.fhir.org and hts.heliossoftware.com each resolve this ConceptMap."
     },
     {
       "groupName": "Precision",
@@ -14,18 +14,18 @@
     },
     {
       "groupName": "testConformsTo",
-      "testName": "*", 
-      "reason": "conformsTo not yet implemented"
+      "testName": "*",
+      "reason": "conformsTo not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures."
     },
     {
-      "groupName": "miscEngineTests",
-      "testName": "testContainedId",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
+      "groupName": "documentFunctions",
+      "testName": "testHasCoding11",
+      "reason": "Static type checking: the test expects 'Patient.name.hasCoding(...)' to be rejected before evaluation because HumanName is neither a Coding nor a CodeableConcept. This engine has no element-type model for static checks, and at run time hasCoding() passes over items that aren't Codings or CodeableConcepts and returns false, as the Java engine does when evaluating. See #2245."
     },
     {
-      "groupName": "miscEngineTests",
-      "testName": "testMultipleResolve",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
+      "groupName": "HTMLChecks",
+      "testName": "*",
+      "reason": "htmlChecks() not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures. Previously undeclared: they were invisible because the runner's exit code ignores not-implemented tests (#287)."
     },
     {
       "groupName": "polymorphics",
@@ -51,16 +51,6 @@
       "groupName": "testInheritance",
       "testName": "testFHIRPathAsFunction16",
       "reason": "Contested"
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityMonthLiteralToQuantity",
-      "reason": "Test is wrong"
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityYearLiteralToQuantity",
-      "reason": "Test is wrong"
     },
     {
       "groupName": "testMiscellaneousAccessorTests",

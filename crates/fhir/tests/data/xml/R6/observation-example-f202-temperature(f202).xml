@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="f202"/>
-  <!--  Oral temperature was measured on April fourth  -->
+  <!-- Oral temperature was measured on April fourth -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -9,7 +9,7 @@
     </security>
   </meta>
   <status value="entered-in-error"/>
-  <!--  category code is A code that classifies the general type of observation being made. This is used for searching, sorting and display purposes. -->
+  <!-- category code is A code that classifies the general type of observation being made. This is used for searching, sorting and display purposes. -->
   <category>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/observation-category"/>
@@ -18,10 +18,10 @@
     </coding>
   </category>
   <code>
-    <!--  Kind of observation = Temperature  -->
-    <!--  local code here  -->
+    <!-- Kind of observation = Temperature -->
+    <!-- local code here -->
     <coding>
-      <!--  "interoperability standard" code  -->
+      <!-- "interoperability standard" code -->
       <system value="http://loinc.org"/>
       <code value="8310-5"/>
       <display value="Body temperature"/>
@@ -31,8 +31,8 @@
       <code value="BT"/>
       <display value="Body temperature"/>
     </coding>
-    <!--  LOINC and SNOMED CT translations here - Note in the US the primary code will be LOINC per meaningful use.  Further SNOMED CT  has acceeded to LOINC being the primary coding system for vitals and anthropromorphic measures.  SNOMED CT is required in some countries such as the UK. -->
-    <!--  the measurement LOINC code is more specific than the "interoperability category" code (by system - ie oral temp) this example shows how the  LOINC or method element could be used to convey the same information both not necessary in most cases -->
+    <!-- LOINC and SNOMED CT translations here - Note in the US the primary code will be LOINC per meaningful use.  Further SNOMED CT  has acceeded to LOINC being the primary coding system for vitals and anthropromorphic measures.  SNOMED CT is required in some countries such as the UK. -->
+    <!-- the measurement LOINC code is more specific than the "interoperability category" code (by system - ie oral temp) this example shows how the  LOINC or method element could be used to convey the same information both not necessary in most cases -->
     <coding>
       <system value="http://loinc.org"/>
       <code value="8331-1"/>
@@ -45,7 +45,7 @@
     </coding>
     <text value="Temperature"/>
   </code>
-  <!--  No identifier could be provided to this observation  -->
+  <!-- No identifier could be provided to this observation -->
   <subject>
     <reference value="Patient/f201"/>
     <display value="Roel"/>
@@ -56,7 +56,7 @@
     <reference value="Practitioner/f201"/>
   </performer>
   <valueQuantity>
-    <!--  Temperature=39 degrees Celsius  -->
+    <!-- Temperature=39 degrees Celsius -->
     <value value="39"/>
     <unit value="degrees C"/>
     <system value="http://unitsofmeasure.org"/>
@@ -68,8 +68,8 @@
       <code value="H"/>
     </coding>
   </interpretation>
-  <!--  In the meantime a new oral temperature is measured  -->
-  <!--  http://www.ncbi.nlm.nih.gov/pmc/articles/PMC3418963/  -->
+  <!-- In the meantime a new oral temperature is measured -->
+  <!-- http://www.ncbi.nlm.nih.gov/pmc/articles/PMC3418963/ -->
   <bodySite>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -85,7 +85,7 @@
     </coding>
   </method>
   <referenceRange>
-    <!--   0..* Provides guide for interpretation   -->
+    <!-- 0..* Provides guide for interpretation -->
     <high>
       <value value="38.2"/>
       <unit value="degrees C"/>

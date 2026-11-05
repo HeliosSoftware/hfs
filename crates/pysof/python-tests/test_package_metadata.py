@@ -16,8 +16,8 @@ def test_package_structure() -> None:
 
 
 def test_python_version_compatibility() -> None:
-    """Test that we're running on Python 3.11+ as expected."""
-    assert sys.version_info >= (3, 11), f"Expected Python 3.11+, got {sys.version_info}"
+    """Test that we're running on a supported Python (3.10+, per requires-python)."""
+    assert sys.version_info >= (3, 10), f"Expected Python 3.10+, got {sys.version_info}"
 
 
 def test_module_file_location() -> None:

@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="bmi-using-related"/>
-  <!--  ======== need to fix vitals to removed fixed value 'has-member' ==========
+  <!-- ======== need to fix vitals to removed fixed value 'has-member' ==========
 	<meta>
 		<profile value="http://hl7.org/fhir/StructureDefinition/vitalsigns"/>
-	</meta>
-     -->
+	</meta> -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

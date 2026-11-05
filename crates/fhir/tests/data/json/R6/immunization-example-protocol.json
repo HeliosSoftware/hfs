@@ -122,7 +122,10 @@
             }
           ]
         }
-      ]
+      ],
+      "doseNumber": {
+        "text": "1"
+      }
     },
     {
       "series": "3-dose",
@@ -135,7 +138,13 @@
             }
           ]
         }
-      ]
+      ],
+      "doseNumber": {
+        "text": "2"
+      },
+      "seriesDoses": {
+        "text": "3"
+      }
     }
   ],
   "meta": {

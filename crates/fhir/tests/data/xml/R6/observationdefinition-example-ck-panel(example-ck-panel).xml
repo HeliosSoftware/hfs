@@ -35,17 +35,16 @@
   </code>
   <permittedDataType value="Quantity"/>
   <multipleResultsAllowed value="true"/>
-  <!--  <method>
+  <!-- <method>
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="258066000"/>
       <display value="Enzymatic measurement"/>
     </coding>
-  </method>  -->
+  </method> -->
   <preferredReportName value="Creatine Kinase, MB and Relative Percent"/>
-  <!--  Panel-level qualified value for cardiac assessment  -->
+  <!-- Panel-level qualified value for cardiac assessment -->
   <qualifiedValue>
-    <condition/>
     <context>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -53,10 +52,11 @@
         <display value="Normal Range"/>
       </coding>
     </context>
+    <condition value="Myocardial infarction"/>
     <rangeCategory value="reference"/>
-    <validCodedValueSet/>
+    <validCodedValueSet value="http://hl7.org/fhir/ValueSet/observation-status"/>
   </qualifiedValue>
-  <!--  Component 1: Total Creatine Kinase  -->
+  <!-- Component 1: Total Creatine Kinase -->
   <component>
     <code>
       <coding>
@@ -73,7 +73,6 @@
       <display value="U/L"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -81,6 +80,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>
@@ -98,7 +98,7 @@
       </range>
     </qualifiedValue>
   </component>
-  <!--  Component 2: CK-MB Isoenzyme  -->
+  <!-- Component 2: CK-MB Isoenzyme -->
   <component>
     <code>
       <coding>
@@ -115,7 +115,6 @@
       <display value="ng/mL"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -123,6 +122,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>
@@ -140,7 +140,7 @@
       </range>
     </qualifiedValue>
   </component>
-  <!--  Component 3: CK-MB Relative Percent  -->
+  <!-- Component 3: CK-MB Relative Percent -->
   <component>
     <code>
       <coding>
@@ -157,7 +157,6 @@
       <display value="%"/>
     </permittedUnit>
     <qualifiedValue>
-      <condition/>
       <context>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/referencerange-meaning"/>
@@ -165,6 +164,7 @@
           <display value="Normal Range"/>
         </coding>
       </context>
+      <condition value="Myocardial infarction"/>
       <rangeCategory value="reference"/>
       <range>
         <low>

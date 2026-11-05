@@ -48,7 +48,7 @@
   "frameOfReferenceUid": "1.2.840.113747.20080222.104120739293289003163903631439818.0",
   "focus": [
     {
-      "reference": "ImagingSelection/example-basic-image-selection"
+      "reference": "ImagingSelection/example-single-frame-image-selection"
     }
   ],
   "instance": [

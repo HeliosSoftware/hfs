@@ -13,6 +13,7 @@
   <identifier>
     <value value="12345"/>
   </identifier>
+  <!-- <instantiatesUri value="http://example.org/protocol-for-hypertension-during-pregnancy"/> -->
   <basedOn>
     <reference value="CarePlan/preg"/>
     <display value="Maternity care plan"/>

@@ -9,7 +9,7 @@
   </meta>
   <identifier>
     <use value="temp"/>
-    <!--  0..1 The use of this identifier  -->
+    <!-- 0..1 The use of this identifier -->
     <value value="Encounter_Roel_20130404"/>
   </identifier>
   <status value="completed"/>
@@ -18,7 +18,7 @@
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
       <code value="AMB"/>
-      <!--  outpatient  -->
+      <!-- outpatient -->
       <display value="ambulatory"/>
     </coding>
   </class>

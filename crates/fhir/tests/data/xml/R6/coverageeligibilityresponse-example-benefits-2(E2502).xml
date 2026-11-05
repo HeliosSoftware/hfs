@@ -256,7 +256,7 @@
         </coding>
       </category>
       <excluded value="true"/>
-      <!--  this benefit category is not covered under the plan  -->
+      <!-- this benefit category is not covered under the plan -->
       <name value="Vision"/>
       <description value="Vision products and services such as exams, glasses and contact lenses."/>
     </item>

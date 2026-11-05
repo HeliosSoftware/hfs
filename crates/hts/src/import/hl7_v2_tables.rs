@@ -115,7 +115,7 @@ pub async fn import_hl7_v2_tables(
             ..Default::default()
         };
         let seed_bytes = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-        let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+        let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
         stats.code_systems += seed_stats.code_systems;
         stats.errors.extend(seed_stats.errors);
 
@@ -133,7 +133,7 @@ pub async fn import_hl7_v2_tables(
                 })
                 .collect();
             let bytes = build_code_system_bundle(&meta, &builder);
-            let chunk = backend.import_bundle(ctx, &bytes).await?;
+            let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
             stats.errors.extend(chunk.errors);
 
             eprintln!(
@@ -188,7 +188,10 @@ fn read_xmls_from_zip(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
             archive
                 .by_index(i)
                 .ok()
-                .map(|e| e.name().to_ascii_lowercase().ends_with(".xml"))
+                .map(|e| {
+                    e.name()
+                        .is_ok_and(|n| n.to_ascii_lowercase().ends_with(".xml"))
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -197,7 +200,10 @@ fn read_xmls_from_zip(path: &Path) -> Result<Vec<(String, String)>, HtsError> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry name: {e}")))?
+            .into_owned();
         let mut buf = String::new();
         entry
             .read_to_string(&mut buf)

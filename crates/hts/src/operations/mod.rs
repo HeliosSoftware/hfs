@@ -39,8 +39,11 @@
 //! [`validate_code`]: self::validate_code
 
 pub mod batch;
+pub mod batch_validate;
 pub mod closure;
 pub mod crud;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod crud_transaction;
 pub mod expand;
 pub mod format;
 pub mod health;

@@ -10,6 +10,9 @@ services:
       - "8180:8080"
     volumes:
       - ./realm.json:/opt/keycloak/data/import/realm.json:ro
+      # Helios login theme (branded browser login). start-dev disables theme
+      # caching, so edits under themes/ show up on the next page load.
+      - ./themes:/opt/keycloak/themes:ro
     healthcheck:
       test:
         [

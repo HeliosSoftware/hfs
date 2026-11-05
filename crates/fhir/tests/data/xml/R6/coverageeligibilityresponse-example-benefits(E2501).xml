@@ -21,7 +21,7 @@
     <reference value="Patient/pat1"/>
   </patient>
   <servicedDate value="2014-09-17"/>
-  <!--  Anticipated service date  -->
+  <!-- Anticipated service date -->
   <created value="2014-08-16"/>
   <request>
     <reference value="http://www.BenefitsInc.com/fhir/coverageeligibilityresponse/225476332402"/>

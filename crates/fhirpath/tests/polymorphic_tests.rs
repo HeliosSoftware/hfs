@@ -356,3 +356,38 @@ fn test_more_complex_polymorphic_expressions() {
     // Should return the object since it matches
     assert!(matches!(result, EvaluationResult::Object { .. }));
 }
+
+#[test]
+fn a_longer_field_name_is_not_a_typed_variant() {
+    // A ViewDefinition `select` with `forEachOrNull` but no `forEach`: the
+    // longer name merely extends the shorter one, and `OrNull` is no FHIR
+    // type, so `forEach` must stay empty. The SQL on FHIR `sql-expressions`
+    // constraint counts these, and failed every `forEachOrNull` select.
+    let mut select = HashMap::new();
+    select.insert(
+        "forEachOrNull".to_string(),
+        EvaluationResult::string("code.coding".to_string()),
+    );
+    // A nested object (no `resourceType`) takes the prefix-scan path; a
+    // genuine typed variant there must still resolve.
+    select.insert(
+        "valueString".to_string(),
+        EvaluationResult::string("typed".to_string()),
+    );
+    let mut context = EvaluationContext::new_empty_with_default_version();
+    context.set_this(EvaluationResult::object(select));
+
+    let eval = |expr_str: &str| {
+        let expr = parser().parse(expr_str).into_result().unwrap();
+        evaluate(&expr, &context, None).unwrap()
+    };
+    assert_eq!(eval("forEach.exists()"), EvaluationResult::boolean(false));
+    assert_eq!(
+        eval(
+            "(forEach.exists().toInteger() + forEachOrNull.exists().toInteger() \
+             + repeat.exists().toInteger()) <= 1"
+        ),
+        EvaluationResult::boolean(true)
+    );
+    assert_eq!(eval("value"), EvaluationResult::string("typed".to_string()));
+}

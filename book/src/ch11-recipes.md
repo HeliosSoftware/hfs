@@ -78,7 +78,7 @@ sof-cli \
 
 ### Incremental loads with `--since`
 
-Re-run the pipeline for only records modified after the last run:
+Re-run the pipeline for only records modified at or after the last run:
 
 ```bash
 sof-cli \
@@ -104,13 +104,13 @@ SOF_SERVER_PORT=8080 sof-server
 ### Send a transform request
 
 ```bash
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
   -d '{
     "_format": "json",
     "_since": "2024-01-01T00:00:00Z",
     "_limit": 500,
-    "viewResource": {
+    "subjectResource": {
       "resourceType": "ViewDefinition",
       "from": {"resourceType": "Observation"},
       "select": [{"column": [
@@ -128,10 +128,10 @@ curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
 ### Parquet output for analytics tools
 
 ```bash
-curl -X POST http://localhost:8080/ViewDefinition/\$viewdefinition-run \
+curl -X POST http://localhost:8080/\$sql-run \
   -H "Content-Type: application/json" \
   -H "Accept: application/octet-stream" \
-  -d '{"_format": "parquet", "viewResource": {...}, "resource": [...]}' \
+  -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}' \
   -o result.parquet
 ```
 

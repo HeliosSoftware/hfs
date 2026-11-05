@@ -147,6 +147,128 @@ async fn validate_nonexistent_code_returns_false() {
     assert!(!result, "unknown code should return false");
 }
 
+// ── Versioned canonicals (`url|version`, #2122) ───────────────────────────────
+
+/// Anatomy 2.0: same URL as the shared bundle's 1.0, but `arm` has a different
+/// display and `leg` is gone, so each version is distinguishable.
+#[cfg(feature = "sqlite")]
+const ANATOMY_V2_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{
+  "resourceType":"CodeSystem","id":"anatomy-v2","url":"http://hts.test/anatomy","version":"2.0",
+  "name":"AnatomyCS2","status":"active","content":"complete",
+  "concept":[{"code":"arm","display":"Upper limb"}]}}]}"#;
+
+#[cfg(feature = "sqlite")]
+fn param<'a>(body: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    body["parameter"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+}
+
+/// `system=X|V` looks up version V, the same as `system=X` + `version=V`;
+/// an unknown version is not found.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_accepts_a_versioned_canonical_system() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+
+    for (version, display) in [("1.0", "Arm"), ("2.0", "Upper limb")] {
+        let system = format!("{}|{version}", bundles::ANATOMY_CS_URL);
+        let req = TestApp::params(&[
+            ("system", "valueUri", &system),
+            ("code", "valueCode", "arm"),
+        ]);
+        let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::OK, "{version}: {body}");
+        assert_eq!(
+            param(&body, "display").unwrap()["valueString"],
+            display,
+            "{body}"
+        );
+        assert_eq!(
+            param(&body, "version").unwrap()["valueString"],
+            version,
+            "{body}"
+        );
+    }
+
+    // GET form: the pipe arrives percent-encoded.
+    let (status, body) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$lookup?system={}%7C1.0&code=arm",
+            bundles::ANATOMY_CS_URL
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Arm");
+
+    let system = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+    let req = TestApp::params(&[
+        ("system", "valueUri", &system),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// `url=X|V` (and the `system` alias) validates against version V, the same
+/// as `url=X` + `version=V`. An explicit `version` wins over the pipe.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+    let validate = |entries: &[(&str, &str, &str)]| {
+        let req = TestApp::params(entries);
+        let app = &app;
+        async move {
+            let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result = param(&body, "result").and_then(|p| p["valueBoolean"].as_bool());
+            (result, body)
+        }
+    };
+    let v1 = format!("{}|1.0", bundles::ANATOMY_CS_URL);
+    let v2 = format!("{}|2.0", bundles::ANATOMY_CS_URL);
+    let v9 = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+
+    // `leg` exists only in 1.0.
+    for (name, url, expected) in [
+        ("url", &v1, true),
+        ("url", &v2, false),
+        ("system", &v1, true),
+        ("system", &v2, false),
+    ] {
+        let (result, body) =
+            validate(&[(name, "valueUri", url), ("code", "valueCode", "leg")]).await;
+        assert_eq!(result, Some(expected), "{name}={url}: {body}");
+        assert_eq!(
+            param(&body, "version").map(|p| &p["valueString"]),
+            Some(&serde_json::json!(url.rsplit_once('|').unwrap().1)),
+            "{body}"
+        );
+    }
+
+    let (result, body) = validate(&[("url", "valueUri", &v9), ("code", "valueCode", "arm")]).await;
+    assert_eq!(
+        result,
+        Some(false),
+        "unknown version must not validate: {body}"
+    );
+
+    // Explicit `version=2.0` overrides `|1.0`: `leg` is not in 2.0.
+    let (result, body) = validate(&[
+        ("url", "valueUri", &v1),
+        ("version", "valueString", "2.0"),
+        ("code", "valueCode", "leg"),
+    ])
+    .await;
+    assert_eq!(result, Some(false), "explicit version must win: {body}");
+}
+
 // ── $subsumes ─────────────────────────────────────────────────────────────────
 
 /// Helper: call $subsumes and return the `outcome` string.
@@ -487,4 +609,179 @@ async fn lookup_by_id_unknown_id_returns_404() {
         .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── Issue #200: CodeSystem/$validate-code version pins ────────────────────────
+//
+// `CodeSystem/$validate-code` used to read only the `version` parameter.
+// `systemVersion` and the canonical `*-system-version` pins were parsed by the
+// GET/POST plumbing, were already honoured on `$expand` and
+// `ValueSet/$validate-code`, and were silently ignored here — so a client
+// pinning `systemVersion=1.0.0` got the default row anyway. That was the second
+// defect reported in #200.
+
+/// Two versions of one canonical URL. `old` exists only in 1.0.0, `new` only in
+/// 2.0.0. With no pin the newer row wins (both rows tie on every other tier), so
+/// each pin below is only satisfiable by actually honouring the parameter.
+const PIN_CS_URL: &str = "http://hts.test/cs/pinned";
+
+async fn app_with_two_versions() -> TestApp {
+    let app = TestApp::new();
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "pinned-v1", "url": PIN_CS_URL,
+                "version": "1.0.0", "status": "active", "content": "complete",
+                "concept": [{"code": "old", "display": "Only in 1.0.0"}]
+            }},
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "pinned-v2", "url": PIN_CS_URL,
+                "version": "2.0.0", "status": "active", "content": "complete",
+                "concept": [{"code": "new", "display": "Only in 2.0.0"}]
+            }}
+        ]
+    });
+    let body = serde_json::to_string(&bundle).unwrap();
+    app.import_bundle_ok(&body).await;
+    app
+}
+
+fn result_of(body: &serde_json::Value) -> bool {
+    body["parameter"]
+        .as_array()
+        .expect("Parameters.parameter")
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected a result parameter")
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_unpinned_resolves_newest_version() {
+    let app = app_with_two_versions().await;
+
+    // Baseline: with no pin, 2.0.0 wins, so `old` is not valid and `new` is.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!result_of(&body), "unpinned must resolve to 2.0.0");
+
+    let (_, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "new"),
+            ]),
+        )
+        .await;
+    assert!(result_of(&body), "unpinned must resolve to 2.0.0");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_honours_system_version_param() {
+    let app = app_with_two_versions().await;
+
+    // `systemVersion` was ignored before #200 — this would have resolved to
+    // 2.0.0 and returned false.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("systemVersion", "valueString", "1.0.0"),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        result_of(&body),
+        "systemVersion=1.0.0 must pin the 1.0.0 row"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_honours_canonical_system_version_pin() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // The tx.fhir.org canonical form: `system-version=<url>|<version>`.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(result_of(&body), "system-version pin must select 1.0.0");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn force_system_version_overrides_an_explicit_version() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // `force-system-version` outranks even an explicitly supplied `version`:
+    // the caller asks for 2.0.0, the force pin redirects to 1.0.0, and `old`
+    // (which exists only in 1.0.0) validates.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("version", "valueString", "2.0.0"),
+                ("force-system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        result_of(&body),
+        "force-system-version must override the explicit version parameter"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn explicit_version_beats_default_system_version_pin() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // `system-version` is a *default*, not a force: an explicit `version` wins,
+    // so `old` (1.0.0-only) must NOT validate against the pinned-to-2.0.0 call.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("version", "valueString", "2.0.0"),
+                ("system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !result_of(&body),
+        "an explicit version must take precedence over a system-version default"
+    );
 }

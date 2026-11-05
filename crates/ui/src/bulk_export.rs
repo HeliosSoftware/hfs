@@ -1,0 +1,2477 @@
+//! Bulk Export workspace (`/ui/bulk-export`) — driving HFS's own `$export`
+//! operation (#537).
+//!
+//! The pull-based companion to the Bulk Import workspace: the user picks a
+//! scope (everything / patients / group), the resource types, and the
+//! narrowing filters; the workspace kicks off the server's async `$export`,
+//! then tracks the job on the Exports page — one server-side status
+//! poll per htmx fetch, exactly like the import workspace's recipient
+//! polling.
+//!
+//! Kick-offs, Patient lookup, and polls are self-calls against the configured loopback HFS base,
+//! with the caller's own `Authorization` and tenant forwarded — so the export
+//! runs with the user's credentials, not a service account. Advertised public
+//! paths are validated, but stored URLs are never used as outbound authorities.
+//!
+//! Job state lives in the per-user settings document under
+//! `byTenant.<tenant>.bulkExport.jobs`, object-keyed by id.
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+
+use askama::Template;
+use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
+use axum::{
+    Extension,
+    body::{Body, Bytes},
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect, Response},
+};
+use chrono::{SecondsFormat, Utc};
+use futures_lite::io::AsyncWriteExt as FuturesAsyncWriteExt;
+use helios_fhir::FhirVersion;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
+use tokio::io::AsyncReadExt;
+
+use crate::conformance::{parameter_integer, parameter_string};
+use crate::i18n::{I18n, RequestLocale};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key,
+    upstream_failure_detail,
+};
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportJob {
+    #[serde(default)]
+    pub name: String,
+    /// `system` | `patient` | `group`.
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_id: String,
+    /// Comma-separated `_type` list; empty exports every type.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub types: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub elements: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub type_filter: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub since: String,
+    /// Upper bound of the export window (`_until`). `default` so jobs persisted
+    /// before this field existed still deserialize.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub until: String,
+    /// Canonical `Patient/{logical-id}` references selected for this export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patient_refs: Vec<String>,
+    /// The request version used for the original kick-off. Optional so jobs
+    /// persisted by older HFS versions continue to deserialize and retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fhir_version: Option<FhirVersion>,
+    /// `in-progress` | `complete` | `failed` | `cancelled`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub poll_url: String,
+    /// Trust decision captured at kick-off. Legacy records have `unknown`.
+    #[serde(default, skip_serializing_if = "RemoteJobProvenance::is_unknown")]
+    remote_job: RemoteJobProvenance,
+    /// REST job UUID, populated only when `remote_job` is `known`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    remote_job_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress: String,
+    /// Resource types fully written as of the last poll (#961); `None`
+    /// before the first poll, against a server that sends no `Parameters`
+    /// body, or in any terminal state — see [`ExportJob::progress`] for the
+    /// same lifecycle. A record persisted before #961 deserializes with
+    /// this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types_done: Option<u32>,
+    /// The total resource types in the job as of the last poll (#961); see
+    /// [`ExportJob::types_done`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types_total: Option<u32>,
+    /// The resource type the last poll reported as currently being written
+    /// (#961, `currentType`). Empty when no type is in flight, the server
+    /// doesn't report it, or in any terminal state; see
+    /// [`ExportJob::progress`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finished_at: String,
+    /// Completion-manifest `output` entries (`{type, url, count?}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<Value>,
+}
+
+impl ExportJob {
+    /// Clears `types_done`/`types_total`/`current_type` (#961) — called
+    /// alongside `progress` clearing on every transition into a terminal
+    /// state and on every poll failure, so a finished or failed job never
+    /// carries a stale type count from the last poll before it stopped
+    /// reporting progress.
+    fn clear_types_progress(&mut self) {
+        self.types_done = None;
+        self.types_total = None;
+        self.current_type.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RemoteJobProvenance {
+    /// The request may have reached HFS, but no valid job identity was returned.
+    #[default]
+    Unknown,
+    /// A valid REST job UUID was returned by the trusted kick-off response.
+    Known,
+    /// HFS rejected the kick-off before creating a remotely addressable job.
+    NoRemoteJob,
+}
+
+impl RemoteJobProvenance {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteJobIdentity {
+    Known(uuid::Uuid),
+    NoRemoteJob,
+    Unknown,
+}
+
+#[derive(Default)]
+struct JobsSnapshot {
+    jobs: serde_json::Map<String, Value>,
+    version: i64,
+}
+
+async fn load_jobs_checked(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+) -> Result<JobsSnapshot, String> {
+    let Some(store) = &state.settings else {
+        return Ok(JobsSnapshot::default());
+    };
+    let Some(stored) = store
+        .get_settings(user_key)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(JobsSnapshot::default());
+    };
+    let jobs = stored
+        .document
+        .get("byTenant")
+        .and_then(|value| value.get(tenant))
+        .and_then(|value| value.get("bulkExport"))
+        .and_then(|value| value.get("jobs"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Ok(JobsSnapshot {
+        jobs,
+        version: stored.version,
+    })
+}
+
+async fn load_jobs(state: &WebState, user_key: &str, tenant: &str) -> JobsSnapshot {
+    load_jobs_checked(state, user_key, tenant)
+        .await
+        .unwrap_or_default()
+}
+
+fn optional_string(value: &str) -> Value {
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_string())
+    }
+}
+
+/// An explicit merge value for every job field. Nulls clear fields left behind
+/// by an earlier lifecycle state, so one CAS patch is enough.
+fn job_merge_value(job: &ExportJob) -> Value {
+    json!({
+        "name": job.name,
+        "scope": job.scope,
+        "groupId": optional_string(&job.group_id),
+        "types": optional_string(&job.types),
+        "elements": optional_string(&job.elements),
+        "typeFilter": optional_string(&job.type_filter),
+        "since": optional_string(&job.since),
+        "until": optional_string(&job.until),
+        "patientRefs": if job.patient_refs.is_empty() {
+            Value::Null
+        } else {
+            json!(&job.patient_refs)
+        },
+        "fhirVersion": serde_json::to_value(job.fhir_version).unwrap_or(Value::Null),
+        "status": job.status,
+        "pollUrl": optional_string(&job.poll_url),
+        "remoteJob": match job.remote_job {
+            RemoteJobProvenance::Unknown => Value::Null,
+            RemoteJobProvenance::Known => Value::String("known".to_string()),
+            RemoteJobProvenance::NoRemoteJob => Value::String("no-remote-job".to_string()),
+        },
+        "remoteJobId": optional_string(&job.remote_job_id),
+        "progress": optional_string(&job.progress),
+        "typesDone": job.types_done,
+        "typesTotal": job.types_total,
+        "currentType": optional_string(&job.current_type),
+        "error": optional_string(&job.error),
+        "startedAt": job.started_at,
+        "finishedAt": optional_string(&job.finished_at),
+        "files": if job.files.is_empty() { Value::Null } else { Value::Array(job.files.clone()) },
+    })
+}
+
+async fn store_job(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    job: &ExportJob,
+    expected_version: i64,
+) -> Result<(), String> {
+    let Some(store) = &state.settings else {
+        return Err("settings store unavailable".to_string());
+    };
+    let value = job_merge_value(job);
+    let patch = json!({ "byTenant": { tenant: { "bulkExport": { "jobs": { id: value } } } } });
+    store
+        .patch_settings(user_key, patch, Some(expected_version))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+async fn remove_job(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    expected_version: i64,
+) -> Result<(), String> {
+    let Some(store) = &state.settings else {
+        return Err("settings store unavailable".to_string());
+    };
+    let patch =
+        json!({ "byTenant": { tenant: { "bulkExport": { "jobs": { id: Value::Null } } } } });
+    store
+        .patch_settings(user_key, patch, Some(expected_version))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+enum MemberExpectation<'a> {
+    Absent,
+    Unchanged(&'a Value),
+}
+
+impl MemberExpectation<'_> {
+    fn matches(&self, current: Option<&Value>) -> bool {
+        match self {
+            Self::Absent => current.is_none(),
+            Self::Unchanged(expected) => current == Some(*expected),
+        }
+    }
+}
+
+const SETTINGS_CAS_ATTEMPTS: usize = 3;
+
+async fn store_job_conditionally(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    job: &ExportJob,
+    mut expected_version: i64,
+    expectation: MemberExpectation<'_>,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        match store_job(state, user_key, tenant, id, job, expected_version).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 == SETTINGS_CAS_ATTEMPTS {
+            break;
+        }
+        let refreshed = load_jobs_checked(state, user_key, tenant).await?;
+        if !expectation.matches(refreshed.jobs.get(id)) {
+            return Err("export job changed concurrently".to_string());
+        }
+        expected_version = refreshed.version;
+    }
+    Err(last_error)
+}
+
+async fn remove_job_conditionally(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    expected_member: &Value,
+    mut expected_version: i64,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        match remove_job(state, user_key, tenant, id, expected_version).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 == SETTINGS_CAS_ATTEMPTS {
+            break;
+        }
+        let refreshed = load_jobs_checked(state, user_key, tenant).await?;
+        if refreshed.jobs.get(id) != Some(expected_member) {
+            return Err("export job changed concurrently".to_string());
+        }
+        expected_version = refreshed.version;
+    }
+    Err(last_error)
+}
+
+fn now_stamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn parse_job(value: &Value) -> ExportJob {
+    serde_json::from_value(value.clone()).unwrap_or_default()
+}
+
+fn base_url_with_segments<'a>(
+    base: &str,
+    tenant: &str,
+    tenant_path_routing: bool,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(base).map_err(|e| e.to_string())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "HFS base URL cannot carry path segments".to_string())?;
+        path.pop_if_empty();
+        if tenant_path_routing {
+            path.push(tenant);
+        }
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+/// Internal self-call URL. This is always based on the trusted loopback base,
+/// never a Host header or an advertised/public authority.
+///
+/// `pub(crate)`: `crate::lookup`'s Patient/Group combobox endpoints self-call
+/// through this too (#836).
+pub(crate) fn internal_api_url<'a>(
+    state: &WebState,
+    tenant: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    base_url_with_segments(
+        &state.self_base_url,
+        tenant,
+        state.tenant_path_routing,
+        segments,
+    )
+}
+
+fn public_api_url<'a>(
+    state: &WebState,
+    tenant: &str,
+    tenant_path_routing: bool,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<reqwest::Url, String> {
+    base_url_with_segments(
+        &state.public_base_url,
+        tenant,
+        tenant_path_routing,
+        segments,
+    )
+}
+
+/// The shared client for every UI call back into the FHIR API: the Bulk Export
+/// start/poll/retry/delete/download paths and the patient and Group lookups.
+///
+/// Built once. A per-call `Client::builder().build()` rebuilds the connection
+/// pool, the resolver and the TLS trust store every time, and that work does
+/// not scale across threads — measured here at 18.8ms on an idle machine
+/// against 716ms mean (781ms worst) with 32 builds in flight, a 38x
+/// degradation (#1019). Every card poll and every combobox keystroke paid it,
+/// and paid a fresh TCP connect on top because nothing was ever kept alive.
+///
+/// This is [`crate::bulk_import`]'s `http_client()` lesson (#957) applied to
+/// the paths that did not get it. Sharing is safe because the configuration
+/// below is the same at all ten call sites; the per-request timeouts that
+/// differ between them are set on the `RequestBuilder`, not here.
+///
+/// The `Result` is kept — rather than unwrapping into the `OnceLock` — so a
+/// build failure still degrades the page instead of taking the process down.
+pub(crate) fn no_redirect_client() -> Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+}
+
+fn parse_url_without_credentials(raw: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(raw)
+        .or_else(|_| reqwest::Url::parse("http://hfs.invalid").and_then(|base| base.join(raw)));
+    let url = parsed.ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url)
+}
+
+/// Accepts only the two legacy path shapes that HFS emitted before the UI
+/// stored an explicit REST job UUID. The stored authority is discarded.
+fn legacy_remote_job_id(state: &WebState, poll_url: &str, tenant: &str) -> Option<uuid::Uuid> {
+    let url = parse_url_without_credentials(poll_url)?;
+    let id = url
+        .path_segments()?
+        .next_back()
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())?;
+    let id_text = id.as_hyphenated().to_string();
+    let without_tenant =
+        public_api_url(state, tenant, false, ["export-status", id_text.as_str()]).ok()?;
+    let with_tenant =
+        public_api_url(state, tenant, true, ["export-status", id_text.as_str()]).ok()?;
+    matches!(url.path(), path if path == without_tenant.path() || path == with_tenant.path())
+        .then_some(id)
+}
+
+fn remote_job_identity(job: &ExportJob, state: &WebState, tenant: &str) -> RemoteJobIdentity {
+    match job.remote_job {
+        RemoteJobProvenance::Known => uuid::Uuid::parse_str(&job.remote_job_id)
+            .map(RemoteJobIdentity::Known)
+            .unwrap_or(RemoteJobIdentity::Unknown),
+        RemoteJobProvenance::NoRemoteJob => RemoteJobIdentity::NoRemoteJob,
+        RemoteJobProvenance::Unknown => {
+            if job.poll_url.is_empty() && job.error.starts_with("kick-off answered ") {
+                RemoteJobIdentity::NoRemoteJob
+            } else {
+                legacy_remote_job_id(state, &job.poll_url, tenant)
+                    .map(RemoteJobIdentity::Known)
+                    .unwrap_or(RemoteJobIdentity::Unknown)
+            }
+        }
+    }
+}
+
+fn trusted_kickoff_job_id(
+    state: &WebState,
+    tenant: &str,
+    content_location: &str,
+) -> Option<uuid::Uuid> {
+    let url = parse_url_without_credentials(content_location)?;
+    let id = url
+        .path_segments()?
+        .next_back()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())?;
+    let expected = public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-status", id.as_hyphenated().to_string().as_str()],
+    )
+    .ok()?;
+    (url.path() == expected.path()).then_some(id)
+}
+
+fn status_url(state: &WebState, tenant: &str, id: &uuid::Uuid) -> Result<reqwest::Url, String> {
+    let id = id.as_hyphenated().to_string();
+    internal_api_url(state, tenant, ["export-status", id.as_str()])
+}
+
+fn public_status_url(
+    state: &WebState,
+    tenant: &str,
+    id: &uuid::Uuid,
+) -> Result<reqwest::Url, String> {
+    let id = id.as_hyphenated().to_string();
+    public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-status", id.as_str()],
+    )
+}
+
+/// Forwards the caller's credentials and tenant onto a self-call, so the
+/// export runs as the user who asked for it: the browser's own
+/// `Authorization` when it sent one; else the signed-in session's bearer
+/// (#1480) — a browser signed in through the web UI carries the session
+/// cookie, not a header, and its exports must still run as that user; else
+/// the process's outbound service credential (#1438). Every request here
+/// targets this server, never a third party.
+pub(crate) async fn forward_identity(
+    state: &WebState,
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    tenant: &str,
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    let request = forward_credential(state, request, headers, audience).await?;
+    Ok(request.header("X-Tenant-ID", tenant))
+}
+
+/// The credential half of [`forward_identity`]: the browser's own
+/// `Authorization`, else the signed-in session's bearer, else the process's
+/// outbound service credential. Shared with the Import page, whose
+/// self-calls set their tenant themselves.
+pub(crate) async fn forward_credential(
+    state: &WebState,
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    audience: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        return Ok(request.header("Authorization", auth));
+    }
+    if let Some(bearer) = crate::login::session_authorization(state, headers).await {
+        return Ok(request.header("Authorization", bearer));
+    }
+    state
+        .outbound_auth
+        .authorize(request, audience)
+        .await
+        .map_err(|e| format!("outbound credential unavailable: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// View models & templates
+// ---------------------------------------------------------------------------
+
+struct JobCard {
+    id: String,
+    name: String,
+    status: String,
+    status_label: String,
+    /// `0`–`100` for the progress track (#735): terminal states fill the bar,
+    /// in-progress parses the percentage out of the recipient's X-Progress.
+    progress_pct: String,
+    /// The in-progress meta line's text (#961): "Writing Observation · 1 of
+    /// 3 types" when the last poll reported type counts, else `progress` or
+    /// the localized waiting message — see [`progress_label`].
+    progress_label: String,
+    error: String,
+    file_count: usize,
+    elapsed: String,
+    can_delete: bool,
+    /// The `[_since, _until]` window, pre-rendered, empty when unbounded. Shown
+    /// so a running job states the window it was started with.
+    window: String,
+}
+
+fn progress_pct(status: &str, progress: &str) -> String {
+    if matches!(status, "complete" | "failed" | "cancelled") {
+        return "100".to_string();
+    }
+    let Some(idx) = progress.find('%') else {
+        return "0".to_string();
+    };
+    let digits: String = progress[..idx]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let pct: String = digits.chars().rev().collect();
+    if pct.is_empty() { "0".to_string() } else { pct }
+}
+
+/// The in-progress meta line's text (#961). With type counts from the last
+/// poll's `Parameters` body, this is `"Writing <type> · <done> of <total>
+/// types"` (the leading "Writing <type>" clause omitted when no type is
+/// currently in flight) — the percentage is already the progress bar's job.
+/// Without counts (a pre-#961 server, or before the first poll), this falls
+/// back to today's raw `progress` string, or the localized waiting message
+/// before the first status report.
+fn progress_label(i18n: &I18n, job: &ExportJob) -> String {
+    let Some(total) = job.types_total else {
+        return if job.progress.is_empty() {
+            i18n.t("bulk-export-progress-waiting")
+        } else {
+            job.progress.clone()
+        };
+    };
+    let done = job.types_done.unwrap_or(0);
+    let writing = if job.current_type.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} · ",
+            i18n.t_arg("bulk-export-writing", "name", job.current_type.clone())
+        )
+    };
+    let done_of_total = i18n.t_arg2(
+        "bulk-export-types-progress",
+        "done",
+        done as i64,
+        "total",
+        total as i64,
+    );
+    format!("{writing}{done_of_total}")
+}
+
+fn status_label(i18n: &I18n, status: &str) -> String {
+    match status {
+        "complete" => i18n.t("bulk-export-status-complete"),
+        "failed" => i18n.t("bulk-export-status-failed"),
+        "cancelled" => i18n.t("bulk-export-status-cancelled"),
+        _ => i18n.t("bulk-export-status-in-progress"),
+    }
+}
+
+/// `finished - started` as `5m 08s`, when both stamps parse.
+fn elapsed(job: &ExportJob) -> String {
+    let (Ok(start), Ok(end)) = (
+        chrono::DateTime::parse_from_rfc3339(&job.started_at),
+        chrono::DateTime::parse_from_rfc3339(&job.finished_at),
+    ) else {
+        return String::new();
+    };
+    let secs = (end - start).num_seconds().max(0);
+    format!("{}m {:02}s", secs / 60, secs % 60)
+}
+
+fn job_card(i18n: &I18n, id: &str, job: &ExportJob, state: &WebState, tenant: &str) -> JobCard {
+    JobCard {
+        id: id.to_string(),
+        name: if job.name.is_empty() {
+            job.scope.clone()
+        } else {
+            job.name.clone()
+        },
+        status_label: status_label(i18n, &job.status),
+        status: job.status.clone(),
+        progress_pct: progress_pct(&job.status, &job.progress),
+        progress_label: progress_label(i18n, job),
+        error: job.error.clone(),
+        file_count: job.files.len(),
+        elapsed: elapsed(job),
+        can_delete: terminal_status(&job.status)
+            && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,
+        window: export_window(i18n, job),
+    }
+}
+
+/// Renders a job's `[_since, _until]` window for the card, or an empty string
+/// when the export is unbounded. Either bound may stand alone.
+fn export_window(i18n: &I18n, job: &ExportJob) -> String {
+    match (job.since.is_empty(), job.until.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("{} {}", i18n.t("bulk-export-window-since"), job.since),
+        (true, false) => format!("{} {}", i18n.t("bulk-export-window-until"), job.until),
+        (false, false) => format!("{} \u{2192} {}", job.since, job.until),
+    }
+}
+
+/// One output file on the detail page: the zip-style name and its manifest URL.
+struct FileLink {
+    label: String,
+    href: String,
+}
+
+/// One resource type's row of the Output files table.
+struct OutputRow {
+    resource_type: String,
+    files: Vec<FileLink>,
+}
+
+/// View model of one export's own page.
+struct JobDetail {
+    id: String,
+    /// Same fallback as the card: the scope when the export is unnamed.
+    name: String,
+    status: String,
+    status_label: String,
+    /// Scope label, plus `" · "` and the window when bounded.
+    lede: String,
+    error: String,
+    progress_pct: String,
+    progress_label: String,
+    scope_label: String,
+    /// Empty unless the scope is `group`.
+    group_id: String,
+    /// Empty means all resources.
+    types: Vec<String>,
+    since: String,
+    until: String,
+    elements: String,
+    type_filter: String,
+    patients: Vec<String>,
+    started_label: String,
+    /// `elapsed`, or an em dash when empty.
+    duration_label: String,
+    outputs: Vec<OutputRow>,
+    /// Number of files, not rows.
+    output_count: usize,
+    can_delete: bool,
+}
+
+/// Builds the detail page's view model. File labels reuse
+/// [`unique_zip_filename`] and [`safe_resource_name`] with a per-type ordinal
+/// from 1, so they match the entries of Download All Resources.
+fn build_job_detail(
+    i18n: &I18n,
+    id: &str,
+    job: &ExportJob,
+    state: &WebState,
+    tenant: &str,
+) -> JobDetail {
+    let scope_label = match job.scope.as_str() {
+        "patient" => i18n.t("bulk-export-scope-patient"),
+        "group" => i18n.t("bulk-export-scope-group"),
+        _ => i18n.t("bulk-export-scope-system"),
+    };
+    let window = export_window(i18n, job);
+    let lede = if window.is_empty() {
+        scope_label.clone()
+    } else {
+        format!("{scope_label} \u{b7} {window}")
+    };
+    let mut rows: Vec<OutputRow> = Vec::new();
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+    let mut used = HashSet::new();
+    let mut output_count = 0;
+    for file in &job.files {
+        let (Some(resource_type), Some(href)) = (
+            file.get("type").and_then(Value::as_str),
+            file.get("url").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let ordinal = ordinals.entry(resource_type.to_string()).or_default();
+        *ordinal += 1;
+        let label = unique_zip_filename(&safe_resource_name(resource_type), *ordinal, &mut used);
+        let link = FileLink {
+            label,
+            href: href.to_string(),
+        };
+        output_count += 1;
+        match rows.iter_mut().find(|r| r.resource_type == resource_type) {
+            Some(row) => row.files.push(link),
+            None => rows.push(OutputRow {
+                resource_type: resource_type.to_string(),
+                files: vec![link],
+            }),
+        }
+    }
+    let duration = elapsed(job);
+    JobDetail {
+        id: id.to_string(),
+        name: if job.name.is_empty() {
+            job.scope.clone()
+        } else {
+            job.name.clone()
+        },
+        status: job.status.clone(),
+        status_label: status_label(i18n, &job.status),
+        lede,
+        error: job.error.clone(),
+        progress_pct: progress_pct(&job.status, &job.progress),
+        progress_label: progress_label(i18n, job),
+        scope_label,
+        group_id: if job.scope == "group" {
+            job.group_id.clone()
+        } else {
+            String::new()
+        },
+        types: job
+            .types
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect(),
+        since: job.since.clone(),
+        until: job.until.clone(),
+        elements: job.elements.clone(),
+        type_filter: job.type_filter.clone(),
+        patients: job.patient_refs.clone(),
+        started_label: crate::sql_export::format_timestamp_seconds(&job.started_at),
+        duration_label: if duration.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            duration
+        },
+        outputs: rows,
+        output_count,
+        can_delete: terminal_status(&job.status)
+            && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,
+    }
+}
+
+/// The detail page's status-dependent region (`#job-detail`), shared by the
+/// full page and the 5s refresh fragment.
+#[derive(Template)]
+#[template(path = "partials/bulk_export_detail.html")]
+struct ExportDetailFragment {
+    i18n: I18n,
+    detail: JobDetail,
+}
+
+/// `GET /ui/bulk-export/active/{id}` in the full shell.
+#[derive(Template)]
+#[template(path = "pages/bulk-export-detail.html")]
+struct ExportDetailPage {
+    status: crate::Status,
+    i18n: I18n,
+    active_page: &'static str,
+    fragment: ExportDetailFragment,
+}
+
+#[derive(Template)]
+#[template(path = "pages/bulk-export.html")]
+struct BulkExportPage {
+    status: crate::Status,
+    i18n: I18n,
+    active_page: &'static str,
+    available: bool,
+    resource_types: Vec<String>,
+    error: Option<String>,
+    name_error: Option<String>,
+    since_custom_error: Option<String>,
+    until_error: Option<String>,
+    form: StartForm,
+    rejected: bool,
+    patient_value: String,
+    patient_hint: String,
+}
+
+#[derive(Template)]
+#[template(path = "pages/bulk-export-active.html")]
+struct ActiveExportsPage {
+    status: crate::Status,
+    i18n: I18n,
+    active_page: &'static str,
+    available: bool,
+    summary: ExportSummary,
+    cards: Vec<JobCard>,
+    delete_error: bool,
+}
+
+#[derive(Template)]
+#[template(path = "partials/bulk_export_card_response.html")]
+struct JobCardFragment {
+    i18n: I18n,
+    card: JobCard,
+    summary: Option<ExportSummary>,
+}
+
+/// The same user/tenant job set supplies the page and a terminal card's OOB
+/// summary. Loading it never polls any other job.
+struct ExportSummary {
+    total: usize,
+    running: usize,
+    oob: bool,
+}
+
+fn export_summary(jobs: &serde_json::Map<String, Value>, oob: bool) -> ExportSummary {
+    ExportSummary {
+        total: jobs.len(),
+        running: jobs
+            .values()
+            .filter(|value| parse_job(value).status == "in-progress")
+            .count(),
+        oob,
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct ActiveQuery {
+    #[serde(rename = "delete-error")]
+    delete_error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// `GET /ui/bulk-export/new` — the export builder.
+pub async fn page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    bulk_export_page(
+        &state,
+        locale,
+        rv.0,
+        &rt,
+        StartForm::initial(),
+        StartErrors::default(),
+        None,
+    )
+    .await
+}
+
+async fn bulk_export_page(
+    state: &WebState,
+    locale: RequestLocale,
+    version: FhirVersion,
+    rt: &RequestTenant,
+    mut form: StartForm,
+    errors: StartErrors,
+    error: Option<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let status = current_status(state, version, rt);
+    let resource_types = state
+        .compartments
+        .resource_type_names(&rt.id, version)
+        .await;
+    form.normalize_for_view(&resource_types);
+    let patient_value = form.patients.join("\n");
+    let patient_hint = if state.patient_name_search.load(Ordering::Relaxed) {
+        i18n.t("bulk-export-field-patients-hint")
+    } else {
+        i18n.t("bulk-export-field-patients-id-only-hint")
+    };
+    let rejected = errors.rejected || error.is_some();
+    render(BulkExportPage {
+        status,
+        i18n,
+        active_page: "bulk-export",
+        available: state.settings.is_some(),
+        resource_types,
+        error,
+        name_error: errors.name,
+        since_custom_error: errors.since_custom,
+        until_error: errors.until,
+        form,
+        rejected,
+        patient_value,
+        patient_hint,
+    })
+}
+
+/// The export form. Parsed by hand: the resource-type checkboxes arrive as
+/// repeated `types` fields, which `axum::Form`'s serde_urlencoded rejects.
+#[derive(Default)]
+pub struct StartForm {
+    pub name: String,
+    pub scope: String,
+    pub group_id: String,
+    pub all_types: bool,
+    pub types: Vec<String>,
+    pub elements: String,
+    pub type_filter: String,
+    pub since_preset: String,
+    pub since_custom: String,
+    pub until: String,
+    pub patients: Vec<String>,
+}
+
+impl StartForm {
+    fn initial() -> Self {
+        Self {
+            scope: "system".to_string(),
+            all_types: true,
+            ..Default::default()
+        }
+    }
+
+    fn normalize_for_view(&mut self, resource_types: &[String]) {
+        if !matches!(self.scope.as_str(), "system" | "patient" | "group") {
+            self.scope = "system".to_string();
+        }
+        if !matches!(
+            self.since_preset.as_str(),
+            "" | "day" | "week" | "month" | "custom"
+        ) {
+            self.since_preset.clear();
+        }
+        let mut seen = HashSet::new();
+        self.types.retain(|resource_type| {
+            resource_types.contains(resource_type) && seen.insert(resource_type.clone())
+        });
+    }
+
+    fn has_type(&self, resource_type: &str) -> bool {
+        self.types.iter().any(|selected| selected == resource_type)
+    }
+}
+
+#[derive(Default)]
+struct StartErrors {
+    name: Option<String>,
+    since_custom: Option<String>,
+    until: Option<String>,
+    rejected: bool,
+}
+
+fn parse_start_form(body: &str) -> StartForm {
+    let mut form = StartForm::default();
+    for (key, value) in form_urlencoded::parse(body.as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "name" => form.name = value,
+            "scope" => form.scope = value,
+            "group_id" => form.group_id = value,
+            // Presence is the HTML checkbox contract. Its value is deliberately
+            // ignored so field order and manipulated payloads cannot make
+            // individual types override "All Resources".
+            "all_types" => form.all_types = true,
+            "types" => form.types.push(value),
+            "elements" => form.elements = value,
+            "type_filter" => form.type_filter = value,
+            "since_preset" => form.since_preset = value,
+            "since_custom" => form.since_custom = value,
+            "until" => form.until = value,
+            "patient" => form.patients.push(value),
+            _ => {}
+        }
+    }
+    form
+}
+
+// Since-preset resolution, instant validation, Patient reference
+// canonicalization/parsing, and the Patient combobox search endpoint moved
+// to crate::lookup (#836) — Bulk Export now calls them from there.
+
+/// `POST /ui/bulk-export` — kick off the export, then land on Exports.
+pub async fn start(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let form = parse_start_form(&String::from_utf8_lossy(&body));
+    let scope = match form.scope.as_str() {
+        "patient" | "group" => form.scope.clone(),
+        _ => "system".to_string(),
+    };
+    let patient_refs = if scope == "patient" {
+        crate::lookup::parse_reference_list("Patient", &form.patients)
+    } else {
+        Ok(Vec::new())
+    };
+    let since = crate::lookup::since_instant(&form.since_preset, &form.since_custom);
+    let until = crate::lookup::optional_instant(&form.until);
+    let i18n = I18n::new(locale);
+    let errors = StartErrors {
+        name: form
+            .name
+            .trim()
+            .is_empty()
+            .then(|| i18n.t("bulk-export-name-required")),
+        since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        until: match (&since, &until) {
+            (_, Err(())) => Some(i18n.t("bulk-export-since-invalid")),
+            (Ok(since), Ok(until)) if crate::lookup::instant_before(until, since) => {
+                Some(i18n.t("bulk-export-until-before-since"))
+            }
+            _ => None,
+        },
+        rejected: true,
+    };
+    let patient_error = patient_refs
+        .is_err()
+        .then(|| i18n.t("bulk-export-patient-invalid"));
+    if errors.name.is_some()
+        || errors.since_custom.is_some()
+        || errors.until.is_some()
+        || patient_error.is_some()
+    {
+        let mut response =
+            bulk_export_page(&state, locale, rv.0, &rt, form, errors, patient_error).await;
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
+    }
+
+    let patient_refs = patient_refs.expect("patient references were validated");
+    let since = since.expect("custom instant was validated");
+    let until = until.expect("until instant was validated");
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let mut job = ExportJob {
+        name: form.name.trim().to_string(),
+        scope,
+        group_id: form.group_id.trim().to_string(),
+        types: if form.all_types {
+            String::new()
+        } else {
+            form.types.join(",")
+        },
+        elements: form.elements.trim().to_string(),
+        type_filter: form.type_filter.trim().to_string(),
+        since,
+        until,
+        patient_refs,
+        fhir_version: Some(rv.0),
+        status: "in-progress".to_string(),
+        started_at: now_stamp(),
+        ..Default::default()
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    kickoff(&state, &mut job, &headers, &rt.id).await;
+    if store_job_conditionally(
+        &state,
+        &user_key,
+        &rt.id,
+        &id,
+        &job,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    .is_err()
+    {
+        cleanup_or_record_recovery(&state, &user_key, &rt.id, &job, &headers).await;
+    }
+    Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// How long the kick-off self-call waits for HFS to accept the job. Creating
+/// an export job is one small insert, so this stays well under the server's
+/// own 30s SQLite `busy_timeout`: raising it past that would park this POST
+/// handler for half a minute and still not help, because a search-index
+/// rebuild can hold the single write lock for minutes (#1185). The cap is
+/// deliberately the shorter one, and a kick-off that hits it says so.
+const KICKOFF_TIMEOUT_SECS: u64 = 15;
+
+/// Why a kick-off can go unanswered long enough to hit the cap: on SQLite the
+/// insert that creates the job queues behind the single writer lock, which a
+/// post-import search-index rebuild holds for as long as it takes to rebuild
+/// the value indexes (#1185).
+const KICKOFF_TIMEOUT_HINT: &str =
+    "a search-index rebuild may be holding the database, try again shortly";
+
+/// Performs the `$export` kick-off self-call, recording the poll URL or the
+/// failure on the job.
+async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
+    job.remote_job = RemoteJobProvenance::Unknown;
+    job.remote_job_id.clear();
+    job.poll_url.clear();
+    let path = match job.scope.as_str() {
+        "patient" => internal_api_url(state, tenant, ["Patient", "$export"]),
+        "group" => internal_api_url(state, tenant, ["Group", job.group_id.as_str(), "$export"]),
+        _ => internal_api_url(state, tenant, ["$export"]),
+    };
+    let path = match path {
+        Ok(path) => path,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
+    };
+    let version = job.fhir_version.unwrap_or(state.fhir_version);
+    let media = crate::lookup::fhir_json(version);
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if !job.types.is_empty() {
+        query.push(("_type", &job.types));
+    }
+    if !job.elements.is_empty() {
+        query.push(("_elements", &job.elements));
+    }
+    if !job.type_filter.is_empty() {
+        query.push(("_typeFilter", &job.type_filter));
+    }
+    if !job.since.is_empty() {
+        query.push(("_since", &job.since));
+    }
+    if !job.until.is_empty() {
+        query.push(("_until", &job.until));
+    }
+    let client = match no_redirect_client() {
+        Ok(client) => client,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
+    };
+    let audience = path.to_string();
+    let builder = if job.scope == "patient" && !job.patient_refs.is_empty() {
+        let mut parameters = Vec::new();
+        for (name, value) in &query {
+            if *name == "_since" || *name == "_until" {
+                parameters.push(json!({ "name": name, "valueInstant": value }));
+            } else {
+                parameters.push(json!({ "name": name, "valueString": value }));
+            }
+        }
+        for reference in &job.patient_refs {
+            parameters.push(json!({
+                "name": "patient",
+                "valueReference": { "reference": reference }
+            }));
+        }
+        client
+            .post(path.clone())
+            .header("Content-Type", &media)
+            .json(&json!({
+                "resourceType": "Parameters",
+                "parameter": parameters
+            }))
+    } else {
+        client.get(path).query(&query)
+    };
+    let request = match forward_identity(
+        state,
+        builder
+            .header("Accept", &media)
+            .header("Prefer", "respond-async")
+            .timeout(std::time::Duration::from_secs(KICKOFF_TIMEOUT_SECS)),
+        headers,
+        tenant,
+        &audience,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = e;
+            return;
+        }
+    };
+    match request.send().await {
+        Ok(response) if response.status() == StatusCode::ACCEPTED => {
+            match response
+                .headers()
+                .get("content-location")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(poll) => match trusted_kickoff_job_id(state, tenant, poll) {
+                    Some(id) => {
+                        job.remote_job = RemoteJobProvenance::Known;
+                        job.remote_job_id = id.as_hyphenated().to_string();
+                        job.poll_url = public_status_url(state, tenant, &id)
+                            .map(|url| url.to_string())
+                            .unwrap_or_default();
+                    }
+                    None => {
+                        job.status = "failed".to_string();
+                        job.error = "kick-off returned an invalid Content-Location".to_string();
+                    }
+                },
+                None => {
+                    job.status = "failed".to_string();
+                    job.error = "kick-off accepted without a Content-Location".to_string();
+                }
+            }
+        }
+        Ok(response) => {
+            job.remote_job = RemoteJobProvenance::NoRemoteJob;
+            let code = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            job.status = "failed".to_string();
+            job.error = format!("kick-off answered {code}: {}", response_diagnostics(&body));
+        }
+        Err(e) => {
+            // The provenance stays `Unknown`: a transport failure says
+            // nothing about whether the server created the job, so the card
+            // must keep asking the server before it deletes anything. The
+            // text must therefore not begin with "kick-off answered ", the
+            // legacy marker `remote_job_identity` reads as "the server
+            // refused outright, there is no remote job".
+            job.remote_job = RemoteJobProvenance::Unknown;
+            job.status = "failed".to_string();
+            job.error = format!(
+                "kick-off failed: {}",
+                upstream_failure_detail(&e, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT)
+            );
+        }
+    }
+}
+
+async fn cleanup_kickoff_job(
+    state: &WebState,
+    job: &ExportJob,
+    headers: &HeaderMap,
+    tenant: &str,
+) -> Result<(), String> {
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(job, state, tenant) else {
+        return Ok(());
+    };
+    let client = no_redirect_client()?;
+    let url = status_url(state, tenant, &remote_id)?;
+    let mut last_error = String::new();
+    for attempt in 0..SETTINGS_CAS_ATTEMPTS {
+        let response = forward_identity(
+            state,
+            client
+                .delete(url.clone())
+                .timeout(std::time::Duration::from_secs(10)),
+            headers,
+            tenant,
+            url.as_str(),
+        )
+        .await?
+        .send()
+        .await;
+        match response {
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND =>
+            {
+                return Ok(());
+            }
+            Ok(response)
+                if response.status().is_server_error()
+                    || matches!(
+                        response.status(),
+                        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                    ) =>
+            {
+                last_error = format!("cleanup answered {}", response.status());
+            }
+            Ok(response) => return Err(format!("cleanup answered {}", response.status())),
+            Err(error) => last_error = format!("cleanup request failed: {error}"),
+        }
+        if attempt + 1 < SETTINGS_CAS_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64)).await;
+        }
+    }
+    Err(last_error)
+}
+
+async fn cleanup_or_record_recovery(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    job: &ExportJob,
+    headers: &HeaderMap,
+) {
+    let Err(cleanup_error) = cleanup_kickoff_job(state, job, headers, tenant).await else {
+        return;
+    };
+    let mut recovery = job.clone();
+    recovery.name = if job.name.is_empty() {
+        "Export cleanup required".to_string()
+    } else {
+        format!("{} (cleanup required)", job.name)
+    };
+    recovery.status = "failed".to_string();
+    recovery.error = format!(
+        "Automatic cleanup failed ({cleanup_error}). Delete this card to retry remote cleanup."
+    );
+    recovery.progress.clear();
+    recovery.files.clear();
+    recovery.finished_at = now_stamp();
+    let recovery_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = match load_jobs_checked(state, user_key, tenant).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(
+                remote_job_id = %job.remote_job_id,
+                "failed to load settings for export cleanup recovery: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = store_job_conditionally(
+        state,
+        user_key,
+        tenant,
+        &recovery_id,
+        &recovery,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    {
+        tracing::error!(
+            remote_job_id = %job.remote_job_id,
+            "failed to persist export cleanup recovery card: {error}"
+        );
+    }
+}
+
+fn response_diagnostics(body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(body)
+        && value.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome")
+    {
+        let diagnostics: Vec<&str> = value
+            .get("issue")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|issue| {
+                issue
+                    .get("diagnostics")
+                    .and_then(Value::as_str)
+                    .or_else(|| issue.pointer("/details/text").and_then(Value::as_str))
+            })
+            .collect();
+        if !diagnostics.is_empty() {
+            return diagnostics.join("; ").chars().take(300).collect();
+        }
+    }
+    body.replace('\n', " ").chars().take(300).collect()
+}
+
+/// `GET /ui/bulk-export` — the job list.
+pub async fn active(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    Query(query): Query<ActiveQuery>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    let available = state.settings.is_some();
+    let user_key = settings_user_key(principal.as_deref());
+    let jobs = if available {
+        load_jobs(&state, &user_key, &rt.id).await
+    } else {
+        JobsSnapshot::default()
+    };
+    let mut entries: Vec<(String, ExportJob)> = jobs
+        .jobs
+        .iter()
+        .map(|(id, v)| (id.clone(), parse_job(v)))
+        .collect();
+    entries.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
+    let cards = entries
+        .iter()
+        .map(|(id, j)| job_card(&i18n, id, j, &state, &rt.id))
+        .collect();
+    render(ActiveExportsPage {
+        status,
+        i18n: I18n::new(locale),
+        active_page: "bulk-export",
+        available,
+        summary: export_summary(&jobs.jobs, false),
+        cards,
+        delete_error: matches!(
+            query.delete_error.as_deref(),
+            Some("remote") | Some("local")
+        ),
+    })
+}
+
+/// `GET /ui/bulk-export/active` — permanent compatibility redirect.
+pub async fn active_redirect() -> Redirect {
+    Redirect::permanent("/ui/bulk-export")
+}
+
+/// `GET /ui/bulk-export/active/{id}/card` — one poll, then the refreshed card.
+pub async fn card(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let user_key = settings_user_key(principal.as_deref());
+    let (job, snapshot) = match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, snapshot) => (*job, snapshot),
+        Polled::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        Polled::Unavailable => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let card = job_card(&i18n, &id, &job, &state, &rt.id);
+    let summary = (job.status != "in-progress").then(|| export_summary(&snapshot.jobs, true));
+    render(JobCardFragment {
+        i18n,
+        card,
+        summary,
+    })
+}
+
+/// Outcome of [`poll_persisted`].
+enum Polled {
+    /// The job as persisted after any poll, with the snapshot it was read from.
+    Job(Box<ExportJob>, JobsSnapshot),
+    /// `id` names nothing this user/tenant owns (or it was removed mid-poll).
+    NotFound,
+    /// The settings store could not be read.
+    Unavailable,
+}
+
+/// Loads `id`, polls it once when it is `in-progress`, stores the transition
+/// with a compare-and-swap and re-reads what is persisted — the shared body
+/// of [`card`], [`detail_page`] and [`detail_fragment`]. Never returns a
+/// polled state that lost its CAS race. A checked re-read also prevents a
+/// terminal swap from stopping retries after a store outage, or resurrecting
+/// a concurrently removed job in the browser.
+async fn poll_persisted(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    headers: &HeaderMap,
+    id: &str,
+) -> Polled {
+    let mut snapshot = match load_jobs_checked(state, user_key, tenant).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Polled::Unavailable,
+    };
+    let Some(original) = snapshot.jobs.get(id) else {
+        return Polled::NotFound;
+    };
+    let mut job = parse_job(original);
+    if job.status == "in-progress" {
+        poll_job(state, &mut job, headers, tenant).await;
+        let _ = store_job_conditionally(
+            state,
+            user_key,
+            tenant,
+            id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
+        snapshot = match load_jobs_checked(state, user_key, tenant).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Polled::Unavailable,
+        };
+        let Some(persisted) = snapshot.jobs.get(id) else {
+            return Polled::NotFound;
+        };
+        job = parse_job(persisted);
+    }
+    Polled::Job(Box::new(job), snapshot)
+}
+
+/// `GET /ui/bulk-export/active/{id}` — the export's own page inside the
+/// full shell. A foreign, unknown or unreadable id renders the shell's
+/// "not found" page, indistinguishable from one another.
+pub async fn detail_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    let user_key = settings_user_key(principal.as_deref());
+    match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, _) => {
+            let detail = build_job_detail(&i18n, &id, &job, &state, &rt.id);
+            render(ExportDetailPage {
+                status,
+                i18n,
+                active_page: "bulk-export",
+                fragment: ExportDetailFragment { i18n, detail },
+            })
+        }
+        Polled::NotFound | Polled::Unavailable => crate::render_not_found(
+            status,
+            i18n,
+            "bulk-export",
+            "/ui/bulk-export",
+            i18n.t("bulk-export-active-title"),
+        ),
+    }
+}
+
+/// `GET /ui/bulk-export/active/{id}/detail` — the `#job-detail` content of
+/// [`detail_page`] without the shell, the target of its own 5s refresh while
+/// the job runs. `404` without a body for an unknown id, `503` when the
+/// store cannot be read.
+pub async fn detail_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let user_key = settings_user_key(principal.as_deref());
+    match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, _) => {
+            let detail = build_job_detail(&i18n, &id, &job, &state, &rt.id);
+            render(ExportDetailFragment { i18n, detail })
+        }
+        Polled::NotFound => StatusCode::NOT_FOUND.into_response(),
+        Polled::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// One poll of the export status endpoint. A `202`'s body is read as the
+/// `typesDone`/`typesTotal`/`currentType` parameters
+/// `crates/rest/src/handlers/sof/export.rs` publishes (#961): a missing
+/// body, one that isn't valid JSON, or a `Parameters` resource without those
+/// parameters simply clears them — never an error, since `X-Progress` alone
+/// is still a perfectly good answer from a server that predates this
+/// extension.
+async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(job, state, tenant) else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: remote job identity is unknown".to_string();
+        job.clear_types_progress();
+        return;
+    };
+    let Ok(url) = status_url(state, tenant, &remote_id) else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: invalid HFS base URL".to_string();
+        job.clear_types_progress();
+        return;
+    };
+    let Ok(client) = no_redirect_client() else {
+        job.status = "failed".to_string();
+        job.error = "status poll unavailable: HTTP client setup failed".to_string();
+        job.clear_types_progress();
+        return;
+    };
+    let media = crate::lookup::fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
+    let audience = url.to_string();
+    let request = match forward_identity(
+        state,
+        client
+            .get(url)
+            .header("Accept", media)
+            .timeout(std::time::Duration::from_secs(10)),
+        headers,
+        tenant,
+        &audience,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = format!("status poll unavailable: {e}");
+            job.clear_types_progress();
+            return;
+        }
+    };
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            job.status = "failed".to_string();
+            job.error = format!("status poll failed: {e}");
+            job.clear_types_progress();
+            return;
+        }
+    };
+    match response.status().as_u16() {
+        202 => {
+            job.progress = response
+                .headers()
+                .get("x-progress")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("in progress")
+                .to_string();
+            let body = response.text().await.unwrap_or_default();
+            let params = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+                (value.get("resourceType").and_then(Value::as_str) == Some("Parameters"))
+                    .then(|| value.get("parameter").and_then(Value::as_array).cloned())
+                    .flatten()
+            });
+            match params {
+                Some(params) => {
+                    job.types_done = parameter_integer(&params, "typesDone");
+                    job.types_total = parameter_integer(&params, "typesTotal");
+                    job.current_type = parameter_string(&params, "currentType").unwrap_or_default();
+                }
+                None => job.clear_types_progress(),
+            }
+        }
+        200 => {
+            let manifest: Value = response.json().await.unwrap_or(Value::Null);
+            job.files = manifest["output"].as_array().cloned().unwrap_or_default();
+            job.status = "complete".to_string();
+            job.finished_at = now_stamp();
+            job.progress = String::new();
+            job.clear_types_progress();
+        }
+        code => {
+            let body = response.text().await.unwrap_or_default();
+            job.status = "failed".to_string();
+            job.error = format!("{code}: {}", response_diagnostics(&body));
+            job.clear_types_progress();
+        }
+    }
+}
+
+/// `POST /ui/bulk-export/active/{id}/cancel` — DELETE against the poll URL.
+pub async fn cancel(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    if let Some(original) = snapshot.jobs.get(&id) {
+        let mut job = parse_job(original);
+        // The server's answer decides the card (#1571): a refused DELETE
+        // leaves the job running, so the card stays in progress and says
+        // why; only a landed (or already gone) one marks it cancelled.
+        let mut refused: Option<String> = None;
+        if let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id)
+            && let (Ok(client), Ok(url)) =
+                (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
+        {
+            let audience = url.to_string();
+            refused = match forward_identity(
+                &state,
+                client
+                    .delete(url)
+                    .timeout(std::time::Duration::from_secs(10)),
+                &headers,
+                &rt.id,
+                &audience,
+            )
+            .await
+            {
+                Ok(request) => match request.send().await {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::NOT_FOUND =>
+                    {
+                        None
+                    }
+                    Ok(response) => Some(cancel_refusal(response).await),
+                    Err(e) => Some(e.to_string()),
+                },
+                Err(e) => Some(e),
+            };
+        }
+        match refused {
+            Some(reason) => job.error = reason,
+            None => {
+                job.status = "cancelled".to_string();
+                job.finished_at = now_stamp();
+                job.progress = String::new();
+                job.error = String::new();
+                job.clear_types_progress();
+            }
+        }
+        let _ = store_job_conditionally(
+            &state,
+            &user_key,
+            &rt.id,
+            &id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
+    }
+    Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// The line an in-progress card shows for a DELETE the server refused: the
+/// status and the OperationOutcome text, or the status alone when the body
+/// carried none.
+async fn cancel_refusal(response: reqwest::Response) -> String {
+    let code = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = response_diagnostics(&body);
+    if detail.is_empty() {
+        format!(
+            "{} {}",
+            code.as_u16(),
+            code.canonical_reason().unwrap_or("")
+        )
+        .trim_end()
+        .to_string()
+    } else {
+        format!("{}: {detail}", code.as_u16())
+    }
+}
+
+/// Builds a fresh `in-progress` job that copies only the request fields of
+/// `source` (name, scope, group, types, elements, type filter, resolved
+/// `since`/`until`, selected patients, FHIR version), kicks it off, and
+/// stores it as a brand-new record under a new id. `source` is read-only: it
+/// is never written back to. If the new record cannot be stored, the freshly
+/// created remote job is cleaned up (or recorded for recovery).
+async fn resubmit(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    headers: &HeaderMap,
+    source: &ExportJob,
+) -> Response {
+    let snapshot = load_jobs(state, user_key, tenant).await;
+    let mut job = ExportJob {
+        name: source.name.clone(),
+        scope: source.scope.clone(),
+        group_id: source.group_id.clone(),
+        types: source.types.clone(),
+        elements: source.elements.clone(),
+        type_filter: source.type_filter.clone(),
+        since: source.since.clone(),
+        until: source.until.clone(),
+        patient_refs: source.patient_refs.clone(),
+        fhir_version: source.fhir_version,
+        status: "in-progress".to_string(),
+        started_at: now_stamp(),
+        ..Default::default()
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    kickoff(state, &mut job, headers, tenant).await;
+    if store_job_conditionally(
+        state,
+        user_key,
+        tenant,
+        &id,
+        &job,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    .is_err()
+    {
+        cleanup_or_record_recovery(state, user_key, tenant, &job, headers).await;
+    }
+    Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// Shared tail of [`retry`] and [`rerun`]: loads the record `id` names for
+/// this user/tenant, checks `eligible` against its current status — a silent
+/// no-op redirect (no kick-off, no write) when it is not or when `id` names
+/// nothing — and otherwise hands it to [`resubmit`]. The original record is
+/// read-only throughout; only a new record is ever written.
+async fn retry_or_rerun(
+    state: &WebState,
+    tenant: &str,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: &HeaderMap,
+    id: &str,
+    eligible: impl Fn(&str) -> bool,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(state, &user_key, tenant).await;
+    let Some(source) = snapshot.jobs.get(id).map(parse_job) else {
+        return Redirect::to("/ui/bulk-export").into_response();
+    };
+    if !eligible(&source.status) {
+        return Redirect::to("/ui/bulk-export").into_response();
+    }
+    resubmit(state, &user_key, tenant, headers, &source).await
+}
+
+/// `POST /ui/bulk-export/active/{id}/retry` — for a `failed` job only, start
+/// a fresh export with the same request and store it as a new record. The
+/// failed record is left untouched; any other status is a silent no-op.
+pub async fn retry(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    retry_or_rerun(&state, &rt.id, principal, &headers, &id, |status| {
+        status == "failed"
+    })
+    .await
+}
+
+/// `POST /ui/bulk-export/active/{id}/rerun` — for any terminal job
+/// (`complete`, `failed`, `cancelled`), start a fresh export with the same
+/// request and store it as a new record. The original record is read-only;
+/// an in-progress or unknown job is a silent no-op.
+pub async fn rerun(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    retry_or_rerun(&state, &rt.id, principal, &headers, &id, terminal_status).await
+}
+
+fn terminal_status(status: &str) -> bool {
+    matches!(status, "complete" | "failed" | "cancelled")
+}
+
+fn delete_error_redirect(kind: &str) -> Response {
+    Redirect::to(&format!("/ui/bulk-export?delete-error={kind}")).into_response()
+}
+
+/// `POST /ui/bulk-export/active/{id}/delete` — reclaim server output, then
+/// remove exactly one terminal UI record.
+pub async fn delete(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let Some(original) = snapshot.jobs.get(&id) else {
+        return Redirect::to("/ui/bulk-export").into_response();
+    };
+    let job = parse_job(original);
+    if !terminal_status(&job.status) {
+        return Redirect::to("/ui/bulk-export").into_response();
+    }
+
+    match remote_job_identity(&job, &state, &rt.id) {
+        RemoteJobIdentity::Known(remote_id) => {
+            let (Ok(client), Ok(url)) =
+                (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
+            else {
+                return delete_error_redirect("remote");
+            };
+            let audience = url.to_string();
+            let Ok(request) = forward_identity(
+                &state,
+                client
+                    .delete(url)
+                    .timeout(std::time::Duration::from_secs(10)),
+                &headers,
+                &rt.id,
+                &audience,
+            )
+            .await
+            else {
+                return delete_error_redirect("remote");
+            };
+            let response = request.send().await;
+            match response {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == StatusCode::NOT_FOUND => {}
+                _ => return delete_error_redirect("remote"),
+            }
+        }
+        RemoteJobIdentity::NoRemoteJob => {}
+        RemoteJobIdentity::Unknown => return delete_error_redirect("remote"),
+    }
+
+    match remove_job_conditionally(&state, &user_key, &rt.id, &id, original, snapshot.version).await
+    {
+        Ok(()) => Redirect::to("/ui/bulk-export").into_response(),
+        Err(_) => delete_error_redirect("local"),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FreshManifest {
+    requires_access_token: bool,
+    output: Vec<FreshOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FreshOutput {
+    #[serde(rename = "type")]
+    resource_type: String,
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ZipPlanEntry {
+    resource_type: String,
+    ordinal: usize,
+    filename: String,
+    authenticated_url: Option<reqwest::Url>,
+}
+
+async fn fetch_fresh_manifest(
+    state: &WebState,
+    headers: &HeaderMap,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+) -> Result<FreshManifest, String> {
+    let client = no_redirect_client()?;
+    let url = status_url(state, tenant, remote_id)?;
+    let audience = url.to_string();
+    let response = forward_identity(
+        state,
+        client
+            .get(url)
+            .header("Accept", "application/fhir+json")
+            .timeout(std::time::Duration::from_secs(15)),
+        headers,
+        tenant,
+        &audience,
+    )
+    .await?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("manifest answered {}", response.status()));
+    }
+    let manifest = response
+        .json::<FreshManifest>()
+        .await
+        .map_err(|e| format!("invalid export manifest: {e}"))?;
+    if manifest.output.is_empty() {
+        return Err("export manifest has no output".to_string());
+    }
+    Ok(manifest)
+}
+
+fn trusted_output_url(
+    state: &WebState,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+    advertised: &str,
+) -> Result<reqwest::Url, String> {
+    let advertised = parse_url_without_credentials(advertised)
+        .ok_or_else(|| "invalid authenticated output URL".to_string())?;
+    let segments: Vec<&str> = advertised
+        .path_segments()
+        .ok_or_else(|| "authenticated output URL has no path".to_string())?
+        .collect();
+    let remote_id_text = remote_id.as_hyphenated().to_string();
+    let part = segments
+        .last()
+        .copied()
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .ok_or_else(|| "invalid authenticated output part".to_string())?;
+    let advertised_expected = public_api_url(
+        state,
+        tenant,
+        state.tenant_path_routing,
+        ["export-file", remote_id_text.as_str(), part],
+    )?;
+    if advertised.path() != advertised_expected.path() {
+        return Err("authenticated output URL is not this HFS job".to_string());
+    }
+    internal_api_url(
+        state,
+        tenant,
+        ["export-file", remote_id_text.as_str(), part],
+    )
+}
+
+fn external_output_url(advertised: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(advertised).map_err(|e| e.to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("invalid pre-signed output URL".to_string());
+    }
+    Ok(url)
+}
+
+fn safe_resource_name(resource_type: &str) -> String {
+    let name: String = resource_type
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        "Resource".to_string()
+    } else {
+        name
+    }
+}
+
+fn unique_zip_filename(base: &str, ordinal: usize, used: &mut HashSet<String>) -> String {
+    let stem = format!("{base}-{ordinal:04}");
+    let mut collision = 1;
+    loop {
+        let suffix = if collision == 1 {
+            String::new()
+        } else {
+            format!("-{collision:02}")
+        };
+        let candidate = format!("{stem}{suffix}.ndjson");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        collision += 1;
+    }
+}
+
+fn zip_plan(
+    state: &WebState,
+    tenant: &str,
+    remote_id: &uuid::Uuid,
+    manifest: &FreshManifest,
+) -> Result<Vec<ZipPlanEntry>, String> {
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+    let mut filenames = HashSet::new();
+    manifest
+        .output
+        .iter()
+        .map(|output| {
+            let ordinal = ordinals.entry(output.resource_type.clone()).or_default();
+            *ordinal += 1;
+            let current = *ordinal;
+            let authenticated_url = manifest
+                .requires_access_token
+                .then(|| trusted_output_url(state, tenant, remote_id, &output.url))
+                .transpose()?;
+            Ok(ZipPlanEntry {
+                resource_type: output.resource_type.clone(),
+                ordinal: current,
+                filename: unique_zip_filename(
+                    &safe_resource_name(&output.resource_type),
+                    current,
+                    &mut filenames,
+                ),
+                authenticated_url,
+            })
+        })
+        .collect()
+}
+
+fn output_by_type_ordinal<'a>(
+    manifest: &'a FreshManifest,
+    resource_type: &str,
+    ordinal: usize,
+) -> Option<&'a FreshOutput> {
+    manifest
+        .output
+        .iter()
+        .filter(|output| output.resource_type == resource_type)
+        .nth(ordinal.saturating_sub(1))
+}
+
+async fn stream_zip(
+    state: WebState,
+    headers: HeaderMap,
+    tenant: String,
+    remote_id: uuid::Uuid,
+    plan: Vec<ZipPlanEntry>,
+    writer: tokio::io::DuplexStream,
+) -> Result<(), String> {
+    let client = no_redirect_client()?;
+    let mut archive = ZipFileWriter::with_tokio(writer);
+    for item in plan {
+        let (url, send_identity) = match item.authenticated_url {
+            Some(url) => (url, true),
+            None => {
+                // Pre-signed URLs expire. Re-poll immediately before every
+                // sequential fetch and select the same type ordinal.
+                let refreshed = fetch_fresh_manifest(&state, &headers, &tenant, &remote_id).await?;
+                if refreshed.requires_access_token {
+                    return Err("export manifest access posture changed".to_string());
+                }
+                let output = output_by_type_ordinal(&refreshed, &item.resource_type, item.ordinal)
+                    .ok_or_else(|| "export manifest output changed".to_string())?;
+                (external_output_url(&output.url)?, false)
+            }
+        };
+        let audience = url.to_string();
+        let request = client.get(url).header("Accept", "application/fhir+ndjson");
+        let request = if send_identity {
+            forward_identity(&state, request, &headers, &tenant, &audience).await?
+        } else {
+            request
+        };
+        let mut response = request.send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("output answered {}", response.status()));
+        }
+
+        let entry = ZipEntryBuilder::new(item.filename.into(), Compression::Stored);
+        let mut entry_writer = archive
+            .write_entry_stream(entry)
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            entry_writer
+                .write_all(&chunk)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        entry_writer.close().await.map_err(|e| e.to_string())?;
+    }
+    archive.close().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `GET /ui/bulk-export/active/{id}/download` — stream a fresh manifest's
+/// complete output set as one ZIP. A late source failure terminates the body;
+/// a concurrent Delete can therefore leave the client with a truncated ZIP.
+pub async fn download_all(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let Some(job) = snapshot.jobs.get(&id).map(parse_job) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if job.status != "complete" || job.files.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let manifest = match fetch_fresh_manifest(&state, &headers, &rt.id, &remote_id).await {
+        Ok(manifest) => manifest,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let plan = match zip_plan(&state, &rt.id, &remote_id, &manifest) {
+        Ok(plan) if !plan.is_empty() => plan,
+        _ => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let stream_state = state.clone();
+    let stream_headers = headers.clone();
+    let tenant = rt.id.clone();
+    tokio::spawn(async move {
+        let result = stream_zip(
+            stream_state,
+            stream_headers,
+            tenant,
+            remote_id,
+            plan,
+            writer,
+        )
+        .await;
+        let _ = done_tx.send(result);
+    });
+
+    let body_stream = async_stream::stream! {
+        let mut buffer = vec![0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&buffer[..read])),
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+        match done_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => yield Err(io::Error::other(message)),
+            Err(_) => yield Err(io::Error::other("ZIP stream task ended unexpectedly")),
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/zip")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"bulk-export.zip\"",
+        )
+        .header("Cache-Control", "no-store")
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reference canonicalization/parsing now lives in crate::lookup, along
+    // with its own test coverage (#836) — see
+    // `reference_lists_accept_bare_and_canonical_ids_and_deduplicate`.
+
+    #[test]
+    fn legacy_jobs_deserialize_without_patient_or_version_fields() {
+        let job: ExportJob = serde_json::from_value(json!({
+            "name": "legacy",
+            "scope": "patient",
+            "status": "failed",
+            "startedAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(job.patient_refs.is_empty());
+        assert_eq!(job.fhir_version, None);
+    }
+
+    #[test]
+    fn operation_outcome_diagnostics_surface_unknown_patient_details() {
+        let body = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"diagnostics": "Patient/missing was not found"}]
+        })
+        .to_string();
+        assert_eq!(response_diagnostics(&body), "Patient/missing was not found");
+    }
+
+    /// A job persisted before `until` existed must still load. `#[serde(default)]`
+    /// is what makes that true; without it every stored job would fail to
+    /// deserialize the moment this field shipped.
+    #[test]
+    fn a_job_stored_before_until_existed_still_deserializes() {
+        let stored = serde_json::json!({
+            "name": "Legacy job",
+            "scope": "system",
+            "since": "2026-01-01T00:00:00Z",
+            "status": "in-progress"
+        })
+        .to_string();
+
+        let job: ExportJob = serde_json::from_str(&stored).expect("stored job must still load");
+        assert_eq!(job.since, "2026-01-01T00:00:00Z");
+        assert_eq!(job.until, "", "an absent until reads as unbounded");
+    }
+
+    /// An unbounded job serialises without an `until` key at all, so the stored
+    /// shape does not grow for exports that do not use the bound.
+    #[test]
+    fn an_unbounded_job_does_not_serialise_an_until_key() {
+        let job = ExportJob {
+            name: "Open ended".to_string(),
+            scope: "system".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&job).unwrap();
+        assert!(value.get("until").is_none(), "{value}");
+    }
+
+    /// #961: `typesDone`/`typesTotal`/`currentType` round-trip through JSON
+    /// unchanged, and a job persisted before this field existed still
+    /// deserializes with them at their empty default.
+    #[test]
+    fn test_job_types_progress_round_trips_and_legacy_json_defaults() {
+        let job = ExportJob {
+            name: "Everything".to_string(),
+            scope: "system".to_string(),
+            status: "in-progress".to_string(),
+            types_done: Some(1),
+            types_total: Some(3),
+            current_type: "Observation".to_string(),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&job).expect("job serializes");
+        assert_eq!(value["typesDone"], 1);
+        assert_eq!(value["typesTotal"], 3);
+        assert_eq!(value["currentType"], "Observation");
+        let round_tripped: ExportJob =
+            serde_json::from_value(value).expect("job deserializes back");
+        assert_eq!(round_tripped.types_done, Some(1));
+        assert_eq!(round_tripped.types_total, Some(3));
+        assert_eq!(round_tripped.current_type, "Observation");
+
+        // The settings merge patch carries the same three values verbatim.
+        let merge_value = job_merge_value(&job);
+        assert_eq!(merge_value["typesDone"], 1);
+        assert_eq!(merge_value["typesTotal"], 3);
+        assert_eq!(merge_value["currentType"], "Observation");
+
+        let legacy = json!({
+            "name": "Legacy job",
+            "scope": "system",
+            "status": "in-progress",
+            "startedAt": "2026-01-01T00:00:00Z"
+        });
+        let legacy_job = parse_job(&legacy);
+        assert_eq!(legacy_job.types_done, None);
+        assert_eq!(legacy_job.types_total, None);
+        assert!(legacy_job.current_type.is_empty());
+    }
+
+    /// #1185: a kick-off that goes unanswered must say it timed out and why
+    /// waiting is worth a retry. The card used to show `reqwest`'s own
+    /// `Display` — `error sending request for url (...)` — which names no
+    /// cause at all.
+    ///
+    /// The request here is capped at 50ms so the test does not sit for the
+    /// production cap; the rendered message quotes `KICKOFF_TIMEOUT_SECS`
+    /// because that is the number the user's card has to explain.
+    #[tokio::test]
+    async fn a_kickoff_timeout_is_named_and_blamed_on_the_index_rebuild() {
+        // Bound but never accepted: the kernel completes the handshake from
+        // the backlog, so the request connects and then waits for a response
+        // that never comes — a read timeout, not a connect failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let error = reqwest::Client::new()
+            .get(format!("http://{addr}/$export"))
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("a server that never answers must fail the kick-off");
+        assert!(error.is_timeout(), "{error}");
+
+        let detail = upstream_failure_detail(&error, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT);
+        assert_eq!(
+            detail,
+            "timed out after 15s — a search-index rebuild may be holding the \
+             database, try again shortly"
+        );
+
+        // The stored text must not be mistaken for an outright refusal by the
+        // server: `remote_job_identity` reads that prefix as "no remote job
+        // exists", which would let the card delete a job the server may well
+        // have created.
+        let stored = format!("kick-off failed: {detail}");
+        assert!(!stored.starts_with("kick-off answered "), "{stored}");
+    }
+
+    /// A non-timeout transport failure keeps `reqwest`'s own text but appends
+    /// the `source()` chain, where the actual reason lives (#957, #1185).
+    #[tokio::test]
+    async fn a_refused_kickoff_surfaces_the_cause_reqwest_hides() {
+        // Port 1 on loopback has no listener, so the connect is refused.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/$export")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .expect_err("a refused connection must fail the kick-off");
+        assert!(!error.is_timeout(), "{error}");
+
+        let raw = error.to_string();
+        let detail = upstream_failure_detail(&error, KICKOFF_TIMEOUT_SECS, KICKOFF_TIMEOUT_HINT);
+        assert!(detail.starts_with(&raw), "{detail}");
+        assert!(
+            detail.len() > raw.len(),
+            "the cause reqwest hides in source() must be appended: {detail}"
+        );
+        assert!(!detail.contains("timed out"), "{detail}");
+    }
+}

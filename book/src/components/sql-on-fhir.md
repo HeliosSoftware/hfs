@@ -1,6 +1,6 @@
 # SQL-on-FHIR
 
-The `helios-sof` crate implements the [SQL-on-FHIR](https://sql-on-fhir.org/ig/latest/index.html) specification. It transforms FHIR resources into tabular data using ViewDefinitions and ships two executables.
+The `helios-sof` crate implements the [SQL-on-FHIR](http://hl7.org/fhir/uv/sql-on-fhir/index.html) specification. It transforms FHIR resources into tabular data using ViewDefinitions and ships two executables.
 
 ## CLI — `sof-cli`
 
@@ -27,7 +27,7 @@ cargo run --bin sof-server
 
 ### Endpoint
 
-`POST /ViewDefinition/$viewdefinition-run`
+`POST /$sql-run`
 
 Request body parameters (JSON):
 
@@ -35,7 +35,7 @@ Request body parameters (JSON):
 |-----------|-------------|
 | `_format` | Output format: `csv`, `ndjson`, `json`, `parquet` |
 | `header` | CSV header row: `true` / `false` |
-| `viewResource` | ViewDefinition resource (JSON) |
+| `subjectResource` | ViewDefinition resource (JSON) |
 | `resource` | FHIR resources to transform |
 | `patient` | Filter by patient reference |
 | `_limit` | Limit results (1–10000) |
@@ -50,7 +50,7 @@ Parameter precedence: request body > query params > `Accept` header.
 | `SOF_SERVER_PORT` | 8080 | Server port |
 | `SOF_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `SOF_LOG_LEVEL` | info | Log level |
-| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body (bytes) |
+| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `SOF_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | true | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed origins |
@@ -68,17 +68,22 @@ Parameter precedence: request body > query params > `Accept` header.
 | CSV | Default |
 | JSON | Array of row objects |
 | NDJSON | One row object per line |
-| Parquet | Snappy compression; follows Pathling type conventions |
+| Parquet | Snappy compression; types follow the SQL-on-FHIR 3.0.0-ballot default mappings |
 
 ### Parquet Type Mapping
 
 | FHIR type | Arrow / Parquet type |
 |-----------|----------------------|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
-| integer | INT32 |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
-| arrays | Arrow List |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time | UTF8 |
+| string, code, uri, other | UTF8 |
+| collection columns | Arrow List of the element type |
 
-All fields are OPTIONAL.
+A column `tag` named `ansi/type` overrides the default (for example `DATE` on a `date` column gives a native date); an unknown or incompatible value is rejected. Columns with no declared `type` are inferred from the values. See the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping) for the accepted values and the per-emitter comparison. Decimal columns were previously FLOAT64; add `ansi/type: DOUBLE PRECISION` to keep that.
+
+All fields are OPTIONAL. Parquet and Arrow IPC are encoded incrementally with the schema fixed from the declared column types before the first row, so memory stays bounded rather than growing with the result.

@@ -1,0 +1,11 @@
+node_modules/
+# The repo-root .gitignore excludes package-lock.json globally (no Node in the
+# workspace historically); this harness needs it committed for `npm ci`.
+!package-lock.json
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.hfs-e2e.db
+.hfs-e2e.db-wal
+.hfs-e2e.db-shm

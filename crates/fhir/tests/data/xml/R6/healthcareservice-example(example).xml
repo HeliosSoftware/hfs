@@ -135,7 +135,7 @@
   <appointmentRequired value="false"/>
   <availability>
     <availableTime>
-      <!--  This is a 24 hour service on wednesdays (due to weekly local service needs)  -->
+      <!-- This is a 24 hour service on wednesdays (due to weekly local service needs) -->
       <daysOfWeek value="wed"/>
       <allDay value="true"/>
     </availableTime>
@@ -169,7 +169,7 @@
     </notAvailableTime>
   </availability>
   <endpoint>
-    <!--    Endpoint that handles the v2 messaging for the external organization    -->
+    <!-- Endpoint that handles the v2 messaging for the external organization -->
     <reference value="Endpoint/example"/>
   </endpoint>
 </HealthcareService>

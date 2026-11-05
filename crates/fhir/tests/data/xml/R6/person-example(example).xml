@@ -31,7 +31,7 @@
       </table>
     </div>
   </text>
-  <!--  MRN assigned by ACME healthcare on 6-May 2001  -->
+  <!-- MRN assigned by ACME healthcare on 6-May 2001 -->
   <identifier>
     <use value="usual"/>
     <type>
@@ -50,7 +50,7 @@
     </assigner>
   </identifier>
   <active value="true"/>
-  <!--  Peter James Chalmers, but called "Jim"  -->
+  <!-- Peter James Chalmers, but called "Jim" -->
   <name>
     <use value="official"/>
     <family value="Chalmers"/>
@@ -61,7 +61,7 @@
     <use value="usual"/>
     <given value="Jim"/>
   </name>
-  <!--  home communication details aren't known  -->
+  <!-- home communication details aren't known -->
   <telecom>
     <use value="home"/>
   </telecom>
@@ -75,7 +75,7 @@
     <value value="Jim@example.org"/>
     <use value="home"/>
   </telecom>
-  <!--  use FHIR code system for male / female  -->
+  <!-- use FHIR code system for male / female -->
   <gender value="male"/>
   <birthDate value="1974-12-25"/>
   <address>

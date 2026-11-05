@@ -8,7 +8,7 @@
     </security>
   </meta>
   <identifier>
-    <!--  The identifier for the person as this patient (fictive)  -->
+    <!-- The identifier for the person as this patient (fictive) -->
     <use value="official"/>
     <type>
       <text value="BSN"/>
@@ -16,9 +16,9 @@
     <system value="urn:oid:2.16.840.1.113883.2.4.6.3"/>
     <value value="123456789"/>
   </identifier>
-  <!--  Demographics  -->
+  <!-- Demographics -->
   <identifier>
-    <!--  The identifier for this individual  -->
+    <!-- The identifier for this individual -->
     <use value="official"/>
     <type>
       <text value="BSN"/>
@@ -26,10 +26,10 @@
     <system value="urn:oid:2.16.840.1.113883.2.4.6.3"/>
     <value value="123456789"/>
   </identifier>
-  <!--  Indicates that the patient is not part of a multiple birth   -->
+  <!-- Indicates that the patient is not part of a multiple birth -->
   <active value="true"/>
   <name>
-    <!--  The name associated with the individual (fictive)  -->
+    <!-- The name associated with the individual (fictive) -->
     <use value="official"/>
     <text value="Roel"/>
     <family value="Bor"/>
@@ -38,25 +38,25 @@
     <suffix value="PDEng."/>
   </name>
   <telecom>
-    <!--  The mobile contact detail for the individual  -->
+    <!-- The mobile contact detail for the individual -->
     <system value="phone"/>
     <value value="+31612345678"/>
     <use value="mobile"/>
   </telecom>
   <telecom>
-    <!--  The home contact detail for the individual  -->
+    <!-- The home contact detail for the individual -->
     <system value="phone"/>
     <value value="+31201234567"/>
     <use value="home"/>
   </telecom>
   <gender value="male"/>
   <birthDate value="1960-03-13"/>
-  <!--  The date and time of birth for the individual   -->
+  <!-- The date and time of birth for the individual -->
   <deceasedBoolean value="false"/>
-  <!--  Indicates that the individual is not deceased  -->
-  <!--  ISO 3166 3 letter code  -->
+  <!-- Indicates that the individual is not deceased -->
+  <!-- ISO 3166 3 letter code -->
   <address>
-    <!--  Home address for the individual  -->
+    <!-- Home address for the individual -->
     <use value="home"/>
     <line value="Bos en Lommerplein 280"/>
     <city value="Amsterdam"/>
@@ -64,7 +64,7 @@
     <country value="NLD"/>
   </address>
   <maritalStatus>
-    <!--  Marital status of the person  -->
+    <!-- Marital status of the person -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="36629006"/>
@@ -81,9 +81,9 @@
     <url value="Binary/f006"/>
   </photo>
   <contact>
-    <!--  Contact of the patient  -->
+    <!-- Contact of the patient -->
     <relationship>
-      <!--  Indicates that the contact is the patient's wife  -->
+      <!-- Indicates that the contact is the patient's wife -->
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="127850001"/>
@@ -99,12 +99,12 @@
       </coding>
     </relationship>
     <name>
-      <!--  The name of the contact  -->
+      <!-- The name of the contact -->
       <use value="usual"/>
       <text value="Ariadne Bor-Jansma"/>
     </name>
     <telecom>
-      <!--  The home contact detail  -->
+      <!-- The home contact detail -->
       <system value="phone"/>
       <value value="+31201234567"/>
       <use value="home"/>

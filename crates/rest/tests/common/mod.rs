@@ -13,6 +13,7 @@
 
 pub mod assertions;
 pub mod backend_config;
+pub mod everything;
 pub mod fixtures;
 pub mod harness;
 pub mod spec_loader;

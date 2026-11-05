@@ -2,6 +2,7 @@
 name = "helios-fhir-gen"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "The helios-fhir-gen crate is module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions."
 license.workspace = true
 authors.workspace = true
@@ -22,13 +23,14 @@ skip-r6-download = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.7", default-features = false }
 clap = { version = "4.4", features = ["derive"] }
 chrono = { workspace = true }
 
+
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
-zip = "0.6"
+zip = "9"
 serde_json = { workspace = true }
 
 [package.metadata.docs.rs]

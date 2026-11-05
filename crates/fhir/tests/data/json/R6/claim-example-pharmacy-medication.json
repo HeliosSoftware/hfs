@@ -38,7 +38,7 @@
       }
     ]
   },
-  "prescription": {
+  "request": {
     "reference": "http://pharmacy.org/MedicationRequest/AB1234G"
   },
   "originalPrescription": {
@@ -126,12 +126,14 @@
   "diagnosis": [
     {
       "sequence": 1,
-      "diagnosisCodeableConcept": {
-        "coding": [
-          {
-            "code": "654456"
-          }
-        ]
+      "diagnosis": {
+        "concept": {
+          "coding": [
+            {
+              "code": "654456"
+            }
+          ]
+        }
       }
     }
   ],

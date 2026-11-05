@@ -3,7 +3,7 @@
 //! Emits `AuditEvent` records when the server starts up or shuts down,
 //! capturing configuration details as entity metadata.
 
-use helios_fhir::r4::AuditEvent;
+use crate::fhir_model::AuditEvent;
 
 use crate::balp::AuditAction;
 use crate::builder::AuditEventBuilder;
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(details[0].r#type.value.as_deref(), Some("audit-operation"));
         assert_eq!(
             details[0].value.as_ref().and_then(|v| match v {
-                helios_fhir::r4::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
+                crate::fhir_model::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
                 _ => None,
             }),
             Some("lifecycle-startup")
@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(details[0].r#type.value.as_deref(), Some("audit-operation"));
         assert_eq!(
             details[0].value.as_ref().and_then(|v| match v {
-                helios_fhir::r4::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
+                crate::fhir_model::AuditEventEntityDetailValue::String(s) => s.value.as_deref(),
                 _ => None,
             }),
             Some("lifecycle-shutdown")

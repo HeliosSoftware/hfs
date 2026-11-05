@@ -77,6 +77,231 @@ async fn expand_with_count_limits_results() {
     assert_eq!(contains.len(), 1, "expected exactly 1 code with count=1");
 }
 
+// ── Default hierarchical expansion (is-a CodeSystems) ──────────────────────────
+
+/// A CodeSystem declaring `hierarchyMeaning = "is-a"` with a real parent/child
+/// tree. Used to exercise the default-nesting behaviour pinned by the IG
+/// `version/vs-expand-versionless` fixture.
+#[cfg(feature = "sqlite")]
+const ISA_HIERARCHY_BUNDLE: &str = r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    { "resource": {
+        "resourceType": "CodeSystem",
+        "id": "isa-cs",
+        "url": "http://hts.test/isa",
+        "version": "1.0",
+        "status": "active",
+        "content": "complete",
+        "hierarchyMeaning": "is-a",
+        "concept": [
+          { "code": "parent", "display": "Parent",
+            "concept": [
+              { "code": "child1", "display": "Child 1" },
+              { "code": "child2", "display": "Child 2" }
+            ]
+          },
+          { "code": "sibling", "display": "Sibling" }
+        ]
+    }}
+  ]
+}"#;
+
+/// When the request omits both `excludeNested` and `hierarchical` and the inline
+/// ValueSet wholly includes an is-a CodeSystem, the expansion nests children
+/// under their parent (FHIR default; IG `version/vs-expand-versionless`).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_codesystem_nests_by_default() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-all","status":"active","compose":{"include":[{"system":"http://hts.test/isa"}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["parent", "sibling"],
+        "expected only top-level codes at root, got {body}"
+    );
+    assert_eq!(body["expansion"]["total"], 4, "total counts all 4 concepts");
+
+    let parent = top.iter().find(|c| c["code"] == "parent").unwrap();
+    let children: Vec<&str> = parent["contains"]
+        .as_array()
+        .expect("parent should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(children, vec!["child1", "child2"]);
+}
+
+/// `excludeNested=true` keeps the same is-a CodeSystem expansion FLAT.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_codesystem_flat_with_exclude_nested() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"excludeNested","valueBoolean":true},
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-all","status":"active","compose":{"include":[{"system":"http://hts.test/isa"}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    assert_eq!(
+        top.len(),
+        4,
+        "flat list should hold all 4 codes, got {body}"
+    );
+    assert!(
+        top.iter().all(|c| c.get("contains").is_none()),
+        "excludeNested=true must not nest: {body}"
+    );
+}
+
+/// An include carrying an `is-a` filter designates a hierarchy subtree, so an
+/// unpaged expansion of it nests by default (IG `search/search-filter-yes`).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_nests_by_default() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", isa_filter_expand(&[]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["parent"],
+        "an is-a filter should nest its matches under the filter root, got {body}"
+    );
+
+    let children: Vec<&str> = top[0]["contains"]
+        .as_array()
+        .expect("parent should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(children, vec!["child1", "child2"]);
+}
+
+/// Paging suppresses the is-a-filter default nesting. Tree mode returns the whole
+/// subtree and ignores `count`/`offset`, so a paged request must stay flat and
+/// honour `count` — otherwise `count=10` over a SNOMED root reads ~10^5 concepts
+/// and returns all of them (regression guard for issue #227).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_stays_flat_when_paged() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = isa_filter_expand(&[r#"{"name":"count","valueInteger":2}"#]);
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    assert_eq!(top.len(), 2, "count=2 must cap the expansion, got {body}");
+    assert!(
+        top.iter().all(|c| c.get("contains").is_none()),
+        "a paged expansion must stay flat: {body}"
+    );
+}
+
+/// Unlike paging, a text `filter` does NOT suppress the default nesting: the IG
+/// `search/search-filter-yes` fixture filters on `"data"` and still expects the
+/// matches nested under `data-exchange`. Mirrors that fixture locally.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_with_text_filter_still_nests() {
+    let app = TestApp::new();
+    app.import_bundle_ok(DATA_EXCHANGE_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"filter","valueString":"data"},
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/de-filter","status":"active",
+        "compose":{"include":[{"system":"http://hts.test/search",
+          "filter":[{"property":"code","op":"is-a","value":"data-exchange"}]}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["data-exchange"],
+        "a text-filtered subsumption expansion should still nest, got {body}"
+    );
+
+    let children: Vec<&str> = top[0]["contains"]
+        .as_array()
+        .expect("data-exchange should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(
+        children,
+        vec!["data-exchange1", "data-exchange2", "data-exchange3"]
+    );
+}
+
+/// Mirrors the IG `search` CodeSystem: a `data-exchange` root whose three
+/// children all match the text filter `"data"`.
+#[cfg(feature = "sqlite")]
+const DATA_EXCHANGE_BUNDLE: &str = r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    { "resource": {
+        "resourceType": "CodeSystem",
+        "id": "search-cs",
+        "url": "http://hts.test/search",
+        "version": "1.0",
+        "status": "active",
+        "content": "complete",
+        "hierarchyMeaning": "is-a",
+        "concept": [
+          { "code": "data-exchange", "display": "Data Exchange",
+            "concept": [
+              { "code": "data-exchange1", "display": "Data Exchange1" },
+              { "code": "data-exchange2", "display": "Data Exchange2" },
+              { "code": "data-exchange3", "display": "Data Exchange3" }
+            ]
+          }
+        ]
+    }}
+  ]
+}"#;
+
+/// `$expand` of an inline compose whose only include carries `is-a parent` over
+/// [`ISA_HIERARCHY_BUNDLE`], plus any `extra` Parameters entries.
+#[cfg(feature = "sqlite")]
+fn isa_filter_expand(extra: &[&str]) -> String {
+    let mut parameter = extra.to_vec();
+    parameter.push(
+        r#"{"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-filter","status":"active",
+             "compose":{"include":[{"system":"http://hts.test/isa",
+               "filter":[{"property":"concept","op":"is-a","value":"parent"}]}]}}}"#,
+    );
+    format!(
+        r#"{{"resourceType":"Parameters","parameter":[{}]}}"#,
+        parameter.join(",")
+    )
+}
+
 // ── $validate-code (ValueSet) ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
@@ -130,6 +355,189 @@ async fn vs_validate_code_excluded_code_returns_false() {
         .expect("expected result parameter");
 
     assert!(!result, "'head' should NOT be in the limbs ValueSet");
+}
+
+/// A `url|version` canonical, as profile bindings carry it, resolves the same
+/// stored ValueSet as `url` plus `valueSetVersion`; an unknown version does not.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let result = |body: &serde_json::Value| {
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool())
+    };
+
+    for (code, expected) in [("arm", true), ("head", false)] {
+        let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+        let req = TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("code", "valueCode", code),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ]);
+        let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result(&body), Some(expected), "{code}: {body}");
+    }
+
+    let url = format!("{}|9.9", bundles::LIMBS_VS_URL);
+    let req = TestApp::params(&[
+        ("url", "valueUri", &url),
+        ("code", "valueCode", "arm"),
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+    ]);
+    let (_, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+    assert_ne!(
+        result(&body),
+        Some(true),
+        "unknown version must not validate: {body}"
+    );
+}
+
+/// A `url|version` canonical sent alongside `valueSetVersion` still resolves:
+/// the pipe is stripped from `url`, and the explicit parameter wins, as in
+/// `$expand`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_versioned_canonical_with_explicit_value_set_version() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let url = format!("{}|1.0", bundles::LIMBS_VS_URL);
+    let validate = |vs_version: &'static str| {
+        TestApp::params(&[
+            ("url", "valueUri", &url),
+            ("valueSetVersion", "valueString", vs_version),
+            ("code", "valueCode", "arm"),
+            ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ])
+    };
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("1.0"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = body["parameter"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["name"] == "result"))
+        .and_then(|p| p["valueBoolean"].as_bool());
+    assert_eq!(result, Some(true), "{body}");
+
+    // `valueSetVersion=9.9` overrides `|1.0`, so the lookup misses.
+    let (status, body) = app
+        .post_fhir("/ValueSet/$validate-code", validate("9.9"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.to_string().contains("limbs|9.9"),
+        "explicit valueSetVersion must win: {body}"
+    );
+}
+
+/// Regression: when a request specifies `version=1.0.0` and the CodeSystem
+/// exists at that version (even though a newer version also exists), the
+/// response `version` parameter must echo the *requested* version ("1.0.0"),
+/// not the latest stored version ("1.2.0").
+///
+/// Covers the IG `version-code-v10-vs10-response-parameters` fixture.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn vs_validate_code_version_echoes_requested_version() {
+    let app = TestApp::new();
+
+    // Import a bundle with two versions of the same CodeSystem plus a
+    // ValueSet that pins version 1.0.0.
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "multi-version-cs-v100",
+                    "url": "http://hts.test/cs/multi-version",
+                    "version": "1.0.0",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        { "code": "code1", "display": "Code One v1.0.0" }
+                    ]
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": "multi-version-cs-v120",
+                    "url": "http://hts.test/cs/multi-version",
+                    "version": "1.2.0",
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [
+                        { "code": "code1", "display": "Code One v1.2.0" },
+                        { "code": "code2", "display": "Code Two v1.2.0" }
+                    ]
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "ValueSet",
+                    "id": "vs-pins-v100",
+                    "url": "http://hts.test/vs/pins-v100",
+                    "version": "1.0",
+                    "status": "active",
+                    "compose": {
+                        "include": [
+                            {
+                                "system": "http://hts.test/cs/multi-version",
+                                "version": "1.0.0"
+                            }
+                        ]
+                    }
+                }
+            }
+        ]
+    })
+    .to_string();
+    app.import_bundle_ok(&bundle).await;
+
+    // Validate code1 with explicit version=1.0.0 against the VS that pins 1.0.0.
+    let req = TestApp::params(&[
+        ("url", "valueUri", "http://hts.test/vs/pins-v100"),
+        ("code", "valueCode", "code1"),
+        ("system", "valueUri", "http://hts.test/cs/multi-version"),
+        ("version", "valueString", "1.0.0"),
+    ]);
+    let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let params = body["parameter"].as_array().expect("parameter array");
+
+    let result = params
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected result parameter");
+
+    assert!(
+        result,
+        "code1 should be valid in the 1.0.0-pinned VS; body={body}"
+    );
+
+    // The version echoed back MUST be "1.0.0", not "1.2.0" (the latest stored
+    // version that `code_system_version_for_url` would otherwise return).
+    let version = params
+        .iter()
+        .find(|p| p["name"] == "version")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("expected version parameter in response");
+
+    assert_eq!(
+        version, "1.0.0",
+        "response must echo the requested version (1.0.0), not the latest (1.2.0)"
+    );
 }
 
 // ── GET /ValueSet (search) ────────────────────────────────────────────────────
@@ -531,26 +939,23 @@ async fn expand_hierarchical_returns_nested_tree() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["resourceType"], "ValueSet");
 
-    // Total = flat count (3 codes)
+    // Enumerated composes (every include carries explicit concept[]) are
+    // returned flat regardless of `hierarchical=true`, matching the
+    // tx-ecosystem-ig parameters/parameters-expand-enum-hierarchy fixture
+    // (curated lists are not retrofitted with the underlying CS hierarchy).
     assert_eq!(body["expansion"]["total"], 3);
-
     let contains = body["expansion"]["contains"]
         .as_array()
         .expect("expected expansion.contains array");
-
-    // Only `limb` is a root (arm and leg are nested under it)
-    assert_eq!(contains.len(), 1, "expected 1 root ('limb'), got: {body}");
-    let root = &contains[0];
-    assert_eq!(root["code"], "limb");
-
-    // arm and leg are nested under limb
-    let nested = root["contains"]
-        .as_array()
-        .expect("expected nested contains");
-    assert_eq!(nested.len(), 2, "expected 2 nested children under limb");
-    let nested_codes: Vec<&str> = nested.iter().filter_map(|c| c["code"].as_str()).collect();
-    assert!(nested_codes.contains(&"arm"), "expected arm under limb");
-    assert!(nested_codes.contains(&"leg"), "expected leg under limb");
+    assert_eq!(
+        contains.len(),
+        3,
+        "enumerated VS should expand flat: {body}"
+    );
+    let codes: Vec<&str> = contains.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert!(codes.contains(&"limb"));
+    assert!(codes.contains(&"arm"));
+    assert!(codes.contains(&"leg"));
 }
 
 /// $expand with `hierarchical=false` (or absent) returns the flat list unchanged.

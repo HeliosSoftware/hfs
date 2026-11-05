@@ -66,7 +66,7 @@ async fn test_patient_parameter_with_full_reference() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -80,9 +80,13 @@ async fn test_patient_parameter_with_full_reference() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
+        .add_header("Accept", "application/json")
         .json(&parameters)
         .await;
 
@@ -106,7 +110,7 @@ async fn test_patient_parameter_with_bare_id() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -120,9 +124,13 @@ async fn test_patient_parameter_with_bare_id() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
+        .add_header("Accept", "application/json")
         .json(&parameters)
         .await;
 
@@ -146,7 +154,7 @@ async fn test_patient_parameter_with_value_reference() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -162,9 +170,13 @@ async fn test_patient_parameter_with_value_reference() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
+        .add_header("Accept", "application/json")
         .json(&parameters)
         .await;
 
@@ -235,6 +247,19 @@ async fn test_observation_filtering_with_bare_patient_id() {
                         "reference": "Patient/pt-2"
                     }
                 }
+            },
+            // Production requires the referenced Patient to be present
+            // among the supplied resources: per the SoF v2 spec error
+            // table, a `patient` filter that does not resolve against a
+            // supplied `Patient` resource is a hard 400 (see
+            // `lib.rs::filter_resources_by_patient_and_group`'s
+            // absent-target check). The old stub filtered by reference
+            // match alone and never enforced this.
+            {
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "pt-1"
+                }
             }
         ]
     });
@@ -243,7 +268,7 @@ async fn test_observation_filtering_with_bare_patient_id() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": view_def
             },
             {
@@ -257,9 +282,13 @@ async fn test_observation_filtering_with_bare_patient_id() {
         ]
     });
 
+    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
+    // `json` as the old stub assumed. Request `application/json`
+    // explicitly so the response is a JSON array.
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
+        .add_header("Accept", "application/json")
         .json(&parameters)
         .await;
 

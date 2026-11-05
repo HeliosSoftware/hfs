@@ -29,8 +29,19 @@ fn test_shortened_format_names() -> Result<(), SofError> {
         ContentType::from_string("application/ndjson")?,
         ContentType::NdJson
     );
+    // All three parquet media-type identifiers are accepted: the spec's
+    // native `application/vnd.apache.parquet`, the spec Accept-table value
+    // `application/octet-stream`, and the legacy `application/parquet`.
     assert_eq!(
         ContentType::from_string("application/parquet")?,
+        ContentType::Parquet
+    );
+    assert_eq!(
+        ContentType::from_string("application/vnd.apache.parquet")?,
+        ContentType::Parquet
+    );
+    assert_eq!(
+        ContentType::from_string("application/octet-stream")?,
         ContentType::Parquet
     );
 

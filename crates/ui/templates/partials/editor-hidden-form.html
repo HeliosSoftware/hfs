@@ -1,0 +1,26 @@
+<!--
+  The editor's hidden state (#264, #843). Every structural mutation posts
+  this whole form back; the server applies it, re-validates, and hands back
+  a fresh copy of this same fragment. `pretty` rides along pre-computed
+  (2-space indent, key order preserved) so a host that mirrors the document
+  into its own text editor — View Definitions' CodeMirror pane — always has
+  the exact text the guided form itself produced, without re-deriving it
+  client-side.
+
+  Shared verbatim by the full editor body (`editor-body.html`) and the
+  `pane=form` fragment (`editor-form-fragment.html`): one contract, whichever
+  half of the page asked for it. The `hx-post`/`hx-target` pair is the
+  Resource Editor's own wiring and is inert where a host drives the form
+  through its own script instead (View Definitions, #843).
+-->
+<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}"{% if !focus_path.is_empty() %} data-focus="{{ focus_path }}"{% endif %}>
+  <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
+  <input type="hidden" name="op" id="editor-op" value="">
+  <input type="hidden" name="path" id="editor-path" value="">
+  <input type="hidden" name="name" id="editor-name" value="">
+  <input type="hidden" name="arm" id="editor-arm" value="">
+  <input type="hidden" name="url" id="editor-url" value="">
+  <input type="hidden" name="value" id="editor-value" value="">
+  <input type="hidden" name="modifier" id="editor-modifier" value="">
+  <input type="hidden" name="pretty" id="editor-pretty" value="{{ pretty }}">
+</form>

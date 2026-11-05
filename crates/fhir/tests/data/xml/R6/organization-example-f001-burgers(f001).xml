@@ -15,13 +15,13 @@
   <identifier>
     <use value="usual"/>
     <system value="urn:oid:2.16.840.1.113883.2.4.6.1"/>
-    <!--   Dutch VEKTIS AGB-Z   -->
+    <!-- Dutch VEKTIS AGB-Z -->
     <value value="17-0112278"/>
   </identifier>
   <type>
     <coding>
       <system value="urn:oid:2.16.840.1.113883.2.4.15.1060"/>
-      <!--   RoleCodeNLUZIRoleCodeOrganisaties   -->
+      <!-- RoleCodeNLUZIRoleCodeOrganisaties -->
       <code value="V6"/>
       <display value="University Medical Hospital"/>
     </coding>

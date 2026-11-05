@@ -671,8 +671,11 @@ fn test_function_subsetting_indexer() {
         eval("(10 | 20 | 30)[3]", &context).unwrap(),
         EvaluationResult::Empty
     ); // Index out of bounds -> Empty, Add unwrap
-    // Negative index should error
-    assert!(eval("(10 | 20 | 30)[-1]", &context).is_err());
+    // A negative index is out of range -> Empty
+    assert_eq!(
+        eval("(10 | 20 | 30)[-1]", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     // Non-integer index should error
     assert!(eval("(10 | 20 | 30)['a']", &context).is_err());
 }
@@ -2111,6 +2114,19 @@ fn test_function_string_substring() {
     ); // Add unwrap
     assert_eq!(
         eval("'abc'.substring({})", &context).unwrap(), // Add unwrap
+        EvaluationResult::Empty
+    );
+    // An empty length means "rest of the string" (testSubstring17/18)
+    assert_eq!(
+        eval("'abcdefg'.substring(3, {})", &context).unwrap(),
+        EvaluationResult::string("defg".to_string())
+    );
+    assert_eq!(
+        eval("'abcdefg'.substring(0, {})", &context).unwrap(),
+        EvaluationResult::string("abcdefg".to_string())
+    );
+    assert_eq!(
+        eval("'abcdefg'.substring(7, {})", &context).unwrap(),
         EvaluationResult::Empty
     );
     // Test multi-item collection - should error
@@ -5537,13 +5553,18 @@ fn test_quantity_implicit_conversion_operations() {
         eval("5 '1' = 5.5", &context).unwrap(),
         EvaluationResult::boolean(false)
     );
-    // Incompatible units should return false (not equal)
+    // Units that are not commensurable make equality empty (spec: Quantity Equality)
     assert_eq!(
         eval("5 'mg' = 5", &context).unwrap(),
-        EvaluationResult::boolean(false)
+        EvaluationResult::Empty
     );
     assert_eq!(
         eval("5 = 5 'mg'", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    // ...but never equivalence, which is false
+    assert_eq!(
+        eval("5 'mg' ~ 5", &context).unwrap(),
         EvaluationResult::boolean(false)
     );
 

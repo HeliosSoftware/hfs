@@ -11,7 +11,7 @@
     <Medication>
       <id value="med0301"/>
       <code>
-        <!--  Vancomycin Hydrochloride (VANCOMYCIN HYDROCHLORIDE)"  -->
+        <!-- Vancomycin Hydrochloride (VANCOMYCIN HYDROCHLORIDE)" -->
         <coding>
           <system value="http://hl7.org/fhir/sid/ndc"/>
           <code value="0409-6531-02"/>
@@ -29,18 +29,18 @@
   <status value="active"/>
   <intent value="order"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0301"/>
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
   <encounter>
-    <!--  Linked to a resource Encounter between patient and practitioner -->
+    <!-- Linked to a resource Encounter between patient and practitioner -->
     <reference value="Encounter/f001"/>
     <display value="encounter who leads to this prescription"/>
   </encounter>
@@ -62,49 +62,51 @@
     <text value="culture expected back in 12 hours - may switch depending on results"/>
   </note>
   <dosageInstruction>
-    <simple>
-      <text value="500mg IV q6h x 3 days"/>
-      <timing>
-        <event value="2020-01-01"/>
-        <repeat>
-          <boundsPeriod>
-            <start value="2020-01-01"/>
-            <end value="2020-01-10"/>
-          </boundsPeriod>
-          <frequency value="1"/>
-          <period value="6"/>
-          <periodUnit value="h"/>
-        </repeat>
-      </timing>
-      <route>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="255560000"/>
-          <display value="Intravenous"/>
-        </coding>
-      </route>
-      <method>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="420620005"/>
-          <display value="Push - dosing instruction imperative (qualifier value)"/>
-        </coding>
-      </method>
-      <doseAndRate>
-        <type>
+    <step>
+      <component>
+        <text value="500mg IV q6h x 3 days"/>
+        <timing>
+          <event value="2020-01-01"/>
+          <repeat>
+            <boundsPeriod>
+              <start value="2020-01-01"/>
+              <end value="2020-01-10"/>
+            </boundsPeriod>
+            <frequency value="1"/>
+            <period value="6"/>
+            <periodUnit value="h"/>
+          </repeat>
+        </timing>
+        <route>
           <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
+            <system value="http://snomed.info/sct"/>
+            <code value="255560000"/>
+            <display value="Intravenous"/>
           </coding>
-        </type>
-        <doseQuantity>
-          <value value="500"/>
-          <unit value="mg"/>
-          <system value="http://unitsofmeasure.org"/>
-          <code value="mg"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
+        </route>
+        <method>
+          <coding>
+            <system value="http://snomed.info/sct"/>
+            <code value="420620005"/>
+            <display value="Push - dosing instruction imperative (qualifier value)"/>
+          </coding>
+        </method>
+        <doseAndRate>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+              <code value="ordered"/>
+              <display value="Ordered"/>
+            </coding>
+          </type>
+          <doseQuantity>
+            <value value="500"/>
+            <unit value="mg"/>
+            <system value="http://unitsofmeasure.org"/>
+            <code value="mg"/>
+          </doseQuantity>
+        </doseAndRate>
+      </component>
+    </step>
   </dosageInstruction>
 </MedicationRequest>

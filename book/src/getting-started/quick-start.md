@@ -40,7 +40,7 @@ echo '{"resourceType": "Patient", "id": "123", "name": [{"family": "Smith"}]}' \
 
 ```bash
 ./sof-server
-# POST to http://localhost:8080/ViewDefinition/$viewdefinition-run
+# POST to http://localhost:8080/$sql-run
 ```
 
 ## Start the FHIRPath HTTP Server

@@ -48,6 +48,10 @@
           </denominator>
         </strengthRatio>
       </ingredient>
+      <instance>
+        <lotNumber value="12345"/>
+        <expirationDate value="2019-10-31"/>
+      </instance>
     </Medication>
   </contained>
   <identifier>
@@ -64,7 +68,7 @@
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
@@ -86,6 +90,7 @@
     <text value="Check blood sugar levels before taking insulin"/>
   </note>
   <dosageInstruction>
+    <renderedInstruction value="Inject 10 units subcut 10 minutes before breakfast, 15 units before lunch, 20 units before dinner. Check blood sugar levels before taking insulin."/>
     <step>
       <component>
         <text value="inject 10 units subcut 10 minutes before breakfast"/>

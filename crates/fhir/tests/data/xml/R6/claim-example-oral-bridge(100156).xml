@@ -10,13 +10,13 @@
   <text>
     <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">A human-readable rendering of the Oral Health Claim</div>
   </text>
-  <!--  rest of the resource omitted for brevity  -->
+  <!-- rest of the resource omitted for brevity -->
   <contained>
     <Device>
       <id value="device-bridge"/>
     </Device>
   </contained>
-  <!--  rest of the resource omitted for brevity  -->
+  <!-- rest of the resource omitted for brevity -->
   <contained>
     <ServiceRequest>
       <id value="referral"/>
@@ -64,7 +64,7 @@
         <code value="associated"/>
       </coding>
     </relationship>
-    <!--  case number  -->
+    <!-- case number -->
     <reference>
       <value value="CASE156746B"/>
     </reference>
@@ -89,7 +89,7 @@
       <reference value="Practitioner/example"/>
     </provider>
   </careTeam>
-  <!--  original placement  -->
+  <!-- original placement -->
   <supportingInfo>
     <sequence value="1"/>
     <category>
@@ -110,9 +110,11 @@
   <procedure>
     <sequence value="1"/>
     <date value="2014-07-04"/>
-    <procedureCodeableConcept>
-      <text value="Resection of gum to increase exposed tooth."/>
-    </procedureCodeableConcept>
+    <procedure>
+      <concept>
+        <text value="Resection of gum to increase exposed tooth."/>
+      </concept>
+    </procedure>
   </procedure>
   <insurance>
     <sequence value="1"/>
@@ -144,7 +146,7 @@
       <currency value="USD"/>
     </unitPrice>
     <factor value="0.75"/>
-    <!--  student discount  -->
+    <!-- student discount -->
     <net>
       <value value="1050.00"/>
       <currency value="USD"/>
@@ -252,7 +254,7 @@
         <currency value="USD"/>
       </unitPrice>
       <factor value="0.75"/>
-      <!--  Student discount  -->
+      <!-- Student discount -->
       <net>
         <value value="750.00"/>
         <currency value="USD"/>

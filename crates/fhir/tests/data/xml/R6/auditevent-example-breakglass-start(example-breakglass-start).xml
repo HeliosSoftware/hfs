@@ -25,7 +25,7 @@
     </coding>
   </subtype>
   <action value="E"/>
-  <!--  when was the break-glass started  -->
+  <!-- when was the break-glass started -->
   <recorded value="2013-09-22T00:08:00Z"/>
   <outcome>
     <code>
@@ -38,7 +38,7 @@
     </detail>
   </outcome>
   <authorization>
-    <!--  why was the break-glass declared  -->
+    <!-- why was the break-glass declared -->
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
       <code value="ETREAT"/>
@@ -46,19 +46,19 @@
     </coding>
   </authorization>
   <agent>
-    <!--  who declared the break-glass  -->
+    <!-- who declared the break-glass -->
     <who>
       <reference value="Practitioner/f001"/>
     </who>
     <requestor value="true"/>
-    <!--  where was the break-glass emergency declared  -->
+    <!-- where was the break-glass emergency declared -->
     <location>
       <reference value="Location/1"/>
     </location>
     <networkString value="custodian.net"/>
   </agent>
   <source>
-    <!--  what system detected this break-glass  -->
+    <!-- what system detected this break-glass -->
     <observer>
       <display value="Watchers Accounting of Disclosures Application"/>
     </observer>
@@ -71,7 +71,7 @@
     </type>
   </source>
   <entity>
-    <!--  patient whos data is being accessed  -->
+    <!-- patient whos data is being accessed -->
     <what>
       <reference value="Patient/example"/>
     </what>

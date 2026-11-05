@@ -268,7 +268,7 @@ EOF
 fi
 
 TOPIC_STATUS="$(curl -sS -o "$HTTP_DIR/topic.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/$TOPIC_CREATE_ENDPOINT" \
+  -X PUT "$BASE_URL/$TOPIC_CREATE_ENDPOINT/$TOPIC_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/topic.request.json")"
@@ -325,7 +325,7 @@ EOF
 fi
 
 REST_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/rest-subscription.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/Subscription" \
+  -X PUT "$BASE_URL/Subscription/$REST_SUB_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/rest-subscription.request.json")"
@@ -345,7 +345,7 @@ cat > "$HTTP_DIR/rest-encounter.request.json" <<EOF
 EOF
 
 REST_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/rest-encounter.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/Encounter" \
+  -X PUT "$BASE_URL/Encounter/$REST_ENCOUNTER_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/rest-encounter.request.json")"
@@ -422,7 +422,7 @@ EOF
 fi
 
 WS_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/ws-subscription.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/Subscription" \
+  -X PUT "$BASE_URL/Subscription/$WS_SUB_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/ws-subscription.request.json")"
@@ -468,7 +468,7 @@ cat > "$HTTP_DIR/ws-encounter.request.json" <<EOF
 EOF
 
 WS_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/ws-encounter.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/Encounter" \
+  -X PUT "$BASE_URL/Encounter/$WS_ENCOUNTER_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/ws-encounter.request.json")"
@@ -573,7 +573,7 @@ EOF
     fi
 
     EMAIL_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/email-subscription.response.json" -w "%{http_code}" \
-      -X POST "$BASE_URL/Subscription" \
+      -X PUT "$BASE_URL/Subscription/$EMAIL_SUB_ID" \
       -H "Content-Type: $FHIR_CT" \
       -H "Accept: $FHIR_ACCEPT" \
       --data-binary @"$HTTP_DIR/email-subscription.request.json")"
@@ -613,7 +613,7 @@ EOF
 EOF
 
       EMAIL_ENCOUNTER_STATUS="$(curl -sS -o "$HTTP_DIR/email-encounter.response.json" -w "%{http_code}" \
-        -X POST "$BASE_URL/Encounter" \
+        -X PUT "$BASE_URL/Encounter/$EMAIL_ENCOUNTER_ID" \
         -H "Content-Type: $FHIR_CT" \
         -H "Accept: $FHIR_ACCEPT" \
         --data-binary @"$HTTP_DIR/email-encounter.request.json")"
@@ -725,7 +725,7 @@ EOF
 fi
 
 MSG_SUB_STATUS="$(curl -sS -o "$HTTP_DIR/msg-subscription.response.json" -w "%{http_code}" \
-  -X POST "$BASE_URL/Subscription" \
+  -X PUT "$BASE_URL/Subscription/$MSG_SUB_ID" \
   -H "Content-Type: $FHIR_CT" \
   -H "Accept: $FHIR_ACCEPT" \
   --data-binary @"$HTTP_DIR/msg-subscription.request.json")"
@@ -756,7 +756,7 @@ else
 EOF
 
   MSG_ENC_STATUS="$(curl -sS -o "$HTTP_DIR/msg-encounter.response.json" -w "%{http_code}" \
-    -X POST "$BASE_URL/Encounter" \
+    -X PUT "$BASE_URL/Encounter/$MSG_ENCOUNTER_ID" \
     -H "Content-Type: $FHIR_CT" \
     -H "Accept: $FHIR_ACCEPT" \
     --data-binary @"$HTTP_DIR/msg-encounter.request.json")"

@@ -40,7 +40,7 @@
       </valueCodeableConcept>
     </extension>
   </extension>
-  <!--   Dog tag, under Maroondah City council   -->
+  <!-- Dog tag, under Maroondah City council -->
   <identifier>
     <type>
       <text value="Dog Tag"/>
@@ -55,7 +55,7 @@
     </assigner>
   </identifier>
   <active value="true"/>
-  <!--   Dog's name: Kenzi   -->
+  <!-- Dog's name: Kenzi -->
   <name>
     <use value="usual"/>
     <given value="Kenzi"/>

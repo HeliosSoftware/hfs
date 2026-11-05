@@ -7453,10 +7453,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -8010,10 +8010,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -8392,10 +8392,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -8920,10 +8920,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -10877,10 +10877,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -13578,10 +13578,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -14867,10 +14867,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -17832,10 +17832,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -18151,10 +18151,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -18658,10 +18658,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -18917,7 +18917,7 @@
         ],
         "effectivePeriod": {
           "start": "1994-05-19T19:33:18-04:00",
-          "stop": "1994-05-19T20:33:18-04:00"
+          "end": "1994-05-19T20:33:18-04:00"
         },
         "issued": "1994-05-19T19:33:18.715-04:00",
         "component": [
@@ -19731,10 +19731,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -21741,10 +21741,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -22291,10 +22291,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -22610,10 +22610,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -25674,10 +25674,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -26695,10 +26695,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"
@@ -27307,10 +27307,10 @@
             {
               "system": "http://hl7.org/fhir/sid/cvx",
               "code": "140",
-              "display": "Influenza, seasonal, injectable, preservative free"
+              "display": "Influenza, split virus, trivalent, PF"
             }
           ],
-          "text": "Influenza, seasonal, injectable, preservative free"
+          "text": "Influenza, split virus, trivalent, PF"
         },
         "patient": {
           "reference": "urn:uuid:e91975f5-9445-c11f-cabf-c3c6dae161f2"

@@ -11,6 +11,38 @@
     <value value="ecsr45"/>
   </identifier>
   <status value="active"/>
+  <!-- <progress>
+		<type>
+			<coding>
+				<system value="http://terminology.hl7.org/CodeSystem/research-subject-state-type"/>
+				<code value="Enrollment"/>
+			</coding>
+			<text value="Enrollment status"/>
+		</type>
+	</progress>
+	<progress>
+		<type>
+			<coding>
+				<system value="http://terminology.hl7.org/CodeSystem/research-subject-state-type"/>
+				<code value="Enrollment"/>
+				<display value="Enrollment status"/>
+			</coding>
+		</type>
+		<subjectState>
+			<coding>
+				<system value="http://terminology.hl7.org/CodeSystem/research-subject-state"/>
+				<code value="on-study"/>
+				<display value="On-study"/>
+			</coding>
+		</subjectState>
+		<reason>
+			<coding>
+				<code value="informedConsentSigned"/>
+			</coding>
+			<text value="Informed consent signed"/>
+		</reason>
+		<startDate value="2022-06-10"/>
+	</progress> -->
   <period>
     <start value="2022-06-10"/>
   </period>

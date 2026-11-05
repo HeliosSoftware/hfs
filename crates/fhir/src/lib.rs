@@ -315,6 +315,32 @@ impl PreciseDecimal {
 /// assert_eq!(precise.value(), Some(decimal));
 /// assert_eq!(precise.original_string(), "12.345");
 /// ```
+impl PreciseDecimal {
+    /// Returns the power of ten of the least significant digit when it lies left
+    /// of the units place, i.e. when the original text has a positive exponent
+    /// larger than its mantissa's fractional digits.
+    ///
+    /// `"9.5e2"` → `Some(1)` (precise to tens), `"1.5E3"` → `Some(2)`,
+    /// `"9.50e2"` → `None` (precise to units, already scale 0), `"1.5e-3"` and
+    /// `"950"` → `None` (the parsed `Decimal`'s scale carries the precision).
+    pub fn positive_exponent(&self) -> Option<u32> {
+        let s = self.original_string.trim();
+        let (mantissa, exponent) = s.split_once(['e', 'E'])?;
+        let exponent: i64 = exponent.parse().ok()?;
+        let mantissa = mantissa.trim_start_matches(['+', '-']);
+        let fraction_digits = match mantissa.split_once('.') {
+            Some((_, frac)) => frac.len() as i64,
+            None => 0,
+        };
+        let unit_exponent = exponent.checked_sub(fraction_digits)?;
+        if unit_exponent > 0 {
+            u32::try_from(unit_exponent).ok()
+        } else {
+            None
+        }
+    }
+}
+
 impl From<Decimal> for PreciseDecimal {
     fn from(value: Decimal) -> Self {
         // Generate string representation from the decimal value
@@ -1431,10 +1457,104 @@ pub mod r5;
 #[cfg(feature = "R6")]
 pub mod r6;
 
+pub mod compartment;
+pub mod compartment_expressions;
+pub mod implied_code_systems;
 pub mod parameters;
+pub mod search;
 
 // Re-export commonly used types from parameters module
 pub use parameters::{ParameterValueAccessor, VersionIndependentParameters};
+
+/// Returns the search-parameter NAMES that link `resource_type` to the
+/// named compartment (e.g. `"Patient"`, `"Group"`, `"Encounter"`,
+/// `"Practitioner"`, `"RelatedPerson"`, `"Device"`), for the specified
+/// FHIR version.
+///
+/// Thin version-dispatching wrapper around the per-version code-generated
+/// `get_compartment_params`. Returns an empty slice when the resource
+/// type is not a member of the named compartment.
+///
+/// Used by:
+/// - REST compartment-search handler (`/Patient/{id}/Observation` style URLs)
+///   to know which search params to feed into the search-index query.
+/// - SoF in-DB runners to filter `$viewdefinition-run` results by patient /
+///   group membership.
+///
+/// Pair this with [`compartment_expressions`] when you need the FHIRPath
+/// expressions themselves (e.g. for in-process FHIRPath evaluation against
+/// raw JSON, as `helios_sof::compartment` does).
+#[allow(unreachable_patterns)]
+pub fn compartment_params(
+    version: FhirVersion,
+    compartment_type: &str,
+    resource_type: &str,
+) -> &'static [&'static str] {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_compartment_params(compartment_type, resource_type),
+        _ => &[],
+    }
+}
+
+/// Returns the JSON element names (camelCase — `billablePeriod`, `type`,
+/// `use`) of every element the FHIR specification marks `isSummary: true`
+/// on `resource_type`, for the specified FHIR version: the set `_summary=true`
+/// keeps. An unknown resource type gets the generated lookup's minimal
+/// `resourceType`, `id`, `meta` set.
+///
+/// Thin version-dispatching wrapper around the per-version code-generated
+/// `get_summary_fields`, which reports the *Rust* field names of the
+/// generated structs — snake_case, and a raw identifier (`r#type`, `r#use`,
+/// `r#abstract`, `r#for`) wherever a FHIR element name collides with a Rust
+/// keyword. The conversion back to element names lives here, once, so every
+/// consumer agrees on it: REST `_summary` subsetting and the UI results table
+/// each used to carry their own copy, and the UI's missed the `r#` prefix,
+/// rendering `R#TYPE` / `R#USE` headers over empty columns for Claim and
+/// ~50 other types (#1107).
+#[allow(unreachable_patterns)]
+pub fn summary_elements(version: FhirVersion, resource_type: &str) -> Vec<String> {
+    let fields: &[&str] = match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_summary_fields(resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_summary_fields(resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_summary_fields(resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_summary_fields(resource_type),
+        _ => &[],
+    };
+    fields.iter().map(|f| field_to_element_name(f)).collect()
+}
+
+/// Maps a generated struct's Rust field name back to the FHIR element name it
+/// serializes as: drops the raw-identifier prefix the generator adds for
+/// keyword collisions (`r#type` → `type`) and converts snake_case to
+/// camelCase (`birth_date` → `birthDate`). Exactly inverts the generator's
+/// `make_rust_safe`.
+fn field_to_element_name(field: &str) -> String {
+    let field = field.strip_prefix("r#").unwrap_or(field);
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(c.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 // Internal helpers used by the derive macro; not part of the public API
 #[doc(hidden)]
@@ -1848,6 +1968,148 @@ impl FhirVersion {
             FhirVersion::R6,
         ]
     }
+
+    /// Returns the default FHIR version for the current build.
+    ///
+    /// This is `R4` when the `R4` feature is enabled (the canonical default),
+    /// otherwise the first enabled version (`R4B`, then `R5`, then `R6`). Unlike
+    /// [`Default::default`] — which is gated on `feature = "R4"` and therefore
+    /// unavailable in single-version-minimal builds — this helper is available
+    /// whenever at least one FHIR version feature is enabled, which the crate
+    /// requires at compile time. Use it instead of `unwrap_or_default()` /
+    /// `FhirVersion::default()` on code paths that must compile in any
+    /// single-version build (e.g. R4B-only).
+    pub fn default_enabled() -> FhirVersion {
+        // `enabled_versions()` always has at least one entry: at least one FHIR
+        // version feature must be enabled at compile time.
+        FhirVersion::enabled_versions()[0]
+    }
+}
+
+/// Dispatches a field-type lookup to the per-version generated `FIELD_TYPES`
+/// table. Returns `(field_type, is_collection)` when the
+/// `(parent_type, field_name)` pair is known, or `None` when the version
+/// variant isn't compiled in (e.g. a downstream crate enabled `helios-fhir`
+/// features that this build doesn't have).
+///
+/// Centralizes what used to be a hand-rolled match in
+/// `helios-persistence::sof` and `helios-fhirpath::type_inference`.
+pub fn get_field_type(
+    version: FhirVersion,
+    parent_type: &str,
+    field_name: &str,
+) -> Option<(&'static str, bool)> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => crate::r4::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => crate::r4b::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => crate::r5::get_field_type(parent_type, field_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => crate::r6::get_field_type(parent_type, field_name),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Returns true when `name` is the type code of a FHIR primitive datatype
+/// (case-sensitive, lowercase as in the FHIR spec — `boolean`, `integer`,
+/// `dateTime`, …). The set is the union across FHIR versions, so
+/// `integer64` (added in R5) and `xhtml` are included regardless of which
+/// version feature is enabled.
+///
+/// Centralizes what used to be three hand-maintained primitive-type lists
+/// inside `helios-fhirpath` (`fhir_type_hierarchy`, `resource_type`,
+/// `type_inference`).
+pub fn is_primitive_type(name: &str) -> bool {
+    matches!(
+        name,
+        "base64Binary"
+            | "boolean"
+            | "canonical"
+            | "code"
+            | "date"
+            | "dateTime"
+            | "decimal"
+            | "id"
+            | "instant"
+            | "integer"
+            | "integer64"
+            | "markdown"
+            | "oid"
+            | "positiveInt"
+            | "string"
+            | "time"
+            | "unsignedInt"
+            | "uri"
+            | "url"
+            | "uuid"
+            | "xhtml"
+    )
+}
+
+/// Returns true when `field_name` appears anywhere in the per-version
+/// `FIELD_TYPES` table. Used as a parent-context-free fallback for
+/// detecting polymorphic typed variants (`valueQuantity`,
+/// `deceasedBoolean`, …) when the parent FHIR type isn't statically known.
+pub fn field_exists_anywhere(version: FhirVersion, field_name: &str) -> bool {
+    field_types(version).is_some_and(|t| t.iter().any(|(_, f, _, _)| *f == field_name))
+}
+
+/// Returns the per-version `FIELD_TYPES` slice when the version's feature
+/// is compiled in. Each entry is `(parent_type, field_name, field_type,
+/// is_collection)`. Use this when you need to enumerate all fields of a
+/// parent type — for a single-field lookup, prefer [`get_field_type`].
+pub fn field_types(
+    version: FhirVersion,
+) -> Option<&'static [(&'static str, &'static str, &'static str, bool)]> {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => Some(crate::r4::FIELD_TYPES),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => Some(crate::r4b::FIELD_TYPES),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => Some(crate::r5::FIELD_TYPES),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => Some(crate::r6::FIELD_TYPES),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Returns the compartment search parameters for a given FHIR version.
+///
+/// This is a version-agnostic dispatch over the per-version
+/// `helios_fhir::{r4,r4b,r5,r6}::get_compartment_params` functions, which are
+/// generated from the official FHIR `CompartmentDefinition` resources.
+///
+/// # Arguments
+///
+/// * `version` - The FHIR version to use for lookup
+/// * `compartment_type` - The compartment type (e.g., "Patient", "Encounter")
+/// * `resource_type` - The target resource type (e.g., "Observation")
+///
+/// # Returns
+///
+/// A static slice of search parameter names that link the resource to the
+/// compartment. Returns an empty slice if the resource is not a member of the
+/// compartment.
+pub fn get_compartment_params(
+    version: FhirVersion,
+    compartment_type: &str,
+    resource_type: &str,
+) -> &'static [&'static str] {
+    match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_compartment_params(compartment_type, resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_compartment_params(compartment_type, resource_type),
+    }
 }
 
 /// Implements `Display` trait for user-friendly output formatting.
@@ -1974,6 +2236,25 @@ pub trait FhirComplexTypeProvider {
         Self::get_complex_type_names()
             .iter()
             .any(|&complex_type| complex_type.eq_ignore_ascii_case(type_name))
+    }
+}
+
+/// Trait for providing FHIR primitive type information
+///
+/// This trait allows querying which primitive data types are available in a specific
+/// FHIR version without hardcoding primitive type lists in multiple places. The
+/// implementation is generated from the FHIR specification (StructureDefinitions
+/// whose `kind` is `primitive-type`).
+pub trait FhirPrimitiveTypeProvider {
+    /// Returns a vector of all primitive type names supported in this FHIR version
+    /// (e.g. `boolean`, `string`, `dateTime`, `positiveInt`).
+    fn get_primitive_type_names() -> Vec<&'static str>;
+
+    /// Checks if a given type name is a primitive type in this FHIR version
+    fn is_primitive_type(type_name: &str) -> bool {
+        Self::get_primitive_type_names()
+            .iter()
+            .any(|&primitive_type| primitive_type.eq_ignore_ascii_case(type_name))
     }
 }
 
@@ -2874,8 +3155,9 @@ where
     fn to_evaluation_result(&self) -> EvaluationResult {
         use helios_fhirpath_support::PrimitiveElement;
 
-        // Build PrimitiveElement metadata from id/extension
-        let primitive_meta = if self.id.is_some() || self.extension.is_some() {
+        // Build PrimitiveElement metadata from id/extension, plus the precision of
+        // a positive exponent (`9.5e2`) that the parsed `Decimal` cannot carry
+        let primitive_meta = {
             let mut meta = PrimitiveElement::default();
             if let Some(id) = &self.id {
                 meta.id = Some(id.clone());
@@ -2883,9 +3165,8 @@ where
             if let Some(ext) = &self.extension {
                 meta.extension = ext.iter().map(|e| e.to_evaluation_result()).collect();
             }
+            meta.decimal_exponent = self.value.as_ref().and_then(|v| v.positive_exponent());
             if !meta.is_empty() { Some(meta) } else { None }
-        } else {
-            None
         };
 
         // Prioritize returning the primitive decimal value if it exists
@@ -2950,6 +3231,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn field_to_element_name_inverts_the_generator() {
+        assert_eq!(field_to_element_name("birth_date"), "birthDate");
+        assert_eq!(
+            field_to_element_name("managing_organization"),
+            "managingOrganization"
+        );
+        assert_eq!(field_to_element_name("id"), "id");
+        assert_eq!(field_to_element_name("implicit_rules"), "implicitRules");
+        // Every raw identifier `make_rust_safe` can emit (#1107).
+        assert_eq!(field_to_element_name("r#type"), "type");
+        assert_eq!(field_to_element_name("r#use"), "use");
+        assert_eq!(field_to_element_name("r#abstract"), "abstract");
+        assert_eq!(field_to_element_name("r#for"), "for");
+    }
+
+    /// The raw identifiers `make_rust_safe` emits reach every consumer as
+    /// plain element names — no `r#` may survive for any resource type in
+    /// any enabled version (#1107).
+    #[test]
+    fn summary_elements_never_leak_raw_identifiers() {
+        let checks: &[(FhirVersion, &str, &[&str])] = &[
+            #[cfg(feature = "R4")]
+            (FhirVersion::R4, "Claim", &["type", "use", "billablePeriod"]),
+            #[cfg(feature = "R4")]
+            (
+                FhirVersion::R4,
+                "StructureDefinition",
+                &["abstract", "type"],
+            ),
+            #[cfg(feature = "R4")]
+            (FhirVersion::R4, "Task", &["for", "status"]),
+            #[cfg(feature = "R4B")]
+            (
+                FhirVersion::R4B,
+                "Claim",
+                &["type", "use", "billablePeriod"],
+            ),
+            #[cfg(feature = "R5")]
+            (FhirVersion::R5, "Claim", &["type", "use", "billablePeriod"]),
+            #[cfg(feature = "R6")]
+            (FhirVersion::R6, "Claim", &["type", "use", "billablePeriod"]),
+        ];
+        for (version, resource_type, expected) in checks {
+            let elements = summary_elements(*version, resource_type);
+            for e in *expected {
+                assert!(
+                    elements.iter().any(|x| x == e),
+                    "{version:?} {resource_type} summary {elements:?} lacks {e}"
+                );
+            }
+            assert!(
+                elements
+                    .iter()
+                    .all(|e| !e.contains("r#") && !e.contains('_')),
+                "{version:?} {resource_type}: {elements:?}"
+            );
+        }
+        #[cfg(feature = "R4")]
+        assert_eq!(
+            summary_elements(FhirVersion::R4, "NotAResource"),
+            ["resourceType", "id", "meta"],
+            "unknown types get the generated lookup's minimal set"
+        );
+    }
+
+    #[test]
     fn test_integer_string_deserialization() {
         // Test deserializing a string "2" into Element<i64, ()>
         type TestElement = Element<i64, ()>;
@@ -3004,5 +3351,29 @@ mod tests {
             result.is_err(),
             "Should fail to deserialize non-numeric string as i64"
         );
+    }
+}
+
+#[cfg(test)]
+mod precise_decimal_exponent_tests {
+    use super::PreciseDecimal;
+
+    fn exponent(s: &str) -> Option<u32> {
+        let parsed = PreciseDecimal::parse_decimal_string(s);
+        PreciseDecimal::from_parts(parsed, s.to_string()).positive_exponent()
+    }
+
+    #[test]
+    fn positive_exponent_is_the_unit_of_the_last_mantissa_digit() {
+        assert_eq!(exponent("9.5e2"), Some(1));
+        assert_eq!(exponent("-9.5e2"), Some(1));
+        assert_eq!(exponent("1.5E2"), Some(1));
+        assert_eq!(exponent("1.5e+3"), Some(2));
+        assert_eq!(exponent("7e2"), Some(2));
+        assert_eq!(exponent("9.50e2"), None);
+        assert_eq!(exponent("950e-1"), None);
+        assert_eq!(exponent("1.5e-3"), None);
+        assert_eq!(exponent("950"), None);
+        assert_eq!(exponent("9.5"), None);
     }
 }

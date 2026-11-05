@@ -9,15 +9,12 @@ use std::collections::HashMap;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
-use helios_persistence::core::bulk_export::{BulkExportStorage, ExportRequest};
+use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
 use helios_persistence::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
 };
 use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
-use helios_persistence::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
-use helios_persistence::core::{
-    Backend, BackendCapability, BackendKind, ResourceStorage, VersionedStorage,
-};
+use helios_persistence::core::{BackendCapability, ResourceStorage, VersionedStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::json;
@@ -68,29 +65,47 @@ fn make_bucket_per_tenant_backend(prefix: String) -> Option<S3Backend> {
     Some(S3Backend::from_env(config).expect("create bucket-per-tenant S3 backend"))
 }
 
+/// Capabilities that do not depend on how tenants are placed.
+///
+/// `S3Backend::declared_capabilities()` (no argument) was removed in #369: S3's
+/// tenant-placement topology is a property of the configured
+/// [`S3TenancyMode`], so a single mode-independent answer was necessarily false
+/// in one direction whichever mode an instance ran. The per-mode tenancy claims
+/// are asserted in `tests/backend_capability_contract.rs`.
 #[test]
 fn test_s3_capabilities_declared() {
-    let config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: "dummy".to_string(),
-        },
-        validate_buckets_on_startup: false,
-        ..Default::default()
+    let mode = S3TenancyMode::PrefixPerTenant {
+        bucket: "declared-capabilities".to_string(),
     };
+    let capabilities = S3Backend::declared_capabilities_for(&mode);
 
-    // Build with provider chain config load, no AWS calls because validation is disabled.
-    let backend = S3Backend::from_env(config).expect("backend creation");
+    assert!(capabilities.contains(&BackendCapability::Crud));
+    assert!(capabilities.contains(&BackendCapability::Versioning));
+    assert!(capabilities.contains(&BackendCapability::InstanceHistory));
+    assert!(capabilities.contains(&BackendCapability::TypeHistory));
+    assert!(capabilities.contains(&BackendCapability::SystemHistory));
+    assert!(capabilities.contains(&BackendCapability::BulkExport));
+    assert!(capabilities.contains(&BackendCapability::BulkSubmitIngest));
+    // A shared bucket has room for the cross-tenant claim queue and poll-token
+    // index the `$bulk-submit` worker needs.
+    assert!(capabilities.contains(&BackendCapability::BulkSubmitRestWorker));
+    assert!(!capabilities.contains(&BackendCapability::BasicSearch));
+    assert!(!capabilities.contains(&BackendCapability::Transactions));
 
-    assert_eq!(backend.kind(), BackendKind::S3);
-    assert!(backend.supports(BackendCapability::Crud));
-    assert!(backend.supports(BackendCapability::Versioning));
-    assert!(backend.supports(BackendCapability::InstanceHistory));
-    assert!(backend.supports(BackendCapability::TypeHistory));
-    assert!(backend.supports(BackendCapability::SystemHistory));
-    assert!(backend.supports(BackendCapability::BulkExport));
-    assert!(backend.supports(BackendCapability::BulkImport));
-    assert!(!backend.supports(BackendCapability::BasicSearch));
-    assert!(!backend.supports(BackendCapability::Transactions));
+    // Tenancy is mode-derived: a shared bucket is not physical isolation.
+    assert!(capabilities.contains(&BackendCapability::SharedSchema));
+    assert!(!capabilities.contains(&BackendCapability::DatabasePerTenant));
+
+    let bucket_mode = S3TenancyMode::BucketPerTenant {
+        tenant_bucket_map: std::collections::HashMap::from([(
+            "tenant-a".to_string(),
+            "bucket-a".to_string(),
+        )]),
+        default_system_bucket: None,
+    };
+    let bucket_capabilities = S3Backend::declared_capabilities_for(&bucket_mode);
+    assert!(bucket_capabilities.contains(&BackendCapability::DatabasePerTenant));
+    assert!(!bucket_capabilities.contains(&BackendCapability::SharedSchema));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,25 +190,25 @@ async fn test_aws_bundle_bulk_export_and_submit() {
     let backend = make_prefix_backend(format!("integration/{}/bulk", Uuid::new_v4()));
     let tenant = tenant("aws-tenant-b");
 
-    let entries = vec![BundleEntry {
-        method: BundleMethod::Post,
-        url: "Patient".to_string(),
-        resource: Some(json!({"resourceType":"Patient","id":format!("b-{}", Uuid::new_v4())})),
-        ..Default::default()
-    }];
-    let bundle = backend.process_batch(&tenant, entries).await.unwrap();
-    assert_eq!(bundle.entries.len(), 1);
-    assert_eq!(bundle.entries[0].status, 201);
-
-    let job_id = backend
-        .start_export(
-            &tenant,
-            ExportRequest::system().with_types(vec!["Patient".to_string()]),
-        )
+    // Seeded through `ResourceStorage` directly: this test's subject is the
+    // export/submit feed, not bundle processing. It previously seeded via
+    // `BundleProvider::process_batch`, which #501 removed as unreachable.
+    let patient = json!({"resourceType": "Patient", "id": format!("b-{}", Uuid::new_v4())});
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
-    let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
-    assert!(!manifest.output.is_empty());
+    assert_eq!(stored.resource_type(), "Patient");
+
+    // S3 no longer implements `BulkExportStorage` (job state lives in
+    // SQLite/Postgres); only `ExportDataProvider` remains. Verify the data
+    // feed instead of the removed kick-off/manifest path.
+    let request = ExportRequest::system().with_types(vec!["Patient".to_string()]);
+    let batch = backend
+        .fetch_export_batch(&tenant, &request, "Patient", None, 100)
+        .await
+        .unwrap();
+    assert!(!batch.lines.is_empty());
 
     let submission_id = SubmissionId::new("aws-client", format!("sub-{}", Uuid::new_v4()));
     backend
@@ -222,6 +237,110 @@ async fn test_aws_bundle_bulk_export_and_submit() {
 
     assert_eq!(results.len(), 1);
     assert!(results[0].is_success());
+}
+
+/// #1007: `mark_entries_unindexed` flips only the named `(type, id)` entry
+/// results to `processing-error`, leaving the rest untouched, and is a no-op
+/// on an empty entry list.
+#[tokio::test]
+async fn mark_entries_unindexed_flips_only_the_named_resources() {
+    if !run_aws_tests() {
+        eprintln!("skipping AWS test (set RUN_AWS_S3_TESTS=1)");
+        return;
+    }
+
+    use helios_persistence::core::{BulkEntryOutcome, UnindexedEntry};
+
+    let backend = make_prefix_backend(format!("integration/{}/mark-unindexed", Uuid::new_v4()));
+    let tenant = tenant("aws-tenant-unindexed");
+
+    let submission_id = SubmissionId::new("aws-client", format!("sub-{}", Uuid::new_v4()));
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let ids = ["s3-unidx-1", "s3-unidx-2", "s3-unidx-3"];
+    let entries: Vec<NdjsonEntry> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            NdjsonEntry::new(
+                (i + 1) as u64,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+            )
+        })
+        .collect();
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert!(results.iter().all(|r| r.is_success()));
+
+    assert_eq!(
+        backend
+            .mark_entries_unindexed(&tenant, &submission_id, &manifest.manifest_id, &[])
+            .await
+            .unwrap(),
+        0,
+        "an empty entry list is a no-op"
+    );
+
+    let oo = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "incomplete",
+            "diagnostics": "Patient/s3-unidx-2 was stored but could not be indexed for search \
+                            on es: timeout. Run POST /Patient/$reindex to repair."
+        }]
+    });
+    let changed = backend
+        .mark_entries_unindexed(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            &[UnindexedEntry {
+                resource_type: "Patient".to_string(),
+                resource_id: "s3-unidx-2".to_string(),
+                operation_outcome: oo.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    for paged in &page.entries {
+        let result = &paged.result;
+        if result.resource_id.as_deref() == Some("s3-unidx-2") {
+            assert_eq!(result.outcome, BulkEntryOutcome::ProcessingError);
+            assert_eq!(result.operation_outcome.as_ref(), Some(&oo));
+        } else {
+            assert_eq!(result.outcome, BulkEntryOutcome::Success);
+        }
+    }
 }
 
 #[tokio::test]

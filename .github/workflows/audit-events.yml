@@ -4,12 +4,14 @@ on:
   workflow_dispatch:
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
   HFS_AUDIT_CLOUDWATCH_LOG_GROUP: ${{ vars.HFS_AUDIT_CLOUDWATCH_LOG_GROUP }}
 
@@ -180,7 +182,17 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch, cloudwatch]
+        backend:
+          [
+            sqlite,
+            sqlite-elasticsearch,
+            postgres,
+            postgres-elasticsearch,
+            mongodb,
+            mongodb-elasticsearch,
+            s3-elasticsearch,
+            cloudwatch,
+          ]
 
     steps:
       - name: Checkout code
@@ -200,19 +212,18 @@ jobs:
           chmod +x crates/hfs/tests/audit/validate_report.py
           chmod +x docker/keycloak/get-token.sh
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
-
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Validate backend configuration
         run: |
@@ -226,10 +237,10 @@ jobs:
           fi
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -257,10 +268,10 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-audit-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          PG_CONTAINER="pg-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -288,11 +299,11 @@ jobs:
           exit 1
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
-          MONGO_CONTAINER="mongo-audit-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          MONGO_CONTAINER="mongo-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 
@@ -383,7 +394,7 @@ jobs:
       - name: Start ephemeral Keycloak
         run: |
           KC_CONTAINER="kc-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$KC_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$KC_CONTAINER" 2>/dev/null || true
 
           docker create --name "$KC_CONTAINER" -p 0:8080 \
             -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
@@ -475,8 +486,26 @@ jobs:
             HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
@@ -489,6 +518,22 @@ jobs:
             HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
             HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            MONGO_HOST="$DOCKER_HOST_IP"
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_AUDIT_BACKEND=file \
+            HFS_AUDIT_FILE_PATH="$AUDIT_FILE" \
+            HFS_ENABLE_CORS=false \
+            HFS_AUTH_ENABLED=true \
+            HFS_AUTH_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_AUTH_ISSUER="$AUTH_ISSUER" \
+            HFS_SMART_TOKEN_ENDPOINT="$AUTH_TOKEN_ENDPOINT" \
+            HFS_SMART_AUTHORIZE_ENDPOINT="$AUTH_AUTHORIZE_ENDPOINT" \
+            HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=s3-elasticsearch \
@@ -723,7 +768,7 @@ jobs:
           )
 
           if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-base-url"; then
-            VALIDATE_ARGS+=(--tx-base-url "https://tx.fhir.org/r5")
+            VALIDATE_ARGS+=(--tx-base-url "https://hts.heliossoftware.com")
           fi
           if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-timeout-seconds"; then
             VALIDATE_ARGS+=(--tx-timeout-seconds 12)
@@ -760,16 +805,16 @@ jobs:
           fi
 
           echo "Stopping Keycloak..."
-          docker rm -f "${KC_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${KC_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping Elasticsearch..."
-          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping PostgreSQL..."
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping MongoDB..."
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
 
@@ -800,20 +845,19 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
-
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
           echo "HFS_PORT_SMOKE=18088" >> $GITHUB_ENV
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Validate backend configuration
         run: |
@@ -826,7 +870,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           PG_CONTAINER="pg-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -862,8 +906,8 @@ jobs:
         if: matrix.backend == 'mongodb'
         run: |
           MONGO_CONTAINER="mongo-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 
@@ -1101,13 +1145,15 @@ jobs:
           EXAMPLE_FILE="audit-db-results/example-event.json"
           CHECK_COUNT=0
 
+          # Every arm reads the audit store directly. `shared` mode used to read
+          # over HTTP with `X-Tenant-ID: __system__`, but addressing the internal
+          # system tenant from the network is exactly the isolation hole closed
+          # in #317, so that door no longer opens. Reading the store is what the
+          # `dedicated` arms and the S3 arm always did, and it asserts the same
+          # thing — that the database sink persisted an AuditEvent — without
+          # depending on a request path that must now be refused.
           for _ in {1..20}; do
-            if [ "${{ matrix.mode }}" = "shared" ] && [ "${{ matrix.backend }}" != "s3" ]; then
-              curl -sS -H "X-Tenant-ID: __system__" \
-                "http://localhost:$HFS_PORT_SMOKE/AuditEvent?_count=20" > audit-db-results/auditevent-search.json
-              CHECK_COUNT=$(jq -r '.entry | length // 0' audit-db-results/auditevent-search.json)
-              jq '.entry[0].resource // {}' audit-db-results/auditevent-search.json > "$EXAMPLE_FILE"
-            elif [ "${{ matrix.backend }}" = "sqlite" ]; then
+            if [ "${{ matrix.backend }}" = "sqlite" ]; then
               DB_PATH="$PRIMARY_SQLITE_DB"
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
                 DB_PATH="$AUDIT_SQLITE_DB"
@@ -1196,5 +1242,5 @@ jobs:
       - name: Cleanup smoke resources
         if: always()
         run: |
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true

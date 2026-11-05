@@ -1,0 +1,68 @@
+<!--
+  Shared dialog chrome (#681): the disclosure-as-modal pattern used by every
+  <details class="addbox addbox--modal"> dialog (Bulk Import's New Submission
+  and Add Manifest, Add Tenant). It owns the trigger, the backdrop (the
+  summary itself, per the no-JS mechanism documented on `.addbox--modal[open]
+  > summary` in app.css), the panel shell, and the ARIA that makes it a real
+  dialog — so none of those get re-declared per call site.
+
+  Slot mechanism: Askama macros have no block-content slots, but a call tag
+  invocation binds a "caller()" the macro body can render (askama_parser's
+  Call node) — the same mechanism Jinja2 call-blocks use. That lets this
+  macro own the full details/summary/panel/head skeleton and still take an
+  arbitrary body (the form with its fields and actions) without a duplicated
+  open/close macro pair. The Edit Resource modal does not use this macro —
+  see the comment on the modal class in resources.html for why.
+
+  Params:
+    trigger_label — already-localized text for the trigger button (paired
+                    with a fixed plus icon; every current dialog trigger uses
+                    one).
+    title_id      — id placed on the title element and referenced by the
+                    panel's aria-labelledby. Must be unique on the page.
+    title_text    — already-localized dialog title.
+    marker        — optional boolean data-attribute name stamped on the
+                    <details> element itself, for scripts/tests that need to
+                    address one specific dialog (e.g. Add Manifest's
+                    data-bulk-import-add-manifest).
+-->
+{% macro modal(trigger_label, title_id, title_text, marker="", icon="plus", primary=true, open=false) %}
+<details class="addbox addbox--modal"{% if !marker.is_empty() %} {{ marker }}{% endif %}{% if open %} open{% endif %}>
+  <summary class="{% if primary %}btn btn--primary{% else %}btn{% endif %}">
+    {% if icon == "pencil" %}{% include "icons/pencil.svg" %}{% else %}{% include "icons/plus.svg" %}{% endif %}
+    {{ trigger_label }}
+  </summary>
+  <div class="addbox__panel" role="dialog" aria-modal="true" aria-labelledby="{{ title_id }}">
+    <div class="addbox__head">
+      <div class="addbox__title" id="{{ title_id }}">{{ title_text }}</div>
+      <button type="button" class="addbox__x" data-addbox-close
+              aria-label="{{ i18n.t("ui-close") }}">×</button>
+    </div>
+    {{ caller() }}
+  </div>
+</details>
+{% endmacro %}
+
+<!--
+  The standard dialog field (plan §2.3b): label + input + optional hint,
+  matching the `label.field > span.field__label + input.field__input [+
+  span.field__hint]` pattern used across the dialogs. Every field here is
+  autocomplete="off", matching every existing standard field. Anything that
+  needs more than this — the bulk-import auth fieldset's radios, the headers
+  textarea, the tenant name/id inputs wired to the slug-mirror script's
+  data-tenant-* attributes — is not the standard case and stays as markup.
+
+  initial_focus marks the field addbox.js moves focus to when the dialog
+  opens (data-addbox-initial-focus) — set it on a dialog's first field.
+-->
+{% macro field(label, name, kind, required=false, placeholder="", hint="", initial_focus=false, value="") %}
+<label class="field">
+  <span class="field__label">{{ label }}</span>
+  <input class="field__input" type="{{ kind }}" name="{{ name }}"
+         {% if !value.is_empty() %}value="{{ value }}"{% endif %}
+         {% if required %}required{% endif %}
+         {% if !placeholder.is_empty() %}placeholder="{{ placeholder }}"{% endif %}
+         autocomplete="off"{% if initial_focus %} data-addbox-initial-focus{% endif %}>
+  {% if !hint.is_empty() %}<span class="field__hint">{{ hint }}</span>{% endif %}
+</label>
+{% endmacro %}

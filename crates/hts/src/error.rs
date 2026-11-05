@@ -7,21 +7,27 @@
 //!
 //! ## HTTP mapping
 //!
-//! | Variant | HTTP status | FHIR issue code |
-//! |---------|-------------|-----------------|
-//! | [`NotFound`] | 404 | `not-found` |
-//! | [`NotSupported`] | 501 | `not-supported` |
-//! | [`InvalidRequest`] | 400 | `invalid` |
-//! | [`Internal`] | 500 | `exception` |
-//! | [`StorageError`] | 500 | `exception` |
-//! | [`PreconditionFailed`] | 412 | `conflict` |
-//! | [`TooCostly`] | 422 | `too-costly` |
+//! | Variant | HTTP status | FHIR issue code | tx-issue-type |
+//! |---------|-------------|-----------------|---------------|
+//! | [`NotFound`] | 404 | `not-found` | `not-found` |
+//! | [`Gone`] | 410 | `deleted` | `not-found` |
+//! | [`NotSupported`] | 501 | `not-supported` | `not-supported` |
+//! | [`InvalidRequest`] | 400 | `invalid` | `invalid` |
+//! | [`VsInvalid`] | 400 | `invalid` | `vs-invalid` |
+//! | [`Internal`] | 500 | `exception` | `exception` |
+//! | [`StorageError`] | 500 | `exception` | `exception` |
+//! | [`Conflict`] | 409 | `conflict` | `conflict` |
+//! | [`PreconditionFailed`] | 412 | `conflict` | `conflict` |
+//! | [`TooCostly`] | 422 | `too-costly` | `too-costly` |
 //!
 //! [`NotFound`]: HtsError::NotFound
+//! [`Gone`]: HtsError::Gone
 //! [`NotSupported`]: HtsError::NotSupported
 //! [`InvalidRequest`]: HtsError::InvalidRequest
+//! [`VsInvalid`]: HtsError::VsInvalid
 //! [`Internal`]: HtsError::Internal
 //! [`StorageError`]: HtsError::StorageError
+//! [`Conflict`]: HtsError::Conflict
 //! [`PreconditionFailed`]: HtsError::PreconditionFailed
 //! [`TooCostly`]: HtsError::TooCostly
 
@@ -47,6 +53,10 @@ pub enum HtsError {
     #[error("Resource not found: {0}")]
     NotFound(String),
 
+    /// The requested history revision records deletion. Maps to HTTP 410.
+    #[error("Resource version deleted: {0}")]
+    Gone(String),
+
     /// The operation or parameter is valid FHIR but is not implemented by this
     /// server (e.g., SNOMED post-coordination expressions).  Maps to HTTP 501.
     #[error("Operation not supported: {0}")]
@@ -57,6 +67,15 @@ pub enum HtsError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    /// A ValueSet definition is itself invalid — for example a compose filter
+    /// that omits the required `value`, names an unknown operator, or supplies
+    /// a regular expression that fails to compile.  Maps to HTTP 400 with FHIR
+    /// issue code `invalid` and a `tx-issue-type=vs-invalid` coding so the
+    /// HL7 tx-ecosystem fixtures can distinguish ValueSet-definition errors
+    /// from other 400-class request problems.
+    #[error("Invalid ValueSet: {0}")]
+    VsInvalid(String),
+
     /// An unexpected server-side error that is not attributable to the caller.
     /// Maps to HTTP 500.
     #[error("Internal error: {0}")]
@@ -65,6 +84,11 @@ pub enum HtsError {
     /// A database or connection-pool error.  Maps to HTTP 500.
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// The selected resource changed while the mutation acquired its locks.
+    /// The caller may read the current resource and retry. Maps to HTTP 409.
+    #[error("Resource conflict: {0}")]
+    Conflict(String),
 
     /// An optimistic-concurrency conflict: the `If-Match` version does not
     /// match the stored version.  Maps to HTTP 412.
@@ -90,41 +114,100 @@ impl IntoResponse for HtsError {
         // `TooCostly` has its own tuple so we can't borrow `self` for the
         // diagnostics string in the same `match`; handle it separately.
         if let HtsError::TooCostly(ref msg) = self {
+            // The IG `big/expand-no-limit-outcome` fixture expects:
+            //   - `extension` with `operationoutcome-message-id` =
+            //     `VALUESET_TOO_COSTLY` (optional for tx.fhir.org)
+            //   - `details.text` only (no `details.coding`)
+            //   - `diagnostics` carrying the same message (optional in fixture)
+            // Other servers (e.g. tx.fhir.org) don't emit the message-id
+            // extension, but the IG marks it `$optional$ : "!tx.fhir.org"` so
+            // including it is fine for everyone else.
             let body = json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id",
+                        "valueString": "VALUESET_TOO_COSTLY",
+                    }],
                     "severity": "error",
                     "code": "too-costly",
-                    "diagnostics": msg
+                    "details": {
+                        "text": msg,
+                    },
+                    "diagnostics": msg,
                 }]
             });
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
 
-        let (status, code, diagnostics) = match &self {
-            HtsError::NotFound(msg) => (StatusCode::NOT_FOUND, "not-found", msg.as_str()),
-            HtsError::NotSupported(msg) => {
-                (StatusCode::NOT_IMPLEMENTED, "not-supported", msg.as_str())
+        // (status, FHIR-issue-code, tx-issue-type, diagnostics)
+        // The FHIR issue `code` and the `tx-issue-type` coding are usually
+        // identical, but VsInvalid splits them: FHIR code stays `invalid`
+        // (preserving the HTTP-level meaning) while tx-issue-type signals
+        // `vs-invalid` so the IG validator can route the failure to a
+        // ValueSet-definition diagnostic.
+        let (status, code, tx_issue_type, diagnostics) = match &self {
+            HtsError::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                "not-found",
+                "not-found",
+                msg.as_str(),
+            ),
+            HtsError::Gone(msg) => (StatusCode::GONE, "deleted", "not-found", msg.as_str()),
+            HtsError::NotSupported(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not-supported",
+                "not-supported",
+                msg.as_str(),
+            ),
+            HtsError::InvalidRequest(msg) => {
+                (StatusCode::BAD_REQUEST, "invalid", "invalid", msg.as_str())
             }
-            HtsError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid", msg.as_str()),
-            HtsError::Internal(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "exception", msg.as_str())
-            }
-            HtsError::StorageError(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "exception", msg.as_str())
-            }
-            HtsError::PreconditionFailed(msg) => {
-                (StatusCode::PRECONDITION_FAILED, "conflict", msg.as_str())
-            }
+            HtsError::VsInvalid(msg) => (
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "vs-invalid",
+                msg.as_str(),
+            ),
+            HtsError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+                "exception",
+                msg.as_str(),
+            ),
+            HtsError::StorageError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+                "exception",
+                msg.as_str(),
+            ),
+            HtsError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", "conflict", msg.as_str()),
+            HtsError::PreconditionFailed(msg) => (
+                StatusCode::PRECONDITION_FAILED,
+                "conflict",
+                "conflict",
+                msg.as_str(),
+            ),
             HtsError::TooCostly(_) => unreachable!("handled above"),
         };
 
+        // The HL7 IG validator's TxTesterScrubbers strips OperationOutcome.issue
+        // entries that have `diagnostics` but no `details` — every such issue
+        // disappears from comparison. The IG fixtures additionally expect a
+        // tx-issue-type coding inside details.
         let body = json!({
             "resourceType": "OperationOutcome",
             "issue": [{
                 "severity": "error",
                 "code": code,
-                "diagnostics": diagnostics
+                "details": {
+                    "coding": [{
+                        "system": "http://hl7.org/fhir/tools/CodeSystem/tx-issue-type",
+                        "code": tx_issue_type,
+                    }],
+                    "text": diagnostics,
+                },
+                "diagnostics": diagnostics,
             }]
         });
 

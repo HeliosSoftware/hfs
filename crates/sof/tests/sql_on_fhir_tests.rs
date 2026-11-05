@@ -9,8 +9,10 @@ struct TestCase {
     title: String,
     #[allow(dead_code)]
     description: String,
-    #[serde(rename = "fhirVersion")]
-    fhir_version: Vec<String>,
+    // Optional: some upstream fixtures (e.g. constant_types.json) omit `fhirVersion`, which the
+    // spec treats as "applies to all versions".
+    #[serde(rename = "fhirVersion", default)]
+    fhir_version: Option<Vec<String>>,
     resources: Vec<serde_json::Value>,
     tests: Vec<Test>,
 }
@@ -171,10 +173,18 @@ fn compare_results(actual: &[serde_json::Value], expected: &[serde_json::Value])
         return false;
     }
 
-    // For now, do a simple comparison
-    for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
-        if !compare_json_values(actual_row, expected_row) {
-            return false;
+    // Row order is not significant in SQL-on-FHIR (the official compliance runner canonicalizes
+    // both sides before comparing). Match as a multiset: every expected row must consume a distinct
+    // actual row.
+    let mut used = vec![false; actual.len()];
+    for expected_row in expected {
+        let matched = actual
+            .iter()
+            .enumerate()
+            .find(|(idx, actual_row)| !used[*idx] && compare_json_values(actual_row, expected_row));
+        match matched {
+            Some((idx, _)) => used[idx] = true,
+            None => return false,
         }
     }
 
@@ -336,44 +346,28 @@ fn test_basic_boolean_attribute() {
     }
 }
 
-#[test]
-fn test_run_basic_test_file() {
-    // Load and run a simple test case from the test suite
-    let mut test_suite_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_suite_path.push("tests/sql-on-fhir-v2/tests/basic.json");
-
-    if !test_suite_path.exists() {
-        // Skip test if test suite is not available
-        return;
-    }
-
-    let content = fs::read_to_string(test_suite_path).expect("Failed to read test file");
-    let test_case: TestCase = serde_json::from_str(&content).expect("Failed to parse test case");
-
-    // Check if we support the FHIR version
-    let supports_r4 = test_case.fhir_version.contains(&"4.0.1".to_string());
-    if !supports_r4 {
-        return; // Skip tests that don't support R4
-    }
-
-    // Create a bundle from the test resources
-    let bundle = create_test_bundle(&test_case.resources).expect("Failed to create test bundle");
-
-    // Run the first test
-    if let Some(first_test) = test_case.tests.first() {
-        let result = run_single_test(first_test, &bundle);
-        println!("Test '{}' result: {:?}", first_test.title, result);
-
-        // For now, we'll just print the result rather than assert
-        // This allows us to see what's working and what needs to be fixed
-    }
-}
+// `test_run_basic_test_file` used to live here. It was deleted in the fix for
+// issue #307 rather than repaired, because it was structurally incapable of
+// failing AND fully redundant:
+//
+//   * it read only `basic.json`, 1 of the 22 fixture files;
+//   * it ran only the FIRST of that file's 11 test cases;
+//   * it `println!`d the result instead of asserting on it;
+//   * it `return`ed silently — reported as a pass — if the fixture was missing.
+//
+// `run_comprehensive_test_suite` in `test_runner_integration.rs` already walks
+// every fixture file, runs all 144 cases including all of `basic.json`, and
+// asserts that every one passes. Rewriting this test to assert would have
+// created a second, weaker place to maintain the same claim. The two remaining
+// fixture-driven tests in this file (`test_repeat_directive` below and
+// `run_foreach_tests.rs`) are kept because they panic on a missing fixture and
+// assert on every case in their file.
 
 #[test]
 fn test_repeat_directive() {
     // Load and run repeat directive tests
     let mut test_suite_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_suite_path.push("tests/sql-on-fhir-v2/tests/repeat.json");
+    test_suite_path.push("tests/sql-on-fhir/tests/repeat.json");
 
     if !test_suite_path.exists() {
         panic!("Repeat test file not found at {:?}", test_suite_path);
@@ -384,7 +378,11 @@ fn test_repeat_directive() {
         serde_json::from_str(&content).expect("Failed to parse repeat test case");
 
     // Check if we support the FHIR version
-    let supports_r4 = test_case.fhir_version.contains(&"4.0.1".to_string());
+    let supports_r4 = test_case
+        .fhir_version
+        .as_ref()
+        .map(|v| v.contains(&"4.0.1".to_string()))
+        .unwrap_or(true);
     if !supports_r4 {
         panic!("Repeat tests don't support R4");
     }

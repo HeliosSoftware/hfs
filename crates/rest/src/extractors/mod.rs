@@ -12,13 +12,21 @@
 mod fhir_resource;
 mod fhir_version;
 mod pagination;
+mod peer;
+pub(crate) mod query_pairs;
 mod search_params;
 pub mod search_query_builder;
 mod tenant;
+mod user;
 
 pub use fhir_resource::FhirResource;
 pub use fhir_version::FhirVersionExtractor;
 pub use pagination::Pagination;
+pub use peer::PeerIp;
 pub use search_params::SearchParams;
-pub use search_query_builder::{build_search_query, build_search_query_from_map};
+pub use search_query_builder::{
+    GLOBAL_SEARCH_PARAMS, build_search_query_for_version, build_search_query_from_pairs,
+    drop_empty_parameters, unknown_search_params,
+};
 pub use tenant::TenantExtractor;
+pub use user::UserKey;

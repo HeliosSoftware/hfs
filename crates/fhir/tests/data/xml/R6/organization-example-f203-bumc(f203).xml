@@ -8,7 +8,7 @@
     </security>
   </meta>
   <identifier>
-    <!--  Identifier for the BMC  -->
+    <!-- Identifier for the BMC -->
     <use value="official"/>
     <type>
       <text value="Zorginstelling naam"/>
@@ -16,7 +16,7 @@
     <system value="http://www.zorgkaartnederland.nl/"/>
     <value value="Blijdorp MC"/>
   </identifier>
-  <!--     <accreditation>
+  <!-- <accreditation>
       <!-\-NIAZ Accreditatie-\->
       <identifier>
          <!-\-Identifier for the accreditation -\->
@@ -27,11 +27,11 @@
          <start value="2008-11-07"/>
          <end value="2013-11-07"/>
       </period>
-   </accreditation>  -->
-  <!--  The BMC is in active use  -->
+   </accreditation> -->
+  <!-- The BMC is in active use -->
   <active value="true"/>
   <type>
-    <!--  BMC is an Academic Medical Center  -->
+    <!-- BMC is an Academic Medical Center -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="405608006"/>
@@ -45,14 +45,14 @@
   <name value="Blijdorp Medisch Centrum (BUMC)"/>
   <contact>
     <telecom>
-      <!--  BMC's contact detail  -->
+      <!-- BMC's contact detail -->
       <system value="phone"/>
       <value value="+31107040704"/>
       <use value="work"/>
     </telecom>
-    <!--  ISO 3166 3 letter code  -->
+    <!-- ISO 3166 3 letter code -->
     <address>
-      <!--  BMC's address  -->
+      <!-- BMC's address -->
       <use value="work"/>
       <line value="apenrots 230"/>
       <city value="Blijdorp"/>

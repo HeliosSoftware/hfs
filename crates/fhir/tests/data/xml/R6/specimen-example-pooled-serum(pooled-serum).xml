@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Specimen xmlns="http://hl7.org/fhir">
   <id value="pooled-serum"/>
-  <!--   the accessionId assigned by the lab -->
+  <!-- the accessionId assigned by the lab -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -30,7 +30,7 @@
     <system value="https://vetmed.iastate.edu/vdl"/>
     <value value="20171120-1234"/>
   </identifier>
-  <!--  Pooled serum sample from 30 individuals in the herd- no Snomed Code for this - used a made up local code -->
+  <!-- Pooled serum sample from 30 individuals in the herd- no Snomed Code for this - used a made up local code -->
   <type>
     <coding>
       <system value="https://vetmed.iastate.edu/vdl"/>
@@ -39,7 +39,7 @@
     </coding>
     <text value="Pooled serum sample"/>
   </type>
-  <!--  subject is a herd of breeding sows  -->
+  <!-- subject is a herd of breeding sows -->
   <subject>
     <reference value="Group/herd1"/>
   </subject>
@@ -50,7 +50,13 @@
     </collector>
     <collectedDateTime value="2017-11-14"/>
   </collection>
-  <container/>
+  <container>
+    <device>
+      <reference>
+        <reference value="Device/device-example-specimen-container-red-top-vacutainer"/>
+      </reference>
+    </device>
+  </container>
   <note>
     <text value="Pooled serum sample from 30 individuals"/>
   </note>

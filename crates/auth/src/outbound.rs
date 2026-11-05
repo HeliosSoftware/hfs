@@ -16,11 +16,18 @@
 //! assertion in the SMART Backend Services style) is planned and is the
 //! reason the trait carries an `audience` argument — that lets the future
 //! signer scope tokens per receiver. The current impls ignore it.
+//!
+//! Consumers that need this today: the web UI's server-side self-call
+//! (`crates/hfs/src/main.rs`, mounting `helios_ui`) currently uses the static
+//! bearer, so an auth-enabled deployment must provision `HFS_OUTBOUND_BEARER_TOKEN`
+//! with a valid token or the UI's conformance pages degrade. See the
+//! `TODO(service-token)` there.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::RequestBuilder;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 
 use crate::error::AuthError;
 
@@ -70,9 +77,21 @@ impl OutboundAuthProvider for NoOpOutboundAuthProvider {
 /// [`crate::AuthConfig::outbound_provider`]. Suitable for static
 /// service-to-service tokens; for dynamic tokens (per-tenant, per-audience,
 /// or short-lived JWTs) implement a custom provider.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the token as `[redacted]`, and the `Authorization` header it
+/// sets is marked sensitive so HTTP-level logging hides it (#2149).
+#[derive(Clone)]
 pub struct StaticBearerOutboundAuthProvider {
     token: String,
+}
+
+impl std::fmt::Debug for StaticBearerOutboundAuthProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { token: _ } = self;
+        f.debug_struct("StaticBearerOutboundAuthProvider")
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl StaticBearerOutboundAuthProvider {
@@ -91,7 +110,14 @@ impl OutboundAuthProvider for StaticBearerOutboundAuthProvider {
         request: RequestBuilder,
         _audience: &str,
     ) -> Result<RequestBuilder, AuthError> {
-        Ok(request.header("Authorization", format!("Bearer {}", self.token)))
+        let mut value = HeaderValue::from_str(&format!("Bearer {}", self.token)).map_err(|_| {
+            // The error carries no part of the value; say which setting is bad.
+            AuthError::InternalError(
+                "HFS_OUTBOUND_BEARER_TOKEN is not a valid HTTP header value".to_string(),
+            )
+        })?;
+        value.set_sensitive(true);
+        Ok(request.header(AUTHORIZATION, value))
     }
 }
 
@@ -178,6 +204,39 @@ mod tests {
 
         let response = request.send().await.unwrap();
         assert!(response.status().is_success());
+    }
+
+    #[test]
+    fn static_bearer_debug_redacts_token() {
+        let provider = StaticBearerOutboundAuthProvider::new("outbound-s3cret");
+        let out = format!("{provider:?}");
+        assert!(!out.contains("outbound-s3cret"), "{out}");
+        assert!(out.contains("StaticBearerOutboundAuthProvider"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn static_bearer_header_is_marked_sensitive() {
+        let provider = StaticBearerOutboundAuthProvider::new("outbound-s3cret");
+        let request = provider
+            .authorize(Client::new().get("http://127.0.0.1:1/x"), "")
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let value = request.headers().get(AUTHORIZATION).unwrap();
+        assert!(value.is_sensitive());
+        assert_eq!(value, "Bearer outbound-s3cret");
+        assert!(!format!("{:?}", request.headers()).contains("outbound-s3cret"));
+    }
+
+    #[tokio::test]
+    async fn static_bearer_rejects_a_token_that_is_not_a_header_value() {
+        let provider = StaticBearerOutboundAuthProvider::new("bad\ntoken");
+        let err = provider
+            .authorize(Client::new().get("http://127.0.0.1:1/x"), "")
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("bad"), "{err}");
     }
 
     #[test]

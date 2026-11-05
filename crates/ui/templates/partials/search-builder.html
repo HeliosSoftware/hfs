@@ -1,0 +1,171 @@
+<!--
+  The FHIR query itself: one editable GET URL, and a visual builder whose
+  condition / include / result-control rows stay in two-way sync with it.
+  Shared by Resources (#282) and Search (#255) — on the Search page this
+  same strip is where a translated natural-language query lands, which is why
+  it is editable and why running it is a separate, explicit click.
+
+  Parameter suggestions come from /ui/resources/params — a server-rendered
+  datalist fed by the SearchParameter registry, swapped per resource type.
+  The datalist is the catalog behind the typeahead of the condition parameter
+  (and the native popup of the other fields).
+  The builder rows are hidden until the script hydrates them; the URL input
+  alone is the no-JS baseline.
+-->
+<p class="alert" id="search-error" role="alert" hidden></p>
+
+<form id="saved-query-form" class="query-builder" autocomplete="off">
+  <div class="query-builder__row">
+    <span class="query-builder__tag" aria-hidden="true">
+      <span class="icon">{% include "icons/code.svg" %}</span>
+      {{ i18n.t("search-query-tag") }}
+    </span>
+    <input class="query-builder__url" name="url" required spellcheck="false"
+           placeholder="{{ i18n.t("queries-url-placeholder") }}"
+           aria-label="{{ i18n.t("queries-url-label") }}"
+           {% if let Some(v) = builder_url %}value="GET {{ v }}"{% endif %}>
+    <button class="btn btn--icon query-builder__copy" type="button" id="query-copy"
+            aria-label="{{ i18n.t("search-copy") }}" title="{{ i18n.t("search-copy") }}">
+      <span class="icon">{% include "icons/copy.svg" %}</span>
+    </button>
+    <details class="menu query-recent">
+      <summary class="btn query-recent__toggle">
+        <span class="icon">{% include "icons/history.svg" %}</span>
+        {{ i18n.t("queries-recent") }}
+      </summary>
+      <div class="menu__panel menu__panel--right">
+        <div class="menu__heading menu__heading--row">
+          {{ i18n.t("queries-recent-heading") }}
+          <button type="button" class="addbox__x" data-addbox-close
+                  aria-label="{{ i18n.t("ui-close") }}" title="{{ i18n.t("ui-close") }}">×</button>
+        </div>
+        <div id="recent-searches"
+             data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
+             data-msg-delete="{{ i18n.t("queries-delete") }}"
+             data-msg-saved="{{ i18n.t("queries-saved-group") }}"
+             data-msg-recent-group="{{ i18n.t("queries-recent") }}"></div>
+      </div>
+    </details>
+    <button class="btn btn--primary btn--busy-slot" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+  </div>
+
+  <div class="query-search-state">
+    <span class="busy-status" id="query-search-status" role="status" hidden
+          data-msg-searching="{{ i18n.t("queries-searching") }}"
+          data-msg-elapsed="{{ i18n.t_arg("queries-search-elapsed", "seconds", "{seconds}".to_string()) }}">
+      <span class="spinner" aria-hidden="true"></span>
+      <span data-busy-label></span>
+    </span>
+    <span id="query-search-elapsed" role="timer" aria-live="off" hidden></span>
+    <button class="btn" type="button" id="query-search-cancel" hidden>{{ i18n.t("queries-search-cancel") }}</button>
+  </div>
+  <div class="notice query-search-slow" id="query-search-slow" hidden
+       data-msg-slow="{{ i18n.t("queries-search-slow") }}">
+    <p id="query-search-slow-status" role="status" hidden><span data-busy-label></span></p>
+    <div class="toolbar">
+      <button class="btn" type="button" id="query-search-keep-waiting">{{ i18n.t("queries-search-keep-waiting") }}</button>
+      <button class="btn" type="button" id="query-search-slow-cancel">{{ i18n.t("queries-search-cancel") }}</button>
+    </div>
+  </div>
+
+  <p class="query-plain" id="query-plain" hidden>
+    <span class="query-plain__pill">{{ i18n.t("plain-pill") }}</span>
+    <span id="query-plain-text"></span>
+    <span class="query-plain__unknown" id="query-plain-unknown" data-template="{{ i18n.t("plain-unknown-param") }}" hidden></span>
+  </p>
+  <script type="application/json" id="plain-english-msgs">
+    {
+      "find": "{{ i18n.t("plain-find") }}",
+      "read": "{{ i18n.t("plain-read") }}",
+      "clause": "{{ i18n.t("plain-clause") }}",
+      "clauseNoValue": "{{ i18n.t("plain-clause-no-value") }}",
+      "and": "{{ i18n.t("plain-and") }}",
+      "or": "{{ i18n.t("plain-or") }}",
+      "arrow": "{{ i18n.t("plain-arrow") }}",
+      "has": "{{ i18n.t("plain-has") }}",
+      "hasNoValue": "{{ i18n.t("plain-has-no-value") }}",
+      "include": "{{ i18n.t("plain-include") }}",
+      "revinclude": "{{ i18n.t("plain-revinclude") }}",
+      "iterate": "{{ i18n.t("plain-iterate") }}",
+      "count": "{{ i18n.t("plain-count") }}",
+      "sort": "{{ i18n.t("plain-sort") }}",
+      "missing": {
+        "true": "{{ i18n.t("plain-verb-missing-true") }}",
+        "false": "{{ i18n.t("plain-verb-missing-false") }}"
+      },
+      "verbs": {
+        "": "{{ i18n.t("plain-verb-is") }}",
+        "contains": "{{ i18n.t("plain-verb-contains") }}",
+        "exact": "{{ i18n.t("plain-verb-exact") }}",
+        "missing": "{{ i18n.t("plain-verb-missing") }}",
+        "not": "{{ i18n.t("plain-verb-not") }}",
+        "text": "{{ i18n.t("plain-verb-text") }}",
+        "in": "{{ i18n.t("plain-verb-in") }}",
+        "not-in": "{{ i18n.t("plain-verb-not-in") }}",
+        "identifier": "{{ i18n.t("plain-verb-identifier") }}",
+        "of-type": "{{ i18n.t("plain-verb-of-type") }}",
+        "ge": "{{ i18n.t("plain-verb-ge") }}",
+        "le": "{{ i18n.t("plain-verb-le") }}",
+        "gt": "{{ i18n.t("plain-verb-gt") }}",
+        "lt": "{{ i18n.t("plain-verb-lt") }}",
+        "ne": "{{ i18n.t("plain-verb-ne") }}",
+        "eq": "{{ i18n.t("plain-verb-eq") }}",
+        "sa": "{{ i18n.t("plain-verb-sa") }}",
+        "eb": "{{ i18n.t("plain-verb-eb") }}",
+        "ap": "{{ i18n.t("plain-verb-ap") }}"
+      }
+    }
+  </script>
+
+  <datalist id="param-options"></datalist>
+  <datalist id="resource-type-options">
+    {% for t in resource_types %}<option value="{{ t }}"></option>{% endfor %}
+  </datalist>
+  <div class="builder-sections" id="builder-sections" hidden
+       data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
+       data-msg-param-none="{{ i18n.t("queries-param-none") }}"
+       data-msg-param-unknown="{{ i18n.t("queries-param-unknown") }}"
+       data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
+       data-msg-remove="{{ i18n.t("queries-remove") }}"
+       data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"
+       data-msg-any-target="{{ i18n.t("queries-chain-any-target") }}"
+       data-msg-has-pill="{{ i18n.t("queries-has-pill") }}"
+       data-msg-has-type="{{ i18n.t("queries-has-type-placeholder") }}"
+       data-msg-has-via="{{ i18n.t("queries-has-via") }}"
+       data-msg-has-where="{{ i18n.t("queries-has-where") }}"
+       data-msg-match-is="{{ i18n.t("queries-match-is") }}"
+       data-msg-iterate="{{ i18n.t("queries-iterate") }}"
+       data-msg-or="{{ i18n.t("queries-or") }}"
+       data-msg-modify-heading="{{ i18n.t("queries-modify-heading") }}"
+       data-msg-mod-exact="{{ i18n.t("queries-mod-exact") }}"
+       data-msg-mod-contains="{{ i18n.t("queries-mod-contains") }}"
+       data-msg-mod-missing="{{ i18n.t("queries-mod-missing") }}"
+       data-msg-mod-text="{{ i18n.t("queries-mod-text") }}"
+       data-msg-mod-not="{{ i18n.t("queries-mod-not") }}"
+       data-msg-mod-above="{{ i18n.t("queries-mod-above") }}"
+       data-msg-mod-below="{{ i18n.t("queries-mod-below") }}"
+       data-msg-mod-in="{{ i18n.t("queries-mod-in") }}"
+       data-msg-mod-not-in="{{ i18n.t("queries-mod-not-in") }}"
+       data-msg-mod-identifier="{{ i18n.t("queries-mod-identifier") }}"
+       data-msg-mod-of-type="{{ i18n.t("queries-mod-of-type") }}">
+    <div>
+      <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
+      <div class="builder-rows" id="builder-conditions"></div>
+      <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
+      <button class="btn builder-add" type="button" data-add="has">{{ i18n.t("queries-add-has") }}</button>
+    </div>
+    <div>
+      <h3 class="builder-section__title">{{ i18n.t("queries-related-heading") }}</h3>
+      <p class="builder-section__sub">{{ i18n.t("queries-related-sub") }}</p>
+      <div class="builder-rows" id="builder-includes"></div>
+      <button class="btn builder-add" type="button" data-add="include-fwd">→ {{ i18n.t("queries-related-add-include") }}</button>
+      <button class="btn builder-add" type="button" data-add="include-rev">← {{ i18n.t("queries-related-add-revinclude") }}</button>
+    </div>
+    <div>
+      <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
+      <div class="builder-rows" id="builder-controls"></div>
+      <button class="btn builder-add" type="button" data-add="control">+ _count</button>
+    </div>
+  </div>
+
+</form>

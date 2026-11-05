@@ -109,7 +109,11 @@ pub trait FhirResourceMetadata {
     ///
     /// These are fields marked with `isSummary: true` in the FHIR specification.
     /// The returned slice contains Rust field names (snake_case) for elements
-    /// that should be included when `_summary=true` is requested.
+    /// that should be included when `_summary=true` is requested — including
+    /// raw identifiers (`r#type`, `r#use`, `r#abstract`, `r#for`) where the
+    /// FHIR element name is a Rust keyword. Consumers that need the JSON
+    /// element names should go through `helios_fhir::summary_elements` rather
+    /// than convert these themselves (#1107).
     ///
     /// The default implementation returns an empty slice for backward compatibility
     /// with types that don't have summary metadata.
@@ -157,6 +161,70 @@ pub trait IntoEvaluationResult {
     /// This method should transform the implementing type into the most appropriate
     /// `EvaluationResult` variant that represents the value's semantics in FHIRPath.
     fn to_evaluation_result(&self) -> EvaluationResult;
+}
+
+/// Stamps the FHIR type a choice element's key implies onto its evaluation result.
+///
+/// A choice element (`value[x]`) encodes its datatype in the JSON key — `valueString`,
+/// `valueQuantity` — so the type is known from the variant alone and has to be attached
+/// to the result for `.ofType()` to work. `String` results always take the key-derived
+/// type; the other primitives keep a type the inner conversion already supplied.
+///
+/// This is shared out of the `FhirPath` derive rather than inlined per variant: choice
+/// enums have one variant per permitted datatype, and repeating this match in each of
+/// them across four FHIR versions is worth tens of megabytes of near-identical code in
+/// any binary that links the models.
+pub fn with_choice_type_info(result: EvaluationResult, fhir_type: &str) -> EvaluationResult {
+    match result {
+        EvaluationResult::String(s, _existing_type_info, m) => {
+            // Always use the determined type from the field name for choice types
+            EvaluationResult::String(s, Some(TypeInfoResult::new("FHIR", fhir_type)), m)
+        }
+        EvaluationResult::Integer(i, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Integer(i, Some(type_info), m)
+        }
+        EvaluationResult::Decimal(d, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Decimal(d, Some(type_info), m)
+        }
+        EvaluationResult::Boolean(b, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Boolean(b, Some(type_info), m)
+        }
+        EvaluationResult::Object {
+            map,
+            type_info: existing_type_info,
+        } => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Object {
+                map,
+                type_info: Some(type_info),
+            }
+        }
+        // For other types, return as-is
+        other => other,
+    }
+}
+
+/// Wraps a choice element's result in the single-key object FHIRPath expects.
+///
+/// The key is the type-suffixed field name (`valueString`), so navigation over the
+/// parent resource sees the polymorphic field under its concrete name. The wrapper
+/// object itself carries no type info.
+///
+/// Shared out of the `FhirPath` derive for the same reason as [`with_choice_type_info`].
+pub fn wrap_choice_field(result: EvaluationResult, field_name: &str) -> EvaluationResult {
+    let mut map = std::collections::HashMap::new();
+    map.insert(field_name.to_string(), result);
+    EvaluationResult::Object {
+        map,
+        type_info: None,
+    }
 }
 
 /// Universal result type for FHIRPath expression evaluation.
@@ -218,18 +286,29 @@ pub trait IntoEvaluationResult {
 /// like `Patient.active.id` and `Patient.birthDate.extension` can reach it.
 ///
 /// `extension` holds each FHIR Extension as an `EvaluationResult::Object`.
+///
+/// `decimal_exponent` is not FHIR element metadata. It records the precision of a
+/// FHIR decimal written with a positive exponent, which `rust_decimal::Decimal`
+/// cannot hold (see the field docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PrimitiveElement {
     /// Optional element identifier (the `id` field of the Element).
     pub id: Option<String>,
     /// Extensions on the primitive, each represented as an `EvaluationResult::Object`.
     pub extension: Vec<EvaluationResult>,
+    /// For a decimal whose least significant digit lies left of the units place,
+    /// the power of ten of that digit. `9.5e2` is `Some(1)`: the value is `950`,
+    /// but it is only precise to the tens. `rust_decimal` has no negative scale,
+    /// so `Decimal::from_scientific("9.5e2")` is `950` at scale 0, the same as a
+    /// literal `950`. `None` when the decimal's own scale already describes its
+    /// precision. `lowBoundary()`/`highBoundary()` read it (#2173).
+    pub decimal_exponent: Option<u32>,
 }
 
 impl PrimitiveElement {
-    /// Returns true when there is no id and no extensions.
+    /// Returns true when there is no id, no extensions and no decimal precision hint.
     pub fn is_empty(&self) -> bool {
-        self.id.is_none() && self.extension.is_empty()
+        self.id.is_none() && self.extension.is_empty() && self.decimal_exponent.is_none()
     }
 }
 
@@ -471,6 +550,15 @@ pub enum EvaluationError {
     ///
     /// Example: "Function 'conformsTo' is not implemented"
     UnsupportedFunction(String),
+    /// A terminology operation failed: no terminology server is configured, or a request to it
+    /// failed (HTTP error, timeout, connection error, invalid response).
+    ///
+    /// Displays with the `Invalid Operation:` prefix these errors had before they got their own
+    /// variant, so error text is unchanged.
+    TerminologyError(String),
+    /// The terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up. Also a
+    /// terminology error: see [`EvaluationError::is_terminology_error`].
+    TerminologyCallLimit(String),
     /// Generic error for cases not covered by specific variants.
     ///
     /// Used for internal errors, edge cases, or temporary error conditions
@@ -512,8 +600,26 @@ impl std::fmt::Display for EvaluationError {
             }
             EvaluationError::SemanticError(msg) => write!(f, "Semantic Error: {}", msg),
             EvaluationError::UnsupportedFunction(msg) => write!(f, "Unsupported Function: {}", msg),
+            EvaluationError::TerminologyError(msg) | EvaluationError::TerminologyCallLimit(msg) => {
+                write!(f, "Invalid Operation: {}", msg)
+            }
             EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
         }
+    }
+}
+
+impl EvaluationError {
+    /// True for every failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        matches!(
+            self,
+            Self::TerminologyError(_) | Self::TerminologyCallLimit(_)
+        )
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        matches!(self, Self::TerminologyCallLimit(_))
     }
 }
 
@@ -938,6 +1044,27 @@ impl EvaluationResult {
         EvaluationResult::Object {
             map,
             type_info: Some(TypeInfoResult::new(type_namespace, type_name)),
+        }
+    }
+
+    /// Returns true when this is the Object representation of a FHIR primitive
+    /// element that carries id/extension metadata but no value (e.g. a
+    /// `_field` sibling holding only a data-absent-reason extension).
+    ///
+    /// Such an element is present in the tree (`exists()` is true) but has no
+    /// system value, so value-consuming operations must treat it as empty
+    /// input (see `hasValue()`/`getValue()` in the FHIR spec). The producers
+    /// tag this case with type `FHIR.Element` (`Element<V, E>`) or
+    /// `FHIR.decimal` (`DecimalElement<E>`); valued primitives are scalar
+    /// variants, never Objects, and genuine complex types carry their own
+    /// struct name, so those tags are unambiguous.
+    pub fn is_valueless_primitive_element(&self) -> bool {
+        match self {
+            EvaluationResult::Object {
+                type_info: Some(ti),
+                ..
+            } => ti.namespace == "FHIR" && (ti.name == "Element" || ti.name == "decimal"),
+            _ => false,
         }
     }
 
@@ -1523,5 +1650,22 @@ fn format_unit_for_display(unit: &str) -> String {
     } else {
         // UCUM code units: display with quotes
         format!("'{}'", unit)
+    }
+}
+
+#[cfg(test)]
+mod evaluation_error_tests {
+    use super::EvaluationError;
+
+    #[test]
+    fn terminology_variants_display_and_classify() {
+        let t = EvaluationError::TerminologyError("x".into());
+        let c = EvaluationError::TerminologyCallLimit("x".into());
+        assert_eq!(t.to_string(), "Invalid Operation: x");
+        assert_eq!(c.to_string(), "Invalid Operation: x");
+        assert!(t.is_terminology_error() && !t.is_terminology_call_limit());
+        assert!(c.is_terminology_error() && c.is_terminology_call_limit());
+        let o = EvaluationError::InvalidOperation("x".into());
+        assert!(!o.is_terminology_error() && !o.is_terminology_call_limit());
     }
 }

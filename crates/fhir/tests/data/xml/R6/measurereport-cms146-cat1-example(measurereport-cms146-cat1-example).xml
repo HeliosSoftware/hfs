@@ -1393,7 +1393,7 @@
     </stratifier>
   </group>
   <evaluatedResource>
-    <!--  Condition #example is a condition that was considered in evaluating the measure for Patient #123  -->
+    <!-- Condition #example is a condition that was considered in evaluating the measure for Patient #123 -->
     <reference value="Condition/example"/>
   </evaluatedResource>
 </MeasureReport>

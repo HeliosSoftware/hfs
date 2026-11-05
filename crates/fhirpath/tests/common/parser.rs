@@ -11,6 +11,12 @@ pub struct TestInfo {
     pub predicate: String,
     pub mode: String,
     pub check_ordered_functions: String,
+    /// `context` attribute: an expression whose results each become `$this`.
+    pub context: String,
+    /// `contextType` attribute: the declared type(s) of that focus, `|`-separated.
+    pub context_type: String,
+    /// `ordered="false"`: the expected outputs may appear in any order.
+    pub unordered: bool,
     pub expression: String,
     pub outputs: Vec<(String, String)>, // (type, value)
 }
@@ -30,6 +36,9 @@ pub fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let input_file = test.attribute("inputfile").unwrap_or("").to_string();
             let mode = test.attribute("mode").unwrap_or("").to_string();
             let predicate = test.attribute("predicate").unwrap_or("").to_string();
+            let context = test.attribute("context").unwrap_or("").to_string();
+            let context_type = test.attribute("contextType").unwrap_or("").to_string();
+            let unordered = test.attribute("ordered") == Some("false");
             let check_ordered_functions = test
                 .attribute("checkOrderedFunctions")
                 .unwrap_or("")
@@ -71,6 +80,9 @@ pub fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 predicate,
                 mode,
                 check_ordered_functions,
+                context,
+                context_type,
+                unordered,
                 expression: expression_text,
                 outputs,
             });

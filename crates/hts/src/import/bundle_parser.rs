@@ -34,6 +34,103 @@ pub struct ParsedBundle {
     /// Non-fatal parse errors.  Resources with errors are skipped; the rest
     /// of the bundle continues to be imported.
     pub parse_errors: Vec<String>,
+    /// Optimization hint: when `true`, every code system in this bundle is
+    /// known to have had **no concepts** in the database before this import
+    /// session began, so the per-concept delete-before-reinsert of
+    /// properties/designations is pointless and can be skipped. Set by the
+    /// chunked filesystem importers (SNOMED RF2, LOINC) after a single
+    /// pre-import probe; it stays `true` across every batch of a fresh load.
+    /// Defaults to `false` (always replace), which is always correct — the flag
+    /// is purely a fast-path for first-time bulk loads. Importers MUST leave it
+    /// `false` whenever the target may already contain concepts (re-import).
+    pub fresh_load: bool,
+    /// When `true`, the write layer does not rebuild `concept_closure` for code
+    /// systems that already held concepts before this bundle. Rebuilding after
+    /// every batch of a chunked bulk load (SNOMED RF2, LOINC, RxNorm, …) is
+    /// O(n²), so those importers set this on each batch and leave the single
+    /// rebuild to `finalize_after_bootstrap` / `migrate_concept_closure*`.
+    /// Systems that were empty before the bundle are still rebuilt (cheap).
+    ///
+    /// Defaults to `false`: every code system the bundle writes gets its
+    /// closure rebuilt before the import returns, so a plain re-import never
+    /// leaves `$subsumes` / `is-a` answering from a wiped closure (#2128).
+    pub defer_closure: bool,
+}
+
+/// Authority rank for a resource we have POSITIVE evidence is authoritative:
+/// the package that shipped it declares a `canonical` base that covers the
+/// resource's URL, or it came from a native importer loading a publisher's own
+/// distribution (SNOMED RF2, LOINC, RxNorm, …). Lower wins.
+pub const AUTHORITY_OWNER: i32 = 0;
+
+/// Authority rank for a resource whose provenance we cannot vouch for.
+///
+/// This is the DEFAULT, and the distinction from [`AUTHORITY_OWNER`] is the
+/// whole point: we only ever *promote* on positive evidence, never *demote* on
+/// the absence of it. A row is `UNKNOWN` when it arrived outside any package
+/// (REST write, `$import-bundle`, CLI bundle) or when the package that shipped
+/// it does not declare a canonical base covering the URL.
+///
+/// That second case deliberately conflates two situations we cannot tell apart:
+///
+/// * `hl7.fhir.r4.core` re-publishing `http://terminology.hl7.org/...` — a
+///   genuine stale copy, which must lose to THO's original. This is issue #200.
+/// * `us.nlm.vsac` shipping `http://cts.nlm.nih.gov/...` while declaring the
+///   fhir.org *registry* base `http://fhir.org/packages/us.nlm.vsac` — a genuine
+///   ORIGINAL whose manifest simply doesn't describe its content's authority.
+///   14,850 of its ValueSets look identical to a "copy" under this rule.
+///
+/// Conflating them is safe precisely because rank is only ever a TIEBREAK among
+/// rows sharing one canonical URL. Being `UNKNOWN` costs a row nothing unless a
+/// demonstrable owner of the same URL exists — VSAC's rows have no rival, so they
+/// still win their URLs outright. An earlier draft ranked these as a definite
+/// "foreign copy" (2) and treated non-package writes as owners (0); that was
+/// wrong twice over. It asserted a fact about VSAC we had not established, and —
+/// because `vs_precedence_order_by` has no content/has-concepts tier to absorb
+/// the error — it let any REST upload outrank the real VSAC definition outright.
+pub const AUTHORITY_UNKNOWN: i32 = 1;
+
+/// Sentinel meaning "no source has claimed this row yet", used by the import
+/// upsert's `MIN(COALESCE(authority_rank, …), ?)` / `LEAST(...)` so that a row
+/// which predates the column (NULL) is overwritten by the first source to claim
+/// it, rather than reading as an authoritative 0 and pinning a stale copy.
+///
+/// It must stay strictly greater than every real rank. Note the deliberate
+/// asymmetry: on WRITE, NULL is the *weakest* value (this sentinel); on READ it
+/// coalesces to 0, the *strongest*, so that a database which has not yet
+/// re-imported behaves exactly as it did before the column existed.
+pub const AUTHORITY_UNCLAIMED: i32 = 9;
+
+/// Classify a resource against the canonical base declared by the package that
+/// shipped it (`package.json` → `canonical`).
+///
+/// Returns [`AUTHORITY_OWNER`] only on positive evidence — the package declares a
+/// canonical base and the resource's URL sits under it. Everything else, including
+/// a resource that arrived with no package context at all, is [`AUTHORITY_UNKNOWN`].
+///
+/// The asymmetry is deliberate and load-bearing. Defaulting an unattributed write
+/// to OWNER would mean an operator (or, on a server without auth, anyone) replaying
+/// `hl7.fhir.r4.core`'s truncated copy through `$import-bundle` would stamp it rank
+/// 0 — and since the upsert's `MIN` only ever lowers a rank, that copy would
+/// outrank THO's original permanently and reinstate issue #200 with no way back.
+pub fn authority_rank_for(url: &str, package_canonical: Option<&str>) -> i32 {
+    match package_canonical {
+        Some(base) if !base.is_empty() && url_is_under(url, base) => AUTHORITY_OWNER,
+        _ => AUTHORITY_UNKNOWN,
+    }
+}
+
+/// `true` when `url` sits under the canonical `base`, respecting path
+/// boundaries: `http://hl7.org/fhir` owns `http://hl7.org/fhir/CodeSystem/x`
+/// but NOT `http://hl7.org/fhirpath/x`. A bare `starts_with` would claim the
+/// latter and wrongly mark a genuine original as unattributed.
+fn url_is_under(url: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    match url.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
 }
 
 /// A single FHIR CodeSystem resource extracted from a Bundle entry.
@@ -51,6 +148,9 @@ pub struct ParsedCodeSystem {
     pub concepts: Vec<ParsedConcept>,
     /// The full original JSON resource (stored in `resource_json` column).
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`].
+    pub authority_rank: i32,
 }
 
 /// One concept row, already flattened from the potentially nested FHIR tree.
@@ -102,6 +202,9 @@ pub struct ParsedValueSet {
     /// lazy expansion.  `None` when the ValueSet has no `compose`.
     pub compose_json: Option<String>,
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`].
+    pub authority_rank: i32,
 }
 
 /// A single FHIR ConceptMap resource extracted from a Bundle entry.
@@ -144,6 +247,23 @@ pub struct ParsedMapElement {
 /// Returns [`HtsError::InvalidRequest`] when the bytes are not valid JSON or
 /// the root resource is not a Bundle.
 pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
+    // No package context: REST writes, `$import-bundle`, and CLI bundles are
+    // treated as authoritative for whatever canonical they declare.
+    parse_bundle_from_package(data, None)
+}
+
+/// Parse a Bundle that arrived inside a FHIR NPM package, whose `package.json`
+/// declared `package_canonical` as the canonical base it owns.
+///
+/// Provenance is an explicit parameter, NOT a field on the payload. An earlier
+/// draft smuggled it through a non-FHIR `_htsSourceCanonical` key on the Bundle
+/// wrapper, which meant an untrusted `POST /import` body could set the value
+/// that decides which definition of a canonical URL is authoritative. Trust
+/// input must come from the caller, never from the bytes being parsed.
+pub fn parse_bundle_from_package(
+    data: &[u8],
+    package_canonical: Option<&str>,
+) -> Result<ParsedBundle, HtsError> {
     let root: Value = serde_json::from_slice(data)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid JSON: {e}")))?;
 
@@ -165,13 +285,19 @@ pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
         let rid = resource["id"].as_str().unwrap_or("<no-id>");
         match resource["resourceType"].as_str() {
             Some("CodeSystem") => match parse_code_system(resource) {
-                Some(cs) => bundle.code_systems.push(cs),
+                Some(mut cs) => {
+                    cs.authority_rank = authority_rank_for(&cs.url, package_canonical);
+                    bundle.code_systems.push(cs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "CodeSystem '{rid}' skipped: missing required field 'url'"
                 )),
             },
             Some("ValueSet") => match parse_value_set(resource) {
-                Some(vs) => bundle.value_sets.push(vs),
+                Some(mut vs) => {
+                    vs.authority_rank = authority_rank_for(&vs.url, package_canonical);
+                    bundle.value_sets.push(vs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "ValueSet '{rid}' skipped: missing required field 'url'"
                 )),
@@ -238,6 +364,7 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         content: cs["content"].as_str().unwrap_or("complete").to_owned(),
         concepts,
         resource_json: cs.clone(),
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 
@@ -366,6 +493,9 @@ pub fn extract_property_value(prop: &Value) -> (String, String) {
     if let Some(v) = prop["value"].as_str() {
         return ("string".into(), v.into());
     }
+    if prop["valueCoding"].is_object() {
+        return ("Coding".into(), prop["valueCoding"].to_string());
+    }
     ("string".into(), String::new())
 }
 
@@ -392,6 +522,7 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         status: vs["status"].as_str().unwrap_or("active").to_owned(),
         compose_json,
         resource_json: vs.clone(),
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 
@@ -425,27 +556,41 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
         let group_elements = group["element"].as_array().unwrap_or(&empty);
 
         for element in group_elements {
-            let source_code = element["code"].as_str().unwrap_or("").to_owned();
+            let raw_source_code = element["code"].as_str().unwrap_or("").to_owned();
             let targets = element["target"].as_array().unwrap_or(&empty);
+
+            // HL7 terminology package sometimes encodes multiple source codes as a
+            // comma-separated string (e.g. "unconfirmed, provisional"). Split them
+            // so each code gets its own row in concept_map_elements.
+            let source_codes: Vec<String> = raw_source_code
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             for target in targets {
                 let target_code = target["code"].as_str().unwrap_or("").to_owned();
+                // R4 uses `equivalence`; R5 uses `relationship`. Accept either so
+                // ConceptMap fixtures from either FHIR version import correctly.
                 let equivalence = target["equivalence"]
                     .as_str()
+                    .or_else(|| target["relationship"].as_str())
                     .unwrap_or("equivalent")
                     .to_owned();
 
-                if source_code.is_empty() || target_code.is_empty() {
+                if raw_source_code.is_empty() || target_code.is_empty() {
                     continue;
                 }
 
-                elements.push(ParsedMapElement {
-                    source_system: source_system.clone(),
-                    source_code: source_code.clone(),
-                    target_system: target_system.clone(),
-                    target_code,
-                    equivalence,
-                });
+                for source_code in &source_codes {
+                    elements.push(ParsedMapElement {
+                        source_system: source_system.clone(),
+                        source_code: source_code.clone(),
+                        target_system: target_system.clone(),
+                        target_code: target_code.clone(),
+                        equivalence: equivalence.clone(),
+                    });
+                }
             }
         }
     }
@@ -568,6 +713,47 @@ mod tests {
         assert_eq!(cm.elements[0].equivalence, "equivalent");
     }
 
+    /// R5 ConceptMap targets use `relationship` instead of R4's `equivalence`.
+    /// The parser should accept either form so tx-ecosystem fixtures import
+    /// regardless of which FHIR version they were authored against.
+    #[test]
+    fn concept_map_relationship_field_imports_as_equivalence() {
+        let bundle = br#"{
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "ConceptMap",
+                        "url": "http://example.org/cm-r5",
+                        "status": "active",
+                        "group": [
+                            {
+                                "source": "http://example.org/src",
+                                "target": "http://example.org/tgt",
+                                "element": [
+                                    {
+                                        "code": "code-1",
+                                        "target": [{
+                                            "code": "code1",
+                                            "relationship": "source-is-narrower-than-target"
+                                        }]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        let parsed = parse_bundle(bundle).unwrap();
+        assert_eq!(parsed.concept_maps.len(), 1);
+        let elem = &parsed.concept_maps[0].elements[0];
+        assert_eq!(elem.source_code, "code-1");
+        assert_eq!(elem.target_code, "code1");
+        assert_eq!(elem.equivalence, "source-is-narrower-than-target");
+    }
+
     #[test]
     fn non_bundle_resource_returns_error() {
         let data = br#"{"resourceType":"Patient","id":"p1"}"#;
@@ -644,6 +830,73 @@ mod tests {
             let (vt, v) = extract_property_value(prop);
             assert_eq!(vt, *expected_type);
             assert_eq!(v, *expected_value);
+        }
+    }
+
+    #[test]
+    fn scalar_values_keep_precedence_when_coding_is_also_present() {
+        let cases = [
+            ("valueCode", serde_json::json!("ABC"), "code", "ABC"),
+            ("valueBoolean", serde_json::json!(false), "boolean", "false"),
+            ("valueInteger", serde_json::json!(0), "integer", "0"),
+            ("valueDecimal", serde_json::json!(1.25), "decimal", "1.25"),
+            ("valueString", serde_json::json!("text"), "string", "text"),
+            (
+                "valueDateTime",
+                serde_json::json!("2026-01-01"),
+                "dateTime",
+                "2026-01-01",
+            ),
+            ("value", serde_json::json!("text"), "string", "text"),
+        ];
+        for (field, value, expected_type, expected_value) in cases {
+            let mut property = serde_json::json!({"valueCoding": {"code": "A"}});
+            property[field] = value;
+            assert_eq!(
+                extract_property_value(&property),
+                (expected_type.to_owned(), expected_value.to_owned()),
+                "{field} must retain its existing precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn coding_property_preserves_the_complete_object() {
+        let coding = serde_json::json!({
+            "system": "http://example.org/target",
+            "version": "2026",
+            "code": "A",
+            "display": "Alpha",
+            "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let property = parse_property(&serde_json::json!({
+            "code": "maps-to", "valueCoding": coding
+        }))
+        .unwrap();
+        assert_eq!(property.value_type, "Coding");
+        assert_eq!(
+            serde_json::from_str::<Value>(&property.value).unwrap(),
+            coding
+        );
+        assert!(!property.is_parent_edge);
+    }
+
+    #[test]
+    fn non_object_coding_properties_are_skipped() {
+        for value in [
+            Value::Null,
+            serde_json::json!("A"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                parse_property(&serde_json::json!({
+                    "code": "maps-to", "valueCoding": value
+                }))
+                .is_none()
+            );
         }
     }
 }

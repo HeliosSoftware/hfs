@@ -19,10 +19,12 @@
 //!
 //! | Operation | Endpoint | Used by |
 //! |-----------|----------|---------|
-//! | ValueSet $expand | `POST /ValueSet/$expand` | `:in` / `:not-in` search modifiers |
+//! | ValueSet $expand | `POST /ValueSet/$expand` | `:in` / `:not-in` search modifiers, SQL query ValueSet dependencies |
+//! | ConceptMap search | `GET /ConceptMap?url=` | SQL query ConceptMap dependencies |
 
 use std::time::Duration;
 
+use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -87,12 +89,24 @@ impl TerminologyServiceClient {
     /// Creates a new client targeting the given base URL.
     ///
     /// Trailing slashes in `base_url` are trimmed automatically.
-    /// A 10-second timeout is applied to all requests.
+    /// A 10-second timeout is applied to all requests, with a short connect
+    /// timeout so an unreachable server fails fast — the `:in` fail-open
+    /// semantics depend on it.
+    ///
+    /// The client bypasses any proxy environment: the terminology server is a
+    /// configured internal endpoint, and routing it through an egress proxy
+    /// turns "connection refused in milliseconds" into a multi-minute hang on
+    /// runners whose `no_proxy` uses CIDR ranges reqwest cannot parse. The
+    /// previous silent `unwrap_or_default()` fallback could also discard the
+    /// timeouts entirely; a client build failure is a startup-visible
+    /// misconfiguration, not something to paper over.
     pub fn new(base_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
             .build()
-            .unwrap_or_default();
+            .expect("terminology HTTP client");
 
         Self {
             client,
@@ -141,7 +155,7 @@ impl TerminologyServiceClient {
             .header("Accept", "application/fhir+json")
             .send()
             .await
-            .map_err(|e| TerminologyError::Network(e.to_string()))?;
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -161,9 +175,167 @@ impl TerminologyServiceClient {
         let value: Value = response
             .json()
             .await
-            .map_err(|e| TerminologyError::Parse(e.to_string()))?;
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))?;
 
         extract_expansion_codes(&value)
+    }
+
+    /// Expands the concepts subsumed by (or subsuming) a code, via an inline
+    /// ValueSet `$expand` with a filter.
+    ///
+    /// - `op = "is-a"` returns the code and all its descendants (for `:below`).
+    /// - `op = "generalizes"` returns the code and all its ancestors (for `:above`).
+    ///
+    /// Both include the code itself, per FHIR subsumption-testing semantics.
+    pub async fn expand_subsumption(
+        &self,
+        system: &str,
+        code: &str,
+        op: &str,
+    ) -> Result<Vec<ExpandedCode>, TerminologyError> {
+        let endpoint = format!("{}/ValueSet/$expand", self.base_url);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "valueSet",
+                "resource": {
+                    "resourceType": "ValueSet",
+                    "compose": {
+                        "include": [{
+                            "system": system,
+                            "filter": [{ "property": "concept", "op": op, "value": code }]
+                        }]
+                    }
+                }
+            }]
+        });
+
+        let response = self
+            .client
+            .post(&endpoint)
+            .json(&body)
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            return Err(TerminologyError::ServerError {
+                status,
+                body: body_text,
+            });
+        }
+
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))?;
+
+        extract_expansion_codes(&value)
+    }
+
+    /// Fetches one page of a ValueSet expansion as the raw expanded ValueSet:
+    /// `POST {base_url}/ValueSet/$expand` with `url`, `offset` and `count`.
+    ///
+    /// Returns `Ok(None)` when the server answers `404` (it knows no value set
+    /// at `value_set_url`). Used by SQL-on-FHIR terminology relations (#1824),
+    /// which need nesting, `abstract`, `version` and `inactive` intact.
+    pub async fn expand_value_set_page(
+        &self,
+        value_set_url: &str,
+        offset: usize,
+        count: usize,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": value_set_url},
+                {"name": "offset", "valueInteger": offset},
+                {"name": "count", "valueInteger": count}
+            ]
+        });
+        let request = self
+            .client
+            .post(format!("{}/ValueSet/$expand", self.base_url))
+            .json(&body)
+            .header("Content-Type", "application/fhir+json");
+        self.send_optional(request).await
+    }
+
+    /// Looks up a ConceptMap by canonical (`url`, or `url|version`) with
+    /// `GET {base_url}/ConceptMap?url=…[&version=…]`.
+    ///
+    /// Returns `Ok(None)` when no map matches, and the first match otherwise
+    /// (a server holding several versions of an unversioned canonical decides
+    /// the order).
+    pub async fn find_concept_map(
+        &self,
+        canonical: &str,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let (url, version) = match canonical.split_once('|') {
+            Some((url, version)) => (url, Some(version)),
+            None => (canonical, None),
+        };
+        let mut query = vec![("url", url)];
+        if let Some(version) = version {
+            query.push(("version", version));
+        }
+        let request = self
+            .client
+            .get(format!("{}/ConceptMap", self.base_url))
+            .query(&query);
+        let Some(bundle) = self.send_optional(request).await? else {
+            return Ok(None);
+        };
+        Ok(bundle
+            .get("entry")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("resource"))
+            .find(|r| r.get("resourceType").and_then(Value::as_str) == Some("ConceptMap"))
+            .cloned())
+    }
+
+    /// Sends `request` expecting a FHIR JSON body; `404` becomes `Ok(None)`.
+    async fn send_optional(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Option<Value>, TerminologyError> {
+        let response = request
+            .header("Accept", "application/fhir+json")
+            .send()
+            .await
+            .map_err(|e| TerminologyError::Network(redact_urls_in(&e.to_string())))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>();
+            return Err(TerminologyError::ServerError { status, body });
+        }
+        response
+            .json()
+            .await
+            .map(Some)
+            .map_err(|e| TerminologyError::Parse(redact_urls_in(&e.to_string())))
     }
 }
 
@@ -331,5 +503,23 @@ mod tests {
     fn test_client_no_trailing_slash() {
         let client = TerminologyServiceClient::new("http://localhost:8090".to_string());
         assert_eq!(client.base_url(), "http://localhost:8090");
+    }
+
+    /// A request error names the URL it failed on; the configured base URL's
+    /// query must not come along with it (#2149).
+    #[tokio::test]
+    async fn test_network_error_omits_the_url_query() {
+        // Port 1 on loopback refuses the connection immediately.
+        let client =
+            TerminologyServiceClient::new("http://127.0.0.1:1?token=QUERY-SECRET".to_string());
+        let err = client
+            .expand_value_set("http://hl7.org/fhir/ValueSet/administrative-gender")
+            .await
+            .expect_err("nothing listens on port 1");
+        let message = err.to_string();
+        assert!(matches!(err, TerminologyError::Network(_)), "{message}");
+        assert!(!message.contains("SECRET"), "query leaked: {message}");
+        // reqwest names the URL; it is still there, redacted.
+        assert!(message.contains("127.0.0.1:1"), "{message}");
     }
 }

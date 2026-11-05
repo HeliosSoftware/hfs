@@ -8,14 +8,14 @@
     </security>
   </meta>
   <identifier>
-    <!--  Identifier for the AUMC  -->
+    <!-- Identifier for the AUMC -->
     <use value="official"/>
     <system value="http://www.zorgkaartnederland.nl/"/>
     <value value="Artis University Medical Center"/>
   </identifier>
   <active value="true"/>
   <type>
-    <!--  AUMC is an Academic Medical Center  -->
+    <!-- AUMC is an Academic Medical Center -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="405608006"/>
@@ -23,7 +23,7 @@
     </coding>
     <coding>
       <system value="urn:oid:2.16.840.1.113883.2.4.15.1060"/>
-      <!--   RoleCodeNLUZIRoleCodeOrganisaties   -->
+      <!-- RoleCodeNLUZIRoleCodeOrganisaties -->
       <code value="V6"/>
       <display value="University Medical Hospital"/>
     </coding>
@@ -36,14 +36,14 @@
   <name value="Artis University Medical Center (AUMC)"/>
   <contact>
     <telecom>
-      <!--  AUMC's contact detail  -->
+      <!-- AUMC's contact detail -->
       <system value="phone"/>
       <value value="+31715269111"/>
       <use value="work"/>
     </telecom>
-    <!--  ISO 3166 3 letter code  -->
+    <!-- ISO 3166 3 letter code -->
     <address>
-      <!--  AUMC's address  -->
+      <!-- AUMC's address -->
       <use value="work"/>
       <line value="Walvisbaai 3"/>
       <city value="Den Helder"/>
@@ -51,8 +51,8 @@
       <country value="NLD"/>
     </address>
   </contact>
-  <!--  The AUMC is in active use  -->
-  <!--      <accreditation>
+  <!-- The AUMC is in active use -->
+  <!-- <accreditation>
         <!-\-HIMSS-6 Accreditation-\->
         <identifier>
             <system value="http://www.himss.org/"/>
@@ -70,9 +70,9 @@
             <start value="2000-01-01"/>
             <end value="2013-12-31"/>
         </period>
-    </accreditation>   -->
+    </accreditation> -->
   <contact>
-    <!--  Contact for the AUMC  -->
+    <!-- Contact for the AUMC -->
     <name>
       <use value="official"/>
       <text value="Professor Brand"/>
@@ -85,7 +85,7 @@
       <value value="+31715269702"/>
       <use value="work"/>
     </telecom>
-    <!--  ISO 3166 3 letter code  -->
+    <!-- ISO 3166 3 letter code -->
     <address>
       <line value="Walvisbaai 3"/>
       <line value="Gebouw 2"/>

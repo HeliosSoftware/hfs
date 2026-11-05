@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use helios_auth::OutboundAuthProvider;
+use helios_persistence::core::bulk_submit_input::{redact_url, redact_urls_in};
 use reqwest::{Client, Url};
 use tracing::{debug, warn};
 
@@ -31,11 +32,15 @@ use crate::error::SubscriptionError;
 use crate::manager::{ActiveSubscription, PayloadContent};
 use crate::notification::{notification_type_from_bundle, wrap_as_message_bundle};
 
+/// Resolves the public messaging source endpoint for a tenant.
+pub type SourceEndpointResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// FHIR Messaging channel implementation.
 pub struct MessagingChannel {
     client: Client,
     auth_provider: Arc<dyn OutboundAuthProvider>,
     source_endpoint: String,
+    source_endpoint_resolver: Option<SourceEndpointResolver>,
     /// When `true`, dispatch to private/loopback IPs is allowed. Default
     /// `false`; tests and local dev opt in.
     private_endpoints_allowed: bool,
@@ -54,8 +59,15 @@ impl MessagingChannel {
             client,
             auth_provider,
             source_endpoint,
+            source_endpoint_resolver: None,
             private_endpoints_allowed: false,
         }
+    }
+
+    /// Resolve the default source endpoint from the subscription tenant.
+    pub fn with_source_endpoint_resolver(mut self, resolver: SourceEndpointResolver) -> Self {
+        self.source_endpoint_resolver = Some(resolver);
+        self
     }
 
     /// Replace the HTTP client (used by tests).
@@ -69,6 +81,13 @@ impl MessagingChannel {
     pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
         self.private_endpoints_allowed = allowed;
         self
+    }
+
+    fn source_endpoint_for(&self, tenant_id: &str) -> String {
+        self.source_endpoint_resolver
+            .as_ref()
+            .map(|resolver| resolver(tenant_id))
+            .unwrap_or_else(|| self.source_endpoint.clone())
     }
 
     async fn send(
@@ -100,12 +119,9 @@ impl MessagingChannel {
 
         // Wrap the prebuilt notification bundle as a message bundle.
         let notification_type = notification_type_from_bundle(bundle);
-        let message_bundle = wrap_as_message_bundle(
-            bundle,
-            subscription,
-            &self.source_endpoint,
-            notification_type,
-        )?;
+        let source_endpoint = self.source_endpoint_for(&subscription.tenant_id);
+        let message_bundle =
+            wrap_as_message_bundle(bundle, subscription, &source_endpoint, notification_type)?;
 
         let mut request = self
             .client
@@ -134,7 +150,7 @@ impl MessagingChannel {
 
         debug!(
             subscription_id = %subscription.id,
-            endpoint,
+            endpoint = %redact_url(endpoint),
             "Dispatching messaging notification"
         );
 
@@ -165,6 +181,8 @@ impl MessagingChannel {
                 }
             }
             Err(e) => {
+                // reqwest's message ends with `for url (...)`, query included.
+                let error = redact_urls_in(&e.to_string());
                 if e.is_timeout() {
                     warn!(
                         subscription_id = %subscription.id,
@@ -174,19 +192,19 @@ impl MessagingChannel {
                 } else if e.is_connect() {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Connection failed"
                     );
                     Ok(DispatchResult::RetryableError(format!(
-                        "connection error: {e}"
+                        "connection error: {error}"
                     )))
                 } else {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Message delivery failed"
                     );
-                    Ok(DispatchResult::RetryableError(e.to_string()))
+                    Ok(DispatchResult::RetryableError(error))
                 }
             }
         }
@@ -199,7 +217,9 @@ impl MessagingChannel {
 fn check_endpoint_host(endpoint: &str) -> Option<String> {
     let url = match Url::parse(endpoint) {
         Ok(u) => u,
-        Err(_) => return Some(format!("invalid endpoint URL: {endpoint}")),
+        Err(_) => {
+            return Some(format!("invalid endpoint URL: {}", redact_url(endpoint)));
+        }
     };
 
     let host = url.host_str()?;
@@ -302,6 +322,20 @@ mod tests {
         .with_private_endpoints_allowed(true)
     }
 
+    #[test]
+    fn default_source_endpoint_resolves_per_tenant_but_explicit_stays_fixed() {
+        let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|tenant| format!("https://public.example/fhir/{tenant}"));
+        let dynamic = channel_with_noop().with_source_endpoint_resolver(resolver);
+        assert_eq!(
+            dynamic.source_endpoint_for("acme"),
+            "https://public.example/fhir/acme"
+        );
+
+        let explicit = channel_with_noop();
+        assert_eq!(explicit.source_endpoint_for("acme"), SOURCE);
+    }
+
     fn handshake_bundle(sub: &ActiveSubscription) -> Value {
         build_handshake(sub, SOURCE).unwrap()
     }
@@ -354,6 +388,34 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, DispatchResult::RetryableError(_)));
+    }
+
+    #[tokio::test]
+    async fn connection_error_message_redacts_endpoint_query() {
+        let channel = channel_with_noop();
+        let sub = test_subscription(
+            "http://127.0.0.1:1/process-message?token=QUERYSECRET",
+            PayloadContent::IdOnly,
+        );
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+
+        let DispatchResult::RetryableError(msg) = result else {
+            panic!("expected a retryable error, got {result:?}");
+        };
+        assert!(!msg.contains("QUERYSECRET"), "{msg}");
+        assert!(msg.contains("127.0.0.1:1/process-message"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_endpoint_reason_redacts_credentials() {
+        let reason = check_endpoint_host("https://user:PASSWORD@[bad-host/x?token=QUERYSECRET")
+            .expect("unparseable URL is rejected");
+        assert!(!reason.contains("PASSWORD"), "{reason}");
+        assert!(!reason.contains("QUERYSECRET"), "{reason}");
+        assert!(reason.contains("bad-host"), "{reason}");
     }
 
     #[tokio::test]

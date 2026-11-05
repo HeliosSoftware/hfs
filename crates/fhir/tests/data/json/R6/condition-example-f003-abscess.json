@@ -46,15 +46,17 @@
       }
     ]
   },
-  "bodySite": [
+  "bodyStructure": [
     {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "280193007",
-          "display": "Entire retropharyngeal area"
-        }
-      ]
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "280193007",
+            "display": "Entire retropharyngeal area"
+          }
+        ]
+      }
     }
   ],
   "subject": {

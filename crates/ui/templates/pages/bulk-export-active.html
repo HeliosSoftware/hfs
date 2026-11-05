@@ -1,0 +1,41 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("bulk-export-active-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("bulk-export-active-title") }}</h1>
+    {% if available %}
+    {% include "partials/bulk_export_summary.html" %}
+    {% endif %}
+  </div>
+  {% if available %}
+  <a class="btn btn--primary" href="/ui/bulk-export/new">
+    <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("bulk-export-new") }}
+  </a>
+  {% endif %}
+</header>
+
+{% if delete_error %}
+<div class="card notice notice--warn" role="alert">{{ i18n.t("bulk-export-delete-error") }}</div>
+{% endif %}
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("bulk-export-unavailable") }}</div>
+{% else %}
+{% if cards.is_empty() %}
+<div class="card notice">{{ i18n.t("bulk-export-none") }}</div>
+{% endif %}
+
+{# Share one request slot on this stable list. Dropped ticks retry on the
+   existing timer; no queued callback can retain a replaced terminal card. #}
+<div id="bulk-export-jobs" class="export-jobs" hx-sync="#bulk-export-jobs:drop">
+{% for card in cards %}
+{% include "partials/bulk_export_card.html" %}
+{% endfor %}
+</div>
+{% endif %}
+{% endblock %}

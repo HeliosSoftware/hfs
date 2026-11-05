@@ -88,7 +88,9 @@ mod tests {
     #[test]
     #[cfg(feature = "R4")]
     fn test_parquet_multi_file_generation() {
+        use bytes::Bytes;
         use helios_sof::{format_parquet_multi_file, process_view_definition};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         // Create ViewDefinition and a larger dataset
         let view_definition_json = json!({
@@ -103,15 +105,25 @@ mod tests {
             }]
         });
 
-        // Create a bundle with patients that have large text fields
+        // Enough poorly compressible rows to span several record batches, so the
+        // writer has to roll over to further files at the 1 MB limit.
         let mut entries = Vec::new();
-        for i in 0..100 {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..20_000 {
+            let text: String = (0..300)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    char::from(b'a' + ((state >> 33) % 26) as u8)
+                })
+                .collect();
             entries.push(json!({
                 "resource": {
                     "resourceType": "Patient",
                     "id": format!("patient-{}", i),
                     "text": {
-                        "div": "X".repeat(10000) // Large text to increase file size
+                        "div": text
                     }
                 }
             }));
@@ -159,9 +171,19 @@ mod tests {
 
         let file_buffers = result.unwrap();
         assert!(
-            !file_buffers.is_empty(),
-            "Should generate at least one file"
+            file_buffers.len() > 1,
+            "Expected the 1 MB limit to split the output, got {} file(s)",
+            file_buffers.len()
         );
+
+        // Every row must land in exactly one file.
+        let mut total_rows = 0;
+        for buffer in &file_buffers {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buffer.clone()))
+                .expect("each file should be readable Parquet");
+            total_rows += builder.metadata().file_metadata().num_rows() as usize;
+        }
+        assert_eq!(total_rows, 20_000, "rows must be preserved across files");
 
         // Verify each file is valid Parquet
         for buffer in &file_buffers {

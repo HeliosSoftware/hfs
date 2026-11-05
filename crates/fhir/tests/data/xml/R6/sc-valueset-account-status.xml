@@ -15,8 +15,7 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <a href="codesystem-account-status.html">Account Status</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
@@ -35,35 +34,35 @@
         <tr>
           <td>entered-in-error</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>error</td>
         </tr>
         <tr>
           <td>active</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>active</td>
         </tr>
         <tr>
           <td>on-hold</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>suspended</td>
         </tr>
         <tr>
           <td>inactive</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>inactive</td>
         </tr>
         <tr>
           <td>unknown</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>unknown</td>
         </tr>
@@ -71,7 +70,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-account-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="AccountStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Account Status&quot;"/>
   <status value="draft"/>

@@ -258,6 +258,24 @@ mod url_path_mode {
     }
 
     #[tokio::test]
+    async fn test_readiness_endpoint_reports_storage_ok() {
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::UrlPath,
+            ..Default::default()
+        };
+        let (server, _backend) = create_test_server(config).await;
+
+        // Readiness should work at root level (not tenant-scoped) and report the
+        // storage check as healthy.
+        let response = server.get("/_readiness").await;
+        response.assert_status_ok();
+
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["storage"], "ok");
+    }
+
+    #[tokio::test]
     async fn test_tenant_search() {
         let config = MultitenancyConfig {
             routing_mode: TenantRoutingMode::UrlPath,
@@ -367,6 +385,29 @@ mod combined_mode {
         let body: serde_json::Value = response.json();
         let impl_url = body["implementation"]["url"].as_str().unwrap();
         assert_eq!(impl_url, "http://localhost:8080");
+    }
+
+    #[cfg(feature = "subscriptions")]
+    #[tokio::test]
+    async fn websocket_namespace_is_reachable_by_header_and_url_path() {
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::Both,
+            ..Default::default()
+        };
+        let (server, _backend) = create_test_server(config).await;
+
+        for path in ["/ws/subscriptions/bind", "/acme/ws/subscriptions/bind"] {
+            let mut request = server.get(path);
+            if path.starts_with("/ws/") {
+                request = request.add_header(X_TENANT_ID, HeaderValue::from_static("acme"));
+            }
+
+            // Without upgrade headers, reaching the WebSocket extractor
+            // deterministically yields 400 in this in-process test transport.
+            // A namespace misclassified as tenant falls through to a FHIR read
+            // route and returns 404 instead.
+            assert_eq!(request.await.status_code(), StatusCode::BAD_REQUEST);
+        }
     }
 }
 
@@ -590,7 +631,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/acme/Patient/123", Some("other"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("valid tenant");
 
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::UrlPath);
@@ -606,7 +649,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/Patient/123", None);
-        let resolved = resolver.resolve(&parts, &config, "default-tenant");
+        let resolved = resolver
+            .resolve(&parts, &config, "default-tenant")
+            .expect("valid tenant");
 
         assert_eq!(resolved.tenant_id_str(), "default-tenant");
         assert_eq!(resolved.source, TenantSource::Default);
@@ -622,7 +667,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/acme/Patient/123", Some("acme"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("valid tenant");
 
         // Both sources found the same tenant
         assert_eq!(resolved.all_sources.len(), 2);

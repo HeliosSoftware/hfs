@@ -21,7 +21,7 @@
   </contained>
   <contained>
     <Organization>
-      <id value="payor"/>
+      <id value="payer"/>
       <identifier>
         <system value="http://www.jurisdiction.com/insurer"/>
         <value value="123456"/>
@@ -36,8 +36,8 @@
       </identifier>
     </Practitioner>
   </contained>
-  <!--  body of the resource  -->
-  <!--  this is the value to which the response will refer  -->
+  <!-- body of the resource -->
+  <!-- this is the value to which the response will refer -->
   <identifier>
     <system value="http://www.jurisdiction.com/insurer/123456"/>
     <value value="ABC123"/>
@@ -85,6 +85,6 @@
     <reference value="#provider"/>
   </recipient>
   <informationProvider>
-    <reference value="#payor"/>
+    <reference value="#payer"/>
   </informationProvider>
 </CommunicationRequest>

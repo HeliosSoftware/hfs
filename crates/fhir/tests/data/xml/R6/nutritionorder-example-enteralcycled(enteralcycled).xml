@@ -22,6 +22,10 @@
     <display value="Inpatient"/>
   </encounter>
   <dateTime value="2014-09-17"/>
+  <requester>
+    <reference value="Practitioner/example"/>
+    <display value="Dr Adam Careful"/>
+  </requester>
   <enteralFormula>
     <type>
       <concept>
@@ -32,13 +36,23 @@
         </coding>
       </concept>
     </type>
+    <type>
+      <concept>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="442921000124101"/>
+          <display value="Adult standard formula (product)"/>
+        </coding>
+      </concept>
+    </type>
+    <productName value="Acme Diabetes Formula"/>
     <caloricDensity>
       <value value="1.5"/>
       <unit value="calories per milliliter"/>
       <system value="http://unitsofmeasure.org"/>
       <code value="cal/mL"/>
     </caloricDensity>
-    <!-- step up rate of tube feeding by 20 ml/hr every 4 hours  -->
+    <!-- step up rate of tube feeding by 20 ml/hr every 4 hours -->
     <routeOfAdministration>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/v3-RouteOfAdministration"/>
@@ -63,6 +77,12 @@
         <code value="mL/h"/>
       </rateQuantity>
     </administration>
+    <maxVolumeToAdminister>
+      <value value="880"/>
+      <unit value="milliliter/day"/>
+      <system value="http://unitsofmeasure.org"/>
+      <code value="mL/d"/>
+    </maxVolumeToAdminister>
     <administrationInstruction value="Hold feedings from 7 pm to 7 am."/>
   </enteralFormula>
 </NutritionOrder>

@@ -1,0 +1,59 @@
+{#-
+  CodeSystem `$subsumes` input form (design doc §7.3, ui-design-map §4).
+
+  Both codes are pinned to the current CS's canonical URL server-side
+  (hts-details.md §`$subsumes` requires both codes to share a system), so
+  the form only asks for codeA and codeB. The scoped system is echoed as a
+  read-only `.detail__field` so the operator sees which CS is in play.
+
+  V3 layout: the form IS the card — `.card-head` heading + `.panel` field
+  stack; codeA/codeB share a `.builder-grid` row (design doc §9 form
+  contract).
+-#}
+<form id="hts-workbench-input"
+      class="card"
+      style="margin-bottom:16px"
+      method="post"
+      action="/ui/hts/code-systems/{{ id }}/subsumes"
+      hx-post="/ui/hts/code-systems/{{ id }}/subsumes"
+      hx-target="#hts-workbench-result"
+      hx-swap="outerHTML"
+      aria-labelledby="hts-workbench-input-heading">
+  <div class="card-head">
+    <h3 id="hts-workbench-input-heading">{{ chrome.i18n.t("hts-cs-subsumes-heading") }}</h3>
+  </div>
+
+  <div class="panel">
+    {% if let Some(s) = summary %}
+      {% if !s.url.is_empty() %}
+      <div class="kv-grid">
+        <div class="detail__field detail__field--wide">
+          <span>{{ chrome.i18n.t("hts-cs-subsumes-scoped-system") }}</span>
+          <code>{{ s.url }}</code>
+        </div>
+      </div>
+      {% endif %}
+    {% endif %}
+
+    <div class="builder-grid">
+      <div class="field">
+        <label class="field__label" for="subsumes-codeA">{{ chrome.i18n.t("hts-cs-subsumes-code-a") }}</label>
+        <input class="field__input" id="subsumes-codeA" name="codeA" type="text" required autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="field__label" for="subsumes-codeB">{{ chrome.i18n.t("hts-cs-subsumes-code-b") }}</label>
+        <input class="field__input" id="subsumes-codeB" name="codeB" type="text" required autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="subsumes-version">{{ chrome.i18n.t("hts-cs-lookup-version") }}</label>
+      <input class="field__input" id="subsumes-version" name="version" type="text" autocomplete="off" spellcheck="false"
+             value="{% if let Some(s) = summary %}{{ s.version }}{% endif %}">
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn--primary">{{ chrome.i18n.t("hts-workbench-run") }}</button>
+    </div>
+  </div>
+</form>

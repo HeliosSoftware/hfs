@@ -5,6 +5,7 @@ use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::config::redact_url;
 use crate::error::AuthError;
 
 /// Response from a JWKS endpoint.
@@ -56,14 +57,17 @@ impl JwksFetcher {
 
     /// Fetch and parse a JWKS document from the given URL.
     pub async fn fetch(&self, url: &str) -> Result<JwksResponse, AuthError> {
-        debug!(url, "Fetching JWKS");
+        debug!(url = %redact_url(url), "Fetching JWKS");
 
         let response = self
             .client
             .get(url)
             .send()
             .await
-            .map_err(|e| AuthError::JwksFetchError(format!("HTTP request failed: {}", e)))?;
+            // `without_url`: reqwest's error text would repeat the URL whole (#2149).
+            .map_err(|e| {
+                AuthError::JwksFetchError(format!("HTTP request failed: {}", e.without_url()))
+            })?;
 
         if !response.status().is_success() {
             return Err(AuthError::JwksFetchError(format!(
@@ -79,10 +83,9 @@ impl JwksFetcher {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_max_age);
 
-        let doc: JwksDocument = response
-            .json()
-            .await
-            .map_err(|e| AuthError::JwksFetchError(format!("Failed to parse JWKS JSON: {}", e)))?;
+        let doc: JwksDocument = response.json().await.map_err(|e| {
+            AuthError::JwksFetchError(format!("Failed to parse JWKS JSON: {}", e.without_url()))
+        })?;
 
         let mut keys = HashMap::new();
         for jwk in doc.keys {

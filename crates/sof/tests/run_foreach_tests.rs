@@ -9,8 +9,10 @@ struct TestCase {
     title: String,
     #[allow(dead_code)]
     description: String,
-    #[serde(rename = "fhirVersion")]
-    fhir_version: Vec<String>,
+    // Optional: some upstream fixtures (e.g. constant_types.json) omit
+    // `fhirVersion`, which the spec treats as "applies to all versions".
+    #[serde(rename = "fhirVersion", default)]
+    fhir_version: Option<Vec<String>>,
     resources: Vec<serde_json::Value>,
     tests: Vec<Test>,
 }
@@ -163,7 +165,7 @@ fn compare_json_values(actual: &serde_json::Value, expected: &serde_json::Value)
 #[test]
 fn test_foreach_file() {
     let mut test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_file.push("tests/sql-on-fhir-v2/tests/foreach.json");
+    test_file.push("tests/sql-on-fhir/tests/foreach.json");
 
     if !test_file.exists() {
         println!("Test file not found: {:?}", test_file);
@@ -174,7 +176,11 @@ fn test_foreach_file() {
     let test_case: TestCase = serde_json::from_str(&content).expect("Failed to parse test case");
 
     // Check if we support the FHIR version
-    let supports_r4 = test_case.fhir_version.contains(&"4.0.1".to_string());
+    let supports_r4 = test_case
+        .fhir_version
+        .as_ref()
+        .map(|v| v.contains(&"4.0.1".to_string()))
+        .unwrap_or(true);
     if !supports_r4 {
         panic!("Only R4 (4.0.1) is currently supported");
     }

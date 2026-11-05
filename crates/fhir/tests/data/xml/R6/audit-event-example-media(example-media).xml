@@ -31,11 +31,10 @@
     </code>
   </outcome>
   <agent>
-    <!--  Source active participant, the software making the PIX query
+    <!-- Source active participant, the software making the PIX query
   UserId - The identity of the Patient Identifier Cross-reference Consumer Actor facility and sending application from the HL7 message; 
   concatenated together, separated by the | character. 
-  AlternativeUserId - Process ID
-   -->
+  AlternativeUserId - Process ID -->
     <type>
       <coding>
         <system value="http://dicom.nema.org/resources/ontology/DCM"/>
@@ -49,7 +48,7 @@
     <requestor value="false"/>
   </agent>
   <agent>
-    <!--   The Human using the software, if known   -->
+    <!-- The Human using the software, if known -->
     <type>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/extra-security-role-type"/>
@@ -66,7 +65,7 @@
     <requestor value="true"/>
   </agent>
   <agent>
-    <!--   The media exported onto   -->
+    <!-- The media exported onto -->
     <type>
       <coding>
         <system value="http://dicom.nema.org/resources/ontology/DCM"/>
@@ -88,9 +87,7 @@
     </observer>
   </source>
   <entity>
-    <!-- 
-  The Patient
-   -->
+    <!-- The Patient -->
     <what>
       <identifier>
         <value value="e3cdfc81a0d24bd^^^&amp;2.16.840.1.113883.4.2&amp;ISO"/>
@@ -105,7 +102,7 @@
     </role>
   </entity>
   <entity>
-    <!--  The SubmissionSet identifier  -->
+    <!-- The SubmissionSet identifier -->
     <what>
       <identifier>
         <type>
@@ -127,7 +124,7 @@
     </role>
   </entity>
   <entity>
-    <!--  The Document Manifest exported  -->
+    <!-- The Document Manifest exported -->
     <what>
       <reference value="DocumentReference/example"/>
     </what>

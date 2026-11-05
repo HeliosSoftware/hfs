@@ -2,6 +2,7 @@
 name = "helios-fhirpath"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "This is an implementation of HL7's FHIRPath Specification."
 license.workspace = true
 authors.workspace = true
@@ -17,9 +18,13 @@ R4B = ["helios-fhir/R4B"]
 R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
 
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.2.7", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.7" }
+helios-observability = { path = "../observability", version = "0.2.7" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions
@@ -34,6 +39,7 @@ base64 = "0.22" # For encode/decode functions
 hex = "0.4" # For hex encode/decode functions
 octofhir-ucum = { version = "0.5", features = ["fhir"] } # For UCUM unit handling and conversion
 reqwest = { version = "0.12", features = ["json"] } # For terminology server HTTP calls
+httpdate = "1" # Retry-After HTTP-date parsing for terminology rate limits (#1856)
 rayon = "1.8" # For data parallelism
 arc-swap = "1.6" # For lock-free atomic data structures
 parking_lot = "0.12" # For better mutexes than std
@@ -43,7 +49,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8" }
 tower = { version = "0.5" }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "decompression-full"] }
 http = { version = "1.0" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -53,6 +59,8 @@ axum-test = "18.0"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures = "0.3"
+flate2 = "1" # gzip/deflate test payloads for HTTP compression tests
+wiremock = "0.6" # in-process terminology server stub (tests must not hit the network)
 
 [[bin]]
 name = "fhirpath-cli"

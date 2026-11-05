@@ -1,0 +1,48 @@
+{#-
+  Concept information plane — the permalink page (Direction B, "concept-first").
+
+  Shape of record: a `.page-head`, then stacked `<section class="card">`
+  blocks, exactly like `pages/diagnostics.html`. The cards are *direct*
+  children of `<main class="content">` on purpose — the shared rule
+  `.content > .card ~ .card { margin-top: 20px }` is a direct-child
+  selector, so any wrapper element here would collapse the vertical rhythm
+  between panels.
+
+  Panel order is the order the questions get asked: what is this code,
+  what does it map to, does the hierarchy agree with itself.
+
+  Only Identity renders server-side. Mappings and Subsumption emit their
+  self-fetching skeletons here (the partials branch on
+  `view.mappings_pending()` / `view.relations_pending()`), so first paint
+  is one upstream round-trip.
+
+  Every class used on this page has a rule in `crates/ui/assets/app.css`
+  (shared verbatim with HFS): page-head, page-head__title, page-head__lede,
+  card, card-head, table-card, panel, kv-grid, detail__field,
+  detail__field--wide, detail__code, table-wrap, data-table,
+  data-table__empty, tag, tag--matched, tag--conflict, tag--unknown,
+  tag--param, tag--muted, chip, query-empty, notice, notice--warn, lint,
+  lint__item, lint__item--warn, lint__sev, field, field__label,
+  field__input, field__hint, form-actions, btn, btn--primary.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ view.heading() }} · {{ chrome.i18n.t("hts-concept-title") }} · {{ chrome.i18n.t("hts-app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ view.heading() }}</h1>
+  <p class="page-head__lede">{{ chrome.i18n.t("hts-concept-lede") }}</p>
+</section>
+
+{#- A half-typed permalink is an `invalid` OperationOutcome at HTTP 200, not
+    a bare 400: the operator pasted this out of a ticket and needs to read
+    which half is missing. -#}
+{% if let Some(outcome) = view.address_outcome() %}
+  {% include "partials/hts-outcome.html" %}
+{% else %}
+  {% include "partials/hts-concept-identity.html" %}
+  {% include "partials/hts-concept-mappings.html" %}
+  {% include "partials/hts-concept-relations.html" %}
+{% endif %}
+{% endblock %}

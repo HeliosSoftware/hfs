@@ -73,6 +73,17 @@
         ]
       }
     ],
+    "schedule": {
+      "timing": [
+        {
+          "repeat": {
+            "frequency": 3,
+            "period": 1,
+            "periodUnit": "d"
+          }
+        }
+      ]
+    },
     "nutrient": [
       {
         "modifier": {

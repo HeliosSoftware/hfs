@@ -220,7 +220,7 @@
   </topic>
   <library value="#EXM55"/>
   <group id="group-1">
-    <linkId/>
+    <linkId value="primary"/>
     <type>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/measure-type"/>
@@ -252,7 +252,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Initial Population"/>
       </criteria>
     </population>
@@ -266,7 +266,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Measure Population"/>
       </criteria>
     </population>
@@ -280,7 +280,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Measure Population Exclusion"/>
       </criteria>
     </population>
@@ -294,7 +294,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Measure Observation"/>
       </criteria>
       <inputPopulationId value="measure-population-identifier"/>
@@ -316,7 +316,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Stratification 1"/>
       </criteria>
     </stratifier>
@@ -330,7 +330,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Stratification 2"/>
       </criteria>
     </stratifier>
@@ -344,7 +344,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Stratification 3"/>
       </criteria>
     </stratifier>

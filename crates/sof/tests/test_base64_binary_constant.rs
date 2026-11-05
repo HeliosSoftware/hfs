@@ -9,9 +9,11 @@ struct TestCase {
     title: String,
     #[allow(dead_code)]
     description: String,
+    // Optional: some upstream fixtures (e.g. constant_types.json) omit
+    // `fhirVersion`, which the spec treats as "applies to all versions".
     #[allow(dead_code)]
-    #[serde(rename = "fhirVersion")]
-    fhir_version: Vec<String>,
+    #[serde(rename = "fhirVersion", default)]
+    fhir_version: Option<Vec<String>>,
     resources: Vec<serde_json::Value>,
     tests: Vec<Test>,
 }
@@ -75,7 +77,7 @@ fn test_base64_binary_constant_type() {
 
     // Load test file
     let mut test_file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_file_path.push("tests/sql-on-fhir-v2/tests/constant_types.json");
+    test_file_path.push("tests/sql-on-fhir/tests/constant_types.json");
     let content = fs::read_to_string(&test_file_path)
         .expect("Failed to read test file - make sure the path is correct");
     let test_case: TestCase = serde_json::from_str(&content).expect("Failed to parse test file");

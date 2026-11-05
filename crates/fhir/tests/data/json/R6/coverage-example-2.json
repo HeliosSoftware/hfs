@@ -93,7 +93,9 @@
     }
   ],
   "order": 2,
-  "network": "5",
+  "network": {
+    "reference": "Organization/hl7pay"
+  },
   "costToBeneficiary": [
     {
       "type": {
@@ -124,11 +126,6 @@
           }
         }
       ]
-    }
-  ],
-  "contract": [
-    {
-      "reference": "Contract/INS-101"
     }
   ],
   "meta": {

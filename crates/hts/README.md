@@ -10,7 +10,7 @@ It can also be used standalone as a general-purpose FHIR terminology service, in
 
 An open test server will soon be available at https://hts.heliossoftware.com/ for experimentation and evaluation.
 
-HTS supports both SQLite and PostgreSQL as database backends - see [Storage Backends](#storage-backends) for details.
+HTS supports both SQLite (the zero-config default) and PostgreSQL database backends, with full feature parity between them - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data
 
@@ -34,9 +34,17 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 - [CRUD and search](https://hl7.org/fhir/http.html) for CodeSystem, ValueSet, and ConceptMap resources
 - [Batch](https://hl7.org/fhir/http.html#transaction) endpoint supporting `$validate-code` and `$translate` in a single request
 - Implicit ValueSet expansion: when a CodeSystem's `valueSet` URL is requested and no explicit ValueSet exists, all codes in that system are returned ([FHIR R5 §4.8.7](https://hl7.org/fhir/codesystem.html#implicit))
+- [Value Set Composition Language (VCL)](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expressions as implicit ValueSets (`http://fhir.org/VCL?v1=<expr>`) in `$expand`, `$validate-code` and `$batch-validate-code`; see [Expand a VCL expression](#expand-a-vcl-expression)
 - Dual `/metadata` response modes: `CapabilityStatement` (default) and `TerminologyCapabilities`
 - Content negotiation (JSON / XML)
 - CORS support
+
+### Documentation
+
+| Document | Description |
+|----------|-------------|
+| [IG Publisher compatibility](docs/ig-publisher-compatibility.md) | `$validate-code` parameter aliases, SNOMED `version=current`, LOINC version labeling — required for HL7 IG Publisher `-tx` validation |
+| [Expand paths architecture](docs/expand-paths-architecture.md) | ValueSet `$expand` code paths |
 
 ### Terminologies
 
@@ -140,7 +148,7 @@ See [Environment Variables](#environment-variables) for all available configurat
 
     Windows:
 
-      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
+      Download a pre-built binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
 
     macOS:
 
@@ -273,6 +281,10 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --log-level <LOG_LEVEL>      Log level [env: HTS_LOG_LEVEL=] [default: info]
       --batch-size <N>             Resources per import batch [default: 500]
+      --languages <TAGS>           Comma-separated BCP-47 tags restricting imported
+                                   translation languages (SNOMED RF2, LOINC); English
+                                   is always retained [env: HTS_IMPORT_LANGUAGES=]
+                                   [default: all languages]
       --dry-run                    Parse only - no database writes
       --verbose                    Emit per-batch progress to stderr
   -h, --help                       Print help
@@ -350,6 +362,8 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --enable-cors                Enable CORS [env: HTS_ENABLE_CORS=] [default: true]
       --cors-origins <ORIGINS>     Allowed CORS origins [env: HTS_CORS_ORIGINS=] [default: *]
+      --max-body-size <BYTES>      Maximum request body size in bytes [env: HTS_MAX_BODY_SIZE=]
+                                   [default: 10485760]
       --max-expansion-size <N>     Max codes in a ValueSet expansion [env: HTS_MAX_EXPANSION_SIZE=]
                                    [default: 3500]
   -h, --help                       Print help
@@ -368,7 +382,15 @@ Options:
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` or `postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+| `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
+| `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
+| `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
+
+Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
+`zstd`) are decompressed transparently; unsupported encodings are rejected
+with `415`. Responses are compressed when the client sends `Accept-Encoding`.
 
 ## Storage Backends
 
@@ -400,10 +422,25 @@ concept_map_mappings  - source→target code mappings with equivalence
 
 The `value_set_expansions` table acts as a write-through cache: the first `$expand` call for a given ValueSet computes and stores the expansion; subsequent calls read from the cache directly. The cache is invalidated automatically when a CodeSystem or ValueSet is updated via PUT or DELETE.
 
+#### Indexing and caching
+
+Per-concept reads on the hot operation paths (`$lookup`, `$validate-code`, `$expand`) are served by dedicated indexes rather than table scans. Concept resolution uses the `UNIQUE(system_id, code)` index on `concepts` (so a separate explicit index on the same columns would be redundant), while properties and designations are keyed by `concept_id` — `concept_properties(concept_id, …)` and `concept_designations(concept_id)`. The transitive `concept_closure` table makes `$subsumes` and `is-a` filters O(1) index seeks instead of recursive traversals.
+
+On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches of assembled `$lookup` / `$validate-code` responses and per-concept status flags, keyed on the full request. When a cache reaches its bound it evicts an existing entry (random replacement) and admits the new one, so a working set larger than the bound — e.g. diverse-code `$lookup` traffic against a 600 K-concept SNOMED system — keeps hot codes cached rather than freezing the cache at capacity and locking out every later code. Reads take a shared lock and never block each other; recency is deliberately not tracked, since bumping it on every read would require an exclusive lock and serialize lookups. Caches are flushed when the underlying data changes (import, PUT, DELETE).
+
 ### PostgreSQL
 
+HTS fully supports PostgreSQL as an alternative backend, with feature parity with SQLite across all terminology operations, CRUD, search, and import formats. The schema mirrors the SQLite layout and is applied automatically on first connection, so no manual migration step is required.
+
+Build with the `postgres` feature, then select the backend with `--storage-backend postgres` (or `HTS_STORAGE_BACKEND=postgres`) and a `postgresql://` connection string:
+
 ```bash
-hts run --storage-backend postgres --database-url "postgresql://user:pass@localhost/hts"
+# Build with PostgreSQL support
+cargo build --release -p helios-hts --features postgres
+
+# Run against PostgreSQL
+hts run --storage-backend postgres \
+  --database-url "postgresql://user:pass@localhost/hts"
 ```
 
 ## API Endpoints
@@ -431,8 +468,81 @@ hts run --storage-backend postgres --database-url "postgresql://user:pass@localh
 | search | GET | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | create | POST | `/CodeSystem`, `/ValueSet`, `/ConceptMap` |
 | read | GET | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+| version read | GET | `/{type}/{id}/_history/{versionId}` |
 | update | PUT | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
 | delete | DELETE | `/CodeSystem/{id}`, `/ValueSet/{id}`, `/ConceptMap/{id}` |
+
+POST assigns a new server-generated logical ID, ignoring any submitted `id`.
+PUT requires a body `id` matching the URL. It creates a new ID or restores a
+deleted resource with **201 Created**, and updates a live or imported resource
+with **200 OK**. Restoration continues the existing version history. These
+resources advertise `updateCreate: true` in the CapabilityStatement.
+
+Successful POST and PUT requests return server-managed `meta.versionId` and
+`meta.lastUpdated`, with `ETag` and `Last-Modified` headers. A 201 response also
+includes a version-specific `Location`, such as
+`/CodeSystem/{id}/_history/{versionId}`.
+`If-Match` requires a live persistence-managed resource and a matching ETag;
+absent, deleted, or imported-only resources return **412 Precondition Failed**.
+Canonical ownership checks still apply, so creating or restoring a resource
+cannot overwrite another ID's canonical resource.
+
+Version reads return the exact stored revision, including its `meta`, `ETag`,
+and `Last-Modified`, even after later updates or deletion. Unknown revisions
+return **404 Not Found**; a deletion revision returns **410 Gone**.
+Imported-only resources have no readable persistence revisions until a REST
+write establishes history. The CapabilityStatement advertises `vread`; history
+listing is not supported.
+
+### Imported resource identities
+
+CodeSystem and ValueSet search results use a unique FHIR logical `id`, separate
+from the internal storage key and the canonical `url` plus business `version`.
+Use the returned ID for reads and instance operations. Instance `$lookup`,
+`$validate-code`, and `$expand` select that resource's business version,
+including an unversioned resource when versioned siblings exist. Importing the
+same canonical version again preserves its ID while it remains import-managed.
+When several imported business versions reuse a source ID, the first one
+imported keeps that ID if it is available. Later versions receive UUIDs; their
+assigned IDs remain stable when reimported. Initial allocation therefore depends
+on import order. Invalid source IDs also receive UUIDs. Discover assigned IDs
+through search rather than constructing them from canonical versions.
+
+Public IDs are stored in the existing `resource_json.id` field. Startup repairs
+legacy IDs and adds unique expression indexes; it does not add columns or change
+internal keys. Valid synthetic rows without JSON use their existing internal ID.
+Only rows needing a different public ID receive a JSON update. Existing live
+CRUD identities and deleted-resource reservations take precedence. Otherwise
+migration preserves the ID previously published by each backend where it is
+valid and unique: the PostgreSQL storage key or the SQLite resource JSON ID.
+Ambiguous or invalid legacy IDs need to be rediscovered through search. Internal
+keys and references remain unchanged.
+
+Stop all HTS writers sharing the database before upgrading, and upgrade them
+all before resuming imports. Mixing old writers with the new identity indexes
+is unsupported. ID reservation checks assume CRUD and terminology storage share
+the same database, as configured by the server. REST create, update and delete
+commit the resource, its history, and normalized terminology together. A failed
+normalization rolls back the entire resource write. PostgreSQL coordinates
+imports and REST writes using the same identity locks. These hash into a fixed
+set of 256 advisory locks, so a transaction holds at most 256 locks however
+large its bundle is. A large import therefore also delays REST writes to
+unrelated resources until it commits. SQLite serializes writers in its
+transaction. Bulk imports retain their separate partial-success behavior.
+A bulk import reports an error for a canonical resource already managed through
+REST, preserving its content and history. Use PUT to change that resource.
+
+Imported-only resources can be read, updated and deleted by their assigned ID.
+They have no persistence ETag until a REST write establishes history. An update
+records the imported content as version 1 and the replacement as version 2 in
+one transaction. An If-Match request without a persisted ETag fails with 412
+and makes no changes. A delete creates a persisted tombstone in the same
+transaction as the terminology deletion. Repeating DELETE returns 404 and does
+not add history. The deleted logical ID remains reserved. Reimporting a
+CodeSystem or ValueSet with the same canonical URL and business version assigns
+a new logical ID; it does not restore the deleted ID. ConceptMap imports do not
+allocate replacement IDs: a reimport whose source ID is reserved must supply a
+different ID. Neither rule permanently prohibits importing that canonical URL.
 
 ### Utility
 
@@ -535,6 +645,34 @@ curl -X POST http://localhost:8090/import \
   -d @bundle.json
 ```
 
+A plain import rebuilds the `concept_closure` of every CodeSystem it writes
+before responding, so `$subsumes` and `is-a` filters see the new hierarchy
+immediately. For a large CodeSystem loaded as a series of chunked bundles that
+rebuild is O(n²) across the load, so pass `?defer_closure=true` on every chunk
+except the last, and `?finalize=true` on the **last** chunk. Deferred chunks
+leave the system with hierarchy edges but no closure until it is finalized (or
+the server restarts), during which `$subsumes` answers `not-subsumed`. The
+finalizing response includes `closures_rebuilt`.
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d @bundle-last-chunk.json
+```
+
+The rebuild for a very large system (SNOMED CT takes 30–60 s on PostgreSQL)
+can take longer than the 30 s request timeout. If it is still running after
+20 s, the server answers `202 Accepted` with `"closures_rebuild": "pending"`
+and lets the rebuild finish in the background. A client disconnect does not
+cancel it either. To wait for it, re-send `finalize=true` with an empty Bundle
+until the status is `200`:
+
+```bash
+curl -X POST "http://localhost:8090/import?finalize=true" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Bundle","type":"collection"}'
+```
+
 ### Lookup a Concept
 
 ```bash
@@ -563,6 +701,48 @@ curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
   }'
 ```
 
+#### Display validation
+
+When a `display` is supplied it is validated against the concept's display
+**and its designations**, honouring `displayLanguage` with the same
+BCP-47-aware matching used by `$lookup` (see [SNOMED CT](#snomed-ct) above). A
+designation counts as a valid display when it has no `use` (the default
+display), carries the FHIR `display` use, or is a terminology-native
+description type — notably SNOMED CT synonyms/FSNs, whose designation
+`use.system` is `http://snomed.info/sct`. So a request with
+`displayLanguage=de` and the matching German SNOMED term validates `true` and
+echoes that term back as `display`. Designations whose `use` marks them as an
+alternative-purpose label (e.g. the FHIR designation-usage `consumer-name`)
+are not treated as displays.
+
+By default a display that matches none of these is an `error` and flips
+`result` to `false` (FHIR `invalid-display`). The `lenient-display-validation`
+boolean parameter downgrades that mismatch to a `warning` while keeping
+`result=true`:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {"name": "url",     "valueUri":    "http://loinc.org"},
+      {"name": "code",    "valueCode":   "718-7"},
+      {"name": "display", "valueString": "not the right display"},
+      {"name": "lenient-display-validation", "valueBoolean": true}
+    ]
+  }'
+```
+
+> **Provenance.** `lenient-display-validation` is defined in **FHIR R6**
+> (ballot) on
+> [`ValueSet/$validate-code`](https://build.fhir.org/valueset-operation-validate-code.html);
+> it is absent from the R4 and R5 operation definitions. HTS accepts it on
+> both `CodeSystem/$validate-code` and `ValueSet/$validate-code` regardless of
+> the resources' FHIR version — an opt-in superset of the published
+> definitions. The default (parameter absent or `false`) is the spec-mandated
+> behaviour across all versions: an invalid display fails validation.
+
 ### Expand a ValueSet
 
 ```bash
@@ -590,6 +770,25 @@ curl -X POST http://localhost:8090/ValueSet/\$expand \
     ]
   }'
 ```
+
+### Expand a VCL expression
+
+A [VCL](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expression is passed as the implicit ValueSet URL `http://fhir.org/VCL?v1=<percent-encoded expression>` in the `url` parameter. HTS translates it to a `ValueSet.compose` and evaluates it like an inline ValueSet, on SQLite and PostgreSQL. The expression below is `(http://snomed.info/sct)<<404684003 - (http://snomed.info/sct)<<64572001`:
+
+```bash
+curl -G http://localhost:8090/ValueSet/\$expand \
+  --data-urlencode 'url=http://fhir.org/VCL?v1=%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C404684003%20-%20%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C64572001' \
+  --data-urlencode 'count=20'
+```
+
+`$validate-code` (and `$batch-validate-code` with a batch-level `url`) accept the same URL.
+
+- `v1` is percent-decoded once; the whole `url` value must be encoded by the client.
+- Only one operator kind per nesting level (`A,B;C` is an error); use parentheses.
+- `(system)<<code` (hierarchy operator without a property) is accepted as `concept<<code`.
+- Supported: `*`, `=`, `<<`, `~<<`, `<`, `<!`, `>>`, `/` (regex), `^{a,b}` / `~^{a,b}`, `^(valueSet)`, `;` `,` `-`, grouping. Parsed but answered with 501: `!!<`, `?`, `.` (of), `^{filter…}`, `prop^URI`.
+- Malformed VCL returns 400 with an `OperationOutcome` naming the 1-based position.
+- Limits: 64 KiB expression, 32 nesting levels; `$validate-code` over very large sets returns 422 `too-costly`.
 
 ### Check Concept Hierarchy
 
@@ -665,7 +864,7 @@ HFS propagates the URL to its embedded FHIRPath engine as `FHIRPATH_TERMINOLOGY_
 | FHIRPath `memberOf()` | `POST /ValueSet/$validate-code` |
 | FHIRPath `subsumes()` | `POST /CodeSystem/$subsumes` |
 
-Without `HFS_TERMINOLOGY_SERVER`, these features fall back to empty results or `false`.
+Without `HFS_TERMINOLOGY_SERVER`, these features fail with a clear error naming the variable to set — the search modifiers return `501 Not Implemented`, and the FHIRPath functions raise an evaluation error. They deliberately do not fall back to a public terminology server or to a silent `false`, because both would send codes to a server the operator never chose, or quietly produce wrong answers.
 
 ## Terminology Support
 
@@ -740,6 +939,54 @@ hts import ./SnomedCT_InternationalRF2_PRODUCTION_20250901T120000Z.zip --format 
 ```
 
 For large imports, add `--batch-size 200 --verbose` to monitor progress.
+
+Descriptions in **all languages** present in the archive (including the
+per-language Description files shipped by national extensions, e.g.
+`sct2_Description_Snapshot-de_*.txt`) are imported as FHIR
+`concept.designation` entries tagged with the RF2 language code and a `use`
+Coding carrying the SNOMED description type (FSN / synonym). Language
+reference sets — every one in the archive, not just the English ones — are
+used to pick the preferred synonym for the concept `display` (US English
+first, then GB English) and to add `preferredForLanguage` designations for
+each refset-preferred synonym: one tagged with its bare RF2 language code,
+plus a BCP-47 dialect-tagged copy (`en-US`, `en-GB`, `da-DK`, `fr-CA`,
+`nl-BE`, `sv-SE`, …) when the refset is one of the published
+national-edition language refsets. `$lookup`, `$expand`, and
+`$validate-code` resolve these via the `displayLanguage` parameter or the
+`Accept-Language` HTTP header. Language matching is BCP-47-aware: a tag is
+ranked against stored designations in the preference order **exact
+(`es-ES`) → separator-insensitive (`esES`) → same primary language (`es`, or
+any regional sibling such as `es-AR`/`es-MX`, all equal-preference)**. So a
+request for `de-DE` (what a browser typically sends) finds designations
+tagged `de`, and a request for `fr` accepts `fr-CA`; when an exact `es-ES`
+designation exists it is preferred over `es`/`es-MX`.
+
+To import only a subset of the available languages (cutting designation
+volume and import time), pass `--languages` (or set `HTS_IMPORT_LANGUAGES`
+for the server bootstrap), e.g. `--languages de,fr-FR`. Selection follows the
+same precedence on a **best-tier** basis: for each requested tag only the
+best-ranked available languages are kept. A specific `es-ES` therefore imports
+**only** `es-ES` (excluding `es-AR`/`es-MX`), while a bare `es` — which can only
+reach the primary-language tier — imports every `es-*` variant. Excluded
+per-language Description and Language-refset files are skipped without being
+parsed; English is always retained because display selection depends on it:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$lookup \
+  -H "Content-Type: application/fhir+json" \
+  -H "Accept-Language: de" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
+```
+
+Multiple editions of the same code system (e.g. the SNOMED International
+release plus a national edition) coexist as separate versions keyed on
+`(url, version)`; unversioned requests resolve to the highest version.
+When the requested `displayLanguage` has no designation in that version,
+`$lookup` falls back to the newest *other* stored version that carries the
+language (`$expand` and `$validate-code` match designations across versions
+of the canonical URL by design) — so a German term from a national edition
+is still found when a newer international release is the default. Pinning
+`version` disables the fallback.
 
 ---
 

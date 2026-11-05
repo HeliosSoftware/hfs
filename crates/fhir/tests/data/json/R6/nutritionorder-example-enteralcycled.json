@@ -18,18 +18,36 @@
     "display": "Inpatient"
   },
   "dateTime": "2014-09-17",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": "Dr Adam Careful"
+  },
   "enteralFormula": {
-    "type": {
-      "concept": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "441571000124104",
-            "display": "High energy enteral formula with fiber"
-          }
-        ]
+    "type": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "441571000124104",
+              "display": "High energy enteral formula with fiber"
+            }
+          ]
+        }
+      },
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "442921000124101",
+              "display": "Adult standard formula (product)"
+            }
+          ]
+        }
       }
-    },
+    ],
+    "productName": "Acme Diabetes Formula",
     "caloricDensity": {
       "value": 1.5,
       "unit": "calories per milliliter",
@@ -68,6 +86,12 @@
         }
       }
     ],
+    "maxVolumeToAdminister": {
+      "value": 880,
+      "unit": "milliliter/day",
+      "system": "http://unitsofmeasure.org",
+      "code": "mL/d"
+    },
     "administrationInstruction": "Hold feedings from 7 pm to 7 am."
   },
   "meta": {

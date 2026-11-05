@@ -1,0 +1,748 @@
+//! Seeds storage with the FHIR spec's SearchParameter resources (#235).
+//!
+//! Storage — not the in-memory registry — is the source of truth for
+//! SearchParameters. On startup each primary backend seeds its store from the
+//! same spec bundle the registry loads, so `GET /SearchParameter` discovers
+//! the parameters the server actually resolves searches against, and any node
+//! in a cluster boots into the same set.
+//!
+//! Seeding is idempotent and safe under concurrent multi-node boots: every
+//! spec resource carries its bundle id (`Patient-name`, `Resource-id`, …), so
+//! a second writer's `create` fails with `AlreadyExists` and is treated as
+//! "already seeded". Existing resources are never updated or clobbered.
+//!
+//! Resources are seeded verbatim — including the spec's `status: draft`, which
+//! the registry deliberately promotes to active only when loading (see
+//! `SearchParameterLoader::load_from_spec_file`). The registry keeps loading
+//! spec definitions from the bundled file as `Embedded`; the stored copies
+//! exist for API discovery and cluster-wide consistency, not as a second
+//! registration path — the stored-parameter refresh skips them (draft, and
+//! their canonical URLs are already registered).
+
+use std::future::Future;
+use std::path::Path;
+
+use chrono::Utc;
+use helios_fhir::FhirVersion;
+use serde_json::Value;
+
+use crate::core::{ResourceStorage, WriteEvent, WriteObserver, WriteOrigin};
+use crate::error::{ResourceError, StorageError, StorageResult};
+use crate::search::loader::SearchParameterLoader;
+use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+/// Outcome of a seeding pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedOutcome {
+    /// Resources newly written by this pass.
+    pub created: usize,
+    /// Resources already present (same id), left untouched.
+    pub existing: usize,
+    /// Resources that failed to write and were skipped (logged).
+    pub failed: usize,
+}
+
+/// How many resources go into one [`create_many`] call. Large enough that a
+/// backend with a native batch write sees the seed as a handful of requests
+/// (and, under Elasticsearch `refresh=wait_for`, a handful of refresh waits);
+/// small enough that a failed batch's individual retries stay cheap.
+///
+/// [`create_many`]: ResourceStorage::create_many
+const SEED_BATCH_SIZE: usize = 256;
+
+/// Reports the resources a seeding pass created for one type to `observer`, as
+/// one [`WriteEvent::Counts`] (#1078). Nothing is reported when the pass created
+/// nothing — an already-seeded tenant changes no figure.
+fn report_seeded(
+    observer: Option<&dyn WriteObserver>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    outcome: &SeedOutcome,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    if outcome.created == 0 {
+        return;
+    }
+    observer.on_write(&WriteEvent::Counts {
+        tenant: tenant.tenant_id().clone(),
+        resource_type: resource_type.to_string(),
+        created: outcome.created as u64,
+        updated: 0,
+        deleted: 0,
+        origin: WriteOrigin::ConformanceSeed,
+        at: Utc::now(),
+    });
+}
+
+/// Writes every resource of `resource_type` for `tenant` in
+/// [`SEED_BATCH_SIZE`] batches through [`create_many`], whose default fans
+/// creates out at the backend's [`bulk_write_concurrency`] so latency-bound
+/// backends (one PUT per resource on S3, one round trip per row on networked
+/// databases) pay round-trips-divided-by-fanout rather than their sum, and
+/// whose overrides (Elasticsearch, and a composite feeding it) make each batch
+/// one request. `AlreadyExists` counts as already-seeded. Any other error is
+/// retried resource-by-resource, twice each with a short backoff —
+/// shared-cache SQLite surfaces reader/writer overlap as an immediate `table
+/// is locked` error rather than waiting — before counting as failed.
+///
+/// [`create_many`]: ResourceStorage::create_many
+/// [`bulk_write_concurrency`]: ResourceStorage::bulk_write_concurrency
+async fn create_all<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    fhir_version: FhirVersion,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
+    write_batched(
+        SEED_BATCH_SIZE,
+        concurrency,
+        resource_type,
+        resources,
+        |batch| async move {
+            storage
+                .create_many(tenant, resource_type, batch, fhir_version)
+                .await
+                .into_iter()
+                .map(|result| result.map(|_| ()))
+                .collect()
+        },
+        |resource| async move {
+            storage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// The batching core of [`create_all`], parameterized over the batch write
+/// and the single write so it can be exercised without a storage backend.
+///
+/// Each batch of `batch_size` goes through `create_many`, which answers one
+/// result per resource in order. Resources it created or found existing are
+/// settled; the rest — a transient error, or a short answer from a backend
+/// that dropped part of the batch — fall through to [`write_all`], which
+/// retries them one at a time.
+async fn write_batched<M, MFut, F, Fut>(
+    batch_size: usize,
+    concurrency: usize,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    create_many: M,
+    create: F,
+) -> SeedOutcome
+where
+    M: Fn(Vec<Value>) -> MFut,
+    MFut: Future<Output = Vec<StorageResult<()>>>,
+    F: Fn(Value) -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
+    let mut outcome = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    let mut retry = Vec::new();
+    for batch in resources.chunks(batch_size.max(1)) {
+        let mut results = create_many(batch.to_vec()).await.into_iter();
+        for resource in batch {
+            match results.next() {
+                Some(Ok(())) => outcome.created += 1,
+                Some(Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))) => {
+                    outcome.existing += 1;
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(
+                        "{resource_type} seeding: batch write failed, retrying individually: {e}"
+                    );
+                    retry.push(resource.clone());
+                }
+                None => retry.push(resource.clone()),
+            }
+        }
+    }
+    if !retry.is_empty() {
+        let retried = write_all(concurrency, resource_type, retry, create).await;
+        outcome.created += retried.created;
+        outcome.existing += retried.existing;
+        outcome.failed += retried.failed;
+    }
+    outcome
+}
+
+/// The fanout/retry core of [`create_all`], parameterized over the write so it
+/// can be exercised without a storage backend.
+async fn write_all<F, Fut>(
+    concurrency: usize,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    create: F,
+) -> SeedOutcome
+where
+    F: Fn(Value) -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
+    use futures::stream::{self, StreamExt};
+
+    enum Wrote {
+        Created,
+        Existing,
+        Failed,
+    }
+
+    let create = &create;
+    stream::iter(resources)
+        .map(|resource| async move {
+            let mut attempt: u32 = 0;
+            loop {
+                match create(resource.clone()).await {
+                    Ok(()) => return Wrote::Created,
+                    Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
+                        return Wrote::Existing;
+                    }
+                    Err(_) if attempt < 2 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("{resource_type} seeding: create failed: {e}");
+                        return Wrote::Failed;
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .fold(
+            SeedOutcome {
+                created: 0,
+                existing: 0,
+                failed: 0,
+            },
+            |mut outcome, wrote| async move {
+                match wrote {
+                    Wrote::Created => outcome.created += 1,
+                    Wrote::Existing => outcome.existing += 1,
+                    Wrote::Failed => outcome.failed += 1,
+                }
+                outcome
+            },
+        )
+        .await
+}
+
+/// Seeds `storage` with the spec SearchParameter bundle for `fhir_version`,
+/// plus the embedded fallback parameters, under `tenant_id`.
+///
+/// The tenant is the server's default tenant: searches are tenant-scoped, so
+/// seeding anywhere else would leave `GET /SearchParameter` empty for the
+/// common single-tenant deployment. Non-default tenants do not see the seeded
+/// resources via the API (the in-memory registry still resolves searches for
+/// every tenant); revisit if shared-resource search lands.
+///
+/// Fast path: when the tenant already holds at least as many SearchParameters
+/// as the spec set, the pass is skipped entirely — one `count` per boot. A
+/// partial set (interrupted seed, or user-POSTed parameters predating this
+/// feature) is completed resource-by-resource, skipping whatever exists.
+///
+/// When `observer` is given, the resources this pass created are reported to it
+/// as one [`WriteEvent::Counts`] with [`WriteOrigin::ConformanceSeed`].
+pub async fn seed_spec_search_parameters<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
+) -> StorageResult<SeedOutcome>
+where
+    S: ResourceStorage + ?Sized,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+    let loader = SearchParameterLoader::new(fhir_version);
+
+    let mut resources: Vec<Value> = match loader.load_spec_resources(data_dir) {
+        Ok(resources) => resources,
+        Err(e) => {
+            // No spec file is a supported minimal deployment (the registry
+            // falls back the same way); seed only the embedded fallbacks.
+            tracing::warn!("SearchParameter seeding: no spec bundle loaded: {e}");
+            Vec::new()
+        }
+    };
+    if let Ok(fallbacks) = loader.load_embedded() {
+        // A fallback whose base is not a resource type of this FHIR version
+        // (`ViewDefinition-url`/`-version`, from the SQL-on-FHIR IG) is not a
+        // valid SearchParameter there: `base` is bound to the version's
+        // resource types. Stored, it fails validation wherever it surfaces —
+        // a system `$export` for one. The in-memory registry carries these
+        // fallbacks regardless of what is stored, so search is unaffected.
+        // The spec bundle is the list of known bases; without one, nothing can
+        // be judged and every fallback is kept.
+        let known_bases: std::collections::HashSet<String> = resources
+            .iter()
+            .filter_map(|resource| resource.get("base")?.as_array())
+            .flatten()
+            .filter_map(|base| base.as_str().map(str::to_string))
+            .collect();
+        resources.extend(
+            fallbacks
+                .iter()
+                .filter(|def| {
+                    known_bases.is_empty() || def.base.iter().all(|b| known_bases.contains(b))
+                })
+                .map(SearchParameterLoader::definition_to_fhir_resource),
+        );
+    }
+    // Drop entries whose id duplicates one already in the set. Several embedded
+    // fallbacks (`Resource-id`, `Library-url`, …) share an id with a spec
+    // bundle entry, so their `create` always fails `AlreadyExists` and never
+    // adds a row. Left in, they inflate `resources.len()` above the count the
+    // store can ever reach, so `present >= resources.len()` below would never
+    // hold and every boot would re-run the full create scan instead of taking
+    // the single-`count` fast path.
+    let mut seen_ids = std::collections::HashSet::new();
+    resources.retain(|resource| {
+        resource
+            .get("id")
+            .and_then(|id| id.as_str())
+            .is_none_or(|id| seen_ids.insert(id.to_string()))
+    });
+    if resources.is_empty() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: 0,
+            failed: 0,
+        });
+    }
+
+    let present = storage.count(&tenant, Some("SearchParameter")).await?;
+    if present as usize >= resources.len() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: resources.len(),
+            failed: 0,
+        });
+    }
+
+    let outcome = create_all(storage, &tenant, "SearchParameter", resources, fhir_version).await;
+    report_seeded(observer, &tenant, "SearchParameter", &outcome);
+    tracing::info!(
+        created = outcome.created,
+        existing = outcome.existing,
+        failed = outcome.failed,
+        tenant = %tenant_id,
+        "Seeded spec SearchParameters into storage"
+    );
+    Ok(outcome)
+}
+
+/// Seeds one tenant with both spec conformance resource sets — SearchParameters
+/// (#235) and CompartmentDefinitions (#237/#238) — from `data_dir`. Best-effort
+/// per set: an error in one is logged and does not block the other. Returns the
+/// combined outcome. Idempotent; safe to call at startup and on tenant
+/// provisioning.
+///
+/// `observer` receives one [`WriteEvent::Counts`] per resource type the pass
+/// created resources for (none when everything already existed).
+pub async fn seed_tenant_conformance<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    let mut total = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    let mut add = |r: StorageResult<SeedOutcome>, kind: &str| match r {
+        Ok(o) => {
+            total.created += o.created;
+            total.existing += o.existing;
+            total.failed += o.failed;
+        }
+        Err(e) => tracing::warn!(tenant = %tenant_id, "{kind} seeding failed: {e}"),
+    };
+    add(
+        seed_spec_search_parameters(storage, fhir_version, data_dir, tenant_id, observer).await,
+        "SearchParameter",
+    );
+    add(
+        seed_spec_compartment_definitions(storage, fhir_version, data_dir, tenant_id, observer)
+            .await,
+        "CompartmentDefinition",
+    );
+    total
+}
+
+/// Seeds `storage` with the spec CompartmentDefinition bundle for
+/// `fhir_version`, under `tenant_id`.
+///
+/// The compartment analogue of [`seed_spec_search_parameters`]: storage — not
+/// the codegen'd membership table — is what `GET /CompartmentDefinition` and
+/// the web UI read. Compartment *search* membership is unaffected (it still
+/// resolves through `helios_fhir::get_compartment_params`); these stored copies
+/// exist only for API discovery.
+///
+/// Same idempotency contract: every definition carries its bundle id
+/// (`patient`, `encounter`, …), so a concurrent second writer's `create` fails
+/// `AlreadyExists` and is treated as already-seeded; existing resources are
+/// never clobbered. When the tenant already holds at least the bundle's count,
+/// the pass short-circuits to a single `count`.
+///
+/// When `observer` is given, the resources this pass created are reported to it
+/// as one [`WriteEvent::Counts`] with [`WriteOrigin::ConformanceSeed`].
+pub async fn seed_spec_compartment_definitions<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
+) -> StorageResult<SeedOutcome>
+where
+    S: ResourceStorage + ?Sized,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+    let loader = helios_fhir::compartment::CompartmentDefinitionLoader::new(fhir_version);
+
+    let resources: Vec<Value> = match loader.load_spec_resources(data_dir) {
+        Ok(resources) => resources,
+        Err(e) => {
+            // No bundle is a supported minimal deployment; nothing to seed.
+            tracing::warn!("CompartmentDefinition seeding: no spec bundle loaded: {e}");
+            Vec::new()
+        }
+    };
+    if resources.is_empty() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: 0,
+            failed: 0,
+        });
+    }
+
+    let present = storage
+        .count(&tenant, Some("CompartmentDefinition"))
+        .await?;
+    if present as usize >= resources.len() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: resources.len(),
+            failed: 0,
+        });
+    }
+
+    let outcome = create_all(
+        storage,
+        &tenant,
+        "CompartmentDefinition",
+        resources,
+        fhir_version,
+    )
+    .await;
+    report_seeded(observer, &tenant, "CompartmentDefinition", &outcome);
+    tracing::info!(
+        created = outcome.created,
+        existing = outcome.existing,
+        failed = outcome.failed,
+        tenant = %tenant_id,
+        "Seeded spec CompartmentDefinitions into storage"
+    );
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::error::BackendError;
+
+    fn resources(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({ "id": format!("r{i}") })).collect()
+    }
+
+    fn transient() -> StorageError {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "test".to_string(),
+            message: "table is locked".to_string(),
+            source: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counts_created_and_existing() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(4, "SearchParameter", resources(5), |resource| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let dup = resource["id"] == json!("r0");
+            async move {
+                let _ = n;
+                if dup {
+                    Err(StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type: "SearchParameter".to_string(),
+                        id: "r0".to_string(),
+                    }))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 4);
+        assert_eq!(outcome.existing, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "AlreadyExists is not retried"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_are_retried_then_succeed() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(1, "SearchParameter", resources(1), |_| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(transient())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failures_count_after_three_attempts() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(2, "CompartmentDefinition", resources(2), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err(transient()) }
+        })
+        .await;
+        assert_eq!(outcome.created, 0);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "initial try + two retries each"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_concurrency_is_clamped_not_deadlocked() {
+        let outcome = write_all(0, "SearchParameter", resources(3), |_| async { Ok(()) }).await;
+        assert_eq!(outcome.created, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batches_settle_through_create_many_and_only_rejects_fall_back() {
+        let batch_calls = AtomicUsize::new(0);
+        let single_calls = AtomicUsize::new(0);
+        let outcome = write_batched(
+            2,
+            1,
+            "SearchParameter",
+            resources(5),
+            |batch| {
+                batch_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    batch
+                        .into_iter()
+                        .map(|resource| match resource["id"].as_str() {
+                            Some("r0") => {
+                                Err(StorageError::Resource(ResourceError::AlreadyExists {
+                                    resource_type: "SearchParameter".to_string(),
+                                    id: "r0".to_string(),
+                                }))
+                            }
+                            Some("r3") => Err(transient()),
+                            _ => Ok(()),
+                        })
+                        .collect()
+                }
+            },
+            |resource| {
+                single_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(resource["id"], json!("r3"), "only the reject is retried");
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            batch_calls.load(Ordering::SeqCst),
+            3,
+            "5 resources, 2 per batch"
+        );
+        assert_eq!(single_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome,
+            SeedOutcome {
+                created: 4,
+                existing: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_batch_answer_retries_the_unanswered_resources() {
+        // A backend that answers for fewer resources than it was given must
+        // not lose the rest: they go through the single-write path.
+        let single_calls = AtomicUsize::new(0);
+        let outcome = write_batched(
+            4,
+            2,
+            "CompartmentDefinition",
+            resources(3),
+            |_| async move { vec![Ok(())] },
+            |_| {
+                single_calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(single_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.created, 3);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_rejects_that_keep_failing_count_as_failed() {
+        let outcome = write_batched(
+            8,
+            1,
+            "SearchParameter",
+            resources(2),
+            |batch| async move { batch.iter().map(|_| Err(transient())).collect() },
+            |_| async move { Err(transient()) },
+        )
+        .await;
+        assert_eq!(outcome.created, 0);
+        assert_eq!(outcome.failed, 2);
+    }
+
+    /// One recorded `Counts` event: tenant, resource type, created, updated,
+    /// deleted and origin.
+    #[cfg(feature = "sqlite")]
+    type RecordedCount = (String, String, u64, u64, u64, WriteOrigin);
+
+    /// Records the `Counts` events a seeding pass reports.
+    #[cfg(feature = "sqlite")]
+    #[derive(Default)]
+    struct RecordingObserver {
+        counts: std::sync::Mutex<Vec<RecordedCount>>,
+        other: AtomicUsize,
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl WriteObserver for RecordingObserver {
+        fn on_write(&self, event: &WriteEvent) {
+            match event {
+                WriteEvent::Counts {
+                    tenant,
+                    resource_type,
+                    created,
+                    updated,
+                    deleted,
+                    origin,
+                    ..
+                } => self.counts.lock().unwrap().push((
+                    tenant.as_str().to_string(),
+                    resource_type.clone(),
+                    *created,
+                    *updated,
+                    *deleted,
+                    *origin,
+                )),
+                _ => {
+                    self.other.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seeding_reports_one_count_per_seeded_type_and_nothing_when_seeded() {
+        use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend = SqliteBackend::with_config(
+            ":memory:",
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        let observer = RecordingObserver::default();
+
+        let first = seed_tenant_conformance(
+            &backend,
+            FhirVersion::R4,
+            &data_dir,
+            "acme",
+            Some(&observer),
+        )
+        .await;
+        assert!(first.created > 0, "first seed created: {first:?}");
+
+        let tenant = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let counts = observer.counts.lock().unwrap().clone();
+        let types: Vec<&str> = counts.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(types, vec!["SearchParameter", "CompartmentDefinition"]);
+        for (tenant_id, resource_type, created, updated, deleted, origin) in &counts {
+            assert_eq!(tenant_id, "acme");
+            assert_eq!((*updated, *deleted), (0, 0));
+            assert_eq!(*origin, WriteOrigin::ConformanceSeed);
+            let stored = backend
+                .count(&tenant, Some(resource_type))
+                .await
+                .expect("count seeded");
+            assert_eq!(*created, stored, "{resource_type} created count");
+        }
+        assert_eq!(
+            counts.iter().map(|c| c.2).sum::<u64>(),
+            first.created as u64,
+            "the reported counts add up to the pass's outcome"
+        );
+        assert_eq!(observer.other.load(Ordering::SeqCst), 0);
+
+        // Everything exists now: the second pass reports nothing.
+        let second = seed_tenant_conformance(
+            &backend,
+            FhirVersion::R4,
+            &data_dir,
+            "acme",
+            Some(&observer),
+        )
+        .await;
+        assert_eq!(second.created, 0, "second seed: {second:?}");
+        assert_eq!(observer.counts.lock().unwrap().len(), 2);
+        assert_eq!(observer.other.load(Ordering::SeqCst), 0);
+    }
+}

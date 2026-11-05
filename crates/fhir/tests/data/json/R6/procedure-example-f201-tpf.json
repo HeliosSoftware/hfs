@@ -47,15 +47,17 @@
       }
     }
   ],
-  "bodySite": [
+  "bodyStructure": [
     {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "272676008",
-          "display": "Entire sphenoid bone (body structure)"
-        }
-      ]
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "272676008",
+            "display": "Entire sphenoid bone (body structure)"
+          }
+        ]
+      }
     }
   ],
   "note": [

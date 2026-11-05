@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Provenance xmlns="http://hl7.org/fhir">
   <id value="example-advanced"/>
-  <!--  
-    an example Provenance fully populated
-   -->
+  <!-- an example Provenance fully populated -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -20,12 +18,10 @@
     <reference value="Location/1/_history/1"/>
   </location>
   <authorization>
-    <concept>
-      <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
-        <code value="TREAT"/>
-      </coding>
-    </concept>
+    <coding>
+      <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
+      <code value="TREAT"/>
+    </coding>
   </authorization>
   <activity>
     <coding>
@@ -79,7 +75,7 @@
     </who>
   </agent>
   <signature>
-    <!--  verification signature  -->
+    <!-- verification signature -->
     <type>
       <system value="urn:iso-astm:E1762-95:2013"/>
       <code value="1.2.840.10065.1.12.1.5"/>

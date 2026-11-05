@@ -27,6 +27,11 @@
     </telecom>
   </contact>
   <description value="Screening for Depression"/>
+  <!-- <scoring>
+    <coding>
+      <code value="proportion"/>
+    </coding>
+  </scoring> -->
   <group id="Main">
     <population>
       <code>
@@ -35,7 +40,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Initial Population"/>
       </criteria>
     </population>
@@ -46,7 +51,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Denominator"/>
       </criteria>
     </population>
@@ -57,7 +62,7 @@
         </coding>
       </code>
       <criteria>
-        <language value="text/cql-identifier"/>
+        <language value="text/plain"/>
         <expression value="Numerator"/>
       </criteria>
     </population>

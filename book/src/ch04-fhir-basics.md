@@ -33,7 +33,7 @@ FHIR has evolved through several versions. HFS supports all four currently relev
 | **R4** (4.0.1) | 2019 | Normative; most widely deployed |
 | **R4B** (4.3.0) | 2022 | Normative; introduces clinical reasoning changes |
 | **R5** (5.0.0) | 2023 | Current standard; significant model refinements |
-| **R6** (6.0.0-ballot2) | In progress | Latest ballot; cutting-edge features |
+| **R6** (6.0.0-snapshot1) | In progress | Pre-release snapshot; cutting-edge features |
 
 Most production systems use R4 or R5. R4B is common in the US for specific profiles. R6 is for early adopters and testing.
 

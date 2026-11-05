@@ -122,10 +122,10 @@
       </table>
     </div>
   </text>
-  <!--  Conditions could be further encoded and detailed.  
+  <!-- Conditions could be further encoded and detailed.  
       Could also be handled as references to external resources.
       And not essential to have them captured at all.
-      For purposes of example, will represent this way.  -->
+      For purposes of example, will represent this way. -->
   <contained>
     <Condition>
       <id value="p1"/>
@@ -272,21 +272,21 @@
   <addresses>
     <reference>
       <reference value="#p1"/>
-      <!--  Local reference  -->
+      <!-- Local reference -->
       <display value="GERDS"/>
     </reference>
   </addresses>
   <addresses>
     <reference>
       <reference value="#p2"/>
-      <!--  Local reference  -->
+      <!-- Local reference -->
       <display value="Obesity"/>
     </reference>
   </addresses>
   <addresses>
     <reference>
       <reference value="#p3"/>
-      <!--  Local reference  -->
+      <!-- Local reference -->
       <display value="Psoriasis"/>
     </reference>
   </addresses>
@@ -310,19 +310,19 @@
       <time value="2012-09-10"/>
       <text value="Eve eats one meal a day with her parents"/>
     </progress>
-    <!--  Eve will review photos of high and low density foods and share with her parents  -->
+    <!-- Eve will review photos of high and low density foods and share with her parents -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-1"/>
     </plannedActivityReference>
   </activity>
   <activity>
-    <!--  Eve will ask her dad to asist her to put the head of her bed on blocks  -->
+    <!-- Eve will ask her dad to asist her to put the head of her bed on blocks -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-2"/>
     </plannedActivityReference>
   </activity>
   <activity>
-    <!--  Eve will reduce her intake of coffee and chocolate  -->
+    <!-- Eve will reduce her intake of coffee and chocolate -->
     <plannedActivityReference>
       <reference value="NutritionOrder/activity-3"/>
     </plannedActivityReference>
@@ -336,7 +336,7 @@
       <time value="2012-09-10"/>
       <text value="Eve is still walking the dogs."/>
     </progress>
-    <!--  Eve will walk her friend's dog up and down a big hill 15-30 minutes 3 days a week  -->
+    <!-- Eve will walk her friend's dog up and down a big hill 15-30 minutes 3 days a week -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-4"/>
     </plannedActivityReference>
@@ -350,13 +350,13 @@
       <time value="2012-09-10"/>
       <text value="Eve did not walk to her parents the last week, but has plans to start again"/>
     </progress>
-    <!--  Eve will walk 3 blocks to her parents house twice a week  -->
+    <!-- Eve will walk 3 blocks to her parents house twice a week -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-5"/>
     </plannedActivityReference>
   </activity>
   <activity>
-    <!--  Eve will use a calendar to check off after medications are taken  -->
+    <!-- Eve will use a calendar to check off after medications are taken -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-6"/>
     </plannedActivityReference>
@@ -370,7 +370,7 @@
       <time value="2012-08-27"/>
       <text value="Since her skin is improved Eve has not been using the light treatment as often, maybe once a week.  She would like to increase to 3 times a week again"/>
     </progress>
-    <!--  Eve will use her lights MWF after her shower for 3 minutes  -->
+    <!-- Eve will use her lights MWF after her shower for 3 minutes -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-7"/>
     </plannedActivityReference>
@@ -380,7 +380,7 @@
       <time value="2012-07-23"/>
       <text value="Eve created a chart as a reminer to take the medications that do not fit in her pill box"/>
     </progress>
-    <!--  Eve will use a calendar of a chart to help her remember when to take her medications  -->
+    <!-- Eve will use a calendar of a chart to help her remember when to take her medications -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-8"/>
     </plannedActivityReference>
@@ -394,13 +394,13 @@
       <time value="2012-08-13"/>
       <text value="Eve prefers to focus on walking at this time"/>
     </progress>
-    <!--  Eve will start using stretch bands and one step 2 days a week Mon/Wed 6-7am and maybe Friday afternoon  -->
+    <!-- Eve will start using stretch bands and one step 2 days a week Mon/Wed 6-7am and maybe Friday afternoon -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-9"/>
     </plannedActivityReference>
   </activity>
   <activity>
-    <!--  Eve will match a printed medication worksheet with the medication bottles at home  -->
+    <!-- Eve will match a printed medication worksheet with the medication bottles at home -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-10"/>
     </plannedActivityReference>
@@ -410,7 +410,7 @@
       <time value="2012-07-16"/>
       <text value="Eve now has some of her medications set up in pill packs by her pharmacist"/>
     </progress>
-    <!--   Eve will get a medication box to sort her pills.  She will have one for scheduled medications and one for as needed  -->
+    <!-- Eve will get a medication box to sort her pills.  She will have one for scheduled medications and one for as needed -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-11"/>
     </plannedActivityReference>
@@ -424,7 +424,7 @@
       <time value="2012-08-13"/>
       <text value="hold until &#34;less busy&#34;"/>
     </progress>
-    <!--  Eve will open execersie DVD workout package and listen to it  -->
+    <!-- Eve will open execersie DVD workout package and listen to it -->
     <plannedActivityReference>
       <reference value="ServiceRequest/activity-12"/>
     </plannedActivityReference>

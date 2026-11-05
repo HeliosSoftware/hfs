@@ -10,7 +10,7 @@
   <identifier>
     <value value="12345"/>
   </identifier>
-  <!--  Example of biopsy service request that is part of a colonoscopy -->
+  <!-- Example of biopsy service request that is part of a colonoscopy -->
   <requisition>
     <system value="http://bumc.org/requisitions"/>
     <value value="req12345"/>

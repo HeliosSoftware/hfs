@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Group xmlns="http://hl7.org/fhir">
   <id value="herd1"/>
-  <!--  added this extension to reference the owner (client) of the herd  -->
+  <!-- added this extension to reference the owner (client) of the herd -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -17,7 +17,7 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
-  <!--  diagnostic lab's identifier  -->
+  <!-- diagnostic lab's identifier -->
   <identifier>
     <system value="https://vetmed.iastate.edu/vdl"/>
     <value value="20171120-1234"/>
@@ -33,7 +33,7 @@
   </contact>
   <type value="animal"/>
   <membership value="enumerated"/>
-  <!--  describes a bunch of female breeding sows  added a translation from US APHIS codes to SNOMED CT -->
+  <!-- describes a bunch of female breeding sows  added a translation from US APHIS codes to SNOMED CT -->
   <code>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -48,7 +48,7 @@
     <text value="Porcine"/>
   </code>
   <quantity value="2500"/>
-  <!--  the share the common charasteristic of being sows  -->
+  <!-- the share the common charasteristic of being sows -->
   <characteristic>
     <code>
       <text value="gender"/>
@@ -56,7 +56,7 @@
     <valueCodeableConcept>
       <text value="female"/>
     </valueCodeableConcept>
-    <!--  required element - false means they are all sows  -->
+    <!-- required element - false means they are all sows -->
     <exclude value="false"/>
   </characteristic>
 </Group>

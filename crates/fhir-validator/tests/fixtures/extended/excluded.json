@@ -1,0 +1,54 @@
+{
+  "desc": "excluded keyword — Helios extended (broken in the reference validator)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Patient": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "gender": { "type": "string" },
+        "birthDate": { "type": "string" }
+      }
+    },
+    "NoGender": {
+      "base": "Patient",
+      "excluded": ["gender"],
+      "required": ["birthDate"]
+    }
+  },
+  "tests": [
+    {
+      "desc": "clean when excluded key absent",
+      "schemas": ["NoGender"],
+      "data": { "resourceType": "Patient", "birthDate": "2000-01-01" }
+    },
+    {
+      "desc": "excluded key present",
+      "schemas": ["NoGender"],
+      "data": { "resourceType": "Patient", "gender": "male", "birthDate": "2000-01-01" },
+      "errors": [
+        {
+          "type": "excluded",
+          "path": "Patient.gender",
+          "message": "excluded property gender is present"
+        }
+      ]
+    },
+    {
+      "desc": "excluded and required combine across layers",
+      "schemas": ["NoGender"],
+      "data": { "resourceType": "Patient", "gender": "other" },
+      "errors": [
+        {
+          "type": "required",
+          "path": "Patient.birthDate",
+          "message": "birthDate is required"
+        },
+        {
+          "type": "excluded",
+          "path": "Patient.gender",
+          "message": "excluded property gender is present"
+        }
+      ]
+    }
+  ]
+}

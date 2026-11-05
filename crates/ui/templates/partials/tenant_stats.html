@@ -1,0 +1,29 @@
+{#
+  The Tenants stat cards (#1851): global figures, independent of the search
+  term (#1848 D15). The page includes this in place (oob = false); every rows
+  fragment carries it again with hx-swap-oob, so the cards and the rows they
+  summarize are swapped together. An em dash is never a figure: the sub-label
+  under it always says why there is none (pending, unavailable on this
+  storage, unavailable right now), and a partial or stale figure says so too
+  (#1848 D8, D17).
+#}
+<section id="tenant-stats" class="stat-grid stat-grid--2"{% if oob %} hx-swap-oob="outerHTML"{% endif %}>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("tenants-stat-total") }}</span>
+    {% if let Some(total) = stats.total %}
+    <span class="stat__value">{{ total }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-hidden="true">&mdash;</span>
+    {% endif %}
+    <span class="stat__sub">{{ stats.total_sub }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("tenants-stat-resources") }}</span>
+    {% if let Some(resources) = stats.resources %}
+    <span class="stat__value">{{ resources }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-hidden="true">&mdash;</span>
+    {% endif %}
+    <span class="stat__sub">{{ stats.resources_sub }}</span>
+  </article>
+</section>

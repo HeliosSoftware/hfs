@@ -1,0 +1,85 @@
+/* Close behavior for <details class="addbox"> disclosures (#545) and
+   <details class="menu"> dropdowns (tenant and version pickers, recent
+   searches): Esc closes the open panel, a [data-addbox-close] control closes
+   its own panel, and a click outside any open panel closes it. The disclosures
+   stay fully usable without this script — it only adds ways out. */
+(function () {
+  "use strict";
+
+  var OPEN = "details.addbox[open], details.menu[open]";
+
+  function close(box) {
+    /* #1240: ask before discarding a dirty panel's edits. The answer comes
+       back asynchronously from the shared in-page confirmation (#1667); a
+       clean panel resolves at once. Esc or an outside click over several
+       open panels never stacks dialogs: confirm.js answers a second
+       question `false` while the first is still showing, so that panel
+       simply stays open. */
+    var asked = window.HfsUnsaved ? window.HfsUnsaved.confirmDiscard(box) : Promise.resolve(true);
+    asked.then(function (discard) {
+      if (!discard) return;
+      box.removeAttribute("open");
+      /* Every close this script performs is a dismissal, so the dialog starts
+         blank next time (#682). The failure path never comes through here — an
+         errored submit re-renders inside the still-open panel — and success
+         paths (e.g. tenants.js) reset on their own before closing. */
+      box.querySelectorAll("form").forEach(function (form) {
+        form.reset();
+      });
+      /* Keep focus in a sensible place after Esc / the × removes the panel the
+         focus was in. An outside click keeps its own target's focus. */
+      var summary = box.querySelector("summary");
+      if (summary && box.contains(document.activeElement)) summary.focus();
+    });
+  }
+
+  function focusEntry(box) {
+    var entry = box.querySelector("[data-addbox-initial-focus]");
+    if (entry) entry.focus();
+  }
+
+  document.querySelectorAll("details.addbox[open]").forEach(focusEntry);
+
+  document.addEventListener("toggle", function (event) {
+    var box = event.target;
+    if (!box.matches || !box.matches("details.addbox[open]")) return;
+    window.requestAnimationFrame(function () { focusEntry(box); });
+  }, true);
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") return;
+    var boxes = document.querySelectorAll(OPEN);
+    if (boxes.length === 0) return;
+    /* preventDefault: a discard confirmation opened inside this keydown would
+       otherwise be dismissed by the same Escape (the browser's <dialog> close
+       handling runs after the listeners), answering "cancel" unseen (#1667). */
+    event.preventDefault();
+    boxes.forEach(close);
+  });
+
+  document.addEventListener("click", function (event) {
+    var closer = event.target.closest("[data-addbox-close]");
+    if (closer) {
+      var own = closer.closest("details.addbox, details.menu");
+      if (own) {
+        event.preventDefault();
+        close(own);
+      }
+      return;
+    }
+    /* An open addbox--modal's <summary> is itself the full-screen backdrop
+       (app.css): its native toggle would close the <details> without ever
+       reaching close(), skipping the confirm and the reset. Route a closing
+       summary click (modal or not) through close() instead (#1240). */
+    var summary = event.target.closest("summary");
+    var owner = summary && summary.parentElement;
+    if (owner && owner.matches("details.addbox[open]")) {
+      event.preventDefault();
+      close(owner);
+      return;
+    }
+    document.querySelectorAll(OPEN).forEach(function (box) {
+      if (!box.contains(event.target)) close(box);
+    });
+  });
+})();

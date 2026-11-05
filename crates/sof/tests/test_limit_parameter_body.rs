@@ -96,7 +96,7 @@ async fn test_limit_parameter_in_body_value_integer() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -111,7 +111,7 @@ async fn test_limit_parameter_in_body_value_integer() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
         .add_header("Accept", "application/json")
         .json(&parameters)
@@ -143,7 +143,7 @@ async fn test_limit_parameter_in_body_value_positive_int() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -158,7 +158,7 @@ async fn test_limit_parameter_in_body_value_positive_int() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
         .add_header("Accept", "application/json")
         .json(&parameters)
@@ -188,7 +188,7 @@ async fn test_limit_parameter_negative_value() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -203,7 +203,7 @@ async fn test_limit_parameter_negative_value() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
         .json(&parameters)
         .await;
@@ -220,7 +220,7 @@ async fn test_limit_parameter_exceeds_maximum() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -235,7 +235,7 @@ async fn test_limit_parameter_exceeds_maximum() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
         .json(&parameters)
         .await;
@@ -252,7 +252,7 @@ async fn test_limit_parameter_with_csv_format() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -271,7 +271,7 @@ async fn test_limit_parameter_with_csv_format() {
     });
 
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run")
+        .post("/$sql-run")
         .content_type("application/json")
         .json(&parameters)
         .await;
@@ -302,7 +302,7 @@ async fn test_limit_parameter_body_overrides_query() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": patient_view_definition()
             },
             {
@@ -318,7 +318,7 @@ async fn test_limit_parameter_body_overrides_query() {
 
     // Query parameter says 5, but body says 2
     let response = server
-        .post("/ViewDefinition/$viewdefinition-run?_count=5")
+        .post("/$sql-run?_count=5")
         .content_type("application/json")
         .add_header("Accept", "application/json")
         .json(&parameters)

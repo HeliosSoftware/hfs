@@ -4,11 +4,13 @@ on:
   workflow_dispatch:
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
 jobs:
@@ -51,6 +53,15 @@ jobs:
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
     steps:
+      - name: Resolve Docker host
+        run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+
       - name: Checkout subscriptions-test-kit
         uses: actions/checkout@v5
         with:
@@ -73,7 +84,7 @@ jobs:
         working-directory: subscriptions-test-kit
         run: |
           PROJECT="inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           INFERNO_PORT=$((22000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
           INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
 
@@ -150,13 +161,24 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        backend:
+          [
+            sqlite,
+            sqlite-elasticsearch,
+            postgres,
+            postgres-elasticsearch,
+            mongodb,
+            mongodb-elasticsearch,
+            s3-elasticsearch,
+          ]
         include:
           - { backend: sqlite, hfs_port: 18088 }
           - { backend: sqlite-elasticsearch, hfs_port: 18089 }
           - { backend: postgres, hfs_port: 18090 }
           - { backend: mongodb, hfs_port: 18091 }
           - { backend: s3-elasticsearch, hfs_port: 18092 }
+          - { backend: postgres-elasticsearch, hfs_port: 18093 }
+          - { backend: mongodb-elasticsearch, hfs_port: 18094 }
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
       INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
@@ -181,19 +203,19 @@ jobs:
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Determine runner and Docker host IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
-          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Validate backend configuration
         run: |
@@ -203,10 +225,10 @@ jobs:
           fi
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-inferno-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -234,10 +256,10 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          PG_CONTAINER="pg-inferno-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -265,11 +287,11 @@ jobs:
           exit 1
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
-          MONGO_CONTAINER="mongo-inferno-subscriptions-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          MONGO_CONTAINER="mongo-inferno-subscriptions-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -364,6 +386,18 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -371,6 +405,17 @@ jobs:
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.backend }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            # MongoDB caps database names at 63 characters; the full backend
+            # name pushes this one to 64, so the composite leg abbreviates it.
+            HFS_SUBSCRIPTIONS_ENABLED=true \
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_DEFAULT_FHIR_VERSION=R4 \
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_inferno_subscriptions_${{ github.run_id }}_${{ github.run_attempt }}_mongodb_es" \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_SUBSCRIPTIONS_ENABLED=true \
@@ -771,9 +816,9 @@ jobs:
           fi
 
           echo "Stopping backend containers..."
-          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
   inferno-stack-down:
     name: Stop Shared Inferno Subscriptions Stack
@@ -791,7 +836,7 @@ jobs:
 
           IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
           if [ -n "$IDS" ]; then
-            docker rm -f $IDS
+            docker rm -fv $IDS
           fi
 
           NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)

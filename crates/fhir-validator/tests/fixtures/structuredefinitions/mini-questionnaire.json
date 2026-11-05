@@ -1,0 +1,47 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "Questionnaire",
+  "url": "http://hl7.org/fhir/StructureDefinition/Questionnaire",
+  "name": "Questionnaire",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Questionnaire",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/DomainResource",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {
+        "id": "Questionnaire",
+        "path": "Questionnaire",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Questionnaire", "min": 0, "max": "*" }
+      },
+      {
+        "id": "Questionnaire.item",
+        "path": "Questionnaire.item",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Questionnaire.item", "min": 0, "max": "*" },
+        "type": [{ "code": "BackboneElement" }]
+      },
+      {
+        "id": "Questionnaire.item.linkId",
+        "path": "Questionnaire.item.linkId",
+        "min": 1,
+        "max": "1",
+        "base": { "path": "Questionnaire.item.linkId", "min": 1, "max": "1" },
+        "type": [{ "code": "string" }]
+      },
+      {
+        "id": "Questionnaire.item.item",
+        "path": "Questionnaire.item.item",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Questionnaire.item.item", "min": 0, "max": "*" },
+        "contentReference": "#Questionnaire.item"
+      }
+    ]
+  }
+}

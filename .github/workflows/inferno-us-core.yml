@@ -1,16 +1,32 @@
 name: Inferno US Core Test Suite
 
 on:
-  workflow_dispatch: # Manual trigger only for initial implementation
+  workflow_dispatch: # Manual trigger
+  schedule:
+    # Weekly US Core conformance tracking run (Sunday), in the slot
+    # ci-extended leaves free on weekends. Runs as a status/early-warning
+    # signal — the suite is not yet consistently green, so treat a weekly
+    # red as a tracking indicator rather than a gate.
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri, 09:43 Sat-Sun (~1h30) ·
+    #   inferno-us-quality-core Sat 04:13 · inferno-us-core Sun 04:13 (~2h).
+    - cron: "13 4 * * 0"
 
 env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
-  # Remote Docker host (set via GitHub repository secrets or variables; leave unset for local Docker)
+  # Remote Docker daemon (required repository secret). Published container ports are
+  # reached on its host part, exported as DOCKER_HOST_IP by each job's first step.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # S3+Elasticsearch backend configuration (optional; s3-elasticsearch tests are skipped when not set)
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
 
@@ -52,6 +68,15 @@ jobs:
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
     steps:
+      - name: Resolve Docker host
+        run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+
       - name: Checkout us-core-test-kit
         uses: actions/checkout@v5
         with:
@@ -113,7 +138,7 @@ jobs:
             exit 1
           fi
 
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           echo "Waiting for Inferno test kit to respond on $INFERNO_HOST:$INFERNO_PORT..."
           for i in {1..60}; do
             if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
@@ -141,7 +166,13 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Serialized: all matrix jobs share one Inferno instance, which runs a
+      # single test run at a time. Running two jobs in parallel made the second
+      # collide with the first's in-progress run ("Cannot run new test while
+      # another test run is in progress" / SQLite "database is locked"), and the
+      # per-job retry window (~30s) is far shorter than a run (~30min), so the
+      # loser always failed. One at a time avoids the contention entirely.
+      max-parallel: 1
       matrix:
         suite_id:
           [
@@ -152,7 +183,16 @@ jobs:
             us_core_v700,
             us_core_v800,
           ]
-        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        backend:
+          [
+            sqlite,
+            sqlite-elasticsearch,
+            postgres,
+            postgres-elasticsearch,
+            mongodb,
+            mongodb-elasticsearch,
+            s3-elasticsearch,
+          ]
         include:
           - { suite_id: us_core_v311, version_label: "v3.1.1" }
           - { suite_id: us_core_v400, version_label: "v4.0.0" }
@@ -180,8 +220,14 @@ jobs:
             exit 1
           fi
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
           # Get the runner's IP so the persistent Inferno container can reach HFS on this runner.
           RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
@@ -192,16 +238,39 @@ jobs:
           SUITE=${{ matrix.suite_id }}
           echo "TEST_GROUP_ID=${SUITE}-${SUITE}_fhir_api" >> $GITHUB_ENV
 
+          # An entry here must suppress a real failure in the suite it is emitted
+          # for. Emitting an id that the suite does not contain, or one that now
+          # passes, silently swallows a future regression on that test — see #492
+          # and the "Report omissions that suppressed nothing" step below, which
+          # surfaces both cases in the job summary so this list gets pruned
+          # rather than accreting.
+
           # CapabilityStatement tests: server doesn't yet declare US Core profiles/instantiates
           OMITTED="\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_conformance_support\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_profile_support\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_instantiate\""
           # TLS test: HFS does not serve HTTPS
           OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-standalone_auth_tls\""
-          # DataAbsentReason: test data does not include DAR extensions/code systems
-          # Note: Inferno uses "us_core_311" naming for this group across all US Core versions
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_extension\""
-          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-us_core_311_data_absent_reason-us_core_311_data_absent_reason_code_system\""
+
+          # us_core_profile_support / us_core_instantiate do not exist in the
+          # v3.1.1 suite. They were previously emitted unconditionally, so two
+          # of the six copies matched nothing (#492).
+          case "$SUITE" in
+            us_core_v400|us_core_v501|us_core_v610|us_core_v700|us_core_v800)
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_profile_support\""
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_capability_statement-us_core_instantiate\""
+              ;;
+          esac
+
+          # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it.
+          # The offending bundle (uscore_bundle_patient_client_test.json) is loaded for every suite, so omit across all versions.
+          OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
+
+          # The simple_observation group is only present from v6.1.0 onward; the
+          # v3.1.1/v4.0.0/v5.0.1 copies matched nothing (#492).
+          case "$SUITE" in
+            us_core_v610|us_core_v700|us_core_v800)
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
+              ;;
+          esac
 
           case "$SUITE" in
             us_core_v501|us_core_v610|us_core_v700|us_core_v800)
@@ -211,19 +280,31 @@ jobs:
           esac
 
           case "$SUITE" in
+            us_core_v700|us_core_v800)
+              # Inferno fhir_client gem bug with UUID-based Location references
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_location-${SUITE}_location_address_search_test\""
+              ;;
+          esac
+
+          case "$SUITE" in
+            us_core_v501)
+              # ObservationSocialHistory: shared test data does not conform to v5.0.1 profile slicing
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_observation_social_history-${SUITE}_observation_social_history_validation_test\""
+              ;;
+          esac
+
+          case "$SUITE" in
             us_core_v610|us_core_v700|us_core_v800)
-              # No Practitioner references found in test data for these versions
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_practitioner-${SUITE}_practitioner_address_test\""
+              # ObservationPregnancyIntent / ObservationPregnancyStatus: shared test data carries the unversioned profile URL and does not conform to the v6.1.0+ versioned profile slicing
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_observation_pregnancyintent-${SUITE}_observation_pregnancyintent_validation_test\""
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_observation_pregnancystatus-${SUITE}_observation_pregnancystatus_validation_test\""
               ;;
           esac
 
           case "$SUITE" in
             us_core_v700|us_core_v800)
-              # Inferno fhir_client gem bug with UUID-based Location references
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_location-${SUITE}_location_address_search_test\""
-              # smokingstatus/simple-observation: shared test data references SNOMED CT US-edition version (731000124108) not in International Edition; Inferno validator can't resolve it
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_smokingstatus-${SUITE}_smokingstatus_validation_test\""
-              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_simple_observation-${SUITE}_simple_observation_validation_test\""
+              # Specimen: shared test data does not conform to v7.0.0+ profile slicing
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_specimen-${SUITE}_specimen_validation_test\""
               ;;
           esac
 
@@ -233,17 +314,19 @@ jobs:
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_patient-${SUITE}_patient_validation_test\""
               # QuestionnaireResponse linkId text must match referenced Questionnaire definition
               OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_questionnaire_response-${SUITE}_questionnaire_response_validation_test\""
+              # ObservationADIDocumentation: shared test data does not conform to v8.0.0 profile slicing (introduced in v8)
+              OMITTED="${OMITTED},\"${SUITE}-${SUITE}_fhir_api-${SUITE}_observation_adi_documentation-${SUITE}_observation_adi_documentation_validation_test\""
               ;;
           esac
 
           echo "OMITTED_TESTS=[${OMITTED}]" >> $GITHUB_ENV
 
       - name: Start MongoDB replica set
-        if: matrix.backend == 'mongodb'
+        if: matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch'
         run: |
           MONGO_CONTAINER="mongo-${{ matrix.suite_id }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
 
@@ -283,10 +366,10 @@ jobs:
           exit 1
 
       - name: Start Elasticsearch
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           ES_CONTAINER="es-${{ matrix.suite_id }}-${{ matrix.backend }}"
-          docker rm -f $ES_CONTAINER 2>/dev/null || true
+          docker rm -fv $ES_CONTAINER 2>/dev/null || true
           docker run -d --name $ES_CONTAINER -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -313,10 +396,10 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL
-        if: matrix.backend == 'postgres'
+        if: matrix.backend == 'postgres' || matrix.backend == 'postgres-elasticsearch'
         run: |
-          PG_CONTAINER="pg-${{ matrix.suite_id }}"
-          docker rm -f $PG_CONTAINER 2>/dev/null || true
+          PG_CONTAINER="pg-${{ matrix.suite_id }}-${{ matrix.backend }}"
+          docker rm -fv $PG_CONTAINER 2>/dev/null || true
           docker run -d --name $PG_CONTAINER -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -373,16 +456,77 @@ jobs:
           aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
           echo "Prefix emptied"
 
+      - name: Re-check Elasticsearch before starting HFS
+        # "Start Elasticsearch" only proves ES answered when it was created.
+        # On the s3-elasticsearch legs, "Configure AWS credentials", "Install
+        # AWS CLI" and "Empty S3 prefix" open a gap of up to ~40s after that,
+        # and the matrix runs as many as eight ES containers at once on one
+        # self-hosted runner. A container that dies in that window stays
+        # invisible until HFS is already up: the composite bootstrap seeds
+        # every SearchParameter through the search backend, burns three retries
+        # each against a dead one, and the readiness loop below times out
+        # reporting "HFS failed to start" — the wrong component (run
+        # 35252379003, job 105316685765).
+        #
+        # Nothing has been written yet at this point, so restarting ES loses no
+        # data and is worth a try before failing the leg.
+        if: endsWith(matrix.backend, '-elasticsearch')
+        run: |
+          if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+            echo "Elasticsearch still answering on port $ES_PORT"
+            exit 0
+          fi
+
+          echo "::warning::Elasticsearch stopped answering on port $ES_PORT after 'Start Elasticsearch' — restarting $ES_CONTAINER"
+          docker ps -a --filter "name=$ES_CONTAINER" --format '{{.Names}}\t{{.Status}}' || true
+          # Memory pressure on the runner is the usual verdict; print it rather
+          # than leave it to be guessed from the absence of a reply.
+          docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
+          echo "=== last 30 log lines of $ES_CONTAINER ==="
+          docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
+          echo "=== end of log ==="
+
+          docker restart "$ES_CONTAINER" || true
+          for i in $(seq 1 30); do
+            # The container was published with `-p 0:9200`, so the host port is
+            # allocated at start time and a restart can move it. Re-read it
+            # instead of trusting the ES_PORT from before.
+            NEW_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$NEW_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$NEW_PORT/_cluster/health" > /dev/null 2>&1; then
+              echo "Elasticsearch is answering again on port $NEW_PORT"
+              echo "ES_PORT=$NEW_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/30: Elasticsearch still not answering..."
+            sleep 2
+          done
+
+          echo "::error::Elasticsearch did not come back after a restart. HFS would spend its whole readiness budget retrying bootstrap writes against a dead search backend, so the leg is failed here, where the cause is still visible."
+          exit 1
+
       - name: Start HFS server
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
+          HFS_BASE_URL="http://$RUNNER_IP:$HFS_PORT"
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
+          echo "HFS_BASE_URL=$HFS_BASE_URL" >> $GITHUB_ENV
 
+          # The Elasticsearch legs pair synchronous sync with wait_for so a
+          # write is searchable when the API responds. wait_for blocks each
+          # write until the next refresh, so the refresh interval is the price
+          # of every synchronous write: at the 1s default a 473-entry batch
+          # Bundle (entries synced one at a time, 16-wide) ran into the 30s
+          # request timeout; 200ms keeps it to a few seconds.
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=postgres \
             HFS_PG_HOST=$DOCKER_HOST_IP \
             HFS_PG_PORT=$PG_PORT \
@@ -390,20 +534,50 @@ jobs:
             HFS_PG_USER=helios \
             HFS_PG_PASSWORD=helios \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_STORAGE_BACKEND=postgres-elasticsearch \
+            HFS_PG_HOST=$DOCKER_HOST_IP \
+            HFS_PG_PORT=$PG_PORT \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
+            MONGO_HOST="$DOCKER_HOST_IP"
+            HFS_BASE_URL="$HFS_BASE_URL" \
+            HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+            HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_inferno_${{ matrix.suite_id }}_${{ github.run_id }}_${{ github.run_attempt }}" \
+            HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=s3-elasticsearch \
             HFS_S3_BUCKET=${{ secrets.HFS_S3_BUCKET }} \
             HFS_S3_PREFIX=ci/${{ matrix.suite_id }}/ \
             HFS_S3_VALIDATE_BUCKETS=false \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
+            HFS_COMPOSITE_SYNC_MODE=synchronous \
+            HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
+            HFS_BASE_URL="$HFS_BASE_URL" \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           fi
           echo $! > /tmp/hfs.pid
@@ -429,6 +603,19 @@ jobs:
             sleep 2
           done
           echo "HFS failed to start (process still running but not responding)"
+          # On the Elasticsearch legs this is usually not HFS's fault: its
+          # readiness depends on the search backend, so name that backend's
+          # state here instead of leaving the HFS log to be read for it.
+          if [ -n "$ES_CONTAINER" ]; then
+            if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+              echo "Elasticsearch on port $ES_PORT is answering, so this is not a search-backend outage."
+            else
+              echo "::error::Elasticsearch on port $ES_PORT is NOT answering — HFS was retrying its bootstrap writes against a dead search backend."
+              docker ps -a --filter "name=$ES_CONTAINER" --format '{{.Names}}\t{{.Status}}' || true
+              docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
+              docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
+            fi
+          fi
           echo "=== Last 50 lines of HFS log ==="
           tail -50 "$HFS_LOG"
           echo "=== end of log ==="
@@ -448,19 +635,62 @@ jobs:
         # returns as soon as HFS finishes writing, but the first search may run
         # before ES has refreshed, producing missing-data failures. Force a
         # refresh on all hfs_* indices so the first test batch sees fresh data.
-        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        if: endsWith(matrix.backend, '-elasticsearch')
         run: |
           curl -sf -X POST "http://$DOCKER_HOST_IP:$ES_PORT/hfs_*/_refresh" > /dev/null \
             || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
 
       - name: Sanity-check shared Inferno stack
+        env:
+          INFERNO_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          FALLBACK_PROJECT: inferno-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
-          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
-            echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          # Retry briefly. The shared stack is already proven healthy by
+          # inferno-stack-up, so this only covers a transient blip (nginx busy
+          # serving the previous matrix job's results, a momentary connection
+          # reset). A stack that is genuinely gone will not come back, so the
+          # window stays short: 10 x 3s, against stack-up's 60 x 2s.
+          for attempt in $(seq 1 10); do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
+              echo "Shared Inferno stack reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+              exit 0
+            fi
+            echo "Attempt $attempt/10: Inferno not reachable yet..."
+            sleep 3
+          done
+
+          echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          PROJECT="${INFERNO_PROJECT:-$FALLBACK_PROJECT}"
+          echo "Compose project for this run's stack: $PROJECT"
+          # Not `docker compose ps`: the test-kit checkout (and its compose
+          # file) only exists in the inferno-stack-up job, so query the daemon
+          # by compose label the same way inferno-stack-down does.
+          DOCKER_ERR=$(mktemp)
+          if ! CONTAINERS=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}\t{{.Status}}' 2>"$DOCKER_ERR"); then
+            echo "Could not query the Docker daemon about compose project '$PROJECT':"
+            cat "$DOCKER_ERR"
+            echo "::error::The Inferno stack did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s, and the Docker daemon could not be queried to say why."
             exit 1
           fi
+
+          if [ -z "$CONTAINERS" ]; then
+            echo "No containers exist for compose project '$PROJECT' — the stack for this run was torn down."
+            if [ "$RUN_ATTEMPT" != "1" ]; then
+              echo "::error::Run attempt $RUN_ATTEMPT re-ran this job alone, but 'Stop Shared Inferno Stack' already tore down the stack at the end of the previous attempt. 'Re-run failed jobs' does not re-run 'Start Shared Inferno Stack', and this job inherits that job's replayed outputs (port $INFERNO_PORT, project $PROJECT) pointing at containers that no longer exist. Use 'Re-run all jobs' instead."
+            else
+              echo "::error::The shared Inferno stack is gone even though this is run attempt 1 — check whether 'Stop Shared Inferno Stack' or another workflow removed compose project '$PROJECT' while the matrix was still running."
+            fi
+          else
+            echo "Containers still present for compose project '$PROJECT':"
+            printf '%s\n' "$CONTAINERS"
+            echo "::error::The Inferno stack's containers exist but the API did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s — inspect the container status above."
+          fi
+          exit 1
 
       - name: Create results directory
         run: mkdir -p inferno-results
@@ -609,6 +839,82 @@ jobs:
 
           echo "All tests passed (with $OMITTED_COUNT omitted)"
 
+      # An omission that suppresses nothing is worse than no omission: it is a
+      # test that would go red on a real regression and be swallowed instead.
+      # The list had accreted 20 such entries before #492 pruned them, and the
+      # only reason that was discoverable was a manual audit against a nightly's
+      # results. Surface both failure shapes every run so the next one is cheap:
+      #
+      #   stale  - the id ran and did not fail, so the omission changed nothing
+      #   absent - the id is not in this suite at all, so it never could
+      #
+      # Deliberately a warning, not a gate. A stale omission is not a broken
+      # build, and failing on it would make a *fixed* test turn CI red — exactly
+      # the backwards incentive that grew this list. It also cannot gate safely
+      # for another reason: the list is shared across all seven backend legs, and
+      # an id that passes on one backend may still be suppressing a real failure
+      # on another. Pruning needs agreement across the matrix, which a per-job
+      # gate cannot see. The job summary can.
+      - name: Report omissions that suppressed nothing
+        if: always()
+        run: |
+          if [ ! -f inferno-results/results.json ]; then
+            echo "No results file; skipping omit-list audit"
+            exit 0
+          fi
+          # Read the file directly rather than via `echo "$RESULTS"`. The results
+          # carry `\n` inside `result_message`, and an `echo` that interprets
+          # escapes (zsh, or bash's `echo -e`) expands them mid-string and makes
+          # the JSON unparseable. Passing the filename sidesteps the question.
+          LATEST='[.[] | select(.test_id)] | group_by(.test_id) | map(sort_by(.created_at) | last)'
+
+          STALE=$(jq -r --argjson omit "$OMITTED_TESTS" \
+            "$LATEST | .[] | select((.test_id | IN(\$omit[])) and .result != \"fail\" and .result != \"error\") | \"\(.test_id) — \(.result)\"" \
+            inferno-results/results.json)
+          ABSENT=$(jq -r --argjson omit "$OMITTED_TESTS" \
+            "[$LATEST | .[].test_id] as \$present | \$omit[] | select([.] | inside(\$present) | not)" \
+            inferno-results/results.json)
+
+          if [ -z "$STALE" ] && [ -z "$ABSENT" ]; then
+            echo "Every omitted id suppressed a real failure — nothing to prune."
+            {
+              echo "### Omit-list audit"
+              echo ""
+              echo ":white_check_mark: Every omitted id suppressed a real failure."
+            } >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          {
+            echo "### Omit-list audit — entries that suppressed nothing"
+            echo ""
+            echo "These ids are in \`OMITTED_TESTS\` but swallowed no failure in this run."
+            echo "Confirm across the other backend legs before pruning (see #492)."
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "$STALE" ]; then
+            echo "::warning::Omitted tests that did not fail (candidates for pruning):"
+            echo "$STALE" | sed 's/^/  /'
+            {
+              echo "**Stale — ran and did not fail:**"
+              echo ""
+              echo "$STALE" | sed 's/^/- /'
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -n "$ABSENT" ]; then
+            echo "::warning::Omitted ids not present in this suite at all:"
+            echo "$ABSENT" | sed 's/^/  /'
+            {
+              echo "**Absent — no such test in this suite:**"
+              echo ""
+              echo "$ABSENT" | sed 's/^/- /'
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Generate test summary
         if: always()
         run: |
@@ -684,6 +990,31 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+      # Diagnostics: capture why mongod died (host-OOM vs cgroup-OOM vs crash)
+      # without needing shell access to the Docker host. Runs before Cleanup
+      # removes the container.
+      - name: Diagnose MongoDB failure
+        if: failure() && (matrix.backend == 'mongodb' || matrix.backend == 'mongodb-elasticsearch')
+        run: |
+          echo "::group::MongoDB container state (OOMKilled / exit code)"
+          docker inspect "${MONGO_CONTAINER:-none}" \
+            --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}} Error={{.State.Error}} FinishedAt={{.State.FinishedAt}}' 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::mongod logs (last 60 lines)"
+          docker logs "${MONGO_CONTAINER:-none}" --tail 60 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::Host OOM-killer (kernel ring buffer)"
+          docker run --rm --privileged busybox dmesg 2>/dev/null \
+            | grep -iE "out of memory|killed process|oom" | tail -25 || true
+          echo "(end of OOM grep — empty means no OOM lines found)"
+          echo "::endgroup::"
+          echo "::group::Docker host memory + containers"
+          docker run --rm busybox sh -c \
+            'grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree" /proc/meminfo' 2>&1 || true
+          docker info --format 'MemTotal={{.MemTotal}} Containers={{.Containers}} Running={{.ContainersRunning}}' 2>&1 || true
+          docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' 2>&1 || true
+          echo "::endgroup::"
+
       - name: Cleanup
         if: always()
         run: |
@@ -694,13 +1025,13 @@ jobs:
           fi
 
           echo "Stopping Elasticsearch..."
-          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping PostgreSQL..."
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping MongoDB..."
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
 
@@ -720,7 +1051,7 @@ jobs:
 
           IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
           if [ -n "$IDS" ]; then
-            docker rm -f $IDS
+            docker rm -fv $IDS
           fi
 
           NETS=$(docker network ls --filter "label=com.docker.compose.project=$PROJECT" -q)

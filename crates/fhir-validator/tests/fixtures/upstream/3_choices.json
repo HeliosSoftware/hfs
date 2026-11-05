@@ -1,0 +1,98 @@
+{
+  "desc": "choices keyword",
+  "schemas": {
+    "string":  { "kind": "primitive-type" },
+    "integer": { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": {"type": "string"},
+        "choice": {
+          "choices": ["choiceString", "choiceInteger"]
+        },
+        "choiceString":    {"choiceOf": "choice", "type": "string"},
+        "choiceInteger":   {"choiceOf": "choice", "type": "integer"}
+      }
+    },
+    "Profile": {
+      "base": "Resource",
+      "elements": {
+        "choice": {
+          "choices": ["choiceString"]
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "choice string",
+      "data": {
+        "resourceType": "Resource",
+        "choiceString": "ok"
+      }
+    },
+    {
+      "desc": "choice integer",
+      "data": {
+        "resourceType": "Resource",
+        "choiceInteger": 1
+      }
+    },
+    {
+      "desc": "wrong choice",
+      "data": {
+        "resourceType": "Resource",
+        "choice": "ups"
+      },
+      "errors": [{
+        "type": "unknown-element",
+        "path": "Resource.choice",
+        "message": "choice is unknown"
+      }]
+    },
+    {
+      "desc": "choices conflict - two at the same time",
+      "data": {
+        "resourceType": "Resource",
+        "choiceString": "ok",
+        "choiceInteger": 1
+      },
+      "errors": [{
+        "type": "choice",
+        "path": "Resource.choice",
+        "message": "only one choice for choice allowed, but multiple found: choiceString, choiceInteger"
+      }]
+    },
+    {
+      "desc": "unknown element",
+      "data": {
+        "resourceType": "Resource",
+        "unknown": "ups"
+      },
+      "errors": [{
+        "type": "unknown-element",
+        "path": "Resource.unknown",
+        "message": "unknown is unknown"
+      }]
+    },
+    {
+      "desc": "constraint choice ok",
+      "data": {
+        "resourceType": "Profile",
+        "choiceString": "ok"
+      }
+    },
+    {
+      "desc": "constraint choice not ok",
+      "focus": true,
+      "data": {
+        "resourceType": "Profile",
+        "choiceInteger": 1
+      },
+      "errors": [{
+        "message": "choiceInteger is excluded choice",
+        "path": "Profile.choiceInteger",
+        "type": "choice-excluded"
+      }]
+    }
+  ]
+}

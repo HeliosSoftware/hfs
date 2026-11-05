@@ -54,7 +54,6 @@ ResourceStorage
   │     └── SystemHistoryProvider
   ├── SearchProvider
   │     ├── MultiTypeSearchProvider
-  │     ├── ChainedSearchProvider
   │     └── IncludeProvider
   └── TransactionProvider
         └── BundleProvider

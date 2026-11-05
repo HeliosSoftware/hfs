@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?><Task xmlns="http://hl7.org/fhir">
   <!-- This is an example to demonstrate using task for actioning a servicerequest and to illustrate how to populate many of the task elements - this is the parent task that will be broken into subtask to grab the specimen
-example1 action lipid panel -in progress =>. example2 specimen collection subtask -accepted => example4  specimen collection subtask - completed  with output Specimen=>example 5 action lipid panel -in progress specimen collected => example 6 action lipid panel - completed with output DiagnosticReport  -->
+example1 action lipid panel -in progress =>. example2 specimen collection subtask -accepted => example4  specimen collection subtask - completed  with output Specimen=>example 5 action lipid panel -in progress specimen collected => example 6 action lipid panel - completed with output DiagnosticReport -->
   <id value="example1"/>
-  <!--  using contained resource for the purpose of this example only typically this would be a separate independent resource  -->
+  <!-- using contained resource for the purpose of this example only typically this would be a separate independent resource -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -60,13 +60,13 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     <value value="G20170201-001"/>
   </groupIdentifier>
   <status value="in-progress"/>
-  <!-- fictive business status populated for this example  -->
+  <!-- fictive business status populated for this example -->
   <businessStatus>
     <text value="waiting for specimen"/>
   </businessStatus>
   <intent value="order"/>
   <priority value="routine"/>
-  <!-- fictive code and description elements populated for this example  -->
+  <!-- fictive code and description elements populated for this example -->
   <code>
     <coding>
       <system value="http://hl7.org/fhir/CodeSystem/task-code"/>
@@ -74,15 +74,14 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     </coding>
   </code>
   <description value="Create order for getting specimen, Set up inhouse testing,  generate order for any sendouts and submit with specimen"/>
-  <!-- 	Use the lipid servicerequest example  -->
+  <!-- Use the lipid servicerequest example -->
   <focus>
     <valueReference>
       <reference value="ServiceRequest/lipid"/>
       <display value="Lipid Panel Request"/>
     </valueReference>
   </focus>
-  <!-- 	who the task is for
- -->
+  <!-- who the task is for -->
   <for>
     <reference value="Patient/example"/>
     <display value="Peter James Chalmers"/>
@@ -91,7 +90,7 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     <reference value="Encounter/example"/>
     <display value="Example In-Patient Encounter"/>
   </encounter>
-  <!-- 	Lots of dates  -->
+  <!-- Lots of dates -->
   <executionPeriod>
     <start value="2016-10-31T08:25:05+10:00"/>
   </executionPeriod>
@@ -115,8 +114,7 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     <reference value="Organization/1832473e-2fe0-452d-abe9-3cdb9879522f"/>
     <display value="Clinical Laboratory @ Acme Hospital"/>
   </owner>
-  <!-- 	populate the reason just to demonstrate it use in this example
- -->
+  <!-- populate the reason just to demonstrate it use in this example -->
   <reason>
     <concept>
       <text value="The Task.reason should only be included if there is no Task.focus or if it differs from the reason indicated on the focus"/>
@@ -125,15 +123,12 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
   <note>
     <text value="This is an example to demonstrate using task for actioning a servicerequest and to illustrate how to populate many of the task elements - this is the parent task that will be broken into subtask to grab the specimen and a sendout lab test"/>
   </note>
-  <!-- 	add the link to the signature on the task to show how this element is usedemonstrating in this example the relevant history element using a contained resource for the purpose of this example only typically would reference an external resource
-
- -->
+  <!-- add the link to the signature on the task to show how this element is usedemonstrating in this example the relevant history element using a contained resource for the purpose of this example only typically would reference an external resource -->
   <relevantHistory>
     <reference value="#signature"/>
     <display value="Author's Signature"/>
   </relevantHistory>
-  <!-- 	complete the request within 48 hrs
- -->
+  <!-- complete the request within 48 hrs -->
   <restriction>
     <repetitions value="1"/>
     <period>

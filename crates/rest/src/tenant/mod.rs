@@ -40,8 +40,10 @@
 //! let config = MultitenancyConfig::default();
 //! let resolver = TenantResolver::new(&config);
 //!
-//! // In an Axum handler:
-//! let resolved = resolver.resolve(&parts, &config, "default");
+//! // In an Axum handler. `resolve` fails when a source *asserted* a tenant id
+//! // that is not canonical (see `helios_persistence::tenant::TenantId::parse`);
+//! // a request that asserts nothing resolves to the default tenant.
+//! let resolved = resolver.resolve(&parts, &config, "default")?;
 //! println!("Tenant: {} (from {})", resolved.tenant_id_str(), resolved.source);
 //! ```
 
@@ -50,7 +52,7 @@ mod source;
 mod validation;
 
 pub use resolver::{
-    HeaderTenantExtractor, JwtTenantExtractor, ResolvedTenant, TenantResolver,
+    HeaderTenantExtractor, JwtTenantExtractor, ResolvedTenant, TenantResolver, TenantSourceError,
     TenantSourceExtractor, UrlPathTenantExtractor,
 };
 pub use source::TenantSource;

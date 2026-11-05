@@ -1,0 +1,5 @@
+# This ritual is run by hand (see README.md) — never at build time or in CI.
+# package-lock.json IS committed: it is the pin that makes the ritual
+# reproducible. Only npm's own working state and packed tarballs are ignored.
+node_modules/
+*.tgz

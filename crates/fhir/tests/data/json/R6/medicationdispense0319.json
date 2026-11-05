@@ -68,6 +68,7 @@
     }
   ],
   "dosageInstruction": {
+    "renderedInstruction": "Two tablets at once, then one tablet daily for 4 days. Take with or after food.",
     "step": [
       {
         "component": [

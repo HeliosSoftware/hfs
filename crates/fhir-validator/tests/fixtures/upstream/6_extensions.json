@@ -1,0 +1,115 @@
+{
+  "desc": "extensions",
+  "schemas": {
+    "string":  { "kind": "primitive-type" },
+    "http://hl7.org/us-core-race": {
+      "kind": "extension",
+      "elements": {
+        "value": {
+          "choices": ["valueString"]
+        }
+      }
+    },
+    "Extension": {
+      "elements": {
+        "url": {"type": "string"},
+        "value": {"choices": ["valueString", "valueCode"]},
+        "valueString": {"choiceOf": "value", "type": "string"},
+        "valueCode":   {"choiceOf": "value", "type": "string"}
+      }
+    },
+    "Resource": {
+      "extensions": {
+        "us-core-race": {
+          "url": "http://hl7.org/us-core-race",
+          "max": 1,
+          "min": 1
+        }
+      },
+      "elements": {
+        "resourceType": { "type": "string" },
+        "extension":    { "type": "Extension", "array": true },
+        "element":      { "type": "string" }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "unknown extension - just check the shape",
+      "data": {
+        "resourceType": "Resource",
+        "extension": [
+          {
+            "url": "unknown",
+            "valueString": "string"
+          },
+          {
+            "url": "unknown",
+            "valueCode": "code"
+          },
+          {
+            "url": "http://hl7.org/us-core-race",
+            "valueString": "ok"
+          }
+        ]
+      }
+    },
+    {
+      "desc": "missed extension (no extension element)",
+      "skip": true,
+      "comment": "Shall we support it or it should be combination of required and slices like in JSON schema?",
+      "data": {
+        "resourceType": "Resource"
+      },
+      "errors": [
+        {
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'",
+          "path": "Resource.extension",
+          "type": "slice-cardinality"
+        }
+      ]
+    },
+    {
+      "desc": "missed extension (with extension element)",
+      "data": {
+        "resourceType": "Resource",
+        "extension": [
+          {
+            "url": "unknown",
+            "valueString": "string"
+          },
+          {
+            "url": "unknown",
+            "valueCode": "code"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'",
+          "path": "Resource.extension",
+          "type": "slice-cardinality"
+        }
+      ]
+    },
+    {
+      "desc": "broken extension schema",
+      "data": {
+        "resourceType": "Resource",
+        "extension": [
+          {
+            "url": "http://hl7.org/us-core-race",
+            "valueCode": "wrong"
+          }
+        ]
+      },
+      "errors":  [
+        {
+          "message": "valueCode is excluded choice",
+          "path": "Resource.extension.0.valueCode",
+          "type": "choice-excluded"
+        }
+      ]
+    }
+  ]
+}

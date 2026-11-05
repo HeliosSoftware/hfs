@@ -18,7 +18,7 @@
     },
     {
       "resourceType": "Organization",
-      "id": "payor",
+      "id": "payer",
       "identifier": [
         {
           "system": "http://www.jurisdiction.com/insurer",
@@ -102,7 +102,7 @@
   ],
   "informationProvider": [
     {
-      "reference": "#payor"
+      "reference": "#payer"
     }
   ],
   "meta": {

@@ -8,15 +8,17 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::fhir_types::admit_resource_type;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -58,14 +60,39 @@ pub async fn create_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
+    // Determine FHIR version from header or use server default
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+
+    admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope creates inside the launch patient's compartment only
+    // (#1618): the submitted payload must reference the launch patient through
+    // a compartment parameter. A conditional create is refused outright — its
+    // `If-None-Exist` match could be another patient's resource, which the
+    // response would then disclose.
+    if compartment.is_confined() {
+        if conditional.if_none_exist().is_some() {
+            return Err(compartment.outside_compartment(
+                "a conditional create is not available under a patient/ scope: the If-None-Exist match cannot be confined to the launch patient's compartment".to_string(),
+            ));
+        }
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            fhir_version,
+            &resource,
+            "create",
+        )?;
+    }
+
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
@@ -73,9 +100,6 @@ where
             resource_type: resource_type.to_string(),
         });
     }
-
-    // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -88,24 +112,40 @@ where
         "Processing create request"
     );
 
-    // Validate resourceType in body matches URL
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    } else {
-        return Err(RestError::BadRequest {
-            message: "Resource must contain resourceType".to_string(),
-        });
+    // Per http.html#create "the server ignores the id provided in the
+    // resource" — a create always assigns a fresh server id. Honoring a
+    // client id made a second POST of the same document answer 409, which
+    // broke standard transaction ingestion of bundles that repeat shared
+    // resources (#647). Internal callers that rely on caller-supplied ids
+    // for idempotency (spec seeding) go straight to storage, not through
+    // this handler.
+    let mut resource = resource;
+    if let Some(obj) = resource.as_object_mut() {
+        obj.remove("id");
     }
+
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
+
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
 
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
+        super::conditional_support::require_create(state.storage())?;
         debug!(search_params = %search_params, "Processing conditional create");
 
         let result = state
@@ -122,8 +162,34 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
+                super::sof::terminology::commit_library_write(
+                    &state,
+                    tenant.context(),
+                    stored.id(),
+                    terminology,
+                )
+                .await;
+                // Counted, but conditional writes announce nothing.
+                super::write_event::report(
+                    &state,
+                    tenant.context(),
+                    fhir_version,
+                    &resource_type,
+                    1,
+                    None,
+                );
+                // Stored StructureDefinitions feed the tenant's profile
+                // registry.
+                if resource_type == "StructureDefinition" {
+                    state.validation().upsert_stored_profile(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        stored.content(),
+                    );
+                }
                 let headers = ResourceHeaders::from_stored(&stored, &state);
-                let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+                let location =
+                    state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
                 debug!(
                     resource_type = %resource_type,
@@ -191,27 +257,42 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
+    super::sof::terminology::commit_library_write(
+        &state,
+        tenant.context(),
+        stored.id(),
+        terminology,
+    )
+    .await;
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        1,
+        Some(super::write_event::stored_notice(
+            WriteKind::Create,
+            &stored,
+        )),
+    );
+
+    // Stored StructureDefinitions feed the tenant's profile registry.
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
-    let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
+    let location = state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
 
     debug!(
         resource_type = %resource_type,
         id = %stored.id(),
         "Resource created"
     );
-
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
-            &stored,
-            fhir_version,
-            helios_subscriptions::ResourceEventType::Create,
-        );
-    }
 
     build_create_response(
         StatusCode::CREATED,
@@ -258,19 +339,11 @@ fn build_create_response(
                     }
                 }]
             });
-            format_resource_response(status, header_map, &outcome, format).map_err(|_| {
-                RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                }
-            })
+            format_resource_response(status, header_map, &outcome, format)
         }
         _ => {
             // Default: return=representation
-            format_resource_response(status, header_map, stored.content(), format).map_err(|_| {
-                RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                }
-            })
+            format_resource_response(status, header_map, &stored.content_with_meta(), format)
         }
     }
 }
@@ -286,9 +359,11 @@ fn build_existing_response(
 
     match prefer.return_preference() {
         Some("minimal") => Ok((StatusCode::OK, header_map).into_response()),
-        _ => format_resource_response(StatusCode::OK, header_map, stored.content(), format)
-            .map_err(|_| RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            }),
+        _ => format_resource_response(
+            StatusCode::OK,
+            header_map,
+            &stored.content_with_meta(),
+            format,
+        ),
     }
 }

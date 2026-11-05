@@ -27,6 +27,11 @@ pub trait ConceptMapOperations: Send + Sync {
         query: ResourceSearchQuery,
     ) -> Result<Vec<serde_json::Value>, HtsError>;
 
+    /// Count the ConceptMap resources matching `query`, ignoring `_count` and
+    /// `_offset`. Used for `Bundle.total` and `_summary=count`.
+    async fn count(&self, ctx: &TenantContext, query: ResourceSearchQuery)
+    -> Result<u64, HtsError>;
+
     /// Translate a code from one system to another using a ConceptMap.
     ///
     /// If `url` is provided, only that ConceptMap is consulted; otherwise all

@@ -2,50 +2,71 @@
 
 use serde_json::{Value, json};
 
+use crate::search::fold_text;
 use crate::types::{SearchModifier, SearchParameter};
+
+/// ORs an accent-folded match (against the `folded` field) with a raw-field
+/// match, so accent-insensitive search works on reindexed docs while docs not
+/// yet carrying the `folded` field still match via the raw field.
+fn folded_or_raw(folded: Value, raw: Value) -> Value {
+    json!({ "bool": { "should": [folded, raw], "minimum_should_match": 1 } })
+}
 
 /// Builds an ES query clause for a string search parameter.
 pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
     let name = &param.name;
+    let folded = fold_text(value);
 
     let condition = match param.modifier {
         Some(SearchModifier::Exact) => {
-            // Case-sensitive exact match
+            // Case- and accent-sensitive exact match
             json!({
                 "term": { "search_params.string.value.keyword": value }
             })
         }
         Some(SearchModifier::Contains) => {
-            // Case-insensitive substring match
-            json!({
-                "wildcard": {
-                    "search_params.string.value.lowercase": {
-                        "value": format!("*{}*", value.to_lowercase())
+            // Case- and accent-insensitive substring match
+            folded_or_raw(
+                json!({
+                    "wildcard": { "search_params.string.folded": { "value": format!("*{}*", folded) } }
+                }),
+                json!({
+                    "wildcard": {
+                        "search_params.string.value.lowercase": {
+                            "value": format!("*{}*", value.to_lowercase())
+                        }
                     }
-                }
-            })
+                }),
+            )
         }
         Some(SearchModifier::Text) => {
-            // Full-text match using standard analyzer
-            json!({
-                "match": {
-                    "search_params.string.value": {
-                        "query": value,
-                        "operator": "and"
+            // Full-text match, plus an accent-folded substring branch.
+            folded_or_raw(
+                json!({
+                    "wildcard": { "search_params.string.folded": { "value": format!("*{}*", folded) } }
+                }),
+                json!({
+                    "match": {
+                        "search_params.string.value": {
+                            "query": value,
+                            "operator": "and"
+                        }
                     }
-                }
-            })
+                }),
+            )
         }
         _ => {
-            // Default: case-insensitive prefix match
-            // Use match_phrase_prefix for natural prefix matching
-            json!({
-                "match_phrase_prefix": {
-                    "search_params.string.value": {
-                        "query": value
+            // Default: case- and accent-insensitive prefix match.
+            folded_or_raw(
+                json!({
+                    "wildcard": { "search_params.string.folded": { "value": format!("{}*", folded) } }
+                }),
+                json!({
+                    "match_phrase_prefix": {
+                        "search_params.string.value": { "query": value }
                     }
-                }
-            })
+                }),
+            )
         }
     };
 

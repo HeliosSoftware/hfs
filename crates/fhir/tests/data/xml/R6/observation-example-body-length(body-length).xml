@@ -18,7 +18,7 @@
     </coding>
     <text value="Vital Signs"/>
   </category>
-  <!--   This example demonstrates a measurement code for "Body Length" ( typically used for infants) which is more specific than the "interoperability category" code for "Body height".  -->
+  <!-- This example demonstrates a measurement code for "Body Length" ( typically used for infants) which is more specific than the "interoperability category" code for "Body height". -->
   <code>
     <coding>
       <system value="http://loinc.org"/>
@@ -27,7 +27,7 @@
       <userSelected value="true"/>
     </coding>
     <coding>
-      <!--  for the vital signs profile  -->
+      <!-- for the vital signs profile -->
       <system value="http://loinc.org"/>
       <code value="8302-2"/>
       <display value="Body height"/>

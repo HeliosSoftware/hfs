@@ -69,7 +69,7 @@
   </contained>
   <identifier>
     <use value="official"/>
-    <!--  urn:oid:2.16.840.1.113883.4.642.1.36  -->
+    <!-- urn:oid:2.16.840.1.113883.4.642.1.36 -->
     <system value="http://www.bmc.nl/zorgportal/identifiers/careplans"/>
     <value value="CP3953"/>
   </identifier>
@@ -96,7 +96,7 @@
   <goal>
     <reference value="#goal"/>
   </goal>
-  <!--  moved to contained
+  <!-- moved to contained
     <plannedActivityDetail>
       <kind value="ServiceRequest"/>
       <code>
@@ -113,8 +113,7 @@
         <reference value="Practitioner/f001"/>
         <display value="E.M. van den broek"/>
       </performer>
-    </plannedActivityDetail>
-	 -->
+    </plannedActivityDetail> -->
   <activity>
     <plannedActivityReference>
       <reference value="#activity"/>

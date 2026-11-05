@@ -52,11 +52,13 @@
   </careTeam>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654456"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654456"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <insurance>
     <sequence value="1"/>
@@ -69,7 +71,7 @@
     <sequence value="1"/>
     <careTeamSequence value="1"/>
     <productOrService>
-      <!--  smoking cessation consult  -->
+      <!-- smoking cessation consult -->
       <coding>
         <system value="http://hl7.org/fhir/ex-pharmaservice"/>
         <code value="smokecess"/>

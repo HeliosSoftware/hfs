@@ -62,7 +62,13 @@
       </coding>
     </concept>
   </definition>
-  <handling/>
+  <handling>
+    <coding>
+      <system value="https://fevir.net/sevco"/>
+      <code value="STATO:0000090"/>
+      <display value="dichotomous variable"/>
+    </coding>
+  </handling>
   <category>
     <name value="Jumping from aircraft with parachute"/>
     <valueReference>

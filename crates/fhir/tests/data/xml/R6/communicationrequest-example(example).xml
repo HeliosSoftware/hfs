@@ -12,7 +12,7 @@
   </text>
   <status value="active"/>
   <intent value="proposal"/>
-  <!--  insert contents here  -->
+  <!-- insert contents here -->
   <subject>
     <reference value="Patient/example"/>
   </subject>

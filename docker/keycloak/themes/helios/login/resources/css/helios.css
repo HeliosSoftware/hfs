@@ -1,0 +1,219 @@
+/*
+ * Helios login theme — Keycloak classic login, restyled to match the HFS web
+ * UI (Figma "Dashboard V1.1"). CSS-only overrides on top of the parent
+ * `keycloak` theme; palette and font come from crates/ui/assets/app.css.
+ */
+
+@font-face {
+  font-family: "Figtree";
+  font-style: normal;
+  font-weight: 300 900;
+  font-display: swap;
+  src: url("../fonts/figtree-latin.woff2") format("woff2");
+}
+
+:root {
+  --helios-bg: #f5f5f5;
+  --helios-surface: #ffffff;
+  --helios-border: #eaeaea;
+  --helios-text: #101010;
+  --helios-muted: #737373;
+  --helios-accent: #33b8ff;
+  --helios-accent-strong: #1aa5f0;
+  --helios-radius: 16px;
+}
+
+/* ---------- Page ---------- */
+
+html {
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body.login-pf-page,
+.login-pf body,
+.login-pf-page {
+  background: var(--helios-bg) !important;
+  color: var(--helios-text);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The stock theme paints a full-bleed background image; drop it. */
+.login-pf body {
+  background-image: none !important;
+}
+
+.login-pf-page .login-pf-header {
+  margin-bottom: 24px;
+}
+
+/* ---------- Brand logo (replaces the realm-name text header) ---------- */
+
+#kc-header-wrapper {
+  /* Hide the realm display-name text; the logo carries the brand. */
+  font-size: 0;
+  padding: 0;
+  white-space: normal;
+}
+
+#kc-header-wrapper::before {
+  content: "";
+  display: block;
+  height: 56px;
+  margin: 8px auto 4px;
+  background: url("../img/logo.png") center / contain no-repeat;
+}
+
+/* ---------- Card ---------- */
+
+.login-pf-page .card-pf {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 32px;
+  background: var(--helios-surface);
+  border: 1px solid var(--helios-border);
+  border-radius: var(--helios-radius);
+  box-shadow: 0 8px 30px rgb(0 0 0 / 6%);
+}
+
+#kc-page-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--helios-text);
+}
+
+/* ---------- Labels & inputs ---------- */
+
+.login-pf-page label,
+#kc-form-options,
+.login-pf-page .kc-login-tooltip {
+  color: var(--helios-muted);
+  font-weight: 500;
+}
+
+.login-pf-page input[type="text"],
+.login-pf-page input[type="email"],
+.login-pf-page input[type="password"],
+.login-pf-page .pf-c-form-control,
+#kc-form-login input {
+  height: 44px;
+  padding: 0 12px;
+  background: var(--helios-surface);
+  border: 1px solid var(--helios-border);
+  border-radius: 10px;
+  color: var(--helios-text);
+  font-size: 15px;
+  box-shadow: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.login-pf-page input[type="text"]:focus,
+.login-pf-page input[type="email"]:focus,
+.login-pf-page input[type="password"]:focus,
+#kc-form-login input:focus {
+  outline: none;
+  border-color: var(--helios-accent);
+  box-shadow: 0 0 0 3px rgb(51 184 255 / 15%);
+}
+
+/*
+ * Password field with the show/hide toggle. Keycloak 26's classic login theme
+ * renders `<div.pf-c-input-group> <input.pf-c-form-control> <button.pf-c-button
+ * .pf-m-control>` so the field and the eye read as one control. The group owns
+ * the border/radius; the inner input and button go borderless. Child combinator
+ * + !important so PatternFly's own `.pf-c-input-group *` rules don't win back the
+ * separate borders (which rendered the toggle as a raw square box before this).
+ */
+.login-pf-page .pf-c-input-group {
+  display: flex !important;
+  align-items: stretch;
+  height: 44px;
+  background: var(--helios-surface) !important;
+  border: 1px solid var(--helios-border) !important;
+  border-radius: 10px !important;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.login-pf-page .pf-c-input-group:focus-within {
+  border-color: var(--helios-accent) !important;
+  box-shadow: 0 0 0 3px rgb(51 184 255 / 15%);
+}
+
+.login-pf-page .pf-c-input-group > .pf-c-form-control {
+  height: 42px;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  flex: 1;
+}
+
+.login-pf-page .pf-c-input-group > .pf-c-button.pf-m-control {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  padding: 0;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  color: var(--helios-muted) !important;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.login-pf-page .pf-c-input-group > .pf-c-button.pf-m-control:hover {
+  color: var(--helios-accent-strong) !important;
+  background: transparent !important;
+}
+
+.login-pf-page .pf-c-input-group > .pf-c-button.pf-m-control::before,
+.login-pf-page .pf-c-input-group > .pf-c-button.pf-m-control::after {
+  display: none !important;
+  border: 0 !important;
+}
+
+/* ---------- Primary button ---------- */
+
+.login-pf-page input[type="submit"],
+.login-pf-page .btn-primary,
+#kc-login {
+  width: 100%;
+  height: 46px;
+  margin-top: 8px;
+  background: var(--helios-accent) !important;
+  background-image: none !important;
+  border: 0 !important;
+  border-radius: 10px;
+  color: #002438 !important;
+  font-weight: 600;
+  font-size: 15px;
+  text-shadow: none;
+  box-shadow: none;
+  transition: background 0.15s ease;
+}
+
+.login-pf-page input[type="submit"]:hover,
+.login-pf-page .btn-primary:hover,
+#kc-login:hover {
+  background: var(--helios-accent-strong) !important;
+}
+
+/* ---------- Links ---------- */
+
+.login-pf-page a,
+#kc-registration a,
+#kc-info-message a {
+  color: var(--helios-accent-strong);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.login-pf-page a:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Alerts ---------- */
+
+.login-pf-page .alert-error,
+.login-pf-page .pf-c-alert.pf-m-danger {
+  border-radius: 10px;
+}

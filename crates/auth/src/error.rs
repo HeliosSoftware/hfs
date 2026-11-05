@@ -33,16 +33,25 @@ pub enum AuthError {
         kid: String,
     },
 
-    /// Token with this JTI has already been used.
-    #[error("JTI replay detected: {jti}")]
-    ReplayDetected {
-        /// The replayed JWT ID.
-        jti: String,
-    },
-
     /// Authenticated principal lacks required scopes.
     #[error("Forbidden: insufficient scope for {operation} on {resource_type}")]
     Forbidden {
+        /// The FHIR resource type.
+        resource_type: String,
+        /// The operation that was attempted.
+        operation: String,
+    },
+
+    /// The operation is granted only by a `patient/` scope, but the token
+    /// carries no usable patient launch context to confine it to.
+    ///
+    /// A `patient/` scope is access to one patient's compartment; without a
+    /// `patient` claim naming that patient there is nothing to confine to, so
+    /// the scope is refused rather than widened to `user/` (#1618).
+    #[error(
+        "Forbidden: {operation} on {resource_type} is granted only by a patient/ scope and the token has no usable patient launch context"
+    )]
+    PatientContextRequired {
         /// The FHIR resource type.
         resource_type: String,
         /// The operation that was attempted.

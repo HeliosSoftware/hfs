@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::fetcher::JwksFetcher;
+use crate::config::redact_url;
 use crate::error::AuthError;
 
 /// Default cache TTL when no Cache-Control header is present.
@@ -43,7 +44,8 @@ impl JwksCache {
     ///
     /// Also spawns a background task to refresh keys before expiry.
     pub async fn initial_fetch(&self) -> Result<(), AuthError> {
-        info!(url = %self.jwks_url, "Performing initial JWKS fetch");
+        // Redacted: a JWKS URL may carry userinfo or a query credential (#2149).
+        info!(url = %redact_url(&self.jwks_url), "Performing initial JWKS fetch");
         self.refresh().await?;
         self.spawn_background_refresh();
         Ok(())
@@ -134,7 +136,7 @@ impl JwksCache {
 
                 tokio::time::sleep(sleep_duration).await;
 
-                debug!(url = %url, "Background JWKS refresh triggered");
+                debug!(url = %redact_url(&url), "Background JWKS refresh triggered");
                 match fetcher.fetch(&url).await {
                     Ok(response) => {
                         let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);

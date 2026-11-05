@@ -1,0 +1,89 @@
+{
+  "desc": "primitive value validation — Helios extended (JSON type-class from the primitive's declared type, regex from the pack's `regex` extension; dead code upstream)",
+  "schemas": {
+    "string": { "kind": "primitive-type", "type": "string", "regex": "[ \\r\\n\\t\\S]+" },
+    "boolean": { "kind": "primitive-type", "type": "boolean" },
+    "integer": { "kind": "primitive-type", "type": "integer" },
+    "decimal": { "kind": "primitive-type", "type": "decimal" },
+    "date": {
+      "kind": "primitive-type",
+      "type": "date",
+      "regex": "([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)(-(0[1-9]|1[0-2])(-(0[1-9]|[1-2][0-9]|3[0-1]))?)?"
+    },
+    "Patient": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "active": { "type": "boolean" },
+        "rank": { "type": "integer" },
+        "score": { "type": "decimal" },
+        "birthDate": { "type": "date" },
+        "note": { "type": "string" }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "all primitive values well-typed",
+      "data": {
+        "resourceType": "Patient",
+        "active": true,
+        "rank": 3,
+        "score": 1.5,
+        "birthDate": "1974-12-25",
+        "note": "hello"
+      }
+    },
+    {
+      "desc": "boolean given a string",
+      "data": { "resourceType": "Patient", "active": "true" },
+      "errors": [
+        {
+          "type": "primitive-value",
+          "path": "Patient.active",
+          "message": "expected boolean, got string"
+        }
+      ]
+    },
+    {
+      "desc": "integer given a decimal number",
+      "data": { "resourceType": "Patient", "rank": 2.5 },
+      "errors": [
+        {
+          "type": "primitive-value",
+          "path": "Patient.rank",
+          "message": "expected integer, got number"
+        }
+      ]
+    },
+    {
+      "desc": "string given a number",
+      "data": { "resourceType": "Patient", "note": 5 },
+      "errors": [
+        {
+          "type": "primitive-value",
+          "path": "Patient.note",
+          "message": "expected string, got number"
+        }
+      ]
+    },
+    {
+      "desc": "date failing its regex",
+      "data": { "resourceType": "Patient", "birthDate": "25/12/1974" },
+      "errors": [
+        {
+          "type": "primitive-value",
+          "path": "Patient.birthDate",
+          "message": "value '25/12/1974' is not a valid date"
+        }
+      ]
+    },
+    {
+      "desc": "partial date passes the anchored regex",
+      "data": { "resourceType": "Patient", "birthDate": "1974-12" }
+    },
+    {
+      "desc": "decimal accepts integers too",
+      "data": { "resourceType": "Patient", "score": 2 }
+    }
+  ]
+}

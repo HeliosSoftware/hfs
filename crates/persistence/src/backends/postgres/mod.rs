@@ -74,11 +74,28 @@
 
 mod backend;
 mod bulk_export;
+mod bulk_provider;
 mod bulk_submit;
+mod bundle_lock_plan;
+pub(crate) mod cached;
+mod cleanup;
+mod lock_protocol;
+mod login_sessions;
+pub(crate) mod null_timestamp_facts;
+mod pool_budget;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;
+mod sof_terminology;
 mod storage;
+mod sync_failures;
 mod transaction;
+mod user_settings;
 
 pub use backend::{PostgresBackend, PostgresConfig};
+/// The connection pool snapshot returned by
+/// [`PostgresBackend::pool_status`], re-exported so callers need no direct
+/// deadpool dependency.
+pub use deadpool_postgres::Status as PoolStatus;
+
+pub use transaction::PostgresTransaction;

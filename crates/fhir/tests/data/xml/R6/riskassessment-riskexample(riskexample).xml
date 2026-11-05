@@ -15,20 +15,23 @@
     <system value="http://example.org"/>
     <value value="risk-assessment-breastcancer1"/>
   </identifier>
-  <!-- 
-  <basedOn>
+  <!-- <basedOn>
     <reference value="ImmunizationRecommendation/example"/>
-  </basedOn>
-   -->
+  </basedOn> -->
   <parent>
     <reference value="DiagnosticReport/example"/>
   </parent>
   <status value="final"/>
   <code>
     <coding>
-      <system value="http://browser.ihtsdotools.org/"/>
+      <system value="http://snomed.info/sct"/>
       <code value="709510001"/>
       <display value="Assessment of risk for disease (procedure)"/>
+    </coding>
+    <coding>
+      <system value="http://hl7.org/fhir/risk-assessment-type-example"/>
+      <code value="breast-cancer-risk"/>
+      <display value="Breast Cancer Risk"/>
     </coding>
   </code>
   <subject>

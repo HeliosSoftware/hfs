@@ -493,6 +493,16 @@ impl BundleEntry {
         }
     }
 
+    /// Sets the search relevance score (`entry.search.score`). A `None` score
+    /// leaves the entry unchanged. Has no effect if the entry has no `search`
+    /// component (e.g. an outcome entry).
+    pub fn with_score(mut self, score: Option<f64>) -> Self {
+        if let (Some(s), Some(search)) = (score, self.search.as_mut()) {
+            search.score = Some(s);
+        }
+        self
+    }
+
     /// Creates a new include entry.
     pub fn include_entry(full_url: impl Into<String>, resource: Value) -> Self {
         Self {
@@ -500,6 +510,21 @@ impl BundleEntry {
             resource: Some(resource),
             search: Some(BundleEntrySearch {
                 mode: SearchEntryMode::Include,
+                score: None,
+            }),
+        }
+    }
+
+    /// Creates a new outcome entry (`search.mode = outcome`): information
+    /// about the search itself (e.g. a truncation warning) rather than a
+    /// matched or included resource. Carries no `fullUrl` — the resource has
+    /// no identity of its own to link to.
+    pub fn outcome_entry(resource: Value) -> Self {
+        Self {
+            full_url: None,
+            resource: Some(resource),
+            search: Some(BundleEntrySearch {
+                mode: SearchEntryMode::Outcome,
                 score: None,
             }),
         }

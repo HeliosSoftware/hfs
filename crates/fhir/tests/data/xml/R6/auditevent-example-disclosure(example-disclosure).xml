@@ -40,12 +40,12 @@
       <display value="healthcare marketing"/>
     </coding>
   </authorization>
-  <!--  patient whos data got disclosed  -->
+  <!-- patient whos data got disclosed -->
   <patient>
     <reference value="Patient/example"/>
   </patient>
   <agent>
-    <!--  who disclosed the data  -->
+    <!-- who disclosed the data -->
     <type>
       <coding>
         <system value="http://dicom.nema.org/resources/ontology/DCM"/>
@@ -67,7 +67,7 @@
     <networkString value="custodian.net"/>
   </agent>
   <agent>
-    <!--  who received the data  -->
+    <!-- who received the data -->
     <type>
       <coding>
         <system value="http://dicom.nema.org/resources/ontology/DCM"/>
@@ -90,7 +90,7 @@
     </authorization>
   </agent>
   <source>
-    <!--  what system detected this disclosure  -->
+    <!-- what system detected this disclosure -->
     <observer>
       <display value="Watchers Accounting of Disclosures Application"/>
     </observer>
@@ -103,7 +103,7 @@
     </type>
   </source>
   <entity>
-    <!--  data that got disclosed  -->
+    <!-- data that got disclosed -->
     <what>
       <reference value="Patient/example/_history/1"/>
       <identifier>

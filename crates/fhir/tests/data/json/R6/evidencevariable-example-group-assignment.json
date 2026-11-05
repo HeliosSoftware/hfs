@@ -76,6 +76,15 @@
       ]
     }
   },
+  "handling": {
+    "coding": [
+      {
+        "system": "https://fevir.net/sevco",
+        "code": "STATO:0000090",
+        "display": "dichotomous variable"
+      }
+    ]
+  },
   "category": [
     {
       "name": "Jumping from aircraft with parachute",

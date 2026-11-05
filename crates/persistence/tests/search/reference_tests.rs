@@ -8,8 +8,10 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -20,22 +22,43 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
 async fn seed_test_data(backend: &SqliteBackend, tenant: &TenantContext) {
     // Create patients
-    let patient1 = json!({"resourceType": "Patient", "id": "patient-1", "name": [{"family": "Smith"}]});
-    let patient2 = json!({"resourceType": "Patient", "id": "patient-2", "name": [{"family": "Jones"}]});
-    backend.create_or_update(tenant, "Patient", "patient-1", patient1).await.unwrap();
-    backend.create_or_update(tenant, "Patient", "patient-2", patient2).await.unwrap();
+    let patient1 =
+        json!({"resourceType": "Patient", "id": "patient-1", "name": [{"family": "Smith"}]});
+    let patient2 =
+        json!({"resourceType": "Patient", "id": "patient-2", "name": [{"family": "Jones"}]});
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "patient-1",
+            patient1,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "patient-2",
+            patient2,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create observations referencing patients
     let obs1 = json!({
@@ -56,9 +79,18 @@ async fn seed_test_data(backend: &SqliteBackend, tenant: &TenantContext) {
         "subject": {"reference": "Patient/patient-2"},
         "code": {"coding": [{"code": "test3"}]}
     });
-    backend.create(tenant, "Observation", obs1).await.unwrap();
-    backend.create(tenant, "Observation", obs2).await.unwrap();
-    backend.create(tenant, "Observation", obs3).await.unwrap();
+    backend
+        .create(tenant, "Observation", obs1, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(tenant, "Observation", obs2, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(tenant, "Observation", obs3, FhirVersion::default())
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -78,19 +110,19 @@ async fn test_reference_search_relative() {
         name: "subject".to_string(),
         param_type: SearchParamType::Reference,
         modifier: None,
-        values: vec![SearchValue::reference("Patient/patient-1")],
+        values: vec![SearchValue::eq("Patient/patient-1")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find 2 observations for patient-1
     assert_eq!(result.resources.len(), 2);
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_eq!(
             resource.content()["subject"]["reference"],
             "Patient/patient-1"
@@ -111,13 +143,13 @@ async fn test_reference_search_id_only() {
         name: "subject".to_string(),
         param_type: SearchParamType::Reference,
         modifier: None,
-        values: vec![SearchValue::reference("patient-1")],
+        values: vec![SearchValue::eq("patient-1")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -133,18 +165,20 @@ async fn test_reference_search_type_modifier() {
     let tenant = create_tenant();
     seed_test_data(&backend, &tenant).await;
 
-    // Search with :Patient modifier
+    // Search with :Patient modifier. The type modifier is carried as
+    // `SearchModifier::Type` — the REST layer splits `subject:Patient` into the
+    // parameter name plus the modifier before the query reaches a backend.
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "subject:Patient".to_string(),
+        name: "subject".to_string(),
         param_type: SearchParamType::Reference,
-        modifier: None,
-        values: vec![SearchValue::reference("patient-1")],
+        modifier: Some(SearchModifier::Type("Patient".to_string())),
+        values: vec![SearchValue::eq("patient-1")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -163,13 +197,13 @@ async fn test_reference_search_no_results() {
         name: "subject".to_string(),
         param_type: SearchParamType::Reference,
         modifier: None,
-        values: vec![SearchValue::reference("Patient/nonexistent")],
+        values: vec![SearchValue::eq("Patient/nonexistent")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 

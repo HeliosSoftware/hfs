@@ -152,4 +152,4 @@ Set the default FHIR version the server uses when a client does not specify:
 HFS_DEFAULT_FHIR_VERSION=R5 hfs
 ```
 
-Valid values: `R4`, `R4B`, `R5`, `R6`. Default is `R4`.
+Valid values: `R4`, `R4B`, `R5`, `R6`. Default is `R4`. A build without the `R4` feature defaults to its only enabled version. R5 and R6 builds always include R4B (the IHE BALP audit baseline), so a build without R4 that enables several versions must set `HFS_DEFAULT_FHIR_VERSION`, or `hfs` refuses to start.

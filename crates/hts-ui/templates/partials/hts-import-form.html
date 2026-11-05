@@ -1,0 +1,145 @@
+{#-
+  Import steps 1 and 2 of the V3 "stepped" layout (design doc §7.7).
+
+  Step 1 — "Choose source" — IS the `<form>` element: making the form the
+  `.card` keeps every step a direct child of `<main class="content">`, which
+  is what `.content > .card ~ .card { margin-top: 20px }` in app.css needs in
+  order to space the steps. Nothing here introduces a new class.
+
+  Step 2 — "Review" — is a sibling card holding the submit. The button is
+  associated back to step 1 with the HTML `form="hts-import-form"` attribute,
+  so the no-JS contract is untouched (a native submit still POSTs the whole
+  form) and htmx still intercepts the form's `submit` event.
+
+  Rules of the road (unchanged from Slice F):
+    - Real <form action= method=POST> so the page works without JS.
+    - `hx-post` targets `#hts-import-status`; the hard-nav response
+      re-renders the whole page with the status partial embedded inline
+      (design doc §7.10 row 7.7 nojs).
+    - Source selector is a radio group. `assets/import.js` toggles the two
+      `.field` wrappers by `closest(".field")` and FileReaders the picked
+      file into `#hts-import-bundle`, so BOTH inputs must stay wrapped in a
+      `.field` and keep their ids/names.
+    - Submit is disabled when the shared degraded banner is showing
+      (design doc §7 preamble degraded state).
+
+  Step 2 deliberately shows no entry counts: HTS reports counts only in the
+  `POST /import` *response*, and the server cannot know them before writing.
+  It is a genuine confirm step describing where the Bundle is going and what
+  the write does, not a fabricated pre-flight summary.
+-#}
+<form class="card"
+      id="hts-import-form"
+      action="/ui/hts/import"
+      method="post"
+      hx-post="/ui/hts/import"
+      hx-target="#hts-import-status"
+      hx-swap="innerHTML"
+      enctype="application/x-www-form-urlencoded">
+  <div class="card-head">
+    <h3>1 &middot; {{ chrome.i18n.t("hts-import-step-source") }}</h3>
+  </div>
+  <div class="panel">
+    {#-
+      Source selector. Same `.field` + `.facets--bare` + `.chip` idiom as
+      `hts-cm-translate-input.html`'s direction radios — a bare `<fieldset>`
+      would draw the UA's border/legend chrome, which app.css never styles.
+      `role="radiogroup"` + `aria-labelledby` keeps the grouping a `<legend>`
+      would have provided. `assets/import.js` binds `input[name="source"]`,
+      so the names and values must not change.
+    -#}
+    <div class="field" role="radiogroup" aria-labelledby="hts-import-source-label">
+      <span class="field__label" id="hts-import-source-label">{{ chrome.i18n.t("hts-import-source-legend") }}</span>
+      <div class="facets facets--bare">
+        <label class="chip">
+          <input type="radio" name="source" value="paste" checked>
+          {{ chrome.i18n.t("hts-import-source-paste") }}
+        </label>
+        <label class="chip">
+          <input type="radio" name="source" value="file">
+          {{ chrome.i18n.t("hts-import-source-file") }}
+        </label>
+      </div>
+    </div>
+
+    {#-
+      File source: a drop zone that accepts dragged JSON files or a click to
+      browse, mirroring the Batch page's `.batch-drop` affordance. The hidden
+      `<input type="file">` is the no-JS fallback — it must remain in the DOM
+      so the native form still works without script. `assets/import.js` wires
+      the drop zone to FileReader.readAsText() and populates `#hts-import-bundle`.
+      Data attributes carry i18n strings for JS-driven messages.
+    -#}
+    <div class="field"
+         id="hts-import-file-field"
+         data-msg-reading="{{ chrome.i18n.t("hts-import-reading") }}"
+         data-msg-read-failed="{{ chrome.i18n.t("hts-import-read-failed") }}"
+         data-msg-too-large="{{ chrome.i18n.t("hts-import-file-too-large") }}"
+         data-msg-loaded="{{ chrome.i18n.t("hts-import-file-loaded") }}">
+      <span class="field__label">{{ chrome.i18n.t("hts-import-bundle-file-label") }}</span>
+      <button type="button" class="batch-drop" id="hts-import-drop">
+        <strong>{{ chrome.i18n.t("hts-import-drop-hint") }}</strong>
+        <span>{{ chrome.i18n.t("hts-import-drop-browse") }}</span>
+      </button>
+      <input id="hts-import-file"
+             type="file"
+             name="bundle_file"
+             accept=".json,application/json,application/fhir+json"
+             hidden>
+      <p class="notice" id="hts-import-file-success" role="status" style="background:var(--ok-soft);color:var(--ok);margin-top:8px" hidden></p>
+      <p class="alert" id="hts-import-file-error" role="alert" hidden></p>
+      <span class="field__hint">{{ chrome.i18n.t("hts-import-file-hint") }}</span>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="hts-import-bundle">
+        {{ chrome.i18n.t("hts-import-bundle-textarea-label") }}
+      </label>
+      <textarea id="hts-import-bundle"
+                class="editor__source"
+                name="bundle"
+                rows="16"
+                aria-label="{{ chrome.i18n.t("hts-import-bundle-textarea-label") }}"
+                spellcheck="false"
+                autocorrect="off"
+                autocapitalize="off"></textarea>
+      <p class="editor__source-hint">{{ chrome.i18n.t("hts-import-bundle-hint") }}</p>
+    </div>
+  </div>
+</form>
+
+<section class="card">
+  <div class="card-head">
+    <h3>2 &middot; {{ chrome.i18n.t("hts-import-step-review") }}</h3>
+  </div>
+  <div class="panel">
+    <div class="kv-grid">
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-import-review-target") }}</span>
+        <code>{{ target_url }}</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-import-review-request") }}</span>
+        <code>POST application/fhir+json</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-import-review-accepted") }}</span>
+        <div>{{ chrome.i18n.t("hts-import-review-accepted-value") }}</div>
+      </div>
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-import-review-existing") }}</span>
+        <div>{{ chrome.i18n.t("hts-import-review-existing-value") }}</div>
+      </div>
+    </div>
+    <p class="query-empty">{{ chrome.i18n.t("hts-import-review-note") }}</p>
+    <div class="form-actions">
+      <button id="hts-import-submit"
+              class="btn btn--primary"
+              type="submit"
+              form="hts-import-form"
+              {% if degraded_reason.is_some() %}disabled{% endif %}>
+        {{ chrome.i18n.t("hts-import-submit") }}
+      </button>
+    </div>
+  </div>
+</section>

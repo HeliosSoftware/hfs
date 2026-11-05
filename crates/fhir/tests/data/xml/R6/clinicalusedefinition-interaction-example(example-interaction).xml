@@ -10,7 +10,7 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="brr"/>
   </extension>
-  <!--  example product interacts with other drugs  -->
+  <!-- example product interacts with other drugs -->
   <type value="interaction"/>
   <subject>
     <reference>

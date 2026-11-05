@@ -135,7 +135,10 @@ pub trait VersionedStorage: ResourceStorage {
     /// # Errors
     ///
     /// * `StorageError::Resource(NotFound)` - If the resource doesn't exist
-    /// * `StorageError::Concurrency(VersionConflict)` - If versions don't match
+    /// * `StorageError::Concurrency(VersionConflict)` - If versions don't match,
+    ///   including when a writer lands after the comparison: implementations
+    ///   delete through [`ResourceStorage::delete_versioned`], pinned to the
+    ///   version they compared (#1404)
     /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
     async fn delete_with_match(
         &self,

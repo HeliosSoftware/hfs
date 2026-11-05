@@ -124,7 +124,7 @@
       "mode": {
         "coding": [
           {
-            "system": "http://hl7.org/fhir/composition-attestation-mode",
+            "system": "http://terminology.hl7.org/CodeSystem/composition-attestation-mode",
             "code": "professional"
           }
         ]
@@ -139,7 +139,7 @@
       "code": {
         "coding": [
           {
-            "system": "http://hl7.org/fhir/document-relationship-type",
+            "system": "http://terminology.hl7.org/CodeSystem/document-relationship-type",
             "code": "appends"
           }
         ]

@@ -1,23 +1,6 @@
 {
   "resourceType": "Medication",
   "id": "med0316",
-  "contained": [
-    {
-      "resourceType": "Substance",
-      "id": "sub04",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "387324004",
-              "display": "Chlortalidone (substance)"
-            }
-          ]
-        }
-      }
-    }
-  ],
   "code": {
     "coding": [
       {
@@ -39,8 +22,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub04"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "387324004",
+              "display": "Chlortalidone (substance)"
+            }
+          ]
         }
       },
       "strengthRatio": {

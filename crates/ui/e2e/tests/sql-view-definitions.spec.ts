@@ -1,0 +1,1156 @@
+// View Definitions playground (#649; #752 re-focus): a stored ViewDefinition
+// lists in the rail, its JSON lands in the always-open editor card, the
+// $sql-run preview loads itself on arrival and refreshes live as the editor
+// changes, and Create New offers the starter document. There is no Run
+// button — the live preview is progressive enhancement (`crates/ui/e2e/tests/
+// nojs/sql-view-definitions.spec.ts` covers the Save-shows-results fallback
+// without JavaScript). The rail itself is a server-side search — name
+// filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
+// — not a full-collection fetch.
+import { acceptConfirm, dialogsSeen, expect, test } from "../pages/fixtures";
+import { createResource, deleteByNamePrefix, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
+import type { APIRequestContext, Page } from "@playwright/test";
+import { VdEditor } from "../pages/vd-editor";
+import { Editor } from "../pages/editor";
+
+// Reopen the original for every click: duplicating the selected copy would
+// deliberately produce `_copy_copy`, rather than the original's `_copy_2`.
+async function duplicateViewDefinition(
+  page: Page,
+  request: APIRequestContext,
+  originalId: string,
+  cleanupIds: string[],
+) {
+  await page.goto(`/ui/sql/view-definitions?vd=${originalId}`);
+  await page.locator("button[name='action'][value='duplicate']").click();
+  await page.waitForURL((url) => url.searchParams.get("saved") === "1" && url.searchParams.get("vd") !== originalId);
+  const copyId = new URL(page.url()).searchParams.get("vd")!;
+  cleanupIds.push(copyId);
+  await waitSearchable(request, "ViewDefinition", copyId);
+  return readResource(request, "ViewDefinition", copyId);
+}
+
+test("Duplicate assigns two ViewDefinition copies their own canonicals and preserves the original dependency", async ({ page, request }) => {
+  const stamp = Date.now().toString(36);
+  const name = `e2e_duplicate_vd_${stamp}`;
+  const canonical = `http://example.org/ViewDefinition/${name}`;
+  const patientIds: string[] = [];
+  const viewIds: string[] = [];
+  const libraryIds: string[] = [];
+  try {
+    const patientId = await createResource(request, "Patient", { name: [{ family: name }] });
+    patientIds.push(patientId);
+    const originalId = await createResource(request, "ViewDefinition", {
+      name, url: canonical, status: "active", resource: "Patient",
+      where: [{ path: `name.family = '${name}'` }],
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    viewIds.push(originalId);
+    const dependentId = await createResource(request, "Library", {
+      name: `${name}_reader`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: "sql-view" }] },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "pd" }],
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT id FROM pd").toString("base64") }],
+    });
+    libraryIds.push(dependentId);
+    await waitSearchable(request, "Patient", patientId);
+    await waitSearchable(request, "ViewDefinition", originalId);
+    await waitSearchable(request, "Library", dependentId);
+    const original = await readResource(request, "ViewDefinition", originalId);
+    const dependent = await readResource(request, "Library", dependentId);
+
+    const first = await duplicateViewDefinition(page, request, originalId, viewIds);
+    const second = await duplicateViewDefinition(page, request, originalId, viewIds);
+    expect(new Set([original.id, first.id, second.id]).size).toBe(3);
+    expect([original.name, first.name, second.name]).toEqual([name, `${name}_copy`, `${name}_copy_2`]);
+    expect([original.url, first.url, second.url]).toEqual([canonical, `${canonical}_copy`, `${canonical}_copy_2`]);
+    for (const copy of [first, second]) {
+      expect(copy.select).toEqual(original.select);
+      expect(copy.where).toEqual(original.where);
+      expect(copy.resource).toBe(original.resource);
+      expect(copy.status).toBe(original.status);
+    }
+
+    // Make the newest copy observably different. Waiting for an existing id
+    // with waitSearchable alone would not await this update on ES composites.
+    const changedWhere = [{ path: "false" }];
+    await updateResource(request, "ViewDefinition", second.id as string, { ...second, where: changedWhere });
+    await expect.poll(async () => {
+      const response = await request.get(`/ViewDefinition?url=${encodeURIComponent(second.url as string)}`);
+      if (!response.ok()) return undefined;
+      const entries = (await response.json()).entry ?? [];
+      return entries.find((entry: { resource?: Record<string, unknown> }) => entry.resource?.id === second.id)?.resource?.where;
+    }, { timeout: 15_000 }).toEqual(changedWhere);
+    await page.goto(`/ui/sql/view-definitions?vd=${second.id}`);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · [\d,]+ ms$/);
+
+    await page.goto(`/ui/sql/views?lib=${dependentId}`);
+    const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^pd$/ }) });
+    await expect(row.locator("a")).toHaveText(name);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${dependentId}`)}`);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · [\d,]+ ms$/);
+    await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
+    expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
+    expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
+  } finally {
+    await deleteResources(request, "Library", libraryIds);
+    await deleteResources(request, "ViewDefinition", viewIds);
+    await deleteResources(request, "Patient", patientIds);
+  }
+});
+
+test("Duplicate preserves an absent ViewDefinition url", async ({ page, request }) => {
+  const name = `e2e_duplicate_vd_no_url_${Date.now().toString(36)}`;
+  const ids: string[] = [];
+  try {
+    const originalId = await createResource(request, "ViewDefinition", {
+      name, status: "active", resource: "Patient", where: [{ path: "false" }],
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    ids.push(originalId);
+    await waitSearchable(request, "ViewDefinition", originalId);
+    const original = await readResource(request, "ViewDefinition", originalId);
+    const copy = await duplicateViewDefinition(page, request, originalId, ids);
+    expect(copy.id).not.toBe(originalId);
+    expect(copy.name).toBe(`${name}_copy`);
+    expect(copy).not.toHaveProperty("url");
+    expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
+  } finally {
+    await deleteResources(request, "ViewDefinition", ids);
+  }
+});
+
+test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, request }) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "ViewDefE2E" }],
+  });
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_patients",
+    status: "active",
+    resource: "Patient",
+    // Scoped to this spec's own patient so the 50-row preview stays
+    // deterministic however populated the backing store is (#596).
+    where: [{ path: "name.family = 'ViewDefE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+
+  // ES composites index asynchronously: the rail and the run preview both
+  // read through search, so wait for the seeds to be searchable (#596).
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  // The rail entry, selected; the editor holds the view's JSON.
+  await expect(page.locator(`#vd-rail-list [data-type='${vdId}']`)).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  await expect(page.locator("textarea[name='json']")).toContainText("e2e_patients");
+
+  const createNew = page.locator("a[data-editor-link][href^='/ui/sql/view-definitions?vd=new&']");
+  await expect(createNew).toHaveAttribute("href", `/ui/sql/view-definitions?vd=new&return_to=${encodeURIComponent(`/ui/sql/view-definitions?vd=${vdId}`)}`);
+  await expect(createNew).toHaveClass(/\bbtn--primary\b/);
+  await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
+  await expect(createNew).toHaveCSS("height", "30px");
+  await expect(createNew).toHaveCSS("padding-left", "12px");
+
+  // #752: the preview loads itself — no click, no Run link at all — and
+  // the seeded patient's key is among the rows.
+  await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
+  await expect(page.locator(".data-table")).toBeVisible();
+  await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
+
+  // Create New swaps the editor to the starter document.
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  await expect(page.locator("textarea[name='json']")).toContainText("new_view");
+});
+
+// #838 closes #820's own test gap: until now no
+// Playwright test exercised the CodeMirror 6 editor vd-editor.js mounts over
+// the JSON textarea. `insertText` (a single DOM input event, not per-key
+// key events) is used for the replacement doc so CodeMirror's own
+// closeBrackets extension never sees a lone "{"/"\"" keystroke to pair —
+// exactly the same document ends up in the textarea either way, but this
+// keeps the assertion below an exact match instead of a bracket-pairing
+// footgun.
+test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves them, and never traps Tab", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const vdId = await createResource(request, "ViewDefinition", starter(`zcm_${stamp}_before`));
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+
+  const textarea = page.locator("textarea[name='json']");
+  const editor = page.locator(".vd-editor .cm-content[role='textbox']");
+  await expect(editor).toBeVisible();
+  await expect(textarea).toBeHidden();
+
+  // The editor exposes the textarea's own aria-label on its own
+  // role="textbox" content, so the hidden textarea does not duplicate the
+  // landmark (NF3).
+  const ariaLabel = await textarea.getAttribute("aria-label");
+  expect(ariaLabel).toBeTruthy();
+  await expect(editor).toHaveAttribute("aria-label", ariaLabel!);
+
+  // `resourceType` is what the server's own createResource fixture injects
+  // for us on every other test's writes (pages/api.ts) - typed by hand here
+  // since Save posts exactly what the editor shows.
+  const updatedDoc = JSON.stringify({
+    resourceType: "ViewDefinition",
+    ...starter(`zcm_${stamp}_after`),
+  });
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(updatedDoc);
+  await expect(textarea).toHaveValue(updatedDoc);
+
+  // Tab reaches Cancel, then Save, instead of indenting or trapping focus.
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#vd-editor-cancel")).toBeFocused();
+  await page.keyboard.press("Tab");
+  const save = page.locator("button[name='action'][value='save']");
+  await expect(save).toBeFocused();
+
+  // Save submits exactly what the editor showed; after the redirect, the
+  // freshly rendered page's editor and its hidden textarea both show the
+  // saved JSON.
+  await save.click();
+  await page.waitForURL(/saved=1/);
+  await expect(page.locator("textarea[name='json']")).toContainText(`zcm_${stamp}_after`);
+  await expect(page.locator(".vd-editor .cm-content")).toContainText(`zcm_${stamp}_after`);
+});
+
+// #752: the live preview follows the editor's *current* text, in or out of
+// CodeMirror — on load, on debounced edits, and on failure (which keeps the
+// last good table and marks its meta stale, then a fix clears it).
+
+test("editing the view in CodeMirror refreshes the results live, without a page reload", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "VdLiveE2E" }],
+  });
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_live_preview",
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'VdLiveE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator(".data-table th")).toHaveText(["id"]);
+  await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
+
+  const good = JSON.stringify(
+    {
+      resourceType: "ViewDefinition",
+      id: vdId,
+      name: "e2e_live_preview",
+      status: "active",
+      resource: "Patient",
+      where: [{ path: "name.family = 'VdLiveE2E'" }],
+      select: [{ column: [{ name: "patient_key", path: "getResourceKey()" }] }],
+    },
+    null,
+    2,
+  );
+
+  // The mounted CodeMirror content — the live preview's `input` events come
+  // from here.
+  const cmContent = page.locator("#vd-editor .cm-content");
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(good);
+
+  // The debounced live preview lands within ~3s, with no navigation.
+  await expect(page.locator(".data-table th")).toHaveText(["patient_key"], { timeout: 3000 });
+  await expect(page).toHaveURL(new RegExp(`vd=${vdId}$`));
+  await expect(cmContent).toBeFocused();
+  await expect(cmContent).toContainText("patient_key");
+
+  // Broken JSON reports the failure and keeps the last good table,
+  // relabelled "last successful run" — the editor keeps the broken text.
+  const broken = good.replace(/}\s*$/, "");
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(broken);
+  await expect(page.locator(".notice--warn")).toContainText("Could not run the view", {
+    timeout: 3000,
+  });
+  await expect(page.locator(".data-table th")).toHaveText(["patient_key"]);
+  await expect(page.locator("#run-results-meta")).toHaveText("last successful run");
+  await expect(cmContent).toContainText("patient_key");
+
+  // Fixing the JSON clears the notice and restores a fresh `rows · ms` meta.
+  await cmContent.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.insertText(good);
+  await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
+  await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/);
+});
+
+test("?vd=new produces results on arrival, before any edit", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  await expect(page.locator("textarea[name='json']")).toContainText("new_view");
+  await expect(page.locator("#run-results")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator(".data-table")).toBeVisible();
+});
+
+// The rail is name-sorted and paged at 50, and the specs here look their view
+// up on page 1 of the unfiltered rail. Views left behind by earlier tests
+// (`zpage_` alone makes 55) or earlier specs (the `e2e_` ones) fill that page
+// and push a spec's own view onto page 2. They are swept before and after each
+// test; the suite runs on one worker, so nothing else is using them.
+const SWEPT_VIEW_PREFIXES = [
+  "e2e_",
+  "ztip_",
+  "zpage_",
+  "zmru_",
+  "zsel_",
+  "0nav_",
+  "zcm_",
+  "zdel_",
+  "zpar_",
+];
+
+async function sweepViews(request: APIRequestContext) {
+  for (const prefix of SWEPT_VIEW_PREFIXES) {
+    await deleteByNamePrefix(request, "ViewDefinition", prefix);
+  }
+}
+
+test.beforeEach(async ({ request }) => sweepViews(request));
+test.afterEach(async ({ request }) => sweepViews(request));
+
+/** A minimal savable ViewDefinition, named for the rail. */
+function starter(name: string) {
+  return {
+    name,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  };
+}
+
+// #741: the rail is now a server-side search (name filter, `_sort=name`,
+// 50-item pages) rather than a full-collection fetch filtered in memory.
+
+test("the search box filters the rail to exactly the matching names, case-insensitively", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  // Both "patients" hits share the stamp so the filter below cannot pick up
+  // an unrelated ViewDefinition left over by another spec or worker.
+  const alphaId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zpar_${stamp}_Patients_Alpha`),
+  );
+  const betaId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zpar_${stamp}_PATIENTS_Beta`),
+  );
+  const gammaId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zpar_${stamp}_Observations_Gamma`),
+  );
+  await Promise.all(
+    [alphaId, betaId, gammaId].map((id) => waitSearchable(request, "ViewDefinition", id)),
+  );
+
+  // Typed lowercase against stored mixed/upper case — a case-insensitive
+  // substring match either side, per the SQL-on-FHIR IG's `name:contains`.
+  await page.goto(`/ui/sql/view-definitions?filter=${stamp}_patients`);
+  const rail = page.locator("#vd-rail-list .filter-rail__item");
+  await expect(rail).toHaveCount(2);
+  await expect(page.locator(`#vd-rail-list [data-type='${alphaId}']`)).toBeVisible();
+  await expect(page.locator(`#vd-rail-list [data-type='${betaId}']`)).toBeVisible();
+  await expect(page.locator(`#vd-rail-list [data-type='${gammaId}']`)).toHaveCount(0);
+});
+
+test("paginates the rail past 50 views, preserving the filter across pages", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const names = Array.from(
+    { length: 55 },
+    (_, i) => `zpage_${stamp}_${String(i + 1).padStart(2, "0")}`,
+  );
+  const ids = await Promise.all(
+    names.map((name) => createResource(request, "ViewDefinition", starter(name))),
+  );
+  await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  await page.goto(`/ui/sql/view-definitions?filter=zpage_${stamp}`);
+  const rail = page.locator("#vd-rail-list .filter-rail__item");
+  await expect(rail).toHaveCount(50);
+  const pagination = page.locator("nav.pagination");
+  const next = pagination.locator("a", { hasText: "Next" });
+  await expect(next).toBeVisible();
+  await expect(pagination.locator("a", { hasText: "Previous" })).toHaveCount(0);
+
+  await next.click();
+  await expect(page).toHaveURL(/page=2/);
+  expect(new URL(page.url()).searchParams.get("filter")).toBe(`zpage_${stamp}`);
+  await expect(rail).toHaveCount(5);
+  await expect(pagination.locator("a", { hasText: "Previous" })).toBeVisible();
+  await expect(pagination.locator("a", { hasText: "Next" })).toHaveCount(0);
+});
+
+test("a selection the filter excludes from the rail still shows its own editor", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`zsel_${stamp}_keep`));
+  const otherId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zsel_${stamp}_exclude`),
+  );
+  await Promise.all([keepId, otherId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  await page.goto(`/ui/sql/view-definitions?vd=${keepId}&filter=exclude`);
+  // The rail only shows what the filter matches...
+  await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toBeVisible();
+  await expect(page.locator(`#vd-rail-list [data-type='${keepId}']`)).toHaveCount(0);
+  // ...but the editor still holds the view the filter excluded, read
+  // directly by id rather than dropped as "not found" (#741).
+  await expect(page.locator("textarea[name='json']")).toContainText(`zsel_${stamp}_keep`);
+});
+
+// "Recently used" group (#754/#755, server-rendered): same MRU/cap/restore/
+// prune contract as the type rails, plus the snapshot rule its
+// server-paged, filtered rail needs.
+
+test("visiting six views in order keeps the five most recent, MRU-ordered, deduplicated", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const ids = await Promise.all(
+    [1, 2, 3, 4, 5, 6].map((n) => createResource(request, "ViewDefinition", starter(`zmru_${stamp}_${n}`))),
+  );
+  await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  for (const id of ids) {
+    await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+  }
+  await page.reload();
+
+  const recentGroup = page.locator("#vd-rail-recent");
+  await expect(recentGroup.locator(".filter-rail__item")).toHaveCount(5);
+  // The oldest visit (ids[0]) is the one capped out.
+  await expect(recentGroup.locator(`[data-type='${ids[0]}']`)).toHaveCount(0);
+  const order = await recentGroup
+    .locator(".filter-rail__item")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-type")));
+  expect(order[0]).toBe(ids[5]);
+
+  // Re-visiting an older entry moves it to the front without duplicating it.
+  await page.goto(`/ui/sql/view-definitions?vd=${ids[2]}`);
+  await page.reload();
+  const reordered = await recentGroup
+    .locator(".filter-rail__item")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-type")));
+  expect(reordered[0]).toBe(ids[2]);
+  expect(reordered.filter((id) => id === ids[2])).toHaveLength(1);
+});
+
+test("visiting a view and returning through a plain arrival (no ?vd=) restores it", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`0nav_${Date.now().toString(36)}`),
+  );
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  // Leaving to another page and coming back with no `?vd=` at all — the same
+  // "no explicit selection" request shape a nav click produces — restores it
+  // server-side, not merely through browser history.
+  await page.goto("/ui/resources");
+  await page.goto("/ui/sql/view-definitions");
+  await expect(page.locator(`#vd-rail-list [data-type='${vdId}']`)).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+});
+
+test("a filtered-out recent leaves the group too; a deleted view disappears from the group on the next render", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`zdel_${stamp}_a_keep`));
+  const deleteId = await createResource(
+    request,
+    "ViewDefinition",
+    starter(`zdel_${stamp}_b_delete`),
+  );
+  await Promise.all([keepId, deleteId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+  // Select "delete" (recent[0]/last), then filter it out of the rail: the
+  // filter applies to the "Recently used" group as well as the list (#1275).
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
+  await page.goto(`/ui/sql/view-definitions?filter=${stamp}_a_keep`);
+  await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
+  const recentGroup = page.locator("#vd-rail-recent");
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
+
+  // Delete it through the UI (conformance-crud.js).
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
+  await page.locator("[data-crud-delete]").click();
+  await acceptConfirm(page);
+  await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
+
+  // The stored `last` no longer resolves: the page falls back to the rail's
+  // first visible entry, in silence — some real, non-deleted view (the
+  // redirect carries no `?filter=`, so which one exactly depends on the
+  // shared e2e server's full ViewDefinition collection, not just this
+  // test's own two). This same render's existence sweep (#1014) also
+  // checks the deleted id — off this page and no longer the selection —
+  // against the server; the 404/410 it gets back prunes it from the group
+  // right away, with no separate click needed.
+  //
+  // Not `.toBeVisible()`: the CodeMirror editor (#753/#820) progressively
+  // enhances this textarea and hides it once mounted (`vd-editor__source--
+  // mounted`, `display: none`), while staying its form's live source of
+  // truth. A non-empty value proves a real selection landed regardless of
+  // which of the two — raw textarea or its mounted replacement — is the one
+  // actually on screen.
+  await expect(page.locator("textarea[name='json']")).not.toHaveValue("");
+  await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
+
+  // Navigating straight to the deleted id (an explicit `?vd=`) renders the
+  // page's "no selection" state, and the group still has no trace of it.
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
+  await expect(page.locator("textarea[name='json']")).toHaveCount(0);
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
+});
+
+test("typing in the rail filter narrows the list and the recent group without Enter (#1275)", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`zlive_${stamp}_a_keep`));
+  const otherId = await createResource(request, "ViewDefinition", starter(`zlive_${stamp}_b_other`));
+  try {
+    await Promise.all([keepId, otherId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    // Visit both so each lands in "Recently used".
+    await page.goto(`/ui/sql/view-definitions?vd=${keepId}`);
+    await page.goto(`/ui/sql/view-definitions?vd=${otherId}`);
+    const recent = page.locator("#vd-rail-recent");
+    await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
+    await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
+
+    // Typing alone (no Enter) swaps list and group and replaces the URL (no
+    // new history entry), so a reload keeps the filter.
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    const historyLength = await page.evaluate(() => history.length);
+    await filter.fill(`${stamp}_a_keep`);
+    await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(0);
+    await expect(page.locator(`#vd-rail-list [data-type='${keepId}']`)).toHaveCount(1);
+    await expect(recent.locator(`[data-type='${otherId}']`)).toHaveCount(0);
+    await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
+    await expect.poll(() => new URL(page.url()).searchParams.get("filter")).toBe(`${stamp}_a_keep`);
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
+    await expect(filter).toBeFocused();
+
+    // A term matching nothing empties the rail and hides the group.
+    await filter.fill(`zzzznomatch_${stamp}`);
+    await expect(page.locator("#vd-rail-list .filter-rail__item")).toHaveCount(0);
+    await expect(recent).toBeHidden();
+    await expect(recent.locator(".filter-rail__item")).toHaveCount(0);
+
+    // Clearing the box restores both.
+    await filter.fill("");
+    await expect(recent).toBeVisible();
+    await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
+    await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(1);
+  } finally {
+    await deleteResources(request, "ViewDefinition", [keepId, otherId]);
+  }
+});
+
+test("typing in the rail filter keeps the 'not in the filtered list' notice current (#1275)", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`znotice_${stamp}_a_keep`));
+  const otherId = await createResource(request, "ViewDefinition", starter(`znotice_${stamp}_b_other`));
+  try {
+    await Promise.all([keepId, otherId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+    await page.goto(`/ui/sql/view-definitions?vd=${otherId}`);
+    const notice = page.locator("#sql-selection-filtered");
+    await expect(notice).toBeHidden();
+
+    // The selected view drops off the filtered list: the notice appears
+    // without a page load.
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    await filter.fill(`${stamp}_a_keep`);
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText(`${stamp}_a_keep`);
+
+    // Clearing the box puts it back on the list: the notice goes away.
+    await filter.fill("");
+    await expect(notice).toBeHidden();
+  } finally {
+    await deleteResources(request, "ViewDefinition", [keepId, otherId]);
+  }
+});
+
+test("typing in the rail filter with a dirty editor asks nothing and keeps the draft (#1275)", async ({
+  page,
+}) => {
+  await page.goto("/ui/sql/view-definitions?vd=new&lang=en", { waitUntil: "networkidle" });
+  const editor = new VdEditor(page);
+  const draft = JSON.stringify(starter(`dirty_${Date.now().toString(36)}`));
+  await editor.setDoc(draft);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+
+  dialogsSeen(page);
+  const filter = page.locator("form.filter-rail__search input[name='filter']");
+  const swapped = page.waitForResponse(
+    (r) => r.request().method() === "GET" && new URL(r.url()).searchParams.get("filter") === "zzdirty",
+  );
+  await filter.fill("zzdirty");
+  await swapped;
+
+  expect(dialogsSeen(page)).toEqual([]);
+  await expect(page.locator(".confirm-dialog")).toHaveCount(0);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  expect(JSON.parse(await editor.doc()).name).toBe(JSON.parse(draft).name);
+});
+
+test("a long name clipped by the rail shows an accessible tooltip on keyboard focus", async ({
+  page,
+  request,
+}) => {
+  const longName = `ztip_${Date.now().toString(36)}_a_view_definition_name_long_enough_to_clip_in_the_rail`;
+  const vdId = await createResource(request, "ViewDefinition", starter(longName));
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  // Select it so it also renders (identically) in the "Recently used" group —
+  // the tooltip script is delegated and covers both the list and the group.
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await page.reload();
+
+  const recentItem = page.locator(`#vd-rail-recent [data-type='${vdId}']`);
+  await expect(recentItem).toBeVisible();
+  await recentItem.focus();
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(longName);
+
+  await recentItem.blur();
+  await expect(tooltip).toBeHidden();
+});
+
+// #843: the guided-form card beside the editor — server-rendered on first
+// paint (`.editor__grid--stretch`), driven by `editor-form.js` +
+// `vd-editor.js`, synced with the CodeMirror-mounted editor in both
+// directions. `Editor`, the same page object `editor-controls.spec.ts` uses
+// for the Resources modal and the standalone editor, works here unmodified:
+// `#vd-editor-grid` carries the identical `#editor-form`/`.editor-row`/
+// `.editor-add` contract, since it is the same engine (`editor::build_form_pane`).
+
+test("adding a column from the guided form lands the typed fields in the document and the live results", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "GuidedAddE2E" }],
+  });
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_guided_add_column",
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'GuidedAddE2E'" }],
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Patient", patientId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator(".data-table th")).toHaveText(["id"]);
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const selectRow = ed.rowAt("select.0");
+  await selectRow.locator("summary.editor-add__toggle").click();
+  await selectRow.locator("[data-add-name='column']").click();
+
+  // The new column starts empty (`{}`) — an unset required primitive is
+  // never auto-scaffolded, the same "never render what is not there" rule
+  // the Resource Editor follows — so `name` and `path` are each their own
+  // add step on the new row before they exist as fields to fill.
+  const columnRow = ed.rowAt("select.0.column.1");
+  await expect(columnRow).toBeVisible();
+  await columnRow.locator("summary.editor-add__toggle").click();
+  await columnRow.locator("[data-add-name='name']").click();
+  const nameField = page.locator('[data-set="select.0.column.1.name"]');
+  await expect(nameField).toBeVisible();
+  await nameField.fill("family");
+  await nameField.blur();
+
+  // Each creation closes its own picker (#1721); reopen for the next field.
+  await expect(columnRow.locator("details.editor-add")).not.toHaveAttribute("open");
+  await columnRow.locator("summary.editor-add__toggle").click();
+  await columnRow.locator("[data-add-name='path']").click();
+  const pathField = page.locator('[data-set="select.0.column.1.path"]');
+  await expect(pathField).toBeVisible();
+  await pathField.fill("name.family");
+  await pathField.blur();
+
+  // Structurally identical to writing {"name": "family", "path":
+  // "name.family"} by hand in that position - no extra keys, no dropped
+  // ones, whatever the freshly added item's own default shape was.
+  await expect
+    .poll(async () => ed.currentDoc())
+    .toMatchObject({
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "family", path: "name.family" },
+          ],
+        },
+      ],
+    });
+
+  // The live results table (already wired to the textarea's `input`
+  // event, #752) picks up the new column without a page reload.
+  await expect(page.locator(".data-table th")).toHaveText(["id", "family"], { timeout: 3000 });
+  await expect(
+    page.locator(".data-table td", { hasText: "GuidedAddE2E" }).first(),
+  ).toBeVisible();
+});
+
+test("the guided form closes the owning picker, focuses the added field and keeps Undo outside it", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_guided_picker",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const selectRow = ed.rowAt("select.0");
+  await selectRow.locator("summary.editor-add__toggle").click();
+  await selectRow.locator("[data-add-name='column']").click();
+
+  const columnRow = ed.rowAt("select.0.column.1");
+  await expect(columnRow).toBeVisible();
+  const rowEd = new Editor(page, columnRow);
+  await columnRow.locator("summary.editor-add__toggle").click();
+  await expect(rowEd.addPanel).toHaveAttribute("open", "");
+  await rowEd.addItem("name").click();
+
+  await expect(rowEd.addPanel).not.toHaveAttribute("open");
+  await expect(ed.rowAt("select.0.column.1.name").locator("[data-set]")).toBeFocused();
+  await expect(ed.addStatus).toContainText("name added");
+  await expect(ed.addUndo()).toBeVisible();
+  expect(await ed.addUndo().evaluate(button => button.closest("details") === null)).toBe(true);
+  await expect(rowEd.addFilter()).toHaveValue("");
+
+  await rowEd.openAddPanel();
+  await rowEd.addClose().click();
+  await expect(rowEd.addPanel).not.toHaveAttribute("open");
+});
+
+test("editing resource in the JSON editor updates the guided form's resource row, and an invalid value errors there without saving", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_resource_sync",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const resourceField = ed.rowAt("resource").locator("[data-set='resource']");
+  await expect(resourceField).toHaveValue("Patient");
+
+  const cmContent = page.locator("#vd-editor .cm-content");
+  const editTo = async (resource: string) => {
+    const doc = JSON.stringify(
+      {
+        resourceType: "ViewDefinition",
+        id: vdId,
+        name: "e2e_resource_sync",
+        status: "active",
+        resource,
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      },
+      null,
+      2,
+    );
+    await cmContent.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(doc);
+  };
+
+  // A valid change syncs into the row within the debounce window.
+  await editTo("Observation");
+  await expect(resourceField).toHaveValue("Observation", { timeout: 3000 });
+  await expect(ed.rowAt("resource")).not.toHaveClass(/editor-row--error/);
+
+  // An out-of-value-set resource is caught by the same required-binding
+  // check the Resource Editor already runs (#843's analyze()), anchored on
+  // this row - without ever posting a save.
+  await editTo("NotARealResourceType");
+  await expect(resourceField).toHaveValue("NotARealResourceType", { timeout: 3000 });
+  await expect(ed.rowAt("resource")).toHaveClass(/editor-row--error/);
+  await expect(ed.rowError("resource")).toBeVisible();
+});
+
+test("Ctrl+Z after a guided-form edit restores the previous JSON as one step", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_form_undo",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const textarea = page.locator("textarea[name='json']");
+  const before = await textarea.inputValue();
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const statusField = ed.rowAt("status").locator("[data-set='status']");
+  await statusField.fill("retired");
+  await statusField.blur();
+  await expect
+    .poll(async () => ed.currentDoc())
+    .toMatchObject({ status: "retired" });
+  const after = await textarea.inputValue();
+  expect(after).not.toBe(before);
+  expect(after).toContain("retired");
+
+  // The single form-driven transaction is one undo step - no
+  // CodeMirror focus race: click the editor first, same as every other
+  // keyboard-driven assertion in this file.
+  await page.locator("#vd-editor .cm-content").click();
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(textarea).toHaveValue(before);
+});
+
+test("the editor and guided-form cards share one height and each scrolls inside itself", async ({
+  page,
+  request,
+}) => {
+  // Enough where clauses to make the JSON pane tall, and enough columns
+  // (each with its own row, description, and possible add-picker) to make
+  // the guided-form pane tall on its own - so neither card's height merely
+  // follows from the other's content by coincidence.
+  const where = Array.from({ length: 30 }, (_, i) => ({
+    path: `name.family = 'row_${i}'`,
+  }));
+  const columns = Array.from({ length: 30 }, (_, i) => ({
+    name: `column_${i}`,
+    path: `name.family`,
+  }));
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_stretch_grid",
+    status: "active",
+    resource: "Patient",
+    where,
+    select: [{ column: columns }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const grid = page.locator("#vd-editor-grid");
+  const cards = grid.locator("> .card");
+  await expect(cards).toHaveCount(2);
+
+  const [editorBox, formBox] = await Promise.all([
+    cards.nth(0).boundingBox(),
+    cards.nth(1).boundingBox(),
+  ]);
+  expect(editorBox).not.toBeNull();
+  expect(formBox).not.toBeNull();
+  expect(Math.abs(editorBox!.height - formBox!.height)).toBeLessThanOrEqual(1);
+
+  // Neither card's own height exceeds the 70vh cap the row itself enforces.
+  const viewportHeight = page.viewportSize()!.height;
+  expect(editorBox!.height).toBeLessThanOrEqual(viewportHeight * 0.7 + 1);
+
+  // Each scrolls inside its own content area rather than growing past the
+  // shared cap.
+  const scroller = page.locator("#vd-editor .cm-scroller");
+  const tree = page.locator("#vd-editor-grid .editor-tree");
+  await expect
+    .poll(async () => scroller.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(0);
+  await expect
+    .poll(async () => tree.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(0);
+
+  // The page itself never scrolls horizontally.
+  const overflowsX = await page.evaluate(
+    () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+  );
+  expect(overflowsX).toBe(false);
+});
+
+// #843: the row<->editor cross-highlight (`vd-editor.js`) — CodeMirror line
+// decorations for a hovered/focused row, and a debounced cursor listener
+// that marks the row for whichever node the caret sits in. Both resolve a
+// node through the browser's own CodeMirror syntax tree, the same one
+// `vd-editor.js`'s lint diagnostics already walk (#753), so this only needs
+// to exercise the two directions and their reveal, not the tree walk itself.
+
+test("hovering a row highlights its node's lines in the editor, and leaving clears them", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_hover",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const hitLines = page.locator("#vd-editor .cm-line--hit");
+
+  await ed.rowAt("select.0.column.0.path").hover();
+  await expect.poll(() => hitLines.count()).toBeGreaterThan(0);
+  await expect(hitLines.filter({ hasText: "path" }).first()).toBeVisible();
+
+  // Leaving the row (mouse over something outside the guided-form card)
+  // paints nothing.
+  await page.locator("h1.page-head__title").hover();
+  await expect(hitLines).toHaveCount(0);
+});
+
+test("clicking inside the editor's JSON highlights the row for that node", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_click",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+
+  // Click the property key's own highlighted span — a `.cm-line` spans the
+  // editor's full width, so clicking its own bounding box's center (a
+  // locator's default) usually lands past a short line's visible text
+  // altogether. An exact match on the rendered `"resource"` key, not a
+  // substring one: `"resourceType"` would otherwise match too.
+  await page.locator("#vd-editor .cmt-json-key", { hasText: /^"resource"$/ }).click();
+  await expect(ed.rowAt("resource")).toHaveClass(/editor-row--hit/);
+
+  // The first column's own `name` field — the row for it, not for its
+  // enclosing column or select entry, since a cursor inside a property's
+  // key counts as that property. Two keys render as exactly `"name"`: the
+  // view's own top-level name (index 0) and this column's (index 1).
+  await page.locator("#vd-editor .cmt-json-key", { hasText: /^"name"$/ }).nth(1).click();
+  await expect(ed.rowAt("select.0.column.0.name")).toHaveClass(/editor-row--hit/);
+});
+
+test("hovering a deep row on a long document scrolls the editor pane, not the page, and reveals the line", async ({
+  page,
+  request,
+}) => {
+  // Enough columns that the last one's `path` field sits well below the
+  // editor's own viewport - the same shape the shared-height test above
+  // uses to force `.cm-scroller` to actually overflow.
+  const columns = Array.from({ length: 30 }, (_, i) => ({
+    name: `column_${i}`,
+    path: "name.family",
+  }));
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_cross_highlight_reveal",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: columns }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const scroller = page.locator("#vd-editor .cm-scroller");
+  const pageScrollBefore = await page.evaluate(() => window.scrollY);
+
+  await ed.rowAt("select.0.column.29.path").hover();
+  await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+
+  // The highlighted line lands inside the editor's own viewport...
+  const hit = page.locator("#vd-editor .cm-line--hit").first();
+  await expect(hit).toBeVisible();
+  const [hitBox, scrollerBox] = await Promise.all([hit.boundingBox(), scroller.boundingBox()]);
+  expect(hitBox).not.toBeNull();
+  expect(scrollerBox).not.toBeNull();
+  expect(hitBox!.y).toBeGreaterThanOrEqual(scrollerBox!.y - 1);
+  expect(hitBox!.y + hitBox!.height).toBeLessThanOrEqual(scrollerBox!.y + scrollerBox!.height + 1);
+
+  // ...and the page itself never moved.
+  expect(await page.evaluate(() => window.scrollY)).toBe(pageScrollBefore);
+});
+
+
+// #1757: Shift+Alt+F formats the JSON document, whitespace only.
+const compactVd = '{"resourceType":"ViewDefinition","name":"fmt","select":[{"column":[{"name":"id","path":"id"}]}]}';
+
+async function loadCompact(page: Page, doc: string) {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const editor = page.locator("#vd-editor .cm-content");
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(doc);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(doc);
+  await page.evaluate(() => {
+    (window as any).__fmtResults = [];
+    document
+      .querySelector("#vd-editor")!
+      .addEventListener("hfs:editor-format", (e) =>
+        (window as any).__fmtResults.push((e as CustomEvent).detail.result),
+      );
+  });
+  return editor;
+}
+
+const fmtResults = (page: Page) => page.evaluate(() => (window as any).__fmtResults as string[]);
+
+test("Shift+Alt+F formats a compact document, syncs the textarea and keeps focus; one Ctrl+Z undoes it", async ({
+  page,
+}) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(compactVd);
+});
+
+test("Shift+Alt+F leaves invalid JSON alone and reports it", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+test("Shift+Alt+F on an already formatted document reports unchanged", async ({ page }) => {
+  const formatted = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await loadCompact(page, formatted);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["unchanged"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(formatted);
+});
+
+// #1757: the Format button in the "Definition (JSON)" card head.
+const invalidMsg = "Fix the JSON syntax errors before formatting.";
+const formatCard = (page: Page) => page.locator("section.card:has(#vd-editor)");
+const formatButton = (page: Page) => formatCard(page).locator("[data-editor-format]");
+const formatStatus = (page: Page) => formatCard(page).locator("[data-editor-format-status]");
+
+test("the Format button shows in the Definition (JSON) head with its shortcut beside it", async ({ page }) => {
+  await loadCompact(page, compactVd);
+  const head = formatCard(page).locator(".card-head");
+  const button = head.locator("[data-editor-format]");
+  await expect(button).toBeVisible();
+  await expect(button).toHaveText("Format");
+  await expect(head.getByText("Shift+Alt+F", { exact: true })).toBeVisible();
+});
+
+test("clicking Format formats a compact document, syncs the textarea and focuses the editor", async ({ page }) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await formatButton(page).click();
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("clicking Format on invalid JSON leaves the document alone, says why, and typing clears the message", async ({
+  page,
+}) => {
+  const invalid = '{"name":"fmt",}';
+  const editor = await loadCompact(page, invalid);
+  await formatButton(page).click();
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+  expect(await editor.innerText()).toBe(invalid);
+  await expect(editor).toBeFocused();
+
+  await page.keyboard.type("x");
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("Shift+Alt+F on invalid JSON shows the same message without touching the button", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+for (const size of [
+  { width: 1280, height: 800 },
+  { width: 768, height: 1024 },
+]) {
+  test(`the Definition (JSON) card head does not overflow horizontally at ${size.width}x${size.height}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(size);
+    await loadCompact(page, '{"name":"fmt",}');
+    await page.keyboard.press("Shift+Alt+F");
+    await expect(formatStatus(page)).toHaveText(invalidMsg);
+    const head = formatCard(page).locator(".card-head");
+    await expect(formatButton(page)).toBeVisible();
+    const fits = await head.evaluate((el) => el.scrollWidth <= el.clientWidth);
+    expect(fits).toBe(true);
+  });
+}

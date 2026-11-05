@@ -147,6 +147,13 @@ pub struct ResourceCapabilities {
     pub conditional_update: bool,
     /// Whether conditional delete is supported.
     pub conditional_delete: bool,
+    /// Whether conditional patch is supported. Not set by
+    /// [`with_conditional_ops`](Self::with_conditional_ops) — MongoDB and S3
+    /// lack it — and not rendered by
+    /// [`StorageCapabilities::to_capability_rest`], which is version-unaware:
+    /// `rest.resource.conditionalPatch` exists from FHIR R5 on only.
+    #[serde(default)]
+    pub conditional_patch: bool,
     /// Additional documentation.
     pub documentation: Option<String>,
 }

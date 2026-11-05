@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="f204"/>
-  <!--  The observation is complete  -->
-  <!--  No reliability concerns  -->
+  <!-- The observation is complete -->
+  <!-- No reliability concerns -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -11,16 +11,16 @@
   </meta>
   <identifier>
     <system value="https://intranet.aumc.nl/labvalues"/>
-    <!--  Does not exist  -->
+    <!-- Does not exist -->
     <value value="1304-03720-Creatinine"/>
   </identifier>
-  <!--  Creatinine was measured on April fourth  -->
+  <!-- Creatinine was measured on April fourth -->
   <status value="final"/>
   <code>
-    <!--  Kind of observation = Serum Creatinine, Using only a local code in this example   -->
+    <!-- Kind of observation = Serum Creatinine, Using only a local code in this example -->
     <coding>
       <system value="https://intranet.aumc.nl/labtestcodes"/>
-      <!--  Does not exist  -->
+      <!-- Does not exist -->
       <code value="20005"/>
       <display value="Creatinine(Serum)"/>
     </coding>
@@ -35,7 +35,7 @@
     <display value="Luigi Maas"/>
   </performer>
   <valueQuantity>
-    <!--  Creatinine=122mmol/L  -->
+    <!-- Creatinine=122mmol/L -->
     <value value="122"/>
     <unit value="umol/L"/>
     <system value="http://snomed.info/sct"/>
@@ -53,7 +53,7 @@
     </coding>
   </interpretation>
   <referenceRange>
-    <!--  Healthy creatinine level ranges from 64umol/L to 104umol/L  -->
+    <!-- Healthy creatinine level ranges from 64umol/L to 104umol/L -->
     <low>
       <value value="64"/>
     </low>

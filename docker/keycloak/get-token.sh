@@ -30,10 +30,37 @@ RESPONSE=$(curl -sf -X POST "${TOKEN_ENDPOINT}" \
   --data-urlencode "client_id=${CLIENT_ID}" \
   --data-urlencode "client_secret=${CLIENT_SECRET}")
 
-ACCESS_TOKEN=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+# Pick a JSON parser once. We *test* each candidate against a known document
+# rather than trusting `command -v`, because on some machines (e.g. Windows via
+# Git Bash) a `python3` execution-alias stub resolves but then fails to run.
+# Order: jq, then node, then python3 — whichever actually works.
+JSON_PARSER=""
+for candidate in jq node python3; do
+  case "${candidate}" in
+    jq)      echo '{"x":"ok"}' | jq -r '.x' 2>/dev/null | grep -qx ok && JSON_PARSER=jq && break ;;
+    node)    echo '{"x":"ok"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write(JSON.parse(d).x))" 2>/dev/null | grep -qx ok && JSON_PARSER=node && break ;;
+    python3) echo '{"x":"ok"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['x'])" 2>/dev/null | grep -qx ok && JSON_PARSER=python3 && break ;;
+  esac
+done
+if [ -z "${JSON_PARSER}" ]; then
+  echo "Need a working jq, node, or python3 to parse the token response" >&2
+  exit 1
+fi
 
-echo "Token obtained (expires in $(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('expires_in','?'))") seconds)" >&2
-echo "Scopes: $(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('scope','(none)'))") " >&2
+# Extract a top-level string field from the JSON response using the chosen parser.
+json_field() {
+  local field="$1"
+  case "${JSON_PARSER}" in
+    jq)      echo "${RESPONSE}" | jq -r ".${field} // \"\"" ;;
+    node)    echo "${RESPONSE}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d)['${field}']??''))" ;;
+    python3) echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('${field}',''))" ;;
+  esac
+}
+
+ACCESS_TOKEN=$(json_field access_token)
+
+echo "Token obtained (expires in $(json_field expires_in) seconds)" >&2
+echo "Scopes: $(json_field scope) " >&2
 echo "" >&2
 echo "To decode claims:" >&2
 echo "  echo \"\$TOKEN\" | cut -d. -f2 | base64 -d | python3 -m json.tool" >&2

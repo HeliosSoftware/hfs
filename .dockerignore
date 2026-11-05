@@ -1,0 +1,9 @@
+# The Dockerfile is runtime-only: it expects a *staged* build context holding
+# the pre-built binary (plus optional data/). Nothing under the repo root
+# belongs in a build context, but guard the expensive paths explicitly so an
+# accidental root-context build does not transfer the whole workspace.
+target/
+.git/
+**/*.rs
+**/node_modules/
+**/__pycache__/

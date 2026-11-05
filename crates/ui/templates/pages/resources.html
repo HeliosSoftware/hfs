@@ -1,0 +1,240 @@
+{% extends "layouts/base.html" %}
+{% import "partials/type_rail.html" as rail %}
+{% import "partials/rail_recent.html" as recent %}
+
+{% block title %}{{ i18n.t("resources-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
+<!--
+  Resources workspace (#282): the resource-type rail lives in the content
+  under the fixed page head — the same app-shell pattern as Search
+  Parameters (the page never scrolls; the rail list and the main column each
+  scroll on their own) — and the centre is search + a "Create new" primary
+  button + the results table.
+-->
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
+    <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
+    {# #1065: results may miss stored resources while the search index rebuilds,
+       #1125: or after the last rebuild left resources unindexed. #}
+    {% if let Some(activity) = rebuild %}
+    <p class="notice notice--warn" role="status" data-rebuild-notice data-rebuild-state="{{ self.rebuild_state(activity) }}">{{ self.rebuild_text(activity) }}</p>
+    {% endif %}
+  </div>
+  <div class="resources-create-wrap">
+    <button type="button" class="btn btn--primary resources-create" id="resource-create"
+            aria-describedby="resource-create-reason"
+            data-msg-create="{{ i18n.t_arg("resources-create-typed", "type", "{type}".to_string()) }}"
+            data-msg-create-generic="{{ i18n.t("resources-create") }}"
+            {% if create_disabled %}disabled{% endif %}>
+      <span class="icon">{% include "icons/plus.svg" %}</span>
+      <span class="resources-create__label">{{ create_label }}</span>
+    </button>
+    <p class="field__hint" id="resource-create-reason" {% if create_reason.is_empty() %}hidden{% endif %}>{{ create_reason }}</p>
+  </div>
+</section>
+
+<div class="queries-layout search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
+  <aside class="filter-rail" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}"
+         data-selected-type="{{ selected_type }}"
+         data-create-eligible="{% if create_disabled %}false{% else %}true{% endif %}"
+         data-create-target="{% if create_disabled %}{% else %}{{ selected_type }}{% endif %}"
+         data-create-metadata="{% if create_metadata_available %}available{% else %}unavailable{% endif %}"
+         data-create-resource-types="{{ create_resource_types }}"
+         data-create-advertised-types="{{ create_advertised_types }}"
+         data-create-schema-types="{{ create_schema_types }}"
+         data-msg-create-invalid="{{ i18n.t("resources-create-invalid-type") }}"
+         data-msg-create-not-advertised="{{ i18n.t("resources-create-not-advertised") }}"
+         data-msg-create-schema-unavailable="{{ i18n.t("resources-create-schema-unavailable") }}"
+         data-msg-create-metadata-unavailable="{{ i18n.t("resources-create-metadata-unavailable") }}">
+    <div class="filter-rail__heading">{{ i18n.t("resources-types-heading") }}</div>
+    <div class="filter-rail__search">
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" id="type-rail-filter"
+             placeholder="{{ i18n.t("queries-rail-filter") }}"
+             aria-label="{{ i18n.t("queries-rail-filter") }}">
+    </div>
+    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
+    <div class="filter-rail__list" id="type-rail-list">
+      {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
+    </div>
+  </aside>
+
+  <div class="queries-main">
+    <section class="card query-form-card">
+      {% if nl.configured %}
+      <div class="seg" role="group" aria-label="{{ i18n.t("search-mode-label") }}">
+        <button type="button" class="seg__btn" data-mode-btn="nl" aria-pressed="true">
+          <span class="icon">{% include "icons/sparkle.svg" %}</span>
+          {{ i18n.t("search-mode-nl") }}
+        </button>
+        <button type="button" class="seg__btn" data-mode-btn="builder" aria-pressed="false">
+          <span class="icon">{% include "icons/grid.svg" %}</span>
+          {{ i18n.t("search-mode-builder") }}
+        </button>
+      </div>
+
+      <div class="nl-pane" id="nl-pane"
+           data-msg-error="{{ i18n.t("error-generic") }}"
+           data-msg-unsupported="{{ i18n.t("search-nl-unsupported") }}"
+           data-msg-caveats="{{ i18n.t("search-nl-caveats") }}"
+           data-msg-working="{{ i18n.t("search-nl-working") }}">
+        <div class="nl-input">
+          <span class="icon nl-input__spark">{% include "icons/sparkle.svg" %}</span>
+          <input type="text" id="nl-text" maxlength="500" autocomplete="off"
+                 placeholder="{{ i18n.t("search-nl-placeholder") }}"
+                 aria-label="{{ i18n.t("search-nl-label") }}">
+          <button class="btn btn--primary btn--busy-slot" type="button" id="nl-submit">
+            <span class="icon">{% include "icons/search.svg" %}</span>
+            {{ i18n.t("action-search") }}
+          </button>
+        </div>
+        <p class="nl-pane__hint">{{ i18n.t("search-nl-hint") }}</p>
+        <div class="nl-examples">
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-1") }}</button>
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-2") }}</button>
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-3") }}</button>
+        </div>
+        <div class="nl-answer" id="nl-answer" hidden></div>
+      </div>
+      {% else %}
+      <div class="nl-setup" id="nl-setup">
+        <div class="nl-setup__head">
+          <span class="icon">{% include "icons/sparkle.svg" %}</span>
+          <h2>{{ i18n.t("search-setup-heading") }}</h2>
+        </div>
+        <p>{{ i18n.t("search-setup-body") }}</p>
+        <pre class="nl-setup__env"><code>HFS_NL_SEARCH_API_KEY=&lt;{{ i18n.t("search-setup-key-placeholder") }}&gt;
+HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
+        <p class="nl-setup__note">{{ i18n.t("search-setup-disable") }}</p>
+        <a class="btn btn--primary" href="{{ docs_url }}" target="_blank" rel="noopener">
+          {{ i18n.t("search-setup-docs") }}
+        </a>
+      </div>
+      {% endif %}
+
+      {% include "partials/search-builder.html" %}
+    </section>
+
+    {% include "partials/search-results.html" %}
+    {% include "partials/search-messages.html" %}
+  </div>
+</div>
+
+<!--
+  Edit Resource modal (shadowbox). Opened by JS when a result row is clicked, or
+  by "Create new" for a fresh resource. It embeds the schema-driven editor body
+  and offers Save / Delete / History with the version diff, over the FHIR API.
+
+  #681: this does not use the shared partials/dialog.html macro. That macro's
+  <details>/<summary> disclosure is the no-JS mechanism the addbox--modal
+  dialogs need; this modal is opened/closed by resources.js toggling `hidden`
+  on an always-present element (so resources.js can address #resource-modal,
+  its tabs, and its Edit/History panes directly) and has its own header
+  layout (subject line, tab switcher, Save/Delete actions) that the shared
+  head slot does not model. It still consumes the same tokens: var(--scrim)
+  and the var(--z-dialog-backdrop) band (app.css), and the same ARIA pattern
+  (role="dialog" aria-modal="true" aria-labelledby) as the shared macro.
+-->
+<div class="modal" id="resource-modal" hidden
+     data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
+     data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-save-target="{{ i18n.t_arg("editor-save-target", "target", "{target}".to_string()) }}"
+     data-msg-id-exists="{{ i18n.t_arg("editor-id-exists", "target", "{target}".to_string()) }}"
+     data-msg-id-exists-confirm="{{ i18n.t("editor-id-exists-confirm") }}"
+     data-msg-load-error="{{ i18n.t("editor-load-error") }}"
+     data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
+     data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
+  <div class="modal__backdrop" data-modal-close></div>
+  <div class="modal__box" role="dialog" aria-modal="true" aria-labelledby="resource-modal-title">
+    <header class="modal__head">
+      <div class="modal__title">
+        <h2 id="resource-modal-title">{{ i18n.t("resources-edit-title") }}</h2>
+        <span class="modal__subject" id="resource-modal-subject"></span>
+      </div>
+      <div class="modal__tabs" role="tablist">
+        <button type="button" role="tab" class="modal__tab modal__tab--on" data-modal-tab="edit" aria-selected="true">{{ i18n.t("resources-tab-edit") }}</button>
+        <button type="button" role="tab" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
+      </div>
+      <div class="modal__actions">
+        <button type="button" class="btn btn--busy-slot" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
+        <button type="button" class="btn btn--primary btn--busy-slot" id="resource-save">{{ i18n.t("editor-save") }}</button>
+        <button type="button" class="modal__x" data-modal-close aria-label="{{ i18n.t("action-cancel") }}">×</button>
+      </div>
+    </header>
+    <div class="modal__status" id="resource-modal-status" role="status"></div>
+    <!-- #1649: the saved confirmation for assistive technology only; see
+         pages/editor.html. -->
+    <span class="visually-hidden" id="resource-modal-announce" role="status"></span>
+    <div class="modal__body">
+      <div data-modal-pane="edit">
+        <div id="resource-editor-body"></div>
+      </div>
+      <div data-modal-pane="history" hidden>
+        <div id="resource-history"
+             data-msg-load-error="{{ i18n.t("history-load-error") }}"
+             data-msg-current="{{ i18n.t("history-current") }}"
+             data-msg-op-create="{{ i18n.t("history-op-create") }}"
+             data-msg-op-update="{{ i18n.t("history-op-update") }}"
+             data-msg-op-patch="{{ i18n.t("history-op-patch") }}"
+             data-msg-op-delete="{{ i18n.t("history-op-delete") }}"
+             data-msg-op-version="{{ i18n.t("history-op-version") }}"
+             data-msg-not-found="{{ i18n.t("history-not-found") }}">
+          <div class="history__split">
+            <aside class="card history__rail">
+              <div class="history__rail-head">
+                <span class="icon">{% include "icons/history.svg" %}</span>
+                <span id="resource-history-subject"></span>
+              </div>
+              <div class="history__versions" id="resource-history-versions"></div>
+            </aside>
+            <div>
+              <div class="history__controls" id="resource-history-controls" hidden>
+                <div class="history__select"><span id="resource-history-from-label">{{ i18n.t("history-from") }}</span><select id="resource-history-from" aria-labelledby="resource-history-from-label" data-combobox-select></select></div>
+                <span class="history__arrow">→</span>
+                <div class="history__select"><span id="resource-history-to-label">{{ i18n.t("history-to") }}</span><select id="resource-history-to" aria-labelledby="resource-history-to-label" data-combobox-select></select></div>
+                <label class="history__meta-toggle"><input type="checkbox" id="resource-history-metadata"> {{ i18n.t("history-show-metadata") }}</label>
+              </div>
+              <div id="resource-history-diff">
+                <p class="history__empty">{{ i18n.t("history-empty") }}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/ui/assets/fhir-search-value.js" defer></script>
+<script src="/ui/assets/typeahead.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/search-builder.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
+{% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
+<script src="/ui/assets/resource-filter.js" defer></script>
+<!-- The resource editor's JSON pane is the shared code editor (#1756), paired
+     with the guided form like View Definitions' (sql-view-definitions.html):
+     the vendored CodeMirror 6 bundle loads before the mount helper, which
+     loads before the guided form's shared loop, which loads before the
+     editor/form pairing, which loads before resource-json-editor.js — each
+     reads globals (window.HfsCodeMirror, window.HfsCodeEditor,
+     window.HfsEditorForm, window.HfsEditorPair) when it runs. They are loaded
+     here, not from base.html: no other page drives this pairing through
+     them. editor-add.js (#1239) loads right before editor-form.js, which
+     reads window.HfsEditorAdd when it mounts. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
+<script src="/ui/assets/resource-json-editor.js" defer></script>
+<script src="/ui/assets/save-target.js" defer></script>
+<script src="/ui/assets/resources.js" defer></script>
+{% endblock %}

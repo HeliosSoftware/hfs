@@ -54,7 +54,7 @@
       },
       "exclude": false,
       "description": "HbA1c at 12 months",
-      "timing": [
+      "relativeTime": [
         {
           "contextCode": {
             "coding": [

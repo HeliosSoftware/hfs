@@ -71,5 +71,14 @@
     "concept": {
       "text": "PARACHUTE Trial Participants that declined randomization"
     }
+  },
+  "handling": {
+    "coding": [
+      {
+        "system": "https://fevir.net/sevco",
+        "code": "STATO:0000724",
+        "display": "boolean variable"
+      }
+    ]
   }
 }

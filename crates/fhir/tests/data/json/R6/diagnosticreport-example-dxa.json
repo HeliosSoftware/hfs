@@ -32,7 +32,17 @@
     }
   ],
   "conclusionCode": [
-    null
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "391040000",
+            "display": "At risk of osteoporotic fracture"
+          }
+        ]
+      }
+    }
   ],
   "meta": {
     "tag": [

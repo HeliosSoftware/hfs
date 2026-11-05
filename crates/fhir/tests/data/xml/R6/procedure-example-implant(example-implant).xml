@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Procedure xmlns="http://hl7.org/fhir">
   <id value="example-implant"/>
-  <!--  <association> 
+  <!-- <association> 
       <status> 
         <coding>
           <system value="http://hl7.org/fhir/device-association-status"/>
@@ -10,7 +10,7 @@
       <humanSubject> 
         <reference value="Patient/example"/> 
       </humanSubject> 
-		</association>   -->
+		</association> -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

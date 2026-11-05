@@ -1,0 +1,16 @@
+{
+  "description": "Declared exclusions for the IN-PROCESS Rust FHIRPath R4 conformance suite (crates/fhirpath/tests/r4_tests.rs), read against the vendored corpus data/r4/tests-fhir-r4.xml. There is no .NET counterpart for R4 — the external validator job in .github/workflows/ci.yml is R5-only — so this file has no sibling to stay in sync with. Every entry is enforced: an entry matching no test fails the build, and an exact entry whose test starts passing fails the build with 'delete this entry'. See issue #307. Add an entry only for a real limitation; the only ones today are the two documentFunctions cases that need static type checking (#2245). The ten testQuantity entries this file shipped with were inherited from the in-body `quantity_tests_to_ignore` array and were already obsolete — UCUM conversion and calendar-duration comparison are implemented (crates/fhirpath/src/ucum.rs, octofhir-ucum), all eleven testQuantity tests pass, and the enforcement added in #307 is what surfaced it. NOTE: the R4 corpus contains two duplicate (group, test) name pairs (testObservations::testPolymorphismIsA and testLiterals::testLiteralString); an entry naming either would cover both tests.",
+  "version": "1.0.0",
+  "knownFailures": [
+    {
+      "groupName": "documentFunctions",
+      "testName": "testResourcesAbstract3",
+      "reason": "Static type checking: the test expects 'resources(...).nonsenseElement' to be rejected before evaluation because no resource type has that element. This engine has no element-type model for static checks, so the path evaluates to empty, as it does at run time in the Java engine. (The .NET harness scores this case as passing because it accepts an empty result for an invalid=\"semantic\" test.) See #2245."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "testHasCoding11",
+      "reason": "Static type checking: the test expects 'Patient.name.hasCoding(...)' to be rejected before evaluation because HumanName is neither a Coding nor a CodeableConcept. This engine has no element-type model for static checks, and at run time hasCoding() passes over items that aren't Codings or CodeableConcepts and returns false, as the Java engine does when evaluating. See #2245."
+    }
+  ]
+}

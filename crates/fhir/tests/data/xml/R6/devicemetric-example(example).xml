@@ -11,6 +11,15 @@
     <system value="http://goodcare.org/devicemetric/id"/>
     <value value="345675"/>
   </identifier>
+  <status value="active"/>
+  <operationalStatus value="on"/>
+  <category>
+    <coding>
+      <system value="http://terminology.hl7.org/CodeSystem/metric-category"/>
+      <code value="measurement"/>
+      <display value="Measurement"/>
+    </coding>
+  </category>
   <type>
     <coding>
       <system value="urn:iso:std:iso:11073:10101"/>
@@ -18,6 +27,9 @@
       <display value="MDC_PULS_OXIM_SAT_O2"/>
     </coding>
   </type>
+  <device>
+    <reference value="Device/dev1"/>
+  </device>
   <unit>
     <coding>
       <system value="urn:iso:std:iso:11073:10101"/>
@@ -25,19 +37,13 @@
       <display value="MDC_DIM_PERCENT"/>
     </coding>
   </unit>
-  <device>
-    <reference value="Device/dev1"/>
-  </device>
-  <status value="active"/>
-  <operationalStatus value="on"/>
-  <color value="blue"/>
-  <category>
+  <color>
     <coding>
-      <system value="http://hl7.org/fhir/metric-category"/>
-      <code value="measurement"/>
-      <display value="Measurement"/>
+      <system value="http://terminology.hl7.org/CodeSystem/color-names"/>
+      <code value="blue"/>
+      <display value="Blue"/>
     </coding>
-  </category>
+  </color>
   <measurementFrequency>
     <value value="1"/>
     <unit value="Hertz"/>
@@ -45,8 +51,20 @@
     <code value="Hz"/>
   </measurementFrequency>
   <calibration>
-    <type/>
-    <state value="calibrated"/>
+    <type>
+      <coding>
+        <system value="http://terminology.hl7.org/CodeSystem/metric-calibration-type"/>
+        <code value="two-point"/>
+        <display value="Two Point"/>
+      </coding>
+    </type>
+    <state>
+      <coding>
+        <system value="http://terminology.hl7.org/CodeSystem/metric-calibration-state"/>
+        <code value="calibrated"/>
+        <display value="Calibrated"/>
+      </coding>
+    </state>
     <time value="2016-12-28T09:03:04-05:00"/>
   </calibration>
 </DeviceMetric>

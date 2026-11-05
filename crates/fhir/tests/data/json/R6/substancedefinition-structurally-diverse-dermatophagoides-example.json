@@ -1,0 +1,142 @@
+{
+  "resourceType": "SubstanceDefinition",
+  "id": "dermatophagoides-farinae",
+  "identifier": [
+    {
+      "system": "http://example.europa.eu/fhir/SMSId",
+      "value": "DERMFAR1S"
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/publication-status",
+        "code": "active",
+        "display": "Active"
+      }
+    ]
+  },
+  "classification": [
+    {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/SubstanceType",
+          "code": "structurally-diverse",
+          "display": "Structurally Diverse"
+        }
+      ]
+    }
+  ],
+  "domain": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Domain",
+        "code": "human",
+        "display": "Human use"
+      }
+    ]
+  },
+  "description": "Dermatophagoides farinae — American house dust mite allergen extract. A structurally diverse substance defined by its source organism rather than a discrete chemical structure, used in allergen immunotherapy products.",
+  "code": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Substance",
+            "code": "DERMFAR1S"
+          }
+        ]
+      }
+    }
+  ],
+  "name": [
+    {
+      "name": "Dermatophagoides farinae",
+      "preferred": true,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ],
+      "official": [
+        {
+          "authority": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/substance-name-authority",
+                "code": "USAN",
+                "display": "USAN"
+              }
+            ]
+          },
+          "status": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/publication-status",
+                "code": "active",
+                "display": "Active"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "American house dust mite",
+      "preferred": false
+    }
+  ],
+  "sourceMaterial": {
+    "type": {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/substance-source-material-type",
+          "code": "Animal",
+          "display": "Animal"
+        }
+      ]
+    },
+    "genus": {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/Genus",
+          "code": "Dermatophagoides",
+          "display": "Dermatophagoides"
+        }
+      ]
+    },
+    "species": {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/Species",
+          "code": "farinae",
+          "display": "D. farinae"
+        }
+      ]
+    },
+    "part": {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/Part",
+          "code": "whole-organism",
+          "display": "Whole organism"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

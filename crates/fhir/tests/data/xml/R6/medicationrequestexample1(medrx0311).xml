@@ -34,18 +34,18 @@
   <status value="active"/>
   <intent value="order"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0316"/>
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
   <encounter>
-    <!--  Linked to a resource Encounter between patient and practitioner -->
+    <!-- Linked to a resource Encounter between patient and practitioner -->
     <reference value="Encounter/f001"/>
     <display value="encounter who leads to this prescription"/>
   </encounter>
@@ -64,54 +64,56 @@
     <text value="Chlorthalidone increases urniation so take it in the morning"/>
   </note>
   <dosageInstruction>
-    <simple>
-      <text value="One tablet daily"/>
-      <additionalInstruction>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="311504000"/>
-          <display value="With or after food"/>
-        </coding>
-      </additionalInstruction>
-      <timing>
-        <code>
+    <step>
+      <component>
+        <text value="One tablet daily"/>
+        <additionalInstruction>
           <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/v3-GTSAbbreviation"/>
-            <code value="QD"/>
-            <display value="QD"/>
+            <system value="http://snomed.info/sct"/>
+            <code value="311504000"/>
+            <display value="With or after food"/>
           </coding>
-        </code>
-      </timing>
-      <route>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="26643006"/>
-          <display value="Oral Route"/>
-        </coding>
-      </route>
-      <method>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="421521009"/>
-          <display value="Swallow - dosing instruction imperative (qualifier value)"/>
-        </coding>
-      </method>
-      <doseAndRate>
-        <type>
+        </additionalInstruction>
+        <timing>
+          <code>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/v3-GTSAbbreviation"/>
+              <code value="QD"/>
+              <display value="QD"/>
+            </coding>
+          </code>
+        </timing>
+        <route>
           <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
+            <system value="http://snomed.info/sct"/>
+            <code value="26643006"/>
+            <display value="Oral Route"/>
           </coding>
-        </type>
-        <doseQuantity>
-          <value value="1"/>
-          <unit value="TAB"/>
-          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
-          <code value="TAB"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
+        </route>
+        <method>
+          <coding>
+            <system value="http://snomed.info/sct"/>
+            <code value="421521009"/>
+            <display value="Swallow - dosing instruction imperative (qualifier value)"/>
+          </coding>
+        </method>
+        <doseAndRate>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+              <code value="ordered"/>
+              <display value="Ordered"/>
+            </coding>
+          </type>
+          <doseQuantity>
+            <value value="1"/>
+            <unit value="TAB"/>
+            <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+            <code value="TAB"/>
+          </doseQuantity>
+        </doseAndRate>
+      </component>
+    </step>
   </dosageInstruction>
   <dispenseRequest>
     <validityPeriod>

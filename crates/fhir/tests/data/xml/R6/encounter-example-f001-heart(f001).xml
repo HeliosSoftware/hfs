@@ -17,7 +17,7 @@
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
       <code value="AMB"/>
-      <!--  outpatient  -->
+      <!-- outpatient -->
       <display value="ambulatory"/>
     </coding>
   </class>
@@ -72,7 +72,7 @@
       <system value="http://www.amc.nl/zorgportal/identifiers/pre-admissions"/>
       <value value="93042"/>
     </preAdmissionIdentifier>
-    <!--       <preAdmissionTest>
+    <!-- <preAdmissionTest>
             <coding>
                 <system value="http://snomed.info/sct"/>
                 <code value="164847006"/>
@@ -83,7 +83,7 @@
                 <code value="396550006"/>
                 <display value="Blood test"/>
             </coding>
-        </preAdmissionTest>  -->
+        </preAdmissionTest> -->
     <admitSource>
       <coding>
         <system value="http://snomed.info/sct"/>

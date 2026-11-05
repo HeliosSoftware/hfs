@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><Task xmlns="http://hl7.org/fhir">
-  <!--    This is an example to demonstrate using task for actioning a claim status check  -->
+  <!-- This is an example to demonstrate using task for actioning a claim status check -->
   <id value="fm-example5"/>
   <meta>
     <security>
@@ -23,15 +23,22 @@
   <status value="requested"/>
   <intent value="order"/>
   <priority value="stat"/>
-  <!--  real time request and response required  -->
-  <!--    fictive code and description elements populated for this example     -->
+  <!-- real time request and response required -->
+  <!-- fictive code and description elements populated for this example -->
   <code>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/financialtaskcode"/>
       <code value="status"/>
     </coding>
   </code>
-  <focus/>
+  <focus>
+    <valueReference>
+      <identifier>
+        <system value="http://happyvalley.com/claim"/>
+        <value value="1500"/>
+      </identifier>
+    </valueReference>
+  </focus>
   <authoredOn value="2018-10-04T08:25:05+10:00"/>
   <lastModified value="2018-10-04T08:25:05+10:00"/>
   <requester>

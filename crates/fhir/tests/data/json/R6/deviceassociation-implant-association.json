@@ -67,22 +67,35 @@
   "device": {
     "reference": "#implant-device"
   },
-  "status": "active",
-  "associationStatus": {
+  "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-association-status",
-        "code": "attached",
-        "display": "Attached"
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship",
+        "code": "implanted-in",
+        "display": "Implanted In"
+      }
+    ]
+  },
+  "status": "active",
+  "relationshipStatus": {
+    "coding": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status",
+        "code": "active",
+        "display": "Active"
       }
     ]
   },
   "subject": {
     "reference": "#example-patient"
   },
-  "bodyStructure": {
-    "reference": "#heart-structure"
-  },
+  "bodyStructure": [
+    {
+      "reference": {
+        "reference": "#heart-structure"
+      }
+    }
+  ],
   "period": {
     "start": "2022-01-01"
   },

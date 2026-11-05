@@ -33,7 +33,7 @@
       </OperationOutcome>
     </resource>
     <search>
-      <!--  this is not a match - it's about the search  -->
+      <!-- this is not a match - it's about the search -->
       <mode value="outcome"/>
     </search>
   </entry>

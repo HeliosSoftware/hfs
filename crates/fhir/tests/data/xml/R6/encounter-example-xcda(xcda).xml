@@ -17,7 +17,7 @@
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
       <code value="AMB"/>
-      <!--  outpatient  -->
+      <!-- outpatient -->
       <display value="ambulatory"/>
     </coding>
   </class>

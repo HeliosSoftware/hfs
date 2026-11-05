@@ -1,0 +1,11 @@
+{# The Submission Log. Included by the detail page's first paint and, with
+   `log_oob`, re-emitted out-of-band by the status fragment so an open page
+   never drifts behind the entries each 5s poll records (#955). `log` is
+   newest-first in both, and the whole block is replaced rather than appended
+   to, because `LOG_CAP` trimming can drop old lines server-side. #}
+<section id="submission-log" class="card table-card"{% if log_oob %} hx-swap-oob="true"{% endif %}>
+  <div class="toolbar"><h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2></div>
+  {% if log.is_empty() %}<div class="empty-state">{{ i18n.t("bulk-import-log-empty") }}</div>
+  {% else %}<pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
+{% endfor %}</pre>{% endif %}
+</section>

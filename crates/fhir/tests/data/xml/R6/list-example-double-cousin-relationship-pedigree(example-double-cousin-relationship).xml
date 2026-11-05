@@ -125,7 +125,7 @@
         <display value="Pam Taylor"/>
       </patient>
       <name value="Alica"/>
-      <!-- This is a new relationship that here is a maternal grandmother who is paternal grandmonther's sibling  -->
+      <!-- This is a new relationship that here is a maternal grandmother who is paternal grandmonther's sibling -->
       <relationship>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/v3-RoleCode"/>
@@ -220,7 +220,7 @@
         <display value="Pam Taylor"/>
       </patient>
       <name value="Paul"/>
-      <!-- This is a new relationship that here is a maternal grandmother who is paternal grandmonther's sibling  -->
+      <!-- This is a new relationship that here is a maternal grandmother who is paternal grandmonther's sibling -->
       <relationship>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/v3-RoleCode"/>

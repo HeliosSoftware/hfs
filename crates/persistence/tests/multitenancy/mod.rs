@@ -5,3 +5,5 @@
 
 pub mod cross_tenant_tests;
 pub mod isolation_tests;
+pub mod tenant_id_fidelity_suite;
+pub mod tenant_id_fidelity_tests;

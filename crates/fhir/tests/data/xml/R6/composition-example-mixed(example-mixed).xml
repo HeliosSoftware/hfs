@@ -35,7 +35,7 @@
   <attester>
     <mode>
       <coding>
-        <system value="http://hl7.org/fhir/composition-attestation-mode"/>
+        <system value="http://terminology.hl7.org/CodeSystem/composition-attestation-mode"/>
         <code value="legal"/>
         <display value="Legal"/>
       </coding>
@@ -50,7 +50,7 @@
     <reference value="Organization/2.16.840.1.113883.19.5"/>
     <display value="Good Health Clinic"/>
   </custodian>
-  <!--  entries for child - CarePlan, observations, conditions, encounter, Prescriptions, etc.  -->
+  <!-- entries for child - CarePlan, observations, conditions, encounter, Prescriptions, etc. -->
   <section>
     <title value="Child's Details"/>
     <code>
@@ -66,7 +66,7 @@
 			</div>
     </text>
   </section>
-  <!--  entries for mother - Coverage, Observations, Supplies, etc.  -->
+  <!-- entries for mother - Coverage, Observations, Supplies, etc. -->
   <section>
     <title value="Mpther's Details"/>
     <code>

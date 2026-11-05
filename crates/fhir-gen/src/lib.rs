@@ -31,6 +31,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+mod implied_code_systems;
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, CompartmentDefinition, Resource};
@@ -329,6 +330,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let mut global_type_hierarchy = std::collections::HashMap::new();
     let mut all_resources = Vec::new();
     let mut all_complex_types = Vec::new();
+    let mut all_primitive_types = Vec::new();
 
     // First pass: parse all JSON files and collect all StructureDefinitions
     let bundles: Vec<_> = visit_dirs(&version_dir)?
@@ -365,10 +367,13 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         }
 
         // Extract global information
-        if let Some((hierarchy, resources, complex_types)) = extract_bundle_info(bundle) {
+        if let Some((hierarchy, resources, complex_types, primitive_types)) =
+            extract_bundle_info(bundle)
+        {
             global_type_hierarchy.extend(hierarchy);
             all_resources.extend(resources);
             all_complex_types.extend(complex_types);
+            all_primitive_types.extend(primitive_types);
         }
     }
 
@@ -393,6 +398,8 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     all_resources.dedup();
     all_complex_types.sort();
     all_complex_types.dedup();
+    all_primitive_types.sort();
+    all_primitive_types.dedup();
 
     // Load compartment definitions for this version
     let compartment_definitions = load_compartment_definitions(&version_dir);
@@ -403,11 +410,27 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         &global_type_hierarchy,
         &all_resources,
         &all_complex_types,
+        &all_primitive_types,
         &compartment_definitions,
     )?;
 
     // Generate the per-version field-type lookup used by FHIRPath type inference.
     generate_field_type_lookup(&version_path, &all_struct_defs)?;
+
+    // Refresh the compartment search-param FHIRPath expression table for
+    // this version, written to a separate file under
+    // `<output_path>/compartment_expressions/{ver}.rs` so the giant
+    // per-version source file stays untouched between regenerations that
+    // only need the spec-data join.
+    generate_compartment_expressions_file(output_path.as_ref(), &version_dir, version.as_str())?;
+
+    // And the implied code system of each `code`-typed token search
+    // parameter (#1395), under `<output_path>/implied_code_systems/{ver}.rs`.
+    implied_code_systems::generate_implied_code_systems_file(
+        output_path.as_ref(),
+        &version_dir,
+        version.as_str(),
+    )?;
 
     Ok(())
 }
@@ -477,6 +500,52 @@ pub fn process_fhir_version(
             Ok(())
         }
         Some(specific_version) => process_single_version(&specific_version, output_path),
+    }
+}
+
+/// Regenerates only the compartment-expression tables under
+/// `<output_path>/compartment_expressions/{ver}.rs`, and the implied
+/// code-system tables under `<output_path>/implied_code_systems/{ver}.rs`,
+/// skipping the
+/// (expensive, large-diff) regeneration of the per-version `r4.rs` /
+/// `r4b.rs` / `r5.rs` / `r6.rs` source files.
+///
+/// Useful when only the upstream `CompartmentDefinition` or
+/// `search-parameters.json` data has changed. Same FHIR-version
+/// selection semantics as [`process_fhir_version`].
+pub fn regenerate_compartment_expressions(
+    version: Option<FhirVersion>,
+    output_path: impl AsRef<Path>,
+) -> io::Result<()> {
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let run = |ver: FhirVersion| -> io::Result<()> {
+        let version_dir = resources_dir.join(ver.as_str());
+        generate_compartment_expressions_file(output_path.as_ref(), &version_dir, ver.as_str())?;
+        implied_code_systems::generate_implied_code_systems_file(
+            output_path.as_ref(),
+            &version_dir,
+            ver.as_str(),
+        )
+    };
+    match version {
+        None => {
+            for ver in [
+                #[cfg(feature = "R4")]
+                FhirVersion::R4,
+                #[cfg(feature = "R4B")]
+                FhirVersion::R4B,
+                #[cfg(feature = "R5")]
+                FhirVersion::R5,
+                #[cfg(feature = "R6")]
+                FhirVersion::R6,
+            ] {
+                if let Err(e) = run(ver) {
+                    eprintln!("Warning: Failed to process {:?}: {}", ver, e);
+                }
+            }
+            Ok(())
+        }
+        Some(v) => run(v),
     }
 }
 
@@ -552,7 +621,74 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
 fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).map_err(serde_json::Error::io)?;
     let reader = BufReader::new(file);
-    serde_json::from_reader(reader)
+    let mut bundle: Bundle = serde_json::from_reader(reader)?;
+    if let Some(entries) = bundle.entry.as_mut() {
+        for entry in entries {
+            if let Some(Resource::StructureDefinition(def)) = entry.resource.as_mut() {
+                add_resource_definition_element(def);
+            }
+        }
+    }
+    Ok(bundle)
+}
+
+/// Marks a StructureDefinition as defining an *additional resource*: a resource
+/// type defined outside the core specification (e.g. SQL on FHIR's
+/// ViewDefinition).
+const ADDITIONAL_RESOURCE_EXTENSION: &str =
+    "http://hl7.org/fhir/tools/StructureDefinition/additional-resource";
+
+/// Gives an additional resource its `resourceDefinition` element.
+///
+/// Every instance of an additional resource carries a `resourceDefinition`
+/// property — the versioned canonical of the StructureDefinition that defines
+/// it — next to `resourceType`. The property belongs to the additional-resource
+/// mechanism rather than to the resource, so no snapshot lists it; without it
+/// the generated struct drops the value on a typed round trip. The element is
+/// added here, once, so that everything derived from the snapshot (the struct,
+/// the field type lookup, the documentation) sees it.
+fn add_resource_definition_element(def: &mut StructureDefinition) {
+    let is_additional_resource = def
+        .extension
+        .as_ref()
+        .is_some_and(|exts| exts.iter().any(|e| e.url == ADDITIONAL_RESOURCE_EXTENSION));
+    if !is_additional_resource {
+        return;
+    }
+    let path = format!("{}.resourceDefinition", def.name);
+    let Some(elements) = def.snapshot.as_mut().and_then(|s| s.element.as_mut()) else {
+        return;
+    };
+    if elements.iter().any(|e| e.path == path) {
+        return;
+    }
+    // Directly after the root element, so that it serializes where instances
+    // carry it: right after `resourceType`, ahead of `id`.
+    let position = elements
+        .iter()
+        .position(|e| e.path == def.name)
+        .map_or(0, |root| root + 1);
+    elements.insert(
+        position,
+        ElementDefinition {
+            id: Some(path.clone()),
+            path,
+            short: Some("Canonical of the definition of this additional resource".to_string()),
+            definition: Some(
+                "The versioned canonical URL of the StructureDefinition that defines this \
+                 resource type. Instances of an additional resource - a resource type \
+                 defined outside the core FHIR specification - carry it alongside \
+                 resourceType."
+                    .to_string(),
+            ),
+            min: Some(0),
+            max: Some("1".to_string()),
+            r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                "canonical".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
 }
 
 /// Determines if a StructureDefinition should be included in code generation.
@@ -600,6 +736,7 @@ type BundleInfo = (
     std::collections::HashMap<String, String>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 );
 
 /// Extracts type hierarchy and resource information from a bundle
@@ -607,6 +744,7 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
     let mut type_hierarchy = std::collections::HashMap::new();
     let mut resources = Vec::new();
     let mut complex_types = Vec::new();
+    let mut primitive_types = Vec::new();
 
     if let Some(entries) = bundle.entry.as_ref() {
         for entry in entries {
@@ -624,6 +762,8 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
                             resources.push(def.name.clone());
                         } else if def.kind == "complex-type" && !def.r#abstract {
                             complex_types.push(def.name.clone());
+                        } else if def.kind == "primitive-type" && !def.r#abstract {
+                            primitive_types.push(def.name.clone());
                         }
                     }
                 }
@@ -631,7 +771,7 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
         }
     }
 
-    Some((type_hierarchy, resources, complex_types))
+    Some((type_hierarchy, resources, complex_types, primitive_types))
 }
 
 /// Generates global constructs (Resource enum, type hierarchy, etc.) once at the end
@@ -640,6 +780,7 @@ fn generate_global_constructs(
     type_hierarchy: &std::collections::HashMap<String, String>,
     all_resources: &[String],
     all_complex_types: &[String],
+    all_primitive_types: &[String],
     compartment_definitions: &[CompartmentDefinition],
 ) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
@@ -714,6 +855,28 @@ fn generate_global_constructs(
         writeln!(file, "        vec![")?;
         for complex_type in all_complex_types {
             writeln!(file, "            \"{}\",", complex_type)?;
+        }
+        writeln!(file, "        ]")?;
+        writeln!(file, "    }}")?;
+        writeln!(file, "}}")?;
+    }
+
+    // Generate PrimitiveTypes struct and FhirPrimitiveTypeProvider implementation
+    if !all_primitive_types.is_empty() {
+        writeln!(file, "\n// --- Primitive Types Provider ---")?;
+        writeln!(file, "/// Marker struct for primitive type information")?;
+        writeln!(file, "pub struct PrimitiveTypes;")?;
+        writeln!(
+            file,
+            "\nimpl crate::FhirPrimitiveTypeProvider for PrimitiveTypes {{"
+        )?;
+        writeln!(
+            file,
+            "    fn get_primitive_type_names() -> Vec<&'static str> {{"
+        )?;
+        writeln!(file, "        vec![")?;
+        for primitive_type in all_primitive_types {
+            writeln!(file, "            \"{}\",", primitive_type)?;
         }
         writeln!(file, "        ]")?;
         writeln!(file, "    }}")?;
@@ -1120,6 +1283,235 @@ fn generate_compartment_lookup(
     writeln!(file, "}}")?;
 
     Ok(())
+}
+
+/// Generates the `compartment_expressions/{ver}.rs` file that exposes
+/// [`get_compartment_param_expressions`][get_compartment_param_expressions].
+///
+/// For each `(compartment, resource_type, param_name)` triple from a
+/// FHIR `CompartmentDefinition`, joins against `search-parameters.json`
+/// (matching `code == param_name` and `resource_type ∈ base`) to attach
+/// the parameter's FHIRPath expression. The resulting static table lets
+/// callers walk a resource's compartment membership at runtime with no
+/// JSON parsing — see `helios_sof::compartment` for the consumer side.
+///
+/// Output file goes under `output_root/compartment_expressions/{ver_lower}.rs`.
+/// Re-running the generator overwrites the file with deterministic content
+/// (BTreeMap ordering, sorted entries).
+///
+/// [get_compartment_param_expressions]: ../../helios_fhir/compartment_expressions/index.html
+fn generate_compartment_expressions_file(
+    output_root: &Path,
+    version_dir: &Path,
+    version_name: &str,
+) -> io::Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    // `(resource_type, code) → expression` from the spec's
+    // search-parameters bundle.
+    let sp_path = version_dir.join("search-parameters.json");
+    let sp_lookup = load_search_parameter_expressions(&sp_path)?;
+
+    // `compartment_code → resource_type → Vec<(param_name, expression)>`.
+    let mut table: BTreeMap<String, BTreeMap<String, Vec<(String, String)>>> = BTreeMap::new();
+
+    if let Ok(entries) = std::fs::read_dir(version_dir) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("compartmentdefinition-")
+                || !name.ends_with(".json")
+                || name.contains("example")
+            {
+                continue;
+            }
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let json: serde_json::Value = match serde_json::from_reader(BufReader::new(file)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(code) = json.get("code").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(resources) = json.get("resource").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for resource in resources {
+                let Some(rt) = resource.get("code").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(params) = resource.get("param").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let mut joined = Vec::new();
+                for param_value in params {
+                    let Some(param_name) = param_value.as_str() else {
+                        continue;
+                    };
+                    if let Some(expression) =
+                        sp_lookup.get(&(rt.to_string(), param_name.to_string()))
+                    {
+                        joined.push((param_name.to_string(), expression.clone()));
+                    }
+                }
+                if !joined.is_empty() {
+                    table
+                        .entry(code.to_string())
+                        .or_default()
+                        .insert(rt.to_string(), joined);
+                }
+            }
+        }
+    }
+
+    let dir = output_root.join("compartment_expressions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.rs", version_name.to_lowercase()));
+    let mut file = std::fs::File::create(&path)?;
+
+    writeln!(
+        file,
+        "//! Compartment search-param FHIRPath expression tables for FHIR {version_name}."
+    )?;
+    writeln!(file, "//!")?;
+    writeln!(
+        file,
+        "//! Generated by `cargo run -p helios-fhir-gen -- --all`. Source data:"
+    )?;
+    writeln!(
+        file,
+        "//! `crates/fhir-gen/resources/{version_name}/compartmentdefinition-*.json` joined"
+    )?;
+    writeln!(
+        file,
+        "//! against `search-parameters.json` from the same directory. Do not edit by"
+    )?;
+    writeln!(file, "//! hand — re-run the generator instead.")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "/// Returns `(search-param-name, FHIRPath-expression)` pairs that link"
+    )?;
+    writeln!(
+        file,
+        "/// `resource_type` to the given `compartment_type`, per FHIR {version_name}'s"
+    )?;
+    writeln!(file, "/// `CompartmentDefinition` resources.")?;
+    writeln!(file, "///")?;
+    writeln!(
+        file,
+        "/// Returns an empty slice when the resource type is not a member of the"
+    )?;
+    writeln!(file, "/// compartment.")?;
+    writeln!(file, "pub fn get_compartment_param_expressions(")?;
+    writeln!(file, "    compartment_type: &str,")?;
+    writeln!(file, "    resource_type: &str,")?;
+    writeln!(file, ") -> &'static [(&'static str, &'static str)] {{")?;
+    writeln!(file, "    match compartment_type {{")?;
+
+    for (compartment, resources) in &table {
+        writeln!(file, "        \"{compartment}\" => match resource_type {{")?;
+        for (rt, entries) in resources {
+            writeln!(file, "            \"{rt}\" => &[")?;
+            for (name, expression) in entries {
+                writeln!(
+                    file,
+                    "                ({}, {}),",
+                    rust_raw_string_literal(name),
+                    rust_raw_string_literal(expression)
+                )?;
+            }
+            writeln!(file, "            ],")?;
+        }
+        writeln!(file, "            _ => &[],")?;
+        writeln!(file, "        }},")?;
+    }
+
+    writeln!(file, "        _ => &[],")?;
+    writeln!(file, "    }}")?;
+    writeln!(file, "}}")?;
+
+    Ok(())
+}
+
+/// Loads `(resource_type, code) → expression` mappings from a FHIR
+/// `search-parameters.json` Bundle. The same SearchParameter resource
+/// can appear under multiple bases, so the same `code` joins to each base
+/// independently.
+fn load_search_parameter_expressions(
+    path: &Path,
+) -> io::Result<std::collections::BTreeMap<(String, String), String>> {
+    use std::collections::BTreeMap;
+
+    let mut lookup = BTreeMap::new();
+    let Ok(file) = File::open(path) else {
+        return Ok(lookup);
+    };
+    let json: serde_json::Value = match serde_json::from_reader(BufReader::new(file)) {
+        Ok(v) => v,
+        Err(_) => return Ok(lookup),
+    };
+    let Some(entries) = json.get("entry").and_then(|v| v.as_array()) else {
+        return Ok(lookup);
+    };
+    for entry in entries {
+        let Some(resource) = entry.get("resource") else {
+            continue;
+        };
+        if resource.get("resourceType").and_then(|v| v.as_str()) != Some("SearchParameter") {
+            continue;
+        }
+        let Some(code) = resource.get("code").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(expression) = resource.get("expression").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(bases) = resource.get("base").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for base in bases {
+            if let Some(base_str) = base.as_str() {
+                lookup.insert(
+                    (base_str.to_string(), code.to_string()),
+                    expression.to_string(),
+                );
+            }
+        }
+    }
+    Ok(lookup)
+}
+
+/// Emits a Rust raw-string literal for `s`, choosing a `#`-count that
+/// avoids any closing-delimiter collision in the body (FHIRPath expressions
+/// contain quoted-string literals inside `.where(...)` calls).
+fn rust_raw_string_literal(s: &str) -> String {
+    let max_hash = s
+        .as_bytes()
+        .windows(2)
+        .filter(|w| w[0] == b'"')
+        .map(|w| {
+            let mut c = 0usize;
+            for &b in &w[1..] {
+                if b == b'#' {
+                    c += 1;
+                } else {
+                    break;
+                }
+            }
+            c
+        })
+        .max()
+        .unwrap_or(0);
+    let hashes = "#".repeat(max_hash + 1);
+    format!("r{hashes}\"{s}\"{hashes}")
 }
 
 /// Generates a Rust enum containing all FHIR resource types.
@@ -2204,8 +2596,8 @@ fn generate_element_documentation(element: &ElementDefinition) -> String {
                 line.to_string()
             } else {
                 // This should never happen, but if it does, add the prefix
-                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}", 
-                    &element.path, i, line);
+                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}",
+                    element.path, i, line);
                 format!("/// {}", line)
             }
         })
@@ -3026,6 +3418,54 @@ mod tests {
     use super::*;
     use initial_fhir_model::Resource;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_additional_resource_gets_resource_definition_element() {
+        let definition = |additional: bool| -> StructureDefinition {
+            let extension = if additional {
+                serde_json::json!([{ "url": ADDITIONAL_RESOURCE_EXTENSION, "valueBoolean": true }])
+            } else {
+                serde_json::json!([])
+            };
+            serde_json::from_value(serde_json::json!({
+                "resourceType": "StructureDefinition",
+                "extension": extension,
+                "url": "http://hl7.org/fhir/StructureDefinition/ViewDefinition",
+                "name": "ViewDefinition",
+                "status": "draft",
+                "kind": "resource",
+                "abstract": false,
+                "type": "ViewDefinition",
+                "snapshot": { "element": [
+                    { "id": "ViewDefinition", "path": "ViewDefinition" },
+                    { "id": "ViewDefinition.id", "path": "ViewDefinition.id" }
+                ]}
+            }))
+            .expect("Failed to build StructureDefinition")
+        };
+        let paths = |def: &StructureDefinition| -> Vec<String> {
+            let elements = def.snapshot.as_ref().unwrap().element.as_ref().unwrap();
+            elements.iter().map(|e| e.path.clone()).collect()
+        };
+
+        // Added directly after the root element, exactly once
+        let mut def = definition(true);
+        add_resource_definition_element(&mut def);
+        add_resource_definition_element(&mut def);
+        assert_eq!(
+            paths(&def),
+            [
+                "ViewDefinition",
+                "ViewDefinition.resourceDefinition",
+                "ViewDefinition.id"
+            ]
+        );
+
+        // Core resources are left alone
+        let mut def = definition(false);
+        add_resource_definition_element(&mut def);
+        assert_eq!(paths(&def), ["ViewDefinition", "ViewDefinition.id"]);
+    }
 
     #[test]
     fn test_process_fhir_version() {

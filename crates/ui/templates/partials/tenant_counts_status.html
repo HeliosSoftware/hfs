@@ -1,0 +1,19 @@
+{#
+  The count status line (#1851): what state the resource counts are in, as
+  of when, and how they were measured. A persistent role="status" region, so
+  assistive technology hears each change; fragments swap only its contents
+  (hx-swap-oob="innerHTML"). It is deliberately not the provisioning rows'
+  .busy-status: loading counts and provisioning a tenant are different
+  things. data-counts-state is the marker tests wait on: pending and
+  refreshing are still moving (and the rows fragment polls), every other
+  state is settled. Without JavaScript nothing polls, so while counts are on
+  their way a plain Refresh link reloads the page with the same search term
+  (#1848 D18); the reload reads the shared cache and never counts in the
+  request.
+#}
+<p id="tenant-counts-status" class="counts-status" role="status"{% if oob %} hx-swap-oob="innerHTML"{% endif %}>
+  <span data-counts-state="{{ counts.state }}">{{ counts.message }}</span>
+  {% if let Some(href) = counts.refresh_href %}
+  <a class="counts-status__refresh" href="{{ href }}">{{ i18n.t("tenants-counts-refresh") }}</a>
+  {% endif %}
+</p>

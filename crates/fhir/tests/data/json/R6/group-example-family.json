@@ -23,7 +23,7 @@
   "code": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/ValueSet/group-code",
+        "system": "http://hl7.org/fhir/group-code",
         "code": "family"
       }
     ]

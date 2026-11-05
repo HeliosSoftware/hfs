@@ -6,21 +6,6 @@
       "resourceType": "Organization",
       "id": "mmanu",
       "name": "Medication Manufacturer"
-    },
-    {
-      "resourceType": "Substance",
-      "id": "sub04",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "386906001",
-              "display": "Capecitabine (substance)"
-            }
-          ]
-        }
-      }
     }
   ],
   "code": {
@@ -47,8 +32,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub04"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "386906001",
+              "display": "Capecitabine (substance)"
+            }
+          ]
         }
       },
       "strengthRatio": {

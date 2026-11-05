@@ -31,8 +31,7 @@
   </identifier>
   <status value="available"/>
   <type>
-    <!-- 
-   Type is a loosely defined field because there is such a lot of variation in how it is used.
+    <!-- Type is a loosely defined field because there is such a lot of variation in how it is used.
    The principal variation is how much information that could be represented elsewhere is also
    represented here. For instance, here's some possible types:
      lithium heparin plasma   (+ .container.additive) (e.g. SNOMED CT 446272009)
@@ -40,8 +39,7 @@
      Peritoneal lavage        (+ collection.bodySite)
    If the type includes other fields, it would be normal not to populate the other fields
 
-   Note that this practice is so widespread that it's pointless to try and stop it
-  -->
+   Note that this practice is so widespread that it's pointless to try and stop it -->
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v2-0487"/>
       <code value="RANDU"/>
@@ -52,14 +50,14 @@
     <reference value="Patient/example"/>
   </subject>
   <receivedTime value="2015-08-18T07:03:00Z"/>
-  <!--  method is usually implied by type  -->
+  <!-- method is usually implied by type -->
   <collection>
     <collector>
-      <!--  in practice, collecter is almost always recorded  -->
+      <!-- in practice, collecter is almost always recorded -->
       <reference value="Practitioner/f202"/>
     </collector>
-    <!--  the time of collection is usually required. Usually a point in time, but can be a period 
-      (collectedPeriod) if it's a timed collection (e.g. a 24 hour urine)  -->
+    <!-- the time of collection is usually required. Usually a point in time, but can be a period 
+      (collectedPeriod) if it's a timed collection (e.g. a 24 hour urine) -->
     <collectedDateTime value="2015-08-18T07:03:00Z"/>
   </collection>
   <processing>
@@ -70,11 +68,21 @@
         <code value="ACID"/>
       </coding>
     </method>
-    <additive/>
+    <additive>
+      <type>
+        <concept>
+          <text value="6 N HCl"/>
+        </concept>
+      </type>
+    </additive>
     <timeDateTime value="2015-08-18T08:10:00Z"/>
   </processing>
   <container>
-    <deviceCanonical value="http://hl7.org/fhir/Device/device-example-specimen-container-polycup"/>
+    <device>
+      <reference>
+        <reference value="Device/device-example-specimen-container-polycup"/>
+      </reference>
+    </device>
     <specimenQuantity>
       <value value="10"/>
       <unit value="mls"/>

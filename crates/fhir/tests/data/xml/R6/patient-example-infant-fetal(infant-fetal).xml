@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><Patient xmlns="http://hl7.org/fhir">
-  <!--  example of a fetal (pre-birth) patient  -->
+  <!-- example of a fetal (pre-birth) patient -->
   <id value="infant-fetal"/>
-  <!--  The details of the child  -->
+  <!-- The details of the child -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -24,9 +24,9 @@
   </identifier>
   <gender value="male"/>
   <contact>
-    <!--  Contact of the patient  -->
+    <!-- Contact of the patient -->
     <relationship>
-      <!--  Indicates that the contact is the patient's mother  -->
+      <!-- Indicates that the contact is the patient's mother -->
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="72705000"/>

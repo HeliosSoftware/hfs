@@ -1,0 +1,325 @@
+<!--
+  The guided-form card (#264): one row per node, flattened depth-first.
+  Included both inside the full editor body's two-column grid
+  (`editor-body.html`) and, standalone, as the `pane=form` fragment (#843) —
+  a host that keeps its own JSON view (View Definitions' CodeMirror pane)
+  only ever needs this half re-rendered.
+
+  `needs-js` (#843, gated on `needs_js`): only the View Definitions page sets
+  this — it renders this card inline on its own first paint, so the card
+  stays hidden until `theme.js` has marked `<html class="js">`, or a page
+  whose JavaScript never runs (or hasn't run yet) would show a form with no
+  client-side loop wired to it. Every other renderer of this partial (the
+  Resource Editor's own body, and this crate's `POST /ui/editor/render`
+  endpoint by default) leaves `needs_js` `false` — the Resource Editor only
+  ever fills `#editor-body` from `editor.js`'s own client-side fetch, so a
+  card hidden here would have no page left to reveal it.
+-->
+<section class="card editor-form{% if needs_js %} needs-js{% endif %}">
+  <div class="card-head">
+    <h3><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("editor-view-form") }}</h3>
+    <!--
+      `data-msg-invalid-json` (#843): the short chip text `vd-editor.js`
+      switches to, client-side only, while the editor's text does not parse
+      as JSON at all — nothing here ever renders that state itself, since a
+      document that fails to parse never reaches `analyze()` in the first
+      place (see `partials/editor-form-fragment.html`'s own `parse_error`
+      branch for the *page's* invalid-JSON state, a different card
+      entirely). Gated on `needs_js` too: no other consumer of this partial
+      reads it, and the Resource Editor keeps rendering exactly the markup
+      it always has.
+
+      `data-error-count` (#1014): the server's own count — FHIR schema,
+      required bindings, and lint findings — read by `vd-editor.js`'s Save
+      guard as a second source alongside the last completed lint pass, so a
+      validator-only error (one the lint endpoint never reports) still
+      confirms before saving silently. Rendered unconditionally, unlike
+      `data-msg-invalid-json` below: `editor-form.js` calls `POST
+      /ui/editor/render` (`pane=form`) after every settled edit and always
+      gets `needs_js: false` back (`editor.rs`), then swaps this whole card
+      in — a gate here would drop the attribute on the very first edit and
+      leave the Save guard permanently blind. It is inert without the JS
+      that reads it, so the Resource Editor gains only this one attribute.
+
+      `data-issues` (#1756): the same validation issues as a JSON array of
+      `{path, message}` objects (dotted path, `""` for the root), read by the
+      resource editor's JSON pane to mark the line each issue belongs to.
+      Rendered unconditionally for the same reason as `data-error-count`, and
+      inert without the JS that reads it.
+    -->
+    <div class="editor-validity{% if error_count == 0 %} editor-validity--ok{% endif %}"
+         data-error-count="{{ error_count }}"
+         data-issues="{{ issues_json }}"
+         {%- if needs_js %} data-msg-invalid-json="{{ i18n.t("vd-form-invalid-chip") }}"{% endif %}>
+      {% if error_count == 0 %}{{ i18n.t("editor-valid") }}{% else %}{{ i18n.t_arg("editor-issues", "count", error_count) }}{% endif %}
+    </div>
+  </div>
+
+  <!--
+    Live-vs-save legibility (#366): the per-keystroke pass is structural
+    plus the embedded required-binding check; FHIRPath constraints and the
+    configured terminology run on save. A clean form here is not the whole
+    story, and the legend says so instead of surprising on save. Which of
+    the three legends below shows is the host's own choice (`legend`, #840),
+    not necessarily derived from the document's `resourceType` — see
+    `editor::Legend`.
+
+    ViewDefinition (#843) gets its own single-line legend: Save stays
+    permissive there, so "checked on save" would promise a pass this page
+    never runs. Its line names what the per-keystroke pass here actually
+    covers, including the SOF-only lint diagnostics `analyze` folds into
+    `rows`/`orphan_errors` below (an invalid FHIRPath expression, an
+    undeclared constant, duplicate column names, ...) alongside the
+    validator's own structural checks.
+
+    SQL Query / SQL View (#840) get their own three-line legend: "checked on
+    save" there names the SQL on FHIR Library type and the SQL attachment —
+    what actually gates Save on those pages — rather than the generic
+    constraints/terminology promise below, which would be misleading with
+    `HFS_VALIDATION_MODE` off (the default). Its third line (#1233) says
+    where the SQL attachment itself is edited, since `hidden=["content"]`
+    (`render_lib_details_pane`, `crates/ui/src/lib.rs`) keeps this guided
+    form from ever listing it.
+  -->
+  <p class="editor-legend">
+    {% match legend %}
+    {% when Legend::ViewDefinition %}
+    <span class="editor-legend__live">{{ i18n.t("vd-form-legend-live") }}</span>
+    {% when Legend::SqlLibrary %}
+    <span class="editor-legend__live">{{ i18n.t("lib-form-legend-live") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("lib-form-legend-save") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("lib-form-legend-content") }}</span>
+    {% when Legend::Resource %}
+    <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
+    {% endmatch %}
+  </p>
+
+  <span class="visually-hidden" data-add-status role="status" aria-live="polite" aria-atomic="true"
+        data-msg-added="{{ i18n.t("editor-add-added") }}"
+        data-msg-pending="{{ i18n.t("editor-add-undo-pending") }}"
+        data-msg-unavailable="{{ i18n.t("editor-add-undo-unavailable") }}"
+        data-msg-failed="{{ i18n.t("editor-update-failed") }}"></span>
+  <p class="editor-row__error" data-editor-failure hidden>{{ i18n.t("editor-update-failed") }}</p>
+  <p class="editor-row__undo" data-add-undo-note hidden>
+    <button type="button" class="editor-add__undo" data-add-undo>{{ i18n.t("editor-add-undo") }}</button>
+  </p>
+
+  <div class="editor-tree">
+    {% for row in rows %}
+    <div class="editor-row{% if row.collection.is_some() %} editor-row--collection{% endif %}{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
+         style="padding-left: {{ row.indent }}px"
+         {% if row.collection.is_some() %}data-collection{% endif %}
+         {% if !row.is_primitive %}role="group" tabindex="-1" aria-label="{{ row.accessible_label }}"{% endif %}
+         data-path="{{ row.path }}">
+
+      <div class="editor-row__head">
+        <span class="editor-row__label">{{ row.label }}</span>
+
+        {% if !row.type_label.is_empty() %}
+        <span class="editor-row__type">{{ row.type_label }}</span>
+        {% endif %}
+
+        {% if !row.slice.is_empty() %}
+        <span class="editor-row__slice">{{ row.slice }}</span>
+        {% endif %}
+
+        {% if row.must_support %}
+        <span class="editor-row__ms" title="{{ i18n.t("editor-must-support-hint") }}">{{ i18n.t("editor-must-support-badge") }}</span>
+        {% endif %}
+
+        {% if row.is_modifier %}
+        <span class="editor-row__warn" title="{{ i18n.t("editor-modifier-warning") }}">
+          {{ i18n.t("editor-modifier-badge") }}
+        </span>
+        {% endif %}
+
+        {% if row.is_unknown %}
+        <span class="editor-row__warn editor-row__warn--muted" title="{{ i18n.t("editor-unknown-hint") }}">
+          {{ i18n.t("editor-unknown-badge") }}
+        </span>
+        {% endif %}
+
+        {% if row.has_primitive_extension %}
+        <span class="editor-row__warn editor-row__warn--muted" title="{{ i18n.t("editor-primitive-extension-hint") }}">
+          {{ i18n.t("editor-primitive-extension-badge") }}
+        </span>
+        {% endif %}
+
+        {% if !row.binding_strength.is_empty() %}
+        <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+        <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
+        {% endif %}
+
+        {% if row.is_primitive %}
+        <!--
+          `aria-label` (#843, closing a gap open since #264): the field's own
+          `.editor-row__label` span above is not a `<label for>` — one row can
+          hold several controls (this input, the remove button, an add-picker)
+          — so without an explicit name here the input has none at all, an
+          axe `label` violation on every page that renders this partial.
+          `row.label` alone repeats across siblings (every column's `name`
+          field reads "name"), so the row's own dotted path rides along too —
+          the same identifier `data-set` already carries, just read aloud —
+          which is always present and unique for a primitive row.
+        -->
+        <input class="editor-row__input" type="text" value="{{ row.value }}"
+               data-set="{{ row.path }}"
+               aria-label="{{ row.accessible_label }}"
+               {% if row.type_label == "date" %}
+               placeholder="2024-05-17" inputmode="numeric"
+               pattern="\d{4}(-\d{2}(-\d{2})?)?"
+               title="{{ i18n.t("editor-hint-date") }}"
+               {% else if row.type_label == "dateTime" %}
+               placeholder="2024-05-17T14:30:00+02:00"
+               pattern="\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2}))?)?)?"
+               title="{{ i18n.t("editor-hint-datetime") }}"
+               {% else if row.type_label == "time" %}
+               placeholder="14:30:00" inputmode="numeric"
+               pattern="\d{2}:\d{2}:\d{2}(\.\d+)?"
+               title="{{ i18n.t("editor-hint-time") }}"
+               {% else if row.type_label == "instant" %}
+               placeholder="2024-05-17T14:30:00.000Z"
+               pattern="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2})"
+               title="{{ i18n.t("editor-hint-instant") }}"
+               {% endif %}
+               {% if !row.binding_url.is_empty() %}data-vs-url="{{ row.binding_url }}"{% endif %}
+               {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
+        {% endif %}
+
+        {% if row.can_remove %}
+        <button type="button" class="editor-row__del" data-remove="{{ row.path }}"
+                aria-label="{{ i18n.t("editor-remove") }}" title="{{ i18n.t("editor-remove") }}">×</button>
+        {% endif %}
+
+        {% if let Some(collection) = row.collection %}
+        {% if collection.append.len() == 1 %}
+        {% for option in collection.append %}
+        <button type="button" class="btn" data-collection-add
+                data-add="{{ collection.parent_path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}
+                aria-label="{{ i18n.t("editor-add") }} — {{ row.path }}">
+          + {{ i18n.t("editor-collection-add") }}
+        </button>
+        {% endfor %}
+        {% else if !collection.append.is_empty() %}
+        <details class="editor-add editor-add--picker">
+          <summary class="editor-add__toggle">+ {{ i18n.t("editor-collection-add") }}</summary>
+          <div class="editor-add__panel">
+            <div class="editor-add__head">
+              <span class="editor-add__title">{{ row.label }}</span>
+              <button type="button" class="editor-add__close" data-add-close aria-label="{{ i18n.t("editor-add-close") }}">×</button>
+            </div>
+            <input type="search" class="editor-add__filter"
+                   placeholder="{{ i18n.t("editor-add-filter") }}"
+                   aria-label="{{ i18n.t("editor-add-filter") }}">
+            <div class="editor-add__list">
+              {% for option in collection.append %}
+              <button type="button" class="editor-add__item" data-collection-add
+                      data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
+                      data-add="{{ collection.parent_path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}</span>
+                <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if !option.short.is_empty() %}<span class="editor-add__short">{{ option.short }}</span>{% endif %}
+              </button>
+              {% endfor %}
+            </div>
+          </div>
+        </details>
+        {% endif %}
+        {% endif %}
+      </div>
+
+      {% if !row.short.is_empty() %}
+      <p class="editor-row__desc">{{ row.short }}</p>
+      {% endif %}
+
+      {% for message in row.errors %}
+      <p class="editor-row__error">{{ message }}</p>
+      {% endfor %}
+
+      {% if !row.addable.is_empty() %}
+      <details class="editor-add editor-add--picker"{% if row.path.is_empty() && auto_open_add %} open{% endif %}>
+        <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
+        <div class="editor-add__panel">
+          <div class="editor-add__head">
+            <span class="editor-add__title">{{ i18n.t("editor-add") }}</span>
+            <button type="button" class="editor-add__close" data-add-close aria-label="{{ i18n.t("editor-add-close") }}">×</button>
+          </div>
+          <input type="search" class="editor-add__filter"
+                 placeholder="{{ i18n.t("editor-add-filter") }}"
+                 aria-label="{{ i18n.t("editor-add-filter") }}">
+          <details class="editor-add__group" open>
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-elements") }} <span class="editor-add__count">{{ i18n.num(row.addable.len()) }}</span></summary>
+            <div class="editor-add__list">
+              {% for option in row.addable %}
+              {% if option.kind == "choice" %}
+              <div class="editor-add__choice" data-add-name="{{ option.name }}">
+                <span class="editor-add__name">{{ option.name }}[x]{% if option.required %} <em>*</em>{% endif %}</span>
+                <select data-combobox-select data-choose="{{ row.path }}" data-declarer="{{ option.name }}"
+                        aria-label="{{ option.name }}[x] — {{ i18n.t("editor-pick-type") }}">
+                  <option value="">{{ i18n.t("editor-pick-type") }}</option>
+                  {% for arm in option.arms %}
+                  <option value="{{ arm }}">{{ arm }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              {% else %}
+              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
+                <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if !option.short.is_empty() %}
+                <span class="editor-add__short">{{ option.short }}</span>
+                {% endif %}
+                {% if option.kind == "another" %}
+                <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
+                {% endif %}
+              </button>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </details>
+          {% if row.accepts_extension %}
+          <details class="editor-add__group" data-add-group="extensions">
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-extensions") }} <span class="editor-add__count">{{ i18n.num(row.ext_options.len()) }}</span></summary>
+            <div class="editor-add__ext">
+              {% if !row.ext_options.is_empty() %}
+              <div class="editor-add__list">
+                {% for ext in row.ext_options %}
+                <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
+                        data-extension="{{ row.path }}" data-url="{{ ext.url }}"
+                        {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
+                  <span class="editor-add__name">{{ ext.name }}</span>
+                  {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+                </button>
+                {% endfor %}
+              </div>
+              {% endif %}
+              <div class="editor-add__ext-row">
+                <label class="editor-add__ext-label">{{ i18n.t("editor-extension-url") }}
+                  <input type="url" class="editor-add__ext-url"
+                         placeholder="http://example.org/fhir/StructureDefinition/…">
+                </label>
+                <button type="button" class="btn" data-extension="{{ row.path }}">
+                  {{ i18n.t("editor-add-extension") }}
+                </button>
+              </div>
+            </div>
+          </details>
+          {% endif %}
+        </div>
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  {% if !orphan_errors.is_empty() %}
+  <div class="editor__orphans" role="alert">
+    <div class="editor__orphans-title">{{ i18n.t("editor-orphans-title") }}</div>
+    {% for message in orphan_errors %}
+    <p class="editor__orphan">{{ message }}</p>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>

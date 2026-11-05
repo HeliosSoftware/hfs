@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><GuidanceResponse xmlns="http://hl7.org/fhir">
   <id value="additional-data-example"/>
-  <!--  This example demonstrates the response to a decision support guidance request where additional information is requested using the GuidanceResponse resource.  -->
+  <!-- This example demonstrates the response to a decision support guidance request where additional information is requested using the GuidanceResponse resource. -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

@@ -51,6 +51,18 @@
       }
     }
   ],
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "display": "Right arm"
+          }
+        ],
+        "text": "Right arm"
+      }
+    }
+  ],
   "meta": {
     "tag": [
       {

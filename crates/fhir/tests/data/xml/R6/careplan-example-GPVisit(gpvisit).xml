@@ -19,7 +19,7 @@
         the parient progresses, or start with a standard template (which can, of course, be altered to suit the patient.</p>
     </div>
   </text>
-  <!--  This is the reason for the encounter. It is referenced by the concern  -->
+  <!-- This is the reason for the encounter. It is referenced by the concern -->
   <contained>
     <Condition>
       <id value="p1"/>
@@ -36,7 +36,7 @@
         </coding>
       </verificationStatus>
       <code>
-        <!--  Could coded if we wanted to... -->
+        <!-- Could coded if we wanted to... -->
         <text value="Overseas encounter"/>
       </code>
       <subject>
@@ -163,9 +163,9 @@
     <reference value="Patient/100"/>
     <display value="Peter James Chalmers"/>
   </subject>
-  <!--  No end yet as the encounter is still in progress. -->
+  <!-- No end yet as the encounter is still in progress. -->
   <period>
-    <!--  This is the time the plan started - i.e. when they arrived -->
+    <!-- This is the time the plan started - i.e. when they arrived -->
     <start value="2013-01-01T10:30:00+00:00"/>
   </period>
   <careTeam>
@@ -180,7 +180,7 @@
   <goal>
     <reference value="#goal"/>
   </goal>
-  <!--  moved to contained
+  <!-- moved to contained
 	<plannedActivityDetail>
       <kind value="Appointment"/>
       <code>
@@ -202,23 +202,22 @@
         <reference value="Practitioner/13"/>
         <display value="Nurse Nancy"/>
       </performer>
-    </plannedActivityDetail>
-	 -->
+    </plannedActivityDetail> -->
   <activity>
     <performedActivity>
       <reference>
-        <!--  This is a link to the nurse encounter. The assumption is that all contacts with practitioners
+        <!-- This is a link to the nurse encounter. The assumption is that all contacts with practitioners
         are modelled as separate encounters. Ideally, there will be  a 'master/parent' encounter that ties them together.
         If there is a single encounter, then all participants will be linked to that encounter. -->
         <reference value="Encounter/example"/>
       </reference>
     </performedActivity>
-    <!--  This activity is for the initial nurse encounter where vitals are taken. It has been completed.  -->
+    <!-- This activity is for the initial nurse encounter where vitals are taken. It has been completed. -->
     <plannedActivityReference>
       <reference value="#activity-1"/>
     </plannedActivityReference>
   </activity>
-  <!--  moved to contained
+  <!-- moved to contained
     <plannedActivityDetail>
       <kind value="Appointment"/>
       <code>
@@ -234,10 +233,9 @@
         <reference value="Practitioner/14"/>
         <display value="Doctor Dave"/>
       </performer>
-    </plannedActivityDetail>
-	 -->
+    </plannedActivityDetail> -->
   <activity>
-    <!--  This activity is for the encounter with the doctor  -->
+    <!-- This activity is for the encounter with the doctor -->
     <plannedActivityReference>
       <reference value="#activity-2"/>
     </plannedActivityReference>

@@ -1,7 +1,7 @@
-//! Unit tests for ViewDefinition/$viewdefinition-run operation with query parameters
+//! Unit tests for ViewDefinition/$sql-run operation with query parameters
 //!
 //! This module tests parameter validation, filtering, and pagination functionality
-//! for the $viewdefinition-run operation.
+//! for the $sql-run operation.
 
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use serde_json::json;

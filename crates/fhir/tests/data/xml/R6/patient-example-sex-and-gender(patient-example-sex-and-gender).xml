@@ -73,7 +73,7 @@
       <valueDateTime value="2005-12-06"/>
     </extension>
     <extension url="sourceDocument">
-      <!--  Reference to a scan of the birth certificate  -->
+      <!-- Reference to a scan of the birth certificate -->
       <valueReference>
         <reference value="DocumentReference/1"/>
       </valueReference>
@@ -122,7 +122,7 @@
       <valueDateTime value="2021-06-06"/>
     </extension>
     <extension url="sourceDocument">
-      <!--  Reference to a scan of the insurance card -->
+      <!-- Reference to a scan of the insurance card -->
       <valueReference>
         <reference value="DocumentReference/2"/>
       </valueReference>
@@ -171,7 +171,7 @@
       <valueDateTime value="2005-12-06"/>
     </extension>
     <extension url="sourceDocument">
-      <!--  Reference to a scan of the driver's license  -->
+      <!-- Reference to a scan of the driver's license -->
       <valueReference>
         <reference value="DocumentReference/1"/>
       </valueReference>
@@ -208,13 +208,13 @@
       <valueString value="Patient transitioned from male to female in 2001."/>
     </extension>
     <extension url="supportingInfo">
-      <!--  Observation about an organ inventory (prostate)  -->
+      <!-- Observation about an organ inventory (prostate) -->
       <valueReference>
         <reference value="Observation/1"/>
       </valueReference>
     </extension>
     <extension url="supportingInfo">
-      <!--  MedicationStatement indicating patient underwent hormone therapy  -->
+      <!-- MedicationStatement indicating patient underwent hormone therapy -->
       <valueReference>
         <reference value="MedicationStatement/2"/>
       </valueReference>
@@ -232,7 +232,7 @@
     <value value="12345"/>
   </identifier>
   <active value="true"/>
-  <!--  Legal Name: Patrick Roth, goes by Patricia (formally), but also Pat (informally)  -->
+  <!-- Legal Name: Patrick Roth, goes by Patricia (formally), but also Pat (informally) -->
   <name>
     <use value="official"/>
     <family value="Roth"/>

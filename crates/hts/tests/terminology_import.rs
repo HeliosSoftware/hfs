@@ -9,6 +9,7 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{TestApp, bundles};
+use serde_json::Value;
 
 // ── R4 import ─────────────────────────────────────────────────────────────────
 
@@ -123,6 +124,89 @@ async fn reimport_same_bundle_is_idempotent() {
     assert!(
         status2 == StatusCode::OK || status2 == StatusCode::MULTI_STATUS,
         "second import should succeed, got {status2}: {body2}"
+    );
+}
+
+// ── Re-import refreshes filtered $expand (issue #295) ─────────────────────────
+
+/// #295: a filtered `$expand` reads the concept FTS index. Re-importing a
+/// CodeSystem with a changed concept display must invalidate that system's FTS
+/// so the filter reflects the new display and no longer matches the old one.
+///
+/// This is the end-to-end guard for the per-system FTS invalidation in
+/// `write_code_system`: before the fix the FTS index was rebuilt only by an
+/// unconditional wipe at server startup, so a live re-import left stale
+/// display/synonym rows searchable until the next restart.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn reimport_changed_display_refreshes_filtered_expand() {
+    let app = TestApp::new();
+
+    // Same (url, version) both times so the storage system_id is stable and the
+    // concept is updated in place — the case the per-system invalidation covers.
+    let bundle = |display: &str| {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[
+                {{"resource":{{"resourceType":"CodeSystem",
+                    "url":"http://hts.test/cs/reindex","version":"1.0.0",
+                    "status":"active","content":"complete",
+                    "concept":[{{"code":"x","display":"{display}"}}]}}}}]}}"#
+        )
+    };
+
+    // Full-system include + text filter → the FTS-backed filtered expand path.
+    let expand = |filter: &str| {
+        format!(
+            r#"{{"resourceType":"Parameters","parameter":[
+                {{"name":"filter","valueString":"{filter}"}},
+                {{"name":"valueSet","resource":{{"resourceType":"ValueSet",
+                    "url":"http://hts.test/vs/reindex","status":"active",
+                    "compose":{{"include":[{{"system":"http://hts.test/cs/reindex"}}]}}}}}}]}}"#
+        )
+    };
+
+    let contains_x = |body: &Value| -> bool {
+        body["expansion"]["contains"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|c| c["code"].as_str() == Some("x")))
+    };
+
+    // Import with the original display; the filter on "originalword" matches.
+    app.import_bundle_ok(&bundle("originalword marker")).await;
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "initial expand failed: {body}");
+    assert!(
+        contains_x(&body),
+        "original display should match its filter: {body}"
+    );
+
+    // Re-import the same system with a changed display.
+    app.import_bundle_ok(&bundle("changedword marker")).await;
+
+    // The new display now matches…
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("changedword"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-reimport expand failed: {body}"
+    );
+    assert!(
+        contains_x(&body),
+        "changed display should match after re-import (FTS rebuilt): {body}"
+    );
+
+    // …and the old display no longer matches (stale FTS rows were invalidated).
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "stale-filter expand failed: {body}");
+    assert!(
+        !contains_x(&body),
+        "stale display must not match after re-import: {body}"
     );
 }
 

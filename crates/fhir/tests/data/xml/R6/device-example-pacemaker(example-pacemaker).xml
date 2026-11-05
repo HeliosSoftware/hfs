@@ -29,7 +29,7 @@
       <display value="Performance pace maker for high octane patients"/>
     </coding>
   </type>
-  <!--  <association>
+  <!-- <association>
 	  <status> 
 	     <coding>
 		   <system value="http://terminology.hl7.org/CodeSystem/device-associationstatus" />
@@ -39,7 +39,7 @@
       <humanSubject>
 		<reference value="Patient/example"/>
 	  </humanSubject>
-	</association>  -->
+	</association> -->
   <contact>
     <system value="phone"/>
     <value value="ext 4352"/>

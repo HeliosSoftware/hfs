@@ -15,7 +15,7 @@ An HL7 standard for invoking clinical decision support logic at specific points 
 An HFS pattern that combines two storage backends behind a single `ResourceStorage` interface: one for CRUD operations and one for search queries (e.g., SQLite + Elasticsearch). Configured via `HFS_STORAGE_BACKEND`.
 
 **ETag**
-An HTTP header used for optimistic concurrency control. HFS includes an ETag with each resource response. Clients submit the ETag in an `If-Match` header on updates to prevent lost updates.
+An HTTP header used for optimistic concurrency control. HFS includes an ETag with each resource response. Clients submit the ETag in an `If-Match` header on updates, patches and deletes to prevent lost updates and lost deletes.
 
 **FHIR**
 Fast Healthcare Interoperability Resources. An HL7 standard for exchanging electronic health records. Defines typed resources (Patient, Observation, etc.) with a REST API and JSON/XML serialization.

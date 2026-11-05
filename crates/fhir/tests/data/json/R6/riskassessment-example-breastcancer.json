@@ -16,9 +16,14 @@
   "code": {
     "coding": [
       {
-        "system": "http://browser.ihtsdotools.org/",
+        "system": "http://snomed.info/sct",
         "code": "709510001",
         "display": "Assessment of risk for disease (procedure)"
+      },
+      {
+        "system": "http://hl7.org/fhir/risk-assessment-type-example",
+        "code": "breast-cancer-risk",
+        "display": "Breast Cancer Risk"
       }
     ]
   },

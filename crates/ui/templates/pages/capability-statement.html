@@ -1,0 +1,43 @@
+{#-
+  Capability Statement (/ui/capability-statement, #653).
+
+  All five cards — the four summaries and the Raw CapabilityStatement fold —
+  are rendered by `helios_ui_chrome::capability::CapabilityCards` and are
+  byte-identical to the ones HTS renders at /ui/hts/capability-statement
+  (#808). Do NOT inline that markup back here: two copies of this page is
+  exactly what #808 removed. Card *content* changes belong in
+  `crates/ui-chrome/templates/partials/capability-*.html`.
+
+  Raw is not a `<pre>` of the whole document: its first level is rendered
+  from the page's existing metadata fetch, then nested nodes load bounded,
+  paginated HTML fragments (#798/#808/#902). Its incremental endpoint
+  (`/ui/capability-statement/json-fragment`) stays HFS's own —
+  HTS mounts an equivalent at `/ui/hts/capability-statement/json-fragment`
+  against its own upstream fetch — but the card shell, the fragment
+  templates and the JSON-rendering engine behind both are the same code.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("cap-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("cap-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("cap-lede") }}</p>
+</section>
+
+{% if let Some(cards) = cards %}
+{{ cards.summary|safe }}
+
+{{ cards.interactions|safe }}
+
+{{ cards.operations|safe }}
+
+{{ cards.resources|safe }}
+
+{{ cards.raw|safe }}
+{% else %}
+<p class="notice notice--warn">{{ i18n.t("cap-unavailable") }}</p>
+{% endif %}
+<script src="/ui/assets/capability-json.js" defer></script>
+{% endblock %}

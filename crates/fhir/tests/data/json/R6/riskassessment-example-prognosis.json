@@ -20,7 +20,7 @@
         "coding": [
           {
             "system": "http://snomed.info/sct",
-            "code": "249943000:363698007\u003d72098002,260868000\u003d6934004"
+            "code": "249943000:260868000\u003d6934004,{363698007\u003d72098002}"
           }
         ],
         "text": "permanent weakness of the left arm"

@@ -84,7 +84,9 @@ helios-persistence/
 │   │   ├── search.rs       # Search providers (basic, chained, include)
 │   │   ├── transaction.rs  # ACID transactions with bundle support
 │   │   ├── capabilities.rs # Runtime capability discovery
-│   │   ├── bulk_export.rs  # FHIR Bulk Data Export traits
+│   │   ├── bulk_export.rs  # FHIR Bulk Data Export job/data traits
+│   │   ├── bulk_export_output.rs # ExportOutputStore trait
+│   │   ├── bulk_export_worker.rs # Bulk export worker runtime and leasing traits
 │   │   └── bulk_submit.rs  # FHIR Bulk Submit traits
 │   ├── search/          # Search parameter infrastructure
 │   │   ├── registry.rs     # SearchParameterRegistry (in-memory cache)
@@ -94,22 +96,17 @@ helios-persistence/
 │   │   ├── writer.rs       # Search index writer
 │   │   ├── reindex.rs      # Reindexing operations
 │   │   └── errors.rs       # Search-specific error types
-│   ├── strategy/        # Tenancy isolation strategies
-│   │   ├── shared_schema.rs       # tenant_id column + optional RLS
-│   │   ├── schema_per_tenant.rs   # PostgreSQL search_path isolation
-│   │   └── database_per_tenant.rs # Complete database isolation
 │   ├── backends/        # Backend implementations
 │   │   ├── sqlite/      # Reference implementation (complete)
 │   │   │   ├── backend.rs      # SqliteBackend with connection pooling
 │   │   │   ├── storage.rs      # ResourceStorage implementation
 │   │   │   ├── transaction.rs  # TransactionProvider implementation
-│   │   │   ├── schema.rs       # Schema migrations (v1-v6)
+│   │   │   ├── schema.rs       # Schema migrations (v1 to current)
 │   │   │   ├── search_impl.rs  # SearchProvider implementation
 │   │   │   ├── bulk_export.rs  # BulkExportStorage implementation
 │   │   │   ├── bulk_submit.rs  # BulkSubmitProvider implementation
 │   │   │   └── search/         # Search query building
 │   │   │       ├── query_builder.rs      # SQL query construction
-│   │   │       ├── chain_builder.rs      # Chained parameter resolution
 │   │   │       ├── filter_parser.rs      # _filter parameter parsing
 │   │   │       ├── fts.rs                # FTS5 full-text search
 │   │   │       ├── modifier_handlers.rs  # Search modifier logic
@@ -152,10 +149,11 @@ helios-persistence/
 │   │       ├── config.rs         # S3BackendConfig, S3TenancyMode
 │   │       ├── client.rs         # S3Api trait and AwsS3Client implementation
 │   │       ├── keyspace.rs       # S3Keyspace key-path generation
-│   │       ├── models.rs         # HistoryIndexEvent, ExportJobState, SubmissionState
+│   │       ├── models.rs         # HistoryIndexEvent, SubmissionState
 │   │       ├── storage.rs        # ResourceStorage implementation
 │   │       ├── bundle.rs         # Batch/transaction bundle processing
-│   │       ├── bulk_export.rs    # BulkExportStorage implementation
+│   │       ├── bulk_export.rs    # ExportDataProvider implementation
+│   │       ├── output_store.rs   # S3OutputStore for bulk export files
 │   │       ├── bulk_submit.rs    # BulkSubmitProvider implementation
 │   │       └── tests.rs          # Integration tests
 │   ├── composite/       # Multi-backend coordination
@@ -218,8 +216,7 @@ Backend (connection management, capabilities)
     ├── SearchProvider (search, search_count)
     │       │
     │       ├── IncludeProvider (_include resolution)
-    │       ├── RevincludeProvider (_revinclude resolution)
-    │       └── ChainedSearchProvider (chained parameters, _has)
+    │       └── RevincludeProvider (_revinclude resolution)
     │
     └── TransactionProvider (begin, commit, rollback)
 ```
@@ -227,7 +224,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Three isolation strategies with type-level enforcement
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode, `HFS_S3_TENANCY=bucket-per-tenant` in the `hfs` binary — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -235,15 +232,47 @@ Backend (connection management, capabilities)
 
 ## Multitenancy
 
-All storage operations require a `TenantContext`, ensuring tenant isolation at the type level. There is no way to bypass this requirement—the compiler enforces it.
+Every tenant-scoped storage operation requires a `TenantContext` as its first argument, so the compiler guarantees tenant scope is *available* at the call site (a few operations are intentionally cross-tenant — `count_by_tenant`, the tenant-registry calls — and take none). This is a guarantee about call sites, not about the SQL each backend emits: the `tenant_id` predicate is hand-written per query, and the control on it is review. A database-enforced layer (PostgreSQL RLS) is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
-### Tenancy Strategies
+### Tenant Isolation
 
-| Strategy                | Isolation                         | Use Case                                     |
-| ----------------------- | --------------------------------- | -------------------------------------------- |
-| **Shared Schema**       | `tenant_id` column + optional RLS | Multi-tenant SaaS with shared infrastructure |
-| **Schema-per-Tenant**   | PostgreSQL schemas                | Logical isolation with shared database       |
-| **Database-per-Tenant** | Separate databases                | Complete isolation for compliance            |
+There is one isolation model — **shared schema with a `tenant_id`
+discriminator** — chosen deliberately in [discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28).
+All tenants' records live in one set of tables, collections, or indices;
+isolation is logical and enforced at the query level. No backend gives a tenant
+its own database schema, its own database, or a Row-Level Security policy. Each
+backend applies the discriminator in its own idiom:
+
+| Backend           | How the discriminator is applied                                          |
+| ----------------- | ------------------------------------------------------------------------- |
+| **SQLite**        | `tenant_id` column; composite indexes lead with `tenant_id`               |
+| **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
+| **MongoDB**       | `tenant_id` field on every document                                       |
+| **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
+| **S3**            | Tenant-scoped key prefix (`prefix-per-tenant`, the default) or a dedicated bucket per tenant (`bucket-per-tenant`, see below) |
+
+The S3 backend is the one place HFS offers a genuine per-tenant *physical*
+boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
+bucket, with its own IAM/policy surface. A tenant absent from the bucket map
+is refused with `TenantError::UnmappedTenant` (on request *and* on
+`register_tenant`, so the registry cannot name a tenant that has no bucket);
+only `__system__` falls back, to the optional `default_system_bucket`, which
+also hosts the cross-tenant control-plane state. The `hfs` binary selects the
+mode with `HFS_S3_TENANCY=bucket-per-tenant`, maps tenants with
+`HFS_S3_TENANT_BUCKETS=tenant=bucket,…` and names the system bucket with
+`HFS_S3_SYSTEM_BUCKET` (#1598; the `/run-hfs-server` skill has the rules).
+Every other backend is shared-schema.
+Note that Elasticsearch gives each tenant its own index, but within a single
+cluster and credential, so that is a naming boundary rather than a physical
+one — the term filter is what actually isolates.
+
+Schema-per-tenant and database-per-tenant are **not** offered for the SQL
+backends, so neither can be cited to satisfy an isolation, compliance, or
+data-residency requirement. Unwired SQL generators for them were removed in
+[#370](https://github.com/HeliosSoftware/hfs/issues/370), after the capability
+advertisements that referenced them were corrected in
+[#369](https://github.com/HeliosSoftware/hfs/issues/369). A backend reports
+what it actually does through `Backend::capabilities()`.
 
 ### Hierarchical Tenants
 
@@ -312,9 +341,12 @@ let query_with_include = SearchQuery::new("Observation")
 
 The matrix below shows which FHIR operations each backend supports. This reflects the actual implementation status, not aspirational goals.
 
+For a capability-by-capability narrative of FHIR Search against the [spec](https://build.fhir.org/search.html) — including the REST-layer vs. backend boundary and a roadmap of known gaps — see [`crates/persistence/docs/search-spec-assessment.md`](./docs/search-spec-assessment.md).
+
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
-**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service
+**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service | ‡ Mode-dependent — see the notes below the table | — Backend not present in this tree
+
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
 | **Core Operations**                                                         |
@@ -327,39 +359,40 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | [Batch Bundles](https://build.fhir.org/http.html#batch)                     | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Transaction Bundles](https://build.fhir.org/http.html#transaction)         | ✓      | ✓          | ✓       | ✗         | ○     | ✗             | ◐   |
 | [Conditional Operations](https://build.fhir.org/http.html#cond-update)      | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
-| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ○       | ✗         | ○     | ○             | ✗   |
+| [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
+| Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |
-| Shared Schema                                                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✓   |
-| Schema-per-Tenant                                                           | ✗      | ○          | ○       | ✗         | ✗     | ✗             | ✗   |
-| Database-per-Tenant                                                         | ✓      | ○          | ○       | ○         | ○     | ○             | ✓   |
-| Row-Level Security                                                          | ✗      | ○          | ✗       | ✗         | ✗     | ✗             | ✗   |
+| Shared Schema                                                               | ✓      | ✓          | ✓       | —         | —     | ✓             | ‡✓  |
+| Schema-per-Tenant                                                           | ✗      | ✗          | ✗       | —         | —     | ✗             | ✗   |
+| Database-per-Tenant                                                         | ✗      | ✗          | ○       | —         | —     | ○             | ‡✓  |
+| Row-Level Security                                                          | ✗      | ○          | ✗       | —         | —     | ✗             | ✗   |
 | **[Search Parameters](https://build.fhir.org/search.html#ptypes)**          |
 | [String](https://build.fhir.org/search.html#string)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [Token](https://build.fhir.org/search.html#token)                           | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✗   |
 | [Reference](https://build.fhir.org/search.html#reference)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [Date](https://build.fhir.org/search.html#date)                             | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
-| [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ○   |
+| [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ✓       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ○          | ○       | ✗         | ○     | ✓             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
-| [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ○       | ○         | ○     | ✓             | ○   |
-| [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
+| [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
+| [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [:text](https://build.fhir.org/search.html#modifiers) (full-text)           | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
-| [:not](https://build.fhir.org/search.html#modifiers)                        | ✓      | ○          | ○       | ✗         | ○     | ✓             | ○   |
-| [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ○          | ○       | ✗         | ○     | ✓             | ○   |
-| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ✗      | †○         | †○      | ✗         | ○     | ✓             | ✗   |
+| [:not](https://build.fhir.org/search.html#modifiers)                        | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
+| [:missing](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ○   |
+| [:above / :below](https://build.fhir.org/search.html#modifiers)             | ◐      | ◐          | ◐       | ✗         | ○     | ◐             | ✗   |
 | [:in / :not-in](https://build.fhir.org/search.html#modifiers)               | ✗      | †○         | †○      | ✗         | ○     | †○            | ✗   |
-| [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ○          | ○       | ✗         | ○     | ✓             | ✗   |
+| [:of-type](https://build.fhir.org/search.html#modifiers)                    | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
 | [:text-advanced](https://build.fhir.org/search.html#modifiertextadvanced)   | ✓      | †○         | †○      | ✗         | ✗     | ✓             | ✗   |
 | **[Special Parameters](https://build.fhir.org/search.html#all)**            |
-| [\_text](https://build.fhir.org/search.html#_text) (narrative search)       | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
-| [\_content](https://build.fhir.org/search.html#_content) (full content)     | ✓      | ◐          | ○       | ✗         | ✗     | ✓             | ✗   |
+| [\_text](https://build.fhir.org/search.html#_text) (narrative search)       | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
+| [\_content](https://build.fhir.org/search.html#_content) (full content)     | ✓      | ✓          | ○       | ✗         | ✗     | ✓             | ✗   |
 | [\_filter](https://build.fhir.org/search.html#_filter) (advanced filtering) | ✓      | ○          | ○       | ✗         | ○     | ○             | ✗   |
 | **Advanced Search**                                                         |
-| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
-| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ◐          | ○       | ✗         | ○     | ✗             | ✗   |
+| [Chained Parameters](https://build.fhir.org/search.html#chaining)           | ✓      | ✓          | ◐       | ✗         | ○     | ◐             | ✗   |
+| [Reverse Chaining (\_has)](https://build.fhir.org/search.html#has)          | ✓      | ✓          | ◐       | ✗         | ○     | ◐             | ✗   |
 | [\_include](https://build.fhir.org/search.html#include)                     | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [\_revinclude](https://build.fhir.org/search.html#revinclude)               | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Pagination](https://build.fhir.org/http.html#paging)**                   |
@@ -367,16 +400,208 @@ The matrix below shows which FHIR operations each backend supports. This reflect
 | Cursor (keyset)                                                             | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | **[Sorting](https://build.fhir.org/search.html#sort)**                      |
 | Single field                                                                | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
-| Multiple fields                                                             | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
+| Multiple fields                                                             | ✓      | ✓          | ◐       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
-| [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
-| [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle)                       | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
+| [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
+| [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ‡✓  |
 
-The S3 backend is intentionally storage-focused (CRUD/version/history/bulk) and does not act as a full FHIR search engine. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/bulk/history storage.
+**Notes on partial cells:**
+
+- **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
+  date, number, quantity, reference, URI) via a correlated subquery into the search index, taking
+  the min value ascending / max descending for multi-valued params; `_id`/`_lastUpdated` sort on
+  the resources table directly. Cursor (keyset) pagination is consistent with the active sort: the
+  sort key value is encoded into the opaque cursor and the keyset comparison runs on it, so deep
+  paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
+  sorts by `_id`/`_lastUpdated`, or by up to 15 indexed search parameters (each key in its own
+  direction, a missing value last for that key, ties broken by id); it cannot combine a
+  search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
+  multiple fields. A MongoDB search-parameter sort with no filter asks the server for only the
+  first `offset + _count + 1` ids, so memory follows the page, not the size of the type; it
+  answers 422 when `offset + _count` exceeds 300,000. A MongoDB `:not` or `:missing=true` search
+  with no positive parameter (or with only a compartment) reads the type in batches instead of
+  loading every id; past 300,000 matching ids it falls back to the query plan when one applies,
+  and otherwise answers 422.
+- **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
+  **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
+  (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
+  the REST layer — the code and its descendants (`:below`, `is-a`) or ancestors (`:above`,
+  `generalizes`) are expanded via the terminology server's `$expand`, then matched as a plain token
+  OR list on any backend. Token hierarchy therefore requires `HFS_TERMINOLOGY_SERVER`.
+- **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
+  server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
+  backend resolves these natively.
+- **Chained / `_has`** — chained and reverse-chained parameters are resolved by the persistence
+  layer's backend-agnostic resolver (`search::resolve_chains`): each hop is one plain `search()`
+  against the backend, and the result is folded into an `_id` filter
+  that the backend's ordinary `search()` executes. Because the rewrite happens above the backend,
+  `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
+  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
+  may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
+  matching: standalone SQLite reads a `_has` hop's references from its index in one statement
+  (`search_reference_values`), MongoDB reads only projected ids (`search_ids`) and the indexed
+  reference rows (`search_reference_values`) instead of loading resource bodies, and PostgreSQL evaluates
+  `Patient?_has:Observation:patient:code=system|code` inside `search()`
+  on R4 with the denormalized index layout (`supports_native_reverse_chains`).
+- **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
+  within one composite instance. SQLite and PostgreSQL unfolded rows share a `composite_group`
+  and retain per-type component ordinals in `composite_slot`; predicates for repeated types also
+  require the corresponding slot. Thus `A$B`, `B$A`, and `A$A` preserve their declared positions
+  in ordinary and contained search, including counts and paging. Contained matches belong to one
+  contained entity and group; top-level composite subqueries exclude contained rows. MongoDB uses
+  the same group/slot identity with value-index probes. Elasticsearch uses one nested object per
+  instance with inline component values; this SQL change does not expand its repeated-type support.
+  See [`crates/persistence/docs/search-spec-assessment.md`](./docs/search-spec-assessment.md).
+
+#### SQL composite slots and upgrade recovery
+
+SQLite schema **38** and PostgreSQL schema **48** add a nullable `composite_slot` without assigning
+positions to old rows. New unfolded SQL rows preserve the extractor's ordinal among components of
+one type (Token–Quantity–Token uses slots 1, 1, 2). Repeated Token, Number, Quantity, String and Date
+components are supported by SQLite and PostgreSQL unfolded readers, up to 255 components of one
+type. PostgreSQL's Legacy ordinary reader also accepts valid transitional folded Token/Number
+rows. Its Denormalized ordinary reader retains the existing folded columns: at most two Token or
+two Number components and one component of each other family. Consequently Token–Quantity–Token
+is representable; repeated String/Date/Quantity or a third Token/Number is unsupported for ordinary
+or `_contained=both` Denormalized searches. These shapes return a named 400, and `$reindex` does
+not make them representable. `_contained=true` uses unfolded rows in either PostgreSQL layout.
+
+Ordinary composite `:missing=true|false` checks only parameter presence, so it needs neither slots
+nor a representable positional shape and bypasses these SQL legacy guards. Contained `:missing`
+remains unsupported.
+
+For positional matching of a supported repeated-type parameter, SQL conservatively refuses a search
+if ambiguous old unfolded rows exist for that tenant, searched resource type, parameter and requested
+top-level or contained scope. The named 400 asks for `$reindex` even when the requested value has no matches or
+`_count=0`. Valid folded rows and distinct-type composites remain usable. MongoDB's corresponding
+guard is value-dependent: it refuses when a component's value probe encounters an old matching row.
+
+Upgrade **all writers** before rebuilding each affected tenant with `POST /$reindex` and
+`clearExisting=false` (the default with no body). Use the tenant-wide route rather than a
+type-limited rebuild: contained resources are indexed under their container's type. Poll
+`GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
+`errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
+
+### `clearExisting` and `clearOnly` (#2278)
+
+`clearExisting` does **not** empty the search index before rebuilding. Each page replaces the
+entries of its resources (Elasticsearch deletes the page's entries first, since an upsert by `_id`
+would keep the document of a dropped `contained[]` entry). When the run completes, a final sweep
+lists the resource ids each writer indexed and deletes the entries of those the source no longer
+holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
+crashes, is cancelled or fails is therefore left with the old index plus the pages already
+rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
+its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
+before the run fails.
+
+`clearOnly` is destructive by design: it empties the scope and rebuilds nothing, so the scope is
+unsearchable until a later rebuild (for example by id ranges). If clearing fails part-way through
+several writers, the failure message and the server log name the writers already cleared.
+
+SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
+a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
+probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
+layout. PostgreSQL builds these under the startup advisory lock with transaction-local statement
+timeouts disabled, restoring the session timeout afterward. Fresh Denormalized databases do not
+create the ordinary Legacy probes. Existing ambiguous rows stay nullable until the rebuild.
+
+The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+
+**Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
+
+- **‡ The S3 `$bulk-submit` REST worker needs somewhere cross-tenant to write.** Its claim queue and
+  poll-token index live outside every tenant prefix, because a worker claims manifests and resolves
+  poll tokens with no tenant in hand. Every configuration has such a place except `BucketPerTenant`
+  with no `default_system_bucket`, which does not declare the capability and reports `501` from
+  `$bulk-submit` — the same axis `supports_user_settings` answers. Synchronous *ingest* is
+  tenant-scoped throughout and is available on every configuration. See
+  `S3Backend::supports_bulk_submit_worker`.
+- **‡ S3 tenancy is a property of the deployment, not the backend type.** A `PrefixPerTenant` instance (one shared bucket, tenant-scoped key prefixes) is *Shared Schema*; a `BucketPerTenant` instance (a dedicated bucket per tenant) is *Database-per-Tenant*. An instance declares exactly one — see `S3Backend::declared_capabilities_for`.
+- **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
+- **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
+- **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
+- **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
+
+### Polling `_history` with `_since`
+
+`_since` keeps the history rows whose `last_updated` is at or after it, on every backend. A client
+that polls `_history?_since=` and starts each window where its previous poll ended can miss
+entries for good, in two ways.
+
+**Commit-time gap.** On every backend a write takes its `last_updated` from the HFS process clock
+before other readers can see it, and concurrent writes can land out of stamp order. For one
+ordinary write the gap is short, but it is not zero. On S3, `StoredResource::new` stamps the
+resource and only then do the current, history and index PUTs run, and a batch Bundle runs up to
+16 entries at once (`bulk_write_concurrency` 32, capped by `HFS_BATCH_MAX_CONCURRENCY`), so a later
+stamp can land while an earlier one is still being PUT. On SQLite, `update` stamps before
+`BEGIN IMMEDIATE`, which can wait up to the 30 s busy timeout for the write lock. A transaction
+Bundle is the long case, on SQLite, PostgreSQL and MongoDB: it stamps each entry when it stages the
+entry, and other readers see the rows only once the Bundle commits, which for a large Bundle can be
+much later (minutes on SQLite). Either way, a poll can have covered a `last_updated` whose row only
+becomes visible afterwards. S3 refuses transaction Bundles, and Elasticsearch serves no history (a
+composite serves `_history` from its primary).
+
+How long the gap can be depends on who bounds the write:
+
+- Every backend: overlap by at least `HFS_REQUEST_TIMEOUT` (default 30 s), because each write is
+  stamped before it becomes visible and concurrent writes can land out of order. On PostgreSQL and
+  MongoDB that is enough, since a transaction Bundle still running at the timeout is rolled back
+  (the timeout layer drops the handler; PostgreSQL's transaction drop spawns the `ROLLBACK`, and
+  MongoDB's dropped `ClientSession` aborts its transaction; the MongoDB Bundle deadline, the
+  timeout less 2 s, only stops replays and admission waits before that).
+- SQLite: the timeout does not reliably bound a transaction Bundle. The path between
+  `BEGIN IMMEDIATE` and `COMMIT` is mostly synchronous `rusqlite` calls behind a mutex, with few
+  suspension points (a PATCH entry's validation can be one), so the timeout layer usually cannot
+  drop the handler and the Bundle runs to its commit however long that takes (about 2 minutes for
+  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An update can also wait
+  up to 30 s for the write lock after it is stamped, and the request timeout cannot cut that wait
+  short. Overlap by at least 30 s and by the longest transaction Bundle any client sends. This is
+  from reading the code, not from a test that runs a Bundle past a short timeout.
+- `$bulk-submit`: the worker is not a request, so no request timeout bounds it. On SQLite and
+  PostgreSQL it commits each batch as one transaction. On MongoDB `bulk_ingest.rs` takes one
+  `Utc::now()` per batch while planning, stamps every plan with it, and then writes the batch as
+  separate commands (resources, then `resource_history`), so a batch's history rows appear after
+  their `last_updated` by up to the batch's write time plus retries. S3 writes each entry through
+  its ordinary `create`/`update`, so there is no batch-wide gap beyond the request-timeout
+  overlap. Overlap by more than the longest batch takes.
+- Several HFS instances sharing one store each stamp from their own clock: add the largest clock
+  difference between them.
+
+Start each window earlier than the newest `response.lastModified` seen, by the largest of these.
+
+**Page limit.** The REST history handlers answer one page, newest first, with no `link`/`next`
+(`HistoryQuery` takes no cursor, although the backends do compute one). `_count` defaults to
+`HFS_DEFAULT_PAGE_SIZE` (20) and is capped at `HFS_MAX_PAGE_SIZE` (default 1000). On SQLite,
+PostgreSQL and MongoDB the Bundle `total` is just the number of entries returned (their
+`PageInfo.total` is `None`, so the handler falls back to the entry count); S3 sets it to every
+match before paging, so there a `total` above the entry count means the page was cut off. When a
+window holds more versions than `_count`, its oldest entries are dropped and a later window can
+never reach them. `build_history_params` lowers a `_count` above the cap to `HFS_MAX_PAGE_SIZE`
+without saying so, so the effective page size is the `_count` sent or `HFS_MAX_PAGE_SIZE`,
+whichever is smaller. A client should pass `_count` up to the cap, treat a response with that many
+entries as cut off (a response to a larger `_count` stops at the cap, so comparing against `_count`
+misses it), and poll often enough to stay under it, or accept the limit; history paging is not
+implemented.
+
+Other client rules:
+
+- dedupe on `(resourceType, id, versionId)`, since `_since` is inclusive and the windows overlap.
+  A `DELETE` entry has no `resource`: take the type and id from `fullUrl` and the version from
+  `response.etag`;
+- percent-encode the `_since` instant (`+` as `%2B`) or send it in UTC with a `Z` suffix: HFS
+  writes `lastModified` with `to_rfc3339()`, which ends in `+00:00`, and an unencoded `+` decodes
+  to a space and gets `400 Invalid _since value`.
+
+The client-facing copy of this note is in the book's CLI reference
+(`book/src/appendix-a-cli.md`, "Polling history with `_since`").
 
 ### Primary/Secondary Role Matrix
 
-Backends can serve as primary (CRUD, versioning, transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.
+Backends can serve as primary (CRUD, versioning, and — where the backend supports it — transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.
+
+**Not every primary can offer transactions.** A FHIR `transaction` Bundle is all-or-nothing, which requires the primary to be able to unwind. SQLite and PostgreSQL provide it through `TransactionProvider`, and MongoDB through a server-side session transaction. S3 cannot: an object store has no atomic multi-object operation, so an S3-primary deployment declines transaction Bundles with 501 `not-supported` and advertises only `batch` in its CapabilityStatement (#489). This is the trait separation design discussion #28 describes — a backend without transaction support still handles batches, where entries are independent and partial success is the contract.
 
 | Configuration              | Primary    | Secondary              | Status                          | Use Case                                |
 | -------------------------- | ---------- | ---------------------- | ------------------------------- | --------------------------------------- |
@@ -389,8 +614,8 @@ Backends can serve as primary (CRUD, versioning, transactions) or secondary (opt
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
-| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused) | Archival/bulk/history storage           |
-| S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented                   | Large-scale + search                    |
+| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused, batch only) | Archival/history storage                |
+| S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented (batch only, no transactions) | Large-scale + search                    |
 
 ### Backend Selection Guide
 
@@ -434,6 +659,13 @@ cargo build --bin hfs --release
 
 SQLite handles all CRUD operations, versioning, history, and search using its built-in FTS5 full-text search engine. Data is stored in `fhir.db` by default.
 
+**Schema version.** Startup records the SQLite schema version in the `schema_version` table. A build refuses to start on a database file that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before any migration or startup index step runs, the recorded version and the indexes stay as they were, and the error names the database file and both versions and says the database was written by a newer HFS. The recorded version is never lowered, and a crash while it is written no longer leaves the table empty. There is no override. HFS releases from before this check (#2365) still start on such a database and run their own startup index steps on it.
+
+For a first-page search on a single parameter, SQLite reads at most 2,001 index rows of that parameter to decide
+whether its key list is short enough to drive the query from, instead of letting the planner walk `resources` in
+`last_updated` order. Set `HFS_SQLITE_SEARCH_PROBE=0` (`false`, `off` and `no` also work) to turn the probe off and
+always use the planner's plan; it is read once per process and defaults to on. Results are the same either way.
+
 ### SQLite + Elasticsearch
 
 SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handles all search operations with:
@@ -461,18 +693,44 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout), a
+search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
+asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
+read answers `500` with the generic internal-error text, and the server logs the detail. A write to
+the search index, and a `_bulk` page that composite sync or a reindex writes, fails as
+`BackendError::Unavailable` in both cases: a `503` where it reaches a response (for example a
+purge), a recorded sync failure for composite sync, and a retried page for `$reindex`. That
+includes an item Elasticsearch throttles for good, such as the flood-stage block
+(`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
+operation, for example
+`Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
+and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
+host and port, the index and the query string, and Elasticsearch's own answer (its status and
+response body, which can name the index) are logged at `warn` with the constant message
+`Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
+matches every path that answers `503` (#2385).
+
 ### PostgreSQL
 
-Full-featured relational backend for production deployments with JSONB storage, full-text search, and advanced multi-tenant isolation strategies.
+Full-featured relational backend for production deployments with JSONB storage and full-text search.
 
 - Full CRUD operations with ACID transactions
 - Full-text search via PostgreSQL's tsvector/tsquery
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Chained parameters and reverse chaining (`_has`)
 - `_include` and `_revinclude` resolution
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
-**Prerequisites:** A running PostgreSQL instance (14+).
+**Prerequisites:** A running PostgreSQL instance (14+; startup refuses an older server before
+changing the schema).
+
+**Schema version.** Startup records the PostgreSQL schema version in the `schema_version` table. A
+build refuses to start on a database that records a newer schema version than its own, one a newer
+HFS release has already upgraded: startup fails under the migration lock before anything is
+changed, the recorded version and the indexes stay as they were, and the error names the database
+and both versions and says the database was written by a newer HFS. The recorded version is never
+lowered. There is no override. HFS releases from before this check (#2367) still start on such a
+database and run their own startup index steps on it.
 
 ```bash
 # Build with PostgreSQL support
@@ -491,6 +749,66 @@ HFS_DATABASE_URL="postgresql://hfs:hfs@localhost:5432/fhir" \
   ./target/release/hfs
 ```
 
+The cross-tenant `count_by_tenant` aggregate (Tenants UI, `/admin/tenants`, console tenant
+metrics) runs in its own read-only transaction under
+`HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: `25000`; must be 1 to 2147483647),
+applied with `SET LOCAL statement_timeout` so the pooled session keeps
+`HFS_PG_STATEMENT_TIMEOUT_MS` for everything else. The count runs under the smaller of the two.
+Past the budget the call fails with `BackendError::Timeout` (`504` on the REST endpoints while
+the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
+PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
+
+Every indexed write confirms its tenant's SearchParameter overlay with a cheap
+`SELECT COUNT(*), MAX(last_updated)` fingerprint probe. `HFS_PG_SP_FINGERPRINT_TTL_MS`
+(default: `0`, every write probes) lets ordinary writes reuse an overlay validated within
+that many milliseconds (for example `1000`) and skip the probe. A SearchParameter written by
+this process invalidates the cache immediately; one committed by another HFS process is seen by
+ordinary writes within the TTL. Bulk submit always probes, whatever the TTL.
+
+Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
+is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
+`idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
+under the migration lock: writes to `resources` continue, but the build waits for transactions
+older than it (long exports, sessions idle in a transaction) and blocks other DDL and `VACUUM` on
+the table while it runs. v49 is recorded only once the catalog shows a valid index of the expected
+shape; an interrupted build is dropped and rebuilt on the next startup. Measured on a
+~19M-resource corpus (PostgreSQL 16): 12.3 s and 125.3 MiB to build, and the warm count went from
+about 2.43 s to 1.00 s (0.60 s once `VACUUM` had set the visibility map). Operators who want the
+build out of the startup path can run it beforehand; v49 then finds it and only records the
+version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
+  ON resources (tenant_id) WHERE is_deleted = FALSE;
+```
+
+Schema v50 adds `idx_search_date_recent_end` on `search_index (tenant_id, resource_type, param_name,
+last_updated DESC, resource_id) INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL`,
+which lets date `gt`/`ge` searches walk the newest-first order and stop at the first qualifying rows
+(Observation, Encounter and Patient `gt`/`ge`: 0.07-0.11 ms on a 7M-row `search_index`; 66 MB). It is
+built the same way as the v49 index (`CREATE INDEX CONCURRENTLY` under the migration lock, recorded only
+once the index is valid, an interrupted build is dropped and rebuilt on the next startup) and runs no
+`ANALYZE`: the planner keeps using the table's per-column statistics, which the index does not change.
+The index is additive and has no opt-out. To keep the build out of the startup path, run it beforehand;
+v50 then finds it and only records the version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_date_recent_end
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_date, value_date_end) WHERE value_date_end IS NOT NULL;
+```
+
+The newest-first search fast path is only valid when no `search_index` row of the searched parameter
+has `last_updated IS NULL` (contained-resource memberships are written that way). Each fast-path
+statement used to re-run the whole search predicate in an `index_eligible` CTE to prove it. The
+backend now learns, per tenant, which `(resource type, parameter)` pairs have such rows with one
+`SELECT DISTINCT ... WHERE is_contained` and caches the answer for 30 s (plus a 10 s grace window
+served while one request refreshes it). A cached "NULL rows exist" answer, any probe failure, or a
+write by this process that creates contained rows keeps the original SQL, so the cache can only
+remove the probe, never add results. Writes by other processes are noticed after the TTL, so a
+deployment with several writers that create contained resources against one database can turn the
+cache off with `HFS_PG_ELIGIBLE_CACHE=0` (default on; `0`, `false`, `off` and `no` disable it).
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.
@@ -499,7 +817,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 - Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Advanced text search with stemming, boolean operators, and proximity matching (`:text-advanced`)
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
@@ -532,16 +850,30 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 MongoDB provides document-centric primary storage with full FHIR capabilities including CRUD, versioning, history, search, and transactions.
 
 - Full CRUD operations with document-native resource storage
-- Versioning and history providers (`vread`, instance/type/system history)
-- Transaction bundles with urn:uuid reference resolution (requires replica set)
-- Native search (string, token, reference, date, number, URI parameters)
+- Versioning and history providers (`vread`, instance/type/system history); their `resource_history`
+  indexes are described in [MongoDB history indexes](mongodb/history-indexes.md)
+- Transaction bundles with urn:uuid reference resolution (requires replica set; see
+  [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
+- Native search (string, token, reference, date, number, quantity, URI and composite parameters;
+  `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
+  chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
-- Cursor and offset pagination with multi-field sorting
+- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search
+  parameters (a search-parameter sort is offset-paged and cannot be combined with
+  `_id`/`_lastUpdated`/`_score` or with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
-**Prerequisites:** A running MongoDB instance. Use standalone for basic deployments or replica set/sharded topology for transaction bundle support.
+MongoDB records supported missing parameters on each resource. See
+[missing-parameter metadata](mongodb/search-indexes.md#missing-parameter-metadata)
+for the index, compatibility behavior, rollout and definition maintenance.
+
+**Prerequisites:** A running MongoDB instance. A replica set (one member is enough) or a sharded cluster is needed for transaction Bundles, and it is what makes each single-resource create, update, delete and restore one transaction: the resource, its history row and its search-index entries commit together. On a standalone server those writes run without a transaction, so the `resources` and `resource_history` writes are separate commands and a failure between them can leave a version without its history row; each backend logs a warning the first time it sees a standalone server and again each time a replica set turns into a standalone server, and an info line when a standalone server turns into a replica set. Before such a write HFS needs to know whether the server has transactions, and asks it (`hello`) until it has a transactional answer: the first write of each backend asks, and once the server has answered as a replica-set member or a mongos the answer is kept, so later writes and transaction Bundles send no `hello` (#2308). A standalone answer is never kept: on a standalone server every write asks again, so a server restarted as a replica set gets transactional writes from its next write on. A kept answer only ever leads to a write in a transaction: if the server refuses the transaction as an illegal operation (code 20, what a server without transactions answers), nothing is written, the write or Bundle answers `503` with `Retry-After`, a warning is logged, and the next write asks again. A write or transaction Bundle that finds no usable server once it has started (one that skipped the check does when the deployment goes down or an election outlasts the server-selection timeout, `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) is not run again: it answers `503` with `Retry-After` (a transaction Bundle as `transient`) after that one timeout, nothing of its transaction is committed, and a kept answer is forgotten, so the first write after the outage asks again. A check that runs never treats a failure as a standalone answer (#2258): a dropped connection, a cleared connection pool or a retryable error is tried up to 3 more times (after 25, 50 and 100 ms); a check that still fails or finds no usable server answers `503` with `Retry-After`, a server deadline `504`, any other failure `500`, and nothing is written. A member started with `--replSet` that has no replica-set configuration yet answers `503` as well; it is not taken for a standalone server. A transaction Bundle's check is not tried again, and since #2410 a failure of it answers as the single-resource check's does: `503` (`transient`) with `Retry-After` for a dropped connection, a cleared connection pool, a retryable error or no usable server, `504` for a server deadline and `500` for any other failure, with no driver text; before, every failure of a Bundle's check answered `500`. A transaction Bundle on such an unconfigured `--replSet` member is still refused with `501`, as on a standalone server. The check uses the `hello` command, which MongoDB has from 4.2.10 and 4.4.2 on (and in every 5.0 or later release); on an older server every single-resource write answers `500`.
+
+**Schema version.** Each boot creates the indexes the running build needs and then records its MongoDB schema version in the `schema_version` collection. A build refuses to start on a database that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before anything is written, the recorded version stays as it was, and the error names both versions and says the database was written by a newer HFS. The recorded version is never lowered, also when two builds start at once. There is no override. HFS releases from before this check (#2352) still start on such a database and record their own, lower version.
+
+To roll back to an older build on purpose, follow [Rolling back to an older build](mongodb/schema-version.md#rolling-back-to-an-older-build). For an older build from #2352 on, this includes lowering the recorded version by hand. The page also lists what each schema version adds and what an older build leaves behind.
 
 ```bash
 # Build with MongoDB support
@@ -562,8 +894,795 @@ MongoDB runtime configuration also supports:
 
 - `HFS_MONGODB_URL` or `HFS_MONGODB_URI` as preferred connection-string inputs
 - `HFS_MONGODB_DATABASE` to select the database name (default: `helios`)
-- `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: `10`)
-- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the connection timeout (default: `5000`)
+- `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: the URI's
+  `maxPoolSize`, else `10`)
+- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the TCP handshake timeout (default: the URI's
+  `connectTimeoutMS`, else `5000`)
+- `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
+  usable server before failing (default: the URI's `serverSelectionTimeoutMS`, else `15000`). This — not the connect timeout — is what
+  bounds how quickly an unreachable MongoDB surfaces an error. The request then answers `503`
+  with `Retry-After`, and the message names only the operation, for example
+  `Failed to execute MongoDB search: the database is temporarily unavailable; retry the request`.
+  A dropped connection or a cleared connection pool answers the same way. The driver's error,
+  which lists the topology and each server address, is logged at `warn` (#2303).
+
+Precedence for pool size, connect timeout and server selection timeout: an explicitly
+set `HFS_MONGODB_*` variable, then the option in the connection string (`maxPoolSize`,
+`connectTimeoutMS`, `serverSelectionTimeoutMS`), then the HFS default. `appName` and `maxIdleTimeMS`
+have no variable: the URI value, else the default (`helios-persistence`, 60 s). A numeric variable that does not parse counts as unset,
+so the URI value applies. `waitQueueTimeoutMS` has no effect, because the Rust driver has no
+timeout for waiting on a pooled connection. Behavior change: a URI such as `?maxPoolSize=200` was
+previously overwritten with 10 and is now honored. Startup logs a warning when the pool leaves
+fewer than 4 connections beyond the 8 bulk writers. Pool state is exported as `mongodb_pool_*`
+metrics (see `crates/rest/docs/console-metrics.md`).
+
+- `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many standard-size transaction
+  Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
+- `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
+  (default: `1000`; `0` counts every Bundle as one slot).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` for the entry count from which a
+  transaction Bundle writes its search-index entries after its commit instead of inside the
+  transaction (default: `auto`, the admission room, 4,000 entries; `off` or `0` never defers).
+  Ignored on `mongodb-elasticsearch`. See
+  [Deferred search indexing](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` to refuse, before it is admitted, a
+  transaction Bundle whose created and updated resources total more than this many BSON bytes
+  (default: unset, off; `0` or `off` also turns it off). See the sizing section below.
+- `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` (`hfs` binary) for the seconds between passes of
+  the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
+  turns the task off). It also runs once at startup. A pass takes only ledger documents older
+  than the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s).
+- `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
+  the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
+  be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
+  server selection, waiting for a pooled connection or socket time.
+- `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` for the documents per cursor batch of a SQL-on-FHIR scan
+  (default: `512`; must be 1 to 100000). Lower means lower first-row latency on selective views,
+  higher means fewer round trips against a remote MongoDB. It applies to the in-database
+  aggregate and to the patient/group fallback `find`.
+
+#### Single-resource write and read errors
+
+A create, update, delete or restore of one resource runs as one MongoDB transaction on a replica
+set or a sharded cluster. These are the answers for its failures:
+
+- **A lost race on the resource document of an update, a delete or a restore** (`WriteConflict`,
+  112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
+  retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
+- **An abort that is not a lost race** runs the write again from its first read, up to 4
+  attempts with pauses of 100, 200 and 400 ms (some aborts get more; see below). That covers a
+  chunk migration (`StaleConfig`), a `WriteConflict` that names a catalog change and, since #2269,
+  a `WriteConflict` on the resource's `search_index` rows. Other writers touch those rows without
+  changing the resource's version (a large Bundle's deferred-rows batch, `$reindex`), so that
+  conflict does not say another write won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
+  commit and on a restore's history row or commit, which used to answer `500`, and since #2342 one
+  on an update's or a delete's history row or commit, which used to answer `409` for a resource that
+  had not moved: a create carries no version to lose, and a restore, an update or a delete already
+  holds the resource document by then. Every run checks the precondition again, so a real winner
+  still answers `409` or `404`: a create whose id another write stored in the meantime answers `409`
+  (`AlreadyExists`), and a PUT to a new id that another write created in the meantime reads again
+  and updates it. When the attempts run out the answer is `503` with `Retry-After`. A create or a
+  PUT to a new id also runs out of them when another write of the same id stays uncommitted
+  through every attempt.
+
+  Aborts that only time can end get more attempts (#2267): a `WriteConflict` that names a catalog
+  change and `SnapshotUnavailable` (246), which a `background` index build's catalog changes
+  cause, and `LockTimeout` (24), which names no lock holder, so that a build causes it is
+  inferred. After the fourth attempt such a write goes on, up to 12 attempts, with pauses of 400
+  to 800 ms and then 500 to 1000 ms drawn at random. It starts no further attempt if a run as
+  long as the last one would end more than 12 s after the write started, or past
+  `single_write_deadline`. Up to 8.5 s of that is pause, so a server that answers each attempt in
+  100 ms ends such a write within about 10 s. A DELETE without `If-Match` counts its extra try
+  inside the same 12 s. The 12 s and the deadline count per create, update, delete or restore
+  call, not per request. A PUT without `If-Match` that loses a race makes a new call with a new
+  budget (up to 4 calls, so in theory up to 48 s), and each entry of a batch Bundle has its own
+  budget, so a long enough run of these aborts can end such a request in `408`. Every other abort
+  keeps the 4 attempts.
+- **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
+  once; the same write would meet the same cache.
+- **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
+  error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
+  never runs again, because it may already be applied. If the outcome stays unknown, one read
+  settles it (#2304): outside the write's transaction, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). The read
+  is causally consistent with the failed commit: it runs in a new session that starts from the
+  failed session's operation time, so the server waits until its majority snapshot has reached
+  the commit, for at most `settle_read_max_time_ms` (`maxTimeMS`; a `MongoBackendConfig` field,
+  default 1 s, that no `HFS_*` variable sets). A commit that applied and is only briefly short of
+  the majority is therefore still settled. When the row is there, the write is answered as
+  committed, and everything that follows a write runs. When it is not, when the majority did not
+  reach the commit within that bound, or when the read fails, the answer is `500` with the
+  code `exception` and a message that says the change may have been stored and should be checked
+  before retrying; there is no `Retry-After`. A majority read that misses the row, or that
+  times out waiting for the majority, does not prove the commit never applies, so it is not
+  turned into a failure. It is the same status a transaction Bundle gives for an
+  unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
+  resubmit could store a POST a second time. A write that stays unknown skips what normally
+  follows a write, and each consumer catches up on its own:
+  - The stored-SearchParameter cache is reloaded anyway, for a SearchParameter write, so a
+    commit that did apply takes effect for search.
+  - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
+    sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
+    Subscribers reconcile with a search. A stored `Subscription`, `SubscriptionTopic` or R4
+    backport topic (stored as `Basic`) is picked up by the startup rehydration
+    (`crates/subscriptions/src/rehydrate.rs`). The Home dashboard's live counts catch up at the
+    next reconcile pass
+    (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
+    not record, marks the figures approximate and reads the totals again.
+  - The stored-profile registry is built from the StructureDefinition writes of the running
+    process only, and nothing loads it at startup. A StructureDefinition write that stays
+    unknown registers nothing, and only the next successful write of that StructureDefinition
+    does.
+  - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
+    demand.
+  - With a composite storage, the secondary (Elasticsearch) is not synced. It catches up at that
+    resource's next successful write, or at a manual `$reindex`: nothing reconciles it
+    automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
+    not wired (#2287).
+
+  The re-sends have a deadline (#2320). The driver sends each re-sent commit with `w: majority`
+  and a `wtimeout` of 10 s, so a re-send whose majority write stalls takes about 10 s. A
+  `MongoBackendConfig` field, `single_write_deadline`, bounds them: `hfs` sets it to
+  `HFS_REQUEST_TIMEOUT` less 2 s, counted from when the create, update, delete or restore reaches
+  the backend (a `PUT` through `create_or_update` starts it at that nested call, after its read).
+  A re-send starts only if a commit as slow as the slowest one so far, plus the settling read's
+  bound (`settle_read_max_time_ms`), still ends before it. Otherwise the write goes straight to
+  the settling read. It answers as committed if the read finds the version, and otherwise with
+  the `500` that says to check before retrying, rather than a `408` that hides that the write
+  may have applied. The read runs after the re-sends stop and the deadline does not shorten it.
+  Without a deadline (the field's default, for any other embedder of the backend) the two
+  re-sends alone can take about 20 s on top of the write and its first commit, and a request can
+  end in `408`. Even with the deadline two cases can still end in `408`. The first commit is not
+  bounded by the deadline. `hfs` sets no write concern of its own, so the first commit waits as long
+  as the connection string's write concern or the server's default allows. And a re-send that is
+  slower than every commit before it (waiting for a server during a failover, up to
+  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun. The same deadline stops the extra
+  attempts of a catalog-change or lock-timeout abort (#2267), so with a shorter
+  `HFS_REQUEST_TIMEOUT` those attempts end in `503` instead of running on to a `408`. It does not
+  cut a write's first four attempts or an attempt already running.
+
+  A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
+  as before and reports none of its entries' write events, but a Bundle with a SearchParameter
+  entry reloads the SearchParameter cache. Its commit re-sends stop at the Bundle's deadline
+  (`bundle_transaction_deadline`, see the caveats below).
+- **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
+  `Retry-After` when its connection dropped, its connection pool was cleared or it found no
+  usable server. It also answers `503` when the server refused it with a code that means the node
+  could not serve it just now (#2302). Either the node is not (or no longer) the primary, is
+  recovering or is shutting down: NotWritablePrimary (10107), NotPrimaryNoSecondaryOk (13435),
+  LegacyNotPrimary (10058), InterruptedDueToReplStateChange (11602), NotPrimaryOrSecondary
+  (13436), PrimarySteppedDown (189), InterruptedAtShutdown (11600) and ShutdownInProgress (91).
+  Or the server gave one of the other codes the driver retries a read on: HostUnreachable (6),
+  HostNotFound (7), NetworkTimeout (89), SocketException (9001) and
+  ReadConcernMajorityNotAvailableYet (134). The driver retries a read once on each of these codes
+  except LegacyNotPrimary (10058), so such a read has already outlasted that retry. The message
+  names the read only; the driver error is logged at `warn`. A server deadline (MaxTimeMSExpired
+  50, ExceededTimeLimit 262) answers `504`; any other driver error answers `500`, with the driver
+  error kept as its source. Since #2301 the same rules cover the other single-document reads: the
+  reads a single-resource write makes outside its transaction (on a standalone server, and the
+  re-reads after a lost race), the tenant registry lookup, `delete_with_match`'s load, `$purge`'s
+  existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
+  is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
+  that outlasts that retry reaches the client as this `503`.
+- **A failed query or purge** (searches, counts, history queries, `$purge`, the tenant purge and
+  `$reindex`'s clear step) answers `503` with `Retry-After` on the same state-change and
+  retryable-read codes since #2334; it used to answer `500`. The message names the operation
+  only, and the driver error goes to the same `warn` line. A server deadline (50, 262) still
+  answers `504`. The driver retries the initial command of such a read once (never a cursor's
+  `getMore`), and never a `delete_many` or `update_many`, so a purge can stop partway. Sending it
+  again does no harm: each delete removes only what is left, and nothing is written twice. But a
+  retry does not always finish the job. A retried tenant purge
+  (`DELETE /admin/tenants/{id}?purge=true`) finishes it only with the #2309 fix (PR #2358);
+  without it the retry answers `404` once the tenant is deregistered and has no live resources.
+  An instance `$purge` that stopped after its `resources` and `resource_history` deletes answers
+  `404` to a retry, because it finds no trace of the resource, and leaves its search rows,
+  contained search rows, bulk-submit previous content and sync-failure rows behind (#2146). A
+  transaction Bundle entry that meets one of these codes aborts the attempt, and the Bundle runs
+  again as after any transient abort. A failed commit is still decided by the commit's own labels,
+  so a commit whose outcome is unknown is re-sent, never replayed.
+- **A failed cursor or bulk-data read** (#2335) is classified the same way: a history query's
+  later batches (`getMore`), the tenant list, the `$reindex` page and by-id reads, the bulk export
+  data reads (type list, counts, pages, patient list, Group members) and the `$bulk-submit`
+  job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
+  log, claim scan).
+  They used to answer `500` whatever the cause, with the driver text in the message. A bulk
+  export run that meets such a failure leaves its job to be claimed again while it has attempts
+  left (#2384; see `HFS_BULK_EXPORT_MAX_ATTEMPTS` in the REST README). The `$bulk-submit` claim
+  loop still waits and claims again; for it only the error's kind and text change.
+- **A `$bulk-submit` write, or one of the ingest's own reads (load manifest, read file progress,
+  resolve batch ids, confirm batch writes), that fails on one of these codes** (#2383), in the
+  batch ingest or the job store, is `Unavailable` too, as when its retries run out on a dropped
+  connection, and the driver error goes to the same `warn` line. When a batch step fails this
+  way, the entries' receipts of that batch get the issue code `transient` and the driver-free text
+  (the receipt of one entry whose own update failed keeps the code `exception`, with the
+  driver-free text). A failed load-manifest or read-file-progress read ends that file's ingest,
+  and the manifest's file error carries the driver-free text. It used to be `Internal`, with the
+  driver text. HFS does not retry these codes itself (the driver retries a read once);
+  resubmitting or re-ingesting the file does. A write-concern error with such a code still records
+  `exception`, unless the server labelled it retryable, because the write was applied.
+
+#### Sizing the WiredTiger cache for transaction Bundles
+
+A FHIR transaction Bundle is one MongoDB multi-document transaction, so it needs a replica set
+or a sharded cluster, not a standalone server. The Bundle's whole write set (its resources, their
+history rows and their search-index entries) must fit in WiredTiger's cache while the
+transaction runs, and each Bundle running at the same time needs room of its own. Since #1975 a
+Bundle of at least `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries (4,000 by
+default) does not write its search-index entries inside the transaction, which is most of its
+write set; see
+[Deferred search indexing for large MongoDB transaction Bundles](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+The admission and eviction measurements further down predate that change and describe Bundles
+under the threshold, except where they say otherwise; the #2350 rule and measurements right below
+are for Bundles that defer or offload their search rows, and above 4 GB for Bundles that offload
+them only.
+
+**How large a cache a transaction Bundle needs (#2350).** A transaction Bundle that runs alone is
+rolled back when its write set no longer fits the cache. The rule below is in BSON bytes, because
+that is what `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` counts (see the conversion from
+JSON further down). The figures come from the ceiling harness described under the measurements, on
+Synthea Bundles; sizes above 96,418,693 bytes as the setting counts them are the largest Synthea
+Bundle's first entries repeated with fresh identities.
+
+- **The rule.** Set `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES`, for one Bundle at a time,
+  from the cache size in GB (`--wiredTigerCacheSizeGB`, which mongod reads as GiB): 20,000,000 x GB
+  up to 5 GB, and above 5 GB the larger of 100,000,000 and 16,000,000 x GB. That gives 40,000,000
+  at 2 GB, 80,000,000 at 4 GB, 100,000,000 at 5 and 6 GB, 112,000,000 at 7 GB, 128,000,000 at 8 GB
+  and 192,000,000 at 12 GB. To size a cache for a Bundle, take the smallest cache whose value is at
+  least the Bundle's BSON bytes; a Bundle of 100,000,001 to 112,000,000 bytes therefore asks for
+  7 GB, more than the runs needed (6 GB committed 108,252,500 in 2 of 2). A Bundle of more than
+  134,217,728 bytes of body also needs `HFS_MAX_BODY_SIZE` raised (see Timeouts and request size,
+  below); formatted Synthea JSON reaches that at about 100,000,000 bytes of BSON, computed from the
+  49,027-entry file (98,624,908 bytes of BSON, 132,777,889 bytes on disk).
+  - Above 4 GB these figures are for `offloaded` Bundles (search rows outside the transaction, as on
+    `mongodb-elasticsearch`). `native_deferred` (plain `mongodb` with deferred search rows) was not
+    run above 4 GB, and its largest commit at 2 GB was lower (53,479,447 against 57,113,476 as
+    sent).
+  - Up to 5 GB the 20,000,000 figure held in the runs; above 5 GB it was rolled back at the commit
+    in 9 of 9 runs.
+  - 16,000,000 per GB is the largest round figure at or below the sizes that committed in 3 of 3
+    runs at each of 6, 8 and 12 GB. It was fitted to those cells after the 20,000,000 cells had
+    failed, and was not tested on cells held out from the fit.
+  - 100,000,000 at 6 GB lies between 96,418,693 (3 of 3) and 108,252,500 (2 of 2); no cell ran at
+    exactly that size, and it is there so that a larger cache never gets a smaller value than 5 GB.
+- **Measured range (#2433).** The sizes below are as the setting counts them (see What the setting
+  counts), from #2433's quiet runs on a fresh mongod each, except where noted (the table after the
+  ceiling-harness tables lists every cell). Up to 5 GB the 20,000,000 per GB figure held: at 2 GB
+  55,853,476 bytes committed in its one `offloaded` run (a #2350 run on a shared host, not re-run in
+  #2433); at 4 GB 79,802,556 committed in 3 of 3 runs and 89,209,531 in 3 of 3; at 5 GB the real
+  49,027-entry Bundle, 96,418,693, committed in 6 of 6 and 101,146,424 (the Bundle's first 25,000
+  entries twice, with fresh identities) in 1 of 1. No cell ran at exactly 100,000,000 at 5 GB, and 3
+  of 3 or 6 of 6 does not exclude a failure rate of up to 63% or 39% (one-sided 95% bounds). Above 5
+  GB it did not hold: 119,775,962 at 6 GB, 159,605,112 at 8 GB and 239,407,668 at 12 GB, each
+  20,000,000 per GB, were rolled back at the commit in 3 of 3 runs each. 16,000,000 per GB committed
+  in 3 of 3 runs at each cache (96,418,693 at 6 GB, 129,327,886 at 8 GB, 193,991,829 at 12 GB; at 8
+  GB one of the 3 started at a load of 2.14, so it is 2 of 2 quiet, with a one-sided 95% failure
+  bound of 78%, against 63% for 3 of 3), and larger sizes in 2 of 2 (108,252,500, 139,837,738 and
+  209,756,607). At each of those caches, then, commits were seen in 2 of 2 runs at
+  17,479,717-18,042,083 per GB and rollbacks in 3 of 3 at 19,950,639-19,962,660 per GB; where the
+  limit lies between them was not measured, and 2 of 2 does not exclude a failure rate of up to 78%.
+  Near a limit the outcome varies from run to run, so a measured limit is a band, not a line: at 5
+  GB 108,252,500 committed in 2 of 3 runs, 113,551,312 in 0 of 1 and 118,715,144 in 0 of 3, and the
+  whole 49,027-entry Bundle, 96,418,693, committed at 4 GB in 1 of 7 quiet runs (see Worked
+  example). `native_deferred` was not run above 4 GB, so the figures above 4 GB are for `offloaded`
+  Bundles. Every cell above 96,418,693 bytes, and so every 8 and 12 GB cell, repeats the file's
+  first entries; no real Bundle of those sizes was run. 3, 7, 9, 10 and 11 GB were not run and their
+  values are interpolated by the formula. The 6, 8 and 12 GB cells were not alternated: the
+  20,000,000 cells ran first as one block and the others in the 3 hours after it, and the
+  whole-Bundle commits at 5 GB right before that block and at 6 GB right after it are the only drift
+  check. Check a cache above 12 GB, other data or a loaded disk with the ceiling harness (end of
+  this section) before relying on the rule there. The rule's margins, as the setting counts bytes:
+  - 80,000,000 at 4 GB is 10% under 89,209,531 (3 of 3).
+  - 100,000,000 at 5 GB is above the largest size with more than one run, all committed
+    (96,418,693, 6 of 6), and 8% under 108,252,500 (2 of 3).
+  - 128,000,000 and 192,000,000 at 8 and 12 GB are 1% under the 3-of-3 sizes, about 8% under the
+    2-of-2 sizes and about 20% under the 0-of-3 sizes.
+  - Bundles above the value may still commit, and an operator who has measured with the harness on
+    their own hardware can set it higher.
+- **What the setting counts.** The BSON figures in this section are the resources as the Bundle
+  carries them, ids included (the harness's `V1_CEILING_PAYLOAD` and `bson_bytes`).
+  `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` counts a POST without its `id`, which the REST
+  layer strips (#647): 45 bytes of BSON less per POST with a 36-character id, about 2% on the
+  all-POST Synthea Bundles. As the setting counts them (computed), the 49,027-entry Bundle is
+  96,418,693 bytes, the prefixes that committed are 55,853,476 (28,000 entries, 2 GB), 52,309,447
+  (26,000, 2 GB `native_deferred`) and 89,209,531 (47,000, 4 GB), and the 48,000-entry prefix rolled
+  back at 4 GB is 91,010,418.
+- **The commit needs room beyond the writes.** The commit writes the transaction's oplog entry,
+  which the Bundle's own writes did not need (#1991 measured about 7% at 2 GB). The 7% fits the 2 GB
+  results: the Bundle that was rolled back while writing at entry 30,138 (60,972,978 bytes of BSON)
+  (30,133 and 60,968,544, and 30,084 and 60,885,690, in the two later sessions) had a committing
+  prefix at 57,113,476, 6% lower. At 4 GB the lone-Bundle scans reach twice the 2 GB entries (1.997
+  on `offloaded`, 2.000 on `native_deferred`), but the Synthea Bundle's commit failed from about 93
+  million bytes (93,170,418 in one run; 98,624,908 in 5 of 7 runs), and its largest commit was
+  98,624,908 (2 of 7 runs), where twice the 2 GB write ceiling would be about 122 million (inferred
+  by doubling). So the cache does not buy twice the commitable bytes past 2 GB. The #2433 runs
+  measured it again: in all 36 commits the peak of the tracked dirty bytes was 6.07 to 6.19 times
+  the Bundle's BSON, whatever the cache, and the largest sizes that committed in every run of a cell
+  with at least 3 runs were 89,209,531 at 4 GB, 96,418,693 at 5 and 6 GB, 129,327,886 at 8 GB (one
+  of the 3 started at a load of 2.14) and 193,991,829 at 12 GB (Why the outcome varies (#2433)). Why
+  the figure per GB falls above 5 GB is not established.
+- **Worked example.** The benchmark's largest Bundle (49,027 entries) has 87,007,894 bytes of JSON
+  and 98,624,908 bytes of BSON (96,418,693 as the setting counts it), so the rule asks for 5 GB. At
+  4 GB it is borderline in the harness. It wrote all its entries in every run, and every rollback
+  was at its commit (`Commit failed:` with error 388 in `WiredTigerRecordStore::insertRecord`, the
+  oplog write). In the #2433 runs (a fresh mongod each, `offloaded`, one scan and one Bundle) it
+  committed in 1 of 1 run of the #2432 command, and, with the harness's timeline sampler, in 1 of 7
+  quiet runs and 0 of 2 runs that started right after the harness's own previous run; the same
+  Bundle committed in 6 of 6 quiet runs at 5 GB and 3 of 3 at 6 GB. The earlier figure, 5 of 7
+  rolled back at 4 GB (3 of 4 on `offloaded`, 2 of 3 on `native_deferred`), pooled runs that had
+  different work before them in the same mongod and a different load, so it is not a rate for this
+  cell; its two commits took 120.5 s on `offloaded` and 780.0 s on `native_deferred`, and the 6
+  whole-Bundle `offloaded` commits at 4 GB in #2433 took 100.0-132.5 s. Where the harness sampled
+  it, the tracked dirty bytes peaked at 605-607 MB in every commit of the whole Bundle (15 runs at
+  4, 5 and 6 GB, 11 of them at the default eviction setting: 605,151,275-606,622,169 bytes,
+  6.14-6.15 times its BSON) and at 440-550 MB in the 24 rollbacks at 4 GB (16 of them at 512.1-513.3
+  MB). Why the outcome varies is taken up in Why the outcome varies (#2433), below.
+  `native_deferred` was not run above 4 GB.
+- **From JSON to BSON.** HFS stores each JSON number as a sub-document of 40 bytes plus its text,
+  because `serde_json` is built with `arbitrary_precision`, so BSON is larger than compact JSON.
+  Measured with the driver's own encoding on the resources as sent: 1.134 for the 49,027-entry
+  Synthea Bundle (127,006 numbers, 2.59 per entry) and 1.078 for the US Core test fixture (0.15 per
+  entry). The same arithmetic, computed outside HFS over the benchmark's corpus (the `bulk_1k`
+  archive: 1,129 Bundle files, 1,828,315 entries, 3,393,651,911 bytes of JSON; the import suite
+  sends its 2 seed Bundles and 1,000 rotation Bundles, `.github/workflows/fhir-benchmark.yml`),
+  gives 1.141 on average and 1.11-1.21 per Bundle; it agreed with the harness to the byte on the
+  two Bundles above. Resources with many numbers (ExplanationOfBenefit, Claim) are at the high end.
+  So 1.14 x the JSON is a fair estimate for Synthea data and more is needed for number-heavy data;
+  the harness prints both sizes for a Bundle file (`V1_CEILING_PAYLOAD`).
+- **Smaller resources fit fewer bytes.** Each resource costs a document header and index keys in
+  `resources` and `resource_history` besides its payload. At 2 GB on `offloaded`, a Bundle of 245
+  copies of the US Core fixture (1,328 bytes of compact JSON per entry) was rolled back at about
+  24.4 million bytes of compact JSON per GB, where the 49,027-entry Synthea Bundle (1,775 bytes per
+  entry) was at 27.0. Both figures are real Bundles through `process_transaction`, counting the
+  bytes before the entry that failed, and agree across three runs each (24.36-24.40 and
+  26.96-27.00 million). Leave more headroom for Bundles of small resources.
+- **Bundles at the same time share the cache.** The budget is the cache's, not each Bundle's.
+  Bundles admitted together (the admission room, described below), single-resource writes, batch
+  Bundles, `$bulk-submit`, other HFS instances and other clients of the same MongoDB all draw on it.
+  Divide the rule by the number of large Bundles that may run at once. A Bundle at or above the
+  admission room runs alone only among this instance's transaction Bundles.
+- **Scope.** A Bundle under `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries also
+  writes its search rows in the transaction on a natively indexed backend and is bounded by the
+  admission room, not by this rule; the figures are for Bundles that defer or offload their search
+  rows, and above 4 GB for Bundles that offload them only. HFS checks the limit only when
+  `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` is set; see Refusing an oversized Bundle before
+  it runs (#2351), below.
+
+**Measured (#2350).** HFS benchmark, MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users,
+1,000 Synthea transaction Bundles, runs 40728433458 and 40772360813 (`main` at d13704122): both
+the `mongodb` and the `mongodb-elasticsearch` leg import 996 of 1,000. The four Bundles above
+30,000 entries (33,562, 35,593, 43,966 and 49,027) end with `TooLargeForCache` at entries
+28,627-31,983, and on the `mongodb` leg the 49,027-entry Bundle ends as a lone eviction rollback.
+A run at 4 GB is pending (#2350). From the harness below, a 4 GB cache is expected to commit the
+33,562- and 35,593-entry Bundles (63.8 and 71.7 million bytes of BSON, computed outside HFS), which
+are under the 91.3 million (89.2 million as the setting counts) that committed in every harness run
+that tried it, 3 of 3 in #2433. The 43,966- and 49,027-entry Bundles (94.4 and 98.6 million) fall
+where the harness's 4 GB commit was not repeatable (93.2 million rolled back in its one run; the
+98.6 million Bundle committed in 2 of 10 default runs in #2433, one of them with the #2432 command,
+and in 2 of 7 earlier ones), so a 4 GB benchmark may import 998, 999 or 1,000 of 1,000, and which
+one cannot be predicted. The benchmark's `--oplogSize 2048` was not seen to change that: the
+harness at 2,048 MB committed the 98.6 million Bundle in 0 of 9 runs, against 1 of 9 at 1,024 MB
+(not counting the #2432-command run, which has no timeline and so differs in more than the oplog
+size; see Why the outcome varies (#2433)), which is no evidence either way. The prediction is
+inferred, not measured; the benchmark's host, load and an oplog that earlier imports have filled
+differ from the harness's.
+
+The ceiling harness (`v1_history_ceiling`, #2252), the `mongo:7.0` image (mongod 7.0.43) as a
+single-member replica set (`--replSet rs0 --oplogSize 1024`, `transactionLifetimeLimitSeconds=900`;
+the benchmark runs mongod with `--oplogSize 2048`, `.github/scripts/fhir-bench/start-mongodb.sh`;
+`HFS_TEST_V1_CEILING_OPLOG_MB` sets it, and the #2433 runs below found no evidence that 2,048 MB
+differs at 4 GB), one lone transaction, the production write set (`resources` and
+`resource_history`), on a shared 12-core host that other jobs loaded (load average 1-15). Each row
+is six runs, two in each of three sessions. The tracked dirty
+bytes at the last acknowledged chunk were 10.0% of the cache in every scan (214.2-215.9 MB at 2 GB,
+428.9-430.5 MB at 4 GB and 537.1 MB at 5 GB). The JSON column is the harness's count, about 1% over
+compact JSON:
+
+| Shape | Cache | Abort entry, median (range) | JSON MB, median | Dirty bytes per entry, range |
+|---|---:|---:|---:|---:|
+| `offloaded` | 2 GB | 35,450 (35,200-35,500) | 47.54 | 6,019-6,103 |
+| `offloaded` | 4 GB | 70,800 (70,700-71,000) | 94.95 | 6,055-6,072 |
+| `native_deferred` | 2 GB | 35,100 (34,400-35,100) | 47.07 | 6,127-6,243 |
+| `native_deferred` | 4 GB | 70,200 (69,600-70,200) | 94.14 | 6,119-6,177 |
+
+The 4 GB abort entry is 1.997 (`offloaded`) and 2.000 (`native_deferred`) times the 2 GB one. A
+single `offloaded` scan at 5 GB aborted at entry 88,500, 2.50 times the 2 GB median. The two shapes'
+medians differ by 1% at both sizes. `native_deferred` now models a deferred create as #2256
+writes it: the offloaded fields plus the `search_rows_pending` marker, with neither `missing_params`
+nor `missing_params_fp`, so #1976's 21,600 entries (measured before #2256) is not comparable.
+
+Then real lone Bundles through `process_transaction`, the first N entries of the 49,027-entry
+Synthea Bundle (references to later entries stay as written; one run per cell unless noted).
+"Commits" lists the largest sizes that committed and "rolled back" the smallest that did not, with
+their runs; at 4 GB the two overlap, because the whole Bundle committed in some runs and not in
+others:
+
+| Cache | Shape | Commits (entries, bytes of BSON) | Rolled back (entries, bytes of BSON) |
+|---|---|---:|---:|
+| 2 GB | `offloaded` | 28,000, 57,113,476 | whole Bundle, at entry 30,138, 30,133 or 30,084 (60,885,690-60,972,978 before it; three runs) |
+| 2 GB | `native_deferred` | 26,000, 53,479,447 | 28,000, 57,113,476, at commit; whole Bundle at entry 29,814, 29,888 or 29,807 (three runs) |
+| 4 GB | `offloaded` | whole Bundle, 98,624,908 (1 of 4 runs, 120.5 s); 47,000, 91,324,531 | 48,000, 93,170,418, at commit; whole Bundle at commit (3 of 4 runs) |
+| 4 GB | `native_deferred` | whole Bundle, 98,624,908 (1 of 3 runs, 780.0 s); 47,000, 91,324,531 (714 s) | whole Bundle, at commit (2 of 3 runs) |
+| 5 GB | `offloaded` | whole Bundle, 98,624,908 (105.7 s) | |
+
+On the US Core fixture, a Bundle of 245 copies (65,415 entries, 93,680,650 bytes of BSON, 86.9 MB of
+JSON) was rolled back at entries 36,716, 36,735 and 36,682 (`offloaded`) and 36,201, 36,304 and
+36,245 (`native_deferred`) at 2 GB, 3-4% above the scans' median abort entries, and at its commit at
+4 GB in all six runs. Memory: `docker stats` of the harness mongod, sampled every 15-20 s during the
+4 GB runs, showed at most 2.31 GiB (`offloaded`) and 3.28 GiB (`native_deferred`) over three
+sessions (1.68 and 2.07 GiB in the second, 2.15 and 2.05 GiB in the third). That is not a peak, and
+in the benchmark mongod reached 7.3 GiB RSS at a 2 GB cache (#1900).
+
+#2433 repeated the 4 and 5 GB cells and added 6, 8 and 12 GB, one scan and one Bundle per fresh
+mongod (`HFS_TEST_V1_CEILING_REPEATS=1` with `HFS_TEST_V1_CEILING_CONTROL_BUNDLE`), `offloaded`, 74
+runs in all. "Quiet" means no other hfs-rust-dev or mongo container ran and the one-minute load
+average was below 2.0 when the run started (the harness then raises it: 2.35-3.83 at the Bundle's
+start and at most 5.26 at its end, 4.64 in the quiet runs). Rows marked "x2" or "x3" are the
+Bundle's first N entries repeated two or three times with fresh identities
+(`HFS_TEST_V1_CEILING_CONTROL_BUNDLE_COPIES`), which is how a Bundle larger than the 49,027-entry
+file was made; they are not real Bundles, and their committed peak was 6.08 to 6.15 times the BSON,
+against 6.14 for the real file. Sizes are as the setting counts them (as sent, less 45 bytes per
+entry), "per GB" is that size over the cache in GB, and a count is runs that committed of runs made:
+
+| Cache | Bundle | Entries | Bytes | Per GB | Committed |
+|---|---|---:|---:|---:|---:|
+| 4 GB | first 41,600 entries | 41,600 | 79,802,556 | 19,950,639 | 3 of 3 |
+| 4 GB | first 47,000 entries | 47,000 | 89,209,531 | 22,302,383 | 3 of 3 |
+| 4 GB | whole file | 49,027 | 96,418,693 | 24,104,673 | 1 of 7 (+ 0 of 2 after a previous run; 1 of 1 with the #2432 command) |
+| 4 GB, oplog 2,048 MB | whole file | 49,027 | 96,418,693 | 24,104,673 | 0 of 7 (+ 0 of 2 after a previous run) |
+| 4 GB, 12 CPU spinners | whole file | 49,027 | 96,418,693 | 24,104,673 | 0 of 7 |
+| 4 GB, `eviction_updates_trigger=15` | whole file | 49,027 | 96,418,693 | 24,104,673 | 2 of 2 (+ 2 of 2 after a previous run) |
+| 5 GB | whole file | 49,027 | 96,418,693 | 19,283,739 | 6 of 6 |
+| 5 GB | x2, first 25,000 | 50,000 | 101,146,424 | 20,229,285 | 1 of 1 |
+| 5 GB | x2, first 27,000 | 54,000 | 108,252,500 | 21,650,500 | 2 of 3 |
+| 5 GB | x2, first 28,500 | 57,000 | 113,551,312 | 22,710,262 | 0 of 1 |
+| 5 GB | x2, first 30,000 | 60,000 | 118,715,144 | 23,743,029 | 0 of 3 |
+| 6 GB | whole file | 49,027 | 96,418,693 | 16,069,782 | 3 of 3 |
+| 6 GB | x2, first 27,000 | 54,000 | 108,252,500 | 18,042,083 | 2 of 2 |
+| 6 GB | x2, first 30,300 | 60,600 | 119,775,962 | 19,962,660 | 0 of 3 |
+| 8 GB | x2, first 33,000 | 66,000 | 129,327,886 | 16,165,986 | 3 of 3 (one with a start load of 2.14) |
+| 8 GB | x2, first 36,000 | 72,000 | 139,837,738 | 17,479,717 | 2 of 2 |
+| 8 GB | x2, first 41,600 | 83,200 | 159,605,112 | 19,950,639 | 0 of 3 |
+| 12 GB | x3, first 33,000 | 99,000 | 193,991,829 | 16,165,986 | 3 of 3 |
+| 12 GB | x3, first 36,000 | 108,000 | 209,756,607 | 17,479,717 | 2 of 2 |
+| 12 GB | x3, first 41,600 | 124,800 | 239,407,668 | 19,950,639 | 0 of 3 |
+
+Every rollback was at the commit. The 4 GB whole-file rows are the ones behind the oplog, host-load
+and eviction questions below; "after a previous run" is a run that started within minutes of the
+harness's own previous run, with the load average still above 2.0 but no other container. The
+earlier 2 of 7 at 4 GB (above) is not pooled with these.
+
+**Why the outcome varies (#2433).** Four questions, one change at a time, on the 49,027-entry Bundle
+(table above). Of the 74 runs 36 committed and 38 were rolled back with error 388, every one at the
+commit. No other hfs-rust-dev or mongo container appeared in any 30-second host sample taken during
+the runs; other containers and other processes were not sampled. A count is k of n; a difference
+with a Fisher exact two-sided p of 0.05 or more is no evidence either way. With 7 runs against 7
+only a near-total flip shows: 0 of 7 against 5 of 7 gives p = 0.021 and 1 of 7 against 6 of 7 gives
+0.029, but 0 of 7 against 4 of 7 gives 0.070, and a fall from 1 of 7 cannot show at all.
+
+- **Oplog size: no evidence either way (measured).** At 4 GB the whole Bundle committed in 0 of 7
+  quiet runs with `--oplogSize 2048` (the benchmark's value) and in 1 of 7 with 1024 (p = 1.000),
+  and 0 of 2 against 0 of 2 after a previous run. Measured: a commit wrote 196,605,256 to
+  515,581,824 bytes of oplog (about 237,000,000 for this Bundle), at most 48% of 1,024 MB, into a
+  fresh oplog, about 2.4 times the Bundle's BSON (2.39-2.41 in all 36 commits), and a rolled-back
+  commit wrote at most 6,579. Inferred: the size could not act through truncation here, because a
+  commit wrote less than a fresh 1,024 MB oplog holds and a rolled-back commit wrote almost nothing.
+  An oplog smaller than the largest write or already near its cap was not tested, nor was one that
+  earlier imports have filled, as the benchmark's is.
+- **Host load: no evidence either way (measured).** With 12 CPU spinners on the host (one-minute
+  load average 13.5-14.9 at the start of the Bundle) 0 of 7 committed, against 1 of 7 quiet (p =
+  1.000). This is CPU contention only; the disk was not loaded. The runs that started after the
+  harness's previous run (load 3.0-3.7, no other container) agree with the quiet ones: 0 of 2 (1,024
+  MB), 0 of 2 (2,048 MB) and 2 of 2 with the eviction setting below.
+- **Eviction: the scan ceiling follows `eviction_updates_trigger` (measured); the Bundle committed
+  in 4 of 4 runs with it raised, but the comparison is weak.** At the default every one of the 70
+  scans stopped with the tracked dirty bytes at 9.97-10.08% of the cache (4, 5, 6, 8 and 12 GB).
+  With `--wiredTigerEngineConfigString=eviction_updates_trigger=15` all 4 scans stopped at
+  14.96-15.01% (642,696,553-644,512,338 bytes at 4 GB; abort entries 106,200-106,300 against
+  70,700-71,000), and the whole Bundle committed 4 of 4 (2 of 2 quiet), against 1 of 9 with the
+  default at 4 GB (1 of 7 quiet; the denominator is 9 because the #2432-command run has no timeline,
+  and with it 4 of 4 against 2 of 10 gives p = 0.015): p = 0.007 over all runs, which differ in load
+  and were not run side by side, and p = 0.083 on the quiet runs alone. Only the 2 runs that started
+  after a previous run alternated with default runs (2 of 2 against 0 of 2, p = 0.33), and the 2
+  quiet runs were about 2 hours before and about 4 hours after the nearest quiet default runs, so
+  the commit difference is observational and, with the other comparisons made, not strong. The 9
+  commits whose peak stayed below 10% of the cache (6, 8 and 12 GB at 16,000,000 per GB: 9 of 9)
+  never sampled a second at or above it and had an aggressive-eviction score of at most 2; all 38
+  rollbacks, and 26 of the 35 commits with a timeline, sampled at least one second there, so the
+  time above 10% (1.0-3.4 s rolled back, 0.0-3.9 s committed), the score (50-100 against 0-100) and
+  the second of the last write do not separate commits from rollbacks in the once-a-second readings
+  (descriptive, not a cause). Read from WiredTiger's source, branch `mongodb-7.0` (not the 7.0.43
+  binary): `eviction_updates_trigger` defaults to half of `eviction_dirty_trigger`
+  (`src/conn/conn_cache.c`), which is the 10% above; the cache counts as stuck when the aggressive
+  score is at its maximum, 100, with `WT_CACHE_EVICT_HARD` set (`src/include/cache_inline.h`); the
+  score rises by one per 20 ms without eviction progress, and the code comment says that after 2 s
+  "we will treat the cache as stuck and start rolling back transactions" (`src/evict/evict_lru.c`).
+  Inferred, not shown by any run: the commit pushes the transaction's updates past that trigger and
+  a time-based race with the commit's remaining writes decides whether it is rolled back, which
+  would fit a yes or no that varies and a rollback that stops at varying dirty levels (440-550 MB at
+  4 GB). This README does not recommend `--wiredTigerEngineConfigString`: it was run as an
+  experiment, #1976 chose to size the cache, and its effect on other workloads was not measured. The
+  8-thread eviction setting was cut for budget, so the effect of the thread count is unanswered, and
+  timing finer than one second could not be read from these samples.
+- **5 GB and above: 20,000,000 per GB committed in every cell run up to 5 GB (none at exactly
+  100,000,000 at 5 GB) and in 0 of 9 runs above it (measured).** At 5 GB the whole Bundle committed
+  6 of 6 (against 1 of 7 at 4 GB, p = 0.005) and the limit is a band above it: 101,146,424 bytes
+  committed in 1 of 1, 108,252,500 in 2 of 3, 113,551,312 in 0 of 1 and 118,715,144 in 0 of 3. The
+  file cannot make a larger Bundle, so the sizes above 96,418,693 are the file's first entries
+  repeated (above). 20,000,000 per GB at 6, 8 and 12 GB was rolled back in 9 of 9 runs and
+  16,000,000 per GB committed in 9 of 9. At each of those caches 2 of 2 runs committed at
+  17,479,717-18,042,083 per GB and 3 of 3 rolled back at 19,950,639-19,962,660 per GB; where the
+  limit lies between them was not measured. The 9 commits at about 16,000,000 per GB peaked at
+  9.40-9.46% of the cache, below the 10% level every default scan stopped at; that this is why they
+  committed is inferred, and whether it holds above 12 GB was not measured. No single dirty level
+  above the 10% trigger separates commits from rollbacks across the caches (committed peaks were
+  11.6-14.1% of the cache at 4 GB and 11.3-12.6% at 5 GB, 9.4-10.5% at 6, 8 and 12 GB, where a
+  computed 11.7% was rolled back 9 of 9), so no formula with an intercept is offered. The sample
+  cannot exclude a failure rate of up to 63% (3 of 3) or 39% (6 of 6) at the committed sizes, and
+  the cut cells are not covered: `native_deferred` above 4 GB, a loaded disk, an oplog near its cap,
+  the 8-thread eviction setting and caches above 12 GB.
+
+**Timeouts and request size for large Bundles (#2350).** A Bundle this large runs for minutes, so
+three limits besides the cache apply.
+
+- mongod's `transactionLifetimeLimitSeconds` (default 60 s) aborts any transaction older than
+  that, whatever the cache holds. It must exceed the time from the Bundle's first write to its
+  commit. Set it at startup, for example `--setParameter transactionLifetimeLimitSeconds=900`, as
+  the benchmark does (`.github/scripts/fhir-bench/start-mongodb.sh`).
+- `HFS_REQUEST_TIMEOUT` (default 30 s) bounds the whole call, the wait for admission included, and
+  the Bundle's own deadline is that less 2 s (the caveats below). On a natively indexed backend
+  the deferred search rows are also written before the response, which takes longer than the
+  commit itself. The benchmark runs with `HFS_REQUEST_TIMEOUT=900`. In the ceiling harness
+  (see the measurements above) a 47,000-entry Synthea Bundle took 94 s on `offloaded` and 714 s on
+  `native_deferred`, which writes its search rows before it returns; both are single runs on a
+  loaded host. The whole 49,027-entry Bundle, in the runs where it committed at 4 GB, took 120.5 s
+  on `offloaded` and 780.0 s on `native_deferred`, close to the benchmark's 900 s. In the test of
+  the [deferred-indexing section](#deferred-search-indexing-for-large-mongodb-transaction-bundles),
+  28,035 deferred entries took about 350 s.
+- `HFS_MAX_BODY_SIZE` (default 134,217,728 bytes, 128 MiB, #1662) must exceed the Bundle's body.
+  The 49,027-entry Synthea Bundle is 132,777,889 bytes as a file, just under it.
+
+**Loads too large for one transaction (#2350).** Three ways to load them, in the order to try.
+
+- `$bulk-submit` ingests without a transaction Bundle, on `mongodb` too (on by default,
+  `HFS_BULK_SUBMIT_ENABLED`; see [Bulk Data Submit](../rest/README.md#bulk-data-submit)). It is
+  not atomic across the load.
+- Several transaction Bundles, each atomic on its own but not the load as a whole. A POST ignores
+  a client's `id` (#647), so create the resources that other Bundles refer to with
+  `PUT Type/id` and ids the client assigns; the references then resolve across Bundles. A PUT
+  reads its target first, and a PUT that creates is sent on its own, not in a 100-entry chunk, so
+  such Bundles run slower than ones made of POSTs (see #1977 below).
+- A `batch` Bundle, when the load does not need all-or-nothing: each entry is its own write and
+  no transaction grows with the Bundle. Entries must not depend on each other, so use
+  client-assigned ids for references. A batch leaves conditional references (for example
+  `Practitioner?identifier=...`) as written; only a transaction resolves them
+  ([REST crate README](../rest/README.md)).
+
+**How a Bundle sends its creates (#1977).** Creating a resource (a POST, or a PUT or conditional
+PUT that creates) no longer starts with a read of `resources` to see whether the id is taken; a
+PUT still looks up its target to choose between create and update. The unique
+`idx_resources_identity` refuses a reused id, live or deleted, and the Bundle fails at that entry
+with the same `400` ("resource already exists") as before. The creates are kept in memory and sent
+in chunks: a chunk goes out once it holds 100 entries, 16 MiB of resource payload (counted as BSON
+once for the `resources` document and once for its history copy, not the memory held) or 5,000
+search rows, and a
+resource of 1 MiB or more is sent on its own. These bounds are fixed in code, not configurable. A
+chunk is one ordered `insert_many` into `resources`, one into `resource_history` and, for natively
+indexed resources, one delete of any old rows of the created ids from each of `search_index` and
+`search_index_contained`, followed by one `insert_many` of the new rows into each that has any. A
+chunk is also sent before any entry that reads what the Bundle wrote (a GET, PUT, PATCH, DELETE,
+or a POST with `ifNoneExist`), before an entry's failure is reported, before the deferred-index
+ledger and before the commit. HFS runs a Bundle's entries in the order DELETE, POST, PUT or PATCH,
+GET, so its plain POSTs are normally one run. A run of plain POSTs within the bounds sends at most
+6 commands per 100 entries, where it sent 6 to 7 per entry before (3 per entry on
+`mongodb-elasticsearch` and above the deferral threshold, which now send 2 per 100); a bound can
+cut a chunk short. A PUT or conditional PUT that creates, and a POST with `ifNoneExist`, make the
+Bundle send what it holds first, so such creates are sent one at a time and save only the
+existence read. The Bundle writes the same documents and index keys, so this shortens how long it
+runs and holds the admission room. For the same reason the cache ceiling below is not expected to
+move; that is inferred. Neither the speed-up nor the ceiling has been measured on the benchmark.
+
+Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
+ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
+runs alone (see below), and returns `503` with `Retry-After` when the replays run out, but
+replays cannot fix this: the Bundles that collide again run into the same cache limit. A Bundle
+that is too large for the cache fails on every replay.
+
+So HFS admits transaction Bundles while their entries fit in
+`HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` x `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`
+(default 4 x 1,000 = 4,000 entries) per backend instance. A Bundle counts its entry count, at
+least 1; one larger than the whole room is admitted alone, so it can always run. The rest wait
+in arrival order (FIFO) without holding a session or a transaction, and a large Bundle at the
+head of the queue is not overtaken by smaller ones behind it. The time spent waiting counts
+toward the request timeout. A limit of `0` removes the gate; a weight of `0` counts every Bundle
+as one slot, which is the plain count-based gate of #1776. In the `hfs` binary the backend
+instance is the MongoDB primary that serves Bundles. The weighting is per backend instance, not
+per tenant.
+
+The limit counts standard Bundles of `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` entries,
+not Bundles. With the default weight, many small transaction Bundles can be open at once, each
+with its own session and transaction, bounded by the entry room and the connection pool rather
+than by the limit. For a hard cap on concurrent Bundles (for example limit `1` to serialise
+them), set `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES=0`.
+
+The default weight of 1,000 is the smallest round size at or above the 801-entry Bundles
+measured below, so those are admitted four at a time exactly as before. For Bundles of up to
+1,000 entries the defaults never admit more entries at once than the count-based gate did.
+Bundles of about 1,600 entries now run two at a time instead of four, and small Bundles share a
+slot.
+
+Measured with the in-repo harness: 801-entry Bundles sent by 20 concurrent clients, a debug
+build, MongoDB 7.0 as a single-member replica set. The table was measured with the count-based
+gate of #1776, which is the same as `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES=0`:
+
+| WiredTiger cache | Bundles | Limit | Committed | WiredTiger eviction rollbacks |
+|---|---|---|---|---|
+| 1 GB | 24 | 4 (default) | 24/24 | 0 |
+| 1 GB | 24 | none (`0`) | 5/24 | 65 |
+| 1 GB | 24 | 8 | 13/24 | 40 |
+| 0.25 GB | 12 | 1 | 12/12 | 0 |
+| 2 GB, ~1,600 entries | 24 | 4 (default) | 22/24 | 2 |
+
+Rows 1-3 use the harness defaults (`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=1`,
+`HFS_TEST_BUNDLE_LOAD_BUNDLES=24`, `HFS_TEST_BUNDLE_LOAD_COPIES=3`) with
+`HFS_TEST_BUNDLE_LOAD_LIMIT=4`, `0` and `8`. Row 4 is
+`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=0.25 HFS_TEST_BUNDLE_LOAD_BUNDLES=12 HFS_TEST_BUNDLE_LOAD_LIMIT=1`.
+Row 5 is `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=2 HFS_TEST_BUNDLE_LOAD_COPIES=6` at the default
+limit. Results vary a little between runs (another run of row 2 gave 6/24, and of row 3 14/24).
+
+Under the weighted default, rows 1, 2 and 4 admit the same Bundles at once. Row 3 (limit 8)
+would admit nine 801-entry Bundles at once, and row 5 would run its ~1,600-entry Bundles two at
+a time; neither was re-measured. Row 1 was re-run with the weighted default (limit 4, weight 1,000)
+and gave the same result: 24/24 committed, 0 rollbacks (`ok=24 transient=0 wt_rollbacks=0`,
+`wall_s=222.3`, `p50_s=137.8`).
+
+Measured with the HFS benchmark and no admission limit (20 at once), 1,000 Synthea transaction
+Bundles of about 1,600 entries each: about 53% of the Bundles imported with
+`--wiredTigerCacheSizeGB 2`, and about 82% with `--wiredTigerCacheSizeGB 4`. The same Bundle
+shape was measured only with the harness, with the count-based gate (row 5 above, 22/24: four
+~1,600-entry Bundles at once). The weighted default runs them two at a time and has not been
+measured for this shape. At 2 GB the count-based gate helped but did not fully remove the
+failures, so give such Bundles more cache or a lower limit. That row ran without a request
+timeout, with a median Bundle time of about 380 s, far above the 120 s replay budget.
+
+If Bundles still fail with `503`, lower the limit (`1` for a 256 MB cache with ~800-entry
+Bundles). Raise the limit or the weight only with a larger cache. Keep `HFS_REQUEST_TIMEOUT` long
+enough for queued imports, since a Bundle waiting for its turn is still bounded by it.
+Otherwise, size `--wiredTigerCacheSizeGB` for the entries the gate admits at once, the limit ×
+`HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (4,000 by default), or for the largest single
+Bundle when that is bigger, since a Bundle larger than the room runs alone. Or split very large
+Bundles into smaller ones.
+
+A single Bundle can also be too large for the cache on its own, and the gate cannot help with that:
+a Bundle larger than the room already runs alone. When one transaction's write set does not fit in
+WiredTiger's cache, MongoDB rolls it back with error 388 (`TransactionTooLargeForCache`,
+"transaction is too large and will not fit in the storage engine cache"), on one of the Bundle's
+writes or on its commit. The commit also writes the transaction's oplog entry, which can push a
+Bundle just under the ceiling over it (#1991). HFS neither replays such a Bundle nor re-sends its
+commit, since every attempt meets the same cache, and answers `500` with a `too-costly`
+OperationOutcome that names the WiredTiger cache and the Bundle's entry count and says that
+resubmitting it unchanged will fail the same way. It also names the ways out: smaller transaction
+Bundles with client-assigned ids (PUT), `$bulk-submit` if the server enables it, or a larger cache.
+The driver's text stays in the server log (#1837); a commit-time 388 is logged with the prefix
+`Commit failed:`. Size `--wiredTigerCacheSizeGB` with the rule above, or use one of the
+alternatives listed there. In the HFS benchmark at `--wiredTigerCacheSizeGB 2` (runs 40728433458
+and 40772360813), the four Bundles above 30,000 entries end with `TooLargeForCache` on both
+MongoDB legs, at entries 28,627-31,983, and on the `mongodb` leg the 49,027-entry Bundle ends as a
+lone eviction rollback (described below). The first benchmark with the search rows deferred (run
+39657850695) had the `mongodb` leg abort lower, at 19,200-21,100 entries. The ignored ceiling test
+of the
+[deferred-indexing section](#deferred-search-indexing-for-large-mongodb-transaction-bundles) shows
+that a deferred create's transaction then wrote each resource's `missing_params` and its
+`idx_resources_missing_params` keys (15.19 per resource on its fixture), which an offloaded backend
+does not write, and that a deferred Bundle without them reached the offloaded ceiling. We infer
+that the benchmark's gap had the same cause: the test's deferred/offloaded ratio before that change
+was 0.64-0.65 at 0.5 GB and 0.64 at 2 GB, and the benchmark's four Bundles that failed on both legs
+gave 0.62-0.70 (the native abort entry over the offloaded one). A deferred create writes neither
+now (#2256), and in runs 40728433458 and 40772360813 both legs abort in the same range; that this
+is the effect of #2256 is inferred.
+Measured with that test (one synthetic Bundle of a 267-entry US Core fixture repeated, in a
+dedicated `mongo:7.0` container on a shared host; a harness result, not the benchmark), the entry at
+which a larger Bundle's transaction aborted was, over three runs of each cell (two for `offloaded`
+before this change at 2 GB):
+
+| Variant | 0.5 GB cache | 2 GB cache |
+|---|---:|---:|
+| `deferred`, before this change | 5,729-5,780 | 22,898-22,972 |
+| `deferred_no_metadata`, before this change | 9,085-9,211 | not run |
+| `deferred`, after | 8,871-8,933 | 35,346-35,481 |
+| `offloaded`, before this change | 8,936-9,040 | 35,878-35,921 |
+| `offloaded`, after | 9,011-9,036 | 35,884-35,943 |
+
+These are the entries at which a Bundle larger than the ceiling aborted: an upper bound on the size
+of a Bundle that can commit, not the largest one measured to commit, and accurate to about 100
+entries (one create chunk). A deferred Bundle now reaches 0.98-0.99 of the offloaded ceiling
+(0.982-0.991 at 0.5 GB and 0.985-0.987 at 2 GB, each ratio within one run). We infer that the
+remaining 0.9-1.8% is the `search_rows_pending` marker, about 62 bytes per `resources` document; the
+ledger is written after the last entry, and every aborted run left `ledger=0`, so it does not move
+the abort entry. One Bundle was run to commit near the ceiling: at 2 GB, 28,035 entries (105 copies,
+79% of the deferred abort entry above), `deferred` committed it in two runs (351.1 s and 347.5 s), each with `rows=447930`,
+`ledger=0` and `markers=0`, while `inline` aborted at entry 7,349 in the first (see Ceiling test).
+That shows that a Bundle of that size commits here, not where the ceiling lies. The fixture's
+ceilings sit above the benchmark's in entries, because its resources are smaller (see the rule
+above). In the benchmark both legs import every Bundle under 30,000 entries, and the four above it
+(33,562-49,027 entries) fail on their resources and history alone (runs 40728433458 and
+40772360813).
+
+MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
+(`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same rollback
+arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned transaction ID
+rolled back for eviction", or on 7.0 also "transaction rolled back because of cache overflow"), or as
+`TemporarilyUnavailable` (365) at commit. A Bundle that takes the
+whole room (its entries are at least the limit x the weight, 4,000 by default) runs alone, so that
+rollback is mostly its own write set meeting the cache; in the benchmark 49 of 50 such replays
+failed again at nearly the same entry while holding the whole room. HFS does not replay it. It
+answers `500` `too-costly` as for 388, with the entry count and the same advice, but without saying
+that an unchanged resubmit will fail: the room bounds only this instance's transaction Bundles,
+while single-resource writes, batch Bundles, other HFS instances and other clients share the same
+cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
+rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
+`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). With chunked creates
+(#1977), `failed_entry`, and the "Entry N" of the log-only reasons, is the entry whose document the
+server refused when the error names one, and otherwise the first entry of the chunk being sent, so
+an abort position reads up to 99 entries before the entry the server was writing. The
+`Transaction failed` `ERROR` line names the cause: `write set too large` for 388,
+`lone eviction rollback` here. Bundles that shared the room, and plain write conflicts, are still
+replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
+weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
+per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+
+**Refusing an oversized Bundle before it runs (#2351).** With
+`HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
+size of a transaction Bundle's POST and PUT resources, as sent and once each, before the admission.
+Above the limit it answers `500` `too-costly` at once, naming the payload and the limit, with no
+admission, session or transaction, instead of finding out when MongoDB rolls the Bundle back after
+it wrote most of its entries. PATCH entries and the id the server assigns to a create are not
+counted, and a conditional create counts even when it matches. BSON is larger than compact JSON,
+more so for resources with many numbers (each is stored as a small sub-document), so set the limit
+in BSON bytes. Each refusal logs one `WARN`, "transaction bundle refused before admission", with
+`entries`, `payload_bytes` and `limit_bytes`; the `Transaction failed` line names the cause
+`payload over the configured limit`. HFS does not read the cache size.
+
+Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
+2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
+`HFS_REQUEST_TIMEOUT` less 2 s (`bundle_transaction_deadline`), so no replay starts that would run
+into the `408`. Under the default 30 s timeout both are 28 s, so a Bundle that waited most of it
+still gets no replay on a transient abort and returns `503`. With a longer timeout for queued
+imports, the wait no longer uses up the 120 s of replays. A wait that outlasts the request
+timeout still ends in `408`. The same deadline stops the re-sends of a commit whose outcome is
+unknown: a re-send starts only if a commit as slow as the slowest one so far still ends before it,
+and otherwise the Bundle answers as an unknown commit (#2320). The first commit and a re-send
+slower than every commit before it are not bounded. And while a cancelled (timed-out) Bundle's
+server-side abort is still in flight, one more transaction than the limit may briefly be open.
+
+To re-measure on your own hardware, run the ignored harness (it starts its own MongoDB
+container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,
+`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and `HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run;
+`HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the pre-#1776 behaviour,
+`HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776,
+`HFS_TEST_BUNDLE_LOAD_DEFERRED_INDEX_ENTRIES` sets the threshold for writing a Bundle's search
+rows after its commit (#1975; the harness default is `off`, so it keeps measuring the write set
+inside the transaction, and `auto` or a number turns the deferral on), and
+`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient or too-costly):
+
+```bash
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  transaction_bundle_load -- --ignored --nocapture
+```
+
+To find where a lone Bundle aborts on your own hardware and cache size, run the ceiling harness
+(#1976, #2252, #2350). It starts its own `mongo:7.0` replica set with the cache you name and prints
+`V1_CEILING_*` lines: the abort entry, the dirty bytes per entry, the BSON and JSON bytes of a
+Bundle (`V1_CEILING_PAYLOAD`) and, for a control Bundle you give it, whether it commits and where
+it aborts. The knobs are listed at the top of
+`crates/persistence/tests/mongodb/v1_history_ceiling.rs`.
+
+```bash
+HFS_TEST_V1_CEILING_WT_CACHE_GB=4 HFS_TEST_V1_CEILING_SHAPE=offloaded \
+HFS_TEST_V1_CEILING_VARIANTS=resource_history \
+HFS_TEST_V1_CEILING_CONTROL_BUNDLE=<path to a transaction Bundle> \
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  v1_history_copy_ceiling -- --ignored --nocapture --test-threads=1
+```
 
 ### MongoDB + Elasticsearch
 
@@ -573,6 +1692,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 - Elasticsearch handles delegated search queries, including full-text search
 - MongoDB search index population is automatically disabled via `search_offloaded`
 - Composite routing preserves MongoDB as the source of truth for reads and writes
+
+> **MongoDB + Elasticsearch note:** with search offloaded, an in-transaction `ifNoneExist` is resolved by scanning the raw `resources` documents inside the transaction session. Only `_id`, `_lastUpdated` and plain `identifier` values (`code`, `|code`, or `system|code`, with a nonempty code) are evaluated; `|code` matches any system, same as Mongo direct search. Every other shape is rejected so the bundle rolls back instead of matching the wrong set (#1394).
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
@@ -600,13 +1721,14 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and bulk operations. Elasticsearch handles all search operations. Combines S3's cost-effective, durable object storage with Elasticsearch's search capabilities for large-scale deployments.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations, and — since the S3 primary keeps no counts — the Home dashboard's totals, per-type breakdown and write marker (#1280); it keeps no history, so the dashboard's creation-time series is empty on this topology. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
 - Instance, type, and system history via immutable history objects
 - Batch bundles and best-effort transaction bundles
-- Bulk export (NDJSON parts + manifest in S3)
+- Bulk export data provider for system-level exports
+- Optional S3 bulk-export output files via `S3OutputStore`
 - Bulk submit with rollback change log
 - Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
@@ -636,10 +1758,15 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` or `bucket-per-tenant` |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | (none) | Bucket-per-tenant, required: `tenant=bucket,…` including `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | (none) | Bucket-per-tenant, optional: `default_system_bucket` |
 | `HFS_S3_REGION` | (provider chain) | AWS region override |
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 AWS credentials are resolved via the standard AWS provider chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, EC2 instance metadata, shared credentials file, SSO, etc.).
 
@@ -715,6 +1842,394 @@ When `HFS_STORAGE_BACKEND` is set to `sqlite-elasticsearch`, `postgres-elasticse
 
 This is controlled by the `search_offloaded` flag on the primary backend, which the composite layer sets automatically when a search secondary is configured.
 
+### Deferred search indexing for large MongoDB transaction Bundles
+
+On the native `mongodb` backend a transaction Bundle normally writes the search-index entries of
+every resource (about 18.6 `search_index` rows per entry) inside its transaction, and those rows
+are most of what WiredTiger holds in its cache until the commit. A Bundle of at least
+`HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries (#1975) therefore writes only its
+resources and their history inside the transaction, and writes the search-index entries right
+after the commit, before the response. This is the same ordering the Elasticsearch composites
+use, where the search index is written after the primary commits. It lifts the Bundle size at
+which MongoDB rolls a lone Bundle back for cache eviction (see
+[Sizing the WiredTiger cache for transaction Bundles](#sizing-the-wiredtiger-cache-for-transaction-bundles)).
+
+**When it applies.**
+
+- Only on the native `mongodb` backend, and only for transaction Bundles. Never while search is
+  offloaded (`mongodb-elasticsearch`): the variable is ignored there, nothing is deferred, no
+  ledger is written and `hfs` starts no repair task.
+- The rule is `entries >= N`. `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` sets `N`
+  (`MongoBackendConfig::transaction_bundle_deferred_index_entries`). The default, `auto`, is the
+  admission room in entries, the limit x the weight (4 x 1,000 = 4,000), which is also the size
+  from which a Bundle runs alone. With the gate off (limit `0`) or counting Bundles (weight `0`)
+  `auto` is 4,000. `off` or `0` never defers, and a plain integer sets `N` directly. Anything else
+  fails startup with an error that names the variable.
+- `auto` follows the admission room, so shrinking the room shrinks `N`: a limit of `1` with the
+  default weight defers every Bundle of 1,000 entries or more. Set the variable explicitly to keep
+  a threshold you chose.
+- Bundles below `N`, and every Bundle when the deferral is off, run exactly as before.
+- `hfs` logs `N` at startup (the `deferred_index_min_entries` field of "MongoDB transaction
+  Bundles of at least this many entries write their search rows after the commit"; `None` means
+  never).
+
+**What the transaction writes.** The `resources` documents and the history rows, as always. Each
+`resources` document whose rows are deferred also carries a transient field,
+`search_rows_pending: <bundle id>`, until its rows are written. The transaction adds a ledger, the
+`search_index_pending` collection, with one document per 5,000 resources (50,000 resources write
+ten), each naming its resources as `Type/id` together with `tenant_id`, `bundle_id`, `chunk`,
+`chunks`, `entries`, `created_at`, `not_before` and `attempts`. The ledger goes in after the last
+chunk of creates (#1977) and before the commit, and it commits or aborts with the Bundle, so an
+aborted or replayed attempt leaves neither a ledger nor markers. A failure to write the ledger is a
+server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
+ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
+it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
+the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update).
+
+A resource of a deferred type that the Bundle creates also carries no `missing_params` and no
+`missing_params_fp`
+([missing-parameter metadata](mongodb/search-indexes.md#missing-parameter-metadata)) from
+the transaction (the `ifNoneExist` target types stay inline and keep their metadata in the
+transaction, see Conditional entries), and the transaction does not run the search extraction for
+it: the post-commit step (or the repair) writes the rows, `missing_params` and the fingerprint from
+one extraction, in the update that clears the marker. The array adds one multikey key per absent
+search parameter to `idx_resources_missing_params` (15.19 per resource, measured on the ceiling
+fixture's 267 entries) and the fingerprint one key to `idx_resources_missing_params_fp`, and
+WiredTiger holds every one of them in cache until the commit. Without them a create writes what an
+offloaded backend's create writes (the document, its history, one `null` key in
+`idx_resources_missing_params`), plus the marker of about 60 bytes (measured: 1,736 bytes per
+`resources` document against 1,674). An update, a restore or a delete of an existing resource still
+writes its `missing_params` in the transaction, and the step rewrites it after the SearchParameter
+reload; every such update rewrites all of that resource's keys in `idx_resources_missing_params`,
+because `last_updated` is part of the index key. The collection and its `not_before` index
+(`idx_search_index_pending_due`) are created at schema initialisation (schema version 13).
+
+**The step after the commit.** While it still holds its admission (so the next large Bundle does
+not compete with these inserts for cache), the request reloads the SearchParameter cache if the
+Bundle changed SearchParameters, and then rewrites the rows:
+
+- The rows and `missing_params` are rebuilt from the resources' current stored state, with the
+  builder inline writes and `$reindex` use, not from the request. A resource deleted by the Bundle
+  gets no rows.
+- The batches run on the Bundle's own session, which is causally consistent: the first batch reads
+  at or after the Bundle's commit, so a marker cannot be missed because the commit is not yet
+  visible to it (for example under `readConcernLevel=majority` with `w:1`). A batch that finds no
+  marker was finished by another rewriter.
+- Resources are taken in batches of up to 256 of one type. Each batch is its own small
+  transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
+  their old rows and inserts the new ones. It then makes one update per resource that removes the
+  marker and writes `missing_params` and its fingerprint from the same extraction as the rows
+  (a created resource has none until then; an updated one is rewritten): `[]` for a deleted
+  resource, and removed when the extraction failed, as on every other write path. A batch that
+  fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
+  a ledger document are done, the document is deleted.
+- A batch that runs out of its five attempts stops the step: the rest of that ledger document and
+  every later one are left to the repair, so a stalled MongoDB costs one batch's attempts, not
+  one per document.
+- The step starts no new attempt after the Bundle's own deadline (`bundle_transaction_deadline`:
+  `HFS_REQUEST_TIMEOUT` less 2 s, counted from the call), and an attempt still running at the
+  deadline is cut, so a committed Bundle is answered instead of timing out with `408` and being
+  resubmitted. The cut attempt's transaction is aborted by dropping the session, not awaited.
+- It never turns a committed Bundle into an error. Whatever it did not finish stays in the ledger
+  for the repair, and cancelling the request mid-step aborts only the batch in flight, since the
+  batches before it have committed.
+- It logs one `INFO` line per Bundle, "transaction bundle search rows written after commit", with
+  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches`, `retries` and `ms`.
+  If anything is left it also logs a `WARN`, "transaction bundle search rows not all written after
+  commit; the deferred index repair will finish them", with `left_chunks`, `stopped_at_deadline`
+  and `last_error`.
+
+The rows are written in small transactions rather than outside any transaction, because they must
+not end up stale or duplicated next to a concurrent write. The marker is removed, and
+`missing_params` rewritten, in the same transaction that rewrites the rows, so each rewriter (this
+step, a repair, another instance) writes the resource document, and MongoDB's write conflict on
+that document serializes them: a loser starts again from the state the winner committed.
+
+**Consistency.**
+
+- The client that submitted the Bundle can search it once it has the response, unless the `WARN`
+  above reports rows left to the repair (a deadline cut, a failed batch): the response is still the
+  committed Bundle, and the missing rows follow within the repair's lag.
+- Other clients can read the resources at once, by id, version and history, and a search that uses
+  only `_id` and `_lastUpdated` finds them at once, since those are resolved on the resource
+  documents. A search on any other parameter can miss them until their rows are written. For an
+  updated or deleted resource the old rows stay until its batch runs, so such a search can briefly
+  match its previous content. The lag is inferred, not measured with this change: about 2 s for
+  a 6,000-entry Bundle and about 10 s for a 30,000-entry one, from the 57,346 rows/s the
+  `$reindex` writer reached in a benchmark run and 18.6 rows per entry. After a crash or a
+  deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
+  Bundle deadline) plus up to one repair interval plus the time to write the rows.
+- A supported `:missing=true` search resolves on the resource document's `missing_params`. A
+  resource of a deferred type that the Bundle created has none until its batch commits (the
+  `ifNoneExist` target types keep theirs). It still carries the `search_rows_pending` marker
+  then, and `:missing=true` leaves a marked resource without `missing_params` out, like every other
+  search that reads rows, rather than answering it from rows that are not there yet (which would
+  list it as missing every parameter, so that `Patient?family:missing=true` found a Patient that
+  has a family). A conditional criterion with `:missing=true` from another client misses it the
+  same way during the lag. An updated resource keeps the `missing_params` its
+  transaction wrote, so it is answered at once, from its new content. `:missing=false` checks the
+  rows, so like any other parameter it can miss the resources until their rows are written, and
+  for an updated resource it sees the old rows. `:missing=true` reads rows too, and lags the same
+  way, until `idx_resources_missing_params` is built, for a parameter the metadata route does not
+  support, and for a resource whose extraction failed (it has no `missing_params`). The submitting
+  client is not affected unless the step was cut at the Bundle deadline or a batch failed (see the
+  first bullet): the step writes the metadata before the response.
+- Conditional operations and conditional references from other clients resolve through the search
+  rows, so during that lag they can miss a resource of a just-committed Bundle and, for example,
+  create a duplicate. The Elasticsearch composites have the same exposure.
+- A client write to a resource of a just-committed Bundle can lose the write conflict with the
+  step's batch and answer `409` (`VersionConflict`); sending it again once the batch has
+  committed succeeds. Its rows never end stale or duplicated.
+- SearchParameters created or changed in the same Bundle apply to its deferred rows and to the
+  `missing_params` the step writes, because the cache is reloaded after the commit and before the
+  step. Rows and `missing_params` written inside a transaction are built before that reload: those
+  of an inline Bundle, of the `ifNoneExist` types of a deferred Bundle, and, until its batch
+  rewrites it, a deferred update's `missing_params`. A deferred create has none to rewrite.
+
+**Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
+transaction through the search rows, so it must see an earlier entry of the same Bundle. A
+deferred Bundle therefore still writes the rows of every resource whose type is the target of one
+of its own `ifNoneExist` entries inside the transaction (no marker, no ledger entry), and defers
+the other types. Matching is exactly what an inline Bundle does, no criterion is refused that an
+inline Bundle accepts, and a Bundle whose resources are all of such types writes no ledger. URL
+conditionals (`PUT Patient?identifier=...`) and conditional references are resolved before the
+Bundle's first write, against rows that are already committed, so the deferral does not change
+them.
+
+**Repair.** `hfs` runs `MongoBackend::repair_deferred_search_index(min_age, max_chunks)` once at
+startup and then every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds (default `60`; `0`
+turns the task off, and the ledger is still written). Each pass takes up to 20 ledger documents
+(100,000 resources) whose `not_before` is at least `min_age` old, oldest first, across tenants.
+In `hfs` `min_age` is the larger of 60 s and the Bundle deadline (`HFS_REQUEST_TIMEOUT` less 2 s,
+898 s with a 900 s timeout), logged at startup as `min_age_secs`. A live request starts nothing
+after that deadline, counted from its call, and the call precedes the document's `not_before`, so
+a document older than `min_age` has no live writer and one instance's repair never duplicates a
+step that is still running.
+
+- The repair claims each document before working on it, by moving its `not_before` to now only
+  while it still holds the value the pass read. A second repair (another instance, or an
+  overlapping call) that read the same document finds the claim taken and skips it: that is the
+  `skipped` field of `DeferredIndexRepairReport`, which is not counted in `examined`. A claimer
+  that crashes leaves a document that is due again after `min_age`.
+- It runs the same marker-gated batches with no deadline. A batch that runs out of attempts does
+  not stop the document: the healthy batches are still written (up to three failed batches in a
+  row, so a MongoDB that is down does not cost every attempt of every batch), and the document is
+  kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
+  increased, and is retried after another `min_age`.
+- A document with no `refs` array, or with refs that cannot be read, is kept the same way, after
+  its readable refs are indexed. Documents are never dropped before all of their resources are
+  indexed. Every instance may run the repair.
+- Correctness does not depend on the claim or on `min_age`: the rewrite is gated on the marker and
+  serialized by the write conflict on the resource document, so a repair that raced a live step
+  would only repeat work.
+
+An application that embeds `MongoBackend` without the `hfs` binary must call
+`MongoBackend::repair_deferred_search_index` periodically itself (`hfs` does so at startup and
+every interval), or set the threshold to `off`. Otherwise the rows a crash or a deadline cut left
+unwritten are never written.
+
+- A pass that found work logs "Deferred search index repair pass finished" at `INFO` (at `WARN` if
+  any document failed) with `examined`, `skipped`, `resources`, `reindexed`, `rows`, `cleared`,
+  `failed`, `remaining` and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
+  repair could not finish a ledger chunk", with `tenant`, `bundle_id`, `chunk`, `attempts` and
+  `error`. A pass that could not run at all logs "Repair of deferred MongoDB search rows could not
+  run".
+- At startup, if nothing was due but the ledger is not empty, it logs "Deferred search index
+  ledger holds chunks younger than the repair's minimum age; the next pass takes them".
+- To see what is owed, run `db.search_index_pending.countDocuments()` (or call
+  `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
+  fully indexed.
+
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its Bulk
+Data Submit manifests, then its `resources`, then its `search_index`, `search_index_contained` and
+`resource_history` rows, and the rest of its Bulk Data Submit state after those, so a post-commit
+step or a repair that runs during the purge leaves none of the tenant's rows behind (#2259):
+
+- A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
+  that claimed one before it runs its batches, which the next two bullets cover.
+- A batch that has cleared a resource's marker holds that document until it commits, so the
+  `resources` delete waits for the commit and the row deletes that follow remove what the batch
+  wrote.
+- A batch that read a resource the purge then deleted cannot clear its marker (its update loses the
+  write conflict on the deleted document), so it aborts and its retry finds nothing to index.
+  Neither the step nor the repair inserts a ledger document or a resource.
+
+Client writes to the tenant during the purge are not ordered against it. Work that is already
+running is covered by a check in the writer: a `$reindex` page, a `$bulk-submit` batch and a submit
+worker's artifact record write without a transaction, and one running on another instance cannot be
+seen from the instance that purges, so each checks after it writes (#2310):
+
+- A reindex page reads `resources` again once its rows are in (its verification or its metadata
+  read, which it makes anyway). For a resource it read from this store and no longer finds, it
+  removes exactly the rows it wrote for it, by `_id`. A page of resources handed over by another
+  store is not affected.
+- A bulk-submit batch reads its manifest once more after its last write. A batch whose manifest is
+  gone removes what it wrote: the `resources` it created (by id and its own `last_updated`), its
+  `resource_history` versions, its search rows by `_id`, and the manifest's rollback log and
+  receipts. It ends with `ManifestNotFound`, the error the next batch of its file gets, and the
+  submit worker ends its run on the lost lease. A submit worker's artifact record does the same
+  for its `bulk_submit_files` row and ends with a lost lease.
+
+A check that finds the document ran before the purge deleted it, so the purge's own deletes remove
+what the writer wrote before the check. That is why the manifests are deleted right after the
+ledger, before anything a batch writes, and `resources` before the row collections. It holds
+whichever instance runs the writer. The purge does not wait for the writer, so rows of the tenant
+can exist until the page or batch in flight at the purge has returned; after that, and after the
+purge, none remain, apart from the failure cases below.
+
+A submit worker drops the batch it has in flight when its lease keeper reports the lease lost, and
+a dropped batch never reaches its check. The purge deletes the manifest, which is what makes the
+keeper's next heartbeat match nothing, so the backend does not report that lease lost while a batch
+or an artifact record of the manifest is running on the same instance: the heartbeat is answered
+as a renewal, and the progress writes that end a file (and so drop its siblings' batches) wait
+until those writes have returned. The batch then ends by itself, with its check. This only
+protects a worker from its own instance's writes. It says nothing about another instance, whose
+writer removes its own rows when its command returns. A fence that another worker moved on a
+manifest that still exists is still reported lost at once. The answer is held back at most five
+minutes after the latest such write began, so a command that hangs cannot keep a purged manifest's
+job open; a batch still running after that is dropped as before.
+
+A process that dies between a write and its check, a check or a removal that fails after its
+retries, and a batch that is still running after those five minutes can leave rows, and repeating
+the purge removes them. So can a reindex page that ends in a command error: it returns before its
+check, so the rows of the sub-batches it had completed can remain if a purge coincided with it. A
+write that begins after the purge has returned is new work for the tenant and is not covered. The
+checks cost no round trip per reindex page, one `find` per batch and one per submit artifact, and
+at most one more `find` on a lease check that has already failed while a write of that manifest is
+running. They read from the primary at read concern `local` whatever read preference the
+connection string names.
+
+A purge that fails part-way can leave rows, history or ledger documents without their
+resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
+endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
+`200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
+first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
+
+**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` do not use
+the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
+`500` `too-costly`, as described above.
+
+**Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger
+cache and sends one lone synthetic Bundle (`COPIES` copies of a 267-entry fixture, so 15 copies are
+4,005 entries) through one backend per variant, each on a database of its own:
+
+- `inline`: the deferral off; expected too large for the cache.
+- `deferred`: the default threshold; expected to commit, its rows written after the commit.
+- `deferred_no_metadata`: `deferred` with `missing_metadata=false`, so no resource carries
+  `missing_params` or its fingerprint and `idx_resources_missing_params` is not built.
+- `offloaded`: search offloaded, so the transaction holds only the resources and their history.
+
+```bash
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  deferred_indexing_raises_the_lone_bundle_ceiling -- --ignored --nocapture
+```
+
+Before the variants it runs a write-set probe: one copy of the fixture (267 entries) through
+`inline`, `deferred_txn` (the deferral with its post-commit step cut by a 1 ms deadline, so the
+documents are as the transaction wrote them), `deferred_no_metadata` and `offloaded`, counting
+index keys per resource with `validate`. It prints one `DEFERRED_CEILING_PROBE` line per mode
+(`missing_keys_per_resource` and `fp_keys_per_resource` are the keys of
+`idx_resources_missing_params` and `idx_resources_missing_params_fp`, `resource_keys_per_resource`
+all keys of `resources`), and then one `DEFERRED_CEILING` line per variant with `outcome`,
+`cause`, `abort_entry` (the entry the transaction ended at, `commit`, or `na` for a committed
+Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by), the resources,
+rows, ledger documents and markers left, and the server's eviction-rollback delta.
+
+`abort_entry` is accurate to about one create chunk (100 entries): a failed chunk is charged to the
+entry the server names, or else to its first entry, so it can read up to 99 entries low. A 388
+while the ledger is written reads as `abort_entry=<entries>`, because `ledger_attempt_error` reuses
+`entry_attempt_error(entries, entries, ..)`.
+
+Knobs (defaults in parentheses): `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (`0.5`),
+`HFS_TEST_DEFERRED_CEILING_COPIES` (`15`), `HFS_TEST_DEFERRED_CEILING_VARIANTS` (`inline,deferred`),
+`HFS_TEST_DEFERRED_CEILING_PROBE` (`true`), `HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS` (`900`,
+mongod's `transactionLifetimeLimitSeconds`), `HFS_TEST_DEFERRED_CEILING_MONGODB_URL` (an external
+replica set; no container is started), `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT` (`true`;
+`false` accepts any inline outcome) and `HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT` (`true`; `false`
+accepts any outcome of the other variants, to find where they abort). An aborted Bundle must leave
+no resource, ledger or marker whatever the knobs. Speed depends on the load of the host. On a shared
+12-core host with a debug build, a committing 4,005-entry Bundle ran at 48-54 entries per second
+(74.1 s, 79.9 s and 83.7 s), and the variants that aborted ran at 51-401 entries per second up to
+the abort, so an aborting variant took about 90-245 s at 2 GB. A 28,035-entry Bundle that committed
+at 2 GB, rows included, ran at 79.9 and 80.7 entries per second (351.1 s and 347.5 s). Set `TXN_LIFETIME_SECS` to `7200`
+for a run that may last longer than the 900 s default, or a variant ends at the server's transaction
+lifetime instead of at the cache.
+
+Recorded runs, each cell three times (`offloaded` before this change at 2 GB twice), on a shared
+12-core host with a debug build. The third `deferred` run before this change at 2 GB used
+`HFS_TEST_DEFERRED_CEILING_COPIES=100` (26,700 entries), which still aborts before its end. At 0.5 GB:
+`HFS_TEST_DEFERRED_CEILING_COPIES=40` (10,680 entries),
+`HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=false`, and
+`HFS_TEST_DEFERRED_CEILING_VARIANTS=inline,deferred,deferred_no_metadata,offloaded` for the runs
+before this change or `inline,deferred,offloaded` for those after it; the probe ran with them, at
+its default. At 2 GB: `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB=2`,
+`HFS_TEST_DEFERRED_CEILING_COPIES=150` (40,050 entries),
+`HFS_TEST_DEFERRED_CEILING_VARIANTS=deferred,offloaded`,
+`HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT=false`,
+`HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=false`,
+`HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS=7200` and `HFS_TEST_DEFERRED_CEILING_PROBE=false`.
+The probe, per resource (the same in both 0.5 GB runs of each mode):
+
+```text
+mode                 with_missing_params  missing_keys  fp_keys  resource_keys  avg_resource_bytes
+inline                               267         15.19     1.00          21.19                2034
+deferred_txn                           0          1.00     0.00           6.00                1736
+deferred_no_metadata                   0          0.00     0.00           5.00                1736
+offloaded                              0          1.00     0.00           6.00                1674
+```
+
+and before this change `deferred_txn` had `with_missing_params=267`, `missing_keys=15.19`,
+`fp_keys=1.00`, `resource_keys=21.19` and `avg_resource_bytes=2096`. The variants (the abort entry
+of each run; `inline` is the same code before and after, six runs):
+
+```text
+variant                        cache  entries  outcome    abort_entry
+inline                         0.5      10680  too_large  1846-1851 (six runs)
+deferred, before this change   0.5      10680  too_large  5778, 5780, 5729
+deferred_no_metadata, before   0.5      10680  too_large  9211, 9178, 9085
+deferred, after                0.5      10680  too_large  8911, 8871, 8933
+offloaded, before              0.5      10680  too_large  9040, 8936, 8963
+offloaded, after               0.5      10680  too_large  9022, 9036, 9011
+deferred, before this change   2        40050  too_large  22967, 22972, 22898 (of 26700)
+deferred, after                2        40050  too_large  35481, 35346, 35406
+offloaded, before              2        40050  too_large  35878, 35921
+offloaded, after               2        40050  too_large  35943, 35891, 35884
+```
+
+Every abort was `write_set_too_large`, with `resources=0`, `ledger=0` and `markers=0` after it.
+`deferred_no_metadata` stands in for a deferred Bundle that writes no `missing_params` (it also
+skips the one `null` key per resource that the offloaded write set has, 5 keys per resource
+against 6). Before this change it reached 9,085-9,211 against the offloaded 8,936-9,040, which is
+the evidence that `missing_params` and its keys were the difference. A run at the defaults (15
+copies, 4,005 entries, 0.5 GB, the asserting configuration) gave `inline` too large for the cache at
+entry 1,851 and `deferred` committed, with `resources=4005`, `rows=63990`, `ledger=0` and
+`markers=0`.
+
+The Bundle that commits near the ceiling, at 2 GB with 105 copies (28,035 entries; 79% of
+the deferred abort entry above, so the abort entry of `deferred` is not reached):
+
+```bash
+HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB=2 HFS_TEST_DEFERRED_CEILING_COPIES=105 \
+HFS_TEST_DEFERRED_CEILING_VARIANTS=inline,deferred HFS_TEST_DEFERRED_CEILING_PROBE=false \
+HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT=true HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=true \
+HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS=7200 \
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  deferred_indexing_raises_the_lone_bundle_ceiling -- --ignored --nocapture
+```
+
+The test passed, in 553 s, and printed the lines below. A second run, of `deferred` only,
+committed the same Bundle in 347.5 s (80.7 entries per second), again with `resources=28035`, `rows=447930`, `ledger=0` and `markers=0`.
+
+```text
+DEFERRED_CEILING variant=inline wt_cache_gb=2 entries=28035 outcome=too_large cause=write_set_too_large abort_entry=7349 secs=77.4 entries_per_s=95.0 resources=0 rows=0 ledger=0 markers=0 wt_rollbacks=1
+DEFERRED_CEILING variant=deferred wt_cache_gb=2 entries=28035 outcome=ok cause=na abort_entry=na secs=351.1 entries_per_s=79.9 resources=28035 rows=447930 ledger=0 markers=0 wt_rollbacks=0
+```
+
+So at 2 GB the deferred Bundle committed with its rows written and nothing left behind, where the
+inline one aborted at about a quarter of its size. 28,035 entries is under the 30,000 of #1975's
+target, but this is one synthetic Bundle in a harness, not the benchmark's `mongodb` leg, which has
+not been run.
+
 ### Composite Usage
 
 ```rust
@@ -758,7 +2273,7 @@ let composite = CompositeStorage::new(config, backends)?
 
 ## S3 Backend
 
-The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and bulk workflows but is intentionally not a FHIR search engine. For query-heavy deployments, compose S3 with a DB/search backend as the primary query engine.
+The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and the whole `$bulk-submit` surface, but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files; bulk-*export* job state, progress, manifests, leases, and file metadata are not stored in S3, and live in SQLite or PostgreSQL. `$bulk-submit` job state *is* stored in S3, alongside the submission objects it belongs to.
 
 ### Scope
 
@@ -767,7 +2282,8 @@ The S3 backend is a storage-focused persistence backend using AWS S3 object stor
 - Versioning (`vread`, `list_versions`, optimistic conflict checks)
 - Instance/type/system history via immutable history objects plus history index events
 - Batch bundles and best-effort transaction bundles (non-atomic with compensating rollback)
-- Bulk export (NDJSON objects + manifest/progress state in S3)
+- Bulk export resource data provider for system-level exports
+- Bulk export output storage through `S3OutputStore` when configured separately from job state
 - Bulk submit (ingest + raw artifact persistence + rollback change log)
 - Tenant isolation (`PrefixPerTenant` or `BucketPerTenant`)
 
@@ -776,7 +2292,7 @@ The S3 backend is a storage-focused persistence backend using AWS S3 object stor
 ### Configuration
 
 ```rust
-use helios_persistence::backends::s3::S3BackendConfig;
+use helios_persistence::backends::s3::{S3BackendConfig, S3TenancyMode};
 
 let config = S3BackendConfig {
     tenancy_mode: S3TenancyMode::PrefixPerTenant {
@@ -785,8 +2301,8 @@ let config = S3BackendConfig {
     prefix: None,
     region: None,
     validate_buckets_on_startup: true,
-    bulk_export_part_size: 10_000,
     bulk_submit_batch_size: 100,
+    ..Default::default()
 };
 ```
 
@@ -796,15 +2312,16 @@ let config = S3BackendConfig {
 | `prefix` | `None` | Optional global key prefix applied before backend keys |
 | `region` | `None` | AWS region override (falls back to provider chain) |
 | `validate_buckets_on_startup` | `true` | Validate configured buckets with `HeadBucket` on startup |
-| `bulk_export_part_size` | `10000` | Max NDJSON lines per export output part |
 | `bulk_submit_batch_size` | `100` | Default ingestion batch size for bulk submit processing |
+| `default_keyspace_layout` | `KeyspaceLayout::V1` | Layout given to new, empty tenants (`V1` flat, `V2` sharded); an existing tenant keeps what its marker or data says |
+| `scan_concurrency` | `32` | Most `GetObject` requests the read fan-outs (SQL-on-FHIR scans and by-id reads, type counts, conditional-create and SearchParameter scans, `_history`) may have in flight at once, shared by every request on the backend; at least 1. Writes keep their own fan-out |
 
 ### Tenancy Modes
 
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map; an unmapped tenant is refused (`TenantError::UnmappedTenant`). In the `hfs` binary: `HFS_S3_TENANCY=bucket-per-tenant` + `HFS_S3_TENANT_BUCKETS` (+ optional `HFS_S3_SYSTEM_BUCKET`), #1598 |
 
 ### Object Model
 
@@ -817,14 +2334,25 @@ Resource objects:
 | Type history event | `.../history/type/{type}/{ts}_{id}_{version}_{suffix}.json` |
 | System history event | `.../history/system/{ts}_{type}_{id}_{version}_{suffix}.json` |
 
-Bulk export objects:
+Under keyspace layout `V2` the resource and type-history keys gain a shard segment and the system history index is not written:
+
+| Object | `V2` key pattern |
+|--------|-------------|
+| Current pointer | `.../resources/{type}/{h2}/{id}/current.json` |
+| Immutable history version | `.../resources/{type}/{h2}/{id}/_history/{version}.json` |
+| Type history event | `.../history/type/{type}/{h2}/{ts}_{id}_{version}_{suffix}.json` |
+| System history event | *(none: system history lists `history/type/`)* |
+| Layout marker | `.../history/_keyspace.json` (`{"layout":2}`) |
+
+`h2` is the first two hex characters of `sha256(id)`. The layout is per tenant and immutable. See `HFS_S3_KEYSPACE_LAYOUT` above.
+
+Bulk export output objects:
 
 | Object | Key Pattern |
 |--------|-------------|
-| Job state | `.../bulk/export/jobs/{job_id}/state.json` |
-| Progress | `.../bulk/export/jobs/{job_id}/progress/{type}.json` |
-| Output | `.../bulk/export/jobs/{job_id}/output/{type}/part-{n}.ndjson` |
-| Manifest | `.../bulk/export/jobs/{job_id}/manifest.json` |
+| Finalized NDJSON part | `{tenant_id}/exports/{job_id}/{file_type}-{resource_type}-{part_index}-{fencing_token}.ndjson` |
+
+Bulk-export job state is deliberately not an S3 object model. SQLite and PostgreSQL store the job row, progress, leases/fencing tokens, file metadata, and raw manifest rows. `S3OutputStore` stores only finalized output parts and deletes every object under `{tenant_id}/exports/{job_id}/` during cancellation or retention cleanup. The REST layer assembles the client-facing manifest from the job store plus `ExportOutputStore::download_url`.
 
 Bulk submit objects:
 
@@ -841,6 +2369,38 @@ Bulk submit objects:
 - The backend never creates buckets — startup/runtime bucket checks use `HeadBucket` only.
 - Optimistic locking relies on version checks plus S3 preconditions (`If-Match`, `If-None-Match`) where applicable.
 - Transaction bundle behavior is best-effort: entries are applied sequentially, rollback is attempted in reverse order on failure, but rollback is not guaranteed under concurrent writes or partial failures.
+
+### Bulk Submit Result Receipts
+
+When a manifest finishes, its worker turns the stored per-entry results into `output` receipts — one
+NDJSON part per resource type, alphabetically ordered with a dense part index — plus a single
+aggregated `error` part. Those parts are built through temporary spool files rather than in-memory
+vectors, so a submission with millions of entries no longer grows the worker's heap with its whole
+receipt set. All backends share the same path.
+
+- Memory for receipt construction is `O(Pmax + Lmax + B + M)`. `Pmax` is the largest materialized
+  entry page in bytes; `Lmax` is the largest serialized entry in bytes; `B` is fixed I/O workspace,
+  including the local output writer; `M` is retained metadata in bytes for resource types, issue
+  severities, artifacts, and input files. Requesting at most 1000 results limits the row count,
+  not page or entry bytes. This change adds no per-entry size cap.
+- Up to 8 spool files stay open (64 KiB writer buffer each; the underlying Tokio file copy buffer and
+  the fixed replay chunk are each bounded by the same 64 KiB). The least recently written spool is
+  flushed and closed before another opens, so a manifest with more resource types than that never
+  widens the handle set. Replay opens one reader at a time, after every writer is closed.
+- Replay copies each spool to the output store in fixed 64 KiB chunks instead of re-serializing or
+  parsing rows, and assigns the part's line and byte counters from the spool bookkeeping those bytes
+  were counted with. A spool that does not replay exactly its counted bytes fails the manifest
+  rather than publishing counts that disagree with the artifact.
+- Spools live in a per-run temporary directory (`TMPDIR` picks its parent on Unix) that is removed when the
+  run ends, including on lease loss and cancellation. An abrupt process kill can leave one behind,
+  and disk use grows with the manifest's receipt bytes (rows plus one newline each) while it runs.
+
+This bounds the receipt path only, and is not a whole-process bound: a `deleted` file's references
+are still collected in memory, the S3 **primary** backend loads a manifest's stored results as one
+object, the S3 output store writes each part to a scratch file and then reads that whole file back
+into memory for the upload, and composite `finish_manifest` synchronization (including the
+`mongo-es`/`s3-es` wrappers) still materializes the resource set. The REST artifact download handler
+also reads the requested part into memory before returning it.
 
 ### AWS Credentials and Region
 
@@ -913,11 +2473,14 @@ The suite is opt-in and env-gated:
 
 Optional overrides:
 
-- `MINIO_IMAGE` (default: `minio/minio`)
-- `MINIO_TAG` (default: `RELEASE.2025-02-28T09-55-16Z`)
+- `MINIO_IMAGE` (default: `ghcr.io/coollabsio/minio`)
+- `MINIO_TAG` (default: `RELEASE.2025-10-15T17-29-55Z`)
 - `MINIO_ROOT_USER` (default: `minioadmin`)
 - `MINIO_ROOT_PASSWORD` (default: `minioadmin`)
 - `HFS_MINIO_TEST_BUCKET` (if unset, tests auto-generate a unique bucket)
+
+The default GHCR image replaces the Quay image after anonymous pulls from Quay
+started returning 401 in CI ([run 36024486722](https://github.com/HeliosSoftware/hfs/actions/runs/36024486722)).
 
 Example:
 
@@ -961,11 +2524,15 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] Transaction traits (ACID, bundles)
 - [x] Capabilities trait (CapabilityStatement generation)
 
-### Phase 3: Tenancy Strategies ✓
+### Phase 3: Tenant Isolation
 
-- [x] Shared schema strategy with RLS support
-- [x] Schema-per-tenant strategy with PostgreSQL search_path
-- [x] Database-per-tenant strategy with pool management
+- [x] Shared-schema isolation via a `tenant_id` discriminator, with a mandatory
+      `TenantContext` on every tenant-scoped `ResourceStorage` operation
+- [x] Per-tenant physical isolation for S3 (`S3TenancyMode::BucketPerTenant`)
+- [ ] Row-Level Security as a PostgreSQL database-enforced layer — not
+      implemented; tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381)
+- Schema-per-tenant and database-per-tenant for SQL backends: **not planned**
+  (design discussion #28). Unwired SQL generators removed in #370.
 
 ### Phase 4: SQLite Backend ✓
 
@@ -977,16 +2544,17 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] TransactionProvider implementation
 - [x] Conditional operations (conditional create/update/delete)
 
-#### Transaction & Batch Support ◐
+#### Transaction Support ◐
 
-FHIR [transaction](https://build.fhir.org/http.html#transaction) and [batch](https://build.fhir.org/http.html#batch) bundle processing.
+FHIR [transaction](https://build.fhir.org/http.html#transaction) bundle processing, via `BundleProvider`.
 
 > **Backend Support:** Transaction bundles require ACID support. SQLite supports transactions. Cassandra, Elasticsearch, and S3 do not support transactions (batch only). See the capability matrix above.
+
+> **Where batch lives:** [batch](https://build.fhir.org/http.html#batch) Bundles are *not* processed by this crate. Each entry is authorized individually against the request's SMART scopes and emits its own audit event, neither of which the persistence tier can see, so the REST layer executes entries directly against `ResourceStorage` — with bounded concurrency taken from `bulk_write_concurrency()`. `BundleProvider` carried an unreachable `process_batch` until #501 removed it. Batch therefore works on **every** backend that implements `ResourceStorage`, independent of transaction support.
 
 **Implemented Features:**
 
 - [x] **Transaction bundles** - Atomic all-or-nothing processing with automatic rollback on failure
-- [x] **Batch bundles** - Independent entry processing (failures don't affect other entries)
 - [x] **Processing order** - Entries processed per FHIR spec: DELETE → POST → PUT/PATCH → GET
 - [x] **Reference resolution** - `urn:uuid:` references automatically resolved to assigned IDs after creates
 - [x] **fullUrl support** - Track temporary identifiers for intra-bundle references
@@ -1026,6 +2594,129 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] `_include` and `_revinclude` resolution
 - [x] Cursor-based and offset pagination
 - [x] Single-field sorting
+
+**Number and quantity prefix semantics:**
+
+- `eq`/`ne` bound the *implicit-precision range* of the search value as
+  written: the number of significant decimals sets the range's width, so
+  `value=100` matches `[99.5, 100.5)` while `value=100.0` matches the
+  narrower `[99.95, 100.05)`. `ne` matches everything outside that range.
+- `gt`, `lt`, `ge`, `le`, `sa`, `eb` compare against the exact search value
+  and ignore its written precision, per the [FHIR number search
+  spec](https://hl7.org/fhir/R4/search.html#number): *"When a comparison
+  prefix in the set gt, lt, ge, le, sa & eb is provided, the implicit
+  precision of the number is ignored, and they are treated as if they have
+  arbitrarily high precision."* So `value-quantity=gt60` and
+  `value-quantity=gt60.0` are equivalent. On SQLite, PostgreSQL, and
+  Elasticsearch, quantity comparators additionally apply the rule after UCUM
+  unit conversion (e.g. `gt60|http://unitsofmeasure.org|kg` and
+  `gt60000|http://unitsofmeasure.org|g` are equivalent). MongoDB does not
+  perform UCUM conversion: it compares the raw stored quantity value against
+  the search value as written, and filters on the unit code verbatim, so on
+  MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
+  stored as `kg`.
+- The eq/ne-vs-comparator precision rule itself (implicit-precision range for
+  `eq`/`ne`, exact value for the other comparators) is unified across
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
+  (approximately equal), whose tolerance is not unified across backends.
+- Date parameters are unaffected by this rule and keep their own
+  calendar-precision range comparison.
+
+**Date prefix semantics (range targets, #1391):**
+
+- Every indexed date value is a range `[start, end)`. A point value such as
+  `birthDate` or `effectiveDateTime` runs to the end of its own precision
+  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+  `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
+  `end` at that value's precision. A missing `start` or `end` is unbounded,
+  stored as the supported-range limit (year 1 / year 9999). One rule for all
+  four backends: a Period whose `start` or `end` is not a valid FHIR
+  date/dateTime (as the search grammar reads it, so minute precision is fine
+  but `2024-03-15T10Z` or `+0530` is not) is not indexed at all, rather than
+  read as open. Before #1391 each end was indexed as its own point and a
+  backend could be lenient about the format.
+- With search range `[s, e)` and indexed range `[ts, te)`, all four backends
+  apply the FHIR rules for range targets: `eq` `s ≤ ts ∧ te ≤ e`, `ne` its
+  negation, `gt` `te > e`, `lt` `ts < s`, `ge` `gt ∨ eq`, `le` `lt ∨ eq`,
+  `sa` `ts ≥ e`, `eb` `te ≤ s`. So `date=2020` no longer finds a Period that
+  merely starts or ends in 2020, and `date=gt2030` finds a Period with no end.
+- `ap` matches when the ranges overlap once the search range is widened by a
+  margin that follows its precision, shared by all backends: 1 year, 1 month,
+  1 day, 10 minutes, or 10 seconds for year, month, day, minute and
+  second-or-finer values.
+- Descending `_sort` on a date parameter orders by the largest range end.
+- SQLite stores the range as two normalized text columns, `value_date_start`
+  (added by the v39 migration) and `value_date_end`, in the same
+  `YYYY-MM-DD HH:MM:SS.SSS` UTC form, and compares both as plain `TEXT` with no
+  SQL function per row. Two partial indexes cover them:
+  `idx_search_date_start (…, value_date_start, value_date_end, resource_key)`
+  and `idx_search_date_end (…, value_date_end, value_date_start, resource_key)`,
+  both covering for the `resource_key IN (…)` subquery. The query still
+  adds the implied `end > start-bound` term to every group that bounds the
+  start, so `eq`, `gt` and `sa` seek. Before v39 the start was normalized with
+  `strftime` on every row, which made `lt`, `ge`, `le`, `ne`, `eb` and `ap`
+  slower than before #1391 on very large date slices (#1506). The v39 backfill
+  runs in batches of 10 000 rows, one transaction per batch, and resumes after
+  a crash.
+- `_lastUpdated` and the date components of composite parameters are still
+  compared as points.
+- SQLite rows indexed before `value_date_precision` existed (or by the fallback
+  indexer) have no recorded precision, and a padded `T00:00:00` value cannot
+  say whether it was a year, month, day or second. The v35 backfill does not
+  guess: such a row gets a one-second range, the migration logs how many it
+  filled, and `ne`/`ap` on them can differ until `$reindex`.
+- **After upgrading, run `$reindex`.** The SQLite (v35, v39) and PostgreSQL (v43)
+  migrations fill in the range end (and, on SQLite, the start) of existing
+  rows, so point values keep working, but a Period indexed before the upgrade
+  is still two point rows until the resource is reindexed. MongoDB and
+  Elasticsearch documents indexed before the upgrade have no range end at all,
+  so they fail every condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`,
+  `ap`) until reindexed. Reindexing can also change which resources match: the
+  two point rows of an old Period matched on either end, while the single range
+  row follows the range-target rules (a Period starting before `2000` and
+  ending inside it no longer matches `eq2000`).
+- On a very large date slice `le` and `ne` match most rows of the parameter,
+  so their cost follows the size of the result, and they return more rows than
+  before #1391 for the same data (a year-precision value now covers the whole
+  year). They still run faster than before #1391 (#1506):
+  - the two ranges of `ne`, `le` and `ge` are one `SELECT` each, joined by
+    `UNION ALL`, so each reads its covering index alone; joined by `OR`,
+    SQLite de-duplicated every row by rowid and, for `ne`, read each row from
+    the table;
+  - a search on one parameter uses that parameter's `search_index` subquery as
+    the whole filter, without the `SELECT DISTINCT` wrapper that probed
+    `idx_search_composite` once per matching key;
+  - a filtered one-row page (`_count=0` or `1`) reads its matches by rowid
+    instead of probing `idx_resources_live_type` first.
+
+  On 2M date rows (debug build) `le2000` takes 2.3 s against 4.6 s before
+  #1391 and `ne2000` 2.7 s against 5.4 s with `_count=1`; with `_count=100`,
+  1.2 s against 2.6 s and 1.6 s against 3.1 s.
+- **PostgreSQL v43 does not hold a long lock.** It adds `value_date_end` and
+  the statistics object in short transactions (2 s `lock_timeout`, retried),
+  backfills in committed batches of 2,000 heap blocks selected by `ctid` range
+  (resumable: only rows with a `NULL` end are touched), builds each index with
+  `CREATE INDEX CONCURRENTLY` under a temporary name and swaps it in with a
+  short `DROP`/`RENAME`, so date searches always have an index. The schema
+  version is written only after the last step, and every step is idempotent, so
+  a crash resumes on the next startup. Like v49, the concurrent builds wait for
+  older transactions (a long export delays startup) and block other DDL and
+  `VACUUM` while they run. The closing `ANALYZE` is best-effort and bounded
+  (30 s): if it fails or times out, v43 is still recorded, a warning says
+  autovacuum will fill in the statistics, and the session keeps its own
+  `statement_timeout`. Each batch is a TID range scan, which needs PostgreSQL
+  14 — on 13 every batch reads the whole table, so the backfill grows with the
+  square of its size — and 13 cannot run v42's reference index either, so
+  startup refuses servers older than 14 before changing anything.
+- **Elasticsearch mappings are reconciled at startup.** `hfs` runs the
+  backend's initialization (index template, nested-object limit, mapping
+  reconcile) once before serving in every `*-elasticsearch` mode, so a
+  version-1 index is brought up to date, and the "reindex needed" warning is
+  logged once per startup pass. If Elasticsearch is unreachable at startup the
+  failure is logged and the server still starts; indices are then reconciled on
+  their first write, with one warning per index. If the cluster answers but one
+  startup step fails (for example the index template), that step is logged on
+  its own and the other two still run.
 
 **Full-Text Search (FTS5):**
 
@@ -1086,7 +2777,9 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] Index schema and mappings (nested objects for multi-value search params)
 - [x] ResourceStorage implementation for composite sync support
 - [x] Search query translation (FHIR SearchQuery → ES Query DSL)
-- [x] All 8 parameter type handlers (string, token, date, number, quantity, reference, URI, composite)
+- [x] Parameter type handlers (string, token, date, number, quantity, reference, URI, composite —
+      each composite instance is one nested object with inline component values, matched by a
+      single nested query)
 - [x] Full-text search (`_text`, `_content`, `:text-advanced`)
 - [x] Modifier support (:exact, :contains, :text, :not, :missing, :above, :below, :of-type)
 - [x] `_include` and `_revinclude` resolution
@@ -1103,21 +2796,28 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] History providers (instance, type, system)
 - [x] TransactionProvider with configurable isolation levels
 - [x] Conditional operations (conditional create/update/delete)
-- [x] SearchProvider with all parameter types
-- [x] ChainedSearchProvider and reverse chaining (\_has)
+- [x] SearchProvider with all parameter types including composite (string, token, reference, date,
+      number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
+      and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
+      search works end-to-end (REST → registry-resolved components → grouped index → query).
+- [x] Chained search and reverse chaining (\_has), through the shared resolver
 - [x] Full-text search (tsvector/tsquery)
+- [x] `_sort` by `_id`/`_lastUpdated` and any indexed search parameter via a search_index
+      correlated subquery (first-page and offset paths)
 - [x] `_include` and `_revinclude` resolution
 - [x] BulkExportStorage and BulkSubmitProvider
 - [x] Search offloading support
 - [x] ReindexableStorage implementation
 
 ### Phase 5c: S3 Backend ✓
+
 - [x] S3BackendConfig with PrefixPerTenant and BucketPerTenant tenancy modes
 - [x] ResourceStorage implementation (CRUD via S3 objects)
 - [x] VersionedStorage implementation (vread, optimistic locking)
 - [x] History providers (instance, type, system via immutable history objects)
 - [x] Batch and best-effort transaction bundles
-- [x] BulkExportStorage implementation (NDJSON parts + manifest in S3)
+- [x] ExportDataProvider implementation for system-level bulk export
+- [x] S3OutputStore implementation for bulk-export NDJSON output files
 - [x] BulkSubmitProvider implementation (ingest, raw artifacts, rollback change log)
 
 ### Phase 5+: Additional Backends (Planned)
@@ -1167,7 +2867,7 @@ The composite storage layer enables polyglot persistence by coordinating multipl
 | PostgreSQL + Neo4j | PostgreSQL | Neo4j         | Planned       | Graph-heavy queries                     |
 | MongoDB-only       | MongoDB    | None          | ✓ Implemented | Document-centric primary                |
 | MongoDB + ES       | MongoDB    | Elasticsearch | ✓ Implemented | Document-centric + search               |
-| S3 alone           | S3         | —             | ✓ Implemented | Archival/bulk storage                   |
+| S3 alone           | S3         | —             | ✓ Implemented | Archival/history storage                |
 | S3 + ES            | S3         | Elasticsearch | ✓ Implemented | Large-scale + search                    |
 
 ### Quick Start
@@ -1250,6 +2950,151 @@ let async_mode = SyncMode::Asynchronous;
 // Hybrid: Sync for search indexes, async for others
 let hybrid = SyncMode::Hybrid { sync_for_search: true };
 ```
+
+#### Search visibility on Elasticsearch-backed composites
+
+When Elasticsearch is the search secondary, a write can return before the
+resource is findable via search. Two independent delays contribute:
+
+1. **Composite forwarding.** In `Asynchronous` mode the composite returns as
+   soon as the primary commits and forwards the index write to Elasticsearch on
+   a background worker. `Synchronous` (or `Hybrid { sync_for_search: true }`)
+   puts the document in Elasticsearch before the write returns.
+2. **Elasticsearch refresh.** An indexed document only becomes searchable at the
+   next index refresh. By default that happens on a timer
+   (`ElasticsearchConfig::refresh_interval`, set when an index is created and
+   reconciled onto every existing `{index_prefix}_*` index at startup, which
+   overwrites a value set by hand with `PUT _settings`). With `WaitFor` the
+   interval is the price of every write: a long one makes each interactive
+   write wait for the next refresh (#1749).
+   `ElasticsearchConfig::write_refresh`
+   sets the `refresh` parameter on each index/delete request instead:
+   `WriteRefreshPolicy::False` (default) leaves it to the timer, `WaitFor`
+   blocks the write until the affected shards refresh, and `True` forces a
+   refresh per write (expensive; low-volume deployments only).
+
+Read-after-write search therefore requires **both** a synchronous sync mode and
+`write_refresh: WaitFor`; either alone still leaves a window in which an
+immediate follow-up search misses the write. The `hfs` binary exposes these as
+`HFS_COMPOSITE_SYNC_MODE`, `HFS_ELASTICSEARCH_REFRESH_INTERVAL`, and
+`HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
+[hfs README](../hfs/README.md#environment-variables)).
+
+That window applies to *client* searches. Server-side lookups that resolve a
+write against existing content do not inherit it: a transaction Bundle's
+conditional references (`"reference": "Organization?identifier=…"`) and the
+composite's conditional create/update/delete (`If-None-Exist`,
+`PUT [type]?[criteria]`) first call
+`SearchProvider::ensure_writes_visible` for the types they name. The composite
+drains its asynchronous sync queue up to that point, then the Elasticsearch
+backend refreshes those indices (a no-op under `WaitFor`/`True`, where the
+write was already searchable when it returned). A resource the server has
+acknowledged is therefore always found by such a lookup, on every sync mode
+and every `write_refresh` setting, and the cost is paid only by requests that
+carry such criteria (#1047).
+
+#### Very large resources on Elasticsearch-backed composites
+
+Every indexed search-parameter value is a nested object in the resource's
+Elasticsearch document, and Elasticsearch rejects the **whole document** once it
+holds more than `index.mapping.nested_objects.limit` of them. The resource stays
+stored in the primary and readable by id, but is absent from every search.
+Elasticsearch's own default of 10000 is exceeded by real data: 458 of the 11,704
+Synthea `Provenance` resources carry more than 10000 `target` references (the
+largest, 28,192).
+
+`ElasticsearchConfig::nested_objects_limit` (default 50000) is written into the
+index template, so new indices get it, and is raised during backend
+initialization on existing indices that are below it. The setting is dynamic,
+so resources that already indexed need no reindex. Resources rejected before the
+raise can be reindexed with `POST /{type}/$reindex`, but raising the limit alone
+does not guarantee that repair: `$reindex` sends the same documents through the
+`_bulk` path described below. Before #1125, on `sqlite-elasticsearch`, every
+500-document `Provenance` request failed as a whole at the transport level
+(`backend unavailable: elasticsearch`, `retryable: true`), so `$reindex` indexed
+none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_id}`
+reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
+`HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
+A search that pins many ids — a chained or `_has` search whose terminal hop
+resolved a wide set, sent to Elasticsearch as `_id` values — meets a second
+ceiling, `index.max_terms_count` (Elasticsearch's default 65,536 values per
+`terms` query). `ElasticsearchConfig::max_terms_count` (default 65536) is written
+into the index template, and the query builder splits an id list longer than it
+into several `terms` clauses ORed under one `bool.should`, so such a search
+succeeds instead of being refused (#1548); when Elasticsearch still refuses a
+query for a limit it names, the `400` names that limit. The `hfs` binary exposes
+it as `HFS_ELASTICSEARCH_MAX_TERMS_COUNT`.
+
+#### Bulk writes and rebuilds on Elasticsearch-backed composites
+
+`create_many` and `ReindexTarget::write_search_entries_page` put documents on the
+wire through one `_bulk` path. Each request is capped at 500 operations **and**
+at `ElasticsearchConfig::bulk_max_bytes` (default 10 MiB); a single document
+larger than the byte cap is sent alone. The cap exists because the client's
+`ElasticsearchConfig::request_timeout_ms` (default 30000) covers the whole
+request: 500 Synthea `Provenance` resources average ~108 KB each, and the ~54 MB
+body that produced timed out on every attempt.
+
+Failures are classified by shape:
+
+- **Transport timeout, `413`, or a proxy's `408`/`504`**: the chunk is split in
+  half and each half is resent, recursively, down to a single document, so an
+  oversized chunk is never resent unchanged nor reported as hundreds of
+  rejected resources. A single document still answered `413` is permanent; one
+  that still times out is transient, and on the client's own timeout the rest
+  of the page is failed as transient too rather than split further (the
+  cluster is stalled, and every halving would wait out another timeout).
+- **`429`**, for the whole request or per item: retried with bounded exponential
+  back-off, resending only the rejected items.
+- **Connection error, `5xx` for the whole request, or a `429` that outlasts its
+  retries**: every document of that request fails as transient. The connection
+  error, or Elasticsearch's status and response body, goes to the
+  `Elasticsearch is temporarily unavailable` warn line, once per request (once
+  per status for item failures); the receipts carry the operation and the fixed
+  sentence instead (#2385).
+- **Per-document `4xx`** (for example the nested-object limit above): permanent,
+  so a rebuild that has only those is not retried.
+- **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),
+  not `Internal`.
+
+A client-side timeout does not cancel the `_bulk` Elasticsearch is already
+executing, so a resource reported as failed may still end up indexed; confirm
+with a count before rebuilding again.
+
+`ElasticsearchConfig::reindex_refresh` sets the `refresh` parameter for rebuild
+writes separately from `write_refresh`; `None` (default) follows `write_refresh`.
+
+On a primary whose search is offloaded (`set_search_offloaded(true)`), the
+reindex writers `write_search_entries_on`, `write_search_entries_page` and
+`clear_search_index` are no-ops, as `begin/end_bulk_index_rebuild` already were,
+and `hfs` wires only Elasticsearch as the reindex target on
+`sqlite-elasticsearch`. Before #1125 the rebuild also wrote the SQLite
+`search_index`/FTS rows that no query there reads, and because the matching
+delete was already a no-op the rows accumulated on every run (≥ 11 KB per
+resource). A SQLite row `fetch_resources_page` cannot parse is reported as a
+per-resource error and no longer ends the rebuild of its type.
+
+A manifest ingested with indexing deferred records that it still owes a
+rebuild, in `bulk_manifests.index_pending` (SQLite schema v30), inside the
+transaction that publishes it. `SubmitWorkerStorage::list_manifests_awaiting_reindex`
+is what a restarted server scans to re-fire those rebuilds, and the marker is
+cleared once a generation finishes; backends that do not implement the three
+defaulted methods simply never resume, as before #1125.
+
+The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY`,
+`HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` and
+`HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
+`HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
+[hfs README](../hfs/README.md#environment-variables)).
+
+Measured on `sqlite-elasticsearch` with a 228,580-resource Synthea cut
+(Elasticsearch 8.15, 4 GB heap): the rebuild completes in one generation with
+every Provenance indexed, against `main` losing 2,500 of them and failing
+twice. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the rebuild takes 806 s;
+adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes it to 145 s
+(1,576 resources/s), which is the recommended pair.
 
 ### Cost-Based Optimization
 

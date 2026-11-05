@@ -28,18 +28,18 @@
   <status value="active"/>
   <intent value="order"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0305"/>
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
   <encounter>
-    <!--  Linked to a resource Encounter between patient and practitioner -->
+    <!-- Linked to a resource Encounter between patient and practitioner -->
     <reference value="Encounter/f002"/>
     <display value="encounter who leads to this prescription"/>
   </encounter>
@@ -49,45 +49,47 @@
     <display value="Patrick Pump"/>
   </requester>
   <dosageInstruction>
-    <simple>
-      <text value="Instil one drop in each eye twice daily"/>
-      <timing>
-        <repeat>
-          <frequency value="2"/>
-          <period value="1"/>
-          <periodUnit value="d"/>
-        </repeat>
-      </timing>
-      <route>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="54485002"/>
-          <display value="Ophthalmic route (qualifier value)"/>
-        </coding>
-      </route>
-      <method>
-        <coding>
-          <system value="http://snomed.info/sct"/>
-          <code value="421538008"/>
-          <display value="Instill - dosing instruction imperative (qualifier value)"/>
-        </coding>
-      </method>
-      <doseAndRate>
-        <type>
+    <step>
+      <component>
+        <text value="Instil one drop in each eye twice daily"/>
+        <timing>
+          <repeat>
+            <frequency value="2"/>
+            <period value="1"/>
+            <periodUnit value="d"/>
+          </repeat>
+        </timing>
+        <route>
           <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
+            <system value="http://snomed.info/sct"/>
+            <code value="54485002"/>
+            <display value="Ophthalmic route (qualifier value)"/>
           </coding>
-        </type>
-        <doseQuantity>
-          <value value="1"/>
-          <unit value="OPDROP"/>
-          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
-          <code value="OPDROP"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
+        </route>
+        <method>
+          <coding>
+            <system value="http://snomed.info/sct"/>
+            <code value="421538008"/>
+            <display value="Instill - dosing instruction imperative (qualifier value)"/>
+          </coding>
+        </method>
+        <doseAndRate>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+              <code value="ordered"/>
+              <display value="Ordered"/>
+            </coding>
+          </type>
+          <doseQuantity>
+            <value value="1"/>
+            <unit value="OPDROP"/>
+            <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+            <code value="OPDROP"/>
+          </doseQuantity>
+        </doseAndRate>
+      </component>
+    </step>
   </dosageInstruction>
   <dispenseRequest>
     <validityPeriod>

@@ -10,10 +10,10 @@
   <identifier>
     <use value="usual"/>
     <system value="urn:oid:2.16.840.1.113883.2.4.6.3"/>
-    <!--   BSN identification system   -->
+    <!-- BSN identification system -->
     <value value="738472983"/>
   </identifier>
-  <!--   BSN identification system   -->
+  <!-- BSN identification system -->
   <identifier>
     <use value="usual"/>
     <system value="urn:oid:2.16.840.1.113883.2.4.6.3"/>
@@ -38,7 +38,7 @@
   <gender value="male"/>
   <birthDate value="1944-11-17"/>
   <deceasedBoolean value="false"/>
-  <!--   ISO 3166 Codes (Countries)   -->
+  <!-- ISO 3166 Codes (Countries) -->
   <address>
     <use value="home"/>
     <line value="Van Egmondkade 23"/>
@@ -77,7 +77,7 @@
     <language>
       <coding>
         <system value="urn:ietf:bcp:47"/>
-        <!--   IETF language tag   -->
+        <!-- IETF language tag -->
         <code value="nl"/>
         <display value="Dutch"/>
       </coding>

@@ -56,7 +56,9 @@
           }
         ]
       },
-      "rangeCategory": "reference"
+      "condition": "Myocardial infarction",
+      "rangeCategory": "reference",
+      "validCodedValueSet": "http://hl7.org/fhir/ValueSet/observation-status"
     }
   ],
   "component": [
@@ -92,6 +94,7 @@
               }
             ]
           },
+          "condition": "Myocardial infarction",
           "rangeCategory": "reference",
           "range": {
             "low": {
@@ -142,6 +145,7 @@
               }
             ]
           },
+          "condition": "Myocardial infarction",
           "rangeCategory": "reference",
           "range": {
             "low": {
@@ -192,6 +196,7 @@
               }
             ]
           },
+          "condition": "Myocardial infarction",
           "rangeCategory": "reference",
           "range": {
             "low": {

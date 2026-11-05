@@ -18,7 +18,19 @@
           }
         ],
         "text": "Spleen"
-      }
+      },
+      "morphology": [
+        {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "4147007",
+              "display": "Mass (morphologic abnormality)"
+            }
+          ],
+          "text": "Splenic mass"
+        }
+      ]
     }
   ],
   "description": "7 cm maximum diameter",

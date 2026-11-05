@@ -126,7 +126,6 @@
   "disclaimer": "These performance Measures are not clinical guidelines and do not establish a standard of medical care, and have not been tested for all potential applications. THE MEASURES AND SPECIFICATIONS ARE PROVIDED \"AS IS\" WITHOUT WARRANTY OF ANY KIND. Due to technical limitations, registered trademarks are indicated by (R) or [R] and unregistered trademarks are indicated by (TM) or [TM].",
   "rationale": "Group A streptococcal bacterial infections and other infections that cause pharyngitis (which are most often viral) often produce the same signs and symptoms (IDSA 2002). The American Academy of Pediatrics, the Centers for Disease Control and Prevention, and the Infectious Diseases Society of America all recommend a diagnostic test for Strep A to improve diagnostic accuracy and avoid unnecessary antibiotic treatment (Linder et al. 2005). Estimated economic costs of pediatric streptococcal pharyngitis in the United States range from $224 million to $539 million per year, including indirect costs related to parental work losses. At a higher level, the economic cost of antibiotic resistance vary but have extended as high as $20 billion in excess direct healthcare costs, with additional costs to society for lost productivity as high as $35 billion a year (2008 dollars) (Roberts et al. 2009).",
   "clinicalRecommendationStatement": "The Infectious Diseases Society of America (IDSA) \"recommends swabbing the throat and testing for GAS pharyngitis by rapid antigen detection test (RADT) and/or culture because the clinical features alone do not reliably discriminate between GAS and viral pharyngitis except when overt viral features like rhinorrhea, cough, oral ulcers, and/or hoarseness are present\"",
-  "guidance": "This is an episode of care measure that examines all eligible episodes for the patient during the measurement period. If the patient has more than one episode, include all episodes in the measure",
   "group": [
     {
       "linkId": "CMS146-group-1",
@@ -159,7 +158,7 @@
           },
           "description": "Outpatient, telephone, virtual encounter (i.e., e-visit or virtual check-in), or emergency department (ED) visits with a diagnosis of pharyngitis or tonsillitis from January 1 to December 28 of the measurement period and an antibiotic order on or three days after the episode date among patients 3 years or older",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "InitialPopulation"
           }
         },
@@ -175,7 +174,7 @@
           },
           "description": "A group A streptococcus test in the seven-day period from three days prior to the episode date through three days after the episode date",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Numerator"
           }
         },
@@ -191,7 +190,7 @@
           },
           "description": "Equals Initial Population",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Denominator"
           }
         },
@@ -207,7 +206,7 @@
           },
           "description": "Exclude pharyngitis episodes when the patient had hospice care for any part of the measurement period.\\n\\nExclude pharyngitis episodes when the patient had a comorbid condition during the 12 months prior to or on the episode date.\\n\\nExclude pharyngitis episodes where the patient is taking antibiotics in the 30 days prior to the episode date.\\n\\nExclude pharyngitis episodes where the patient had a competing diagnosis on or three days after the episode date.",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "DenominatorExclusion"
           }
         }
@@ -220,7 +219,7 @@
           },
           "description": "3-9 years",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "AgesUpToNine"
           }
         },
@@ -231,7 +230,7 @@
           },
           "description": "10 years or older",
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "AgesTenPlus"
           }
         },

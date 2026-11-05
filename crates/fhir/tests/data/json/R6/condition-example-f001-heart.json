@@ -46,16 +46,18 @@
       }
     ]
   },
-  "bodySite": [
+  "bodyStructure": [
     {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "40768004",
-          "display": "Left thorax"
-        }
-      ],
-      "text": "heart structure"
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "40768004",
+            "display": "Left thorax"
+          }
+        ],
+        "text": "heart structure"
+      }
     }
   ],
   "subject": {

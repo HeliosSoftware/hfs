@@ -27,18 +27,18 @@
   <status value="active"/>
   <intent value="order"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0320"/>
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
   <encounter>
-    <!--  Linked to a resource Encounter between patient and practitioner -->
+    <!-- Linked to a resource Encounter between patient and practitioner -->
     <reference value="Encounter/f001"/>
     <display value="encounter who leads to this prescription"/>
   </encounter>
@@ -63,6 +63,7 @@
     <text value="Patient told to take with food"/>
   </note>
   <dosageInstruction>
+    <renderedInstruction value="Two tablets at once, then one tablet daily for 4 days. Take with or after food."/>
     <step>
       <component>
         <text value="Two tablets at once"/>

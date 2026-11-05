@@ -59,6 +59,6 @@
     <mimeType value="application/fhir+xml"/>
   </payload>
   <address value="http://fhir3.healthintersections.com.au/open/CarePlan"/>
-  <!--  Not a valid bearer token, but is here for demonstration purposes  -->
+  <!-- Not a valid bearer token, but is here for demonstration purposes -->
   <header value="bearer-code BASGS534s4"/>
 </Endpoint>

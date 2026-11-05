@@ -1,0 +1,128 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "2.16.840.1.113762.1.4.1267.17",
+        "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1267.17",
+        "version": "20231001",
+        "name": "CommonLaboratoryTestResults",
+        "title": "Common Laboratory Test Results",
+        "status": "active",
+        "compose": {
+          "include": [
+            {
+              "system": "http://loinc.org",
+              "concept": [
+                { "code": "2345-7",  "display": "Glucose [Mass/volume] in Blood" },
+                { "code": "718-7",   "display": "Hemoglobin [Mass/volume] in Blood" },
+                { "code": "2951-2",  "display": "Sodium [Moles/volume] in Serum or Plasma" },
+                { "code": "2160-0",  "display": "Creatinine [Mass/volume] in Serum or Plasma" },
+                { "code": "2093-3",  "display": "Cholesterol [Mass/volume] in Serum or Plasma" },
+                { "code": "777-3",   "display": "Platelets [#/volume] in Blood by Automated count" },
+                { "code": "2823-3",  "display": "Potassium [Moles/volume] in Serum or Plasma" },
+                { "code": "1751-7",  "display": "Albumin [Mass/volume] in Serum or Plasma" },
+                { "code": "1975-2",  "display": "Bilirubin.total [Mass/volume] in Serum or Plasma" },
+                { "code": "49563-0", "display": "Cardiac troponin I [Mass/volume] in Serum or Plasma" },
+                { "code": "4548-4",  "display": "Hemoglobin A1c/Hemoglobin.total in Blood" },
+                { "code": "2085-9",  "display": "HDL Cholesterol" },
+                { "code": "6690-2",  "display": "Leukocytes [#/volume] in Blood by Automated count" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "2.16.840.1.114222.24.7.14",
+        "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.114222.24.7.14",
+        "version": "20231001",
+        "name": "InfectiousOrganisms",
+        "title": "Infectious Disease Organisms",
+        "status": "active",
+        "compose": {
+          "include": [
+            {
+              "system": "http://snomed.info/sct",
+              "concept": [
+                { "code": "3092008",   "display": "Staphylococcus aureus (organism)" },
+                { "code": "80166006",  "display": "Streptococcus pyogenes (organism)" },
+                { "code": "53326007",  "display": "Candida albicans (organism)" },
+                { "code": "112283007", "display": "Escherichia coli (organism)" },
+                { "code": "56415008",  "display": "Klebsiella pneumoniae (organism)" },
+                { "code": "40284000",  "display": "Aspergillus fumigatus (organism)" },
+                { "code": "52499004",  "display": "Pseudomonas aeruginosa (organism)" },
+                { "code": "78215008",  "display": "Enterococcus faecalis (organism)" },
+                { "code": "2756001",   "display": "Acinetobacter baumannii (organism)" },
+                { "code": "116197008", "display": "Clostridium difficile (organism)" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "2.16.840.1.113762.1.4.1260.230",
+        "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1260.230",
+        "version": "20231001",
+        "name": "OncologyChemotherapyAgents",
+        "title": "Oncology Chemotherapy Agents",
+        "status": "active",
+        "compose": {
+          "include": [
+            {
+              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+              "concept": [
+                { "code": "40048",  "display": "carboplatin" },
+                { "code": "35911",  "display": "cisplatin" },
+                { "code": "56946",  "display": "paclitaxel" },
+                { "code": "41493",  "display": "tamoxifen" },
+                { "code": "330962", "display": "bevacizumab" },
+                { "code": "4492",   "display": "fluorouracil" },
+                { "code": "31420",  "display": "doxorubicin" },
+                { "code": "3002",   "display": "cyclophosphamide" },
+                { "code": "51185",  "display": "methotrexate" },
+                { "code": "258494", "display": "docetaxel" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "2.16.840.1.113762.1.4.1078.781",
+        "url": "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1078.781",
+        "version": "20231001",
+        "name": "MigraineTherapyMedications",
+        "title": "Migraine Therapy Medications",
+        "status": "active",
+        "compose": {
+          "include": [
+            {
+              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+              "concept": [
+                { "code": "72888",  "display": "sumatriptan" },
+                { "code": "117860", "display": "rizatriptan" },
+                { "code": "4025",   "display": "ergotamine" },
+                { "code": "109052", "display": "naratriptan" },
+                { "code": "115751", "display": "zolmitriptan" },
+                { "code": "1737",   "display": "caffeine" },
+                { "code": "1191",   "display": "aspirin" },
+                { "code": "358255", "display": "eletriptan" },
+                { "code": "36437",  "display": "dihydroergotamine" }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

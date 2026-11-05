@@ -78,13 +78,13 @@
       <display value="obesity"/>
     </reference>
   </addresses>
-  <!--  weight loss goal where the goal's outcome is the body weight observation -->
+  <!-- weight loss goal where the goal's outcome is the body weight observation -->
   <goal>
     <reference value="Goal/example"/>
   </goal>
-  <!--  exercise activity  -->
+  <!-- exercise activity -->
   <activity>
-    <!--  exercise activity completed  -->
+    <!-- exercise activity completed -->
     <performedActivity>
       <concept>
         <coding>
@@ -94,7 +94,7 @@
         </coding>
       </concept>
     </performedActivity>
-    <!--  planned exercise plan  -->
+    <!-- planned exercise plan -->
     <plannedActivityReference>
       <reference value="ServiceRequest/benchpress"/>
     </plannedActivityReference>

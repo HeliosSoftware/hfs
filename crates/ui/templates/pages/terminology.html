@@ -1,0 +1,45 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("terminology-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("terminology-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("terminology-lede") }}</p>
+</section>
+
+{% if let Some(url) = status.terminology_url() %}
+<section class="nl-setup" id="terminology-configured">
+  <div class="nl-setup__head">
+    <span class="icon">{% include "icons/book.svg" %}</span>
+    <h2>{{ i18n.t("terminology-configured-heading") }}</h2>
+  </div>
+  <p>{{ i18n.t("terminology-configured-body") }}</p>
+  <pre class="nl-setup__env"><code>{{ url }}</code></pre>
+  <a class="btn btn--primary" href="{{ url }}" target="_blank" rel="noopener noreferrer" hx-boost="false"
+     aria-label="{{ i18n.t("nav-terminology-new-window") }}">
+    {{ i18n.t("terminology-configured-open") }}
+  </a>
+</section>
+{% else if status.terminology_invalid() %}
+<section class="nl-setup" id="terminology-invalid" role="alert">
+  <div class="nl-setup__head">
+    <span class="icon">{% include "icons/book.svg" %}</span>
+    <h2>{{ i18n.t("terminology-invalid-heading") }}</h2>
+  </div>
+  <p>{{ i18n.t("terminology-invalid-body") }}</p>
+  <pre class="nl-setup__env"><code>HFS_TERMINOLOGY_SERVER=http://localhost:8090</code></pre>
+  <p class="nl-setup__note">{{ i18n.t("terminology-invalid-note") }}</p>
+</section>
+{% else %}
+<section class="nl-setup" id="terminology-setup">
+  <div class="nl-setup__head">
+    <span class="icon">{% include "icons/book.svg" %}</span>
+    <h2>{{ i18n.t("terminology-setup-heading") }}</h2>
+  </div>
+  <p>{{ i18n.t("terminology-setup-body") }}</p>
+  <pre class="nl-setup__env"><code>HFS_TERMINOLOGY_SERVER=http://localhost:8090</code></pre>
+  <p class="nl-setup__note">{{ i18n.t("terminology-setup-note") }}</p>
+</section>
+{% endif %}
+{% endblock %}

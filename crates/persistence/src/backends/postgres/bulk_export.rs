@@ -1,18 +1,58 @@
 //! Bulk export implementation for PostgreSQL backend.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::time::Duration as StdDuration;
 
 use crate::core::bulk_export::{
-    BulkExportStorage, ExportDataProvider, ExportJobId, ExportLevel, ExportManifest,
-    ExportOutputFile, ExportProgress, ExportRequest, ExportStatus, GroupExportProvider,
-    NdjsonBatch, PatientExportProvider, TypeExportProgress,
+    BulkExportStorage, ExpiredExportRef, ExportDataProvider, ExportFileMetadata, ExportJobId,
+    ExportJobMetadata, ExportLevel, ExportProgress, ExportRequest, ExportStatus,
+    GroupExportProvider, NdjsonBatch, PatientExportProvider, RawExportManifest, RawManifestEntry,
+    StartExportInput, TypeExportProgress,
 };
-use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
-use crate::tenant::TenantContext;
+use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+use crate::core::bulk_export_worker::{
+    ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message, export_lease_expiry,
+};
+use crate::core::patient_compartment::PatientCompartmentMatcher;
+use crate::error::{BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult};
+use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::types::StoredResource;
 
 use super::PostgresBackend;
+
+/// Appends the `_since` / `_until` window to an export query, binds the bounds,
+/// and returns the next free parameter index.
+///
+/// Both are inclusive, matching the S3 backend's `last_modified() < since` /
+/// `> until` skips. Every export query path uses this, so a job's count and its
+/// emitted rows cannot disagree about the window.
+///
+/// The bounds bind as `DateTime<Utc>`, never as a string: `tokio_postgres`
+/// will not bind `String`/`&str` to `TIMESTAMPTZ`, and a `$n::timestamptz` cast
+/// does not change that — it only tells PG what type to infer for the
+/// parameter.
+fn push_export_window(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    request: &ExportRequest,
+    mut param_idx: usize,
+) -> usize {
+    if let Some(since) = request.since {
+        sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
+        params.push(Box::new(since));
+        param_idx += 1;
+    }
+    if let Some(until) = request.until {
+        sql.push_str(&format!(" AND last_updated <= ${}", param_idx));
+        params.push(Box::new(until));
+        param_idx += 1;
+    }
+    param_idx
+}
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -22,60 +62,72 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// Splits a `{resource_type}-{part_index}` download segment.
+fn parse_part_segment(part: &str) -> Option<(String, u32)> {
+    let idx = part.rfind('-')?;
+    let resource_type = &part[..idx];
+    let part_index: u32 = part[idx + 1..].parse().ok()?;
+    if resource_type.is_empty() {
+        return None;
+    }
+    Some((resource_type.to_string(), part_index))
+}
+
+/// Encodes an [`ExportPartKey`] into the `file_path` column.
+fn encode_part_path(key: &ExportPartKey) -> String {
+    format!(
+        "{}/{}/{}/{}-{}-{}",
+        key.tenant_id,
+        key.job_id,
+        key.file_type,
+        key.resource_type,
+        key.part_index,
+        key.fencing_token
+    )
+}
+
 #[async_trait]
 impl BulkExportStorage for PostgresBackend {
     async fn start_export(
         &self,
         tenant: &TenantContext,
-        request: ExportRequest,
+        input: StartExportInput,
     ) -> StorageResult<ExportJobId> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check for too many concurrent exports (limit to 5 active exports per tenant)
-        let row = client
-            .query_one(
-                "SELECT COUNT(*) FROM bulk_export_jobs
-                 WHERE tenant_id = $1 AND status IN ('accepted', 'in-progress')",
-                &[&tenant_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to count active exports: {}", e)))?;
-
-        let active_count: i64 = row.get(0);
-        if active_count >= 5 {
-            return Err(StorageError::BulkExport(
-                BulkExportError::TooManyConcurrentExports { max_concurrent: 5 },
-            ));
-        }
-
         let job_id = ExportJobId::new();
         let now = Utc::now();
 
-        let level_str = match &request.level {
+        let level_str = match &input.request.level {
             ExportLevel::System => "system".to_string(),
             ExportLevel::Patient => "patient".to_string(),
             ExportLevel::Group { .. } => "group".to_string(),
         };
 
-        let group_id = request.group_id().map(|s| s.to_string());
+        let group_id = input.request.group_id().map(|s| s.to_string());
 
-        let request_json = serde_json::to_string(&request)
+        let request_json = serde_json::to_string(&input.request)
             .map_err(|e| internal_error(format!("Failed to serialize request: {}", e)))?;
+        let fhir_version = input.fhir_version.as_mime_param();
 
         client
             .execute(
                 "INSERT INTO bulk_export_jobs
-                 (id, tenant_id, status, level, group_id, request_json, transaction_time, created_at)
-                 VALUES ($1, $2, 'accepted', $3, $4, $5, $6, $7)",
+                 (id, tenant_id, status, level, group_id, request_json, transaction_time,
+                  created_at, owner_subject, request_url, fhir_version, fencing_token)
+                 VALUES ($1, $2, 'accepted', $3, $4, $5, $6, $7, $8, $9, $10, 0)",
                 &[
                     &job_id.as_str(),
                     &tenant_id,
                     &level_str.as_str(),
                     &group_id,
                     &request_json.as_str(),
+                    &input.transaction_time,
                     &now,
-                    &now,
+                    &input.owner_subject,
+                    &input.request_url.as_str(),
+                    &fhir_version,
                 ],
             )
             .await
@@ -94,7 +146,7 @@ impl BulkExportStorage for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type
+                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type, types_done, types_total
                  FROM bulk_export_jobs
                  WHERE id = $1 AND tenant_id = $2",
                 &[&job_id.as_str(), &tenant_id],
@@ -117,6 +169,8 @@ impl BulkExportStorage for PostgresBackend {
         let completed_at: Option<chrono::DateTime<Utc>> = row.get(5);
         let error_message: Option<String> = row.get(6);
         let current_type: Option<String> = row.get(7);
+        let types_done: i32 = row.get(8);
+        let types_total: i32 = row.get(9);
 
         let status: ExportStatus = status_str
             .parse()
@@ -151,9 +205,9 @@ impl BulkExportStorage for PostgresBackend {
             .iter()
             .map(|r| TypeExportProgress {
                 resource_type: r.get(0),
-                total_count: r.get::<_, Option<i64>>(1).map(|v| v as u64),
-                exported_count: r.get::<_, i64>(2) as u64,
-                error_count: r.get::<_, i64>(3) as u64,
+                total_count: r.get::<_, Option<i32>>(1).map(|v| v as u64),
+                exported_count: r.get::<_, i32>(2) as u64,
+                error_count: r.get::<_, i32>(3) as u64,
                 cursor_state: r.get(4),
             })
             .collect();
@@ -167,6 +221,8 @@ impl BulkExportStorage for PostgresBackend {
             completed_at,
             type_progress,
             current_type,
+            types_done: types_done as u32,
+            types_total: types_total as u32,
             error_message,
         })
     }
@@ -247,61 +303,255 @@ impl BulkExportStorage for PostgresBackend {
         &self,
         tenant: &TenantContext,
         job_id: &ExportJobId,
-    ) -> StorageResult<ExportManifest> {
-        let progress = self.get_export_status(tenant, job_id).await?;
-
-        if progress.status != ExportStatus::Complete {
-            return Err(StorageError::BulkExport(BulkExportError::InvalidJobState {
-                job_id: job_id.to_string(),
-                expected: "complete".to_string(),
-                actual: progress.status.to_string(),
-            }));
-        }
-
+    ) -> StorageResult<RawExportManifest> {
         let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let job_rows = client
+            .query(
+                "SELECT status, transaction_time, request_url, error_message, completed_at
+                 FROM bulk_export_jobs WHERE id = $1 AND tenant_id = $2",
+                &[&job_id.as_str(), &tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to get export job: {}", e)))?;
+        let job_row = job_rows.first().ok_or_else(|| {
+            StorageError::BulkExport(BulkExportError::JobNotFound {
+                job_id: job_id.to_string(),
+            })
+        })?;
+        let status_str: String = job_row.get(0);
+        let transaction_time: DateTime<Utc> = job_row.get(1);
+        let request_url: String = job_row.get(2);
+        let error_message: Option<String> = job_row.get(3);
+        let completed_at: Option<DateTime<Utc>> = job_row.get(4);
+        let status: ExportStatus = status_str
+            .parse()
+            .map_err(|_| internal_error(format!("Invalid status in database: {}", status_str)))?;
 
         let rows = client
             .query(
-                "SELECT resource_type, file_path, resource_count, file_type
+                "SELECT resource_type, resource_count, file_type, part_index, fencing_token
                  FROM bulk_export_files
                  WHERE job_id = $1
-                 ORDER BY resource_type",
+                 ORDER BY file_type, resource_type, part_index",
                 &[&job_id.as_str()],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to query files: {}", e)))?;
 
-        let mut output_files = Vec::new();
-        let mut error_files = Vec::new();
-
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
         for row in &rows {
             let resource_type: String = row.get(0);
-            let file_path: String = row.get(1);
-            let count: Option<i64> = row.get(2);
-            let file_type: String = row.get(3);
-
-            let file = ExportOutputFile {
-                resource_type,
-                url: file_path,
-                count: count.map(|c| c as u64),
+            let count: Option<i32> = row.get(1);
+            let file_type: String = row.get(2);
+            let part_index: i32 = row.get(3);
+            let fencing_token: i64 = row.get(4);
+            let key = ExportPartKey {
+                tenant_id: tenant_id.to_string(),
+                job_id: job_id.clone(),
+                resource_type: resource_type.clone(),
+                file_type: file_type.clone(),
+                part_index: part_index as u32,
+                fencing_token: fencing_token as u64,
             };
-
+            let entry = RawManifestEntry {
+                resource_type,
+                key,
+                count: count.unwrap_or(0) as u64,
+            };
             if file_type == "error" {
-                error_files.push(file);
+                errors.push(entry);
             } else {
-                output_files.push(file);
+                output.push(entry);
             }
         }
 
-        Ok(ExportManifest {
-            transaction_time: progress.transaction_time,
-            request: format!("$export?job={}", job_id),
-            requires_access_token: true,
-            output: output_files,
-            error: error_files,
-            message: None,
-            extension: None,
+        Ok(RawExportManifest {
+            transaction_time,
+            request_url,
+            status,
+            error_message,
+            completed_at,
+            output,
+            errors,
         })
+    }
+
+    async fn get_export_job_metadata(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+    ) -> StorageResult<ExportJobMetadata> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT status, level, group_id, owner_subject, transaction_time,
+                        completed_at, request_url
+                 FROM bulk_export_jobs WHERE id = $1 AND tenant_id = $2",
+                &[&job_id.as_str(), &tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to get export job metadata: {}", e)))?;
+        let row = rows.first().ok_or_else(|| {
+            StorageError::BulkExport(BulkExportError::JobNotFound {
+                job_id: job_id.to_string(),
+            })
+        })?;
+        let status_str: String = row.get(0);
+        let level_str: String = row.get(1);
+        let group_id: Option<String> = row.get(2);
+        let owner_subject: Option<String> = row.get(3);
+        let transaction_time: DateTime<Utc> = row.get(4);
+        let completed_at: Option<DateTime<Utc>> = row.get(5);
+        let request_url: String = row.get(6);
+        let status: ExportStatus = status_str
+            .parse()
+            .map_err(|_| internal_error(format!("Invalid status: {}", status_str)))?;
+        let level = match level_str.as_str() {
+            "system" => ExportLevel::System,
+            "patient" => ExportLevel::Patient,
+            "group" => ExportLevel::Group {
+                group_id: group_id.unwrap_or_default(),
+            },
+            _ => return Err(internal_error(format!("Invalid level: {}", level_str))),
+        };
+        Ok(ExportJobMetadata {
+            job_id: job_id.clone(),
+            status,
+            level,
+            owner_subject,
+            transaction_time,
+            completed_at,
+            request_url,
+        })
+    }
+
+    async fn get_export_file_metadata(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        part: &str,
+    ) -> StorageResult<ExportFileMetadata> {
+        let (resource_type, part_index) = parse_part_segment(part).ok_or_else(|| {
+            StorageError::BulkExport(BulkExportError::JobNotFound {
+                job_id: format!("{job_id}/{part}"),
+            })
+        })?;
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT f.file_type, f.resource_count, f.fencing_token, j.owner_subject
+                 FROM bulk_export_files f
+                 JOIN bulk_export_jobs j ON j.id = f.job_id
+                 WHERE f.job_id = $1 AND j.tenant_id = $2
+                   AND f.resource_type = $3 AND f.part_index = $4",
+                &[
+                    &job_id.as_str(),
+                    &tenant_id,
+                    &resource_type.as_str(),
+                    &(part_index as i32),
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to get file metadata: {}", e)))?;
+        let row = rows.first().ok_or_else(|| {
+            StorageError::BulkExport(BulkExportError::JobNotFound {
+                job_id: format!("{job_id}/{part}"),
+            })
+        })?;
+        let file_type: String = row.get(0);
+        let resource_count: Option<i32> = row.get(1);
+        let fencing_token: i64 = row.get(2);
+        let owner_subject: Option<String> = row.get(3);
+        let key = ExportPartKey {
+            tenant_id: tenant_id.to_string(),
+            job_id: job_id.clone(),
+            resource_type: resource_type.clone(),
+            file_type: file_type.clone(),
+            part_index,
+            fencing_token: fencing_token as u64,
+        };
+        Ok(ExportFileMetadata {
+            key,
+            resource_type,
+            file_type,
+            line_count: resource_count.unwrap_or(0) as u64,
+            job_owner_subject: owner_subject,
+        })
+    }
+
+    async fn count_active_exports(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_jobs
+                 WHERE tenant_id = $1 AND status IN ('accepted', 'in-progress')",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count active exports: {}", e)))?;
+        let count: i64 = row.get(0);
+        Ok(count as u64)
+    }
+
+    async fn count_exports_by_status(
+        &self,
+        tenant: &TenantContext,
+        status: ExportStatus,
+    ) -> StorageResult<u64> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let status = status.to_string();
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_jobs WHERE tenant_id = $1 AND status = $2",
+                &[&tenant_id, &status],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count exports by status: {e}")))?;
+        let count: i64 = row.get(0);
+        Ok(count as u64)
+    }
+
+    async fn list_expired_exports(
+        &self,
+        now: DateTime<Utc>,
+        output_ttl: StdDuration,
+        limit: u32,
+    ) -> StorageResult<Vec<ExpiredExportRef>> {
+        let client = self.get_client().await?;
+        let cutoff = now
+            - chrono::Duration::from_std(output_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(0));
+        let rows = client
+            .query(
+                "SELECT tenant_id, id FROM bulk_export_jobs
+                 WHERE status IN ('complete', 'error', 'cancelled')
+                   AND completed_at IS NOT NULL AND completed_at < $1
+                 ORDER BY completed_at LIMIT $2",
+                &[&cutoff, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to query expired exports: {}", e)))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let tenant_id: String = row.get(0);
+                let id: String = row.get(1);
+                ExpiredExportRef {
+                    tenant: TenantContext::new(
+                        TenantId::new(tenant_id),
+                        TenantPermissions::full_access(),
+                    ),
+                    job_id: ExportJobId::from_string(id),
+                }
+            })
+            .collect())
     }
 
     async fn list_exports(
@@ -337,13 +587,573 @@ impl BulkExportStorage for PostgresBackend {
 }
 
 #[async_trait]
+impl ExportClaimStrategy for PostgresBackend {
+    async fn claim_next(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: StdDuration,
+        max_attempts: u32,
+    ) -> StorageResult<Option<ExportJobLease>> {
+        let mut client = self.get_client().await?;
+        let now = Utc::now();
+        let lease_expiry = export_lease_expiry(now, lease_duration);
+
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
+
+        // Each turn either claims a job or retires one whose attempts are
+        // spent. Retiring moves the job out of the eligible set — visible to
+        // the next select, which runs in this same transaction — so the scan
+        // makes progress on every turn and a caller is never left empty-handed
+        // while another job is still claimable (#1041).
+        loop {
+            let rows = txn
+                .query(
+                    "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
+                     WHERE status = 'accepted'
+                        OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < $1))
+                     ORDER BY created_at
+                     LIMIT 1
+                     FOR UPDATE SKIP LOCKED",
+                    &[&now],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to select claimable job: {}", e)))?;
+
+            let Some(row) = rows.first() else {
+                txn.commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+                return Ok(None);
+            };
+            let job_id: String = row.get(0);
+            let tenant_id: String = row.get(1);
+            let status: String = row.get(2);
+            let fencing_token: i64 = row.get(3);
+            let attempts: i32 = row.get(4);
+            let new_token = fencing_token + 1;
+            let attempt = attempts + 1;
+
+            if i64::from(attempt) > i64::from(max_attempts) {
+                // Every worker that held this job lost its lease before
+                // finishing. Hand it to no one else: fail it terminally so the
+                // status poll ends in an error the client can act on, and so
+                // the job stops occupying one of the tenant's export slots.
+                let attempts_made = u32::try_from(attempts).unwrap_or(u32::MAX);
+                txn.execute(
+                    "UPDATE bulk_export_jobs
+                     SET status = 'error', error_message = $1, completed_at = $2,
+                         current_type = NULL, worker_id = NULL, lease_expiry = NULL
+                     WHERE id = $3",
+                    &[
+                        &abandoned_export_message(attempts_made),
+                        &now,
+                        &job_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to abandon export job: {}", e)))?;
+                tracing::warn!(
+                    job_id = %job_id,
+                    attempts = attempts_made,
+                    "export job abandoned: its lease expired on every attempt"
+                );
+                // No wipe: the job is terminal, and the output TTL sweep
+                // reclaims its rows and its artifacts together.
+                continue;
+            }
+
+            // A re-claimed job restarts from scratch. The worker resumes
+            // *within* a type from `cursor_state` but always restarts
+            // `part_index` at 0, so keeping the previous attempt's rows would
+            // let the resumed run overwrite parts 0..n of the half-finished
+            // type — silently dropping every resource the dead worker had
+            // already written, with the job still ending `complete` (#1041).
+            // Types that did finish would also be exported twice, inflating
+            // `exported_count`. A job still `accepted` never wrote anything.
+            //
+            // Only the rows go. The artifacts stay: unlinking them would pull
+            // the `.tmp` file out from under a zombie worker, whose
+            // `finalize_part` would then fail its rename with a plain
+            // `StorageError` instead of `LeaseLost` — and that makes the
+            // worker loop emit a spurious `failed` audit event for a job now
+            // running under someone else's lease. The periodic TTL cleanup
+            // drops the job's whole output prefix anyway.
+            //
+            // The DELETEs ride in the claim transaction, so the token bump and
+            // the wipe become visible together.
+            if status == "in-progress" {
+                txn.execute(
+                    "DELETE FROM bulk_export_progress WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed progress: {}", e))
+                })?;
+                txn.execute(
+                    "DELETE FROM bulk_export_files WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed file rows: {}", e))
+                })?;
+                tracing::info!(
+                    job_id = %job_id,
+                    attempt,
+                    "reclaimed export job: discarding the previous attempt's progress"
+                );
+            }
+
+            txn.execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'in-progress', worker_id = $1, lease_expiry = $2,
+                     heartbeat_at = $3, fencing_token = $4, attempts = $5,
+                     started_at = COALESCE(started_at, $3)
+                 WHERE id = $6",
+                &[
+                    &worker_id.as_str(),
+                    &lease_expiry,
+                    &now,
+                    &new_token,
+                    &attempt,
+                    &job_id.as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
+
+            txn.commit()
+                .await
+                .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+
+            return Ok(Some(ExportJobLease {
+                job_id: ExportJobId::from_string(job_id),
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                worker_id: worker_id.clone(),
+                lease_expiry,
+                fencing_token: new_token as u64,
+                lease_duration,
+            }));
+        }
+    }
+
+    async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        // Renew by the duration the job was claimed under, not by a constant
+        // this backend picked. A hardcoded 60s here made
+        // `HFS_BULK_EXPORT_LEASE_DURATION` inert: the first heartbeat shrank
+        // every lease back to a minute, so a slow batch still outlived its
+        // lease and the job got reclaimed in a loop (#1152, #1041).
+        let new_expiry = export_lease_expiry(now, lease.lease_duration);
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET lease_expiry = $1, heartbeat_at = $2
+                 WHERE id = $3 AND worker_id = $4 AND fencing_token = $5",
+                &[
+                    &new_expiry,
+                    &now,
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("heartbeat failed: {e}"))))?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: lease.job_id.clone(),
+            })
+        } else {
+            Ok(new_expiry)
+        }
+    }
+
+    async fn release(&self, lease: ExportJobLease) -> StorageResult<bool> {
+        let mut client = self.get_client().await?;
+        // The fenced UPDATE and the wipe commit together: a claim that saw the
+        // job `accepted` again but still found this run's rows would resume
+        // from them (#1041). The fence also keeps a zombie from refunding or
+        // wiping an attempt that another worker now runs.
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin release txn: {}", e)))?;
+        let released = txn
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'accepted', worker_id = NULL, lease_expiry = NULL,
+                     attempts = GREATEST(attempts - 1, 0),
+                     current_type = NULL, types_done = 0
+                 WHERE id = $1 AND worker_id = $2 AND fencing_token = $3
+                   AND status = 'in-progress'",
+                &[
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to release lease: {}", e)))?
+            == 1;
+        if released {
+            txn.execute(
+                "DELETE FROM bulk_export_progress WHERE job_id = $1",
+                &[&lease.job_id.as_str()],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear released progress: {}", e)))?;
+            txn.execute(
+                "DELETE FROM bulk_export_files WHERE job_id = $1",
+                &[&lease.job_id.as_str()],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear released file rows: {}", e)))?;
+        }
+        txn.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit release txn: {}", e)))?;
+        Ok(released)
+    }
+}
+
+#[async_trait]
+impl ExportWorkerStorage for PostgresBackend {
+    async fn get_export_job_for_worker(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+    ) -> Result<WorkerJobView, LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT request_json, level, group_id, transaction_time, fhir_version, owner_subject
+                 FROM bulk_export_jobs
+                 WHERE id = $1 AND tenant_id = $2 AND worker_id = $3 AND fencing_token = $4",
+                &[
+                    &job_id.as_str(),
+                    &tenant_id,
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("load worker job: {e}"))))?;
+        let row = rows.first().ok_or_else(|| LeaseError::LeaseLost {
+            job_id: job_id.clone(),
+        })?;
+        let request_json: String = row.get(0);
+        let level_str: String = row.get(1);
+        let group_id: Option<String> = row.get(2);
+        let transaction_time: DateTime<Utc> = row.get(3);
+        let fhir_version_str: String = row.get(4);
+        let owner_subject: Option<String> = row.get(5);
+
+        let request: ExportRequest = serde_json::from_str(&request_json)
+            .map_err(|e| LeaseError::Storage(internal_error(format!("parse request_json: {e}"))))?;
+        let level = match level_str.as_str() {
+            "system" => ExportLevel::System,
+            "patient" => ExportLevel::Patient,
+            "group" => ExportLevel::Group {
+                group_id: group_id.unwrap_or_default(),
+            },
+            _ => {
+                return Err(LeaseError::Storage(internal_error(format!(
+                    "Invalid level: {level_str}"
+                ))));
+            }
+        };
+        let fhir_version = helios_fhir::FhirVersion::from_mime_param(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        let progress_rows = client
+            .query(
+                "SELECT resource_type, total_count, exported_count, error_count, cursor_state
+                 FROM bulk_export_progress WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("query progress: {e}"))))?;
+        let type_progress: Vec<TypeExportProgress> = progress_rows
+            .iter()
+            .map(|r| TypeExportProgress {
+                resource_type: r.get(0),
+                total_count: r.get::<_, Option<i32>>(1).map(|v| v as u64),
+                exported_count: r.get::<_, i32>(2) as u64,
+                error_count: r.get::<_, i32>(3) as u64,
+                cursor_state: r.get(4),
+            })
+            .collect();
+
+        Ok(WorkerJobView {
+            request,
+            level,
+            transaction_time,
+            fhir_version,
+            type_progress,
+            owner_subject,
+        })
+    }
+
+    async fn mark_export_in_progress(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'in-progress', started_at = COALESCE(started_at, $1)
+                 WHERE id = $2 AND tenant_id = $3 AND worker_id = $4 AND fencing_token = $5",
+                &[
+                    &now,
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("mark_in_progress: {e}"))))?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_export_type_progress(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        progress: &TypeExportProgress,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "INSERT INTO bulk_export_progress
+                   (job_id, resource_type, total_count, exported_count, error_count, cursor_state)
+                 SELECT $1, $2, $3, $4, $5, $6
+                 WHERE EXISTS (
+                     SELECT 1 FROM bulk_export_jobs
+                     WHERE id = $1 AND tenant_id = $7 AND worker_id = $8 AND fencing_token = $9
+                 )
+                 ON CONFLICT (job_id, resource_type) DO UPDATE SET
+                   total_count = EXCLUDED.total_count,
+                   exported_count = EXCLUDED.exported_count,
+                   error_count = EXCLUDED.error_count,
+                   cursor_state = EXCLUDED.cursor_state",
+                &[
+                    &job_id.as_str(),
+                    &progress.resource_type.as_str(),
+                    &progress.total_count.map(|v| v as i32),
+                    &(progress.exported_count as i32),
+                    &(progress.error_count as i32),
+                    &progress.cursor_state,
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("update_type_progress: {e}")))
+            })?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET current_type = $1, types_done = $2, types_total = $3
+                 WHERE id = $4 AND tenant_id = $5 AND worker_id = $6 AND fencing_token = $7",
+                &[
+                    &current_type,
+                    &(types_done as i32),
+                    &(types_total as i32),
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("set_export_current_type: {e}")))
+            })?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_export_file(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        part: &FinalizedPart,
+        file_type: &str,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let file_path = encode_part_path(&part.key);
+        let affected = client
+            .execute(
+                "INSERT INTO bulk_export_files
+                   (job_id, resource_type, file_type, file_path, resource_count, byte_count,
+                    part_index, fencing_token)
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                 WHERE EXISTS (
+                     SELECT 1 FROM bulk_export_jobs
+                     WHERE id = $1 AND tenant_id = $9 AND worker_id = $10 AND fencing_token = $11
+                 )
+                 ON CONFLICT (job_id, file_type, resource_type, part_index) DO UPDATE SET
+                   file_path = EXCLUDED.file_path,
+                   resource_count = EXCLUDED.resource_count,
+                   byte_count = EXCLUDED.byte_count,
+                   fencing_token = EXCLUDED.fencing_token",
+                &[
+                    &job_id.as_str(),
+                    &part.resource_type.as_str(),
+                    &file_type,
+                    &file_path.as_str(),
+                    &(part.line_count as i32),
+                    &(part.size_bytes as i64),
+                    &(part.key.part_index as i32),
+                    &(part.key.fencing_token as i64),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("record_export_file: {e}"))))?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn finish_export_job(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'complete', completed_at = $1, current_type = NULL
+                 WHERE id = $2 AND tenant_id = $3 AND worker_id = $4 AND fencing_token = $5",
+                &[
+                    &now,
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("finish_job: {e}"))))?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn fail_export_job(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        error_message: &str,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'error', error_message = $1, completed_at = $2, current_type = NULL
+                 WHERE id = $3 AND tenant_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &error_message,
+                    &now,
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("fail_job: {e}"))))?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
 impl ExportDataProvider for PostgresBackend {
     async fn list_export_types(
         &self,
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         if !request.resource_types.is_empty() {
@@ -365,7 +1175,18 @@ impl ExportDataProvider for PostgresBackend {
             return Ok(valid_types);
         }
 
-        let rows = client
+        // The all-types listing reads every live row of the tenant to find a
+        // few dozen distinct types, so its cost follows the tenant's size.
+        // Lift the session `statement_timeout` for this one statement, as the
+        // reindex listing does (#2040); the session keeps it afterwards.
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin export type listing")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for export type listing")?;
+        let rows = tx
             .query(
                 "SELECT DISTINCT resource_type FROM resources
                  WHERE tenant_id = $1 AND is_deleted = FALSE
@@ -373,7 +1194,10 @@ impl ExportDataProvider for PostgresBackend {
                 &[&tenant_id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to query types: {}", e)))?;
+            .or_query_error("Failed to query types")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish export type listing")?;
 
         let types: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         Ok(types)
@@ -388,27 +1212,16 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let (sql, params): (
-            String,
-            Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-        ) = if let Some(since) = request.since {
-            (
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND last_updated >= $3".to_string(),
-                vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                    Box::new(since),
-                ],
-            )
-        } else {
-            (
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string(),
-                vec![
-                    Box::new(tenant_id.to_string()),
-                    Box::new(resource_type.to_string()),
-                ],
-            )
-        };
+        // Built incrementally rather than as one SQL string per combination of
+        // bounds: with both `_since` and `_until` that is four spellings to keep
+        // in step with `fetch_export_batch`, which is how a count and its rows
+        // drift apart.
+        let mut sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        push_export_window(&mut sql, &mut params, request, 3);
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -418,7 +1231,7 @@ impl ExportDataProvider for PostgresBackend {
         let row = client
             .query_one(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+            .or_query_error("Failed to count resources")?;
 
         let count: i64 = row.get(0);
         Ok(count as u64)
@@ -435,29 +1248,25 @@ impl ExportDataProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut sql = "SELECT id, data, last_updated FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+        let mut sql = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        let mut param_idx = 3;
-
-        if let Some(since) = request.since {
-            sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
-            params.push(Box::new(since));
-            param_idx += 1;
-        }
+        let param_idx = push_export_window(&mut sql, &mut params, request, 3);
 
         if let Some(cursor) = cursor {
             let parts: Vec<&str> = cursor.splitn(2, '|').collect();
             if parts.len() == 2 {
-                sql.push_str(&format!(
-                    " AND (last_updated, id) > (${}, ${})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params.push(Box::new(parts[0].to_string()));
-                params.push(Box::new(parts[1].to_string()));
+                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
+                    sql.push_str(&format!(
+                        " AND (last_updated, id) > (${}, ${})",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    params.push(Box::new(dt.with_timezone(&Utc)));
+                    params.push(Box::new(parts[1].to_string()));
+                }
             }
         }
 
@@ -474,7 +1283,7 @@ impl ExportDataProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query batch: {}", e)))?;
+            .or_query_error("Failed to query batch")?;
 
         let has_more = rows.len() > batch_size as usize;
         let rows_to_process = if has_more {
@@ -490,6 +1299,9 @@ impl ExportDataProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
 
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
@@ -522,6 +1334,12 @@ impl PatientExportProvider for PostgresBackend {
             vec![Box::new(tenant_id.to_string())];
         let mut param_idx = 2;
 
+        // `_since` only, deliberately: this selects WHICH patients are in scope,
+        // not which of their resources are exported. Bounding it above by
+        // `_until` would drop a patient whose own record was touched after the
+        // window and take their in-window compartment resources with them. The
+        // Patient resource itself is still bounded, by the compartment fetch.
+        // S3 makes the same distinction (`backends/s3/bulk_export.rs:216`).
         if let Some(since) = request.since {
             sql.push_str(&format!(" AND last_updated >= ${}", param_idx));
             params.push(Box::new(since));
@@ -543,7 +1361,7 @@ impl PatientExportProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query patient ids: {}", e)))?;
+            .or_query_error("Failed to query patient ids")?;
 
         let mut ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
 
@@ -570,123 +1388,118 @@ impl PatientExportProvider for PostgresBackend {
             return Ok(NdjsonBatch::empty());
         }
 
-        let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let matcher = PatientCompartmentMatcher::new(
+            self.tenant_registry(tenant_id),
+            request.fhir_version,
+            resource_type,
+        );
+        let is_patient = resource_type == "Patient";
+        if !is_patient && matcher.is_empty() {
+            return Ok(NdjsonBatch::empty());
+        }
+        let patient_refs: HashSet<String> = patient_ids
+            .iter()
+            .map(|id| format!("Patient/{id}"))
+            .collect();
+        let patient_ref_list: Vec<String> = patient_refs.iter().cloned().collect();
 
-        if resource_type == "Patient" {
-            // For Patient resources, just filter by the IDs using ANY($3::text[])
-            let mut sql = "SELECT id, data, last_updated FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = ANY($3::text[]) AND is_deleted = FALSE".to_string();
+        // Candidate selection reads the JSONB payload rather than search_index,
+        // which can be empty when search is offloaded. Materializing the GIN
+        // matches before applying the tenant, type and ordering predicates keeps
+        // PostgreSQL from choosing the chronological index and evaluating the
+        // JSON expression across the whole resources table. `matcher` still
+        // applies the exact compartment rules to each candidate.
+        let client = self.get_client().await?;
+        let indexed_candidates =
+            self.has_patient_export_index() && !(is_patient && matcher.is_empty());
+        let mut sql = if indexed_candidates {
+            let refs_idx = if is_patient { 4 } else { 3 };
+            let mut sql = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
+                     FROM resources
+                     WHERE is_deleted = FALSE
+                       AND hfs_patient_references_v1(data) && ${refs_idx}::text[]"
+            );
+            if is_patient {
+                // A Patient may be in its own compartment by ID even without a
+                // reference. Exclude rows already selected by the GIN branch so
+                // a self-referencing Patient cannot appear twice in the export.
+                sql.push_str(
+                    " UNION ALL
+                     SELECT tenant_id, resource_type, id, data, last_updated, version_id
+                     FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2
+                       AND is_deleted = FALSE AND id = ANY($3::text[])
+                       AND NOT (hfs_patient_references_v1(data) && $4::text[])",
+                );
+            }
+            sql.push_str(
+                ") SELECT id, data, last_updated, version_id FROM candidates
+                   WHERE tenant_id = $1 AND resource_type = $2",
+            );
+            sql
+        } else {
+            "SELECT id, data, last_updated, version_id FROM resources
+             WHERE tenant_id = $1
+                AND resource_type = $2
+                AND is_deleted = FALSE"
+                .to_string()
+        };
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        let mentions_a_patient = |idx: usize| {
+            format!(
+                "EXISTS (SELECT 1 FROM jsonb_path_query(data, '$.**.reference') AS r \
+                 WHERE split_part(r #>> '{{}}', '/_history/', 1) = ANY(${idx}::text[]))"
+            )
+        };
+        let next_idx = if indexed_candidates && is_patient {
+            params.push(Box::new(patient_ids.to_vec()));
+            params.push(Box::new(patient_ref_list));
+            5
+        } else if indexed_candidates {
+            params.push(Box::new(patient_ref_list));
+            4
+        } else if is_patient && matcher.is_empty() {
+            sql.push_str(" AND id = ANY($3::text[])");
+            params.push(Box::new(patient_ids.to_vec()));
+            4
+        } else if is_patient {
+            sql.push_str(&format!(
+                " AND (id = ANY($3::text[]) OR {})",
+                mentions_a_patient(4)
+            ));
+            params.push(Box::new(patient_ids.to_vec()));
+            params.push(Box::new(patient_ref_list));
+            5
+        } else {
+            sql.push_str(&format!(" AND {}", mentions_a_patient(3)));
+            params.push(Box::new(patient_ref_list));
+            4
+        };
+        let param_idx = push_export_window(&mut sql, &mut params, request, next_idx);
 
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-                Box::new(patient_ids.to_vec()),
-            ];
-            let param_idx = 4;
-
-            if let Some(cursor) = cursor {
-                let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-                if parts.len() == 2 {
+        if let Some(cursor) = cursor {
+            let parts: Vec<&str> = cursor.splitn(2, '|').collect();
+            if parts.len() == 2 {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(parts[0]) {
                     sql.push_str(&format!(
                         " AND (last_updated, id) > (${}, ${})",
                         param_idx,
                         param_idx + 1
                     ));
-                    params.push(Box::new(parts[0].to_string()));
+                    params.push(Box::new(dt.with_timezone(&Utc)));
                     params.push(Box::new(parts[1].to_string()));
                 }
-            }
-
-            sql.push_str(&format!(
-                " ORDER BY last_updated, id LIMIT {}",
-                batch_size + 1
-            ));
-
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            let rows = client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
-
-            let has_more = rows.len() > batch_size as usize;
-            let rows_slice = if has_more {
-                &rows[..batch_size as usize]
-            } else {
-                &rows[..]
-            };
-
-            let mut lines = Vec::new();
-            let mut last_cursor = None;
-
-            for row in rows_slice {
-                let id: String = row.get(0);
-                let resource: Value = row.get(1);
-                let last_updated: chrono::DateTime<Utc> = row.get(2);
-
-                let line = serde_json::to_string(&resource)
-                    .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
-                lines.push(line);
-                last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
-            }
-
-            return Ok(NdjsonBatch {
-                lines,
-                next_cursor: if has_more { last_cursor } else { None },
-                is_last: !has_more,
-            });
-        }
-
-        // For other resources, use search index to find resources referencing these patients
-        let patient_refs: Vec<String> = patient_ids
-            .iter()
-            .map(|id| format!("Patient/{}", id))
-            .collect();
-
-        let mut sql = "SELECT DISTINCT r.id, r.data, r.last_updated
-             FROM resources r
-             INNER JOIN search_index si ON r.tenant_id = si.tenant_id
-                AND r.resource_type = si.resource_type
-                AND r.id = si.resource_id
-             WHERE r.tenant_id = $1
-                AND r.resource_type = $2
-                AND r.is_deleted = FALSE
-                AND si.param_name IN ('subject', 'patient')
-                AND si.value_reference = ANY($3::text[])"
-            .to_string();
-
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-            Box::new(tenant_id.to_string()),
-            Box::new(resource_type.to_string()),
-            Box::new(patient_refs),
-        ];
-        let mut param_idx = 4;
-
-        if let Some(since) = request.since {
-            sql.push_str(&format!(" AND r.last_updated >= ${}", param_idx));
-            params.push(Box::new(since));
-            param_idx += 1;
-        }
-
-        if let Some(cursor) = cursor {
-            let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-            if parts.len() == 2 {
-                sql.push_str(&format!(
-                    " AND (r.last_updated, r.id) > (${}, ${})",
-                    param_idx,
-                    param_idx + 1
-                ));
-                params.push(Box::new(parts[0].to_string()));
-                params.push(Box::new(parts[1].to_string()));
             }
         }
 
         sql.push_str(&format!(
-            " ORDER BY r.last_updated, r.id LIMIT {}",
+            " ORDER BY last_updated, id LIMIT {}",
             batch_size + 1
         ));
 
@@ -698,8 +1511,11 @@ impl PatientExportProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?;
+            .or_query_error("Failed to query compartment")?;
 
+        // The cursor advances over every candidate the query returned, kept or
+        // not, so a page of candidates that all fail the exact test still
+        // moves the export forward (an empty, non-final batch is legal).
         let has_more = rows.len() > batch_size as usize;
         let rows_slice = if has_more {
             &rows[..batch_size as usize]
@@ -714,11 +1530,19 @@ impl PatientExportProvider for PostgresBackend {
             let id: String = row.get(0);
             let resource: Value = row.get(1);
             let last_updated: chrono::DateTime<Utc> = row.get(2);
+            let version_id: String = row.get(3);
+            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
 
+            let in_compartment = (is_patient && patient_ids.contains(&id))
+                || matcher.is_member(&resource, &patient_refs);
+            if !in_compartment {
+                continue;
+            }
+            // The blob carries no server meta; merge it from the row (#1273).
+            let resource = StoredResource::merge_meta(resource, &version_id, last_updated);
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize: {}", e)))?;
             lines.push(line);
-            last_cursor = Some(format!("{}|{}", last_updated.to_rfc3339(), id));
         }
 
         Ok(NdjsonBatch {
@@ -748,7 +1572,9 @@ impl GroupExportProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to fetch group: {}", e)))?;
 
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: group_id.to_string(),
+            }));
         }
 
         let data: Value = rows[0].get(0);
@@ -775,16 +1601,79 @@ impl GroupExportProvider for PostgresBackend {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<String>> {
-        let members = self.get_group_members(tenant, group_id).await?;
+        // Flatten nested Groups iteratively, guarding against membership
+        // cycles with a visited set.
+        use std::collections::HashSet;
+        let mut visited_groups: HashSet<String> = HashSet::new();
+        let mut seen_patients: HashSet<String> = HashSet::new();
+        let mut patient_ids: Vec<String> = Vec::new();
+        let mut worklist: Vec<String> = vec![group_id.to_string()];
 
-        let mut patient_ids = Vec::new();
-        for member_ref in &members {
-            // Extract patient ID from "Patient/123" format
-            if let Some(id) = member_ref.strip_prefix("Patient/") {
-                patient_ids.push(id.to_string());
+        while let Some(gid) = worklist.pop() {
+            if !visited_groups.insert(gid.clone()) {
+                continue; // cycle / already processed
+            }
+            let members = self.get_group_members(tenant, &gid).await?;
+            for member_ref in &members {
+                if let Some(id) = member_ref.strip_prefix("Patient/") {
+                    if seen_patients.insert(id.to_string()) {
+                        patient_ids.push(id.to_string());
+                    }
+                } else if let Some(nested) = member_ref.strip_prefix("Group/") {
+                    worklist.push(nested.to_string());
+                }
             }
         }
 
         Ok(patient_ids)
+    }
+
+    async fn get_group_members_with_periods(
+        &self,
+        tenant: &TenantContext,
+        group_id: &str,
+    ) -> StorageResult<Vec<(String, Option<DateTime<Utc>>)>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT data FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Group'
+                   AND id = $2 AND is_deleted = false",
+                &[&tenant_id, &group_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to get group: {}", e)))?;
+        let row = rows.first().ok_or_else(|| {
+            StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: group_id.to_string(),
+            })
+        })?;
+        let data: Vec<u8> = row.get(0);
+        let group: Value = serde_json::from_slice(&data)
+            .map_err(|e| internal_error(format!("Failed to parse group: {}", e)))?;
+        let mut out = Vec::new();
+        if let Some(arr) = group.get("member").and_then(|m| m.as_array()) {
+            for member in arr {
+                let Some(reference) = member
+                    .get("entity")
+                    .and_then(|e| e.get("reference"))
+                    .and_then(|r| r.as_str())
+                else {
+                    continue;
+                };
+                let period_start = member
+                    .get("period")
+                    .and_then(|p| p.get("start"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| {
+                        DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    });
+                out.push((reference.to_string(), period_start));
+            }
+        }
+        Ok(out)
     }
 }

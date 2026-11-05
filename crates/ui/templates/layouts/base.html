@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="{{ i18n.lang() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/ui/assets/logo.png">
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <!-- The effective tenant for browser-issued FHIR calls (#344). -->
+  <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
+  <!-- No `defer`: the theme attribute must land on <html> before first paint,
+       or the stored theme flashes its default first. -->
+  <script src="/ui/assets/theme.js"></script>
+  <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
+  <script src="/ui/assets/htmx.min.js" defer></script>
+  <!-- The shared busy states (#679); ahead of every page script by defer's
+       document order, because page scripts call into window.hfsBusy. -->
+  <script src="/ui/assets/busy.js" defer></script>
+  <!-- Shared locale number formatting, window.HfsNumber: page scripts and
+       dashboard.js call it when they write a figure into the page. -->
+  <script src="/ui/assets/number.js" defer></script>
+  <!-- The shared in-page confirmation (#1667), window.HfsConfirm: unsaved.js
+       and every page script ask through it, so it loads ahead of them. -->
+  <script src="/ui/assets/confirm.js" defer></script>
+  <!-- Shared unsaved-changes tracker (#1240), window.HfsUnsaved: addbox.js
+       reads it at click time, so it must be defined before then. -->
+  <script src="/ui/assets/unsaved.js" defer></script>
+  <script src="/ui/assets/addbox.js" defer></script>
+  <script src="/ui/assets/dashboard.js" defer></script>
+</head>
+<body class="{% block body_class %}{% endblock %}"
+      data-msg-unsaved="{{ i18n.t("unsaved-changes") }}"
+      data-msg-unsaved-discard="{{ i18n.t("unsaved-discard-confirm") }}"
+      data-msg-unsaved-leave="{{ i18n.t("unsaved-leave-confirm") }}"
+      data-msg-unsaved-leave-action="{{ i18n.t("unsaved-leave-action") }}"
+      data-msg-confirm-ok="{{ i18n.t("confirm-dialog-ok") }}"
+      data-msg-confirm-cancel="{{ i18n.t("action-cancel") }}">
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
+      <img class="brand__logo" src="/ui/assets/logo.png" alt="">
+      <div class="brand__text">
+        <span class="brand__name">{{ i18n.t("app-title") }}</span>
+        <span class="brand__version">hfs v{{ status.version }}</span>
+      </div>
+    </a>
+
+    <!--
+      Tenant selector (#344). A <details> disclosure — works without
+      JavaScript. The label is the effective tenant (the user's stored choice,
+      validated against the registry, else the server default). The options are
+      lazily fetched from the registry by htmx when the menu first opens; with
+      JavaScript disabled the panel offers the tenant-maintenance page instead.
+    -->
+    {% if status.show_tenant_picker() %}
+    <details class="menu">
+      <summary class="selector">
+        <span class="avatar">{{ status.tenant_initials() }}</span>
+        <span class="selector__label">{{ status.tenant_label() }}</span>
+        <span class="selector__chevrons">
+          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+        </span>
+      </summary>
+      <div class="menu__panel">
+        <div class="menu__heading">{{ i18n.t("tenant-heading") }}</div>
+        <div hx-get="/ui/tenant/options" hx-trigger="toggle once from:closest details" hx-swap="outerHTML">
+          <a class="menu__option" href="/ui/tenants">
+            <span class="avatar">{% include "icons/building.svg" %}</span>
+            {{ i18n.t("nav-tenants") }}
+          </a>
+        </div>
+      </div>
+    </details>
+    {% endif %}
+
+    <hr class="divider">
+
+    <nav class="nav">
+      <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
+      <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-home") }}">
+        <span class="icon">{% include "icons/home.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-home") }}</span>
+      </a>
+      <!--
+        Resources (#282): the primary read/write workspace, and the one entry
+        for it. Searching, editing, and version history all live inside
+        Resources — on the page and in its edit modal — so they have no separate
+        nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
+        /ui/history); they are just not in the menu.
+      -->
+      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
+      </a>
+      <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
+      <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/bulk-import"{% if active_page == "bulk-import" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-import") }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/bulk-export"{% if active_page == "bulk-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-export") }}">
+        <span class="icon">{% include "icons/export.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-export") }}</span>
+      </a>
+      <!--
+        SQL on FHIR (#649): its own top-level section, a peer of Work / Batch &
+        Data / Server, replacing the single dead placeholder that used to sit
+        inside Batch & Data. Every child is a real route — the pages behind
+        them arrive in follow-up changes, starting with the ViewDefinition
+        Editor. The child is labeled "SQL Export" (not "Export") because the
+        sidebar already carries Batch & Data's FHIR Bulk Data Export, a
+        different operation.
+      -->
+      <div class="nav__section">{{ i18n.t("nav-section-sql-on-fhir") }}</div>
+      <a class="nav-item" href="/ui/sql/view-definitions"{% if active_page == "sql-view-definitions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-view-definitions") }}">
+        <span class="icon">{% include "icons/grid.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-view-definitions") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/queries"{% if active_page == "sql-queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-queries") }}">
+        <span class="icon">{% include "icons/code.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-queries") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/views"{% if active_page == "sql-views" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-views") }}">
+        <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-views") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/sql/export"{% if active_page == "sql-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-export") }}">
+        <span class="icon">{% include "icons/export.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-sql-export") }}</span>
+      </a>
+
+      <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
+      <a class="nav-item" href="/ui/tenants"{% if active_page == "tenants" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-tenants") }}">
+        <span class="icon">{% include "icons/building.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-tenants") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/capability-statement"{% if active_page == "capability-statement" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-capability-conformance") }}">
+        <span class="icon">{% include "icons/shield.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search-parameters") }}">
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-search-parameters") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
+        <span class="icon">{% include "icons/compartments.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
+      </a>
+
+      <div class="nav__section">{{ i18n.t("nav-section-tools") }}</div>
+      {% if let Some(url) = status.terminology_url() %}
+      <a class="nav-item" href="{{ url }}" target="_blank" rel="noopener noreferrer" hx-boost="false"
+         aria-label="{{ i18n.t("nav-terminology-new-window") }}" title="{{ i18n.t("nav-terminology-new-window") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
+      </a>
+      {% else %}
+      <a class="nav-item" href="/ui/terminology"{% if active_page == "terminology" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-terminology") }}">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
+      </a>
+      {% endif %}
+      <!-- Always present, like the other feature pages: with the engine off
+           the page explains how to enable it (#767). -->
+      <a class="nav-item" href="/ui/subscriptions"{% if active_page == "subscriptions" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-subscriptions") }}">
+        <span class="icon">{% include "icons/sync.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
+      </a>
+    </nav>
+
+    <!--
+      FHIR version selector (#343). A <details> disclosure like the tenant
+      selector, so it works without JavaScript. The label is the effective
+      version for this request — the user's stored choice when one is set,
+      else the server default (#553); each option POSTs /ui/version to
+      persist a new choice and reloads the current page.
+    -->
+    <div class="sidebar__foot">
+      <details class="menu menu--up">
+        <summary class="selector selector--outline">
+          <span class="icon">{% include "icons/hierarchy.svg" %}</span>
+          <span class="selector__label">{{ i18n.t_arg("fhir-version", "version", status.fhir_version_label().to_string()) }}</span>
+          <span class="selector__chevrons">
+            <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+            <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+          </span>
+        </summary>
+        <div class="menu__panel">
+          <div class="menu__heading">{{ i18n.t("fhir-version-heading") }}</div>
+          {% for v in status.enabled_version_labels() %}
+          <form method="post" action="/ui/version">
+            <input type="hidden" name="version" value="{{ v }}">
+            <button type="submit" class="menu__option"{% if v == status.fhir_version_label() %} aria-current="true"{% endif %}>
+              <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
+              {{ v }}
+              {% if v == status.fhir_version_label() %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </button>
+          </form>
+          {% endfor %}
+        </div>
+      </details>
+    </div>
+  </aside>
+
+  <!--
+    Optional secondary panel, flush against the sidebar and styled as part of
+    the menu (Brett's Resources frame): the Resources page fills it with the
+    resource-type list. Absent on every other page.
+  -->
+  {% block nav_panel %}{% endblock %}
+
+  <div class="pane">
+    <header class="topbar">
+      <div class="topbar__tools">
+        <!-- The theme toggle stays in the topbar (#725): it is a one-click,
+             instant-feedback control, and a click deeper behind the menu
+             would slow the most common visit-time adjustment. -->
+        <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
+          <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
+            {% include "icons/sun.svg" %}
+          </button>
+          <button type="button" data-set-theme="dark" aria-label="{{ i18n.t("theme-dark") }}">
+            {% include "icons/moon.svg" %}
+          </button>
+        </div>
+
+        <!--
+          The user menu (#725): identity, language, and session actions behind
+          the avatar — a <details> disclosure like the tenant (#344) and
+          version (#343) selectors, so it works without JavaScript. The
+          language options are real ?lang= links; the middleware persists the
+          choice in the hfs_lang cookie (see crates/ui/src/i18n.rs).
+
+          Avatar fallback chain: IdP photo → initials → generic user icon.
+          /ui has no signed-in principal yet (#320), so today the icon and
+          the local-operator row render; the other states are wired to
+          Status::user_* and light up when the login flow and the claim
+          inventory (#724) land.
+        -->
+{{ status.user_menu(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
+      </div>
+    </header>
+    {% if status.bearer_only_auth %}
+    <!-- Auth is on and no browser sign-in is configured (#1560): said once
+         here, so no page has to fail with the API's 401 text to show it. -->
+    <p class="shell-notice" id="auth-bearer-only">{{ i18n.t("auth-bearer-only") }}</p>
+    {% endif %}
+    <main class="content{% block content_class %}{% endblock %}">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <script src="/ui/assets/json-view.js" defer></script>
+</body>
+</html>

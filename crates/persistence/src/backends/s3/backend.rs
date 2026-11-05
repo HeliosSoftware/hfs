@@ -1,30 +1,77 @@
 //! AWS S3 backend — struct definition, capability matrix, and Backend trait
 //! implementation.
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use helios_fhir::FhirVersion;
+use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
+use crate::search::{SearchParameterDefinition, TenantSearchRegistries};
 use crate::tenant::{TenantContext, TenantId};
 
 use super::client::{AwsS3Client, AwsS3ClientOptions, S3Api, S3ClientError};
 use super::config::{S3BackendConfig, S3TenancyMode};
-use super::keyspace::S3Keyspace;
+use super::keyspace::{KeyspaceLayout, ResourceKeyspace, S3Keyspace};
+
+/// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
+/// definitions, keyed by tenant id. S3 has no query capability of its own for
+/// "every SearchParameter for tenant X" the way a database does, and the
+/// per-tenant registry loader must be sync anyway, so the async reload paths
+/// (SearchParameter writes, startup, TTL refresh — see `reload_stored_cache*`
+/// in `storage.rs`) populate this map by scanning S3 and the loader reads it.
+pub(crate) type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// AWS S3 backend for object-storage persistence.
 #[derive(Clone)]
 pub struct S3Backend {
     pub(crate) config: S3BackendConfig,
+    /// FHIR version used by the in-process SQL-on-FHIR runner.
+    pub(crate) fhir_version: FhirVersion,
     pub(crate) client: Arc<dyn S3Api>,
+    /// Per-tenant search parameter registries (shared base + per-tenant
+    /// overlay). The base starts empty here — S3 has no `data_dir` and does
+    /// not load embedded/spec params during construction, so a composite's
+    /// starter function (e.g. `start_s3_elasticsearch`) populates
+    /// `tenant_registries().base()` after construction, the same way the
+    /// registry used to be built standalone. What S3 *does* own is the
+    /// real per-tenant overlay: a stored (POSTed) SearchParameter now takes
+    /// effect immediately via the write hooks in `storage.rs` (#787), instead
+    /// of never applying at all (the previous `base_only()` registry's loader
+    /// unconditionally returned an empty overlay for every tenant).
+    pub(crate) registries: Arc<TenantSearchRegistries>,
+    /// Sync cache of each tenant's stored params, read by the registry loader.
+    pub(crate) stored_by_tenant: StoredByTenant,
+    /// ETags of `current.json` objects a scan found to be delete tombstones,
+    /// keyed by bucket and object key. A later scan skips the GET of an object
+    /// whose listed ETag still matches, so the cost of scanning a type is the
+    /// LIST plus its live objects rather than every delete the type has ever
+    /// seen. A rewrite changes the ETag and forces a fresh read.
+    pub(crate) tombstone_etags: Arc<RwLock<HashMap<(String, String), String>>>,
+    /// Resolved [`KeyspaceLayout`] per tenant location, keyed by bucket and the
+    /// tenant's marker key (which is unique per bucket + tenant prefix). Only
+    /// settled layouts are cached; an empty tenant read under a `V2` default is
+    /// answered `V2` without being remembered, so a later write stamps it.
+    pub(crate) layouts: Arc<RwLock<HashMap<(String, String), KeyspaceLayout>>>,
+    /// The backend-wide read limit (`HFS_S3_SCAN_CONCURRENCY`, #2063): one
+    /// permit per `GetObject` a read fan-out has in flight. Shared by every
+    /// clone, so concurrent scans split one budget instead of each fanning out
+    /// on its own. See [`S3Backend::get_json_object_limited`].
+    pub(crate) scan_limit: Arc<tokio::sync::Semaphore>,
 }
+
+/// Upper bound on remembered tombstones; past it scans simply read them.
+pub(crate) const TOMBSTONE_CACHE_CAP: usize = 200_000;
 
 impl std::fmt::Debug for S3Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Backend")
             .field("config", &self.config)
+            .field("fhir_version", &self.fhir_version)
             .finish_non_exhaustive()
     }
 }
@@ -50,7 +97,128 @@ pub(crate) struct TenantLocation {
     pub keyspace: S3Keyspace,
 }
 
+/// A tenant's bucket and layout-resolved resource/history keys.
+///
+/// Unlike [`TenantLocation`], this can only be obtained from
+/// [`S3Backend::resource_location`] or
+/// [`S3Backend::resource_location_for_write`], so building a resource or
+/// history key without having resolved the tenant's layout does not compile.
+#[derive(Debug, Clone)]
+pub(crate) struct ResourceLocation {
+    /// S3 bucket that holds this tenant's data.
+    pub bucket: String,
+    /// Resource and history key builder bound to the tenant's layout.
+    pub keyspace: ResourceKeyspace,
+}
+
 impl S3Backend {
+    /// The capabilities S3 declares regardless of how tenants are placed.
+    ///
+    /// Deliberately excludes every tenant-placement variant — those depend on
+    /// the configured [`S3TenancyMode`] and are added by
+    /// [`declared_capabilities_for`](Self::declared_capabilities_for).
+    fn base_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::CursorPagination,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::ConditionalCreate,
+        ]
+    }
+
+    /// The capabilities an S3 backend configured with `mode` declares.
+    ///
+    /// Kept independent of client construction so reporting and tests do not
+    /// need AWS SDK initialization — the reason the previous no-argument
+    /// `declared_capabilities()` existed. It takes the mode because, unlike
+    /// every other backend in this crate, S3's tenant-placement topology is a
+    /// property of the *instance*, not of the backend type:
+    ///
+    /// | Mode | Placement | Declares |
+    /// |---|---|---|
+    /// | [`S3TenancyMode::PrefixPerTenant`] | one shared bucket, tenant-scoped key prefixes | `SharedSchema` |
+    /// | [`S3TenancyMode::BucketPerTenant`] | a dedicated bucket per tenant | `DatabasePerTenant` |
+    ///
+    /// Exactly one tenancy variant is declared, per the mutual-exclusivity rule
+    /// on [`BackendCapability`]. `BucketPerTenant` does **not** additionally
+    /// declare `SharedSchema` when `default_system_bucket` is set: whether
+    /// cross-tenant state is storable is a different axis, answered by
+    /// [`supports_user_settings`](Self::supports_user_settings) and
+    /// `ResourceStorage::supports_tenant_registry`.
+    ///
+    /// `BulkSubmitRestWorker` rides that same axis and so is *also* mode
+    /// dependent: the `$bulk-submit` worker's claim queue and poll-token index
+    /// span tenants (see [`crate::backends::s3::submit_worker`]), which
+    /// bucket-per-tenant with no `default_system_bucket` has nowhere to keep.
+    /// Synchronous ingestion (`BulkSubmitIngest`) is tenant-scoped throughout
+    /// and stays in [`base_capabilities`](Self::base_capabilities).
+    ///
+    /// The `match` is exhaustive without a wildcard arm on purpose, so adding a
+    /// third `S3TenancyMode` is a compile error here rather than a silently
+    /// stale claim.
+    pub fn declared_capabilities_for(mode: &S3TenancyMode) -> Vec<BackendCapability> {
+        let (tenancy, cross_tenant_state) = match mode {
+            S3TenancyMode::PrefixPerTenant { .. } => (BackendCapability::SharedSchema, true),
+            S3TenancyMode::BucketPerTenant {
+                default_system_bucket,
+                ..
+            } => (
+                BackendCapability::DatabasePerTenant,
+                default_system_bucket.is_some(),
+            ),
+        };
+
+        let mut capabilities = Self::base_capabilities();
+        capabilities.push(tenancy);
+        if cross_tenant_state {
+            capabilities.push(BackendCapability::BulkSubmitRestWorker);
+        }
+        capabilities
+    }
+
+    /// Builds a fresh, empty-base per-tenant registry container and its
+    /// backing stored-param cache. Shared by every constructor.
+    fn new_registries() -> (Arc<TenantSearchRegistries>, StoredByTenant) {
+        let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let loader_cache = stored_by_tenant.clone();
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                // A HashMap lookup cannot fail the way a live query can — a
+                // missing entry legitimately means "no stored params yet",
+                // not "load failed" — so this always reports success (#787).
+                Some(
+                    loader_cache
+                        .read()
+                        .get(tenant_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            },
+        )));
+        (registries, stored_by_tenant)
+    }
+
+    /// The per-tenant registry container. Its base is empty until a composite
+    /// starter populates it (see the field doc on [`S3Backend::registries`]);
+    /// shared with a co-located Elasticsearch backend via
+    /// `ElasticsearchBackend::with_shared_registry`.
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
+    /// Sets the server's FHIR version for stored-data SQL-on-FHIR runs.
+    /// Constructors use the first enabled version until explicitly configured.
+    pub fn with_fhir_version(mut self, fhir_version: FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
+    }
+
     /// Creates a new S3 backend using AWS standard credential provider chain.
     pub fn new(config: S3BackendConfig) -> StorageResult<Self> {
         Self::from_env(config)
@@ -94,7 +262,19 @@ impl S3Backend {
             },
         ));
 
-        let backend = Self { config, client };
+        let (registries, stored_by_tenant) = Self::new_registries();
+        // Built before the literal: `config` is moved into its first field.
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
+        let backend = Self {
+            config,
+            fhir_version: FhirVersion::default_enabled(),
+            client,
+            registries,
+            stored_by_tenant,
+            tombstone_etags: Arc::default(),
+            layouts: Arc::default(),
+            scan_limit,
+        };
 
         if backend.config.validate_buckets_on_startup {
             backend.validate_buckets().await?;
@@ -112,7 +292,18 @@ impl S3Backend {
         client: Arc<dyn S3Api>,
     ) -> StorageResult<Self> {
         config.validate()?;
-        Ok(Self { config, client })
+        let (registries, stored_by_tenant) = Self::new_registries();
+        let scan_limit = Arc::new(tokio::sync::Semaphore::new(config.scan_concurrency));
+        Ok(Self {
+            config,
+            fhir_version: FhirVersion::default_enabled(),
+            client,
+            registries,
+            stored_by_tenant,
+            tombstone_etags: Arc::default(),
+            layouts: Arc::default(),
+            scan_limit,
+        })
     }
 
     /// Verifies that every bucket referenced in the configuration exists and
@@ -136,15 +327,11 @@ impl S3Backend {
     /// by a key prefix derived from the tenant ID. In `BucketPerTenant` mode
     /// each tenant maps to a dedicated bucket looked up from the config map.
     ///
-    /// Returns a `TenantError` if the tenant has no bucket assignment in the
-    /// `BucketPerTenant` mapping.
+    /// Returns [`TenantError::UnmappedTenant`](crate::error::TenantError::UnmappedTenant)
+    /// if the tenant has no bucket assignment in the `BucketPerTenant` mapping
+    /// (only `__system__` falls back, to `default_system_bucket`).
     pub(crate) fn tenant_location(&self, tenant: &TenantContext) -> StorageResult<TenantLocation> {
-        let global_prefix = self
-            .config
-            .prefix
-            .as_ref()
-            .map(|p| p.trim_matches('/').to_string())
-            .filter(|p| !p.is_empty());
+        let global_prefix = self.global_prefix();
 
         match &self.config.tenancy_mode {
             S3TenancyMode::PrefixPerTenant { bucket } => Ok(TenantLocation {
@@ -167,11 +354,7 @@ impl S3Backend {
                             None
                         }
                     })
-                    .ok_or_else(|| {
-                        StorageError::Tenant(crate::error::TenantError::InvalidTenant {
-                            tenant_id: TenantId::new(tenant_id),
-                        })
-                    })?;
+                    .ok_or_else(|| Self::unmapped_tenant(tenant_id))?;
 
                 Ok(TenantLocation {
                     bucket,
@@ -179,6 +362,298 @@ impl S3Backend {
                 })
             }
         }
+    }
+
+    /// Resolves the tenant's location together with its keyspace layout, for
+    /// reads and sweeps. Never writes: a tenant with no marker and no data is
+    /// reported under the configured default layout without stamping it.
+    pub(crate) async fn resource_location(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<ResourceLocation> {
+        self.resolve_resource_location(tenant, false).await
+    }
+
+    /// Like [`resource_location`](Self::resource_location), but an empty tenant
+    /// with no marker is stamped with the configured default layout (a
+    /// conditional `If-None-Match: *` PUT; a lost race adopts the winner's).
+    pub(crate) async fn resource_location_for_write(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<ResourceLocation> {
+        self.resolve_resource_location(tenant, true).await
+    }
+
+    async fn resolve_resource_location(
+        &self,
+        tenant: &TenantContext,
+        for_write: bool,
+    ) -> StorageResult<ResourceLocation> {
+        let location = self.tenant_location(tenant)?;
+        let layout = self.resolve_layout(&location, for_write).await?;
+        Ok(ResourceLocation {
+            bucket: location.bucket,
+            keyspace: location.keyspace.with_layout(layout),
+        })
+    }
+
+    /// Settles a tenant location's layout.
+    ///
+    /// 1. Cached → done.
+    /// 2. Marker present → its layout (an unknown version is an error, never a
+    ///    guess).
+    /// 3. Marker absent, default `V1` → `V1`, nothing written or probed.
+    /// 4. Marker absent, default `V2` → a tenant holding any object under
+    ///    `resources/` or `history/` is a legacy `V1` tenant; an empty one is
+    ///    `V2`, stamped only when `for_write`.
+    async fn resolve_layout(
+        &self,
+        location: &TenantLocation,
+        for_write: bool,
+    ) -> StorageResult<KeyspaceLayout> {
+        let marker_key = location.keyspace.layout_marker_key();
+        let cache_key = (location.bucket.clone(), marker_key.clone());
+        if let Some(layout) = self.layouts.read().get(&cache_key).copied() {
+            return Ok(layout);
+        }
+
+        if let Some(layout) = self
+            .read_layout_marker(&location.bucket, &marker_key)
+            .await?
+        {
+            self.layouts.write().insert(cache_key, layout);
+            return Ok(layout);
+        }
+
+        let default = self.config.default_keyspace_layout;
+        if default == KeyspaceLayout::V1 {
+            self.layouts.write().insert(cache_key, KeyspaceLayout::V1);
+            return Ok(KeyspaceLayout::V1);
+        }
+
+        let occupied = self
+            .prefix_has_objects(&location.bucket, &location.keyspace.resources_prefix())
+            .await?
+            || self
+                .prefix_has_objects(&location.bucket, &location.keyspace.history_root_prefix())
+                .await?;
+        if occupied {
+            self.layouts.write().insert(cache_key, KeyspaceLayout::V1);
+            return Ok(KeyspaceLayout::V1);
+        }
+        if !for_write {
+            return Ok(default);
+        }
+
+        let layout = match self
+            .client
+            .put_object(
+                &location.bucket,
+                &marker_key,
+                default.marker_body(),
+                Some("application/json"),
+                None,
+                Some("*"),
+            )
+            .await
+        {
+            Ok(_) => default,
+            // Lost the create race (412), or the store reported a conflicting
+            // concurrent create (409): adopt whatever the winner stamped.
+            Err(put_error) => match self
+                .read_layout_marker(&location.bucket, &marker_key)
+                .await?
+            {
+                Some(winner) => winner,
+                None => return Err(self.map_client_error(put_error)),
+            },
+        };
+        self.layouts.write().insert(cache_key, layout);
+        Ok(layout)
+    }
+
+    /// Reads the marker object; `Ok(None)` when absent.
+    async fn read_layout_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> StorageResult<Option<KeyspaceLayout>> {
+        let Some(object) = self
+            .client
+            .get_object(bucket, key)
+            .await
+            .map_err(|e| self.map_client_error(e))?
+        else {
+            return Ok(None);
+        };
+        KeyspaceLayout::from_marker_body(&object.bytes)
+            .map(Some)
+            .ok_or_else(|| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "unrecognised keyspace layout marker at s3://{bucket}/{key}; \
+                         refusing to guess the layout"
+                    ),
+                    source: None,
+                })
+            })
+    }
+
+    /// Whether any object exists under `prefix`: `MaxKeys=1` listings that
+    /// follow continuation tokens, since a page can be empty yet truncated.
+    async fn prefix_has_objects(&self, bucket: &str, prefix: &str) -> StorageResult<bool> {
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects(bucket, prefix, token.as_deref(), Some(1))
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            if !page.items.is_empty() {
+                return Ok(true);
+            }
+            match page.next_continuation_token {
+                None => return Ok(false),
+                Some(next) if token.as_deref() == Some(next.as_str()) => {
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "s3".to_string(),
+                        message: format!("S3 repeated the continuation token listing {prefix}"),
+                        source: None,
+                    }));
+                }
+                Some(next) => token = Some(next),
+            }
+        }
+    }
+
+    /// The error for a tenant this configuration has no bucket for.
+    pub(crate) fn unmapped_tenant(tenant_id: &str) -> StorageError {
+        StorageError::Tenant(crate::error::TenantError::UnmappedTenant {
+            tenant_id: TenantId::new(tenant_id),
+        })
+    }
+
+    /// In `BucketPerTenant` mode, rejects a tenant that is absent from the
+    /// tenant→bucket map; a no-op in `PrefixPerTenant` mode, where every tenant
+    /// has a prefix.
+    ///
+    /// `register_tenant` calls this so the registry cannot hold a tenant whose
+    /// every request would then fail with the same error: the map is the
+    /// provisioning in this mode, and the registry only mirrors it. The system
+    /// tenant never reaches here (`ensure_canonical_tenant_id` refuses reserved
+    /// ids first), so its `default_system_bucket` fallback is not consulted.
+    pub(crate) fn ensure_tenant_mapped(&self, tenant_id: &str) -> StorageResult<()> {
+        if let S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map, ..
+        } = &self.config.tenancy_mode
+            && !tenant_bucket_map.contains_key(tenant_id)
+        {
+            return Err(Self::unmapped_tenant(tenant_id));
+        }
+        Ok(())
+    }
+
+    /// Tenants this configuration names statically: the keys of the
+    /// `BucketPerTenant` map, in sorted order. Empty in `PrefixPerTenant` mode,
+    /// where tenants are discovered from the bucket rather than configured.
+    ///
+    /// A binary that builds the map from its environment uses this to provision
+    /// (register and seed) the mapped tenants at startup, so the map is the one
+    /// place an operator declares a tenant.
+    pub fn mapped_tenants(&self) -> Vec<String> {
+        match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { .. } => Vec::new(),
+            S3TenancyMode::BucketPerTenant {
+                tenant_bucket_map, ..
+            } => {
+                let mut ids: Vec<String> = tenant_bucket_map.keys().cloned().collect();
+                ids.sort();
+                ids
+            }
+        }
+    }
+
+    /// Returns the configured global key prefix, with surrounding slashes
+    /// stripped and an empty prefix normalised to `None`.
+    pub(crate) fn global_prefix(&self) -> Option<String> {
+        self.config
+            .prefix
+            .as_ref()
+            .map(|p| p.trim_matches('/').to_string())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Resolves the bucket and (un-tenanted) keyspace for state that spans
+    /// tenants — the tenant registry and the per-user settings store.
+    ///
+    /// Such state lives outside any tenant prefix: in `PrefixPerTenant` mode it
+    /// sits under `[prefix/]` in the shared bucket, alongside the per-tenant
+    /// directories; in `BucketPerTenant` mode there is no single natural bucket,
+    /// so the tenant-independent `default_system_bucket` is used. Returns `None`
+    /// when no such location exists (bucket-per-tenant without a system bucket),
+    /// in which case cross-tenant state cannot be stored at all.
+    ///
+    /// Note the keyspace is deliberately *not* passed through
+    /// [`with_tenant_prefix`](S3Keyspace::with_tenant_prefix): callers own the
+    /// segment that distinguishes their namespace.
+    pub(crate) fn shared_location(&self) -> Option<TenantLocation> {
+        let bucket = match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { bucket } => bucket.clone(),
+            S3TenancyMode::BucketPerTenant {
+                default_system_bucket,
+                ..
+            } => default_system_bucket.clone()?,
+        };
+        Some(TenantLocation {
+            bucket,
+            keyspace: S3Keyspace::new(self.global_prefix()),
+        })
+    }
+
+    /// Resolves the bucket and keyspace holding the tenant registry, which spans
+    /// tenants and so lives under `[prefix/]tenants/`. `None` means the registry
+    /// is unsupported for this configuration.
+    pub(crate) fn registry_location(&self) -> Option<TenantLocation> {
+        self.shared_location()
+    }
+
+    /// Whether this configuration can host the per-user settings store.
+    ///
+    /// False only in bucket-per-tenant mode with no `default_system_bucket`,
+    /// where there is nowhere tenant-independent to keep a user-global document.
+    /// Callers should wire the store only when this holds, so an operator on such
+    /// a configuration gets the explained `501 Not Implemented` from
+    /// `/_user/settings` rather than a `500` on every request. Mirrors
+    /// [`supports_tenant_registry`](crate::core::ResourceStorage::supports_tenant_registry),
+    /// which answers the same question for the tenant registry.
+    pub fn supports_user_settings(&self) -> bool {
+        self.shared_location().is_some()
+    }
+
+    /// Resolves the bucket and keyspace holding the per-user settings objects.
+    ///
+    /// Unlike [`tenant_location`](Self::tenant_location) this takes no
+    /// [`TenantContext`]: per-user settings are *user-global*, not per-tenant (a
+    /// "default tenant" preference is inherently cross-tenant), and the
+    /// [`SettingsStore`](crate::core::SettingsStore) trait accordingly has no
+    /// tenant argument.
+    ///
+    /// When no tenant-independent bucket is configured (bucket-per-tenant with no
+    /// `default_system_bucket`) per-user settings cannot be stored. Callers are
+    /// expected to have gated on [`supports_user_settings`](Self::supports_user_settings)
+    /// first, so reaching this path is a configuration error; it is reported as
+    /// one rather than silently writing into some arbitrary tenant's bucket.
+    pub(crate) fn settings_location(&self) -> StorageResult<TenantLocation> {
+        self.shared_location().ok_or_else(|| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "per-user settings require a tenant-independent bucket: set \
+                          `default_system_bucket` in bucket-per-tenant mode"
+                    .to_string(),
+                source: None,
+            })
+        })
     }
 
     /// Maps a low-level `S3ClientError` to the shared `StorageError` taxonomy.
@@ -192,9 +667,30 @@ impl S3Backend {
                 backend_name: "s3".to_string(),
                 message: "resource not found in S3".to_string(),
             }),
+            // The bucket is missing or invisible: the store is misconfigured. This
+            // must always be an error — never an empty read — so a typo'd or
+            // deleted bucket can't masquerade as a store with no data in it.
+            S3ClientError::BucketNotFound(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!("S3 bucket not found or not accessible: {message}"),
+                })
+            }
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
+            // Transient (#2047): S3 had a conflicting conditional write in flight
+            // and wrote nothing. Deliberately NOT `QueryError`, which the
+            // resource paths read as a lost precondition (AlreadyExists /
+            // VersionConflict). `Unavailable` is served as 503 with Retry-After.
+            S3ClientError::ConditionalConflict(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
+                    ),
+                })
+            }
             S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
                 backend_name: "s3".to_string(),
                 message,
@@ -233,36 +729,11 @@ impl Backend for S3Backend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::CursorPagination
-                | BackendCapability::BulkExport
-                | BackendCapability::BulkImport
-                | BackendCapability::SharedSchema
-                | BackendCapability::DatabasePerTenant
-        )
+        self.capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::CursorPagination,
-            BackendCapability::BulkExport,
-            BackendCapability::BulkImport,
-            BackendCapability::SharedSchema,
-            BackendCapability::DatabasePerTenant,
-        ]
+        Self::declared_capabilities_for(&self.config.tenancy_mode)
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {

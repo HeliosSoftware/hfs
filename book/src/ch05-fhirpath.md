@@ -144,6 +144,8 @@ fhirpath-cli -e "Patient.name.given.first()" --parse-debug-tree
 fhirpath-cli --fhir-version R5 -e "Patient.name.family" -r patient.json
 ```
 
+**Unknown leading identifiers:** if an expression starts with a name that is neither a FHIR type nor an element of the resource (for example a typo such as `Pateint.name.family`), `fhirpath-cli` reports an error and exits with code 1 instead of printing an empty result. A valid type that simply is not the resource's type (`Observation.code` against a Patient) still evaluates to empty, so union expressions keep working. `Resource` and `DomainResource` prefixes (`Resource.meta.source`) resolve against any resource.
+
 ---
 
 ## Using fhirpath-server

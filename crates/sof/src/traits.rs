@@ -20,9 +20,9 @@
 //! - **Code Reuse**: Single implementation handles all supported versions
 
 use crate::SofError;
+use crate::constants::ConstantValue;
 use helios_fhir::FhirResource;
 use helios_fhirpath::EvaluationResult;
-use helios_fhirpath_support::TypeInfoResult;
 
 /// Trait for abstracting ViewDefinition across FHIR versions.
 ///
@@ -446,116 +446,71 @@ mod r4_impl {
 
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
+            let value = self.value.as_ref().ok_or_else(|| {
+                SofError::InvalidViewDefinition(format!("Constant '{name}' must have a value"))
+            })?;
+            r4_constant_to_neutral(value).to_evaluation_result()
+        }
+    }
 
-            if let Some(value) = &self.value {
-                let eval_result = match value {
-                    ViewDefinitionConstantValue::String(s) => {
-                        EvaluationResult::String(s.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Boolean(b) => {
-                        EvaluationResult::Boolean(b.value.unwrap_or(false), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Decimal(d) => {
-                        if let Some(precise_decimal) = &d.value {
-                            match precise_decimal.original_string().parse() {
-                                Ok(decimal_value) => {
-                                    EvaluationResult::Decimal(decimal_value, None, None)
-                                }
-                                Err(_) => {
-                                    return Err(SofError::InvalidViewDefinition(format!(
-                                        "Invalid decimal value for constant '{}'",
-                                        name
-                                    )));
-                                }
-                            }
-                        } else {
-                            EvaluationResult::Decimal("0".parse().unwrap(), None, None)
-                        }
-                    }
-                    ViewDefinitionConstantValue::Date(d) => EvaluationResult::Date(
-                        d.value.clone().unwrap_or_default().to_string(),
-                        None,
-                        None,
-                    ),
-                    ViewDefinitionConstantValue::DateTime(dt) => {
-                        let value_str = dt.value.clone().unwrap_or_default().to_string();
-                        // Ensure DateTime values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "dateTime")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Time(t) => {
-                        let value_str = t.value.clone().unwrap_or_default().to_string();
-                        // Ensure Time values have the "@T" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@T") {
-                            value_str
-                        } else {
-                            format!("@T{}", value_str)
-                        };
-                        EvaluationResult::Time(prefixed, None, None)
-                    }
-                    ViewDefinitionConstantValue::Code(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Base64Binary(b) => {
-                        EvaluationResult::String(b.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Id(i) => {
-                        EvaluationResult::String(i.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Instant(i) => {
-                        let value_str = i.value.clone().unwrap_or_default().to_string();
-                        // Ensure Instant values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "instant")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Oid(o) => {
-                        EvaluationResult::String(o.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::PositiveInt(p) => {
-                        EvaluationResult::Integer(p.value.unwrap_or(1) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::UnsignedInt(u) => {
-                        EvaluationResult::Integer(u.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Uri(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Url(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Uuid(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Canonical(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                };
-
-                Ok(eval_result)
-            } else {
-                Err(SofError::InvalidViewDefinition(format!(
-                    "Constant '{}' must have a value",
-                    name
-                )))
+    fn r4_constant_to_neutral(value: &ViewDefinitionConstantValue) -> ConstantValue {
+        match value {
+            ViewDefinitionConstantValue::String(s) => {
+                ConstantValue::String(s.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Boolean(b) => {
+                ConstantValue::Boolean(b.value.unwrap_or(false))
+            }
+            ViewDefinitionConstantValue::Integer(i) => {
+                ConstantValue::Integer(i.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::PositiveInt(p) => {
+                ConstantValue::PositiveInt(p.value.unwrap_or(1) as i64)
+            }
+            ViewDefinitionConstantValue::UnsignedInt(u) => {
+                ConstantValue::UnsignedInt(u.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Decimal(d) => ConstantValue::Decimal(
+                d.value
+                    .as_ref()
+                    .map(|p| p.original_string().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            ),
+            ViewDefinitionConstantValue::Date(d) => {
+                ConstantValue::Date(d.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::DateTime(dt) => {
+                ConstantValue::DateTime(dt.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Time(t) => {
+                ConstantValue::Time(t.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Instant(i) => {
+                ConstantValue::Instant(i.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Code(c) => {
+                ConstantValue::Code(c.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Base64Binary(b) => {
+                ConstantValue::Base64Binary(b.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Id(i) => {
+                ConstantValue::Identifier(i.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Oid(o) => {
+                ConstantValue::Identifier(o.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uri(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Url(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uuid(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Canonical(c) => {
+                ConstantValue::Identifier(c.value.clone().unwrap_or_default())
             }
         }
     }
@@ -676,116 +631,71 @@ mod r4b_impl {
 
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
+            let value = self.value.as_ref().ok_or_else(|| {
+                SofError::InvalidViewDefinition(format!("Constant '{name}' must have a value"))
+            })?;
+            r4b_constant_to_neutral(value).to_evaluation_result()
+        }
+    }
 
-            if let Some(value) = &self.value {
-                let eval_result = match value {
-                    ViewDefinitionConstantValue::String(s) => {
-                        EvaluationResult::String(s.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Boolean(b) => {
-                        EvaluationResult::Boolean(b.value.unwrap_or(false), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Decimal(d) => {
-                        if let Some(precise_decimal) = &d.value {
-                            match precise_decimal.original_string().parse() {
-                                Ok(decimal_value) => {
-                                    EvaluationResult::Decimal(decimal_value, None, None)
-                                }
-                                Err(_) => {
-                                    return Err(SofError::InvalidViewDefinition(format!(
-                                        "Invalid decimal value for constant '{}'",
-                                        name
-                                    )));
-                                }
-                            }
-                        } else {
-                            EvaluationResult::Decimal("0".parse().unwrap(), None, None)
-                        }
-                    }
-                    ViewDefinitionConstantValue::Date(d) => EvaluationResult::Date(
-                        d.value.clone().unwrap_or_default().to_string(),
-                        None,
-                        None,
-                    ),
-                    ViewDefinitionConstantValue::DateTime(dt) => {
-                        let value_str = dt.value.clone().unwrap_or_default().to_string();
-                        // Ensure DateTime values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "dateTime")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Time(t) => {
-                        let value_str = t.value.clone().unwrap_or_default().to_string();
-                        // Ensure Time values have the "@T" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@T") {
-                            value_str
-                        } else {
-                            format!("@T{}", value_str)
-                        };
-                        EvaluationResult::Time(prefixed, None, None)
-                    }
-                    ViewDefinitionConstantValue::Code(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Base64Binary(b) => {
-                        EvaluationResult::String(b.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Id(i) => {
-                        EvaluationResult::String(i.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Instant(i) => {
-                        let value_str = i.value.clone().unwrap_or_default().to_string();
-                        // Ensure Instant values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "instant")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Oid(o) => {
-                        EvaluationResult::String(o.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::PositiveInt(p) => {
-                        EvaluationResult::Integer(p.value.unwrap_or(1) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::UnsignedInt(u) => {
-                        EvaluationResult::Integer(u.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Uri(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Url(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Uuid(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Canonical(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                };
-
-                Ok(eval_result)
-            } else {
-                Err(SofError::InvalidViewDefinition(format!(
-                    "Constant '{}' must have a value",
-                    name
-                )))
+    fn r4b_constant_to_neutral(value: &ViewDefinitionConstantValue) -> ConstantValue {
+        match value {
+            ViewDefinitionConstantValue::String(s) => {
+                ConstantValue::String(s.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Boolean(b) => {
+                ConstantValue::Boolean(b.value.unwrap_or(false))
+            }
+            ViewDefinitionConstantValue::Integer(i) => {
+                ConstantValue::Integer(i.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::PositiveInt(p) => {
+                ConstantValue::PositiveInt(p.value.unwrap_or(1) as i64)
+            }
+            ViewDefinitionConstantValue::UnsignedInt(u) => {
+                ConstantValue::UnsignedInt(u.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Decimal(d) => ConstantValue::Decimal(
+                d.value
+                    .as_ref()
+                    .map(|p| p.original_string().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            ),
+            ViewDefinitionConstantValue::Date(d) => {
+                ConstantValue::Date(d.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::DateTime(dt) => {
+                ConstantValue::DateTime(dt.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Time(t) => {
+                ConstantValue::Time(t.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Instant(i) => {
+                ConstantValue::Instant(i.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Code(c) => {
+                ConstantValue::Code(c.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Base64Binary(b) => {
+                ConstantValue::Base64Binary(b.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Id(i) => {
+                ConstantValue::Identifier(i.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Oid(o) => {
+                ConstantValue::Identifier(o.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uri(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Url(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uuid(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Canonical(c) => {
+                ConstantValue::Identifier(c.value.clone().unwrap_or_default())
             }
         }
     }
@@ -907,120 +817,74 @@ mod r5_impl {
 
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
+            let value = self.value.as_ref().ok_or_else(|| {
+                SofError::InvalidViewDefinition(format!("Constant '{name}' must have a value"))
+            })?;
+            r5_constant_to_neutral(value).to_evaluation_result()
+        }
+    }
 
-            if let Some(value) = &self.value {
-                // R5 implementation identical to R4
-                let eval_result = match value {
-                    ViewDefinitionConstantValue::String(s) => {
-                        EvaluationResult::String(s.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Boolean(b) => {
-                        EvaluationResult::Boolean(b.value.unwrap_or(false), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Decimal(d) => {
-                        if let Some(precise_decimal) = &d.value {
-                            match precise_decimal.original_string().parse() {
-                                Ok(decimal_value) => {
-                                    EvaluationResult::Decimal(decimal_value, None, None)
-                                }
-                                Err(_) => {
-                                    return Err(SofError::InvalidViewDefinition(format!(
-                                        "Invalid decimal value for constant '{}'",
-                                        name
-                                    )));
-                                }
-                            }
-                        } else {
-                            EvaluationResult::Decimal("0".parse().unwrap(), None, None)
-                        }
-                    }
-                    ViewDefinitionConstantValue::Date(d) => EvaluationResult::Date(
-                        d.value.clone().unwrap_or_default().to_string(),
-                        None,
-                        None,
-                    ),
-                    ViewDefinitionConstantValue::DateTime(dt) => {
-                        let value_str = dt.value.clone().unwrap_or_default().to_string();
-                        // Ensure DateTime values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "dateTime")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Time(t) => {
-                        let value_str = t.value.clone().unwrap_or_default().to_string();
-                        // Ensure Time values have the "@T" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@T") {
-                            value_str
-                        } else {
-                            format!("@T{}", value_str)
-                        };
-                        EvaluationResult::Time(prefixed, None, None)
-                    }
-                    ViewDefinitionConstantValue::Code(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Base64Binary(b) => {
-                        EvaluationResult::String(b.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Id(i) => {
-                        EvaluationResult::String(i.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Instant(i) => {
-                        let value_str = i.value.clone().unwrap_or_default().to_string();
-                        // Ensure Instant values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "instant")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Oid(o) => {
-                        EvaluationResult::String(o.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::PositiveInt(p) => {
-                        EvaluationResult::Integer(p.value.unwrap_or(1) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::UnsignedInt(u) => {
-                        EvaluationResult::Integer(u.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Uri(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Url(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Uuid(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Canonical(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer64(i) => {
-                        EvaluationResult::Integer64(i.value.unwrap_or(0), None, None)
-                    }
-                };
-
-                Ok(eval_result)
-            } else {
-                Err(SofError::InvalidViewDefinition(format!(
-                    "Constant '{}' must have a value",
-                    name
-                )))
+    fn r5_constant_to_neutral(value: &ViewDefinitionConstantValue) -> ConstantValue {
+        match value {
+            ViewDefinitionConstantValue::String(s) => {
+                ConstantValue::String(s.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Boolean(b) => {
+                ConstantValue::Boolean(b.value.unwrap_or(false))
+            }
+            ViewDefinitionConstantValue::Integer(i) => {
+                ConstantValue::Integer(i.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Integer64(i) => {
+                ConstantValue::Integer64(i.value.unwrap_or(0))
+            }
+            ViewDefinitionConstantValue::PositiveInt(p) => {
+                ConstantValue::PositiveInt(p.value.unwrap_or(1) as i64)
+            }
+            ViewDefinitionConstantValue::UnsignedInt(u) => {
+                ConstantValue::UnsignedInt(u.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Decimal(d) => ConstantValue::Decimal(
+                d.value
+                    .as_ref()
+                    .map(|p| p.original_string().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            ),
+            ViewDefinitionConstantValue::Date(d) => {
+                ConstantValue::Date(d.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::DateTime(dt) => {
+                ConstantValue::DateTime(dt.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Time(t) => {
+                ConstantValue::Time(t.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Instant(i) => {
+                ConstantValue::Instant(i.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Code(c) => {
+                ConstantValue::Code(c.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Base64Binary(b) => {
+                ConstantValue::Base64Binary(b.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Id(i) => {
+                ConstantValue::Identifier(i.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Oid(o) => {
+                ConstantValue::Identifier(o.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uri(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Url(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uuid(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Canonical(c) => {
+                ConstantValue::Identifier(c.value.clone().unwrap_or_default())
             }
         }
     }
@@ -1147,120 +1011,74 @@ mod r6_impl {
 
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
+            let value = self.value.as_ref().ok_or_else(|| {
+                SofError::InvalidViewDefinition(format!("Constant '{name}' must have a value"))
+            })?;
+            r6_constant_to_neutral(value).to_evaluation_result()
+        }
+    }
 
-            if let Some(value) = &self.value {
-                // R5 implementation identical to R4
-                let eval_result = match value {
-                    ViewDefinitionConstantValue::String(s) => {
-                        EvaluationResult::String(s.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Boolean(b) => {
-                        EvaluationResult::Boolean(b.value.unwrap_or(false), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Decimal(d) => {
-                        if let Some(precise_decimal) = &d.value {
-                            match precise_decimal.original_string().parse() {
-                                Ok(decimal_value) => {
-                                    EvaluationResult::Decimal(decimal_value, None, None)
-                                }
-                                Err(_) => {
-                                    return Err(SofError::InvalidViewDefinition(format!(
-                                        "Invalid decimal value for constant '{}'",
-                                        name
-                                    )));
-                                }
-                            }
-                        } else {
-                            EvaluationResult::Decimal("0".parse().unwrap(), None, None)
-                        }
-                    }
-                    ViewDefinitionConstantValue::Date(d) => EvaluationResult::Date(
-                        d.value.clone().unwrap_or_default().to_string(),
-                        None,
-                        None,
-                    ),
-                    ViewDefinitionConstantValue::DateTime(dt) => {
-                        let value_str = dt.value.clone().unwrap_or_default().to_string();
-                        // Ensure DateTime values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "dateTime")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Time(t) => {
-                        let value_str = t.value.clone().unwrap_or_default().to_string();
-                        // Ensure Time values have the "@T" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@T") {
-                            value_str
-                        } else {
-                            format!("@T{}", value_str)
-                        };
-                        EvaluationResult::Time(prefixed, None, None)
-                    }
-                    ViewDefinitionConstantValue::Code(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Base64Binary(b) => {
-                        EvaluationResult::String(b.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Id(i) => {
-                        EvaluationResult::String(i.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Instant(i) => {
-                        let value_str = i.value.clone().unwrap_or_default().to_string();
-                        // Ensure Instant values have the "@" prefix for FHIRPath
-                        let prefixed = if value_str.starts_with("@") {
-                            value_str
-                        } else {
-                            format!("@{}", value_str)
-                        };
-                        EvaluationResult::DateTime(
-                            prefixed,
-                            Some(TypeInfoResult::new("FHIR", "instant")),
-                            None,
-                        )
-                    }
-                    ViewDefinitionConstantValue::Oid(o) => {
-                        EvaluationResult::String(o.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::PositiveInt(p) => {
-                        EvaluationResult::Integer(p.value.unwrap_or(1) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::UnsignedInt(u) => {
-                        EvaluationResult::Integer(u.value.unwrap_or(0) as i64, None, None)
-                    }
-                    ViewDefinitionConstantValue::Uri(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Url(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Uuid(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Canonical(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None, None)
-                    }
-                    ViewDefinitionConstantValue::Integer64(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0), None, None)
-                    }
-                };
-
-                Ok(eval_result)
-            } else {
-                Err(SofError::InvalidViewDefinition(format!(
-                    "Constant '{}' must have a value",
-                    name
-                )))
+    fn r6_constant_to_neutral(value: &ViewDefinitionConstantValue) -> ConstantValue {
+        match value {
+            ViewDefinitionConstantValue::String(s) => {
+                ConstantValue::String(s.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Boolean(b) => {
+                ConstantValue::Boolean(b.value.unwrap_or(false))
+            }
+            ViewDefinitionConstantValue::Integer(i) => {
+                ConstantValue::Integer(i.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Integer64(i) => {
+                ConstantValue::Integer64(i.value.unwrap_or(0))
+            }
+            ViewDefinitionConstantValue::PositiveInt(p) => {
+                ConstantValue::PositiveInt(p.value.unwrap_or(1) as i64)
+            }
+            ViewDefinitionConstantValue::UnsignedInt(u) => {
+                ConstantValue::UnsignedInt(u.value.unwrap_or(0) as i64)
+            }
+            ViewDefinitionConstantValue::Decimal(d) => ConstantValue::Decimal(
+                d.value
+                    .as_ref()
+                    .map(|p| p.original_string().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            ),
+            ViewDefinitionConstantValue::Date(d) => {
+                ConstantValue::Date(d.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::DateTime(dt) => {
+                ConstantValue::DateTime(dt.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Time(t) => {
+                ConstantValue::Time(t.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Instant(i) => {
+                ConstantValue::Instant(i.value.clone().unwrap_or_default().to_string())
+            }
+            ViewDefinitionConstantValue::Code(c) => {
+                ConstantValue::Code(c.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Base64Binary(b) => {
+                ConstantValue::Base64Binary(b.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Id(i) => {
+                ConstantValue::Identifier(i.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Oid(o) => {
+                ConstantValue::Identifier(o.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uri(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Url(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Uuid(u) => {
+                ConstantValue::Identifier(u.value.clone().unwrap_or_default())
+            }
+            ViewDefinitionConstantValue::Canonical(c) => {
+                ConstantValue::Identifier(c.value.clone().unwrap_or_default())
             }
         }
     }

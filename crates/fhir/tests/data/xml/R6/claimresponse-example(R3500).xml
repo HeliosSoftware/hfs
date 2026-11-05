@@ -52,7 +52,7 @@
       <code value="provider"/>
     </coding>
   </payeeType>
-  <!--  Adjudication details  -->
+  <!-- Adjudication details -->
   <item>
     <itemSequence value="1"/>
     <adjudication>
@@ -94,7 +94,7 @@
         </coding>
       </category>
       <reason>
-        <!--  should have paid 100.47  -->
+        <!-- should have paid 100.47 -->
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/adjudication-reason"/>
           <code value="ar002"/>
@@ -129,7 +129,7 @@
       <currency value="USD"/>
     </amount>
   </total>
-  <!--  Payment details  -->
+  <!-- Payment details -->
   <payment>
     <type>
       <coding>

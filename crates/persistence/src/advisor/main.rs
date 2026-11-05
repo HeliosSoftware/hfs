@@ -40,6 +40,17 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The advisor is configured purely from the environment and has no
+    // argument parser; `--version` is the one flag every Helios binary
+    // answers, so a tester can record which build is running (#992).
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("config-advisor {}", helios_persistence::VERSION);
+        return Ok(());
+    }
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(

@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -24,7 +25,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(name: &str) -> serde_json::Value {
@@ -48,7 +52,10 @@ async fn test_delete_resource_success() {
 
     // Create a resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Delete it
     let result = backend.delete(&tenant, "Patient", created.id()).await;
@@ -64,13 +71,21 @@ async fn test_delete_makes_resource_unreadable() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     backend.delete(&tenant, "Patient", &id).await.unwrap();
 
-    let read = backend.read(&tenant, "Patient", &id).await.unwrap();
-    assert!(read.is_none(), "Deleted resource should not be readable");
+    // Soft delete: `read` surfaces a deleted resource as `Gone` (SQLite/PG/S3)
+    // or as `None`; either satisfies "not readable". Mirrors sqlite_tests.rs.
+    match backend.read(&tenant, "Patient", &id).await {
+        Ok(None) => {}
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        other => panic!("Deleted resource should not be readable, got: {:?}", other),
+    }
 }
 
 /// Test that exists returns false after delete.
@@ -81,7 +96,10 @@ async fn test_delete_makes_exists_false() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     backend.delete(&tenant, "Patient", &id).await.unwrap();
@@ -101,7 +119,10 @@ async fn test_delete_decreases_count() {
     let mut ids = Vec::new();
     for i in 0..3 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         ids.push(created.id().to_string());
     }
 
@@ -127,9 +148,7 @@ async fn test_delete_nonexistent_fails() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let result = backend
-        .delete(&tenant, "Patient", "nonexistent-id")
-        .await;
+    let result = backend.delete(&tenant, "Patient", "nonexistent-id").await;
 
     assert!(result.is_err());
     match result {
@@ -147,7 +166,10 @@ async fn test_delete_already_deleted_fails() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // Delete once
@@ -174,17 +196,16 @@ async fn test_delete_without_permission_fails() {
         TenantId::new("test-tenant"),
         TenantPermissions::full_access(),
     );
-    let read_only = TenantContext::new(
-        TenantId::new("test-tenant"),
-        TenantPermissions::read_only(),
-    );
+    let read_only =
+        TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::read_only());
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&full_access, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&full_access, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
-    let result = backend
-        .delete(&read_only, "Patient", created.id())
-        .await;
+    let result = backend.delete(&read_only, "Patient", created.id()).await;
 
     assert!(result.is_err());
     match result {
@@ -204,7 +225,10 @@ async fn test_delete_wrong_tenant_fails() {
     let tenant2 = TenantContext::new(TenantId::new("tenant-2"), TenantPermissions::full_access());
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let result = backend.delete(&tenant2, "Patient", created.id()).await;
 
@@ -232,22 +256,47 @@ async fn test_delete_tenant_isolation() {
     // Create same-id resource in both tenants using create_or_update
     let patient = create_patient_json("Smith");
     backend
-        .create_or_update(&tenant1, "Patient", "shared-id", patient.clone())
+        .create_or_update(
+            &tenant1,
+            "Patient",
+            "shared-id",
+            patient.clone(),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     backend
-        .create_or_update(&tenant2, "Patient", "shared-id", patient)
+        .create_or_update(
+            &tenant2,
+            "Patient",
+            "shared-id",
+            patient,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
     // Delete from tenant1
-    backend.delete(&tenant1, "Patient", "shared-id").await.unwrap();
+    backend
+        .delete(&tenant1, "Patient", "shared-id")
+        .await
+        .unwrap();
 
     // Tenant1 should not have it
-    assert!(!backend.exists(&tenant1, "Patient", "shared-id").await.unwrap());
+    assert!(
+        !backend
+            .exists(&tenant1, "Patient", "shared-id")
+            .await
+            .unwrap()
+    );
 
     // Tenant2 should still have it
-    assert!(backend.exists(&tenant2, "Patient", "shared-id").await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant2, "Patient", "shared-id")
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -263,25 +312,39 @@ async fn test_delete_is_soft_delete() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     backend.delete(&tenant, "Patient", &id).await.unwrap();
 
-    // Normal read returns None
-    let read = backend.read(&tenant, "Patient", &id).await.unwrap();
-    assert!(read.is_none());
+    // Normal read reports the deleted resource as `Gone` (or `None`)
+    match backend.read(&tenant, "Patient", &id).await {
+        Ok(None) => {}
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        other => panic!("Deleted resource should not be readable, got: {:?}", other),
+    }
 
     // But create_or_update with same ID creates a new version
     let patient2 = create_patient_json("Restored");
-    let (restored, created_new) = backend
-        .create_or_update(&tenant, "Patient", &id, patient2)
+    let (restored, _created_new) = backend
+        .create_or_update(&tenant, "Patient", &id, patient2, FhirVersion::default())
         .await
         .unwrap();
 
     // This should create a new resource (after deletion)
     assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
     assert_eq!(restored.content()["name"][0]["family"], "Restored");
+
+    // The restore continues the version chain rather than resetting to "1":
+    // v1 create, v2 delete, v3 restore.
+    assert_eq!(
+        restored.version_id(),
+        "3",
+        "restore should continue the version chain"
+    );
 }
 
 // ============================================================================
@@ -299,7 +362,10 @@ async fn test_delete_multiple_resources() {
     let mut ids = Vec::new();
     for i in 0..5 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         ids.push(created.id().to_string());
     }
 
@@ -325,7 +391,10 @@ async fn test_delete_different_types() {
 
     // Create various resources
     let patient = create_patient_json("Smith");
-    let patient_created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let patient_created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let observation = json!({
         "resourceType": "Observation",
@@ -333,7 +402,7 @@ async fn test_delete_different_types() {
         "code": {"coding": [{"code": "test"}]}
     });
     let obs_created = backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
 
@@ -344,10 +413,20 @@ async fn test_delete_different_types() {
         .unwrap();
 
     // Patient should be gone
-    assert!(!backend.exists(&tenant, "Patient", patient_created.id()).await.unwrap());
+    assert!(
+        !backend
+            .exists(&tenant, "Patient", patient_created.id())
+            .await
+            .unwrap()
+    );
 
     // Observation should still exist
-    assert!(backend.exists(&tenant, "Observation", obs_created.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant, "Observation", obs_created.id())
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -362,7 +441,10 @@ async fn test_delete_after_update() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update multiple times
     let mut current = created;
@@ -373,10 +455,18 @@ async fn test_delete_after_update() {
     }
 
     // Now delete
-    backend.delete(&tenant, "Patient", current.id()).await.unwrap();
+    backend
+        .delete(&tenant, "Patient", current.id())
+        .await
+        .unwrap();
 
     // Should be deleted
-    assert!(!backend.exists(&tenant, "Patient", current.id()).await.unwrap());
+    assert!(
+        !backend
+            .exists(&tenant, "Patient", current.id())
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -391,7 +481,10 @@ async fn test_delete_not_idempotent() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // First delete succeeds

@@ -1,0 +1,13 @@
+{# The tenant selector's option list (#344), swapped into the menu panel when
+   it first opens. One POST form per provisioned tenant, mirroring the FHIR
+   version selector; the effective tenant is marked current. #}
+{% for o in options %}
+<form method="post" action="/ui/tenant">
+  <input type="hidden" name="tenant" value="{{ o.id }}">
+  <button type="submit" class="menu__option"{% if o.current %} aria-current="true"{% endif %}>
+    <span class="avatar">{{ o.initials }}</span>
+    {{ o.label }}
+    {% if o.current %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+  </button>
+</form>
+{% endfor %}

@@ -40,6 +40,10 @@ pub enum IssueType {
     Required,
     /// Value out of range.
     Value,
+    /// FHIRPath invariant violation.
+    Invariant,
+    /// Invalid code / failed terminology binding.
+    CodeInvalid,
     /// Resource not found.
     NotFound,
     /// Resource was deleted.
@@ -52,6 +56,10 @@ pub enum IssueType {
     LockError,
     /// Not supported.
     NotSupported,
+    /// Content that would have been returned was truncated/limited (e.g. a
+    /// searchset's `_include`/`_revinclude` resolution hit a resource-count
+    /// cap).
+    Incomplete,
     /// Duplicate resource.
     Duplicate,
     /// Processing error.
@@ -78,12 +86,15 @@ impl IssueType {
             IssueType::Structure => "structure",
             IssueType::Required => "required",
             IssueType::Value => "value",
+            IssueType::Invariant => "invariant",
+            IssueType::CodeInvalid => "code-invalid",
             IssueType::NotFound => "not-found",
             IssueType::Deleted => "deleted",
             IssueType::MultipleMatches => "multiple-matches",
             IssueType::Conflict => "conflict",
             IssueType::LockError => "lock-error",
             IssueType::NotSupported => "not-supported",
+            IssueType::Incomplete => "incomplete",
             IssueType::Duplicate => "duplicate",
             IssueType::Processing => "processing",
             IssueType::Transient => "transient",

@@ -1,0 +1,18 @@
+{% extends "layouts/base.html" %}
+
+{#
+  A single bulk export's permalink (#1758): the record's own header, failure
+  notice, progress bar, its Job card and the Output files table. Everything
+  that varies with status is nested as `fragment` (partials/
+  bulk_export_detail.html, `#job-detail`) — written once and shared verbatim
+  with `GET /ui/bulk-export/active/{id}/detail`, the htmx endpoint this same
+  element polls every 5s while the job stays in-progress.
+#}
+
+{% block title %}{{ fragment.detail.name }} — {{ i18n.t("bulk-export-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+{{ fragment.render()?|safe }}
+{% endblock %}

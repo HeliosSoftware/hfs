@@ -1,0 +1,63 @@
+{% extends "layouts/base.html" %}
+
+{#
+  Active SQL Exports (#833): the list-first entry page for $sql-export jobs,
+  mirroring /ui/bulk-export's shape. Job state lives in the per-user settings
+  document (see crate::sql_export's module docs); every in-progress job is
+  polled once before rendering, so a plain reload without JavaScript stays
+  current, and each in-progress card also polls its own fragment every 5s
+  over htmx. The builder lives at /ui/sql/export/new.
+#}
+
+{% block title %}{{ i18n.t("sql-export-active-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("sql-export-active-title") }}</h1>
+    {% if available %}
+    {% include "partials/sql_export_summary.html" %}
+    {% endif %}
+  </div>
+  {% if available %}
+  <a class="btn btn--primary" href="/ui/sql/export/new">
+    <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("sql-export-new") }}
+  </a>
+  {% endif %}
+</header>
+
+{% if let Some(job_id) = store_error %}
+<div class="card notice notice--warn" role="alert">
+  {{ i18n.t("sql-export-store-error") }} <code>{{ job_id }}</code>
+  <!-- #835: the job started but this UI's own record of it never got
+       written, so there is no notebook entry to link a detail page to
+       (module docs of sql_export.rs) — Copy job id is all this notice can
+       offer. Server-rendered hidden, like the same button on every card,
+       and revealed only once JavaScript and the Clipboard API are both
+       available (sql-export.js). -->
+  <button type="button" class="btn" hidden
+          data-copy-job-id="{{ job_id }}"
+          data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+          data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+</div>
+{% endif %}
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("sql-export-unavailable") }}</div>
+{% else %}
+{% if cards.is_empty() %}
+<div class="card notice">{{ i18n.t("sql-export-none") }}</div>
+{% endif %}
+
+{# Keep a single request slot across card replacements so an older summary
+   cannot overtake a newer terminal response. Each dropped tick retries. #}
+<div id="sql-export-jobs" class="export-jobs" hx-sync="#sql-export-jobs:drop">
+{% for card in cards %}
+{% include "partials/sql_export_card.html" %}
+{% endfor %}
+</div>
+{% endif %}
+<script src="/ui/assets/sql-export.js" defer></script>
+{% endblock %}

@@ -99,9 +99,9 @@ fn main() {
     // Extract everything
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).unwrap();
-        let outpath = resources_dir.join(file.mangled_name());
+        let outpath = resources_dir.join(file.mangled_name().unwrap());
 
-        if file.name().ends_with('/') {
+        if file.is_dir() {
             fs::create_dir_all(&outpath).unwrap();
         } else {
             if let Some(p) = outpath.parent() {

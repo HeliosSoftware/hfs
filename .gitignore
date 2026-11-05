@@ -8,9 +8,6 @@ crates/sof/output.csv
 package-lock.json
 .prettierrc
 off
-.claude
-AGENTS.md
-
 # Build script download markers
 .download_marker
 
@@ -21,3 +18,35 @@ AGENTS.md
 
 # Test artifacts
 /test-artifacts
+
+# Runtime + build logs (hts-*.log, hts-run.log, test-*.log, compile.log, …)
+*.log
+
+# Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
+__pycache__/
+*.pyc
+/.claude/skills/frontend-design/
+/.agents/skills/frontend-design/
+/.vscode/
+
+# Local working notes, plans and scratch documents. Kept out of the repo on
+# purpose: they are personal working material, not project documentation, and
+# they should never reach a PR. `tmp/` is the intended home for them.
+/tmp/
+
+# Top-level docs/ is local working notes too (discussion #223, #1654):
+# design notes, plans, benchmark write-ups and evidence captures. Docs that
+# ship live beside the code they describe (e.g. crates/<crate>/docs/,
+# crates/persistence/mongodb/) or in book/. Anchored, so crates/*/docs/ is
+# still tracked.
+/docs/
+
+# Local $bulk-submit output receipts
+data/submit/
+
+# Local $export output (filesystem export storage)
+data/exports/
+
+# CI: the Docker-host GC jobs check their action out here, beside the shared
+# runner checkout, and remove it again (see cleanup-test-containers in ci.yml).
+/.gc-actions/

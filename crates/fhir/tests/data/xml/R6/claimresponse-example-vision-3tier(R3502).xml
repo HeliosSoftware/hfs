@@ -46,7 +46,7 @@
       <code value="provider"/>
     </coding>
   </payeeType>
-  <!--  Adjudication details  -->
+  <!-- Adjudication details -->
   <item>
     <itemSequence value="1"/>
     <adjudication>
@@ -341,7 +341,7 @@
       <currency value="USD"/>
     </amount>
   </total>
-  <!--  Payment details  -->
+  <!-- Payment details -->
   <payment>
     <type>
       <coding>
