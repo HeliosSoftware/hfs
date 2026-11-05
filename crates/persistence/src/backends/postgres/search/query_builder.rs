@@ -7790,6 +7790,21 @@ mod tests {
     }
 
     #[test]
+    fn reference_positive_and_not_are_not_folded_into_an_intersect() {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(reference_param("subject", None, "Patient/p1"))
+            .with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Not),
+                "Patient/p2",
+            ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("mixed");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert!(frag.sql.contains("NOT (id IN (SELECT"), "{}", frag.sql);
+        assert_eq!(frag.sql.matches("id IN (SELECT").count(), 2, "{}", frag.sql);
+    }
+
+    #[test]
     fn reference_or_list_is_a_single_sublink() {
         let param = SearchParameter {
             name: "subject".to_string(),
