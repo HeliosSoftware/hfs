@@ -467,6 +467,44 @@ async fn mongodb_a_quantity_row_without_tuple_code_blocks_the_marker() {
     assert!(tuple_path_used(&backend, &codeless).await);
 }
 
+/// A tenant purge that ran (on any instance) after a `$reindex` rebuilt the
+/// tenant but before its hook wrote the markers leaves no marker: the hook
+/// finds no resource of the tenant after writing and removes what it wrote.
+/// Without that, a tenant id reused later would start out marked. The race
+/// with a purge in the middle of the run is `tenant_purge_races::
+/// a_tenant_purge_racing_a_reindex_job_leaves_no_rows_and_the_job_completes`.
+#[tokio::test]
+async fn mongodb_a_marker_written_after_a_tenant_purge_is_removed() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_purged").await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let purged = create_tenant("composite-tuple-purged");
+    let kept = create_tenant("composite-tuple-purge-kept");
+    seed(&backend, &purged).await;
+    seed(&backend, &kept).await;
+    backend
+        .purge_tenant_data("composite-tuple-purged")
+        .await
+        .unwrap();
+
+    backend
+        .reindex_run_completed(&purged, ReindexCoverage::Tenant)
+        .await;
+    let types = ["Observation".to_string(), "Patient".to_string()];
+    backend
+        .reindex_run_completed(&purged, ReindexCoverage::Types(&types))
+        .await;
+    // The same hook keeps the markers of a tenant that still has resources.
+    backend
+        .reindex_run_completed(&kept, ReindexCoverage::Tenant)
+        .await;
+    assert_eq!(
+        markers(&backend).await,
+        vec!["composite-tuple-purge-kept|composite_tuple_code_v2".to_string()]
+    );
+}
+
 /// The planner's tuple read, profiled: it scans `idx_search_composite_tuple_qty`
 /// for a bare code and for `system|code` (`$in` over the partial index).
 #[tokio::test]

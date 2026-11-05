@@ -178,22 +178,48 @@ impl MongoBackend {
     /// the planner would miss (written during the `$reindex` by an older
     /// instance, or by a path that does not stamp) gets no marker, with a
     /// warning. For a run over every type that means no tenant marker at all.
+    ///
+    /// A tenant purge can run, on any instance, before or while the run's
+    /// hook writes, and would leave the marker behind for a tenant id that
+    /// may be reused. [`remove_markers_of_a_purged_tenant`] settles that once
+    /// the markers are written.
     pub(super) async fn record_composite_tuple_codes_complete(
         &self,
         tenant_id: &str,
         coverage: ReindexCoverage<'_>,
     ) -> StorageResult<()> {
         let db = self.get_database().await?;
+        let mut written = Vec::new();
+        let wrote = self
+            .write_verified_markers(&db, tenant_id, coverage, &mut written)
+            .await;
+        // Also after a failed write: the markers written before it count.
+        let settled = remove_markers_of_a_purged_tenant(&db, tenant_id, &written).await;
+        self.composite_marker_cache.forget_tenant(tenant_id);
+        wrote.and(settled)
+    }
+
+    /// The marker writes of [`Self::record_composite_tuple_codes_complete`],
+    /// each after its scope was checked; `written` collects their ids.
+    async fn write_verified_markers(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        coverage: ReindexCoverage<'_>,
+        written: &mut Vec<String>,
+    ) -> StorageResult<()> {
         match coverage {
             ReindexCoverage::Tenant => {
                 let mut unstamped = Vec::new();
                 for (resource_type, params) in self.token_quantity_params(tenant_id, None) {
-                    if has_unstamped_quantity_rows(&db, tenant_id, &resource_type, &params).await? {
+                    if has_unstamped_quantity_rows(db, tenant_id, &resource_type, &params).await? {
                         unstamped.push(resource_type);
                     }
                 }
                 if unstamped.is_empty() {
-                    self.upsert_layout_marker(&db, tenant_marker_id(tenant_id), tenant_id, None)
+                    // Listed before the write: a failed write may still land.
+                    written.push(tenant_marker_id(tenant_id));
+                    self.upsert_layout_marker(db, tenant_marker_id(tenant_id), tenant_id, None)
                         .await?;
                 } else {
                     warn_unstamped(tenant_id, &unstamped);
@@ -207,24 +233,20 @@ impl MongoBackend {
                         .iter()
                         .find(|(checked_type, _)| checked_type == resource_type)
                         .map_or(&[][..], |(_, params)| params.as_slice());
-                    if has_unstamped_quantity_rows(&db, tenant_id, resource_type, params).await? {
+                    if has_unstamped_quantity_rows(db, tenant_id, resource_type, params).await? {
                         unstamped.push(resource_type.clone());
                         continue;
                     }
-                    self.upsert_layout_marker(
-                        &db,
-                        type_marker_id(tenant_id, resource_type),
-                        tenant_id,
-                        Some(resource_type),
-                    )
-                    .await?;
+                    let id = type_marker_id(tenant_id, resource_type);
+                    written.push(id.clone());
+                    self.upsert_layout_marker(db, id, tenant_id, Some(resource_type))
+                        .await?;
                 }
                 if !unstamped.is_empty() {
                     warn_unstamped(tenant_id, &unstamped);
                 }
             }
         }
-        self.composite_marker_cache.forget_tenant(tenant_id);
         Ok(())
     }
 
@@ -373,6 +395,62 @@ async fn has_unstamped_quantity_rows(
     cursor.advance().await.map_err(|e| {
         super::storage::internal_error(format!("Failed to check tuple_code coverage: {e}"))
     })
+}
+
+/// Removes the markers just `written` for `tenant_id` when the tenant holds no
+/// document in `resources` any more: a tenant purge ran, and nothing else will
+/// delete them.
+///
+/// The read comes after the marker writes, the same proof a `$reindex` page
+/// and a `$bulk-submit` batch use against a purge (#2310).
+/// `purge_tenant_data` deletes the tenant's `resources` before its markers. A
+/// read that finds any document of the tenant ran before that delete was done,
+/// so the marker writes before it ran before the delete of the markers, which
+/// removes them. A read that finds nothing removes them here. Read on the
+/// primary with read concern `local` (see
+/// [`super::bulk_submit::primary_selection`]).
+///
+/// A tenant that is simply empty loses its marker too. That only costs it the
+/// tuple path until its next `$reindex`; pair validation is correct.
+async fn remove_markers_of_a_purged_tenant(
+    db: &mongodb::Database,
+    tenant_id: &str,
+    written: &[String],
+) -> StorageResult<()> {
+    if written.is_empty() {
+        return Ok(());
+    }
+    let present = db
+        .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+        .find_one(doc! { "tenant_id": tenant_id })
+        .projection(doc! { "_id": 1 })
+        .selection_criteria(super::bulk_submit::primary_selection())
+        .read_concern(mongodb::options::ReadConcern::local())
+        .await
+        .map_err(|e| {
+            super::storage::internal_error(format!(
+                "Failed to check the tenant before keeping its tuple_code markers: {e}"
+            ))
+        });
+    // An unanswered read is treated as a purge: dropping a marker is safe.
+    if matches!(present, Ok(Some(_))) {
+        return Ok(());
+    }
+    db.collection::<Document>(LAYOUT_COLLECTION)
+        .delete_many(doc! { "_id": { "$in": written } })
+        .await
+        .map_err(|e| {
+            super::storage::internal_error(format!(
+                "Failed to remove the tuple_code markers of a purged tenant: {e}"
+            ))
+        })?;
+    tracing::info!(
+        tenant_id,
+        markers = ?written,
+        "found no resource of the tenant after its `$reindex` (a tenant purge ran) or could \
+         not check: removed the tuple_code markers the run wrote"
+    );
+    present.map(|_| ())
 }
 
 fn warn_unstamped(tenant_id: &str, resource_types: &[String]) {
