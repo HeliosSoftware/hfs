@@ -3361,12 +3361,13 @@ dependencies = [
 
 [[package]]
 name = "helios-cds-hooks-server"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "deadpool-postgres",
  "helios-auth",
  "helios-cds-hooks",
  "http 1.4.0",
@@ -3377,6 +3378,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tower",
  "tower-http 0.5.2",
  "tracing",

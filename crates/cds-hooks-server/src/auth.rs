@@ -1,16 +1,17 @@
-//! Who is calling. Every call carries a JWT the EMR signed (CDS Hooks 2.0,
-//! "Trusting CDS Clients"): `iss` names the client, the signature is checked
-//! against the keys at the `jku` the registry holds for that `iss` (never one
-//! taken from the token), `aud` must be one of this service's own URLs, `exp`
-//! must be in the future and `jti` must not have been seen before.
+//! Who is calling. Every call, discovery included, carries a JWT the EMR
+//! signed (CDS Hooks 2.0.1, "Trusting CDS Clients"): `iss`, with `tenant`
+//! when the issuer signs for several organizations, names the client; the
+//! signature is checked against the keys at the `jku` the registry holds for
+//! that issuer (never one taken from the token), `aud` must be one of this
+//! service's own URLs, `exp` must be in the future and `jti` must not have
+//! been seen before, on any instance.
 //!
-//! A valid token from an issuer the registry does not know is refused: a
-//! well-formed JWT from an EMR that is not a client is still an unauthorized
-//! call.
+//! A valid token from an issuer or tenant the registry does not know is
+//! refused: a well-formed JWT from an EMR that is not a client is still an
+//! unauthorized call.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, header};
 use base64::Engine;
@@ -20,11 +21,8 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::clients::{Client, ClientRegistry};
+use crate::replay::{LEEWAY_SECS, MemoryReplayStore, ReplayStore};
 
-/// Seconds of clock skew tolerated on `exp`, `nbf` and `iat`.
-const LEEWAY_SECS: u64 = 60;
-/// How many seen `jti` values are kept before expired ones are purged.
-const REPLAY_PURGE_AT: usize = 10_000;
 /// Seconds between two fetches of one client's JWKS when a `kid` is unknown.
 const JWKS_MIN_REFRESH_SECS: u64 = 60;
 
@@ -42,8 +40,12 @@ pub enum Refusal {
     Missing,
     #[error("the bearer token could not be read")]
     Malformed,
-    #[error("the token's issuer is not a registered client")]
+    #[error("the token's issuer and tenant are not a registered client")]
     UnknownIssuer,
+    #[error("the call's path names another client")]
+    WrongPath,
+    #[error("the replay store is not available")]
+    Unavailable,
     #[error("the token's signing key is not known")]
     UnknownKey,
     #[error("the token is not valid")]
@@ -57,6 +59,8 @@ pub enum Refusal {
 #[derive(Debug, Deserialize)]
 struct Claims {
     iss: String,
+    #[serde(default)]
+    tenant: Option<String>,
     jti: String,
     exp: u64,
 }
@@ -64,15 +68,20 @@ struct Claims {
 pub struct Authenticator {
     registry: Arc<ClientRegistry>,
     jwks: Mutex<HashMap<String, Arc<JwksCache>>>,
-    seen: Mutex<HashMap<String, u64>>,
+    replay: Arc<dyn ReplayStore>,
 }
 
 impl Authenticator {
+    /// With the in-process replay store: one instance, or tests.
     pub fn new(registry: Arc<ClientRegistry>) -> Self {
+        Self::with_replay_store(registry, Arc::new(MemoryReplayStore::new()))
+    }
+
+    pub fn with_replay_store(registry: Arc<ClientRegistry>, replay: Arc<dyn ReplayStore>) -> Self {
         Self {
             registry,
             jwks: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
+            replay,
         }
     }
 
@@ -91,10 +100,10 @@ impl Authenticator {
             _ => return Err(Refusal::Malformed),
         };
         let kid = header.kid.ok_or(Refusal::Malformed)?;
-        let iss = unverified_issuer(token).ok_or(Refusal::Malformed)?;
+        let (iss, tenant) = unverified_identity(token).ok_or(Refusal::Malformed)?;
         let client = self
             .registry
-            .by_iss(&iss)
+            .by_issuer(&iss, tenant.as_deref())
             .cloned()
             .ok_or(Refusal::UnknownIssuer)?;
         let jku = client.jku.clone().ok_or(Refusal::UnknownIssuer)?;
@@ -116,7 +125,10 @@ impl Authenticator {
                 Refusal::Invalid
             })?
             .claims;
-        self.record_jti(&claims)?;
+        if claims.tenant != client.tenant {
+            return Err(Refusal::Invalid);
+        }
+        self.record_jti(&claims).await?;
         Ok(ClientContext {
             client,
             anonymous: false,
@@ -159,23 +171,19 @@ impl Authenticator {
             .clone()
     }
 
-    fn record_jti(&self, claims: &Claims) -> Result<(), Refusal> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let key = format!("{}|{}", claims.iss, claims.jti);
-        let mut seen = self.seen.lock().expect("replay cache");
-        if seen.len() >= REPLAY_PURGE_AT {
-            seen.retain(|_, exp| *exp + LEEWAY_SECS > now);
+    async fn record_jti(&self, claims: &Claims) -> Result<(), Refusal> {
+        let nonce = match &claims.tenant {
+            Some(tenant) => format!("{}|{}|{}", claims.iss, tenant, claims.jti),
+            None => format!("{}|{}", claims.iss, claims.jti),
+        };
+        match self.replay.first_use(&nonce, claims.exp).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Refusal::Replay),
+            Err(e) => {
+                warn!(error = %e, "replay store failed; refusing the call");
+                Err(Refusal::Unavailable)
+            }
         }
-        if let Some(exp) = seen.get(&key)
-            && *exp + LEEWAY_SECS > now
-        {
-            return Err(Refusal::Replay);
-        }
-        seen.insert(key, claims.exp);
-        Ok(())
     }
 }
 
@@ -185,14 +193,20 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
 }
 
-/// The `iss` claim read before verification, only to pick which keys verify it.
-fn unverified_issuer(token: &str) -> Option<String> {
+/// The `iss` and `tenant` claims read before verification, only to pick the
+/// client whose keys verify the token; both are checked again after.
+fn unverified_identity(token: &str) -> Option<(String, Option<String>)> {
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("iss")?.as_str().map(str::to_string)
+    let iss = value.get("iss")?.as_str()?.to_string();
+    let tenant = value
+        .get("tenant")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    Some((iss, tenant))
 }
 
 #[cfg(test)]
@@ -208,10 +222,19 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(br#"{"iss":"https://emr.example.org","jti":"1"}"#);
         assert_eq!(
-            unverified_issuer(&format!("h.{payload}.s")).as_deref(),
-            Some("https://emr.example.org")
+            unverified_identity(&format!("h.{payload}.s")),
+            Some(("https://emr.example.org".to_string(), None))
         );
-        assert!(unverified_issuer("not-a-token").is_none());
+        let with_tenant = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"https://cloud.example.org","tenant":"north","jti":"1"}"#);
+        assert_eq!(
+            unverified_identity(&format!("h.{with_tenant}.s")),
+            Some((
+                "https://cloud.example.org".to_string(),
+                Some("north".to_string())
+            ))
+        );
+        assert!(unverified_identity("not-a-token").is_none());
     }
 
     #[tokio::test]
@@ -237,6 +260,7 @@ mod tests {
             client: Client {
                 id: "x".into(),
                 iss: None,
+                tenant: None,
                 jku: None,
                 fhir_server: Some("https://fhir.example.org/".into()),
                 services: vec![],

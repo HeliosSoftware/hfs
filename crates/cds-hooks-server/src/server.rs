@@ -21,6 +21,7 @@ use crate::auth::{Authenticator, ClientContext, Refusal};
 use crate::catalog::ServiceCatalog;
 use crate::clients::ClientRegistry;
 use crate::galleri_service::GalleriCoverageService;
+use crate::replay::{MemoryReplayStore, PostgresReplayStore, ReplayStore};
 
 /// Everything a request needs: the services on offer and who may call them.
 pub struct AppState {
@@ -29,7 +30,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// With the in-process replay store: one instance, or tests.
     pub fn new(catalog: ServiceCatalog, registry: ClientRegistry) -> Self {
+        Self::with_replay_store(catalog, registry, Arc::new(MemoryReplayStore::new()))
+    }
+
+    pub fn with_replay_store(
+        catalog: ServiceCatalog,
+        registry: ClientRegistry,
+        replay: Arc<dyn ReplayStore>,
+    ) -> Self {
         for (client, service) in registry.unknown_services(&catalog.ids()) {
             warn!(
                 client,
@@ -41,7 +51,7 @@ impl AppState {
         }
         Self {
             catalog,
-            auth: Authenticator::new(Arc::new(registry)),
+            auth: Authenticator::with_replay_store(Arc::new(registry), replay),
         }
     }
 }
@@ -52,6 +62,9 @@ pub struct ServerConfig {
     pub host: String,
     /// The client registry file (`CDS_HOOKS_CLIENTS`); none means the development registry.
     pub clients: Option<PathBuf>,
+    /// The Postgres URL of the shared `jti` replay store (`CDS_HOOKS_REPLAY_DATABASE_URL`);
+    /// none means this process's memory, enough for one instance.
+    pub replay_database: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +76,9 @@ impl Default for ServerConfig {
                 .unwrap_or(8787),
             host: std::env::var("CDS_HOOKS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             clients: std::env::var_os("CDS_HOOKS_CLIENTS").map(PathBuf::from),
+            replay_database: std::env::var("CDS_HOOKS_REPLAY_DATABASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 }
@@ -83,10 +99,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             http::header::AUTHORIZATION,
         ]);
 
+    // The same three routes twice: at the root, where the token alone names the
+    // client, and under `/c/{client}`, where the path names it too and must
+    // agree with the token. The path form serves EMRs that cannot sign their
+    // discovery call and dedicated deployments routed by path.
     Router::new()
         .route("/cds-services", get(discovery))
         .route("/cds-services/{id}", post(invoke))
         .route("/cds-services/{id}/feedback", post(feedback))
+        .route("/c/{client}/cds-services", get(discovery_at))
+        .route("/c/{client}/cds-services/{id}", post(invoke_at))
+        .route("/c/{client}/cds-services/{id}/feedback", post(feedback_at))
         .route("/health", get(health_check))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -106,7 +129,17 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
             ClientRegistry::development(&catalog.ids())
         }
     };
-    let state = Arc::new(AppState::new(catalog, registry));
+    let replay: Arc<dyn ReplayStore> = match &config.replay_database {
+        Some(url) => {
+            info!("jti replay store: Postgres, shared across instances");
+            Arc::new(PostgresReplayStore::connect(url).await?)
+        }
+        None => {
+            warn!("CDS_HOOKS_REPLAY_DATABASE_URL is not set: jti replay protection is per process");
+            Arc::new(MemoryReplayStore::new())
+        }
+    };
+    let state = Arc::new(AppState::with_replay_store(catalog, registry, replay));
 
     let app = build_router(state);
 
@@ -122,12 +155,45 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 
 // --- Handlers ---
 
+/// The caller, from the token; when the path names a client too, the same one.
+async fn resolve(
+    state: &AppState,
+    headers: &HeaderMap,
+    path_client: Option<&str>,
+) -> Result<ClientContext, Reply> {
+    let ctx = state.auth.authenticate(headers).await?;
+    if let Some(named) = path_client
+        && named != ctx.client.id
+    {
+        info!(client = %ctx.client.id, path_client = named, "path names another client");
+        return Err(Refusal::WrongPath.into());
+    }
+    Ok(ctx)
+}
+
 /// GET /cds-services — the caller's own catalog: its enabled services, its prefetch.
 async fn discovery(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<DiscoveryResponse>, Reply> {
-    let ctx = state.auth.authenticate(&headers).await?;
+    discover(&state, &headers, None).await
+}
+
+/// GET /c/{client}/cds-services — the same catalog, at the client's own URL.
+async fn discovery_at(
+    State(state): State<Arc<AppState>>,
+    Path(client): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DiscoveryResponse>, Reply> {
+    discover(&state, &headers, Some(&client)).await
+}
+
+async fn discover(
+    state: &AppState,
+    headers: &HeaderMap,
+    path_client: Option<&str>,
+) -> Result<Json<DiscoveryResponse>, Reply> {
+    let ctx = resolve(state, headers, path_client).await?;
     let services = state.catalog.definitions_for(&ctx.client);
     info!(client = %ctx.client.id, anonymous = ctx.anonymous, services = services.len(), "discovery");
     Ok(Json(DiscoveryResponse { services }))
@@ -140,12 +206,32 @@ async fn invoke(
     headers: HeaderMap,
     Json(request): Json<CdsRequest>,
 ) -> Result<Json<CdsResponse>, Reply> {
-    let ctx = state.auth.authenticate(&headers).await?;
+    answer(&state, &headers, None, &id, request).await
+}
+
+/// POST /c/{client}/cds-services/{id} — the same, at the client's own URL.
+async fn invoke_at(
+    State(state): State<Arc<AppState>>,
+    Path((client, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<CdsRequest>,
+) -> Result<Json<CdsResponse>, Reply> {
+    answer(&state, &headers, Some(&client), &id, request).await
+}
+
+async fn answer(
+    state: &AppState,
+    headers: &HeaderMap,
+    path_client: Option<&str>,
+    id: &str,
+    request: CdsRequest,
+) -> Result<Json<CdsResponse>, Reply> {
+    let ctx = resolve(state, headers, path_client).await?;
     Authenticator::check_fhir_server(&ctx, request.fhir_server.as_deref())?;
     let service = state
         .catalog
-        .for_client(&ctx.client, &id)
-        .ok_or_else(|| Reply::not_found(&ctx, &id))?;
+        .for_client(&ctx.client, id)
+        .ok_or_else(|| Reply::not_found(&ctx, id))?;
     let definition = service.definition();
     if definition.hook != request.hook {
         return Err(Reply::bad_request(format!(
@@ -171,11 +257,31 @@ async fn feedback(
     headers: HeaderMap,
     Json(feedback): Json<FeedbackRequest>,
 ) -> Result<StatusCode, Reply> {
-    let ctx = state.auth.authenticate(&headers).await?;
+    record_feedback(&state, &headers, None, &id, feedback).await
+}
+
+/// POST /c/{client}/cds-services/{id}/feedback — the same, at the client's own URL.
+async fn feedback_at(
+    State(state): State<Arc<AppState>>,
+    Path((client, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(feedback): Json<FeedbackRequest>,
+) -> Result<StatusCode, Reply> {
+    record_feedback(&state, &headers, Some(&client), &id, feedback).await
+}
+
+async fn record_feedback(
+    state: &AppState,
+    headers: &HeaderMap,
+    path_client: Option<&str>,
+    id: &str,
+    feedback: FeedbackRequest,
+) -> Result<StatusCode, Reply> {
+    let ctx = resolve(state, headers, path_client).await?;
     let service = state
         .catalog
-        .for_client(&ctx.client, &id)
-        .ok_or_else(|| Reply::not_found(&ctx, &id))?;
+        .for_client(&ctx.client, id)
+        .ok_or_else(|| Reply::not_found(&ctx, id))?;
     service.feedback(&feedback).await.map_err(Reply::from)?;
     info!(client = %ctx.client.id, service = %id, cards = feedback.feedback.len(), "feedback");
     Ok(StatusCode::OK)
@@ -217,7 +323,8 @@ impl Reply {
 impl From<Refusal> for Reply {
     fn from(refusal: Refusal) -> Self {
         let status = match refusal {
-            Refusal::ForeignFhirServer => StatusCode::FORBIDDEN,
+            Refusal::ForeignFhirServer | Refusal::WrongPath => StatusCode::FORBIDDEN,
+            Refusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
         Self {

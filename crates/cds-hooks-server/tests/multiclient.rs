@@ -1,6 +1,7 @@
-//! Two EMR instances against one server: each signs with its own key, sees
-//! its own catalog, may call only what it enabled, and nothing unsigned or
-//! unknown gets through.
+//! Several clients against one server: each signs with its own key (or with a
+//! shared issuer's key and its own `tenant`), sees its own catalog, may call
+//! only what it enabled, at the root or at its own URL, and nothing unsigned,
+//! unknown or addressed to another client gets through.
 
 use std::sync::Arc;
 
@@ -33,14 +34,28 @@ async fn jwks_server() -> String {
 }
 
 fn token(iss: &str, aud: &str, jti: &str, exp_offset: i64, kid: Option<&str>) -> String {
+    token_for(iss, None, aud, jti, exp_offset, kid)
+}
+
+fn token_for(
+    iss: &str,
+    tenant: Option<&str>,
+    aud: &str,
+    jti: &str,
+    exp_offset: i64,
+    kid: Option<&str>,
+) -> String {
     let now = chrono::Utc::now().timestamp();
-    let claims = json!({
+    let mut claims = json!({
         "iss": iss,
         "aud": aud,
         "jti": jti,
         "iat": now,
         "exp": now + exp_offset,
     });
+    if let Some(tenant) = tenant {
+        claims["tenant"] = json!(tenant);
+    }
     let header = Header {
         alg: Algorithm::RS256,
         kid: kid.map(str::to_string),
@@ -84,7 +99,11 @@ async fn state(jwks_base: &str) -> Arc<AppState> {
 }
 
 async fn get_discovery(app: &Router, bearer: Option<&str>) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri("/cds-services");
+    get_discovery_at(app, "/cds-services", bearer).await
+}
+
+async fn get_discovery_at(app: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri);
     if let Some(t) = bearer {
         builder = builder.header("Authorization", format!("Bearer {t}"));
     }
@@ -104,12 +123,16 @@ async fn get_discovery(app: &Router, bearer: Option<&str>) -> (StatusCode, Value
 }
 
 async fn post_hook(app: &Router, id: &str, bearer: &str, body: &Value) -> (StatusCode, Value) {
+    post_hook_at(app, &format!("/cds-services/{id}"), bearer, body).await
+}
+
+async fn post_hook_at(app: &Router, uri: &str, bearer: &str, body: &Value) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/cds-services/{id}"))
+                .uri(uri)
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {bearer}"))
                 .body(Body::from(serde_json::to_vec(body).unwrap()))
@@ -246,6 +269,131 @@ async fn unsigned_unknown_expired_replayed_and_misaddressed_tokens_are_refused()
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn tenants_of_one_issuer_are_different_clients() {
+    // One cloud EMR signs for two hospitals with one key: `iss` is the vendor,
+    // `tenant` is the hospital.
+    let jwks = jwks_server().await;
+    let cloud = "https://cloud-emr.example.org";
+    let registry = ClientRegistry::from_yaml(&format!(
+        "audience: [{AUD}]\nclients:\n  - id: north\n    iss: {cloud}\n    tenant: north\n    jku: {jwks}/.well-known/jwks.json\n    services: [bcbsm-galleri-crd]\n  - id: south\n    iss: {cloud}\n    tenant: south\n    jku: {jwks}/.well-known/jwks.json\n    services: []\n"
+    ))
+    .unwrap();
+    let app = build_router(Arc::new(AppState::new(catalog(), registry)));
+
+    let (status, body) = get_discovery(
+        &app,
+        Some(&token_for(cloud, Some("north"), AUD, "n-1", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["services"].as_array().unwrap().len(), 1);
+
+    let (status, body) = get_discovery(
+        &app,
+        Some(&token_for(cloud, Some("south"), AUD, "s-1", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["services"].as_array().unwrap().len(), 0);
+
+    // A tenant the issuer has no client for, and the issuer without a tenant: nobody.
+    let (status, _) = get_discovery(
+        &app,
+        Some(&token_for(cloud, Some("east"), AUD, "e-1", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = get_discovery(&app, Some(&token(cloud, AUD, "c-1", 300, Some(KID)))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The same jti from two tenants of one issuer are two nonces, not a replay.
+    let (first, _) = get_discovery(
+        &app,
+        Some(&token_for(
+            cloud,
+            Some("north"),
+            AUD,
+            "shared",
+            300,
+            Some(KID),
+        )),
+    )
+    .await;
+    let (second, _) = get_discovery(
+        &app,
+        Some(&token_for(
+            cloud,
+            Some("south"),
+            AUD,
+            "shared",
+            300,
+            Some(KID),
+        )),
+    )
+    .await;
+    assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+}
+
+#[tokio::test]
+async fn the_path_form_names_the_client_and_must_agree_with_the_token() {
+    let jwks = jwks_server().await;
+    let app = build_router(state(&jwks).await);
+    let a = "https://emr.hospital-a.example.org";
+    let b = "https://emr.hospital-b.example.org";
+
+    // Hospital A at its own URL: the same catalog as at the root.
+    let (status, body) = get_discovery_at(
+        &app,
+        "/c/hospital-a/cds-services",
+        Some(&token(a, AUD, "p-1", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["services"][0]["id"], "bcbsm-galleri-crd");
+    let (status, body) = post_hook_at(
+        &app,
+        "/c/hospital-a/cds-services/bcbsm-galleri-crd",
+        &token(a, AUD, "p-2", 300, Some(KID)),
+        &galleri_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["cards"].as_array().unwrap().len(), 1);
+
+    // Hospital A's token at hospital B's URL, and B's token at A's: refused, and
+    // nothing of the other client's catalog is returned.
+    let (status, body) = get_discovery_at(
+        &app,
+        "/c/hospital-b/cds-services",
+        Some(&token(a, AUD, "p-3", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.get("services").is_none());
+    let (status, _) = post_hook_at(
+        &app,
+        "/c/hospital-a/cds-services/bcbsm-galleri-crd",
+        &token(b, AUD, "p-4", 300, Some(KID)),
+        &galleri_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A path naming a client that does not exist, with a valid token: refused too.
+    let (status, _) = get_discovery_at(
+        &app,
+        "/c/nobody/cds-services",
+        Some(&token(a, AUD, "p-5", 300, Some(KID))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unsigned at the path form: still 401; the path alone never identifies a caller.
+    let (status, _) = get_discovery_at(&app, "/c/hospital-a/cds-services", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

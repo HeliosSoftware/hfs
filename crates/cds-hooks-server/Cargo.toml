@@ -13,6 +13,8 @@ helios-cds-hooks = { path = "../cds-hooks", version = "0.2.4" }
 helios-auth = { path = "../auth", version = "0.2.4" }
 jsonwebtoken = "9"
 base64 = "0.22"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 serde_yaml = "0.9"
 thiserror = "2"
 serde = { workspace = true }

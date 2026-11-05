@@ -1,8 +1,10 @@
 //! The client registry: which EMR instances may call this service, how each
 //! one signs its calls, and which services each one has enabled.
 //!
-//! A client is one EMR instance (one `iss`). The registry is a YAML file named
-//! by `CDS_HOOKS_CLIENTS`; without it the server runs with a built-in
+//! A client is one healthcare organization on one EMR instance: one `iss`, or
+//! one `iss` and one `tenant` when the issuer signs for several organizations
+//! (a cloud EMR with one key and many hospitals). The registry is a YAML file
+//! named by `CDS_HOOKS_CLIENTS`; without it the server runs with a built-in
 //! development registry in which every caller is the client `dev`.
 
 use std::collections::HashMap;
@@ -28,6 +30,10 @@ pub struct Client {
     /// The `iss` the client's JWTs carry; the registry key.
     #[serde(default)]
     pub iss: Option<String>,
+    /// The `tenant` claim the client's JWTs carry, when its issuer signs for
+    /// several organizations. Clients sharing an issuer are told apart by it.
+    #[serde(default)]
+    pub tenant: Option<String>,
     /// Where the client publishes the keys it signs with.
     #[serde(default)]
     pub jku: Option<String>,
@@ -80,6 +86,7 @@ impl ClientRegistry {
             clients: vec![Client {
                 id: "dev".to_string(),
                 iss: None,
+                tenant: None,
                 jku: None,
                 fhir_server: None,
                 services: service_ids.to_vec(),
@@ -90,7 +97,8 @@ impl ClientRegistry {
 
     fn validate(&self) -> Result<(), RegistryError> {
         let mut ids = std::collections::HashSet::new();
-        let mut issuers = std::collections::HashSet::new();
+        let mut identities = std::collections::HashSet::new();
+        let mut issuers: HashMap<&str, (&str, bool)> = HashMap::new();
         for client in &self.clients {
             if client.id.trim().is_empty() {
                 return Err(RegistryError::Invalid("a client has no id".into()));
@@ -102,14 +110,44 @@ impl ClientRegistry {
                 )));
             }
             match (&client.iss, &client.jku) {
-                (Some(iss), Some(_)) => {
-                    if !issuers.insert(iss.as_str()) {
+                (Some(iss), Some(jku)) => {
+                    if !identities.insert((iss.as_str(), client.tenant.as_deref())) {
+                        return Err(RegistryError::Invalid(match &client.tenant {
+                            Some(tenant) => {
+                                format!(
+                                    "issuer {iss:?} with tenant {tenant:?} belongs to two clients"
+                                )
+                            }
+                            None => format!("issuer {iss:?} belongs to two clients"),
+                        }));
+                    }
+                    let has_tenant = client.tenant.is_some();
+                    match issuers.get(iss.as_str()) {
+                        Some((other_jku, other_has_tenant)) => {
+                            if *other_jku != jku {
+                                return Err(RegistryError::Invalid(format!(
+                                    "issuer {iss:?} publishes its keys at two different jku"
+                                )));
+                            }
+                            if *other_has_tenant != has_tenant {
+                                return Err(RegistryError::Invalid(format!(
+                                    "issuer {iss:?} has a client without a tenant and clients with one"
+                                )));
+                            }
+                        }
+                        None => {
+                            issuers.insert(iss.as_str(), (jku.as_str(), has_tenant));
+                        }
+                    }
+                }
+                (None, None) => {
+                    if client.tenant.is_some() {
                         return Err(RegistryError::Invalid(format!(
-                            "issuer {iss:?} belongs to two clients"
+                            "client {:?} has a tenant but no iss",
+                            client.id
                         )));
                     }
                 }
-                (None, None) => {}
                 _ => {
                     return Err(RegistryError::Invalid(format!(
                         "client {:?} needs both iss and jku, or neither",
@@ -133,8 +171,13 @@ impl ClientRegistry {
         Ok(())
     }
 
-    pub fn by_iss(&self, iss: &str) -> Option<&Client> {
-        self.clients.iter().find(|c| c.iss.as_deref() == Some(iss))
+    /// The client a token's `iss` and `tenant` name. A tenant the issuer has
+    /// no client for, or a missing tenant where the issuer's clients have one,
+    /// names nobody.
+    pub fn by_issuer(&self, iss: &str, tenant: Option<&str>) -> Option<&Client> {
+        self.clients
+            .iter()
+            .find(|c| c.iss.as_deref() == Some(iss) && c.tenant.as_deref() == tenant)
     }
 
     pub fn by_id(&self, id: &str) -> Option<&Client> {
@@ -171,11 +214,42 @@ mod tests {
             "audience: [https://cds.example.org]\nclients:\n  - id: helios-emr\n    iss: https://emr.example.org\n    jku: https://emr.example.org/.well-known/jwks.json\n    services: [bcbsm-galleri-crd]\n    prefetch:\n      bcbsm-galleri-crd:\n        patient: Patient/{{context.patientId}}\n",
         )
         .unwrap();
-        let client = registry.by_iss("https://emr.example.org").unwrap();
+        let client = registry.by_issuer("https://emr.example.org", None).unwrap();
         assert_eq!(client.id, "helios-emr");
         assert!(client.has_service("bcbsm-galleri-crd"));
         assert_eq!(client.prefetch["bcbsm-galleri-crd"].len(), 1);
-        assert!(registry.by_iss("https://other.example.org").is_none());
+        assert!(
+            registry
+                .by_issuer("https://other.example.org", None)
+                .is_none()
+        );
+        assert!(
+            registry
+                .by_issuer("https://emr.example.org", Some("t"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tenants_tell_apart_clients_that_share_an_issuer() {
+        let registry = ClientRegistry::from_yaml(
+            "audience: [a]\nclients:\n  - id: north\n    iss: https://cloud.example.org\n    tenant: north\n    jku: https://cloud.example.org/jwks\n  - id: south\n    iss: https://cloud.example.org\n    tenant: south\n    jku: https://cloud.example.org/jwks\n",
+        )
+        .unwrap();
+        let iss = "https://cloud.example.org";
+        assert_eq!(registry.by_issuer(iss, Some("north")).unwrap().id, "north");
+        assert_eq!(registry.by_issuer(iss, Some("south")).unwrap().id, "south");
+        assert!(registry.by_issuer(iss, Some("east")).is_none());
+        assert!(registry.by_issuer(iss, None).is_none());
+
+        let twice = "audience: [a]\nclients:\n  - id: x\n    iss: https://c\n    tenant: t\n    jku: https://c/jwks\n  - id: y\n    iss: https://c\n    tenant: t\n    jku: https://c/jwks\n";
+        assert!(ClientRegistry::from_yaml(twice).is_err());
+        let mixed = "audience: [a]\nclients:\n  - id: x\n    iss: https://c\n    jku: https://c/jwks\n  - id: y\n    iss: https://c\n    tenant: t\n    jku: https://c/jwks\n";
+        assert!(ClientRegistry::from_yaml(mixed).is_err());
+        let two_jku = "audience: [a]\nclients:\n  - id: x\n    iss: https://c\n    tenant: t\n    jku: https://c/jwks\n  - id: y\n    iss: https://c\n    tenant: u\n    jku: https://c/other\n";
+        assert!(ClientRegistry::from_yaml(two_jku).is_err());
+        let orphan = "clients:\n  - id: x\n    tenant: t\n";
+        assert!(ClientRegistry::from_yaml(orphan).is_err());
     }
 
     #[test]

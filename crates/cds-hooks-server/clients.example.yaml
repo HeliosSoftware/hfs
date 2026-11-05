@@ -35,6 +35,23 @@ clients:
     services:
       - bcbsm-galleri-crd
 
+  # Two hospitals on one cloud EMR: the vendor signs for both with one key
+  # (one iss, one jku), and the JWT's `tenant` claim says which hospital is
+  # calling. Every client of such an issuer needs a tenant, and a token with a
+  # tenant the issuer has no client for is refused.
+  - id: north-clinic
+    iss: https://cloud-emr.example.org
+    tenant: north-clinic
+    jku: https://cloud-emr.example.org/.well-known/jwks.json
+    fhir_server: https://cloud-emr.example.org/north-clinic/fhir
+    services:
+      - bcbsm-galleri-crd
+  - id: south-clinic
+    iss: https://cloud-emr.example.org
+    tenant: south-clinic
+    jku: https://cloud-emr.example.org/.well-known/jwks.json
+    services: []
+
   # A client with no signing material can only be reached as anonymous_client.
   - id: helios-emr-dev
     services:
