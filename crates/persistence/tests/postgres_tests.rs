@@ -12487,11 +12487,11 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/p1"])
             )
             .await,
-            vec!["ob-pat", "ob-ver"],
+            vec!["ob-abs", "ob-pat", "ob-ver"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
-            vec!["ob-abs", "ob-grp", "ob-none", "ob-other"],
+            vec!["ob-grp", "ob-none", "ob-other"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["p1"])).await,
@@ -12500,7 +12500,7 @@ mod postgres_integration {
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1", "Group/p1"])).await,
-            vec!["ob-abs", "ob-none", "ob-other"],
+            vec!["ob-none", "ob-other"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
@@ -34954,29 +34954,6 @@ mod postgres_integration {
                 Divergence {
                     label: "Observation?subject:Patient=Group/p1",
                     expect: Expect::Ids(&["ob-grp"]),
-                },
-                // SUSPECTED BUG (PostgreSQL): `build_reference_condition` has no
-                // `:not` arm, so `subject:not=X` behaves like `subject=X` (the
-                // positive match; `:not=Patient/nobody` returns nothing). SQLite,
-                // ES and MongoDB negate. Recorded, not endorsed.
-                Divergence {
-                    label: "Observation?subject:not=Patient/p1",
-                    expect: Expect::Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
-                },
-                Divergence {
-                    label: "Observation?subject:not=Patient/p1,Group/p1",
-                    expect: Expect::Ids(&[
-                        "ob-abs",
-                        "ob-abs-ver",
-                        "ob-foreign",
-                        "ob-grp",
-                        "ob-pat",
-                        "ob-ver",
-                    ]),
-                },
-                Divergence {
-                    label: "Observation?subject:not=Patient/nobody",
-                    expect: Expect::Ids(&[]),
                 },
                 // `:above` a `_history/1` URL also finds the `_history/2` form
                 // (the version segment is not compared); SQLite and ES return
