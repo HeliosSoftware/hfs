@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 22 crates (21 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
+The project is a Rust workspace with 23 crates (22 default-members; `pysof` excluded from the default build). Counted by hand from `crates/*/Cargo.toml` and the root `Cargo.toml`'s `[workspace] default-members`, cross-checked with `cargo metadata --no-deps --offline` — no build required. This table has drifted from the workspace twice already (missing `helios-ui-chrome` and `helios-hts-ui`); prefer deriving the count over trusting this prose, see `.hfs-monitor/project.md`.
 
 | Crate | Description |
 |-------|-------------|
@@ -27,6 +27,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | **`helios-audit`** | Audit logging — FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine — rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |
 | **`helios-cds-hooks`** | CDS Hooks protocol types and async service trait (HL7 CDS Hooks v3.0.0-ballot). Standalone library. |
+| **`helios-cds-hooks-server`** | CDS Hooks service for many clients (Axum) — client registry, JWT validation per client (`iss`/`tenant`), shared `jti` replay store, discovery computed per client, per-client URLs. Configured via `CDS_HOOKS_*`. |
 | **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
 | **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS — Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
 | **`helios-ui-chrome`** (`crates/ui-chrome`) | Shared Askama chrome partials for the HFS and HTS web UIs — the topbar account menu and Capability Statement projection, so `helios-ui` and `helios-hts-ui` link the same markup instead of each keeping a copy. |
@@ -45,6 +46,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | `config-advisor` | helios-persistence | Storage configuration advisor |
 | `hts` | helios-hts | FHIR Terminology Server (HTS) |
 | `validator-cli` | helios-fhir-validator | FHIR resource validator CLI (`cli` feature) |
+| `cds-hooks-server` | helios-cds-hooks-server | CDS Hooks service for many clients |
 
 ### Key Design Patterns
 
