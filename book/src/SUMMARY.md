@@ -1,6 +1,13 @@
-# Summary
+# The Helios FHIR Server
 
-- [Introduction](ch01-introduction.md)
+[The Helios FHIR Server](title-page.md)
+[Foreword](foreword.md)
+
+[Introduction](introduction.md)
+
+---
+
+- [Getting Started with FHIR](ch01-introduction.md)
 - [Installation](ch02-installation.md)
 - [Quick Start](ch03-quickstart.md)
 - [FHIR Basics](ch04-fhir-basics.md)
@@ -19,6 +26,7 @@
 - [Embedding HFS as a Library](ch12-embedding.md)
 - [Development Setup](ch13-dev-setup.md)
 - [Contributing Guidelines](ch14-contributing.md)
+- [Live API Demo](live-api-demo.md)
 
 ---
 
