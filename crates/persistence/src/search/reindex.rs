@@ -4145,14 +4145,9 @@ async fn run_page_stream(
         // here, a page at a time, now that nothing cleared up front.
         if shared.clear_existing {
             let ids: Vec<String> = page.resources.iter().map(|r| r.id().to_string()).collect();
-            if let Err(e) = delete_ids_from_writers(
-                &shared.writers,
-                &shared.tenant,
-                &resource_type,
-                &ids,
-                true,
-            )
-            .await
+            if let Err(e) =
+                delete_ids_from_writers(&shared.writers, &shared.tenant, &resource_type, &ids, true)
+                    .await
             {
                 return Err(RunExit::Failed(format!(
                     "Failed to clear search index entries: {e}"
@@ -10833,9 +10828,13 @@ mod tests {
                 .entry(self.key.clone())
                 .or_default() += 1;
             if self.fail {
-                return Err(crate::error::BackendError::Unavailable {
+                // A permanent error: an `Unavailable` one is retried by
+                // `retry_transient_read`, and each retry would wait on
+                // `fail_gate` again, which the test releases only once.
+                return Err(crate::error::BackendError::Internal {
                     backend_name: "split".into(),
                     message: format!("injected fetch failure of range {}", self.key),
+                    source: None,
                 }
                 .into());
             }
