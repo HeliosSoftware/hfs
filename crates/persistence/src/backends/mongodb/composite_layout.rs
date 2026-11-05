@@ -41,9 +41,11 @@ use std::time::{Duration, Instant};
 use mongodb::bson::{Document, doc};
 
 use super::backend::MongoBackend;
-use super::search_index_catalog::COMPOSITE_TUPLE_GENERATION;
+use super::composite_search::TUPLE_CODE_FIELD;
+use super::search_index_catalog::{COMPOSITE_TUPLE_GENERATION, SEARCH_INDEX_COLLECTION};
 use crate::error::StorageResult;
 use crate::search::ReindexCoverage;
+use crate::types::SearchParamType;
 
 pub(super) const LAYOUT_COLLECTION: &str = "search_layout";
 /// `_v2`: the length-prefixed `tuple_code` forms. A marker of the first,
@@ -172,30 +174,93 @@ impl MongoBackend {
     }
 
     /// Records that every row of `coverage` in `tenant_id` now carries
-    /// `tuple_code`.
+    /// `tuple_code`, after checking it: a scope that still holds a quantity row
+    /// the planner would miss (written during the `$reindex` by an older
+    /// instance, or by a path that does not stamp) gets no marker, with a
+    /// warning. For a run over every type that means no tenant marker at all.
     pub(super) async fn record_composite_tuple_codes_complete(
         &self,
         tenant_id: &str,
         coverage: ReindexCoverage<'_>,
     ) -> StorageResult<()> {
+        let db = self.get_database().await?;
         match coverage {
             ReindexCoverage::Tenant => {
-                self.upsert_layout_marker(tenant_marker_id(tenant_id), tenant_id, None)
-                    .await?
+                let mut unstamped = Vec::new();
+                for (resource_type, params) in self.token_quantity_params(tenant_id, None) {
+                    if has_unstamped_quantity_rows(&db, tenant_id, &resource_type, &params).await? {
+                        unstamped.push(resource_type);
+                    }
+                }
+                if unstamped.is_empty() {
+                    self.upsert_layout_marker(&db, tenant_marker_id(tenant_id), tenant_id, None)
+                        .await?;
+                } else {
+                    warn_unstamped(tenant_id, &unstamped);
+                }
             }
             ReindexCoverage::Types(types) => {
+                let checked = self.token_quantity_params(tenant_id, Some(types));
+                let mut unstamped = Vec::new();
                 for resource_type in types {
+                    let params = checked
+                        .iter()
+                        .find(|(checked_type, _)| checked_type == resource_type)
+                        .map_or(&[][..], |(_, params)| params.as_slice());
+                    if has_unstamped_quantity_rows(&db, tenant_id, resource_type, params).await? {
+                        unstamped.push(resource_type.clone());
+                        continue;
+                    }
                     self.upsert_layout_marker(
+                        &db,
                         type_marker_id(tenant_id, resource_type),
                         tenant_id,
                         Some(resource_type),
                     )
                     .await?;
                 }
+                if !unstamped.is_empty() {
+                    warn_unstamped(tenant_id, &unstamped);
+                }
             }
         }
         self.composite_marker_cache.forget_tenant(tenant_id);
         Ok(())
+    }
+
+    /// The codes of the two-component token+quantity composites of each
+    /// resource type (of `types`, or of every registered type), types without
+    /// one left out: the parameters the planner reads through `tuple_code`.
+    fn token_quantity_params(
+        &self,
+        tenant_id: &str,
+        types: Option<&[String]>,
+    ) -> Vec<(String, Vec<String>)> {
+        let registry = self.tenant_registry(tenant_id);
+        let registry = registry.read();
+        let types = types.map_or_else(|| registry.resource_types(), <[String]>::to_vec);
+        types
+            .into_iter()
+            .filter_map(|resource_type| {
+                let params: Vec<String> = registry
+                    .get_all_params(&resource_type)
+                    .iter()
+                    .filter(|param| {
+                        param.param_type == SearchParamType::Composite
+                            && matches!(
+                                param.component.as_deref(),
+                                Some([token, quantity])
+                                    if registry.get_by_url(&token.definition)
+                                        .is_some_and(|d| d.param_type == SearchParamType::Token)
+                                    && registry.get_by_url(&quantity.definition)
+                                        .is_some_and(|d| d.param_type == SearchParamType::Quantity)
+                            )
+                    })
+                    .map(|param| param.code.clone())
+                    .collect();
+                (!params.is_empty()).then_some((resource_type, params))
+            })
+            .collect()
     }
 
     /// Deletes the markers of `tenant_id` (tenant purge).
@@ -216,11 +281,11 @@ impl MongoBackend {
 
     async fn upsert_layout_marker(
         &self,
+        db: &mongodb::Database,
         id: String,
         tenant_id: &str,
         resource_type: Option<&str>,
     ) -> StorageResult<()> {
-        let db = self.get_database().await?;
         db.collection::<Document>(LAYOUT_COLLECTION)
             .update_one(
                 doc! { "_id": id },
@@ -238,6 +303,87 @@ impl MongoBackend {
             })?;
         Ok(())
     }
+}
+
+/// Whether `resource_type` of `tenant_id` holds a quantity row of one of the
+/// token+quantity composites `params` without `tuple_code` whose group has a
+/// token row with a code: a row the tuple path would miss. A group whose token
+/// rows carry no code (a `CodeableConcept` with only `text`) is legitimately
+/// left unstamped and is not counted.
+///
+/// Cost: the first stage reads `idx_search_quantity_v2` over
+/// `(tenant_id, resource_type, param_name)` and fetches each quantity row of
+/// those parameters to test `tuple_code` (no index can find an absent field
+/// under the partial `idx_search_composite_tuple_qty`); each unstamped row then
+/// costs one point lookup on `idx_search_composite`. So one document read per
+/// composite quantity value of the scope, once per completed `$reindex` that
+/// just rewrote every one of those rows: a fraction of the reindex itself.
+async fn has_unstamped_quantity_rows(
+    db: &mongodb::Database,
+    tenant_id: &str,
+    resource_type: &str,
+    params: &[String],
+) -> StorageResult<bool> {
+    if params.is_empty() {
+        return Ok(false);
+    }
+    let pipeline = vec![
+        doc! { "$match": {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "param_name": { "$in": params },
+            "value_quantity_value": { "$exists": true },
+            "composite_group": { "$exists": true },
+            TUPLE_CODE_FIELD: { "$exists": false },
+        } },
+        doc! { "$lookup": {
+            "from": SEARCH_INDEX_COLLECTION,
+            "let": {
+                "id": "$resource_id",
+                "param": "$param_name",
+                "group": "$composite_group",
+            },
+            "pipeline": [
+                { "$match": {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "value_token_code": { "$exists": true },
+                    "$expr": { "$and": [
+                        { "$eq": ["$resource_id", "$$id"] },
+                        { "$eq": ["$param_name", "$$param"] },
+                        { "$eq": ["$composite_group", "$$group"] },
+                    ] },
+                } },
+                { "$limit": 1 },
+                { "$project": { "_id": 1 } },
+            ],
+            "as": "token",
+        } },
+        doc! { "$match": { "token.0": { "$exists": true } } },
+        doc! { "$limit": 1 },
+        doc! { "$project": { "_id": 1 } },
+    ];
+    let mut cursor = db
+        .collection::<Document>(SEARCH_INDEX_COLLECTION)
+        .aggregate(pipeline)
+        .await
+        .map_err(|e| {
+            super::storage::internal_error(format!("Failed to check tuple_code coverage: {e}"))
+        })?;
+    cursor.advance().await.map_err(|e| {
+        super::storage::internal_error(format!("Failed to check tuple_code coverage: {e}"))
+    })
+}
+
+fn warn_unstamped(tenant_id: &str, resource_types: &[String]) {
+    tracing::warn!(
+        tenant_id,
+        resource_types = ?resource_types,
+        "token+quantity composite quantity rows without tuple_code remain after `$reindex` \
+         (an older instance or a raw writer wrote them while it ran): no tuple_code marker \
+         recorded for these types, so their composite searches keep pair validation; stop \
+         the older instances and run `$reindex` again"
+    );
 }
 
 #[cfg(test)]

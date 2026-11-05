@@ -7,7 +7,8 @@
 use super::*;
 use futures::TryStreamExt;
 use helios_persistence::search::{
-    ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus,
+    ReindexCoverage, ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus,
+    ReindexTarget,
 };
 
 use super::composite_plan::{command_of, profiled};
@@ -394,6 +395,76 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         found(&returned, &first, "8302-2$gt160").await,
         sorted(tall.clone())
     );
+}
+
+/// N5: a completed `$reindex` marks nothing over a quantity row without
+/// `tuple_code` whose group has a coded token row (an older instance wrote it
+/// while the run went on), per tenant or per type; a type without
+/// token+quantity composites is still marked, and so is a tenant whose only
+/// unstamped quantity rows belong to groups with no code, which are never
+/// stamped.
+#[tokio::test]
+async fn mongodb_a_quantity_row_without_tuple_code_blocks_the_marker() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_verify").await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let late = create_tenant("composite-tuple-verify-late");
+    seed(&backend, &late).await;
+    // Written during the run by an instance that predates `tuple_code`.
+    unstamp(&backend, "composite-tuple-verify-late", Some("h-30")).await;
+
+    backend
+        .reindex_run_completed(&late, ReindexCoverage::Tenant)
+        .await;
+    assert_eq!(markers(&backend).await, Vec::<String>::new());
+    let types = ["Observation".to_string(), "Patient".to_string()];
+    backend
+        .reindex_run_completed(&late, ReindexCoverage::Types(&types))
+        .await;
+    assert_eq!(
+        markers(&backend).await,
+        vec!["composite-tuple-verify-late|Patient|composite_tuple_code_v2".to_string()]
+    );
+    assert!(!tuple_path_used(&backend, &late).await);
+
+    // A group whose token has no code: its quantity row is never stamped.
+    let codeless = create_tenant("composite-tuple-verify-codeless");
+    seed(&backend, &codeless).await;
+    backend
+        .seed_create(
+            &codeless,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "no-code", "status": "final",
+                "code": {"coding": [{"system": LOINC, "display": "Body height"}]},
+                "valueQuantity": {"value": 170.0, "unit": "cm", "system": UCUM},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let unstamped = raw_db(&backend)
+        .await
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": "composite-tuple-verify-codeless",
+            "param_name": "code-value-quantity",
+            "value_quantity_value": { "$exists": true },
+            "tuple_code": { "$exists": false },
+        })
+        .await
+        .unwrap();
+    backend
+        .reindex_run_completed(&codeless, ReindexCoverage::Tenant)
+        .await;
+    assert!(
+        markers(&backend)
+            .await
+            .contains(&"composite-tuple-verify-codeless|composite_tuple_code_v2".to_string()),
+        "codeless group ({unstamped} unstamped quantity rows) blocked the marker"
+    );
+    assert!(tuple_path_used(&backend, &codeless).await);
 }
 
 /// The planner's tuple read, profiled: it scans `idx_search_composite_tuple_qty`
