@@ -1,0 +1,442 @@
+name: Release build
+
+# Builds every release artifact and smoke-tests each on a GitHub-hosted
+# machine of its own platform. Publishes nothing: `ci.yml` calls this as its
+# `build` job on a `v*` tag, and its `release`, `publish-pypi` and
+# `docker-build` jobs publish what this uploads. Artifacts a called workflow
+# uploads belong to the calling run, so their names and layout are the
+# contract with those jobs:
+#
+#   hfs-<target>    the shipped binaries at the paths `cargo` left them
+#                   (`target/release/...` native, `target/<target>/release/...`
+#                   cross), plus `data/`. `release` finds them by name under
+#                   `target/` (depth 3); `docker-build` names the path.
+#   pysof-<target>  the pysof wheels (and the sdist, from Linux x86_64).
+#   test_report     the SQL-on-FHIR conformance report `publish-report` deploys.
+#
+# Where each target builds, and why:
+#
+#   * Linux x86_64 and macOS (Apple Silicon): natively, on a self-hosted Linux
+#     agent and on the Mac (agent5).
+#   * Windows: cross-compiled on a self-hosted Linux agent with cargo-xwin
+#     against Microsoft's MSVC CRT and Windows SDK, same target
+#     (x86_64-pc-windows-msvc) and same 16 MB main-thread stack as the native
+#     build it replaces. No Windows agent is needed.
+#   * Linux ARM64: cross-compiled on a self-hosted Linux agent with
+#     cargo-zigbuild against glibc 2.28, the floor the Mac's cross-compile
+#     gave it before. Off the Mac, the macOS build no longer waits behind it.
+#
+# GitHub's hosted Macs cannot do this build: `macos-latest` and
+# `macos-15-intel` both hit the job time limit still compiling (#2484). The
+# trial in #2484 ran the two cross-compiled legs and their smoke tests.
+#
+# A pull request that changes this file or the smoke script runs it, all
+# four legs, to try the change before a tag does.
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release-build.yml
+      - .github/scripts/release-smoke.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # In-checkout: the upload steps and `docker-build` name `target/...`
+  # directly, and `actions/checkout` cleans it, so every release is a
+  # from-scratch build.
+  CARGO_TARGET_DIR: target
+  # The shipped binaries. Keep in sync with the `for bin in ...` loop in
+  # ci.yml's `release` job.
+  RELEASE_BINS: hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor hts
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 1440
+    env:
+      # Release-mode rustc processes are far larger than dev ones, ~17.5 GB
+      # for helios-fhir alone. At 4 jobs a release build exhausted a 32 GB
+      # Linux agent and took the runner offline (#2484, run 41744976492).
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux-x86
+            runner: [self-hosted, Linux]
+            target: x86_64-unknown-linux-gnu
+            jobs: 2
+          # 1, not 2. At 2, helios-sof and helios-fhirpath compiled side by
+          # side on github-agent8, were OOM-killed, and the runner went
+          # offline (#2484, run 41926491026). At 1: 196 min plus 35 min of
+          # wheels (run 41940631989).
+          - os: Linux-ARM64
+            runner: [self-hosted, Linux]
+            target: aarch64-unknown-linux-gnu
+            jobs: 1
+          - os: Windows
+            runner: [self-hosted, Linux]
+            target: x86_64-pc-windows-msvc
+            jobs: 2
+          - os: macOS
+            runner: [self-hosted, macOS]
+            target: aarch64-apple-darwin
+            jobs: 2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # Every leg on a Linux agent, cross or not: the cross legs compile their
+      # build scripts for this host, and the file would otherwise hold
+      # whatever the agent's last job wrote.
+      - name: Configure Rust to use LLD (Linux host)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Configure Rust linker (macOS)
+        if: matrix.os == 'macOS'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. ld64
+          # prints a benign "__eh_frame section too large" for large binaries,
+          # which current stable turns into a warning. No custom linker flags
+          # on macOS: see "Configure Rust linker (macOS)" in ci.yml for the two
+          # that were tried and broke the build. The main-thread stack already
+          # defaults to 8 MB there.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+
+      # --- Windows: cargo-xwin -------------------------------------------
+
+      # clang 19 or newer: the MSVC C++ headers reject older clang (STL1000),
+      # which `mimalloc` (pysof) hits. The agents' distro clang is 18.
+      - name: Install LLVM 19 (Windows)
+        if: matrix.os == 'Windows'
+        run: |
+          set -euo pipefail
+          ver=19.1.7
+          sha=4a5ec53951a584ed36f80240f6fbf8fdd46b4cf6c7ee87cc2d5018dc37caf679
+          dir="$RUNNER_TOOL_CACHE/llvm-$ver"
+          if [ ! -x "$dir/bin/clang-cl" ]; then
+            tmp=$(mktemp -d)
+            curl -sSfL --retry 5 -o "$tmp/llvm.tar.xz" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-Linux-X64.tar.xz"
+            echo "$sha  $tmp/llvm.tar.xz" | sha256sum -c -
+            rm -rf "$dir.partial"
+            mkdir -p "$dir.partial"
+            tar -xJf "$tmp/llvm.tar.xz" --strip-components=1 -C "$dir.partial"
+            rm -rf "$dir" "$tmp"
+            mv "$dir.partial" "$dir"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/clang-cl" --version | head -1
+
+      - name: Install cargo-xwin (Windows)
+        if: matrix.os == 'Windows'
+        run: |
+          set -euo pipefail
+          want=0.23.1
+          if ! cargo xwin --version 2>/dev/null | grep -q " $want$"; then
+            cargo install --locked cargo-xwin --version "$want"
+          fi
+          cargo xwin --version
+
+      - name: Build release binaries and pysof wheels (Windows)
+        if: matrix.os == 'Windows'
+        env:
+          # cargo-xwin downloads the MSVC CRT and Windows SDK from Microsoft
+          # and needs their license accepted. Setting this accepts it for this
+          # repo's CI: https://go.microsoft.com/fwlink/?LinkId=2086102
+          XWIN_ACCEPT_LICENSE: "1"
+          # The 16 MB main-thread stack the native Windows build linked with.
+          # cargo-xwin appends its own flags to this variable rather than
+          # replacing it; the check below verifies the result.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/STACK:16777216"
+          # `--workspace` includes pysof, and PyO3 cannot ask a Windows Python
+          # for its version here. The wheels are built per interpreter anyway.
+          PYO3_CROSS_PYTHON_VERSION: "3.12"
+        run: |
+          set -euo pipefail
+          cargo xwin build --workspace --all-features --release --target ${{ matrix.target }}
+          cd crates/pysof
+          uv run maturin build --release -o dist --target ${{ matrix.target }} \
+            -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      - name: Check the binaries (16 MB stack)
+        if: matrix.os == 'Windows'
+        run: |
+          set -euo pipefail
+          for b in $RELEASE_BINS; do
+            exe="target/${{ matrix.target }}/release/$b.exe"
+            stack=$(llvm-objdump -p "$exe" | awk '/SizeOfStackReserve/ {print $2}')
+            echo "$b.exe: stack reserve 0x$stack"
+            if [ "$stack" != "0000000001000000" ]; then
+              echo "::error::$b.exe has stack reserve 0x$stack, expected 16 MB (0x1000000)"
+              exit 1
+            fi
+          done
+
+      # --- Linux ARM64: cargo-zigbuild ---------------------------------
+
+      # zig, not a manylinux container: ci.yml points DOCKER_HOST at a remote
+      # daemon, which cannot bind-mount this checkout. zig links with lld,
+      # which hfs and pysof need on aarch64: their .text passes the 128 MB
+      # reach of a direct call, and GNU ld fails ("relocation truncated to
+      # fit: R_AARCH64_CALL26").
+      - name: Install zig and cargo-zigbuild (Linux ARM64)
+        if: matrix.os == 'Linux-ARM64'
+        env:
+          ZIG_VERSION: 0.15.1
+          ZIG_SHA256: c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05
+          # 0.24.1 or newer: 0.20.1 passes rustc's `--fix-cortex-a53-843419`
+          # on to zig, which rejects it ("unsupported linker arg").
+          CARGO_ZIGBUILD_VERSION: 0.24.1
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TOOL_CACHE/zig-$ZIG_VERSION"
+          if [ ! -x "$dir/zig" ]; then
+            tmp=$(mktemp -d)
+            curl -sSfL --retry 5 -o "$tmp/zig.tar.xz" \
+              "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+            echo "$ZIG_SHA256  $tmp/zig.tar.xz" | sha256sum -c -
+            rm -rf "$dir.partial"
+            mkdir -p "$dir.partial"
+            tar -xJf "$tmp/zig.tar.xz" --strip-components=1 -C "$dir.partial"
+            rm -rf "$dir" "$tmp"
+            mv "$dir.partial" "$dir"
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/zig" version
+          if ! cargo install --list | grep -q "^cargo-zigbuild v$CARGO_ZIGBUILD_VERSION:"; then
+            cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+          fi
+          cargo install --list | grep '^cargo-zigbuild'
+
+      # `.2.28` pins the glibc the binaries link against. OpenSSL is vendored
+      # by crates/hfs and crates/pysof's aarch64-only `vendored` feature.
+      - name: Build release binaries and pysof wheels (Linux ARM64)
+        if: matrix.os == 'Linux-ARM64'
+        env:
+          PYO3_CROSS_PYTHON_VERSION: "3.12"
+          # 1.16.0, not pysof's locked 1.10.1: that one's bundled
+          # cargo-zigbuild (0.20.1) hits the same rejected linker flag.
+          MATURIN_VERSION: 1.16.0
+        run: |
+          set -euo pipefail
+          cargo zigbuild --workspace --all-features --release --target ${{ matrix.target }}.2.28
+          cd crates/pysof
+          # `uv tool run`, not `uvx`: the agents have uv but no uvx shim.
+          uv tool run --from "maturin==$MATURIN_VERSION" maturin build --release --zig \
+            -o dist --target ${{ matrix.target }} --compatibility manylinux_2_28 \
+            -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      - name: Check the binaries (ARM64, glibc 2.28, vendored OpenSSL)
+        if: matrix.os == 'Linux-ARM64'
+        run: |
+          set -euo pipefail
+          for b in $RELEASE_BINS; do
+            f="target/${{ matrix.target }}/release/$b"
+            file "$f" | grep -q 'ARM aarch64' || { echo "::error::$b is not an ARM64 binary"; exit 1; }
+            if objdump -p "$f" | grep -E 'NEEDED +lib(ssl|crypto)\.so'; then
+              echo "::error::$b links the system OpenSSL; the ARM64 release vendors it"
+              exit 1
+            fi
+            need=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            echo "$b needs $need"
+            if [ "$(printf '%s\n' "$need" GLIBC_2.28 | sort -V | tail -1)" != GLIBC_2.28 ]; then
+              echo "::error::$b needs $need, newer than glibc 2.28"
+              exit 1
+            fi
+          done
+
+      # --- Linux x86_64 and macOS: native --------------------------------
+
+      - name: Build release binaries (native)
+        if: matrix.os == 'Linux-x86' || matrix.os == 'macOS'
+        run: cargo build --workspace --all-features --release
+
+      # NOTE: `run_comprehensive_test_suite` is invoked here BY NAME as a
+      # substring filter, and `cargo test` exits 0 when a filter matches
+      # nothing. This runs only on tags and on changes to this file, so a
+      # rename would not surface on an ordinary PR: the first symptom would be
+      # a release whose published conformance report is missing or stale.
+      # Rename only together with this step, and keep the verification below.
+      - name: Generate test_report.json file
+        if: matrix.os == 'Linux-x86'
+        run: cargo test -p helios-sof run_comprehensive_test_suite
+
+      # Anti-vacuity gate (issue #307). The report is deployed to GitHub Pages
+      # by `publish-report`, so "the step was green" must mean "a real report
+      # exists".
+      - name: Verify SOF conformance report is present and non-vacuous
+        if: matrix.os == 'Linux-x86'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report=crates/sof/test_report.json
+          if [ ! -f "$report" ]; then
+            echo "::error::[REPORT-MISSING] $report was not produced. Either the test-name filter in the previous step matched nothing (cargo test exits 0 in that case), or run_comprehensive_test_suite bailed before writing. Do not ship a release whose published conformance report is absent."
+            exit 1
+          fi
+          # The corpus is 22 files / 144 cases; a floor of 100 catches a
+          # shrunken or half-written report without breaking on a modest
+          # upstream trim.
+          cases=$(python3 -c "import json,sys; d=json.load(open('$report')); print(sum(len(v.get('tests',[])) for v in d.values()))")
+          echo "SOF conformance report records $cases case(s)."
+          if [ "$cases" -lt 100 ]; then
+            echo "::error::[REPORT-VACUOUS] $report records only $cases case(s), expected >=100. The fixture corpus did not fully load, so this report would understate what was verified."
+            exit 1
+          fi
+
+      - name: Upload test_report.json
+        if: matrix.os == 'Linux-x86'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test_report
+          path: crates/sof/test_report.json
+          if-no-files-found: error
+
+      - name: Build pysof wheels (Linux x86_64, with sdist)
+        if: matrix.os == 'Linux-x86'
+        working-directory: crates/pysof
+        run: uv run maturin build --release --sdist -o dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      - name: Build pysof wheels (macOS)
+        if: matrix.os == 'macOS'
+        working-directory: crates/pysof
+        run: uv run maturin build --release -o dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+
+      # --- Every leg ------------------------------------------------------
+
+      # Only the binaries `release` packages and `docker-build` copies, at the
+      # path cargo left them, plus `data/`. Both consumers run in the same
+      # workflow run, so 3 days only has to cover re-running them.
+      - name: Collect release binaries
+        run: |
+          set -euo pipefail
+          case "${{ matrix.os }}" in
+            Linux-x86 | macOS) dir=target/release ;;
+            *) dir="target/${{ matrix.target }}/release" ;;
+          esac
+          ext=""
+          [ "${{ matrix.os }}" = Windows ] && ext=.exe
+          : > release-bins.txt
+          for b in $RELEASE_BINS; do
+            [ -f "$dir/$b$ext" ] || { echo "::error::missing $dir/$b$ext"; exit 1; }
+            echo "$dir/$b$ext" >> release-bins.txt
+          done
+          echo "data/" >> release-bins.txt
+          cat release-bins.txt
+          {
+            echo 'paths<<EOF'
+            cat release-bins.txt
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+        id: bins
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-${{ matrix.target }}
+          path: ${{ steps.bins.outputs.paths }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload pysof wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: pysof-${{ matrix.target }}
+          path: crates/pysof/dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+      # After every upload above, so eviction can never race an artifact this
+      # job still has to publish. The checkout cleans target/, but the last
+      # tag's release target dir would otherwise stay on the agent until the
+      # next one.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  # A build that links is not one that runs: a missing DLL, a wrong-glibc
+  # binary or a wheel tagged for the wrong platform all pass `build`. Each
+  # target is started on a GitHub-hosted machine of its own platform; the
+  # publishing jobs in ci.yml wait for this.
+  smoke:
+    name: Smoke test (${{ matrix.target }} on ${{ matrix.runner }})
+    needs: [build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-${{ matrix.target }}
+          path: smoke/artifact
+
+      - name: Download pysof wheels
+        uses: actions/download-artifact@v8
+        with:
+          name: pysof-${{ matrix.target }}
+          path: smoke/pysof
+
+      # Lay the binaries out as a release archive does: flat, next to data/.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke/bin
+          find smoke/artifact/target -maxdepth 3 -type f -exec cp {} smoke/bin/ \;
+          cp -r smoke/artifact/data smoke/bin/
+          ls -l smoke/bin
+
+      - name: Smoke test
+        shell: bash
+        run: bash .github/scripts/release-smoke.sh smoke/bin smoke/pysof

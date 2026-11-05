@@ -1,5 +1,5 @@
 [book]
-title = "Helios FHIR Server"
+title = "The Helios FHIR Server"
 authors = ["Helios Software"]
 language = "en"
 src = "src"
