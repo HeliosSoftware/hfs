@@ -33,6 +33,18 @@ use crate::search::{
 type StoredByTenant =
     Arc<RwLock<std::collections::HashMap<String, Vec<SearchParameterDefinition>>>>;
 
+/// Per `(tenant, type)`: the fingerprint the last `:missing=true` probe ran
+/// under and which parameters it found fresh (#1999), shared by every clone
+/// of the backend.
+type MissingMetaFresh = Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (String, String),
+            (String, super::missing_fingerprint::MissingFreshness),
+        >,
+    >,
+>;
+
 use super::schema;
 
 /// Builds a MongoDB client from a backend configuration.
@@ -227,14 +239,7 @@ pub struct MongoBackend {
     reindex_docs_per_resource: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
     /// Per `(tenant, type)`: the fingerprint the last `:missing=true` probe
     /// ran under and which parameters it found fresh (#1999).
-    pub(super) missing_meta_fresh: Arc<
-        parking_lot::RwLock<
-            std::collections::HashMap<
-                (String, String),
-                (String, super::missing_fingerprint::MissingFreshness),
-            >,
-        >,
-    >,
+    pub(super) missing_meta_fresh: MissingMetaFresh,
     /// Fingerprints this process has recorded (or is recording) in
     /// `missing_params_fingerprints`.
     pub(super) recorded_missing_fps: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
