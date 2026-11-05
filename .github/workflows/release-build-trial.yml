@@ -169,8 +169,12 @@ jobs:
       # Its own dir, like the Windows leg: nothing is shared with the native
       # x86_64 builds in `${{ github.workspace }}-target`.
       CARGO_TARGET_DIR: ${{ github.workspace }}-target-zig
-      # 2, like ci.yml's release `build` job; see the Windows leg.
-      CARGO_BUILD_JOBS: 2
+      # 1, not 2 like the Windows leg. At 2, run 41926491026 compiled
+      # helios-sof and helios-fhirpath side by side on github-agent8; both
+      # rustc processes were OOM-killed (SIGKILL) and the runner went offline
+      # minutes later. The same build at 2 passed on github-agent1 in 110 min
+      # (run 41897488561), so 2 is at the edge of a 32 GB agent.
+      CARGO_BUILD_JOBS: 1
       # `--workspace` includes pysof, and PyO3 cannot run an ARM64 Python
       # here. The wheels below are built per interpreter regardless.
       PYO3_CROSS_PYTHON_VERSION: "3.12"
