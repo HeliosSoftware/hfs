@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use elasticsearch::http::transport::Transport;
 use elasticsearch::indices::{
-    IndicesDeleteTemplateParts, IndicesExistsTemplateParts, IndicesGetMappingParts,
-    IndicesGetSettingsParts, IndicesPutMappingParts, IndicesPutSettingsParts,
+    IndicesCreateParts, IndicesDeleteTemplateParts, IndicesExistsTemplateParts,
+    IndicesGetMappingParts, IndicesGetSettingsParts, IndicesPutMappingParts,
+    IndicesPutSettingsParts,
 };
 use elasticsearch::{Elasticsearch, IndexParts, SearchParts, UpdateByQueryParts};
 use helios_fhir::FhirVersion;
@@ -959,6 +960,42 @@ fn expected_target(reference: &str) -> Option<String> {
     helios_persistence::types::absolute_reference_target(reference)
 }
 
+/// What the index must hold for `reference`: the target of an absolute
+/// reference, `""` for an absolute one that has none (so it is not selected
+/// again), nothing for a relative one.
+fn expected_stored(reference: &str) -> Option<String> {
+    if reference.starts_with("http://") || reference.starts_with("https://") {
+        Some(expected_target(reference).unwrap_or_default())
+    } else {
+        None
+    }
+}
+
+/// Rows of `index` the migration would still select.
+async fn pending_rows(index: &str) -> u64 {
+    let body: Value = raw_client()
+        .await
+        .count(elasticsearch::CountParts::Index(&[index]))
+        .body(json!({ "query": { "nested": {
+            "path": "search_params.reference",
+            "ignore_unmapped": true,
+            "query": { "bool": {
+                "filter": [{ "bool": { "should": [
+                    { "prefix": { "search_params.reference.reference": "http://" } },
+                    { "prefix": { "search_params.reference.reference": "https://" } }
+                ] } }],
+                "must_not": [{ "exists": { "field": "search_params.reference.reference_target" } }]
+            } }
+        } } }))
+        .send()
+        .await
+        .expect("count")
+        .json()
+        .await
+        .expect("count json");
+    body["count"].as_u64().expect("count")
+}
+
 fn subject_query(value: &str) -> SearchQuery {
     SearchQuery::new("Observation").with_parameter(SearchParameter {
         name: "subject".to_string(),
@@ -968,17 +1005,10 @@ fn subject_query(value: &str) -> SearchQuery {
     })
 }
 
-/// Documents indexed without `reference_target` (as before #2394) get it from
-/// the backend at startup, with exactly the value the writer computes, and the
-/// absolute references then match a plain `Type/id` search. A second start
-/// changes nothing.
-#[tokio::test]
-async fn startup_fills_reference_target_on_documents_indexed_before_it() {
-    let prefix = new_prefix();
-    let first = started_backend_on(&prefix).await;
-    let forms = reference_forms();
-    for (i, reference) in forms.iter().enumerate() {
-        first
+/// Creates one Observation per [`reference_forms`] entry through `backend`.
+async fn seed_observations(backend: &ElasticsearchBackend) {
+    for (i, reference) in reference_forms().iter().enumerate() {
+        backend
             .create(
                 &tenant(),
                 "Observation",
@@ -994,13 +1024,14 @@ async fn startup_fills_reference_target_on_documents_indexed_before_it() {
             .await
             .expect("create");
     }
-    let index = first.index_name("reconcile", "Observation");
+}
 
-    // Today's writer already stores the field; take it away to get the shape an
-    // index written by an older HFS holds.
+/// Today's writer already stores `reference_target`; take it away to get the
+/// shape an index written by an older HFS holds.
+async fn strip_reference_targets(index: &str) {
     let stripped = raw_client()
         .await
-        .update_by_query(UpdateByQueryParts::Index(&[&index]))
+        .update_by_query(UpdateByQueryParts::Index(&[index]))
         .refresh(true)
         .wait_for_completion(true)
         .body(json!({
@@ -1012,43 +1043,49 @@ async fn startup_fills_reference_target_on_documents_indexed_before_it() {
         .await
         .expect("strip");
     assert!(stripped.status_code().is_success(), "strip failed");
-    let before = subject_rows(&index).await;
-    assert_eq!(before.len(), forms.len());
+    let before = subject_rows(index).await;
+    assert_eq!(before.len(), reference_forms().len());
     assert!(before.iter().all(|(_, _, _, target)| target.is_none()));
-    assert_eq!(
-        found_ids(&first, &subject_query("Patient/p1")).await,
-        vec!["ob0".to_string(), "ob1".to_string()],
-        "before the migration only the relative reference matches Patient/p1"
-    );
+}
 
-    // Starting a backend on the index starts the migration in the background.
-    let second = started_backend_on(&prefix).await;
-    let mut after = Vec::new();
+/// Waits for the background migration, then checks every row against the
+/// writer's rule.
+async fn wait_until_migrated(index: &str) {
+    let mut rows = Vec::new();
     for _ in 0..120 {
-        after = subject_rows(&index).await;
-        if after
+        rows = subject_rows(index).await;
+        if rows
             .iter()
-            .all(|(_, _, reference, target)| *target == expected_target(reference))
+            .all(|(_, _, reference, target)| *target == expected_stored(reference))
         {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    for (_, _, reference, target) in &after {
+    for (_, _, reference, target) in &rows {
         assert_eq!(
             *target,
-            expected_target(reference),
+            expected_stored(reference),
             "reference_target of {reference:?}"
         );
     }
     assert!(
-        after.iter().any(|(_, _, _, target)| target.is_some()),
+        rows.iter()
+            .any(|(_, _, _, target)| target.as_deref().is_some_and(|t| !t.is_empty())),
         "the table must contain absolute references that resolve"
     );
+    assert!(
+        rows.iter()
+            .any(|(_, _, _, target)| target.as_deref() == Some("")),
+        "the table must contain absolute references that do not"
+    );
+    assert_eq!(pending_rows(index).await, 0, "nothing may stay selected");
+}
 
-    // And the search the field exists for now finds them.
-    let found = found_ids(&second, &subject_query("Patient/p1")).await;
-    let mut want: Vec<String> = forms
+/// The Observations a plain `subject=Patient/p1` must find once every
+/// reference has its target.
+fn patient_p1_observations() -> Vec<String> {
+    let mut want: Vec<String> = reference_forms()
         .iter()
         .enumerate()
         .filter(|(_, r)| {
@@ -1059,12 +1096,145 @@ async fn startup_fills_reference_target_on_documents_indexed_before_it() {
         .map(|(i, _)| format!("ob{i}"))
         .collect();
     want.sort();
-    assert_eq!(found, want);
+    want
+}
 
-    // A third start finds nothing left that can change: no document is rewritten.
+/// Documents indexed without `reference_target` (as before #2394) get it from
+/// the backend at startup, with exactly the value the writer computes, and the
+/// absolute references then match a plain `Type/id` search. A second start
+/// changes nothing.
+#[tokio::test]
+async fn startup_fills_reference_target_on_documents_indexed_before_it() {
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    seed_observations(&first).await;
+    let index = first.index_name("reconcile", "Observation");
+    strip_reference_targets(&index).await;
+    assert_eq!(
+        found_ids(&first, &subject_query("Patient/p1")).await,
+        vec!["ob0".to_string(), "ob1".to_string()],
+        "before the migration only the relative references match Patient/p1"
+    );
+
+    // Starting a backend on the index starts the migration in the background.
+    let second = started_backend_on(&prefix).await;
+    wait_until_migrated(&index).await;
+    assert_eq!(
+        found_ids(&second, &subject_query("Patient/p1")).await,
+        patient_p1_observations()
+    );
+
+    // A third start finds nothing left, so it rewrites nothing.
     let versions: Vec<u64> = subject_rows(&index).await.iter().map(|r| r.1).collect();
     started_backend_on(&prefix).await;
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(pending_rows(&index).await, 0);
     let again: Vec<u64> = subject_rows(&index).await.iter().map(|r| r.1).collect();
     assert_eq!(versions, again, "a finished migration rewrites nothing");
+}
+
+/// The write path: an old index an older HFS instance created *after* this one
+/// started is reconciled by the first write that reaches it, and that write
+/// starts the migration too.
+#[tokio::test]
+async fn the_write_path_fills_reference_target_on_an_index_the_startup_pass_did_not_see() {
+    let prefix = new_prefix();
+    let older = started_backend_on(&prefix).await;
+    let newer = started_backend_on(&prefix).await;
+
+    // Created after `newer` started, so only `ensure_index` can reach it.
+    seed_observations(&older).await;
+    let index = older.index_name("reconcile", "Observation");
+    strip_reference_targets(&index).await;
+    downgrade_to_pre_1335_mapping(&index, json!({})).await;
+
+    // The write itself succeeds, and brings the mapping and the data along.
+    newer
+        .create(
+            &tenant(),
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "fresh",
+                "status": "final",
+                "code": { "text": "x" },
+                "subject": { "reference": "http://example.org/fhir/Patient/p1" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("write through the newer instance");
+    assert_reconciled(&mapping_of(&index).await);
+    wait_until_migrated(&index).await;
+    let mut want = patient_p1_observations();
+    want.push("fresh".to_string());
+    want.sort();
+    assert_eq!(found_ids(&newer, &subject_query("Patient/p1")).await, want);
+}
+
+/// The migration only touches indices whose mapping has `reference_target` as a
+/// `keyword`. On one where the field is mapped some other way (here `text`, as
+/// dynamic mapping would leave it), writing it would not help and must not
+/// happen; that index must not stop the migration of the HFS indices next to
+/// it. (The index template applies to every index under the prefix, so a
+/// foreign index with no mapping at all cannot be built here; that case is
+/// covered by the unit test of `indices_with_reference_target` and by
+/// `ignore_unmapped` in the query.)
+#[tokio::test]
+async fn the_migration_skips_an_index_whose_field_is_not_a_keyword_and_migrates_the_rest() {
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    seed_observations(&first).await;
+    let index = first.index_name("reconcile", "Observation");
+    strip_reference_targets(&index).await;
+
+    let odd = format!("{prefix}_odd_observation");
+    let raw = raw_client().await;
+    let created = raw
+        .indices()
+        .create(IndicesCreateParts::Index(&odd))
+        .body(
+            json!({ "mappings": { "properties": { "search_params": { "properties": {
+            "reference": { "type": "nested", "properties": {
+                "reference_target": { "type": "text" }
+            } }
+        } } } } }),
+        )
+        .send()
+        .await
+        .expect("create odd index");
+    assert!(created.status_code().is_success(), "create odd index");
+    let indexed = raw
+        .index(IndexParts::IndexId(&odd, "1"))
+        .refresh(elasticsearch::params::Refresh::True)
+        .body(json!({ "search_params": { "reference": [
+            { "name": "subject", "reference": "http://example.org/fhir/Patient/p1" }
+        ] } }))
+        .send()
+        .await
+        .expect("index odd doc");
+    assert!(indexed.status_code().is_success());
+
+    started_backend_on(&prefix).await;
+    wait_until_migrated(&index).await;
+
+    let doc: Value = raw
+        .get(elasticsearch::GetParts::IndexId(&odd, "1"))
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        doc["_source"]["search_params"]["reference"][0]
+            .get("reference_target")
+            .is_none(),
+        "{doc}"
+    );
+    assert_eq!(doc["_version"], json!(1), "the odd index is not rewritten");
+    assert_eq!(
+        mapping_of(&odd).await["properties"]["search_params"]["properties"]["reference"]["properties"]
+            ["reference_target"]["type"],
+        "text"
+    );
 }

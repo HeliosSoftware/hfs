@@ -982,7 +982,7 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
     // `search_params.reference.reference_target`. Fill it inside the cluster, in
     // the background; it also resumes a run an earlier start did not finish,
     // since the query selects only what is left.
-    super::reference_migration::migrate_reference_targets(backend, &pattern, false).await;
+    super::reference_migration::migrate_reference_targets(backend, &pattern).await;
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -1032,7 +1032,7 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             warn_reindex_needed(&indices_holding_documents(&names, &counts));
         }
         // #2394: see `reconcile_index_mappings`.
-        super::reference_migration::migrate_reference_targets(backend, index, false).await;
+        super::reference_migration::migrate_reference_targets(backend, index).await;
     }
     note_reconcile_outcome(backend, index, &outcome);
 }

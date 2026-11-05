@@ -652,8 +652,13 @@ pub(crate) fn build_es_document(
                 if let Some(ri) = ref_id {
                     ref_doc["resource_id"] = json!(ri);
                 }
-                if let Some(target) = crate::types::absolute_reference_target(reference) {
-                    ref_doc["reference_target"] = json!(target);
+                // An absolute reference that does not end in a FHIR `Type/id` gets
+                // the empty string, which no search matches: it marks the row as
+                // handled, so the startup migration does not select it again.
+                if reference.starts_with("http://") || reference.starts_with("https://") {
+                    ref_doc["reference_target"] = json!(
+                        crate::types::absolute_reference_target(reference).unwrap_or_default()
+                    );
                 }
                 if let Some(d) = display {
                     ref_doc["display"] = json!(d);

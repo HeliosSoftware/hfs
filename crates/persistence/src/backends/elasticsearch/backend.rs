@@ -428,6 +428,9 @@ pub struct ElasticsearchBackend {
     /// `schema::SCHEMA_VERSION` (or found it cannot), so `ensure_index` checks
     /// each index once per process rather than on every write (#1335).
     schema_checked: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Indices for which this process already started the `reference_target`
+    /// migration (#2394), so concurrent first writes start it once.
+    reference_migration_started: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Rayon pool for `$reindex` page extraction; built lazily and only on
     /// a multi-thread runtime (#1250). `Err` remembers a failed build so the
     /// one warning fires once.
@@ -532,6 +535,7 @@ impl ElasticsearchBackend {
             config,
             registries,
             schema_checked: Default::default(),
+            reference_migration_started: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
@@ -557,6 +561,7 @@ impl ElasticsearchBackend {
             config,
             registries,
             schema_checked: Default::default(),
+            reference_migration_started: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
@@ -662,6 +667,19 @@ impl ElasticsearchBackend {
     /// Whether this process has already reconciled `index`'s mapping.
     pub(super) fn is_schema_checked(&self, index: &str) -> bool {
         self.schema_checked.lock().contains(index)
+    }
+
+    /// Claims the right to start the `reference_target` migration of `index`:
+    /// `true` the first time, `false` afterwards.
+    pub(super) fn claim_reference_migration(&self, index: &str) -> bool {
+        self.reference_migration_started
+            .lock()
+            .insert(index.to_string())
+    }
+
+    /// Gives the claim back after a failed attempt so a later call retries.
+    pub(super) fn release_reference_migration(&self, index: &str) {
+        self.reference_migration_started.lock().remove(index);
     }
 
     /// Records that `index`'s mapping needs no further reconciling by this
