@@ -14,8 +14,8 @@ pub const SOFTWARE_NAME: &str = "Helios FHIR Server";
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Abbreviated git commit the build was cut from, when `build.rs` could
-/// determine one; absent for a source tarball with no `.git`, or with no
-/// `git` on `PATH`. Overridable at build time via `HFS_GIT_SHA`.
+/// determine one; absent in a debug build, for a source tarball with no `.git`,
+/// or with no `git` on `PATH`. Overridable at build time via `HFS_GIT_SHA`.
 ///
 /// `option_env!`, not `env!` with an empty-string sentinel: clippy const-folds
 /// `is_empty()` on anything reachable through `env!`, so the sentinel check in
