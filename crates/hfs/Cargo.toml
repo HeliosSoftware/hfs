@@ -119,8 +119,8 @@ testcontainers = { version = "0.27", features = ["watchdog"] }
 [target.'cfg(windows)'.dev-dependencies]
 testcontainers = { version = "0.27" }
 
-# Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
-# doesn't have target-platform OpenSSL dev libs).  Cargo feature unification
+# Vendor OpenSSL when cross-compiling for Linux ARM64 (the release build's
+# zig cross-compile, release-build.yml, has no ARM64 OpenSSL to link).  Cargo feature unification
 # makes this apply to every transitive openssl-sys consumer in the workspace.
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
