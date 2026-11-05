@@ -10,12 +10,21 @@
 //!
 //! 1. `HFS_GIT_SHA` in the build environment — lets a packager building from
 //!    a source tarball (no `.git`) inject the commit it was cut from.
-//! 2. `git rev-parse --short HEAD`, when `git` is on `PATH` and the source
-//!    tree is a checkout (a linked worktree counts).
+//! 2. `git rev-parse --short HEAD`, in a release-profile build only, when
+//!    `git` is on `PATH` and the source tree is a checkout (a linked worktree
+//!    counts).
 //! 3. Nothing at all: `HFS_BUILD_GIT_SHA` is left unset. This is never an
 //!    error — a tarball build with no `git` in it must still compile — and
 //!    `src/build_info.rs` reads the variable with `option_env!`, so "unknown"
 //!    is its absence rather than an empty-string sentinel.
+//!
+//! Debug builds (`cargo build`, `cargo test`, CI) skip step 2. To keep the
+//! commit current, step 2 makes cargo rerun this script whenever `.git/HEAD`
+//! or the branch ref changes, which happens on every commit and checkout.
+//! Rerunning it changes `HFS_BUILD_GIT_SHA`, so helios-rest and every crate
+//! that depends on it recompiles: ~4 minutes of each CI build, even when the
+//! new commit changed nothing in Rust. Release artifacts, the ones whose
+//! commit someone needs to read back, are built with `--release`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,7 +36,13 @@ fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(git_short_sha);
+        .or_else(|| {
+            // Cargo sets PROFILE to "release" for `--release` and for any
+            // custom profile that inherits from it, "debug" otherwise.
+            (std::env::var("PROFILE").as_deref() == Ok("release"))
+                .then(git_short_sha)
+                .flatten()
+        });
 
     // Emitted only when a commit is known. With an empty-string sentinel the
     // consumer had to ask `!GIT_SHA_RAW.is_empty()`, and clippy const-folds
