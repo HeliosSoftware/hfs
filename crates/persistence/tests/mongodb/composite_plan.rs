@@ -404,7 +404,7 @@ fn returned(operation: &Document) -> i64 {
         .unwrap_or(0)
 }
 
-fn command_of(operation: &Document) -> &Document {
+pub(super) fn command_of(operation: &Document) -> &Document {
     operation
         .get_document("originatingCommand")
         .or_else(|_| operation.get_document("command"))
@@ -451,7 +451,7 @@ fn limits_rows_to(operation: &Document, rows: i64) -> bool {
         })
 }
 
-async fn profiled<T>(
+pub(super) async fn profiled<T>(
     db: &mongodb::Database,
     work: impl std::future::Future<Output = T>,
 ) -> (T, Vec<Document>) {

@@ -10,10 +10,12 @@ use helios_persistence::search::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus,
 };
 
+use super::composite_plan::{command_of, profiled};
 use super::reindex_id_walk::wait_for_terminal;
 
 const LOINC: &str = "http://loinc.org";
 const UCUM: &str = "http://unitsofmeasure.org";
+const LOCAL: &str = "http://local";
 const LAYOUT: &str = "search_layout";
 
 fn observation(id: &str, code: &str, value: f64) -> serde_json::Value {
@@ -391,4 +393,354 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         found(&returned, &first, "8302-2$gt160").await,
         sorted(tall.clone())
     );
+}
+
+/// The planner's tuple read, profiled: it scans `idx_search_composite_tuple_qty`
+/// for a bare code and for `system|code` (`$in` over the partial index).
+#[tokio::test]
+async fn mongodb_the_tuple_path_scans_the_tuple_index() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_explain").await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("composite-tuple-explain");
+    let (tall, _) = seed(&backend, &tenant).await;
+    reindex(&backend, &tenant, ReindexRequest::default()).await;
+    let db = raw_db(&backend).await;
+    for value in ["8302-2$gt160", "http://loinc.org|8302-2$gt160"] {
+        let (ids, operations) = profiled(&db, found(&backend, &tenant, value)).await;
+        assert_eq!(ids, sorted(tall.clone()), "{value}");
+        let tuple_reads: Vec<&Document> = operations
+            .iter()
+            .filter(|operation| mentions_tuple_code(&Bson::Document(command_of(operation).clone())))
+            .collect();
+        assert!(
+            !tuple_reads.is_empty(),
+            "{value}: no read filtered on tuple_code"
+        );
+        for read in tuple_reads {
+            let plan = read.get_str("planSummary").unwrap_or_default();
+            assert!(
+                plan.contains("tuple_code"),
+                "{value}: the tuple read used {plan}: {read}"
+            );
+            let docs = read
+                .get_i64("docsExamined")
+                .or_else(|_| read.get_i32("docsExamined").map(i64::from))
+                .unwrap_or(-1);
+            let keys = read
+                .get_i64("keysExamined")
+                .or_else(|_| read.get_i32("keysExamined").map(i64::from))
+                .unwrap_or(-1);
+            eprintln!("{value}: plan {plan}, keysExamined {keys}, docsExamined {docs}");
+        }
+    }
+}
+
+fn mentions_tuple_code(value: &Bson) -> bool {
+    match value {
+        Bson::Document(document) => document
+            .iter()
+            .any(|(key, value)| key == "tuple_code" || mentions_tuple_code(value)),
+        Bson::Array(values) => values.iter().any(mentions_tuple_code),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Oracle: the tuple path against pair validation on the same corpus.
+// ---------------------------------------------------------------------------
+
+/// 24 Observations over three patients: heights with a second, local coding
+/// (and, on `o00`, a coding without system and one whose code holds `|`),
+/// weights in kg and lb, and blood-pressure panels whose two components carry
+/// values far apart, so a cross-group match would show. Two are deleted.
+async fn seed_corpus(backend: &MongoBackend, tenant: &TenantContext) {
+    for i in 0..24_u32 {
+        let id = format!("o{i:02}");
+        let mut resource = json!({
+            "resourceType": "Observation", "id": id,
+            "status": if i % 4 == 3 { "amended" } else { "final" },
+            "subject": {"reference": format!("Patient/p{}", i % 3)},
+            "effectiveDateTime": format!("2020-01-{:02}", i + 1),
+        });
+        match i % 3 {
+            0 => {
+                let mut codings = vec![
+                    json!({"system": LOINC, "code": "8302-2"}),
+                    json!({"system": LOCAL, "code": "L-height"}),
+                ];
+                if i == 0 {
+                    codings.push(json!({"code": "nosys"}));
+                    codings.push(json!({"code": "a|b"}));
+                }
+                resource["code"] = json!({ "coding": codings });
+                resource["valueQuantity"] = json!({
+                    "value": 150 + i * 2, "unit": "cm", "system": UCUM, "code": "cm",
+                });
+            }
+            1 => {
+                resource["code"] = json!({"coding": [{"system": LOINC, "code": "29463-7"}]});
+                resource["valueQuantity"] = if i % 2 == 1 {
+                    json!({"value": 50 + i, "unit": "lb", "system": UCUM, "code": "[lb_av]"})
+                } else {
+                    json!({"value": 50 + i, "unit": "kg", "system": UCUM, "code": "kg"})
+                };
+            }
+            _ => {
+                resource["code"] = json!({"coding": [{"system": LOINC, "code": "85354-9"}]});
+                resource["component"] = json!([
+                    {
+                        "code": {"coding": [{"system": LOINC, "code": "8480-6"}]},
+                        "valueQuantity": {"value": 100 + i, "unit": "mmHg", "system": UCUM, "code": "mm[Hg]"},
+                    },
+                    {
+                        "code": {"coding": [{"system": LOINC, "code": "8462-4"}]},
+                        "valueQuantity": {"value": 60 + i, "unit": "mmHg", "system": UCUM, "code": "mm[Hg]"},
+                    },
+                ]);
+            }
+        }
+        backend
+            .seed_create(tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    for deleted in ["o06", "o17"] {
+        backend
+            .delete(tenant, "Observation", deleted)
+            .await
+            .unwrap();
+    }
+}
+
+fn composite(name: &str, token: &str, quantity: &str, value: &str) -> SearchParameter {
+    SearchParameter {
+        name: name.to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: token.to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: quantity.to_string(),
+            },
+        ],
+    }
+}
+
+fn cvq(value: &str) -> SearchParameter {
+    composite("code-value-quantity", "code", "value-quantity", value)
+}
+
+fn component(value: &str) -> SearchParameter {
+    composite(
+        "component-code-value-quantity",
+        "component-code",
+        "component-value-quantity",
+        value,
+    )
+}
+
+fn combo(value: &str) -> SearchParameter {
+    composite(
+        "combo-code-value-quantity",
+        "combo-code",
+        "combo-value-quantity",
+        value,
+    )
+}
+
+fn plain(name: &str, param_type: SearchParamType, value: &str) -> SearchParameter {
+    SearchParameter {
+        name: name.to_string(),
+        param_type,
+        modifier: None,
+        values: vec![SearchValue::parse_for_type(value, param_type)],
+        chain: vec![],
+        components: vec![],
+    }
+}
+
+/// Every page (3 per page) of `query`, its accurate total, and its count.
+async fn answer(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> (Vec<Vec<String>>, Option<u64>, u64) {
+    let mut pages = Vec::new();
+    let mut first = query.clone().with_count(3);
+    first.total = Some(TotalMode::Accurate);
+    let mut next = first;
+    let mut total = None;
+    loop {
+        let result = backend.search(tenant, &next).await.unwrap();
+        if pages.is_empty() {
+            total = result.total;
+        }
+        pages.push(
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_owned())
+                .collect::<Vec<_>>(),
+        );
+        match result.resources.page_info.next_cursor {
+            Some(cursor) if pages.len() < 20 => {
+                next = query.clone().with_count(3).with_cursor(cursor);
+            }
+            _ => break,
+        }
+    }
+    let count = backend.search_count(tenant, query).await.unwrap();
+    (pages, total, count)
+}
+
+/// The tuple path (a tenant marked by a real `$reindex`) and pair validation
+/// (an identical tenant without a marker) give the same pages, totals and
+/// counts for every shape the planner sends to `tuple_code`: the three
+/// token+quantity composites, several codings and components per resource,
+/// every quantity prefix, units, codes without system or holding `|`, deleted
+/// resources, `_sort`, and a composite combined with other parameters.
+#[tokio::test]
+async fn mongodb_tuple_path_answers_like_pair_validation() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_oracle").await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let fast = create_tenant("composite-tuple-fast");
+    let slow = create_tenant("composite-tuple-slow");
+    seed_corpus(&backend, &fast).await;
+    seed_corpus(&backend, &slow).await;
+    reindex(&backend, &fast, ReindexRequest::default()).await;
+    assert!(tuple_path_used(&backend, &fast).await);
+    assert!(!tuple_path_used(&backend, &slow).await);
+
+    let ucum_cm = format!("8302-2$gt100|{UCUM}|cm");
+    let ucum_kg = format!("29463-7$gt55|{UCUM}|kg");
+    let ucum_lb = format!("29463-7$gt0|{UCUM}|[lb_av]");
+    let mut queries: Vec<(String, SearchQuery)> = [
+        "8302-2$gt160",
+        "http://loinc.org|8302-2$ge150",
+        "http://local|L-height$lt170",
+        "8302-2$ap170",
+        "8302-2$eq170",
+        "8302-2$170",
+        "8302-2$le166",
+        "8302-2$sa160",
+        "8302-2$eb180",
+        "8302-2$gt100||cm",
+        ucum_cm.as_str(),
+        ucum_kg.as_str(),
+        ucum_lb.as_str(),
+        "nosys$gt0",
+        "http://x|nosys$gt0",
+        "a|b$gt0",
+        "8480-6$gt0",
+        "nope$gt0",
+    ]
+    .into_iter()
+    .map(|value| {
+        (
+            format!("code-value-quantity={value}"),
+            SearchQuery::new("Observation").with_parameter(cvq(value)),
+        )
+    })
+    .collect();
+    for value in [
+        "8462-4$gt80",
+        "8480-6$gt110",
+        "http://loinc.org|8462-4$lt70",
+        "8462-4$gt100",
+    ] {
+        queries.push((
+            format!("component-code-value-quantity={value}"),
+            SearchQuery::new("Observation").with_parameter(component(value)),
+        ));
+    }
+    for value in [
+        "8480-6$gt110",
+        "85354-9$gt0",
+        "8302-2$gt160",
+        "29463-7$lt60",
+    ] {
+        queries.push((
+            format!("combo-code-value-quantity={value}"),
+            SearchQuery::new("Observation").with_parameter(combo(value)),
+        ));
+    }
+    queries.extend([
+        (
+            "code-value-quantity + status".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(cvq("8302-2$gt150"))
+                .with_parameter(plain("status", SearchParamType::Token, "final")),
+        ),
+        (
+            "code-value-quantity + subject".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(cvq("8302-2$gt150"))
+                .with_parameter(plain("subject", SearchParamType::Reference, "Patient/p0")),
+        ),
+        (
+            "code-value-quantity + date".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(cvq("http://loinc.org|8302-2$gt100"))
+                .with_parameter(plain("date", SearchParamType::Date, "ge2020-01-10")),
+        ),
+        (
+            "component + subject".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(component("8480-6$gt105"))
+                .with_parameter(plain("subject", SearchParamType::Reference, "Patient/p2")),
+        ),
+        (
+            "code-value-quantity + combo".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(cvq("8302-2$gt150"))
+                .with_parameter(combo("8302-2$lt190")),
+        ),
+        (
+            "code-value-quantity _sort=-_id".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(cvq("8302-2$gt0"))
+                .with_sort(SortDirective::parse("-_id")),
+        ),
+        (
+            "combo _sort=_id".to_string(),
+            SearchQuery::new("Observation")
+                .with_parameter(combo("8480-6$gt0"))
+                .with_sort(SortDirective::parse("_id")),
+        ),
+    ]);
+
+    let mut non_empty = 0;
+    for (label, query) in &queries {
+        let tuple = answer(&backend, &fast, query).await;
+        let pairs = answer(&backend, &slow, query).await;
+        assert_eq!(tuple, pairs, "{label}");
+        if tuple.2 > 0 {
+            non_empty += 1;
+        }
+    }
+    // Not vacuous: most shapes match something, and the cross-group and
+    // wrong-system shapes match nothing.
+    assert!(non_empty >= 20, "{non_empty} of {} matched", queries.len());
+    for empty in [
+        "code-value-quantity=http://x|nosys$gt0",
+        "code-value-quantity=a|b$gt0",
+        "code-value-quantity=8480-6$gt0",
+        "component-code-value-quantity=8462-4$gt100",
+    ] {
+        let query = &queries.iter().find(|(label, _)| label == empty).unwrap().1;
+        assert_eq!(answer(&backend, &fast, query).await.2, 0, "{empty}");
+    }
 }
