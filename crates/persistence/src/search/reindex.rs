@@ -501,19 +501,15 @@ pub trait ReindexTarget: Send + Sync {
         self.clear_search_index(tenant).await
     }
 
-    /// Called once when a run finished with status `Completed`. `full_tenant`
-    /// is true for an unscoped run (every type, no parameter, resource, id or
-    /// metadata restriction, not clear-only); `clean` is true when it recorded
-    /// no error. A writer whose index rows depend on a complete rebuild (the
-    /// MongoDB `tuple_code` of token+quantity composites) records it here.
-    /// Failures are the writer's to log; the run is already complete.
+    /// Called once when a run rebuilt every resource of `coverage` with no
+    /// error, just before the job is reported `Completed`. Not called for a
+    /// run that recorded an error, or whose scope leaves resources of its
+    /// types out (named resources, an id range, named parameters,
+    /// `clearOnly`, `metadataOnly`). A writer whose index rows depend on a
+    /// complete rebuild (the MongoDB `tuple_code` of token+quantity
+    /// composites) records it here. Failures are the writer's to log.
     /// Default: nothing.
-    async fn reindex_run_completed(
-        &self,
-        _tenant: &TenantContext,
-        _full_tenant: bool,
-        _clean: bool,
-    ) {
+    async fn reindex_run_completed(&self, _tenant: &TenantContext, _coverage: ReindexCoverage<'_>) {
     }
 
     /// Lists one page of the resource ids this writer holds index entries for,
@@ -686,6 +682,16 @@ pub trait ReindexTarget: Send + Sync {
 pub trait ReindexableStorage: ReindexSource + ReindexTarget {}
 
 impl<T: ReindexSource + ReindexTarget> ReindexableStorage for T {}
+
+/// What a completed `$reindex` rebuilt in full, every resource and every
+/// parameter, with no error ([`ReindexTarget::reindex_run_completed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexCoverage<'a> {
+    /// Every type of the tenant.
+    Tenant,
+    /// Every resource of these types.
+    Types(&'a [String]),
+}
 
 /// Request to start a reindex operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3634,14 +3640,15 @@ async fn run_reindex(
     // Determine resource types to process, remembering whether the request
     // named them so that clearing stays within that scope.
     let type_scoped = request.resource_types.is_some();
-    let full_tenant_run = request.resource_types.is_none()
-        && request.search_param_urls.is_none()
+    // Whether the run rebuilds every resource of its types (see
+    // `ReindexTarget::reindex_run_completed`). `bulkIndexRebuild` and
+    // `clearExisting` rebuild every resource like any other run.
+    let rebuilds_whole_types = request.search_param_urls.is_none()
         && request.resource_ids.is_none()
         && request.id_start.is_none()
         && request.id_end.is_none()
         && !request.clear_only
-        && !request.metadata_only
-        && !request.bulk_index_rebuild;
+        && !request.metadata_only;
     let resource_types = match (&named_resources, request.resource_types) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
@@ -4183,8 +4190,24 @@ async fn run_reindex(
 
     log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_COMPLETED);
 
+    // Tell the writers what was rebuilt in full before the job reads
+    // `Completed`, so a client that sees it complete sees what they record.
+    let clean = jobs
+        .read()
+        .get(&job_id)
+        .is_some_and(|progress| progress.status.is_running() && !progress.has_errors());
+    if clean && rebuilds_whole_types {
+        let coverage = if type_scoped {
+            ReindexCoverage::Types(&resource_types)
+        } else {
+            ReindexCoverage::Tenant
+        };
+        for writer in &writers {
+            writer.reindex_run_completed(&tenant, coverage).await;
+        }
+    }
+
     // Mark as completed
-    let mut completed_clean: Option<bool> = None;
     {
         let mut jobs_guard = jobs.write();
         if let Some(progress) = jobs_guard.get_mut(&job_id)
@@ -4193,15 +4216,6 @@ async fn run_reindex(
             progress.status = ReindexStatus::Completed;
             progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
             progress.current_resource_type = None;
-            completed_clean = Some(!progress.has_errors());
-        }
-    }
-
-    if let Some(clean) = completed_clean {
-        for writer in &writers {
-            writer
-                .reindex_run_completed(&tenant, full_tenant_run, clean)
-                .await;
         }
     }
 }
@@ -7177,10 +7191,19 @@ mod tests {
         transient_once: parking_lot::Mutex<BTreeSet<String>>,
         /// Ids whose every write is rejected.
         permanent: BTreeSet<String>,
+        /// Every `reindex_run_completed` coverage, in call order.
+        completed: parking_lot::Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl ReindexTarget for RecordingTarget {
+        async fn reindex_run_completed(&self, _: &TenantContext, coverage: ReindexCoverage<'_>) {
+            self.completed.lock().push(match coverage {
+                ReindexCoverage::Tenant => "tenant".to_string(),
+                ReindexCoverage::Types(types) => format!("types {types:?}"),
+            });
+        }
+
         async fn delete_search_entries(
             &self,
             _: &TenantContext,
@@ -8322,6 +8345,87 @@ mod tests {
         assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
         assert_eq!(writer.written.load(Ordering::SeqCst), 0);
+    }
+
+    /// A run tells its writers what it rebuilt in full only when it rebuilt
+    /// every resource of its types with no error: the whole tenant (also with
+    /// `bulkIndexRebuild` or `clearExisting`) or the named types. A range, a
+    /// named parameter or resource, `clearOnly`, `metadataOnly` and a run with
+    /// a rejected resource tell nothing.
+    #[tokio::test]
+    async fn a_run_reports_its_coverage_only_when_it_rebuilt_whole_types_cleanly() {
+        let cases: Vec<(ReindexRequest, Option<&str>)> = vec![
+            (ReindexRequest::default(), Some("tenant")),
+            (
+                ReindexRequest::default().with_bulk_index_rebuild(true),
+                Some("tenant"),
+            ),
+            (
+                ReindexRequest {
+                    clear_existing: true,
+                    ..ReindexRequest::default()
+                },
+                Some("tenant"),
+            ),
+            (
+                ReindexRequest::for_types(["Patient"]),
+                Some("types [\"Patient\"]"),
+            ),
+            (patient_range(Some("p1"), None), None),
+            (
+                ReindexRequest {
+                    search_param_urls: Some(vec!["http://x/SearchParameter/y".into()]),
+                    ..ReindexRequest::default()
+                },
+                None,
+            ),
+            (
+                ReindexRequest {
+                    resource_ids: Some(vec![ResourceRef {
+                        resource_type: "Patient".into(),
+                        resource_id: "p1".into(),
+                    }]),
+                    ..ReindexRequest::default()
+                },
+                None,
+            ),
+            (
+                ReindexRequest {
+                    clear_only: true,
+                    ..ReindexRequest::default()
+                },
+                None,
+            ),
+        ];
+        for (request, expected) in cases {
+            let target = Arc::new(RecordingTarget::default());
+            let op = recording_operation(
+                Arc::new(RangeCapableSource(PagedSource::new(3))),
+                target.clone(),
+            );
+            let label = format!("{request:?}");
+            let job = op
+                .start(named_tenant("coverage"), request, None)
+                .await
+                .unwrap();
+            let progress = await_finished(&op, &job).await;
+            assert_eq!(progress.status, ReindexStatus::Completed, "{label}");
+            assert_eq!(
+                target.completed.lock().clone(),
+                expected.map(str::to_string).into_iter().collect::<Vec<_>>(),
+                "{label}"
+            );
+        }
+
+        // A rejected resource: the run completes with errors, no coverage.
+        let target = Arc::new(RecordingTarget {
+            permanent: BTreeSet::from(["p1".to_string()]),
+            ..Default::default()
+        });
+        let progress = run_paged(3, target.clone(), ReindexRequest::default()).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(progress.has_errors());
+        assert!(target.completed.lock().is_empty());
     }
 
     fn recording_operation(

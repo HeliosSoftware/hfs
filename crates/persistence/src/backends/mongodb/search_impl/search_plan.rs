@@ -899,7 +899,11 @@ impl MongoBackend {
         let Some(quantity) = quantity else {
             return Ok(None);
         };
-        if quantity.negated || !self.composite_tuple_codes_complete(tenant_id).await {
+        if quantity.negated
+            || !self
+                .composite_tuple_codes_complete(tenant_id, resource_type)
+                .await
+        {
             return Ok(None);
         }
         let mut filter = quantity.filter;

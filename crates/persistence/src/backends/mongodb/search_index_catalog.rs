@@ -84,6 +84,15 @@ pub(crate) const DATE_RANGE_GENERATION: i32 = 4;
 // generation it is about can never be ahead of it.
 const _: () = assert!(DATE_RANGE_GENERATION <= SEARCH_INDEX_GENERATION);
 
+/// The generation that writes `tuple_code` on token+quantity composite rows
+/// ([`COMPOSITE_TUPLE_INDEX`]). Pinned like [`DATE_RANGE_GENERATION`]: a
+/// database recorded below it was last booted by a binary that writes rows
+/// without `tuple_code`, so its `tuple_code` markers are not trusted
+/// (`composite_layout`).
+pub(crate) const COMPOSITE_TUPLE_GENERATION: i32 = 5;
+
+const _: () = assert!(COMPOSITE_TUPLE_GENERATION <= SEARCH_INDEX_GENERATION);
+
 /// When an index is created relative to boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexBuild {

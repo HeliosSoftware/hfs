@@ -10152,12 +10152,16 @@ impl ReindexTarget for MongoBackend {
         Ok(result.deleted_count + contained_result.deleted_count)
     }
 
-    async fn reindex_run_completed(&self, tenant: &TenantContext, full_tenant: bool, clean: bool) {
-        if !(full_tenant && clean) || self.is_search_offloaded() {
+    async fn reindex_run_completed(
+        &self,
+        tenant: &TenantContext,
+        coverage: crate::search::ReindexCoverage<'_>,
+    ) {
+        if self.is_search_offloaded() {
             return;
         }
         if let Err(error) = self
-            .record_composite_tuple_codes_complete(tenant.tenant_id().as_str())
+            .record_composite_tuple_codes_complete(tenant.tenant_id().as_str(), coverage)
             .await
         {
             tracing::warn!(%error, "could not record the tuple_code marker");

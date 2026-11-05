@@ -1666,7 +1666,9 @@ impl MongoBackend {
                 self.references_normalized_flag()
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            self.record_empty_search_index_at_boot(&db).await;
+            // Before the builder can record this generation: a rollback may
+            // have written rows without `tuple_code` (`composite_layout`).
+            self.drop_untrusted_tuple_markers_at_boot(&db).await;
             let builder =
                 SearchIndexBuilder::new(db.clone(), self.config.index_build, rows_at_boot)
                     .with_references_flag(self.references_normalized_flag());
