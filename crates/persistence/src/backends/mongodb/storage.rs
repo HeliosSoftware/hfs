@@ -9284,6 +9284,38 @@ impl MongoBackend {
         }
     }
 
+    /// The oldest-live probe (#945): the forward mirror of
+    /// [`Self::reindex_newest_live_last_updated`], a covered scan of
+    /// `idx_resources_type_scan` for the `last_updated` of the oldest live
+    /// resource of `resource_type`, or `None` if it has no live resource.
+    async fn reindex_oldest_live_last_updated(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .sort(doc! { "last_updated": 1, "id": 1 })
+            .projection(doc! { "_id": 0, "last_updated": 1 })
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .map_err(|e| read_driver_error("Failed to probe oldest resource", e))?;
+        match found {
+            Some(doc) => {
+                let ts = doc
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                Ok(Some(bson_to_chrono(ts)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// One hinted, sorted, limited find (#1403). The page is drained up to
     /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
     /// next row — the first row is always admitted.
@@ -9399,12 +9431,16 @@ impl MongoBackend {
     /// `None` on its own account. `fetch_resources_page` and
     /// `fetch_resources_page_capped` are both thin calls to this method.
     /// `range` bounds the ids of every id-phase page and catch-up round
-    /// (#1739). `since` (#945 L3) skips the id phase altogether: the walk
+    /// (#1739). `since` (#945 L3) skips the id phase: the walk
     /// starts at the first catch-up round with `since` as its floor, so it
     /// reads `[since, ceiling)` in `(last_updated, id)` order on
     /// `idx_resources_type_scan` — exactly the round a whole-type walk runs
     /// for what was written during it, now over the manifest's window — and
-    /// the usual rounds then catch what lands while it runs.
+    /// the usual rounds then catch what lands while it runs. When no live
+    /// row of the type is older than `since` (a fresh load), the window is
+    /// the whole type, so the walk is the unscoped one instead (id phase,
+    /// prefetch, then the same catch-up rounds): it reads the same rows,
+    /// but in id order, which keeps the `search_index` inserts sequential.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_reindex_page(
         &self,
@@ -9425,13 +9461,33 @@ impl MongoBackend {
         let mut step = match (cursor, since) {
             (None, Some(since)) => {
                 let floor = truncate_to_millis(since);
-                tracing::info!(
-                    tenant = %tenant_id,
-                    resource_type = %resource_type,
-                    floor = %format_walk_instant(floor),
-                    "mongodb reindex walk started at a time floor"
-                );
-                WalkStep::RoundStart { round: 1, floor }
+                let oldest_live = self
+                    .reindex_oldest_live_last_updated(&resources, tenant_id, resource_type)
+                    .await?;
+                if reindex_time_floor_covers_whole_type(oldest_live, floor) {
+                    // Every live row is inside the window, so the window is
+                    // the whole type: walk it in id order (sequential
+                    // `search_index` inserts, prefetch) exactly as an
+                    // unscoped walk does, instead of in `(last_updated, id)`
+                    // order, which visits ids at random.
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        oldest_live = %oldest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        "mongodb reindex time floor covers the whole type; walking by id"
+                    );
+                    WalkStep::Start
+                } else {
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        oldest_live = %oldest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        "mongodb reindex walk started at a time floor"
+                    );
+                    WalkStep::RoundStart { round: 1, floor }
+                }
             }
             (None, None) => WalkStep::Start,
             (Some(c), _) => WalkStep::from(ReindexWalkCursor::parse(c)?),
@@ -9702,7 +9758,8 @@ impl MongoBackend {
 /// A time-scoped view of a [`MongoBackend`] (#945 L3): its count and pages
 /// read only resources whose `last_updated` is at or after `since`. The walk
 /// is the backend's own catch-up walk from that floor, with the backend's
-/// own cursors.
+/// own cursors — or, when no live row of the type predates the floor, the
+/// backend's whole-type id walk, which reads the same rows.
 struct SinceMongoReindexSource {
     backend: std::sync::Arc<MongoBackend>,
     since: DateTime<Utc>,
@@ -9756,8 +9813,10 @@ impl ReindexSource for SinceMongoReindexSource {
             .await
     }
 
-    /// A time-scoped walk only ever holds catch-up round cursors, which the
-    /// backend never runs ahead of the write in flight.
+    /// A time-scoped walk holds catch-up round cursors, which the backend
+    /// never runs ahead of the write in flight — unless its window covers
+    /// the whole type, where it runs the unscoped walk and its id-phase
+    /// cursors prefetch exactly as they do there.
     fn may_prefetch_page(&self, cursor: &str) -> bool {
         self.backend.may_prefetch_page(cursor)
     }
@@ -10799,6 +10858,17 @@ fn reindex_catch_up_ceiling(
     }
 }
 
+/// Whether a time-scoped walk's window `[floor, ..)` holds every live row of
+/// the type (#945), so it can run as the whole-type id walk: true when the
+/// type has no live row, or its oldest live `last_updated` is at or after
+/// `floor`.
+fn reindex_time_floor_covers_whole_type(
+    oldest_live: Option<DateTime<Utc>>,
+    floor: DateTime<Utc>,
+) -> bool {
+    oldest_live.is_none_or(|oldest| oldest >= floor)
+}
+
 /// Whether the next round should run, or the walk is done (#1403).
 fn reindex_round_start_decision(
     round: u8,
@@ -11799,6 +11869,22 @@ mod reindex_walk_tests {
             reindex_catch_up_ceiling(now, Some(newest), margin),
             newest + chrono::Duration::milliseconds(1)
         );
+    }
+
+    #[test]
+    fn time_floor_covers_whole_type_only_when_no_live_row_predates_it() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ms = chrono::Duration::milliseconds(1);
+        assert!(reindex_time_floor_covers_whole_type(None, floor));
+        assert!(reindex_time_floor_covers_whole_type(Some(floor), floor));
+        assert!(reindex_time_floor_covers_whole_type(
+            Some(floor + ms),
+            floor
+        ));
+        assert!(!reindex_time_floor_covers_whole_type(
+            Some(floor - ms),
+            floor
+        ));
     }
 
     #[test]
