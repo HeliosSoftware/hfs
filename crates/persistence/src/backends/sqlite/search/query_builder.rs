@@ -1112,7 +1112,7 @@ impl QueryBuilder {
                     placeholders.join(", ")
                 ),
             ));
-            params.extend(targets.iter().map(|t| SqlParam::string(t)));
+            params.extend(targets.iter().map(SqlParam::string));
         }
         let rows = SqlFragment::with_params(sql, params);
         Some(Self::membership(param, rows))
