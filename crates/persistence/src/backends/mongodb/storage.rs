@@ -5221,8 +5221,15 @@ impl MongoBackend {
                     })
                     .collect::<Vec<_>>();
                 // The quantity row of a token+quantity composite group carries
-                // its group's codes (`idx_search_composite_tuple_qty`).
-                super::composite_search::stamp_tuple_codes(&mut own);
+                // its group's codes (`idx_search_composite_tuple_qty`). Only
+                // two-component composites: no longer one is read that way.
+                let pairs: HashSet<&str> = extraction
+                    .values
+                    .iter()
+                    .filter(|value| value.composite_arity == Some(2))
+                    .map(|value| value.param_name.as_str())
+                    .collect();
+                super::composite_search::stamp_tuple_codes(&mut own, |param| pairs.contains(param));
                 // A parameter whose values all failed to build a row (an
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
