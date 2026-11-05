@@ -6769,7 +6769,7 @@ impl RevincludeProvider for MongoBackend {
                 continue;
             }
 
-            let mut index_filter = doc! {
+            let index_filter = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": &revinclude.source_type,
                 "param_name": &revinclude.search_param,
