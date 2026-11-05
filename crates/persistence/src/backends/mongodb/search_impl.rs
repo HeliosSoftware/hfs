@@ -6702,6 +6702,45 @@ fn revinclude_reference_filter<'a>(
     doc! { "$or": arms }
 }
 
+/// Splits the normalized two-field `$or` of [`revinclude_reference_filter`]
+/// into one filter per field (each merged with `base`); any other shape stays
+/// a single filter.
+fn split_revinclude_queries(base: &Document, reference_filter: Document) -> Vec<Document> {
+    let normalized_arms = match reference_filter.get_array("$or") {
+        Ok(arms)
+            if arms.len() == 2
+                && arms.iter().all(|arm| {
+                    arm.as_document().is_some_and(|d| {
+                        d.contains_key("value_reference")
+                            || d.contains_key("value_reference_target")
+                    })
+                })
+                && arms[1]
+                    .as_document()
+                    .is_some_and(|d| d.contains_key("value_reference_target")) =>
+        {
+            Some(arms.clone())
+        }
+        _ => None,
+    };
+    match normalized_arms {
+        Some(arms) => arms
+            .into_iter()
+            .filter_map(|arm| arm.as_document().cloned())
+            .map(|arm| {
+                let mut query = base.clone();
+                query.extend(arm);
+                query
+            })
+            .collect(),
+        None => {
+            let mut query = base.clone();
+            query.extend(reference_filter);
+            vec![query]
+        }
+    }
+}
+
 #[async_trait]
 impl RevincludeProvider for MongoBackend {
     async fn resolve_revincludes(
@@ -6735,18 +6774,40 @@ impl RevincludeProvider for MongoBackend {
                 "resource_type": &revinclude.source_type,
                 "param_name": &revinclude.search_param,
             };
-            index_filter.extend(revinclude_reference_filter(
+            let reference_filter = revinclude_reference_filter(
                 resources
                     .iter()
                     .map(|resource| (resource.resource_type(), resource.id())),
                 self.references_normalized(),
-            ));
+            );
 
             // Bounded, streamed id resolution (#1061) — see
             // `referring_resource_ids`. `reference_values` above is already
             // bounded by the page; this is what previously was not.
-            let (matching_ids, index_truncated) =
-                Self::referring_resource_ids(&search_index, index_filter, limit).await?;
+            //
+            // Normalized mode: one query per field instead of a two-field
+            // `$or`. On a real server the `$or` made the planner pick
+            // `idx_search_composite` and scan every `subject` row of the type
+            // (1500 documents examined for 4 matches), while each arm alone
+            // uses its own value index. Ids are merged and capped here.
+            let queries = split_revinclude_queries(&index_filter, reference_filter);
+            let mut matching_ids: Vec<String> = Vec::new();
+            let mut index_truncated = false;
+            for query in queries {
+                let (ids, truncated) =
+                    Self::referring_resource_ids(&search_index, query, limit).await?;
+                index_truncated |= truncated;
+                for id in ids {
+                    if matching_ids.contains(&id) {
+                        continue;
+                    }
+                    if matching_ids.len() >= limit {
+                        index_truncated = true;
+                        break;
+                    }
+                    matching_ids.push(id);
+                }
+            }
 
             if matching_ids.is_empty() {
                 continue;

@@ -12701,6 +12701,135 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
     );
 }
 
+/// #2394: the normalized `_revinclude` filter is a two-field `$or`
+/// (`value_reference` / `value_reference_target`). The same shape once defeated
+/// the index on the plain reference search, so check on a real server that the
+/// recorded `find` never falls back to a collection scan and examines only
+/// about as many documents as it returns.
+#[tokio::test]
+async fn mongodb_revinclude_normalized_or_filter_uses_indexes() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_or_explain").await else {
+        eprintln!(
+            "Skipping mongodb_revinclude_normalized_or_filter_uses_indexes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-revinclude-explain");
+    let patient = backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "target"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..1500 {
+        let reference = match i {
+            0..=2 => format!("Patient/{}", patient.id()),
+            3 => format!("http://example.org/fhir/Patient/{}", patient.id()),
+            _ => format!("Patient/other-{i}"),
+        };
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": format!("c-{i}")}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend.wait_for_search_index_build().await;
+
+    let Some(cs) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let db = raw_test_client(&cs)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("server refused {{profile: 2}}; skipping");
+        return;
+    }
+    let revinclude = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let result = backend
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&revinclude),
+        )
+        .await
+        .expect("resolve_revincludes");
+    db.run_command(doc! { "profile": 0_i32 }).await.unwrap();
+    assert_eq!(result.len(), 4, "3 relative + 1 absolute referrer");
+
+    use futures::stream::TryStreamExt;
+    let profile = db.collection::<Document>("system.profile");
+    let entries: Vec<Document> = profile
+        .find(doc! {
+            "ns": format!("{}.search_index", db.name()),
+            "command.find": "search_index",
+        })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "one find per reference field");
+    let mut total_docs = 0;
+    for entry in &entries {
+        let command = entry.get_document("command").unwrap();
+        let mut inner = Document::new();
+        for key in ["find", "filter", "sort", "limit", "projection", "hint"] {
+            if let Some(v) = command.get(key) {
+                inner.insert(key, v.clone());
+            }
+        }
+        let explain = db
+            .run_command(doc! { "explain": inner, "verbosity": "executionStats" })
+            .await
+            .unwrap();
+        let plan = format!(
+            "{:?}",
+            explain
+                .get_document("queryPlanner")
+                .unwrap()
+                .get("winningPlan")
+        );
+        let stats = explain.get_document("executionStats").unwrap();
+        let num = |k: &str| {
+            stats
+                .get_i64(k)
+                .or_else(|_| stats.get_i32(k).map(i64::from))
+                .unwrap()
+        };
+        let (keys, docs) = (num("totalKeysExamined"), num("totalDocsExamined"));
+        eprintln!(
+            "REVINCLUDE-EXPLAIN filter={:?} keys={keys} docs={docs}",
+            command.get("filter")
+        );
+        assert!(!plan.contains("COLLSCAN"), "collection scan: {plan}");
+        total_docs += docs;
+    }
+    assert!(
+        total_docs <= 50,
+        "examined {total_docs} documents for 4 matches"
+    );
+}
+
 /// #1061 part (b): the referring set must be bounded at
 /// `max_included_resources`, applied per directive, with truncation signaled
 /// by a synthetic `OperationOutcome` (`search.mode = outcome`) rather than
