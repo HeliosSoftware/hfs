@@ -2304,7 +2304,7 @@ mod es_integration {
                 },
                 // `:[type]` filters on the indexed `resource_type`. A versioned reference
                 // (relative `ob-ver`, absolute `ob-abs-ver`) does not carry one:
-                // `parse_reference` (search/converters.rs) turns the versioned
+                // `parse_reference` (search/converters.rs, tracked in #2495) turns the versioned
                 // absolute URL into resource_type "_history", so neither the
                 // `:Patient` modifier nor a bare id finds `ob-abs-ver`. A bare id
                 // also matches an absolute URL, including a foreign-base one
