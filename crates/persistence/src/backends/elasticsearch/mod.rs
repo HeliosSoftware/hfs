@@ -42,7 +42,6 @@
 
 mod backend;
 mod naming;
-mod reference_migration;
 mod schema;
 pub mod search;
 mod search_impl;

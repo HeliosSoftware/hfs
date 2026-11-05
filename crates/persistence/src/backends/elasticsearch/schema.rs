@@ -74,10 +74,9 @@ use super::backend::ElasticsearchBackend;
 ///   point values until then.
 /// - `3` — `search_params.reference.reference_target`, the `Type/id` an
 ///   absolute `http(s)` reference points at (#2394). Documents indexed before
-///   it lack the field; the backend fills it in the background at startup
-///   (`reference_migration`, one `_update_by_query`), and until that finishes a
-///   reference search or `_revinclude` does not match their absolute
-///   references (`http://host/fhir/Patient/p1`). No `$reindex` is needed.
+///   it lack the field, so a reference search or `_revinclude` does not match
+///   their absolute references (`http://host/fhir/Patient/p1`) until a
+///   `$reindex`; relative references are unaffected.
 pub const SCHEMA_VERSION: u64 = 3;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
@@ -805,6 +804,17 @@ fn predates_date_range_end(meta: Option<&Value>) -> bool {
     stored_schema_version(meta) < DATE_END_SCHEMA_VERSION
 }
 
+/// The first [`SCHEMA_VERSION`] whose documents carry
+/// `search_params.reference.reference_target` (#2394).
+const REFERENCE_TARGET_SCHEMA_VERSION: u64 = 3;
+
+/// Whether an index whose mapping `_meta` is `meta` was laid out before
+/// [`REFERENCE_TARGET_SCHEMA_VERSION`], so that its documents were indexed
+/// without `search_params.reference.reference_target`.
+fn predates_reference_target(meta: Option<&Value>) -> bool {
+    stored_schema_version(meta) < REFERENCE_TARGET_SCHEMA_VERSION
+}
+
 /// Document counts per index out of a filtered `GET {indices}/_stats/docs`
 /// response (`indices.<name>.primaries.docs.count`). An index the response does
 /// not list has no entry.
@@ -900,6 +910,26 @@ fn warn_reindex_needed(indices: &[String]) {
     );
 }
 
+/// Warns, once, that the documents of `indices` were indexed before #2394
+/// (schema version `3`) and so have no `search_params.reference.reference_target`:
+/// a reference search or `_revinclude` does not match their absolute
+/// (`http(s)://...`) references until `$reindex` indexes them again.
+fn warn_reference_reindex_needed(indices: &[String]) {
+    if indices.is_empty() {
+        return;
+    }
+    const SAMPLE: usize = 5;
+    tracing::warn!(
+        indices = indices.len(),
+        sample = indices[..indices.len().min(SAMPLE)].join(", "),
+        schema_version = SCHEMA_VERSION,
+        "Elasticsearch indices holding documents indexed before #2394 were upgraded to a \
+         mapping with `search_params.reference.reference_target`, but those documents have \
+         no such field, so references stored as absolute URLs will not match reference \
+         searches or _revinclude until `$reindex` is run"
+    );
+}
+
 /// Brings every existing HFS index under the configured prefix up to
 /// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
 /// convention and the failure policy.
@@ -978,11 +1008,15 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         let counts = document_counts(backend, &predating).await;
         warn_reindex_needed(&indices_holding_documents(&predating, &counts));
     }
-    // #2394: documents indexed before schema version 3 have no
-    // `search_params.reference.reference_target`. Fill it inside the cluster, in
-    // the background; it also resumes a run an earlier start did not finish,
-    // since the query selects only what is left.
-    super::reference_migration::migrate_reference_targets(backend, &pattern).await;
+    let predating_ref: Vec<String> = updated_names
+        .iter()
+        .filter(|name| predates_reference_target(previous.get(*name).and_then(Option::as_ref)))
+        .cloned()
+        .collect();
+    if !predating_ref.is_empty() {
+        let counts = document_counts(backend, &predating_ref).await;
+        warn_reference_reindex_needed(&indices_holding_documents(&predating_ref, &counts));
+    }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -1006,12 +1040,14 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
         return;
     }
     let mut predates_end = false;
+    let mut predates_ref = false;
     let outcome = match read_schema_versions(backend, index).await {
         Err(outcome) => outcome,
         Ok(body) => match stale_indices(&body) {
             (stale, _) if !stale.is_empty() => {
                 let meta = stale[0].1.as_ref();
                 predates_end = predates_date_range_end(meta);
+                predates_ref = predates_reference_target(meta);
                 let body = reconcile_mapping_body(backend.config(), meta);
                 put_mapping(backend, &[index], body).await
             }
@@ -1026,13 +1062,17 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             schema_version = SCHEMA_VERSION,
             "reconciled Elasticsearch index mapping"
         );
-        if predates_end {
+        if predates_end || predates_ref {
             let names = [index.to_string()];
             let counts = document_counts(backend, &names).await;
-            warn_reindex_needed(&indices_holding_documents(&names, &counts));
+            let holding = indices_holding_documents(&names, &counts);
+            if predates_end {
+                warn_reindex_needed(&holding);
+            }
+            if predates_ref {
+                warn_reference_reindex_needed(&holding);
+            }
         }
-        // #2394: see `reconcile_index_mappings`.
-        super::reference_migration::migrate_reference_targets(backend, index).await;
     }
     note_reconcile_outcome(backend, index, &outcome);
 }
@@ -1436,15 +1476,34 @@ mod tests {
         )));
     }
 
-    /// #2394: the mapping carries `search_params.reference.reference_target`.
+    /// #2394: an index recorded below version 3 holds documents without
+    /// `search_params.reference.reference_target`.
     #[test]
-    fn test_mapping_has_reference_target() {
+    fn test_predates_reference_target() {
+        assert!(predates_reference_target(None));
+        assert!(predates_reference_target(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 2 })
+        )));
+        assert!(!predates_reference_target(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 3 })
+        )));
         let mapping = create_index_mapping(&ElasticsearchConfig::default());
         assert_eq!(
             mapping["mappings"]["properties"]["search_params"]["properties"]["reference"]["properties"]
                 ["reference_target"]["type"],
             "keyword"
         );
+    }
+
+    /// #2394: the warning names the field and the remedy, once.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_warn_reference_reindex_needed_message() {
+        warn_reference_reindex_needed(&[]);
+        assert!(!logs_contain("#2394"));
+        warn_reference_reindex_needed(&["hfs_t_patient".to_string()]);
+        assert!(logs_contain("reference_target"));
+        assert!(logs_contain("$reindex"));
     }
 
     /// #1391: an empty index has nothing to reindex; one whose count could not
