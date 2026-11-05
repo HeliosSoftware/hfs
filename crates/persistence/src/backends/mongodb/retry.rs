@@ -11,7 +11,7 @@ use std::time::Duration;
 use mongodb::error::{Error as MongoError, ErrorKind, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR};
 
 use crate::core::bulk_submit::CancelToken;
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult, mongodb_unavailable};
 
 /// How many times an operation runs and how long it waits in between.
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +48,22 @@ pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
     cap: Duration::from_secs(1),
 };
 
+/// Reindex page policy (#2290): 100, 200, 400 ms between the four runs of one
+/// page, about 0.7 s of sleep at most. A run starts at the page's delete, so
+/// it clears what the previous run left behind. The pause also gives a command
+/// the failed run had in flight time to land before the next snapshot.
+pub(super) const REINDEX_PAGE_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 4,
+    base: Duration::from_millis(100),
+    cap: Duration::from_secs(1),
+};
+
+/// Wall-clock budget of one page's runs (#2290): no run starts if it would end,
+/// taking as long as the last, past this. A run that waits out the driver's
+/// 30 s server-selection timeout therefore ends the page after that one run,
+/// instead of four.
+pub(super) const REINDEX_PAGE_BUDGET: Duration = Duration::from_secs(30);
+
 /// Transaction-bundle policy: at most three runs of one bundle, pausing up to
 /// 200 ms and then up to 400 ms in between, each pause drawn with full jitter
 /// ([`next_attempt_delay`]). The server aborts a transaction that loses a race
@@ -63,15 +79,60 @@ pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
 };
 
 /// Single-resource write policy: a write whose transaction the server aborted
-/// for a reason other than a conflicting writer runs again after 100, 200 and
+/// for a reason other than a lost race runs again after 100, 200 and
 /// 400 ms. The common reason is a chunk migration holding the critical
 /// section of one of the write's collections (`StaleConfig`), which lasts a
 /// few hundred milliseconds.
+///
+/// This stays the whole budget of every abort except a catalog-change or
+/// lock-timeout one ([`CATALOG_OR_LOCK_ABORT_RETRY`]), and the first four
+/// attempts of those.
 pub(super) const WRITE_ABORT_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 4,
     base: Duration::from_millis(100),
     cap: Duration::from_millis(400),
 };
+
+/// Single-resource write policy for the aborts that only time ends (#2267): a
+/// `WriteConflict` that names a catalog change, `SnapshotUnavailable` (246) and
+/// `LockTimeout` (24). A background index build causes them, by changing the
+/// catalog of a collection and by holding its lock (that a particular
+/// `LockTimeout` came from a build is inferred, not established), so no writer
+/// won anything and a longer wait is what ends them. The four attempts of
+/// [`WRITE_ABORT_RETRY`] and their 700 ms of pauses were shorter than some of
+/// those runs.
+///
+/// A write aborted that way keeps the first four attempts and their pauses
+/// (100, 200 and 400 ms) exactly. After the fourth abort it goes on, up to 12
+/// attempts in all, pausing 800 ms and then 1 s before each later one, each
+/// pause drawn between half and all of that
+/// ([`next_write_replay_delay`]): 4.6 s to 8.5 s of pause across the 11
+/// pauses of a write that uses every attempt. [`CATALOG_OR_LOCK_ABORT_BUDGET`]
+/// bounds the whole run.
+pub(super) const CATALOG_OR_LOCK_ABORT_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 12,
+    base: Duration::from_millis(100),
+    cap: Duration::from_secs(1),
+};
+
+/// Wall-clock budget of a write aborted by a catalog change or a lock timeout,
+/// counted from its first attempt (#2267): no attempt past the fourth starts if
+/// a run as long as the last one would end later than this. 12 s is 18 s inside
+/// the REST layer's default 30 s request timeout; a shorter `HFS_REQUEST_TIMEOUT`
+/// shortens it further through `single_write_deadline`.
+///
+/// The first four attempts are exempt, as they always were, so one write takes
+/// at most the larger of `0.7 s + 4T` and this budget, plus the overrun of one
+/// attempt slower than the one before it, where `T` is the time of one attempt.
+/// With `T` = 100 ms that is about 9.7 s at most: 12 attempts and 8.5 s of
+/// pause. An unconditional delete's second try in the same run is part of the
+/// run's attempt time, so the nesting does not add to the bound.
+///
+/// The budget counts per create, update, delete or restore call. A `PUT`
+/// through `create_or_update` that loses a race makes a new call with a new
+/// budget (up to 4 calls), and each batch Bundle entry has its own, so such a
+/// request is bounded only by the REST request timeout.
+pub(super) const CATALOG_OR_LOCK_ABORT_BUDGET: Duration = Duration::from_secs(12);
 
 /// Default wall-clock budget for one transaction bundle, retries and pauses
 /// included: the value of `MongoBackendConfig::bundle_transaction_budget` when
@@ -174,6 +235,62 @@ pub(super) fn next_bundle_attempt_delay(
     (ends_at <= deadline.unwrap_or(budget)).then_some(delay)
 }
 
+/// The pause before running a single-resource write again after the server
+/// aborted its transaction, or `None` when it must not run again (#2267).
+///
+/// While `attempts_made` is below [`WRITE_ABORT_RETRY`]'s `max_attempts` every
+/// abort gets that policy's pause, with no jitter and no look at the clock, so
+/// a write that recovers within four attempts behaves as it always did. Past
+/// that only a `catalog_or_lock_abort` (a catalog-change `WriteConflict`,
+/// `SnapshotUnavailable` or `LockTimeout`: aborts that only time ends) goes on,
+/// by [`CATALOG_OR_LOCK_ABORT_RETRY`], within [`CATALOG_OR_LOCK_ABORT_BUDGET`]
+/// and the `deadline` ([`next_attempt_delay`]); the class of the most recent
+/// abort decides, so any other abort after the fourth attempt ends the write
+/// at once. A plain `WriteConflict` in a replayed step, which another write of
+/// the same id that stays uncommitted can raise (#2300), or `StaleConfig`, is
+/// not one and keeps its four attempts.
+///
+/// `elapsed` is the time since the write's first attempt began, `last_attempt`
+/// the time its most recent attempt took, and `deadline` the time left until
+/// the write's deadline measured from the same start as `elapsed` (`None`
+/// without one). `fraction` is the jitter draw ([`jitter_fraction`]); it is a
+/// parameter so the decision is deterministic under test. The pause past the
+/// fourth attempt is drawn from the upper half of the backoff, never below
+/// half: full jitter has a floor of zero, which would give back the guaranteed
+/// wait this budget exists to buy. An out-of-range `fraction` is clamped.
+pub(super) fn next_write_replay_delay(
+    catalog_or_lock_abort: bool,
+    attempts_made: u32,
+    elapsed: Duration,
+    last_attempt: Duration,
+    deadline: Option<Duration>,
+    fraction: f64,
+) -> Option<Duration> {
+    if attempts_made < WRITE_ABORT_RETRY.max_attempts {
+        return Some(WRITE_ABORT_RETRY.backoff(attempts_made));
+    }
+    if !catalog_or_lock_abort {
+        return None;
+    }
+    let budget = deadline.map_or(CATALOG_OR_LOCK_ABORT_BUDGET, |left| {
+        left.min(CATALOG_OR_LOCK_ABORT_BUDGET)
+    });
+    // `NaN` compares false to everything, so it must be caught before `clamp`.
+    let fraction = if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
+    next_attempt_delay(
+        &CATALOG_OR_LOCK_ABORT_RETRY,
+        attempts_made,
+        elapsed,
+        last_attempt,
+        budget,
+        0.5 + fraction * 0.5,
+    )
+}
+
 /// An operation's final result and how many times it ran.
 pub(super) struct Attempted<T> {
     pub result: Result<T, MongoError>,
@@ -210,6 +327,13 @@ pub(super) fn is_transient_mongo_error(err: &MongoError) -> bool {
             ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. }
         )
 }
+
+// The server state-change and retryable-read codes and their predicate live in
+// `crate::error` since #2334, where `classify_mongodb_error` reads them too;
+// re-exported here so the backend keeps naming them from this module.
+#[cfg(test)]
+pub(super) use crate::error::TRANSIENT_READ_SERVER_CODES;
+pub(super) use crate::error::is_transient_read_server_error;
 
 /// Runs `op` until it succeeds, fails with a non-transient error, or
 /// `policy.max_attempts` is reached. A tripped `cancel` token ends the loop
@@ -276,25 +400,54 @@ where
         .result
 }
 
-/// Maps an operation's final driver error to a `StorageError`: a transient
-/// error that outlived its retries is `Unavailable`, anything else `Internal`.
+/// Maps an operation's final driver error to a `StorageError`.
+///
+/// `Unavailable` covers:
+///
+/// - a transient error that outlived its retries ([`is_transient_mongo_error`]);
+/// - a failed server selection (not retried, see [`is_transient_mongo_error`]);
+/// - since #2383, a failed command whose own code is a server state-change or
+///   retryable-read code ([`is_transient_read_server_error`], the codes
+///   `classify_mongodb_error` answers `Unavailable` since #2334). Such an error is
+///   not retried here either.
+///
+/// The text is driver-free, `"{context} (after N attempts): the database is
+/// temporarily unavailable; retry the request"`, with no count after a single
+/// attempt. The driver error goes to the shared `warn` line of
+/// [`mongodb_unavailable`]. Bulk ingest copies that message into per-entry
+/// receipts (#2324).
+///
+/// Only a failed command's own code counts, as in `classify_mongodb_error`: an
+/// unlabelled write-concern error with such a code (the write was applied) and
+/// an `insert_many` with per-document `write_errors` stay `Internal`. A labelled
+/// write-concern error is still `Unavailable` through the retry predicate. A
+/// server deadline (50/262) stays `Internal` here, unlike
+/// `classify_mongodb_error`'s `Timeout`, because none of these operations sets
+/// `maxTimeMS`.
+///
+/// Anything else is `Internal` with `"{context}: {err}"` plus the attempt count,
+/// as before, and since #2383 the driver error is kept as its `source`.
 pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> StorageError {
+    if is_transient_mongo_error(err)
+        || is_transient_read_server_error(err)
+        || matches!(err.kind.as_ref(), ErrorKind::ServerSelection { .. })
+    {
+        let context = if attempts == 1 {
+            context.to_string()
+        } else {
+            format!("{context} (after {attempts} attempts)")
+        };
+        return StorageError::Backend(mongodb_unavailable(&context, err));
+    }
     let message = if attempts == 1 {
         format!("{context}: {err}")
     } else {
         format!("{context}: {err} (after {attempts} attempts)")
     };
-    StorageError::Backend(if is_transient_mongo_error(err) {
-        BackendError::Unavailable {
-            backend_name: "mongodb".to_string(),
-            message,
-        }
-    } else {
-        BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message,
-            source: None,
-        }
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message,
+        source: Some(Box::new(err.clone())),
     })
 }
 
@@ -322,6 +475,67 @@ mod tests {
     fn io_and_pool_errors_are_transient_custom_is_not() {
         assert!(is_transient_mongo_error(&io_error()));
         assert!(!is_transient_mongo_error(&custom_error()));
+    }
+
+    fn command_error(code: i32) -> MongoError {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(
+            mongodb::bson::doc! { "code": code, "codeName": "Test", "errmsg": "test" },
+        )
+        .expect("a command error document");
+        MongoError::from(ErrorKind::Command(command))
+    }
+
+    /// A failed command with a real server code name and message, so a test can
+    /// look for the driver text in a client message and in a log line.
+    fn named_command_error(code: i32, code_name: &str, errmsg: &str) -> MongoError {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(
+            mongodb::bson::doc! { "code": code, "codeName": code_name, "errmsg": errmsg },
+        )
+        .expect("a command error document");
+        MongoError::from(ErrorKind::Command(command))
+    }
+
+    /// A write that succeeded on the primary but failed its write concern, as the
+    /// driver builds it from a reply that carries `writeConcernError`. The driver
+    /// copies the write-concern error's labels onto the error.
+    fn write_concern_error(code: i32, labels: &[&str]) -> MongoError {
+        let concern: mongodb::error::WriteConcernError =
+            mongodb::bson::from_document(mongodb::bson::doc! {
+                "code": code,
+                "codeName": "ShutdownInProgress",
+                "errmsg": "Replication is being shut down at 10.0.0.9:27017",
+                "errorLabels": labels.to_vec(),
+            })
+            .expect("a WriteConcernError deserializes from a server reply");
+        MongoError::from(ErrorKind::Write(
+            mongodb::error::WriteFailure::WriteConcernError(concern),
+        ))
+    }
+
+    #[test]
+    fn transient_read_server_codes_are_not_transient_for_the_write_retries() {
+        for code in TRANSIENT_READ_SERVER_CODES {
+            assert!(
+                is_transient_read_server_error(&command_error(code)),
+                "{code} is a transient read code"
+            );
+            assert!(
+                !is_transient_mongo_error(&command_error(code)),
+                "{code} must not make a write retry"
+            );
+        }
+        for code in [2, 8, 50, 112, 262, 11000] {
+            assert!(
+                !is_transient_read_server_error(&command_error(code)),
+                "{code} is not a transient read code"
+            );
+        }
+        assert!(!is_transient_read_server_error(&io_error()));
+        assert!(!is_transient_read_server_error(&custom_error()));
+        // The seven codes #2302 names.
+        for code in [10107, 13435, 11602, 13436, 189, 11600, 91] {
+            assert!(TRANSIENT_READ_SERVER_CODES.contains(&code), "{code}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -601,8 +815,10 @@ mod tests {
         let transient = exhausted("insert batch resources", 6, &io_error());
         match transient {
             StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-                assert!(message.starts_with("insert batch resources: "));
-                assert!(message.ends_with(" (after 6 attempts)"), "{message}");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
@@ -614,6 +830,373 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    /// #2324: bulk ingest copies an `Unavailable` message into per-entry receipts
+    /// and REST sends it to the client as the 503 text, so it holds no driver
+    /// text, only the operation and the attempt count. The driver error goes to
+    /// the shared `warn` line.
+    #[test]
+    #[tracing_test::traced_test]
+    fn exhausted_keeps_the_driver_text_out_of_unavailable_and_keeps_the_attempt_count() {
+        const DRIVER_DETAIL: &str = "connection reset by 203.0.113.7:27017";
+        let io = || {
+            MongoError::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                DRIVER_DETAIL,
+            ))
+        };
+
+        match exhausted("insert batch resources", 6, &io()) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("203.0.113.7"), "{message}");
+                assert!(!message.contains("Kind:"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        match exhausted("insert batch resources", 1, &io()) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "insert batch resources: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("attempts"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found
+                .iter()
+                .find(|l| !l.contains("WARN") || !l.contains("203.0.113.7"))
+            {
+                return Err(format!(
+                    "the line is not a WARN with the driver text: {line}"
+                ));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("insert batch resources (after 6 attempts)"))
+            {
+                return Err(format!("no line carries the attempt count: {found:?}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: a failed server selection is not retried, so it reaches
+    /// `exhausted` after one attempt. Its driver text lists the topology and
+    /// every server address, and it must not reach a client or a bulk receipt.
+    /// A closed local port, so it needs no server or Docker.
+    #[tokio::test]
+    async fn exhausted_answers_a_failed_server_selection_as_unavailable_without_the_topology() {
+        let client = mongodb::Client::with_uri_str(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("a well-formed connection string builds a client");
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .database("admin")
+                .run_command(mongodb::bson::doc! { "ping": 1_i32 }),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout")
+        .unwrap_err();
+        assert!(
+            matches!(err.kind.as_ref(), ErrorKind::ServerSelection { .. }),
+            "expected a server-selection error, got {err}"
+        );
+        assert!(
+            !is_transient_mongo_error(&err),
+            "a failed server selection is still not retried"
+        );
+
+        match exhausted("load manifest", 1, &err) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "load manifest: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(!message.contains("Topology"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #2383: a failed command that carries a server state-change code is not
+    /// retried (`is_transient_mongo_error` is false: unlabelled), so it reaches
+    /// `exhausted` after a single attempt, or after the attempts an unrelated
+    /// earlier failure used. `classify_mongodb_error` answers it `Unavailable`
+    /// since #2334, and `exhausted` answers it the same way, without the driver
+    /// text a bulk receipt would otherwise copy. The driver error goes to the
+    /// shared `warn` line.
+    #[test]
+    #[tracing_test::traced_test]
+    fn exhausted_answers_an_unlabelled_state_change_code_as_unavailable_without_the_driver_text() {
+        let not_primary = named_command_error(
+            10107,
+            "NotWritablePrimary",
+            "not primary, last seen 10.0.0.9:27017",
+        );
+        assert!(
+            !is_transient_mongo_error(&not_primary),
+            "the write-retry predicate is unchanged: the error is unlabelled"
+        );
+        match exhausted("insert batch resources", 6, &not_primary) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("10.0.0.9"), "{message}");
+                assert!(!message.contains("NotWritablePrimary"), "{message}");
+                assert!(!message.contains("Kind:"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        let shutting_down = named_command_error(
+            91,
+            "ShutdownInProgress",
+            "The server is in quiesce mode and will shut down",
+        );
+        match exhausted("load manifest", 1, &shutting_down) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "load manifest: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("attempts"), "{message}");
+                assert!(!message.contains("ShutdownInProgress"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not a WARN: {line}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("error_code=10107") && l.contains("10.0.0.9"))
+            {
+                return Err(format!(
+                    "no line carries error_code=10107 and the driver text: {found:?}"
+                ));
+            }
+            if !found.iter().any(|l| l.contains("error_code=91")) {
+                return Err(format!("no line carries error_code=91: {found:?}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("insert batch resources (after 6 attempts)"))
+            {
+                return Err(format!("no line carries the attempt count: {found:?}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2383: every code `classify_mongodb_error` answers `Unavailable` for a
+    /// failed command is answered the same way by `exhausted`, because both read
+    /// `TRANSIENT_READ_SERVER_CODES`.
+    #[test]
+    fn exhausted_answers_every_transient_read_server_code_as_unavailable() {
+        for code in TRANSIENT_READ_SERVER_CODES {
+            assert!(
+                !is_transient_mongo_error(&command_error(code)),
+                "{code}: an unlabelled command error is not a write retry"
+            );
+            match exhausted("resolve batch ids", 3, &command_error(code)) {
+                StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                    assert_eq!(
+                        message,
+                        "resolve batch ids (after 3 attempts): the database is temporarily unavailable; retry the request",
+                        "code {code}"
+                    );
+                }
+                other => panic!("code {code}: expected Unavailable, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2383: as in `classify_mongodb_error`, only a failed command's own code
+    /// counts. A write-concern error with a state-change code means the write was
+    /// applied, so it is not a refusal and stays `Internal`, unless the server
+    /// labelled it retryable (then `is_transient_mongo_error` makes it
+    /// `Unavailable`, as before this change).
+    #[test]
+    fn exhausted_keeps_a_write_concern_error_with_a_state_change_code_internal() {
+        for code in [91, 10107] {
+            let err = write_concern_error(code, &[]);
+            assert!(!is_transient_read_server_error(&err), "{code}");
+            assert!(!is_transient_mongo_error(&err), "{code}");
+            match exhausted("update batch resource", 6, &err) {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name,
+                    message,
+                    source: Some(source),
+                }) => {
+                    assert_eq!(backend_name, "mongodb");
+                    assert_eq!(
+                        message,
+                        format!("update batch resource: {err} (after 6 attempts)"),
+                        "code {code}"
+                    );
+                    assert!(source.downcast_ref::<MongoError>().is_some(), "{code}");
+                }
+                other => panic!("code {code}: expected Internal with a source, got {other:?}"),
+            }
+        }
+
+        // The carve-out is for the code arm only: the retry predicate still
+        // makes a labelled write-concern error `Unavailable`.
+        let labelled = write_concern_error(91, &[RETRYABLE_WRITE_ERROR]);
+        assert!(labelled.contains_label(RETRYABLE_WRITE_ERROR));
+        assert!(!is_transient_read_server_error(&labelled));
+        assert!(is_transient_mongo_error(&labelled));
+        match exhausted("update batch resource", 6, &labelled) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "update batch resource (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #2383: regression guard for what stays `Internal`: codes that are not
+    /// state-change codes, and an `insert_many` whose per-document
+    /// `write_errors` the caller must attribute, whatever codes or labels ride
+    /// on it.
+    #[test]
+    fn exhausted_keeps_unrelated_codes_and_attributed_insert_many_errors_internal() {
+        // 50 MaxTimeMSExpired and 262 ExceededTimeLimit stay `Internal` on
+        // purpose: `classify_mongodb_error` answers them `Timeout`, but none of
+        // the operations that reach `exhausted` sets `maxTimeMS`, and that arm
+        // is not mirrored here.
+        for code in [2, 112, 11000, 50, 262] {
+            let err = command_error(code);
+            match exhausted("ctx", 1, &err) {
+                StorageError::Backend(BackendError::Internal { message, .. }) => {
+                    assert_eq!(message, format!("ctx: {err}"), "code {code}");
+                    assert!(!message.contains("attempts"), "{message}");
+                }
+                other => panic!("code {code}: expected Internal, got {other:?}"),
+            }
+        }
+
+        let insert_many = |document: mongodb::bson::Document| {
+            let insert_many: mongodb::error::InsertManyError =
+                mongodb::bson::from_document(document)
+                    .expect("an InsertManyError deserializes from a server reply");
+            MongoError::from(ErrorKind::InsertMany(insert_many))
+        };
+
+        let attributed = insert_many(mongodb::bson::doc! {
+            "writeErrors": [{ "index": 0, "code": 10107, "errmsg": "not primary" }],
+        });
+        match exhausted("insert batch resources", 1, &attributed) {
+            StorageError::Backend(BackendError::Internal { .. }) => {}
+            other => panic!("expected Internal, got {other:?}"),
+        }
+
+        let labelled = insert_many(mongodb::bson::doc! {
+            "writeErrors": [{ "index": 0, "code": 10107, "errmsg": "not primary" }],
+            "writeConcernError": {
+                "code": 91,
+                "errmsg": "x",
+                "errorLabels": [RETRYABLE_WRITE_ERROR],
+            },
+        });
+        assert!(
+            labelled.contains_label(RETRYABLE_WRITE_ERROR),
+            "the driver copies the write-concern label onto the error"
+        );
+        assert!(!is_transient_mongo_error(&labelled));
+        match exhausted("insert batch resources", 1, &labelled) {
+            StorageError::Backend(BackendError::Internal { .. }) => {}
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// #2383: the `Internal` arm keeps the driver error as `source`, as
+    /// `classify_mongodb_error` does. For a driver error that carries no
+    /// `source` of its own, the client text does not change: `Display` does
+    /// not print `source`, and `error_chain` skips a layer the previous one
+    /// already quotes.
+    #[test]
+    fn exhausted_keeps_the_driver_error_as_the_internal_source_and_leaves_the_text_alone() {
+        let err = command_error(2);
+        let se = exhausted("insert batch resources", 6, &err);
+        let expected = format!("insert batch resources: {err} (after 6 attempts)");
+        match &se {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source: Some(source),
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(message, &expected);
+                let kept = source
+                    .downcast_ref::<MongoError>()
+                    .expect("the source is the driver error");
+                match kept.kind.as_ref() {
+                    ErrorKind::Command(command) => assert_eq!(command.code, 2),
+                    other => panic!("expected a Command error, got {other:?}"),
+                }
+            }
+            other => panic!("expected Internal with a source, got {other:?}"),
+        }
+        assert_eq!(
+            se.to_string(),
+            format!("internal error in mongodb: {expected}")
+        );
+        assert_eq!(
+            crate::core::bulk_submit_input::error_chain(&se),
+            se.to_string(),
+            "the bulk-submit worker's manifest file-error text does not change"
+        );
     }
 
     fn secs(s: u64) -> Duration {
@@ -764,5 +1347,182 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// [`next_write_replay_delay`] for a write with no clock reading: nothing
+    /// elapsed, nothing last took, no deadline.
+    fn write_delay(
+        catalog_or_lock_abort: bool,
+        attempts_made: u32,
+        fraction: f64,
+    ) -> Option<Duration> {
+        next_write_replay_delay(
+            catalog_or_lock_abort,
+            attempts_made,
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+            fraction,
+        )
+    }
+
+    #[test]
+    fn the_write_abort_numbers_are_the_documented_ones() {
+        assert_eq!(WRITE_ABORT_RETRY.max_attempts, 4);
+        assert_eq!(WRITE_ABORT_RETRY.base, ms(100));
+        assert_eq!(WRITE_ABORT_RETRY.cap, ms(400));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.max_attempts, 12);
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.base, ms(100));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.cap, secs(1));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_BUDGET, secs(12));
+    }
+
+    #[test]
+    fn every_abort_keeps_its_first_three_pauses_unjittered_whatever_the_clock_says() {
+        for catalog_or_lock_abort in [false, true] {
+            for fraction in [0.0, 0.5, 1.0, f64::NAN, -3.0, 7.0] {
+                for (attempts_made, expected) in [(1, 100), (2, 200), (3, 400)] {
+                    // Not even a spent budget or a deadline of zero stops them:
+                    // the first four attempts were never bounded by the clock.
+                    for (elapsed, deadline) in [
+                        (Duration::ZERO, None),
+                        (secs(60), None),
+                        (secs(60), Some(Duration::ZERO)),
+                    ] {
+                        assert_eq!(
+                            next_write_replay_delay(
+                                catalog_or_lock_abort,
+                                attempts_made,
+                                elapsed,
+                                secs(60),
+                                deadline,
+                                fraction,
+                            ),
+                            Some(ms(expected)),
+                            "attempt {attempts_made}, catalog or lock {catalog_or_lock_abort}, \
+                             fraction {fraction}, elapsed {elapsed:?}, deadline {deadline:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_abort_that_is_not_a_catalog_change_or_a_lock_timeout_ends_after_four_attempts() {
+        for attempts_made in [4, 5, 11] {
+            for fraction in [0.0, 1.0] {
+                assert_eq!(write_delay(false, attempts_made, fraction), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_catalog_or_lock_abort_goes_on_with_half_jittered_pauses() {
+        // Attempt 4: the backoff is 800 ms, drawn from 400 to 800 ms.
+        assert_eq!(write_delay(true, 4, 0.0), Some(ms(400)));
+        assert_eq!(write_delay(true, 4, 1.0), Some(ms(800)));
+        // Attempt 5 and later: 1 s, drawn from 500 ms to 1 s.
+        assert_eq!(write_delay(true, 5, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 5, 1.0), Some(ms(1000)));
+        assert_eq!(write_delay(true, 5, 0.5), Some(ms(750)));
+        assert_eq!(write_delay(true, 8, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 8, 1.0), Some(ms(1000)));
+        // The last attempt that may be followed by another, and the last.
+        assert_eq!(write_delay(true, 11, 1.0), Some(ms(1000)));
+        assert_eq!(write_delay(true, 11, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 12, 0.0), None);
+        assert_eq!(write_delay(true, 12, 1.0), None);
+        assert_eq!(write_delay(true, 40, 1.0), None);
+    }
+
+    #[test]
+    fn the_jitter_of_the_extra_attempts_is_clamped_and_never_below_half() {
+        // A draw outside [0, 1) is clamped, and `NaN` counts as zero, so the
+        // pause stays between half the backoff and the whole of it.
+        for (fraction, expected) in [
+            (-1.0, 500),
+            (f64::NAN, 500),
+            (f64::NEG_INFINITY, 500),
+            (2.0, 1000),
+            (f64::INFINITY, 1000),
+        ] {
+            assert_eq!(
+                write_delay(true, 5, fraction),
+                Some(ms(expected)),
+                "fraction {fraction}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_that_uses_every_attempt_pauses_between_4_6_and_8_5_seconds() {
+        let total = |fraction| {
+            (1..CATALOG_OR_LOCK_ABORT_RETRY.max_attempts)
+                .map(|attempts_made| {
+                    write_delay(true, attempts_made, fraction)
+                        .expect("every attempt before the last is followed by a pause")
+                })
+                .sum::<Duration>()
+        };
+        assert_eq!(total(1.0), ms(8_500));
+        assert_eq!(total(0.0), ms(4_600));
+        // The longest of those pauses fits in the budget with 3.5 s to spare
+        // for the attempts themselves.
+        assert!(total(1.0) < CATALOG_OR_LOCK_ABORT_BUDGET);
+    }
+
+    #[test]
+    fn the_wall_clock_budget_stops_the_extra_attempts() {
+        let run = |elapsed, last_attempt| {
+            next_write_replay_delay(true, 5, elapsed, last_attempt, None, 1.0)
+        };
+        // 10 s elapsed + 1 s for another run as long as the last + a pause of
+        // 1000 ms ends at 12 s: it fits. A millisecond more does not.
+        assert_eq!(run(secs(10), secs(1)), Some(ms(1000)));
+        assert_eq!(run(secs(10) + ms(1), secs(1)), None);
+        assert_eq!(run(secs(10), secs(1) + ms(1)), None);
+        // A slow last attempt is what stops a write early.
+        assert_eq!(run(secs(1), secs(11)), None);
+    }
+
+    #[test]
+    fn a_deadline_shorter_than_the_budget_wins_and_a_longer_one_does_not_extend_it() {
+        let run =
+            |elapsed, deadline| next_write_replay_delay(true, 5, elapsed, ms(100), deadline, 1.0);
+        // 5 s + 100 ms + 1000 ms = 6.1 s.
+        assert_eq!(run(secs(5), Some(ms(6_100))), Some(ms(1000)));
+        assert_eq!(run(secs(5), Some(ms(6_099))), None);
+        // 10.9 s + 100 ms + 1000 ms = 12 s: the budget allows it, and a
+        // deadline 100 s away changes nothing. A shorter deadline wins.
+        assert_eq!(run(ms(10_900), None), Some(ms(1000)));
+        assert_eq!(run(ms(10_900), Some(secs(100))), Some(ms(1000)));
+        assert_eq!(run(ms(10_900), Some(secs(11))), None);
+        // 11 s + 100 ms + 1000 ms = 12.1 s is past the 12 s budget, whatever
+        // the deadline: a longer one does not extend it.
+        assert_eq!(run(secs(11), None), None);
+        assert_eq!(run(secs(11), Some(secs(100))), None);
+    }
+
+    #[test]
+    fn a_deadline_of_zero_leaves_the_four_attempts_and_nothing_more() {
+        let run = |attempts_made| {
+            next_write_replay_delay(
+                true,
+                attempts_made,
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::ZERO),
+                0.0,
+            )
+        };
+        assert_eq!(run(1), Some(ms(100)));
+        assert_eq!(run(3), Some(ms(400)));
+        assert_eq!(run(4), None);
+        assert_eq!(run(5), None);
     }
 }

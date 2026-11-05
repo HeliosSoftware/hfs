@@ -7,6 +7,7 @@ Markdown block with per-row tables and Mermaid xychart-beta line charts.
 Best effort: every failure is swallowed and the exit code is always 0.
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -14,6 +15,8 @@ import re
 import subprocess
 import sys
 import tempfile
+
+import host_changes
 
 MAX_CHARTS = 6
 MAX_BYTES = 200 * 1024
@@ -24,17 +27,51 @@ NEW_BATCH = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources
 NEW_BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
 NEW_INGEST = "↳ ingest, until Completed (resources/s, seconds)"
 NEW_INDEX = "↳ search indexing (seconds)"
-OLD_REBUILD = "↳ search-index rebuild after Completed (seconds)"
-# older wordings of renamed rows -> canonical (new) wording, so they join into one row
+NEW_BATCH_P95 = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (per Bundle)"
+NEW_BULK_P95 = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`)"
+NEW_BATCH_ERR = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles)"
+# older wordings of renamed rows -> canonical (new) wording, so they join into one row.
+# The `reindex, `$reindex` Encounter` rows and the "Indexing ($reindex of Encounter)"
+# table are a different measurement and are deliberately NOT aliased.
 LABEL_ALIASES = {
+    "import (resources/s)": NEW_BATCH,
+    "import, `POST /` transaction Bundles (resources/s)": NEW_BATCH,
     "Batch/Transaction Import, `POST /` Bundles (resources/s)": NEW_BATCH,
+    "bulk-import (resources/s)": NEW_BULK,
+    "bulk-import, `$bulk-submit` (resources/s)": NEW_BULK,
     "Bulk Import, `$bulk-submit` (resources/s)": NEW_BULK,
+    "bulk-import ingest (resources/s, seconds)": NEW_INGEST,
     "Bulk Import: ingest (resources/s, seconds)": NEW_INGEST,
     "↳ ingest (resources/s, seconds)": NEW_INGEST,
-    # a REAL deferred rebuild: a different measurement from NEW_INDEX (whose ES
-    # cells are "= ingest"), so it stays its own row and never joins NEW_INDEX
-    "Bulk Import: index rebuild (seconds)": OLD_REBUILD,
+    "bulk-import initial index (seconds)": NEW_INDEX,
+    "Bulk Import: index rebuild (seconds)": NEW_INDEX,
+    "↳ search-index rebuild after Completed (seconds)": NEW_INDEX,
+    # p95 and error tables
+    "import (per Bundle)": NEW_BATCH_P95,
+    "import, `POST /` transaction Bundles (per Bundle)": NEW_BATCH_P95,
+    "Batch/Transaction Import, `POST /` Bundles (per Bundle)": NEW_BATCH_P95,
+    "bulk-import, `$bulk-submit`": NEW_BULK_P95,
+    "Bulk Import, `$bulk-submit`": NEW_BULK_P95,
+    "import": NEW_BATCH_ERR,
+    "import, `POST /` transaction Bundles": NEW_BATCH_ERR,
+    "Batch/Transaction Import, `POST /` Bundles": NEW_BATCH_ERR,
 }
+# Raw labels of the DEFERRED-indexing era (before #2248). On the Elasticsearch legs
+# their ingest/index numbers are not the quantity today's rows carry (today
+# index = ingest): they stay in the series, marked DEFERRED_MARK, and the change of
+# a cell is only computed against runs with the same indexing mode (see index_mode).
+DEFERRED_INDEX_LABELS = {
+    "bulk-import initial index (seconds)",
+    "Bulk Import: index rebuild (seconds)",
+    "↳ search-index rebuild after Completed (seconds)",
+}
+MODE_BLOCKS = {NEW_INGEST, NEW_INDEX}  # the blocks that carry the indexing mode
+DEFERRED_MARK = "ᵈ"
+
+
+def is_es_leg(name):
+    n = name.lower()
+    return "elasticsearch" in n or "+es" in n.replace(" ", "")
 
 
 def canon_label(label):
@@ -62,8 +99,39 @@ def _split_row(line):
     return [c.strip() for c in line.split("|")]
 
 
+# bracketed statuses of a search-index rebuild cell that did not finish cleanly
+# (bulk_import.py index_status; compare_legs.py renders `N s (<status>)`)
+BAD_STATUS_RE = re.compile(r"\((failed|cancelled|permanent-errors)\)", re.I)
+
+
+def cell_flags(cell):
+    """Flags of a table cell: rebuild that did not complete (`status` = the bracketed
+    word, e.g. failed / cancelled), '(= ingest)' inline marker."""
+    c = cell.lower()
+    m = BAD_STATUS_RE.search(c)
+    return {"failed": bool(m), "status": m.group(1) if m else "",
+            "inline": "(= ingest)" in c}
+
+
+def index_mode(raw_labels):
+    """Indexing mode of the Elasticsearch legs of one table, from its raw row labels:
+    'inline' (current `↳ search indexing` row), 'deferred' (old index rows), else 'unknown'."""
+    if NEW_INDEX in raw_labels:
+        return "inline"
+    if raw_labels & DEFERRED_INDEX_LABELS:
+        return "deferred"
+    return "unknown"
+
+
+def leg_mode(table, leg):
+    """Indexing mode of a leg in a table: non-ES legs are always 'deferred' (before and
+    after #2248, so they stay comparable); ES legs follow the table."""
+    return table.get("index_mode", "unknown") if is_es_leg(leg) else "deferred"
+
+
 def parse_tables(md):
-    """Return {'throughput': T, 'p95': T}; T = {'legs': [...], 'rows': [(label, [vals])]}."""
+    """Return {'throughput': T, 'p95': T}; T = {'legs': [...], 'rows': [(label, [vals])],
+    'cells': {label: [flags per leg]}, 'index_mode': 'inline'|'deferred'|'unknown'}."""
     lines = md.splitlines()
     tables = []
     i = 0
@@ -75,9 +143,12 @@ def parse_tables(md):
         if re.match(r"^\|\s*Suite\s*\|", ln):
             legs = _split_row(ln)[1:]
             rows = []
+            cells_of = {}
+            raw_labels = set()
             i += 2  # skip separator
             while i < len(lines) and lines[i].strip().startswith("|"):
                 cells = _split_row(lines[i])
+                raw_labels.add(cells[0].strip())
                 label = canon_label(cells[0])
                 if any(label == r[0] for r in rows):
                     i += 1
@@ -85,8 +156,11 @@ def parse_tables(md):
                 vals = [parse_cell(c) for c in cells[1:1 + len(legs)]]
                 vals += [None] * (len(legs) - len(vals))
                 rows.append((label, vals))
+                fl = [cell_flags(c) for c in cells[1:1 + len(legs)]]
+                cells_of[label] = fl + [cell_flags("")] * (len(legs) - len(fl))
                 i += 1
-            tables.append((heading, {"legs": legs, "rows": rows}))
+            tables.append((heading, {"legs": legs, "rows": rows, "cells": cells_of,
+                                     "index_mode": index_mode(raw_labels)}))
             continue
         i += 1
     out = {}
@@ -120,25 +194,54 @@ def _list_runs(repo, workflow, branch, per_page):
 def _norm(run):
     return {"id": int(run["id"]), "number": run.get("run_number"),
             "date": (run.get("created_at") or "")[:10],
+            "created_at": run.get("created_at") or "",
             "branch": run.get("head_branch") or "",
+            "conclusion": run.get("conclusion") or "",
             "url": run.get("html_url") or ""}
+
+
+LIST_CAP = 100  # most runs examined per branch while looking for ones with artifacts
+
+
+def has_artifact(repo, run_id):
+    """True when the run still has a benchmark artifact. Unknown counts as True."""
+    try:
+        r = _gh(["api", f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"])
+        if r.returncode != 0:
+            return True
+        arts = json.loads(r.stdout).get("artifacts", [])
+        return any(not a.get("expired") and str(a.get("name", "")).startswith(
+                       ("fhir-bench-comparison-", "fhir-bench-report-data-")) for a in arts)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _with_artifacts(repo, runs, limit, exclude_id):
+    """First `limit` runs (newest first) that still have an artifact: a run whose
+    artifacts expired or were never uploaded must not use up a slot."""
+    out = []
+    for x in runs:
+        if len(out) >= limit:
+            break
+        if int(x["id"]) == int(exclude_id):
+            continue
+        if has_artifact(repo, x["id"]):
+            out.append(_norm(x))
+    return out
 
 
 def fetch_runs(repo, workflow, branch, exclude_id, max_runs):
     runs = []
     try:
-        runs = [_norm(x) for x in _list_runs(repo, workflow, branch, max_runs + 5)
-                if int(x["id"]) != int(exclude_id)][:max_runs]
+        runs = _with_artifacts(repo, _list_runs(repo, workflow, branch, LIST_CAP),
+                               max_runs, exclude_id)
     except Exception as e:  # noqa: BLE001
         print(f"history: branch run list failed: {e}", file=sys.stderr)
     if branch != "main":
         try:
-            for x in _list_runs(repo, workflow, "main", 5):
-                if int(x["id"]) != int(exclude_id):
-                    n = _norm(x)
-                    if all(n["id"] != r["id"] for r in runs):
-                        runs.append(n)
-                    break
+            for n in _with_artifacts(repo, _list_runs(repo, workflow, "main", 20), 1, exclude_id):
+                if all(n["id"] != r["id"] for r in runs):
+                    runs.append(n)
         except Exception as e:  # noqa: BLE001
             print(f"history: main run list failed: {e}", file=sys.stderr)
     return runs
@@ -164,14 +267,45 @@ def fetch_comparison(repo, run, artifact_name):
         return None
 
 
-def fetch_data(repo, run, data_dir):
-    """Best effort: report-data.json artifact of a run into data_dir/<run id>."""
+_EXPIRY_WARNED = False
+
+
+def fetch_data(repo, run, data_dir, artifact_name="fhir-bench-comparison", legacy=True):
+    """Best effort: report-data.json artifact of a run into data_dir/<run id>.
+
+    TEMPORARY fallback (see legacy_points.py): a run from before that artifact
+    existed gets <run id>/legacy-point.json derived from its comparison.md."""
+    dest = os.path.join(data_dir, str(run["id"]))
+    ok = False
     try:
-        _gh(["run", "download", str(run["id"]), "-R", repo,
-             "-n", f"fhir-bench-report-data-{run['id']}",
-             "-D", os.path.join(data_dir, str(run["id"]))])
+        r = _gh(["run", "download", str(run["id"]), "-R", repo,
+                 "-n", f"fhir-bench-report-data-{run['id']}", "-D", dest])
+        ok = r.returncode == 0
     except Exception as e:  # noqa: BLE001
         print(f"history: data download failed for {run.get('id')}: {e}", file=sys.stderr)
+    if ok or not legacy:
+        return
+    try:
+        import legacy_points  # TEMPORARY: delete with the module
+        if datetime.date.today().isoformat() > legacy_points.EXPIRES:
+            global _EXPIRY_WARNED
+            if not _EXPIRY_WARNED:  # once per history.py run, not once per legacy run
+                _EXPIRY_WARNED = True
+                print(f"::warning::history: --legacy-trend expired on {legacy_points.EXPIRES}; "
+                      "remove legacy_points.py (see README, Removal)")
+            return
+        text = fetch_comparison(repo, run, artifact_name)
+        if not text:
+            return
+        doc = legacy_points.point_doc(text, str(run["id"]), run.get("date") or "",
+                                      run.get("branch") or "",
+                                      partial_run=run.get("conclusion") == "failure")
+        if doc:
+            os.makedirs(dest, exist_ok=True)
+            with open(os.path.join(dest, "legacy-point.json"), "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+    except Exception as e:  # noqa: BLE001
+        print(f"history: legacy point failed for {run.get('id')}: {e}", file=sys.stderr)
 
 
 def suites_of(text):
@@ -193,6 +327,21 @@ def pct(prev, cur):
         return ""
     p = (cur - prev) / abs(prev) * 100
     return f"{p:+.0f}%"
+
+
+def reference_index(series, i, mode_block):
+    """Index of the nearest earlier entry of series[i] with a value, or None. series is
+    [(value, mode, failed)]; a flagged (failed/cancelled) entry is never a reference, and in
+    the ingest/index blocks the reference must also have the same indexing mode."""
+    _v, mode, _f = series[i]
+    for j in range(i - 1, -1, -1):
+        rv, rmode, rfailed = series[j]
+        if rv is None:
+            continue
+        if rfailed or (mode_block and rmode != mode):
+            continue
+        return j
+    return None
 
 
 def _is_chart_row(label):
@@ -235,6 +384,17 @@ def render_chart(label, leg, vals, xlabels):
         "```"]) + "\n"
 
 
+LEGEND_CHANGE = ('_Change is against the nearest earlier run of the same leg with a value '
+                 '("vs #N" when it is not the previous column); no change shown = no earlier '
+                 'run to compare with; – = no data._')
+LEGEND_MODE = ('_Change in these rows is only computed against runs with the same indexing '
+               'mode; ᵈ = indexing deferred (runs before #2248: ingest excludes indexing and '
+               'the index row is the post-load rebuild) (marked on Elasticsearch legs only; '
+               'the other legs always defer); today\'s Elasticsearch legs index '
+               'inline during ingest. For Elasticsearch compare "Bulk Import … until '
+               'searchable (resources/s)", which covers load plus indexing in both modes._')
+
+
 def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_data_fn=None):
     try:
         runs = fetch_runs_fn(args.repo, args.workflow, args.branch,
@@ -251,7 +411,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 pass
     cur_suites = suites_of(current_text)
     entries = []  # (run dict, tables)
-    for run in sorted(runs, key=lambda r: (r.get("date", ""), r.get("id", 0))):
+    for run in sorted(runs, key=lambda r: (r.get("date", ""), r.get("created_at", ""),
+                                           r.get("id", 0))):
         try:
             text = fetch_comparison_fn(args.repo, run, args.artifact_name)
             if not text:
@@ -270,6 +431,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
             tabs = parse_tables(current_text)
             if "throughput" in tabs and tabs["throughput"]["rows"]:
                 entries.append(({"id": int(args.run_id), "number": None, "date": "",
+                                 "created_at": getattr(args, "created_at", None) or "",
                                  "branch": args.branch, "current": True,
                                  "url": f"https://github.com/{args.repo}/actions/runs/{args.run_id}"},
                                 tabs))
@@ -282,12 +444,27 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
         return "this run" if run.get("current") else f"#{run.get('number') or run['id']}"
 
     xlabels = [xl(r) for r, _ in entries]
+    # timestamp of each column; the current run counts as the latest ('now') without its own
+    stamps = [r.get("created_at") or r.get("date") or "" for r, _ in entries]
+    known = [x for x in stamps if x]
+    latest = max(known, key=host_changes._ts) if known else ""
+    stamps = [x or latest for x in stamps]
+
+    def host_lines(idx):
+        """Legend sentence for each host change inside the span of the columns idx."""
+        ts = sorted((stamps[i] for i in idx if stamps[i]), key=host_changes._ts)
+        if len(ts) < 2:
+            return []
+        return [f"_{host_changes.legend(c)}_" for c in host_changes.changes_between(ts[0], ts[-1])]
+
     out = [f"<details><summary>Progress over the last {len(entries)} runs</summary>\n"]
     out.append("Runs, oldest to newest: " + " · ".join(
         f"[{xl(r)}]({r['url']}) ({r['branch']}{', ' + r['date'] if r.get('date') else ''})"
         for r, _ in entries) + "\n")
-    out.append("Throughput per run (change vs the previous run in brackets; higher is better "
+    out.append("Throughput per run (change vs the nearest earlier run of the same leg with a value, in brackets; higher is better "
                "for resources/s and creates/s, lower for seconds rows).\n")
+    for hl in host_lines(range(len(entries))):
+        out.append(hl + "\n")
 
     # row labels in order of first appearance, from the newest table backwards
     labels, seen = [], set()
@@ -310,28 +487,68 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 if lg not in legs:
                     legs.append(lg)
         data = {lg: [] for lg in legs}
+        metas = {lg: [] for lg in legs}  # (indexing mode, flagged rebuild) per run
+        flags = {lg: [] for lg in legs}  # status text of a flagged cell per run
         for _, tabs in entries:
             t = tabs["throughput"]
             row = dict(t["rows"]).get(lab)
+            irow = dict(t["rows"]).get(NEW_INDEX)
             for lg in legs:
-                v = None
+                v, failed, status, mode = None, False, "", leg_mode(t, lg)
                 if row is not None and lg in t["legs"]:
-                    v = row[t["legs"].index(lg)]
+                    k = t["legs"].index(lg)
+                    v = row[k]
+                    cl = t.get("cells", {})
+                    own = cl.get(lab, [{}] * (k + 1))[k]
+                    idx = cl.get(NEW_INDEX, [{}] * (k + 1))[k]
+                    if lab in MODE_BLOCKS:
+                        failed, status = bool(own.get("failed")), own.get("status") or "failed"
+                    elif lab == NEW_BULK and idx.get("failed"):
+                        # until-searchable time of a rebuild that did not complete
+                        failed, status = True, "index " + (idx.get("status") or "failed")
+                    # the leg's mode comes from its own index cell, else from the table
+                    if is_es_leg(lg) and lab in MODE_BLOCKS:
+                        if idx.get("inline"):
+                            mode = "inline"
+                        elif irow is not None and irow[k] is not None:
+                            mode = "deferred"
                 data[lg].append(v)
+                metas[lg].append((mode, failed))
+                flags[lg].append(status)
         if all(v is None for vs in data.values() for v in vs):
             continue
         sec = [f"**{lab}**\n", "| Leg | " + " | ".join(xlabels) + " |",
                "|---|" + "---:|" * len(xlabels)]
+        mode_block = lab in MODE_BLOCKS
+        es_data = False
         for lg in legs:
             vs = data[lg]
             if all(v is None for v in vs):
                 continue
+            series = [(v,) + meta for v, meta in zip(vs, metas[lg])]
             cells = []
             for i, v in enumerate(vs):
                 c = fmt_num(v)
-                d = pct(vs[i - 1], v) if i else ""
-                cells.append(f"{c} ({d})" if d else c)
+                if v is not None and mode_block and is_es_leg(lg):
+                    es_data = True
+                    if series[i][1] == "deferred":
+                        c += DEFERRED_MARK
+                # a failed rebuild is the time until it failed, not a result: flag it, no change
+                if v is not None and series[i][2]:
+                    cells.append(c + f" ({flags[lg][i]})")
+                    continue
+                ref = reference_index(series, i, mode_block) if v is not None else None
+                d = pct(vs[ref], v) if ref is not None else ""
+                if d:
+                    c += f" ({d})" if ref == i - 1 else f" ({d} vs {xlabels[ref]})"
+                cells.append(c)
             sec.append(f"| `{lg}` | " + " | ".join(cells) + " |")
+        sec.append("\n" + LEGEND_CHANGE)
+        if es_data:
+            sec.append("\n" + LEGEND_MODE)
+        have = [i for i in range(len(entries)) if any(data[lg][i] is not None for lg in legs)]
+        for hl in host_lines(have):
+            sec.append("\n" + hl)
         out.append("\n".join(sec) + "\n")
         if _is_chart_row(lab) and len(charts) < MAX_CHARTS:
             lg = headline_leg(legs, data)
@@ -377,11 +594,17 @@ def main(argv=None):
     ap.add_argument("--max-runs", type=int, default=5)
     ap.add_argument("--workflow", default="fhir-benchmark.yml")
     ap.add_argument("--data-dir", default=None)
+    # timestamp of the current run (defaults to now); decides if a host change is in the span
+    ap.add_argument("--created-at", default=None)
+    # TEMPORARY: derive trend points from comparison.md of runs without report-data
+    ap.add_argument("--legacy-trend", action=argparse.BooleanOptionalAction, default=True)
     try:
         args = ap.parse_args(argv)
     except SystemExit:
         return 0
     try:
+        if not args.created_at:
+            args.created_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             with open(args.current, encoding="utf-8") as f:
                 cur = f.read()
@@ -389,7 +612,9 @@ def main(argv=None):
             cur = None
         text = build(args, lambda *a: fetch_runs(*a),
                      lambda repo, run, name: fetch_comparison(repo, run, name), cur,
-                     fetch_data if args.data_dir else None)
+                     (lambda repo, run, d: fetch_data(repo, run, d, args.artifact_name,
+                                                      args.legacy_trend))
+                     if args.data_dir else None)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
     except Exception as e:  # noqa: BLE001

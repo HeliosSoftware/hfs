@@ -42,3 +42,29 @@ async fn create_test_server(_name: &str) -> Option<TestServer> {
 }
 
 patient_scope_suite!(create_test_server);
+
+/// The capture the suites rely on (#2045) reaches an internal error's detail,
+/// which the generic 500 OperationOutcome withholds from the client. This
+/// does not need a real 500 from a backend, so it proves the filter, target,
+/// writer and thread-local dispatch work on every run. It uses
+/// `HFS_TEST_SERVER_LOG_FILTER` like the suites, so a filter that drops
+/// `helios_rest` ERROR events makes it fail.
+#[test]
+fn the_server_log_records_an_internal_errors_detail() {
+    let mut log = patient_scope::ServerLog::capture("self-check");
+    log.disarm();
+    let response =
+        axum::response::IntoResponse::into_response(helios_rest::RestError::InternalError {
+            message: "detail-2045: Error code 112 (WriteConflict)".to_string(),
+        });
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let text = log.text();
+    assert!(
+        text.contains("internal error while processing request"),
+        "{text}"
+    );
+    assert!(text.contains("detail-2045"), "{text}");
+}

@@ -2,7 +2,7 @@
   "resourceType" : "Bundle",
   "id" : "profiles-others",
   "meta" : {
-    "lastUpdated" : "2026-10-17T20:58:40.703+00:00"
+    "lastUpdated" : "2026-10-21T19:40:39.479+00:00"
   },
   "type" : "collection",
   "entry" : [{
@@ -5373,7 +5373,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -8538,7 +8539,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -11559,7 +11561,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -14664,7 +14667,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -17769,7 +17773,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -20874,7 +20879,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -23973,7 +23979,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -28083,7 +28090,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -31188,7 +31196,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -34293,7 +34302,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -37398,7 +37408,8 @@
             "http://hl7.org/fhir/StructureDefinition/Patient",
             "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
             "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-            "http://hl7.org/fhir/StructureDefinition/Group"]
+            "http://hl7.org/fhir/StructureDefinition/Group",
+            "http://hl7.org/fhir/StructureDefinition/Device"]
           }],
           "constraint" : [{
             "key" : "ele-1",
@@ -42170,7 +42181,7 @@
       "title" : "History bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "description" : "This profile holds all the requirements and constraints related to a FHIR history bundle.",
       "fhirVersion" : "6.0.0-snapshot1",
       "mapping" : [{
@@ -49179,7 +49190,7 @@
       "title" : "Search Set Bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -53045,7 +53056,7 @@
       "title" : "Subscription Notification bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -56902,7 +56913,7 @@
       "title" : "Batch bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -65003,7 +65014,7 @@
       "title" : "Batch response bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -66766,7 +66777,7 @@
       "title" : "Transaction bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -74867,7 +74878,7 @@
       "title" : "Transaction response bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -76630,7 +76641,7 @@
       "title" : "Document bundle",
       "status" : "active",
       "experimental" : false,
-      "date" : "2026-10-17T20:58:40+00:00",
+      "date" : "2026-10-21T19:40:39+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{

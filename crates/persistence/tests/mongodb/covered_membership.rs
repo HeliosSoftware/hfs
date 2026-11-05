@@ -394,7 +394,6 @@ async fn mongodb_covered_membership_preserves_multi_token_results_and_totals() {
         covered_status,
         "simple status membership must demonstrate a covered execution"
     );
-    fixture.db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -495,7 +494,6 @@ async fn mongodb_covered_membership_keeps_single_filter_and_named_system_control
             .all(|op| op.get_document("command").unwrap().get_str("hint") == Ok(ID_INDEX)),
         "null-system alternatives must retain candidate seeks: {null_system:?}"
     );
-    fixture.db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -542,7 +540,6 @@ async fn mongodb_covered_membership_missing_token_index_uses_existing_id_index()
             ),
         "missing-index retry must use the existing candidate index: {operations:?}"
     );
-    fixture.db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -630,7 +627,6 @@ async fn mongodb_covered_membership_code_only_work_stays_bounded_across_many_sys
             "candidate document work must remain bounded: {source:?}"
         );
     }
-    db.drop().await.unwrap();
 }
 
 async fn seed_skewed_membership(db: &mongodb::Database, scope: &str, many_systems: bool) {
@@ -778,5 +774,4 @@ async fn mongodb_covered_membership_cached_plans_remain_bounded_across_tenant_sk
             }
         }
     }
-    db.drop().await.unwrap();
 }

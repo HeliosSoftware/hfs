@@ -730,9 +730,16 @@ async fn counted_backends_keep_the_numeric_payload_unchanged() {
 /// from the first, so deleting one tenant counted every tenant in the
 /// store (#1912). Behind this wrapper, any handler still doing that fails
 /// with a 5xx, and `cross_tenant_counts` records the attempt.
+///
+/// It also counts `purge_tenant_data` calls (`purge_calls`) and can make the
+/// next purge fail after it ran (`interrupt_next_purge`), modelling a
+/// non-atomic backend (MongoDB, S3, composite) that deleted the resources and
+/// then failed on a later step (#2309).
 struct NoCrossTenantCount {
     inner: Arc<SqliteBackend>,
     cross_tenant_counts: std::sync::atomic::AtomicUsize,
+    purge_calls: std::sync::atomic::AtomicUsize,
+    interrupt_next_purge: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -869,7 +876,20 @@ impl helios_persistence::core::ResourceStorage for NoCrossTenantCount {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> helios_persistence::error::StorageResult<u64> {
-        self.inner.purge_tenant_data(id).await
+        use std::sync::atomic::Ordering::SeqCst;
+        self.purge_calls.fetch_add(1, SeqCst);
+        let removed = self.inner.purge_tenant_data(id).await?;
+        if self.interrupt_next_purge.swap(false, SeqCst) {
+            return Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal {
+                    backend_name: self.backend_name().to_string(),
+                    message: "purge interrupted after the resources were deleted (#2309)"
+                        .to_string(),
+                    source: None,
+                },
+            ));
+        }
+        Ok(removed)
     }
 }
 
@@ -881,6 +901,8 @@ fn create_scoped_delete_server() -> (TestServer, Arc<NoCrossTenantCount>) {
     let storage = Arc::new(NoCrossTenantCount {
         inner: Arc::new(backend),
         cross_tenant_counts: std::sync::atomic::AtomicUsize::new(0),
+        purge_calls: std::sync::atomic::AtomicUsize::new(0),
+        interrupt_next_purge: std::sync::atomic::AtomicBool::new(false),
     });
     let config = ServerConfig {
         base_url: "http://localhost:8080".to_string(),
@@ -914,6 +936,12 @@ async fn seed_patient(storage: &NoCrossTenantCount, tenant: &str, id: &str) {
 fn cross_tenant_counts(storage: &NoCrossTenantCount) -> usize {
     storage
         .cross_tenant_counts
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn purge_calls(storage: &NoCrossTenantCount) -> usize {
+    storage
+        .purge_calls
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -959,7 +987,9 @@ async fn delete_of_a_data_only_tenant_uses_no_cross_tenant_count() {
 
 /// The no-data branches: a registered empty tenant is deregistered, while an
 /// unregistered tenant holding nothing — never seen, or only delete tombstones
-/// on SQLite, whose discovery counts live resources — is a 404.
+/// on SQLite, whose discovery counts live resources — is a 404. These are the
+/// no-purge 404 branches: with `?purge=true` the same ids answer 200 (see the
+/// #2309 tests below).
 #[tokio::test]
 async fn delete_without_data_uses_no_cross_tenant_count() {
     let (server, storage) = create_scoped_delete_server();
@@ -998,9 +1028,344 @@ async fn delete_without_data_uses_no_cross_tenant_count() {
         .assert_status(StatusCode::NOT_FOUND);
 
     server
-        .delete("/admin/tenants/ghost?purge=true")
+        .delete("/admin/tenants/ghost")
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
     assert_eq!(cross_tenant_counts(&storage), 0);
+}
+
+// ── #2309: a purge never answers 404, so a retry finishes it ─────────────────
+
+/// A deregistered tenant holding only delete tombstones and history — the
+/// natural leftover on SQLite and PostgreSQL, where `tenant_has_resources`
+/// counts live rows only — is purged by `?purge=true` instead of answering 404.
+#[tokio::test]
+async fn purge_reaches_a_deregistered_tenant_that_holds_only_tombstones() {
+    use helios_persistence::core::{InstanceHistoryProvider, ResourceStorage};
+    use helios_persistence::error::{ResourceError, StorageError};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    let (server, storage) = create_scoped_delete_server();
+    let ctx = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_patient(&storage, "acme", "p1").await;
+    storage
+        .delete(&ctx, "Patient", "p1")
+        .await
+        .expect("delete Patient/p1");
+
+    // Only a tombstone and its history are left.
+    assert!(matches!(
+        storage.read(&ctx, "Patient", "p1").await,
+        Err(StorageError::Resource(ResourceError::Gone { .. }))
+    ));
+    assert!(
+        storage
+            .inner
+            .history_instance_count(&ctx, "Patient", "p1")
+            .await
+            .expect("history count")
+            > 0
+    );
+
+    // The no-purge rule is unchanged: the first call deregisters, the second 404s.
+    let del = server.delete("/admin/tenants/acme").await;
+    del.assert_status(StatusCode::OK);
+    assert_eq!(del.json::<Value>()["deregistered"], true);
+    server
+        .delete("/admin/tenants/acme")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // With purge the leftovers are reached.
+    let purge = server.delete("/admin/tenants/acme?purge=true").await;
+    purge.assert_status(StatusCode::OK);
+    assert_eq!(
+        purge.json::<Value>(),
+        json!({
+            "id": "acme",
+            "deregistered": false,
+            "purged": true,
+            "resources_removed": 1,
+        })
+    );
+    assert!(
+        storage
+            .read(&ctx, "Patient", "p1")
+            .await
+            .expect("read after purge")
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .inner
+            .history_instance_count(&ctx, "Patient", "p1")
+            .await
+            .expect("history count"),
+        0
+    );
+    assert_eq!(purge_calls(&storage), 1);
+
+    // Purging again removes nothing and is still a 200.
+    let again = server.delete("/admin/tenants/acme?purge=true").await;
+    again.assert_status(StatusCode::OK);
+    assert_eq!(again.json::<Value>()["resources_removed"], 0);
+    assert_eq!(cross_tenant_counts(&storage), 0);
+}
+
+/// The issue's sequence: the purge removes the resources and then fails, the
+/// tenant is deregistered with no live resource, and the retry is neither a 404
+/// nor skipped.
+#[tokio::test]
+async fn a_purge_that_failed_after_its_resources_were_deleted_can_be_retried() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (server, storage) = create_scoped_delete_server();
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_patient(&storage, "acme", "p1").await;
+    seed_patient(&storage, "acme", "p2").await;
+    storage.interrupt_next_purge.store(true, SeqCst);
+
+    // The deregister ran and the inner purge removed the rows; then it failed.
+    let first = server.delete("/admin/tenants/acme?purge=true").await;
+    assert!(
+        first.status_code().is_server_error(),
+        "the interrupted purge must fail the request, got {}",
+        first.status_code()
+    );
+
+    // The trap: without purge the tenant looks gone.
+    server
+        .delete("/admin/tenants/acme")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // The retry reaches the purge and succeeds. The resources were already
+    // deleted, so it reports 0 removed.
+    let retry = server.delete("/admin/tenants/acme?purge=true").await;
+    retry.assert_status(StatusCode::OK);
+    assert_eq!(
+        retry.json::<Value>(),
+        json!({
+            "id": "acme",
+            "deregistered": false,
+            "purged": true,
+            "resources_removed": 0,
+        })
+    );
+    assert_eq!(purge_calls(&storage), 2);
+    assert_eq!(cross_tenant_counts(&storage), 0);
+}
+
+/// An id that was never seen is purged to nothing: 200, `deregistered: false`,
+/// 0 removed. Without `purge` it is still a 404.
+#[tokio::test]
+async fn purge_of_a_tenant_that_never_existed_is_200_with_nothing_removed() {
+    let (server, storage) = create_scoped_delete_server();
+
+    let purge = server.delete("/admin/tenants/ghost?purge=true").await;
+    purge.assert_status(StatusCode::OK);
+    assert_eq!(
+        purge.json::<Value>(),
+        json!({
+            "id": "ghost",
+            "deregistered": false,
+            "purged": true,
+            "resources_removed": 0,
+        })
+    );
+    assert_eq!(purge_calls(&storage), 1);
+
+    server
+        .delete("/admin/tenants/ghost")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(cross_tenant_counts(&storage), 0);
+}
+
+/// With the existence probe gone from the purge path, validation is the only
+/// REST-layer guard: a reserved id is a 400 and never reaches the purge.
+#[tokio::test]
+async fn reserved_ids_with_purge_are_400_and_never_reach_the_purge() {
+    let (server, storage) = create_scoped_delete_server();
+    for reserved in ["__system__", "tenants", "resources", "history", "bulk"] {
+        server
+            .delete(&format!("/admin/tenants/{reserved}?purge=true"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(purge_calls(&storage), 0);
+}
+
+/// Purging an id the server does not know still reports the tenant-level
+/// events, in order, and creates no dashboard-counter entry for it: every
+/// observer treats an unknown tenant as a no-op.
+#[tokio::test]
+async fn purge_of_an_unknown_tenant_reports_erased_then_removed() {
+    let (server, recorder, counters) = create_observed_test_server().await;
+
+    server
+        .delete("/admin/tenants/ghost?purge=true")
+        .await
+        .assert_status(StatusCode::OK);
+    assert_eq!(
+        *recorder.events.lock().unwrap(),
+        vec!["erased:ghost", "removed:ghost"]
+    );
+    assert!(!counters.tenants().contains(&"ghost".to_string()));
+}
+
+/// An output store over a real local-fs store whose tenant-wide delete can be
+/// made to fail (#2279).
+struct FlakyOutputStore {
+    inner: helios_persistence::backends::local_fs::LocalFsOutputStore,
+    fail_tenant_delete: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl helios_persistence::core::ExportOutputStore for FlakyOutputStore {
+    async fn open_writer(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::ExportPartWriter> {
+        self.inner.open_writer(key).await
+    }
+    async fn finalize_part(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        writer: helios_persistence::core::ExportPartWriter,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::FinalizedPart> {
+        self.inner.finalize_part(key, writer).await
+    }
+    async fn download_url(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        ttl: std::time::Duration,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::DownloadUrl> {
+        self.inner.download_url(key, ttl).await
+    }
+    async fn open_reader(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>
+    {
+        self.inner.open_reader(key).await
+    }
+    async fn delete_job_outputs(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        job_id: &helios_persistence::core::ExportJobId,
+    ) -> helios_persistence::error::StorageResult<()> {
+        self.inner.delete_job_outputs(tenant, job_id).await
+    }
+    async fn delete_tenant_outputs(
+        &self,
+        tenant_id: &str,
+    ) -> helios_persistence::error::StorageResult<()> {
+        if self
+            .fail_tenant_delete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal {
+                    backend_name: "test".to_string(),
+                    message: "output store down".to_string(),
+                    source: None,
+                },
+            ));
+        }
+        self.inner.delete_tenant_outputs(tenant_id).await
+    }
+}
+
+/// A purge deletes the tenant's bulk output files before its rows (#2279): a
+/// failing output store fails the request with every row still in place, and
+/// the retry then removes both. Rows-first, the failure would have left files
+/// whose job rows were gone, which no expiry sweep can find.
+#[tokio::test]
+async fn delete_with_purge_removes_output_files_first() {
+    use helios_persistence::core::{ExportJobId, ExportOutputStore, ExportPartKey};
+    use std::sync::atomic::Ordering;
+
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to init schema");
+    let backend = Arc::new(backend);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FlakyOutputStore {
+        inner: helios_persistence::backends::local_fs::LocalFsOutputStore::new(
+            tmp.path(),
+            "http://localhost:8080",
+        ),
+        fail_tenant_delete: true.into(),
+    });
+    let key = ExportPartKey::output("acme", ExportJobId::new(), "Patient", 0, 1);
+    let mut writer = store.open_writer(&key).await.unwrap();
+    writer.write_line("{}").await.unwrap();
+    store.finalize_part(&key, writer).await.unwrap();
+
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
+        backend.clone() as Arc<dyn helios_persistence::core::BulkExportJobStore>,
+        store.clone() as Arc<dyn ExportOutputStore>,
+        Arc::new(helios_rest::bulk_export_auth::BearerScopeAuth),
+    );
+    let router = helios_rest::routing::fhir_routes::create_routes(state.clone())
+        .merge(helios_rest::routing::admin_tenants::routes(state));
+    let server = TestServer::new(router).unwrap();
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "acme", "Patient").await;
+
+    let failed = server.delete("/admin/tenants/acme?purge=true").await;
+    assert!(
+        !failed.status_code().is_success(),
+        "a failed file delete must fail the purge, got {}",
+        failed.status_code()
+    );
+    assert!(tmp.path().join("acme").exists());
+    let list = server.get("/admin/tenants").await.json::<Value>();
+    assert!(
+        find(&list, "acme").is_some(),
+        "the rows must survive a failed file delete"
+    );
+
+    store.fail_tenant_delete.store(false, Ordering::SeqCst);
+    let retried = server.delete("/admin/tenants/acme?purge=true").await;
+    retried.assert_status(StatusCode::OK);
+    assert_eq!(retried.json::<Value>()["resources_removed"], 1);
+    assert!(!tmp.path().join("acme").exists());
 }

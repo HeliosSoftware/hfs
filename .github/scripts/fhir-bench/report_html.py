@@ -28,6 +28,9 @@ import sys
 from array import array
 from concurrent.futures import ProcessPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I does not add the script dir
+import host_changes  # noqa: E402
+
 # Same thresholds as compare_legs.py
 IMPORT_TARGET = 1000
 ERR_PCT_HIGH = 1.0
@@ -53,6 +56,14 @@ PAL_KNOWN = {
 PAL_EXTRA = {"dark": ["#c9a227", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
              "light": ["#8a6d00", "#a63a6e", "#16757c", "#a8501a", "#5b6785", "#4a7a1c"]}
 KNOWN_BASES = ("postgres", "sqlite", "mongodb")
+
+
+# A deferred reindex that failed or was cancelled (bulk_import.py): its index timing is not valid.
+INDEX_INVALID = ("failed", "cancelled")
+
+
+def index_invalid(status):
+    return status in INDEX_INVALID
 
 
 def label(leg):
@@ -389,6 +400,8 @@ def markers(d):
         m = "" if b["searchable"] else "†"
         if b["failed"] is not None and b["submitted"] and (100.0 * b["failed"] / b["submitted"] > ERR_PCT_HIGH or b["failed"] > 0):
             m += "‡"
+        if index_invalid(b.get("index_status")):
+            m += "‡"  # a failed or cancelled rebuild is not a valid indexing time
         if d["died"]:
             m += "⚠"
         mk["bulk"] = m
@@ -638,6 +651,7 @@ def trend_point(leg, x):
             "suites": suites,
             "bulk": b and {"rps": b["rps"], "total": b["total"], "ingest_rps": b["ingest_rps"],
                            "ingest": b["ingest"], "index_eff": b["index_eff"]},
+            "index_inline": b["index_inline"] if b else None, "index_status": b["index_status"] if b else None,
             "bundles_ok": x["ic"]["bundles_ok"] if x["ic"] else None, "pg_ms": x["pg_ms"],
             "crud_load": cs["la1"] if cs else None, "markers": x["markers"]}
 
@@ -648,46 +662,89 @@ def run_key(t):
 
 
 def load_history(trend_dir):
-    """[(run id, dump)] of the earlier runs found as <trend_dir>/<run id>/report-data.json."""
+    """[(run id, dump)] of the earlier runs found as <trend_dir>/<run id>/report-data.json.
+
+    TEMPORARY: a run without report-data.json may carry legacy-point.json (same shape, points derived from its
+    comparison.md by history.py). Delete the second file name below when the legacy fallback is removed."""
     out = []
     if not trend_dir or not os.path.isdir(trend_dir):
         return out
     for name in sorted(os.listdir(trend_dir)):
-        p = os.path.join(trend_dir, name, "report-data.json")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            if isinstance(doc, dict) and isinstance(doc.get("legs"), dict):
-                out.append((name, doc))
-        except (OSError, ValueError):
-            continue
+        for fname in ("report-data.json", "legacy-point.json"):
+            p = os.path.join(trend_dir, name, fname)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                if isinstance(doc, dict) and isinstance(doc.get("legs"), dict):
+                    out.append((name, doc))
+                    break
+            except (OSError, ValueError):
+                continue
     return out
 
 
-def leg_trend(leg, cur_point, history, run):
-    """(previous point or None, trend list including the current run). Nothing assumes earlier runs exist."""
+REF_METRICS = ("search", "crud", "insert", "sql-run", "sql_rows", "import",
+               "bulk.rps", "bulk.total", "bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
+MODE_METRICS = ("bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
+# A failed/cancelled rebuild invalidates only the index timing and the until-searchable total/rps, not the ingest.
+INDEX_METRICS = ("bulk.index_eff", "bulk.rps", "bulk.total")
+
+
+def metric_value(pt, metric):
+    if metric.startswith("bulk."):
+        return (pt.get("bulk") or {}).get(metric[5:])
+    return ((pt.get("suites") or {}).get(metric) or {}).get("rps")
+
+
+def nearest_reference(metric, cur_point, older):
+    """Nearest earlier point (of `older`, ascending) with a value for `metric`. Ingest and indexing metrics also
+    need the same indexing mode (unknown only matches unknown); the index timing and the until-searchable
+    total/rps also need a rebuild that did not fail or get cancelled (the ingest metrics of such a run stay valid)."""
+    for t in reversed(older):
+        if metric_value(t, metric) is None:
+            continue
+        if metric in MODE_METRICS and t.get("index_inline") != cur_point.get("index_inline"):
+            continue
+        if metric in INDEX_METRICS and index_invalid(t.get("index_status")):
+            continue
+        return t
+    return None
+
+
+def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
+    """(previous point or None, trend list including the current run, {metric: reference point or None}).
+    Nothing assumes earlier runs exist."""
     pts = []
     for name, doc in history:
         lg = doc["legs"].get(leg)
         pt = lg.get("point") if isinstance(lg, dict) else None
         if isinstance(pt, dict) and isinstance(pt.get("suites"), dict):
             pt = dict(pt)
+            # older report-data.json points lack the indexing mode: take it from the leg's bulk block
+            bk = lg.get("bulk") or {}
+            pt.setdefault("index_inline", bk.get("index_inline"))
+            pt.setdefault("index_status", bk.get("index_status"))
+            if index_invalid(pt.get("index_status")):
+                mk = dict(pt.get("markers") or {})
+                if "‡" not in (mk.get("bulk") or ""):
+                    mk["bulk"] = (mk.get("bulk") or "") + "‡"
+                pt["markers"] = mk
             pt["run"] = pt.get("run") or doc.get("run") or name
             if str(pt["run"]) != str(run):
                 pts.append(pt)
     seen, trend = set(), []
-    for t in sorted(pts, key=run_key)[-(TREND_MAX - 1):] + ([cur_point] if cur_point else []):
+    for t in sorted(pts, key=run_key)[-(max(1, trend_max) - 1):] + ([cur_point] if cur_point else []):
         if str(t["run"]) not in seen:
             seen.add(str(t["run"]))
             trend.append(t)
     trend.sort(key=run_key)
-    prev = None
+    prev, prev_by = None, {}
     if cur_point:
-        older = [t for t in trend if run_key(t) < run_key(cur_point)
-                 and any(s in t["suites"] for s in ("search", "crud", "import"))]
-        same = [t for t in older if t.get("branch") == cur_point.get("branch")]
-        prev = (same or older or [None])[-1]
-    return prev, trend
+        older = [t for t in trend if run_key(t) < run_key(cur_point)]
+        prev = older[-1] if older else None
+        for m in REF_METRICS:
+            prev_by[m] = nearest_reference(m, cur_point, older)
+    return prev, trend, prev_by
 
 
 # ── palette ────────────────────────────────────────────────────────────
@@ -761,9 +818,13 @@ def build_data(a):
     for l in order:
         pt = trend_point(l, dict(legs[l], run=run, ref=a.branch or legs[l]["ref"]))
         legs[l]["point"] = pt
-        legs[l]["prev"], legs[l]["trend"] = leg_trend(l, pt, history, run)
+        legs[l]["prev"], legs[l]["trend"], legs[l]["prev_by"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
+    dates = [t.get("date") for l in order for t in legs[l]["trend"] if t.get("date")]
+    changes = host_changes.changes_between(min(dates), max(dates)) if dates else []
+    hchg = [{"at": c["at"], "approximate": bool(c.get("approximate")), "note": c["note"],
+             "legend": host_changes.legend(c)} for c in changes]
     starts = sorted(legs[l]["start"] for l in order if legs[l]["start"])
     timing = load_timing(getattr(a, "timing_json", None))
     sha = (a.sha or first.get("sha") or "")[:9] or None
@@ -771,7 +832,7 @@ def build_data(a):
     return {**extra, "run": run, "date": starts[0] if starts else None, "sha": sha, "sha_full": a.sha or None,
             "ref": a.branch or first.get("ref"), "repo": a.repo, "docker_cpus": docker_cpus,
             "docker_ram_gb": docker_ram, "headline": head, "order": order, "missing": missing, "legs": legs,
-            "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history),
+            "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history), "host_changes": hchg,
             "palette": palette(order), "comparison": parse_comparison(find_comparison(a.run_dir)),
             "verdict_all": verdict_all(legs, order, docker_cpus, missing, timing),
             "thresholds": {"import_target": IMPORT_TARGET, "err_pct_high": ERR_PCT_HIGH,
@@ -826,6 +887,7 @@ def main(argv=None):
     ap.add_argument("--out", default="fhir-bench-report.html")
     ap.add_argument("--dump-json")
     ap.add_argument("--trend-dir")
+    ap.add_argument("--trend-max", type=int, default=TREND_MAX, help="most runs (including this one) charted per leg")
     ap.add_argument("--timing-json", default=None, help="run_timing.py output: waiting vs working time")
     ap.add_argument("--no-shapes", action="store_true", help="do not read the heavy search-points.json")
     ap.add_argument("--headline-leg", default=None, help="leg preselected in the tiles (default: first leg with results)")
@@ -837,7 +899,8 @@ def main(argv=None):
     except SystemExit:
         a = argparse.Namespace(run_dir="", run_id="", repo="", branch="", sha="", out="fhir-bench-report.html",
                                dump_json=None, trend_dir=None, no_shapes=True, headline_leg=None,
-                               docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None)
+                               docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None,
+                               trend_max=TREND_MAX)
     text, data, size_legs = None, None, 0
     try:
         data = build_data(a)
@@ -850,7 +913,7 @@ def main(argv=None):
         try:
             dump = dict(data) if data else {"run": a.run_id, "legs": {}, "order": []}
             dump.pop("timing_view", None)
-            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev")}
+            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev", "prev_by")}
                             for l, lg in dump["legs"].items()}
             with open(a.dump_json, "w", encoding="utf-8") as fh:
                 json.dump(dump, fh, ensure_ascii=False, separators=(",", ":"))

@@ -87,18 +87,37 @@ pub fn is_calendar_vs_ucum_year_or_month(unit1: &str, unit2: &str) -> bool {
     fn is_calendar_keyword(unit: &str) -> bool {
         calendar_to_ucum_unit(unit) != unit
     }
-    fn is_calendar_year_or_month(unit: &str) -> bool {
-        matches!(
-            unit.to_lowercase().as_str(),
-            "year" | "years" | "month" | "months"
-        )
-    }
     let mixed = |cal: &str, other: &str| {
         is_calendar_year_or_month(cal)
             && !is_calendar_keyword(other)
             && units_are_comparable(cal, other)
     };
     mixed(unit1, unit2) || mixed(unit2, unit1)
+}
+
+/// Whether `unit` is the calendar keyword `year` or `month` (singular or plural).
+fn is_calendar_year_or_month(unit: &str) -> bool {
+    matches!(
+        unit.to_lowercase().as_str(),
+        "year" | "years" | "month" | "months"
+    )
+}
+
+/// Whether two time units cannot be ordered (`<`, `<=`, `>`, `>=`) because
+/// one is a calendar year/month keyword and the other is a different unit.
+/// Calendar years and months have no fixed length, so `1 year < 2 months`,
+/// `1 year <= 2 days` and `1 year > 1 'a'` are all empty. The singular and
+/// plural keyword are the same unit (`1 year < 2 years` is true), and
+/// calendar durations of a week or less still order against other units.
+pub fn is_calendar_year_or_month_unorderable(unit1: &str, unit2: &str) -> bool {
+    match (
+        is_calendar_year_or_month(unit1),
+        is_calendar_year_or_month(unit2),
+    ) {
+        (true, true) => calendar_to_ucum_unit(unit1) != calendar_to_ucum_unit(unit2),
+        (true, false) | (false, true) => true,
+        (false, false) => false,
+    }
 }
 
 /// Checks if two quantities are equivalent (same value when converted to common units)

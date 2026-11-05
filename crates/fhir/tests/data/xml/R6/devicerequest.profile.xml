@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DeviceRequest"/>
   <meta>
-    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
+    <lastUpdated value="2026-10-21T19:40:39.479+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -718,7 +718,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="DeviceRequest.asNeeded : This status is to indicate whether the request is a PRN or may be given as needed.">asNeeded</span>
+            <span title="DeviceRequest.asNeeded : This status is to indicate whether the request is for a device to be used as needed (a.k.a. PRN or *pro re nata*).">asNeeded</span>
             <a name="DeviceRequest.asNeeded"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -726,7 +726,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#boolean">boolean</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">PRN status of request
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Whether the device is to be used as needed
             <br/>
           </td>
         </tr>
@@ -740,11 +740,15 @@
             <a name="DeviceRequest.asNeededFor"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Device usage reason
+            <br/>Binding: 
+            <a href="valueset-medication-as-needed-reason.html">SNOMED CT Medication As Needed Reason Codes</a> (
+            <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
+            <br/>
             <br/>
           </td>
         </tr>
@@ -857,7 +861,7 @@
   <name value="DeviceRequest"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -2359,8 +2363,8 @@
     </element>
     <element id="DeviceRequest.asNeeded">
       <path value="DeviceRequest.asNeeded"/>
-      <short value="PRN status of request"/>
-      <definition value="This status is to indicate whether the request is a PRN or may be given as needed."/>
+      <short value="Whether the device is to be used as needed"/>
+      <definition value="This status is to indicate whether the request is for a device to be used as needed (a.k.a. PRN or *pro re nata*)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2387,11 +2391,11 @@
       <short value="Device usage reason"/>
       <definition value="The reason for using the device."/>
       <min value="0"/>
-      <max value="1"/>
+      <max value="*"/>
       <base>
         <path value="DeviceRequest.asNeededFor"/>
         <min value="0"/>
-        <max value="1"/>
+        <max value="*"/>
       </base>
       <type>
         <code value="CodeableConcept"/>
@@ -2406,6 +2410,13 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="DeviceRequestAsNeededReason"/>
+        </extension>
+        <strength value="example"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medication-as-needed-reason"/>
+      </binding>
     </element>
     <element id="DeviceRequest.insurance">
       <path value="DeviceRequest.insurance"/>
@@ -3333,8 +3344,8 @@
     </element>
     <element id="DeviceRequest.asNeeded">
       <path value="DeviceRequest.asNeeded"/>
-      <short value="PRN status of request"/>
-      <definition value="This status is to indicate whether the request is a PRN or may be given as needed."/>
+      <short value="Whether the device is to be used as needed"/>
+      <definition value="This status is to indicate whether the request is for a device to be used as needed (a.k.a. PRN or *pro re nata*)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3349,13 +3360,20 @@
       <short value="Device usage reason"/>
       <definition value="The reason for using the device."/>
       <min value="0"/>
-      <max value="1"/>
+      <max value="*"/>
       <type>
         <code value="CodeableConcept"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="DeviceRequestAsNeededReason"/>
+        </extension>
+        <strength value="example"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medication-as-needed-reason"/>
+      </binding>
     </element>
     <element id="DeviceRequest.insurance">
       <path value="DeviceRequest.insurance"/>

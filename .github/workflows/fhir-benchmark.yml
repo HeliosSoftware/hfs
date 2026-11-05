@@ -83,6 +83,9 @@ name: FHIR Server Benchmark
 #     `hfs-bench-<kind>-<backend>-<run_id>`, labelled hfs-bench=1 +
 #     hfs-bench-run=<run_id> + hfs-bench-leg=<backend>, so the start-of-job
 #     reaper and the end-of-job leak check both cover it.
+#     The one exception is the Synthea corpus cache volume
+#     `hfs-bench-corpus-cache` (label hfs-bench-cache=1), which must outlive
+#     runs; .github/scripts/fhir-bench/start-tgz-server.sh explains it.
 #
 # The upstream suites pin their own k6 `scenarios` blocks (CRUD 300 VUs / 5m,
 # search 30 VUs / 2m, import 20 VUs × 1000 iters) so results stay comparable to
@@ -158,6 +161,11 @@ on:
         description: "Run ID tag to group this run's suites (default: GitHub run id)"
         required: false
         default: ""
+      history_runs:
+        description: "How many earlier runs the history and the HTML trend compare against (1-20)"
+        type: number
+        required: false
+        default: 5
       log_level:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
@@ -241,6 +249,14 @@ env:
   # Pin the benchmark repo/ref so a run is reproducible.
   BENCHMARK_REPO: HealthSamurai/fhir-server-performance-benchmark
   BENCHMARK_REF: main
+  # k6 is pinned, not "latest": the harness parses k6's human-readable progress
+  # lines and reads specific --summary-export fields and submetrics, so a k6
+  # release that changes either would change or blank benchmark rows with no
+  # change in this repository (see k6_progress_seconds in
+  # .github/scripts/fhir-bench/suite-lib.sh). 2.3.0 is the release recent runs
+  # already used. Bump it on purpose and re-run the parsing tests plus one real
+  # dispatch.
+  K6_VERSION: 2.3.0
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -640,50 +656,19 @@ jobs:
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
       # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
-      # infra/tgz Go server, exactly as the upstream docker-compose does.
+      # infra/tgz Go server, exactly as the upstream docker-compose does, but
+      # serving the corpus from a persistent cache volume on the Docker host
+      # instead of downloading 418 MB per leg (see the script header: a 120 s
+      # wait for concurrent per-leg downloads failed run 41506467762).
       - name: Build & start tgz bundle server
-        run: |
-          set -euo pipefail
-          TGZ_IMAGE="hfs-bench-tgz:${{ github.run_id }}"
-          TGZ_CONTAINER="hfs-bench-tgz-${{ matrix.backend }}-${{ github.run_id }}"
-          echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
-
-          docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
-          docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
-          # `hfs-bench=1`/`hfs-bench-run` mark this container as this
-          # workflow's and this run's (the start-of-job reaper matches the
-          # `hfs-bench-` name prefix).
-          # `hfs-ci=true` additionally makes .github/actions/docker-host-gc
-          # the backstop if a killed runner leaves this container behind —
-          # it reaps any hfs-ci=true orphan after 180 min regardless of which
-          # workflow leaked it. `hfs-bench-leg` is read by the end-of-job
-          # "Docker host usage after cleanup" leak check.
-          docker run -d --name "$TGZ_CONTAINER" \
-            --label hfs-bench=1 \
-            --label hfs-ci=true \
-            --label "hfs-bench-run=${{ github.run_id }}" \
-            --label "hfs-bench-leg=${{ matrix.backend }}" \
-            --log-driver local \
-            -p 0:8080 "$TGZ_IMAGE" \
-            "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
-
-          echo "Waiting for tgz bundle server..."
-          TGZ_PORT=""
-          for i in $(seq 1 60); do
-            TGZ_PORT=$(timeout 30 docker port "$TGZ_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
-            if [ -n "$TGZ_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$TGZ_PORT/hospitalInformation.json" -o /dev/null 2>/dev/null; then
-              echo "tgz ready on $DOCKER_HOST_IP:$TGZ_PORT after $((i * 2))s"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "ERROR: tgz bundle server did not become ready (still downloading corpus?)"
-              timeout 60 docker logs --tail 50 "$TGZ_CONTAINER" 2>&1 || true
-              exit 1
-            fi
-            sleep 2
-          done
-
-          echo "BUNDLE_URL=http://$DOCKER_HOST_IP:$TGZ_PORT" >> "$GITHUB_ENV"
+        # A cache miss may download for up to TGZ_SEED_TIMEOUT_S (900 s);
+        # build + serve readiness add a couple of minutes on top.
+        timeout-minutes: 20
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-tgz-server.sh"
 
       # ── Backend wiring ───────────────────────────────────────────────────
       # One explicit branch per backend family — never an if/else. An if/else
@@ -1016,6 +1001,13 @@ jobs:
       # ── Tools (k6) ───────────────────────────────────────────────────────
       - name: Install k6
         uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      # The pin above can be defeated by a different k6 earlier on PATH on the
+      # self-hosted runner; fail here rather than benchmark with the wrong one.
+      - name: Verify k6 version
+        run: k6 version | grep -F "v${K6_VERSION}" || { echo "::error::k6 is not v${K6_VERSION}"; exit 1; }
 
       # ── Server ───────────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ matrix.port }}
@@ -1212,10 +1204,10 @@ jobs:
       - name: Run benchmark suites
         working-directory: fhir-benchmark
         env:
-          # This run: block must contain no ${{ }} — GitHub caps a run block
+          # This run: block must contain no GitHub expressions — GitHub caps a run block
           # that contains an expression at 21,000 characters (dispatch of
           # cffc076b1 failed with "Exceeded max expression length 21000" on
-          # this exact step, which was ~26,300 characters with 31 ${{ }}
+          # this exact step, which was ~26,300 characters with 31 expression
           # substitutions). Every matrix/inputs/github/needs value the block
           # below uses is passed through here instead and read back as a
           # plain env var in bash. es_sync_mode needs no entry here: it is
@@ -1315,6 +1307,10 @@ jobs:
             mongodb*) MONGO_TXN_LIFETIME_REC="${MONGO_TXN_LIFETIME_S:-unknown}" ;;
             *)        MONGO_TXN_LIFETIME_REC=n/a ;;
           esac
+          # First line of the binary's own `k6 version` ("unknown" if it prints
+          # nothing). No pipe, so pipefail cannot turn a short read into a failure.
+          BENCH_K6_OUT=$(k6 version 2>/dev/null || true)
+          BENCH_K6_VER=${BENCH_K6_OUT%%$'\n'*}
 
           {
             echo "runner_name:  ${RUNNER_NAME:-unknown}"
@@ -1326,6 +1322,7 @@ jobs:
             echo "git_sha:      $BENCH_SHA"
             echo "git_ref:      $BENCH_REF_NAME"
             echo "backend:      $BACKEND"
+            echo "k6_version:   ${BENCH_K6_VER:-unknown}"
             echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
             echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
@@ -1786,7 +1783,10 @@ jobs:
         with:
           name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
           path: bench-results/
-          retention-days: 90
+          # Raw results are only read by this run's compare job; the trend
+          # charts read fhir-bench-comparison-* / fhir-bench-report-data-*,
+          # which keep 90 days.
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Upload server log
@@ -1852,6 +1852,10 @@ jobs:
         run: |
           if [ -n "${TGZ_CONTAINER:-}" ]; then
             docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
+          fi
+          # Only exists if the leg was killed while seeding the corpus cache.
+          if [ -n "${TGZ_SEED_CONTAINER:-}" ]; then
+            docker rm -fv "$TGZ_SEED_CONTAINER" 2>/dev/null || true
           fi
 
       # `-v` and the explicit `volume rm` matter: without them the Postgres data
@@ -1948,13 +1952,13 @@ jobs:
         env:
           # pg_shared_buffers is a free-text input; it reaches
           # summary_backends.py (see the pointer comment below) only
-          # through env:, never inlined as ${{ }} — a value containing a
+          # through env:, never inlined as an expression — a value containing a
           # `"` would otherwise break the Python string literal it lands
           # in (and, in principle, inject code). Nothing else in this step
           # reads it.
           IN_PG_SHARED_BUFFERS: ${{ inputs.pg_shared_buffers }}
           # Also consumed by summary_backends.py (see the pointer comment
-          # below) — that script cannot use ${{ }} itself.
+          # below) — that script cannot use GitHub expressions itself.
           BACKEND: ${{ matrix.backend }}
         run: |
           # GitHub's default shell has no pipefail: without it the step status
@@ -2357,8 +2361,19 @@ jobs:
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
+          HISTORY_RUNS: ${{ inputs.history_runs }}
         run: |
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5 --data-dir "$RUNNER_TEMP/trend"
+          # integer 1..20, else 5; the HTML trend gets one more point for this run
+          N=5
+          case "$HISTORY_RUNS" in
+            ''|*[!0-9]*) ;;
+            ????????*) N=20 ;;
+            *) N=$((10#$HISTORY_RUNS)) ;;
+          esac
+          if [ "$N" -lt 1 ]; then N=1; fi
+          if [ "$N" -gt 20 ]; then N=20; fi
+          echo "HISTORY_RUNS_N=$N" >> "$GITHUB_ENV"
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend"
 
       # comparison.md exists only after the summary step, so it is staged here.
       - name: Stage comparison for the report
@@ -2390,6 +2405,7 @@ jobs:
             --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
+            --trend-max $(( ${HISTORY_RUNS_N:-5} + 1 )) \
             --no-shapes
 
       # archive: false uploads the single .html as-is (not zipped), so it opens

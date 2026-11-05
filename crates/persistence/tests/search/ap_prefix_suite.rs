@@ -26,6 +26,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 /// (id, `ChargeItem.factorOverride`), either side of the `ap` windows below.
 const FACTORS: &[(&str, f64)] = &[
     ("ap-n-neg-111", -111.0),
@@ -214,7 +216,7 @@ where
 
     for (id, factor) in FACTORS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ChargeItem",
                 json!({
@@ -231,7 +233,7 @@ where
     }
     for (id, dose) in DOSES {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({

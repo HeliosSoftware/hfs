@@ -16,10 +16,10 @@ use crate::core::VersionedStorage;
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
-    invalid_entry_result_page,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    UnindexedEntry, invalid_entry_result_page,
 };
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -27,6 +27,39 @@ use crate::tenant::TenantContext;
 /// Keys per `ListObjectsV2` page when walking a manifest's result objects:
 /// S3's own maximum, so one receipt page rarely needs more than one LIST.
 const RECEIPT_LIST_PAGE_KEYS: i32 = 1000;
+
+/// A receipt as a result object stores it: the entry result, plus the manifest
+/// output file it came from (#2184). The object key only holds a digest of
+/// that file, so without the field the receipt writer could not name the input
+/// an error came from. Optional both ways: objects written before #2184 lack
+/// it and read back unattributed, and readers from before #2184 ignore it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredEntryResult {
+    #[serde(flatten)]
+    result: BulkEntryResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_url: Option<String>,
+}
+
+/// The borrowed write-side form of [`StoredEntryResult`], so persisting a
+/// batch does not clone its receipts.
+#[derive(serde::Serialize)]
+struct StoredEntryResultRef<'a> {
+    #[serde(flatten)]
+    result: &'a BulkEntryResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_url: Option<&'a str>,
+}
+
+impl StoredEntryResult {
+    /// The receipt's original identity, when the object kept its file.
+    fn stored_identity(&self) -> Option<EntryResultCursor> {
+        self.file_url.as_ref().map(|file_url| EntryResultCursor {
+            file_url: file_url.clone(),
+            line_number: self.result.line_number,
+        })
+    }
+}
 
 use super::backend::{S3Backend, TenantLocation};
 use super::models::{SubmissionManifestState, SubmissionState};
@@ -646,14 +679,14 @@ impl BulkSubmitProvider for S3Backend {
                     .await?
                     .unwrap_or_default();
                 while (cursor.entry_index as usize) < batch.len() {
-                    let result = &batch[cursor.entry_index as usize];
+                    let stored = &batch[cursor.entry_index as usize];
                     cursor.entry_index += 1;
-                    if outcome_filter.is_some_and(|filter| result.outcome != filter) {
+                    if outcome_filter.is_some_and(|filter| stored.result.outcome != filter) {
                         continue;
                     }
                     entries.push(PagedEntryResult {
-                        result: result.clone(),
-                        stored_identity: None,
+                        result: stored.result.clone(),
+                        stored_identity: stored.stored_identity(),
                     });
                     if entries.len() == limit {
                         if cursor.entry_index as usize == batch.len() {
@@ -706,8 +739,8 @@ impl BulkSubmitProvider for S3Backend {
                 .read_entry_result_object(&location, &object.key)
                 .await?
             {
-                for result in batch {
-                    summary.increment(result.outcome);
+                for stored in batch {
+                    summary.increment(stored.result.outcome);
                 }
             }
         }
@@ -1241,7 +1274,12 @@ impl S3Backend {
             file_url,
             first_line,
         );
-        let payload = self.serialize_json(&results)?;
+        let file_url = file_url.filter(|url| !url.is_empty());
+        let stored: Vec<StoredEntryResultRef<'_>> = results
+            .iter()
+            .map(|result| StoredEntryResultRef { result, file_url })
+            .collect();
+        let payload = self.serialize_json(&stored)?;
         self.put_json_object(&location.bucket, &key, &payload, None, None)
             .await?;
         Ok(())
@@ -1250,12 +1288,13 @@ impl S3Backend {
     /// Reads one object under `results/<manifest>/`, which holds either a
     /// coalesced batch — a JSON array of receipts (#1429) — or a legacy
     /// per-line receipt. Discriminated on the parsed JSON so both shapes are
-    /// read back.
+    /// read back. Each receipt keeps the file it came from when the object
+    /// recorded one (#2184).
     async fn read_entry_result_object(
         &self,
         location: &TenantLocation,
         key: &str,
-    ) -> StorageResult<Option<Vec<BulkEntryResult>>> {
+    ) -> StorageResult<Option<Vec<StoredEntryResult>>> {
         let Some((value, _)) = self
             .get_json_object::<serde_json::Value>(&location.bucket, key)
             .await?
@@ -1335,7 +1374,9 @@ impl S3Backend {
                 continue;
             };
             let is_batch = value.is_array();
-            let mut results: Vec<BulkEntryResult> = if is_batch {
+            // Read and written back as stored, so a flip keeps each receipt's
+            // file (#2184).
+            let mut results: Vec<StoredEntryResult> = if is_batch {
                 serde_json::from_value(value).map_err(|e| {
                     StorageError::Backend(BackendError::SerializationError {
                         message: format!("failed to deserialize entry result batch: {e}"),
@@ -1349,7 +1390,7 @@ impl S3Backend {
                 })?]
             };
             let mut flipped = 0u64;
-            for result in &mut results {
+            for StoredEntryResult { result, .. } in &mut results {
                 let Some(resource_id) = result.resource_id.as_deref() else {
                     continue;
                 };

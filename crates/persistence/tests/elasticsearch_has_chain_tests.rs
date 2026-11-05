@@ -58,8 +58,8 @@ use helios_persistence::search::{
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Page, ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery, SearchValue,
-    StoredResource,
+    ChainedParameter, Page, ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, StoredResource,
 };
 
 // ============================================================================
@@ -290,6 +290,8 @@ struct Counting<S> {
     inner: Arc<S>,
     searches: Mutex<HashMap<String, u64>>,
     reference_calls: Mutex<u64>,
+    /// `search_ids` calls (a subset of `searches`).
+    id_calls: Mutex<u64>,
     /// Answer `Ok(None)` to `search_reference_values`, as before #1753.
     hide_hook: bool,
 }
@@ -300,6 +302,7 @@ impl<S> Counting<S> {
             inner,
             searches: Mutex::new(HashMap::new()),
             reference_calls: Mutex::new(0),
+            id_calls: Mutex::new(0),
             hide_hook: false,
         }
     }
@@ -426,6 +429,7 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
         query: &SearchQuery,
     ) -> StorageResult<Page<String>> {
         self.count(&query.resource_type);
+        *self.id_calls.lock().unwrap() += 1;
         self.inner.search_ids(tenant, query).await
     }
     async fn search_count(
@@ -706,6 +710,287 @@ async fn has_resolution_issues_no_source_type_search() {
         .await
         .expect("Patient search");
     assert_eq!(ids(&result), set(&["p1", "p3"]));
+}
+
+// ============================================================================
+// search_ids on Elasticsearch (#2295): ids only, same pages as `search`
+// ============================================================================
+
+/// Pages `query` with both `search` and `search_ids` at `count` and checks
+/// that every page carries the same ids in the same order, the same
+/// `has_next` and the same `next_cursor`. Returns the ids in page order.
+async fn page_both_ways(
+    es: &ElasticsearchBackend,
+    t: &TenantContext,
+    query: &SearchQuery,
+    count: u32,
+) -> Vec<String> {
+    let mut all = Vec::new();
+    let mut seen_cursors = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..1000 {
+        let mut q = query.clone().with_count(count);
+        if let Some(c) = &cursor {
+            q = q.with_cursor(c.clone());
+        }
+        let full = es.search(t, &q).await.expect("search");
+        let lean = es.search_ids(t, &q).await.expect("search_ids");
+
+        let full_ids: Vec<String> = full
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(lean.items, full_ids, "page ids differ at cursor {cursor:?}");
+        assert_eq!(lean.page_info.has_next, full.resources.page_info.has_next);
+        assert_eq!(
+            lean.page_info.next_cursor, full.resources.page_info.next_cursor,
+            "next_cursor differs at cursor {cursor:?}"
+        );
+        assert!(
+            !(lean.page_info.has_next && lean.items.is_empty()),
+            "empty page with has_next"
+        );
+        assert!(lean.items.len() <= count as usize);
+        all.extend(lean.items.iter().cloned());
+
+        match lean.page_info.next_cursor.clone() {
+            Some(next) if lean.page_info.has_next => {
+                assert!(seen_cursors.insert(next.clone()), "cursor repeated: {next}");
+                cursor = Some(next);
+            }
+            _ => return all,
+        }
+    }
+    panic!("paging did not terminate");
+}
+
+#[tokio::test]
+async fn search_ids_pages_match_search_pages() {
+    let es = create_backend().await;
+    let t = tenant("ids-parity");
+    // A tenant whose id extends this one, and a plain neighbour.
+    let other = tenant("ids-parity-x");
+
+    let mut expected = BTreeSet::new();
+    for i in 0..23 {
+        let id = format!("o{i:02}");
+        put(
+            &es,
+            &t,
+            "Observation",
+            observation(&id, HEIGHT, "Patient/a"),
+        )
+        .await;
+        expected.insert(id);
+    }
+    for i in 0..5 {
+        let id = format!("d{i}");
+        put(
+            &es,
+            &t,
+            "Observation",
+            observation(&id, HEIGHT, "Patient/a"),
+        )
+        .await;
+        es.delete(&t, "Observation", &id).await.expect("delete");
+    }
+    // Another code in the same tenant, and the same code in another tenant.
+    put(
+        &es,
+        &t,
+        "Observation",
+        observation("z1", OTHER_CODE, "Patient/a"),
+    )
+    .await;
+    for i in 0..4 {
+        put(
+            &es,
+            &other,
+            "Observation",
+            observation(&format!("x{i}"), HEIGHT, "Patient/a"),
+        )
+        .await;
+    }
+
+    for count in [1, 4, 7, 23, 24, 1000] {
+        let paged = page_both_ways(&es, &t, &height_query(), count).await;
+        let distinct: BTreeSet<String> = paged.iter().cloned().collect();
+        assert_eq!(paged.len(), distinct.len(), "count={count}: duplicates");
+        assert_eq!(distinct, expected, "count={count}");
+    }
+
+    // A missing index is an empty page, not an error.
+    let none = es
+        .search_ids(&t, &SearchQuery::new("Encounter"))
+        .await
+        .expect("search_ids on a missing index");
+    assert!(none.items.is_empty() && !none.page_info.has_next);
+}
+
+#[tokio::test]
+async fn search_ids_falls_back_to_search_for_sorted_and_offset_queries() {
+    let es = create_backend().await;
+    let t = tenant("ids-fallback");
+    for i in 0..6 {
+        put(
+            &es,
+            &t,
+            "Observation",
+            observation(&format!("o{i}"), HEIGHT, "Patient/a"),
+        )
+        .await;
+    }
+    let mut offset = height_query().with_count(2);
+    offset.offset = Some(2);
+    for q in [offset, {
+        let mut q = height_query().with_count(3);
+        q.total = Some(helios_persistence::types::TotalMode::Accurate);
+        q
+    }] {
+        let full: Vec<String> = es
+            .search(&t, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        let lean = es.search_ids(&t, &q).await.unwrap().items;
+        assert_eq!(lean, full);
+    }
+}
+
+#[tokio::test]
+async fn forward_chain_resolves_the_same_through_search_ids() {
+    let es = create_backend().await;
+    let t = tenant("ids-chain");
+    for (id, family) in [("p1", "Smith"), ("p2", "Smith"), ("p3", "Jones")] {
+        put(
+            &es,
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+        )
+        .await;
+    }
+    let mut expected = BTreeSet::new();
+    for i in 0..12 {
+        let id = format!("o{i:02}");
+        let subject = ["Patient/p1", "Patient/p2", "Patient/p3"][i % 3];
+        put(&es, &t, "Observation", observation(&id, HEIGHT, subject)).await;
+        if i % 3 != 2 {
+            expected.insert(id);
+        }
+    }
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "name".to_string(),
+        }],
+        components: vec![],
+    });
+    let resolved = resolve_chains(&es, &t, &query)
+        .await
+        .expect("resolve chain");
+
+    for count in [3, 100] {
+        let paged = page_both_ways(&es, &t, &resolved, count).await;
+        assert_eq!(paged.iter().cloned().collect::<BTreeSet<_>>(), expected);
+        assert_eq!(paged.len(), expected.len(), "count={count}: duplicates");
+    }
+}
+
+/// Which resolver hops use which provider method (#2295):
+/// - forward chain hops (terminal and every walk back) go through `search_ids`;
+/// - a `_has` terminal goes through `search_reference_values` and issues no
+///   source-type search at all (see `has_resolution_issues_no_source_type_search`);
+/// - only when that hook declines does `_has` page the source type with the
+///   full `search`, because it needs the reference values held in the bodies.
+#[tokio::test]
+async fn resolver_hops_use_search_ids_for_forward_chains_only() {
+    let es = Arc::new(create_backend().await);
+    let t = tenant("ids-routing");
+    for (id, family) in [("p1", "Smith"), ("p2", "Jones")] {
+        put(
+            &*es,
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+        )
+        .await;
+    }
+    put(
+        &*es,
+        &t,
+        "Observation",
+        observation("o1", HEIGHT, "Patient/p1"),
+    )
+    .await;
+    put(
+        &*es,
+        &t,
+        "Observation",
+        observation("o2", HEIGHT, "Patient/p2"),
+    )
+    .await;
+
+    let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "name".to_string(),
+        }],
+        components: vec![],
+    });
+    let counting = Counting::new(es.clone());
+    let resolved = resolve_chains(&counting, &t, &forward)
+        .await
+        .expect("resolve forward chain");
+    assert_eq!(
+        *counting.id_calls.lock().unwrap(),
+        2,
+        "terminal + walk back"
+    );
+    assert_eq!(
+        counting.searches_of("Patient") + counting.searches_of("Observation"),
+        2,
+        "every forward hop is an id-only search"
+    );
+    assert_eq!(
+        ids(&counting.search(&t, &resolved).await.unwrap()),
+        set(&["o1"])
+    );
+
+    let counting = Counting::new(es.clone());
+    resolve_chains(&counting, &t, &has_height_query())
+        .await
+        .expect("resolve _has");
+    assert_eq!(*counting.id_calls.lock().unwrap(), 0);
+    assert_eq!(counting.searches_of("Observation"), 0);
+
+    let counting = Counting::new(es).without_hook();
+    resolve_chains(&counting, &t, &has_height_query())
+        .await
+        .expect("resolve _has without the hook");
+    assert_eq!(*counting.id_calls.lock().unwrap(), 0);
+    assert_eq!(
+        counting.searches_of("Observation"),
+        1,
+        "full search fallback"
+    );
 }
 
 // ============================================================================

@@ -110,6 +110,7 @@ use crate::export::controller::{
 };
 use crate::extractors::TenantExtractor;
 use crate::handlers::bulk_common::parse_instant_param;
+use crate::middleware::content_type::{get_accept_fhir_version, get_content_type_fhir_version};
 use crate::state::AppState;
 
 /// Top-level `Parameters` body parameter names recognised by `$sql-export`.
@@ -241,7 +242,11 @@ where
 
     // Pure, and it bounds the `patient`/`group` values, so an over-limit
     // request gets its 400 before any subject is resolved.
-    let inputs = merge_export_inputs(&params, Some(&body))?;
+    let mut inputs = merge_export_inputs(&params, Some(&body))?;
+    // As `$sql-run` (#2254): a `fhirVersion` named on `Content-Type`, else on
+    // `Accept`, restricts the export to resources stored under that version.
+    inputs.fhir_version =
+        get_content_type_fhir_version(&headers).or_else(|| get_accept_fhir_version(&headers));
 
     let work = extract_subjects_from_body(&state, &tenant, &body).await?;
     if work.is_empty() {
@@ -680,6 +685,7 @@ where
         since: inputs.since,
         patient: inputs.patient.clone(),
         group: inputs.group.clone(),
+        fhir_version: inputs.fhir_version,
     };
 
     let task = ExportTask {
@@ -1209,6 +1215,8 @@ struct ExportInputs {
     patient: Vec<String>,
     group: Vec<String>,
     client_tracking_id: Option<String>,
+    /// The FHIR version the request named, if any (#2254).
+    fhir_version: Option<helios_fhir::FhirVersion>,
 }
 
 /// Parses the raw query string into [`ExportQueryParams`], rejecting any
@@ -1367,6 +1375,7 @@ fn merge_export_inputs(
         patient,
         group,
         client_tracking_id,
+        fhir_version: None,
     })
 }
 

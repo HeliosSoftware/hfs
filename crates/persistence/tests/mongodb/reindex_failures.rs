@@ -1,6 +1,12 @@
-//! Reindex preserves page-level transient failures without replaying a page.
+//! Reindex retries a transiently failed page from its delete and keeps the
+//! failure retryable once the attempts run out; it never resends an insert batch.
 //! Failpoints share the suite's server-global lock, but match only this test's
 //! unique client application name and collection namespace.
+//!
+//! Most tests wrap their body in `catch_unwind` and re-raise the panic. That dates
+//! from when each test dropped its own database after the body, panic or not.
+//! The `db_cleanup` sweeper does that now (#2326), so those outer wrappers are
+//! plain pass-throughs; unwrap them after #2341 and #2346 have merged.
 
 use super::*;
 
@@ -32,10 +38,17 @@ async fn failure_fixture(
             },
         ),
         database_name: build_test_database_name("reindex_failures"),
-        app_name: format!("reindex-failures-{}", uuid::Uuid::new_v4().simple()),
+        app_name: Some(format!(
+            "reindex-failures-{}",
+            uuid::Uuid::new_v4().simple()
+        )),
         data_dir: Some(repo_data_dir()),
         reindex_overlap: overlap,
         reindex_prepare_threads: 1,
+        // These cases count the runs a failpoint gets before the page gives
+        // up; on a loaded runner the default 30 s budget can end it a run
+        // early (#2290).
+        reindex_page_budget: std::time::Duration::from_secs(600),
         ..Default::default()
     };
     let backend = build_backend(config).await?;
@@ -47,7 +60,7 @@ async fn failure_fixture(
     for n in 0..40 {
         let id = format!("obs-{n:02}");
         let (resource, _) = backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 &id,
@@ -86,14 +99,21 @@ async fn failure_fixture(
 /// Disable the failpoint before propagating a writer panic or asserting its
 /// result. A generous finite hit count catches unexpected retries instead of
 /// allowing a retry to succeed after consuming a one-shot failpoint.
+/// `REINDEX_PAGE_RETRY.max_attempts`, which the crate keeps private.
+const REINDEX_PAGE_RETRY_ATTEMPTS: i64 = 4;
+
 async fn write_with_failpoint(
     backend: &MongoBackend,
     tenant: &TenantContext,
     page: &[StoredResource],
     data: Document,
 ) -> Option<(Vec<StorageResult<usize>>, ReindexPageStats, i64)> {
-    let Some(failpoint) =
-        FailPoint::enable(&backend.config().app_name, data, doc! { "times": 100 }).await
+    let Some(failpoint) = FailPoint::enable(
+        backend.config().app_name_or_default(),
+        data,
+        doc! { "times": 100 },
+    )
+    .await
     else {
         skip_or_fail_unavailable("reindex failure tests require enableTestCommands=1");
         return None;
@@ -205,7 +225,15 @@ async fn page_failure_matrix(overlap: bool) {
                 let case = format!(
                     "overlap={overlap} {command} {collection} writeConcern={write_concern}"
                 );
-                assert_eq!(hits, 1, "one Helios attempt, no page replay: {case}");
+                // A failpoint that never clears exhausts the page's runs
+                // (#2290); a metadata write-concern failure is not transient
+                // and is not replayed.
+                let expected_hits = if command == "update" && write_concern {
+                    1
+                } else {
+                    REINDEX_PAGE_RETRY_ATTEMPTS
+                };
+                assert_eq!(hits, expected_hits, "page runs before giving up: {case}");
                 assert_eq!(outcomes.len(), page.len(), "{case}");
                 assert!(
                     outcomes.iter().all(|outcome| matches!(
@@ -269,7 +297,6 @@ async fn page_failure_matrix(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -357,7 +384,6 @@ async fn permanent_document_failure(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -385,7 +411,7 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
         }
         let data = transient_failure_data("insert", &format!("{}.search_index", db.name()), false);
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name, data, doc! {"times": 1},
+            backend.config().app_name_or_default(), data, doc! {"times": 1},
         ).await else {
             skip_or_fail_unavailable("reindex driver retry test requires enableTestCommands=1");
             return;
@@ -402,8 +428,123 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
         assert_eq!(stats.sub_batches, 1, "driver retry must not re-extract a page");
         assert_eq!(stats.insert_commands, 2, "one Helios own insert and one contained insert; retries happen inside the driver");
     }).catch_unwind().await;
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+/// One transient failure of `command` on `collection` (`times: 1`): the page
+/// runs again from its delete, ends indexed, and holds exactly the rows a
+/// clean page holds, with no duplicate left by the failed run (#2290).
+async fn transient_page_failure_is_retried(
+    overlap: bool,
+    command: &str,
+    collection: &str,
+    seed_rows: bool,
+) {
+    let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
+        skip_or_fail_unavailable("reindex page retry test requires MongoDB");
+        return;
+    };
+    let checked = AssertUnwindSafe(async {
+        let own = db.collection::<Document>("search_index");
+        let contained = db.collection::<Document>("search_index_contained");
+        if !seed_rows {
+            // First build into an empty index: the delete finds nothing, so
+            // only the forced verification protects a re-run.
+            let scope = doc! {"tenant_id": tenant.tenant_id().as_str()};
+            own.delete_many(scope.clone()).await.unwrap();
+            contained.delete_many(scope).await.unwrap();
+        }
+        // Reference: rows of a clean page, taken before any failure.
+        let mut clean = ReindexPageStats::default();
+        let first = backend
+            .write_search_entries_page_timed(&tenant, &page, &mut clean)
+            .await;
+        assert!(first.iter().all(Result::is_ok), "{first:?}");
+        let expected_own = own.count_documents(doc! {}).await.unwrap();
+        let expected_contained = contained.count_documents(doc! {}).await.unwrap();
+        if !seed_rows {
+            let scope = doc! {"tenant_id": tenant.tenant_id().as_str()};
+            own.delete_many(scope.clone()).await.unwrap();
+            contained.delete_many(scope).await.unwrap();
+        }
+
+        let data = transient_failure_data(command, &format!("{}.{}", db.name(), collection), false);
+        let Some(failpoint) = FailPoint::enable(
+            backend.config().app_name_or_default(),
+            data,
+            doc! {"times": 1},
+        )
+        .await
+        else {
+            skip_or_fail_unavailable("reindex page retry test requires enableTestCommands=1");
+            return;
+        };
+        let mut stats = ReindexPageStats::default();
+        let outcomes = backend
+            .write_search_entries_page_timed(&tenant, &page, &mut stats)
+            .await;
+        let hits = failpoint.off_and_count().await;
+        let case = format!("overlap={overlap} {command} {collection} seeded={seed_rows}");
+        assert_eq!(hits, 1, "the failpoint fired once: {case}");
+        assert_eq!(outcomes.len(), page.len(), "{case}");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Ok(n) if *n > 0)),
+            "a transient failure must end with the page indexed: {case}: {outcomes:?}"
+        );
+        assert_eq!(
+            own.count_documents(doc! {}).await.unwrap(),
+            expected_own,
+            "own rows must match a clean page, with no duplicates: {case}"
+        );
+        assert_eq!(
+            contained.count_documents(doc! {}).await.unwrap(),
+            expected_contained,
+            "contained rows must match a clean page, with no duplicates: {case}"
+        );
+        for resource in &page {
+            assert_eq!(
+                rows_of(&db, &tenant, resource.id()).await,
+                rows_of(&db, &tenant, page[0].id()).await,
+                "every resource holds the same row count: {case}"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
     db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_delete_failure_is_retried() {
+    transient_page_failure_is_retried(false, "delete", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_delete_failure_is_retried() {
+    transient_page_failure_is_retried(true, "delete", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_insert_failure_is_retried_without_duplicates() {
+    transient_page_failure_is_retried(false, "insert", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_insert_failure_is_retried_without_duplicates() {
+    transient_page_failure_is_retried(true, "insert", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_insert_failure_is_retried_into_an_empty_index() {
+    transient_page_failure_is_retried(false, "insert", "search_index_contained", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_insert_failure_is_retried_into_an_empty_index() {
+    transient_page_failure_is_retried(true, "insert", "search_index_contained", false).await;
 }
 
 /// Rows that appear after the page's delete and before its inserts are what
@@ -454,7 +595,7 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
         // Hold the post-delete snapshot before it executes, so the planted
         // leftovers are observed before this page starts inserting rows.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -529,7 +670,6 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -555,7 +695,7 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         // The page's first find on search_index is the post-delete snapshot;
         // skipping it fails the next one, the post-insert ID read.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             transient_failure_data("find", &format!("{}.search_index", db.name()), false),
             doc! { "skip": 1 },
         )
@@ -567,8 +707,8 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed verification read, no replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing verification read exhausts the page's runs"
         );
         assert_eq!(outcomes.len(), page.len());
         assert!(
@@ -589,7 +729,6 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -611,7 +750,7 @@ async fn page_with_held_command(
         (command, "search_index")
     };
     let Some(failpoint) = FailPoint::enable(
-        &backend.config().app_name,
+        backend.config().app_name_or_default(),
         doc! {
             "failCommands": [command],
             "namespace": format!("{}.{}", db.name(), collection),
@@ -748,7 +887,6 @@ async fn mongodb_integration_reindex_update_between_delete_and_insert_keeps_the_
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -804,7 +942,6 @@ async fn mongodb_integration_reindex_update_after_insert_is_left_alone() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -883,7 +1020,6 @@ async fn mongodb_integration_reindex_offsetting_rows_do_not_hide_unknown_ones() 
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -951,7 +1087,6 @@ async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification()
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -989,14 +1124,14 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
         // The update comes from another instance so the hold below never
         // applies to its own writes.
         let mut other_config = backend.config().clone();
-        other_config.app_name = format!("reindex-other-{}", uuid::Uuid::new_v4().simple());
+        other_config.app_name = Some(format!("reindex-other-{}", uuid::Uuid::new_v4().simple()));
         let other = build_backend(other_config).await.unwrap();
         // One hold per matching command on search_index after the page's own
         // delete: the post-delete snapshot (1), the post-insert ID read (2),
         // the cleanup delete (3), the cleanup's re-read (4) and the re-read
         // after the version check explains the mismatch (5).
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find", "delete"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -1047,7 +1182,6 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1061,7 +1195,7 @@ async fn mongodb_integration_reindex_same_version_writer_rows_are_preserved() {
     };
     let checked = AssertUnwindSafe(async {
         let mut other_config = backend.config().clone();
-        other_config.app_name = format!("reindex-other-{}", uuid::Uuid::new_v4().simple());
+        other_config.app_name = Some(format!("reindex-other-{}", uuid::Uuid::new_v4().simple()));
         let other = build_backend(other_config).await.unwrap();
         let target = page[0].id();
         let own_rows = rows_of(&db, &tenant, target).await;
@@ -1139,7 +1273,6 @@ async fn mongodb_integration_reindex_same_version_writer_rows_are_preserved() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1175,7 +1308,6 @@ async fn changed_resource_with_no_contained_rows(delete: bool, overlap: bool) {
         }
         assert_eq!(stats.stale_rows_remaining, 0, "{stats:?}");
     }).catch_unwind().await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1235,7 +1367,6 @@ async fn mongodb_integration_reindex_resource_without_version_keeps_the_page_row
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1252,7 +1383,7 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
     let checked = AssertUnwindSafe(async {
         let target = page[0].id();
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 target,
@@ -1262,7 +1393,7 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
             .await
             .unwrap();
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             transient_failure_data("delete", &format!("{}.search_index", db.name()), false),
             doc! { "skip": 1 },
         )
@@ -1274,9 +1405,11 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed cleanup delete, no page replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing cleanup delete exhausts the page's runs"
         );
+        // The failpoint stays on after the skipped first delete, so every
+        // replay fails at its own first delete, not at the stale cleanup.
         assert!(
             outcomes.iter().all(|outcome| matches!(
                 outcome,
@@ -1284,18 +1417,9 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
             )),
             "{outcomes:?}"
         );
-        assert!(
-            outcomes.iter().all(|outcome| outcome
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("remove stale")),
-            "the failed operation must be cleanup: {outcomes:?}"
-        );
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1315,7 +1439,7 @@ async fn update_at_version_observation_boundary(before_snapshot: bool) {
             "resources"
         };
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.{}", db.name(), collection),
@@ -1392,7 +1516,6 @@ async fn update_at_version_observation_boundary(before_snapshot: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1469,7 +1592,6 @@ async fn unexpected_row_identity_is_retryable(replace: bool, collection: &str) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1509,7 +1631,7 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
         survivor.insert("_id", survivor_id.clone());
         // Old snapshot, final ID verification, then the three cleanup rereads.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -1571,7 +1693,6 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1585,12 +1706,12 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
         // Keep the saved page at version 1 while the current resource changes.
         if deleted {
             backend
-                .delete(&tenant, "Observation", target)
+                .seed_delete(&tenant, "Observation", target)
                 .await
                 .unwrap();
         } else {
             let (updated, _) = backend
-                .create_or_update(
+                .seed_put(
                     &tenant,
                     "Observation",
                     target,
@@ -1608,7 +1729,7 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
         };
         // Post-delete snapshot, post-insert verification, three cleanup rereads.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.{}", db.name(), collection),
@@ -1681,7 +1802,6 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 

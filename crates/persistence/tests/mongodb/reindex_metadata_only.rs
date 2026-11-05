@@ -20,12 +20,12 @@ async fn seed(backend: &MongoBackend, tenant: &TenantContext) {
             patient["birthDate"] = json!("1970-01-01");
         }
         backend
-            .create(tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap();
     }
     backend
-        .create(
+        .seed_create(
             tenant,
             "Observation",
             json!({"resourceType": "Observation", "id": "o1", "status": "final", "code": {"text": "metadata"}}),
@@ -45,7 +45,7 @@ async fn resources(backend: &MongoBackend) -> mongodb::Collection<Document> {
 
 /// Removes `missing_params` from every resource of `tenant`: what a dataset
 /// written before #1984 looks like, and what the definition-maintenance
-/// procedure in `docs/mongodb/search-indexes.md` leaves behind.
+/// procedure in `crates/persistence/mongodb/search-indexes.md` leaves behind.
 async fn unset_metadata(backend: &MongoBackend, tenant: &TenantContext) {
     resources(backend)
         .await
@@ -232,7 +232,7 @@ async fn mongodb_metadata_only_reindex_extracts_a_large_page_on_the_pool() {
             patient["gender"] = json!("male");
         }
         backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap();
     }

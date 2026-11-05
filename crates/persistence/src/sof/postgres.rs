@@ -109,8 +109,9 @@ impl SofRunner for PgInDbRunner {
         let tenant_id = tenant.tenant_id().to_string();
         let group_pool = self.pool.clone();
         let group_tenant = tenant_id.clone();
+        let group_version = filters.fhir_version.map(|v| v.as_mime_param());
         let load_groups = move |refs: Vec<String>| async move {
-            load_group_documents(&group_pool, &group_tenant, &refs).await
+            load_group_documents(&group_pool, &group_tenant, group_version, &refs).await
         };
         let prepared = match self.export_page_size {
             Some(_) => {
@@ -203,14 +204,19 @@ impl SofRunner for PgInDbRunner {
         let tenant_id = tenant.tenant_id().to_string();
         let group_pool = self.pool.clone();
         let group_tenant = tenant_id.clone();
+        let group_version = filters.fhir_version.map(|v| v.as_mime_param());
         let Some(prepared) = prepare_sql_run(
             &view_definition,
             SqlDialect::Postgres,
             self.fhir_version,
             &tenant_id,
             filters,
-            move |refs| async move { load_group_documents(&group_pool, &group_tenant, &refs).await },
-        ).await? else {
+            move |refs| async move {
+                load_group_documents(&group_pool, &group_tenant, group_version, &refs).await
+            },
+        )
+        .await?
+        else {
             return Ok(Some(Box::pin(futures::stream::empty())));
         };
         let compiled = prepared.query;
@@ -252,10 +258,13 @@ impl SofRunner for PgInDbRunner {
 }
 
 /// Backend-only tenant-scoped Group document loading. Shared runtime
-/// preparation interprets and merges the membership of these documents.
+/// preparation interprets and merges the membership of these documents. A
+/// run restricted to one stored FHIR version (#2254) reads only Groups stored
+/// under it (`stored_version`, the closed MIME form `"4.0"`, `"5.0"`, …).
 async fn load_group_documents(
     pool: &Pool,
     tenant_id: &str,
+    stored_version: Option<&'static str>,
     group_refs: &[String],
 ) -> Result<Vec<Value>, SofError> {
     if group_refs.is_empty() {
@@ -265,14 +274,17 @@ async fn load_group_documents(
         .get()
         .await
         .map_err(|e| SofError::Storage(format!("failed to get pg connection: {e}")))?;
+    let version_clause = stored_version
+        .map(|v| format!(" AND fhir_version = '{v}'"))
+        .unwrap_or_default();
     let stmt = client
-        .prepare(
+        .prepare(&format!(
             "SELECT data FROM resources \
              WHERE tenant_id = $1 \
                AND resource_type = 'Group' \
                AND id = $2 \
-               AND is_deleted = false",
-        )
+               AND is_deleted = false{version_clause}",
+        ))
         .await
         .map_err(|e| SofError::Storage(format!("prepare failed: {e}")))?;
 

@@ -42,6 +42,8 @@ use helios_persistence::types::{
     SearchValue, SortDirection, SortDirective,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// (id, `period`, subject). The ranges they are indexed as are in the
 /// comments, `-∞`/`+∞` for an open side.
 const ENCOUNTERS: &[(&str, Period, &str)] = &[
@@ -327,7 +329,7 @@ where
 {
     let id = resource["id"].as_str().unwrap_or_default().to_string();
     backend
-        .create(tenant, resource_type, resource, FhirVersion::default())
+        .seed_create(tenant, resource_type, resource, FhirVersion::default())
         .await
         .unwrap_or_else(|e| panic!("create {resource_type}/{id} failed: {e}"));
 }

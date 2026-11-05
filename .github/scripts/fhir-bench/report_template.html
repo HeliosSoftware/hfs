@@ -166,6 +166,8 @@ figure{margin:0}
   <div class="seg" role="group" aria-label="Leg" id="segKpi"></div>
   <div class="kpis" id="kpis"></div>
   <p class="how" id="prevNote"></p>
+  <p class="how" id="prevLegend">Change is against the nearest earlier run with a value; for ingest and indexing only against runs with the same indexing mode (Elasticsearch legs: deferred before #2248, inline since; other legs always deferred). For Elasticsearch legs the comparable measure across both modes is Bulk Import until searchable (resources/s).</p>
+  <p class="how" id="hostNote"></p>
 
   <h3>Throughput by suite, all legs</h3>
   <p class="how"><b>How to read this:</b> longer bar = more per second (the search indexing panel is in seconds: shorter is better); each panel has its own scale, so compare legs within a panel, not across panels.</p>
@@ -227,6 +229,7 @@ figure{margin:0}
   <p class="how"><b>How to read this:</b> one point per run (leg colour = this run, orange = other runs), higher is better; with a single data point per date and different hosts, the line shows context, not a proven trend.</p>
   <div class="grid2" id="trend"></div>
   <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
+  <p class="note" id="trendHost"></p>
 </section>
 
 <section id="data">
@@ -368,49 +371,69 @@ function renderValidity(){
   $("validity").innerHTML = h+"</tbody>";
 }
 
+/* ---------- host changes ---------- */
+const HOSTCH = (D.host_changes || []);
+const hostTs = v => { v = String(v||"").trim().replace(/Z$/,""); return v.length===10 ? v+"T00:00:00" : v.slice(0,19); };
+const hostBefore = (ts, c) => !!hostTs(ts) && hostTs(ts) < hostTs(c.at);
+const isEs = leg => /-elasticsearch$/.test(leg || "");
+
 /* ---------- KPIs ---------- */
 function renderKpis(){
   const leg = sel.kpi, H = L[leg] || null, P = H && H.prev;
   $("prevNote").innerHTML = P
-    ? `<b>Indicative comparison</b> with the previous run <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>): a single run each, at a different time and with a different host load; it does not prove an improvement or a regression.`
+    ? `<b>Indicative comparison</b>: a single run each, at a different time and with a different host load; it does not prove an improvement or a regression. The previous run is <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>); each change below names the run it is measured against.`
     : "";
+  $("hostNote").textContent = "";
   if(!H){ $("kpis").innerHTML = NODATA; return; }
+  const hostSeen = new Set();
   const TV = D.timing_view, timingTile = TV
     ? `<div class="card kpi${TV.warn?" warn":""}"><div class="lbl">${esc(TV.label)}</div><div class="val" style="font-size:1.25rem">${esc(TV.value)}</div><div class="sub">${esc(TV.sub)}</div></div>` : "";
-  const ps = s => P && P.suites && P.suites[s] ? P.suites[s] : null;
+  const PB = (H && H.prev_by) || {};
+  const refOf = m => PB[m] || null;
+  const ps = s => { const r = refOf(s); return r && r.suites && r.suites[s] ? r.suites[s] : null; };
+  const bv = (m, f) => { const r = refOf("bulk."+m); return r && r.bulk ? r.bulk[f] : null; };
+  const modeMetric = k => k==="bulk_ingest" || k==="bulk_index";
   const items = [["search","Search","req/s"],["crud","CRUD","req/s"],["insert","Insert","creates/s"],["sql-run",NSQ,"req/s"],["sql_rows",NSR,"rows/s"],
     ["import",NB,"resources/s"],["bulk",NK,"resources/s"],["bulk_ingest",NKI,"resources/s"],["bulk_index",NKX,"s"]];
   $("kpis").innerHTML = timingTile + items.map(([k,name,unit])=>{
-    let v, p95, pv, pp95, sub = "", valTxt = null;
+    let v, p95, pv, pp95, sub = "", valTxt = null, refPt = null;
     const b = H.bulk, bdone = b && b.status==="complete";
+    const idxBad = bdone && (b.index_status==="failed" || b.index_status==="cancelled");
     if(k==="bulk"||k==="bulk_ingest"||k==="bulk_index"){
       pv = null;
-      if(k==="bulk"){ v = bdone ? b.rps : null; pv = P && P.bulk ? P.bulk.rps : null;
-        sub = b ? (bdone ? "total time "+n0(b.total)+" s"+(P&&P.bulk?" (was "+n0(P.bulk.total)+" s)":"") : esc(b.status)+": "+esc(b.reason||b.phase||"")) : ""; }
-      else if(k==="bulk_ingest"){ v = bdone ? b.ingest_rps : null; pv = P && P.bulk ? P.bulk.ingest_rps : null; sub = bdone && ok(b.ingest) ? n0(b.ingest)+" s from kick-off until Completed" : ""; }
-      else { v = bdone ? b.index_eff : null; pv = P && P.bulk ? P.bulk.index_eff : null;
-        if(bdone && b.index_inline){ valTxt = n0(b.index_eff)+' <span class="unit">s (= ingest)</span>'; sub = "inline (during ingest)"; }
+      if(k==="bulk"){ v = bdone ? b.rps : null; pv = bv("rps","rps"); refPt = refOf("bulk.rps");
+        sub = b ? (bdone ? "total time "+n0(b.total)+" s"+(ok(bv("total","total"))?" (was "+n0(bv("total","total"))+" s)":"") : esc(b.status)+": "+esc(b.reason||b.phase||"")) : ""; }
+      else if(k==="bulk_ingest"){ v = bdone ? b.ingest_rps : null; pv = bv("ingest_rps","ingest_rps"); refPt = refOf("bulk.ingest_rps"); sub = bdone && ok(b.ingest) ? n0(b.ingest)+" s from kick-off until Completed" : ""; }
+      else { v = bdone ? b.index_eff : null; pv = bv("index_eff","index_eff"); refPt = refOf("bulk.index_eff");
+        if(idxBad){ valTxt = n0(v)+' <span class="unit">s (' + esc(b.index_status) + ')</span>'; sub = "rebuild " + esc(b.index_status) + ": not a valid indexing time"; }
+        else if(bdone && b.index_inline){ valTxt = n0(b.index_eff)+' <span class="unit">s (= ingest)</span>'; sub = "inline (during ingest)"; }
         else if(bdone){ sub = "deferred rebuild after Completed"; } }
     } else if(k==="sql_rows"){
-      const s = H.suites["sql-run"], q = ps("sql_rows"); v = s ? s.rows_rps : null; pv = q ? q.rps : null;
+      const s = H.suites["sql-run"], q = ps("sql_rows"); v = s ? s.rows_rps : null; pv = q ? q.rps : null; refPt = refOf("sql_rows");
       sub = s && s.vus ? s.vus+" VUs · NDJSON rows returned" : "";
     } else {
       const s = H.suites[k]; v = s ? s.rps : null; p95 = s ? s.p95 : null;
-      const q = ps(k); pv = q ? q.rps : null; pp95 = q ? q.p95 : null;
+      const q = ps(k); pv = q ? q.rps : null; pp95 = q ? q.p95 : null; refPt = refOf(k);
       sub = s && s.vus ? s.vus+" VUs"+(k==="import"?" · p95 per Bundle":"") : "";
     }
     const mkk = k==="sql_rows" ? "sql-run" : (k==="bulk_ingest"||k==="bulk_index") ? "bulk" : k;
     if(!ok(v)) return `<div class="card kpi"><div class="lbl">${name}</div><div class="val">—</div><div class="sub">no data ${sub?"· "+sub:""}</div></div>`;
     let delta = "";
-    if(ok(pv) && pv && !valTxt){
+    if(k==="bulk" && idxBad) sub += (sub?" · ":"") + "(" + esc(b.index_status) + " rebuild: no change shown)";
+    if(ok(pv) && pv && !valTxt && !(k==="bulk" && idxBad)){
       const pct = (v-pv)/pv*100;
-      delta = `<div class="delta">${pct>=0?"▲ up":"▼ down"} <b>${pct>=0?"+":""}${NF.format(pct)} %</b> vs ${short(P.date)} (${thr(pv)})</div>`;
+      if(HOSTCH.some(c => hostBefore(refPt.date, c))) hostSeen.add(HOSTCH.findIndex(c => hostBefore(refPt.date, c)));
+      const far = P && refPt && String(refPt.run) !== String(P.run);
+      delta = `<div class="delta">${pct>=0?"▲ up":"▼ down"} <b>${pct>=0?"+":""}${NF.format(pct)} %</b> vs run ${esc(refPt.run)}, ${short(refPt.date)} (${thr(pv)})${far?` <span class="note">not the previous run (${esc(P.run)})</span>`:""}</div>`;
+    } else if(modeMetric(k) && !valTxt && !(k==="bulk" && idxBad) && P && !refPt){
+      delta = `<div class="delta note" title="no earlier run with the same indexing mode">no earlier run with the same indexing mode</div>`;
     }
     const lat = ok(p95) ? `p95 ${ms(p95)}${ok(pp95)?` <span class="note">(was ${ms(pp95)})</span>`:""}<br>` : "";
     return `<div class="card kpi"><div class="lbl">${name} <span class="mk">${mk(leg,mkk)}</span></div>
       <div class="val">${valTxt || thr(v)+' <span class="unit">'+unit+'</span>'}</div>
       <div class="sub">${lat}${sub}</div>${delta}</div>`;
   }).join("");
+  $("hostNote").textContent = [...hostSeen].map(i => HOSTCH[i].legend).join(" ");
 }
 
 /* ---------- SVG helpers ---------- */
@@ -809,16 +832,26 @@ function trendPanel(el, key, title, unit){
   const max = Math.max(...vals.filter(ok))*1.15;
   const X = i => T.length===1 ? ml+pw/2 : ml+30+i*(pw-60)/(T.length-1), Y = v => mt+ph-v/max*ph;
   let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
-  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
+  // ingest / indexing seconds only join across runs that indexed the same way (inline vs deferred)
+  const modeSeries = key==="bulk_ingest" || key==="bulk_index";
+  const sameMode = (p, q) => !modeSeries || (p.index_inline != null && q.index_inline != null && p.index_inline === q.index_inline);
+  // a failed or cancelled rebuild is not a valid until-searchable / indexing time: hollow point, ‡, no line in or out
+  const idxSeries = key==="bulk" || key==="bulk_index";
+  const bad = t => idxSeries && (t.index_status==="failed" || t.index_status==="cancelled");
+  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])&&!bad(T[i-1])&&!bad(T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
   T.forEach((t,i)=>{
     const cur = String(t.run)===String(D.run), br = D.ref && t.branch!==D.ref;
     b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
     if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
     const col = cur?legCol(sel.trend):"var(--prev)";
     const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : bad(t) ? `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
                      : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
-    const m = (t.markers||{})[key]||"";
-    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}`)}>${shape}</g>`;
+    let m = (t.markers||{})[key]||"";
+    if(bad(t) && !m.includes("‡")) m += "‡";
+    const der = (t.source==="comparison.md"||t.rounded) ? "\nderived from comparison.md (rounded)" : "";
+    const dfr = modeSeries && t.index_inline === false && isEs(sel.trend) ? "\ndeferred indexing (before #2248)" : "";
+    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
     b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
   });
   el.innerHTML = svg(w, mt+ph+mb, b, "Trend "+title);
@@ -828,9 +861,12 @@ function renderTrend(){
   const TT = trendOf();
   $("trendTitle").textContent = "Trend of "+LBL(sel.trend)+" ("+TT.length+" run"+(TT.length===1?"":"s")+")";
   $("trend").dataset.built = ""; $("trendCtx").dataset.built = "";
-  $("trendNote").textContent = TT.length < 2
+  const nEarlier = TT.filter(t => String(t.run)!==String(D.run)).length;
+  const nDer = TT.filter(t => t.source==="comparison.md").length;
+  const derNote = nDer ? nDer+" of the "+nEarlier+" earlier run"+(nEarlier===1?"":"s")+" shown "+(nDer===1?"is":"are")+" derived from comparison.md: values are rounded; ES ingest and indexing values before #2248 measure deferred indexing. No line joins ingest or indexing points of different indexing modes." : "";
+  $("trendNote").textContent = (TT.length < 2
     ? "Only "+TT.length+" data point"+(TT.length===1?"":"s")+" for this leg ("+(D.history_runs||0)+" earlier run"+(D.history_runs===1?"":"s")+" found): a trend needs at least 2 runs, so the charts below show what exists without drawing a line."
-    : "";
+    : "") + (derNote ? (TT.length < 2 ? " " : "") + derNote : "");
   if(!TT.length){ $("trend").innerHTML = NODATA; $("trendCtx").innerHTML = ""; return; }
   const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
   panels("trend","tr",P);
@@ -841,11 +877,18 @@ function renderTrend(){
       if(D.ref && t.branch!==D.ref) notes.push("* different branch than this run");
       if(!t.suites.import) notes.push("no import");
       if(!t.suites.search) notes.push("no search");
+      if(t.source==="comparison.md"||t.rounded) notes.push("derived from comparison.md (rounded values)");
+      if(t.bulk && t.index_inline === false && isEs(sel.trend) && !(t.notes||[]).some(x => /before #2248/.test(x))) notes.push("deferred indexing (before #2248)");
+      if(HOSTCH.some(c => hostBefore(t.date, c))) notes.push("older Docker host");
+      if(t.partial_run) notes.push("run failed: some legs missing");
+      (t.notes||[]).forEach(x => notes.push(esc(x)));
       if(String(t.run)===String(D.run)) notes.push("this run");
       h += `<tr><td class="mono">${esc(t.run)}</td><td>${fdate(t.date)}</td><td class="mono">${esc(t.branch||"n/a")}</td><td>${esc(t.runner||"n/a")}</td><td class="n">${n1(t.crud_load)}</td><td class="n">${ok(t.pg_ms)?NF2.format(t.pg_ms):"n/a"}</td><td>${notes.join("; ")}</td></tr>`;
     });
     $("trendCtx").innerHTML = h+"</tbody>"; $("trendCtx").dataset.built = 1;
   }
+  const hs = HOSTCH.filter(c => TT.some(t => hostBefore(t.date, c)) && TT.some(t => !hostBefore(t.date, c)));
+  $("trendHost").textContent = hs.map(c => c.legend).join(" ");
   P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
 }
 
