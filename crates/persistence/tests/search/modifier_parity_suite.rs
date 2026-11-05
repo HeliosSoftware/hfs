@@ -53,6 +53,16 @@ const SSN: &str = "http://example.org/ssn";
 const LOINC: &str = "http://loinc.org";
 const VS: &str = "http://example.org/fhir/ValueSet/a";
 const ABS_PATIENT: &str = "http://example.org/fhir/Patient/p1";
+/// A versioned absolute URL to the same Patient.
+const ABS_PATIENT_VER: &str = "http://example.org/fhir/Patient/p1/_history/2";
+/// An absolute URL to a `Patient/p1` on ANOTHER server. PostgreSQL, SQLite and
+/// Elasticsearch ignore the base when matching a relative `Type/id`, so they
+/// find it; that is a deliberate per-installation choice (a server cannot know
+/// which hosts are aliases of itself) and `ob-foreign` pins it. MongoDB does
+/// not find it: its plain `Type/id` filter is an exact match on
+/// `value_reference` and reaches no absolute form (only bare-id filters and
+/// `_revinclude` use `value_reference_target`). See the cases that name it.
+const FOREIGN_PATIENT: &str = "https://other-server.example/fhir/Patient/p1";
 
 /// What a cell must produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +85,8 @@ struct Case {
     resource_type: &'static str,
     param: &'static str,
     param_type: SearchParamType,
-    modifier: SearchModifier,
+    /// `None` is the plain, unmodified parameter.
+    modifier: Option<SearchModifier>,
     value: String,
     /// A second, unmodified token parameter ANDed with the first, so the
     /// modified one is also exercised where it does not drive the search.
@@ -89,9 +100,14 @@ impl Case {
             .and
             .map(|(param, value)| format!("&{param}={value}"))
             .unwrap_or_default();
+        let modifier = self
+            .modifier
+            .as_ref()
+            .map(|m| format!(":{m}"))
+            .unwrap_or_default();
         format!(
-            "{}?{}:{}={}{and}",
-            self.resource_type, self.param, self.modifier, self.value
+            "{}?{}{modifier}={}{and}",
+            self.resource_type, self.param, self.value
         )
     }
 
@@ -113,7 +129,26 @@ fn case(
         resource_type,
         param,
         param_type,
-        modifier,
+        modifier: Some(modifier),
+        value: value.into(),
+        and: None,
+        expect,
+    }
+}
+
+/// A case on the plain parameter, no modifier.
+fn plain(
+    resource_type: &'static str,
+    param: &'static str,
+    param_type: SearchParamType,
+    value: impl Into<String>,
+    expect: Expect,
+) -> Case {
+    Case {
+        resource_type,
+        param,
+        param_type,
+        modifier: None,
         value: value.into(),
         and: None,
         expect,
@@ -231,7 +266,15 @@ fn cases() -> Vec<Case> {
             T::Token,
             M::Not,
             format!("{LOINC}|1234-5"),
-            Ids(&["ob-abs", "ob-grp", "ob-logical", "ob-nosubj", "ob-ver"]),
+            Ids(&[
+                "ob-abs",
+                "ob-abs-ver",
+                "ob-foreign",
+                "ob-grp",
+                "ob-logical",
+                "ob-nosubj",
+                "ob-ver",
+            ]),
         ),
         case(
             "Observation",
@@ -247,7 +290,15 @@ fn cases() -> Vec<Case> {
             T::Token,
             M::Missing,
             "false",
-            Ids(&["ob-abs", "ob-grp", "ob-logical", "ob-pat", "ob-ver"]),
+            Ids(&[
+                "ob-abs",
+                "ob-abs-ver",
+                "ob-foreign",
+                "ob-grp",
+                "ob-logical",
+                "ob-pat",
+                "ob-ver",
+            ]),
         ),
         // Terminology-backed: not available at this layer.
         case(
@@ -349,7 +400,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "p1",
-            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -365,7 +416,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "Patient/p1",
-            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -373,7 +424,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "Patient/p1/_history/2",
-            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
         ),
         case(
             "Observation",
@@ -399,7 +450,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             ABS_PATIENT,
-            Ids(&["ob-abs"]),
+            Ids(&["ob-abs", "ob-abs-ver"]),
         ),
         // Two ids under one type modifier.
         case(
@@ -408,7 +459,130 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "p1,nobody",
-            Ids(&["ob-abs", "ob-pat", "ob-ver"]),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
+        ),
+        // ---- plain `Type/id` (no modifier), #2394 ---------------------
+        // A relative `Type/id` matches every written form of that reference:
+        // relative, versioned, absolute, versioned absolute (`ob-abs-ver`) and,
+        // because the base is ignored, an absolute URL on another server
+        // (`ob-foreign`) on PostgreSQL, SQLite and Elasticsearch. MongoDB keeps
+        // plain `Type/id` exact and is declared as a divergence for these cells.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            "Patient/p1",
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
+        ),
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            "Patient/nobody",
+            Ids(&[]),
+        ),
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            "Group/p1",
+            Ids(&["ob-grp"]),
+        ),
+        // A comma list of two relative values: one matches nothing.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            "Patient/p1,Patient/nobody",
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
+        ),
+        // A comma list mixing an absolute URL and a relative value that match
+        // nothing: the absolute one alone decides.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            format!("Patient/nobody,{ABS_PATIENT}"),
+            Ids(&["ob-abs", "ob-abs-ver"]),
+        ),
+        // A comma list mixing an absolute URL on one resource and a relative
+        // value on another type.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            format!("Group/p1,{ABS_PATIENT}"),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-grp"]),
+        ),
+        // An absolute URL as the search value is exact on the host but
+        // version-agnostic: it finds the unversioned and the versioned form.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            ABS_PATIENT_VER,
+            Ids(&["ob-abs", "ob-abs-ver"]),
+        ),
+        // The foreign URL as the search value is exact too.
+        plain(
+            "Observation",
+            "subject",
+            T::Reference,
+            FOREIGN_PATIENT,
+            Ids(&["ob-foreign"]),
+        ),
+        // `:not` excludes every form of the reference (now `ob-abs`,
+        // `ob-abs-ver` and `ob-foreign` too) and keeps what does not reference
+        // `Patient/p1` at all, including no subject and a logical reference.
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            M::Not,
+            "Patient/p1",
+            Ids(&["ob-grp", "ob-logical", "ob-nosubj"]),
+        ),
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            M::Not,
+            "Patient/p1,Group/p1",
+            Ids(&["ob-logical", "ob-nosubj"]),
+        ),
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            M::Not,
+            "Patient/nobody",
+            Ids(&[
+                "ob-abs",
+                "ob-abs-ver",
+                "ob-foreign",
+                "ob-grp",
+                "ob-logical",
+                "ob-nosubj",
+                "ob-pat",
+                "ob-ver",
+            ]),
+        ),
+        // ---- `:Patient` over the versioned absolute and foreign forms ---
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            patient(),
+            ABS_PATIENT_VER,
+            Ids(&["ob-abs", "ob-abs-ver"]),
+        ),
+        case(
+            "Observation",
+            "subject",
+            T::Reference,
+            patient(),
+            FOREIGN_PATIENT,
+            Ids(&["ob-foreign"]),
         ),
         // `:identifier`: the reference's target has the identifier.
         case(
@@ -458,7 +632,14 @@ fn cases() -> Vec<Case> {
             T::Reference,
             M::Missing,
             "false",
-            Ids(&["ob-abs", "ob-grp", "ob-pat", "ob-ver"]),
+            Ids(&[
+                "ob-abs",
+                "ob-abs-ver",
+                "ob-foreign",
+                "ob-grp",
+                "ob-pat",
+                "ob-ver",
+            ]),
         ),
         case(
             "Observation",
@@ -466,7 +647,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             M::Contains,
             "example.org",
-            Ids(&["ob-abs"]),
+            Ids(&["ob-abs", "ob-abs-ver"]),
         ),
         case(
             "Observation",
@@ -490,7 +671,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             M::Below,
             "http://example.org/fhir/Patient",
-            Ids(&["ob-abs"]),
+            Ids(&["ob-abs", "ob-abs-ver"]),
         ),
         case(
             "Observation",
@@ -526,7 +707,7 @@ fn cases() -> Vec<Case> {
             T::Reference,
             patient(),
             "p1",
-            Ids(&["ob-abs", "ob-ver"]),
+            Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-ver"]),
         )
         .and("code", "9999-9"),
         case(
@@ -626,7 +807,15 @@ fn cases() -> Vec<Case> {
             T::Quantity,
             M::Missing,
             "true",
-            Ids(&["ob-abs", "ob-grp", "ob-logical", "ob-nosubj", "ob-ver"]),
+            Ids(&[
+                "ob-abs",
+                "ob-abs-ver",
+                "ob-foreign",
+                "ob-grp",
+                "ob-logical",
+                "ob-nosubj",
+                "ob-ver",
+            ]),
         ),
     ]
 }
@@ -656,7 +845,7 @@ fn case_query(case: &Case) -> SearchQuery {
         case.resource_type,
         case.param,
         case.param_type,
-        Some(case.modifier.clone()),
+        case.modifier.clone(),
         &case.value,
     );
     match case.and {
@@ -725,7 +914,8 @@ fn render_expect(expect: &Expect) -> String {
 ///   `http://example.org/grp|12345`.
 /// - Observations, by `subject`: `ob-pat` `Patient/p1` (display "John Smith",
 ///   coded LOINC 1234-5 "Heart rate", 5 mg); `ob-ver` `Patient/p1/_history/2`;
-///   `ob-abs` the absolute URL; `ob-grp` `Group/p1`; `ob-logical` only a
+///   `ob-abs` the absolute URL; `ob-abs-ver` the versioned absolute URL;
+///   `ob-foreign` an absolute URL on another server; `ob-grp` `Group/p1`; `ob-logical` only a
 ///   `Reference.identifier`; `ob-nosubj` neither subject nor code.
 /// - ValueSets `vs-a`, `vs-sub` (a URL below `vs-a`'s), `vs-none` (no URL).
 /// - RiskAssessments `ra-half` (probability 0.5) and `ra-none`.
@@ -803,6 +993,24 @@ where
                 "status": "final",
                 "code": other_code.clone(),
                 "subject": {"reference": ABS_PATIENT},
+            }),
+        ),
+        (
+            "Observation",
+            json!({
+                "id": "ob-abs-ver",
+                "status": "final",
+                "code": other_code.clone(),
+                "subject": {"reference": ABS_PATIENT_VER},
+            }),
+        ),
+        (
+            "Observation",
+            json!({
+                "id": "ob-foreign",
+                "status": "final",
+                "code": other_code.clone(),
+                "subject": {"reference": FOREIGN_PATIENT},
             }),
         ),
         (
@@ -894,11 +1102,18 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
     // uses. Polled because Elasticsearch is near-real-time. A failure here
     // means the parameter did not index — a backend built without the spec
     // search parameters — not that a modifier is wrong.
-    let controls: [(&str, &str, SearchParamType, &str, &[&str]); 8] = [
+    let controls: [(&str, &str, SearchParamType, &str, &[&str]); 9] = [
         ("Patient", "identifier", T::Token, "12345", &["p1", "p2"]),
         ("Patient", "family", T::String, "smiths", &["p2"]),
         ("Patient", "birthdate", T::Date, "1980-01-01", &["p1"]),
         ("Observation", "code", T::Token, "1234-5", &["ob-pat"]),
+        (
+            "Observation",
+            "subject",
+            T::Reference,
+            "Patient/p1",
+            &["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"],
+        ),
         (
             "Observation",
             "subject",
@@ -924,6 +1139,16 @@ pub async fn every_valid_modifier_agrees_across_backends<S>(
     ];
     for (resource_type, param, param_type, value, expected) in controls {
         let control = query(resource_type, param, param_type, None, value);
+        // A backend that knowingly differs on the plain cell (its divergence
+        // carries the same label) is held to its own set.
+        let label = format!("{resource_type}?{param}={value}");
+        let expected: &[&str] = match divergences.iter().find(|d| d.label == label) {
+            Some(Divergence {
+                expect: Expect::Ids(ids),
+                ..
+            }) => ids,
+            _ => expected,
+        };
         let want: BTreeSet<String> = expected.iter().map(|id| id.to_string()).collect();
         let mut got = Ok(BTreeSet::new());
         for _ in 0..60 {

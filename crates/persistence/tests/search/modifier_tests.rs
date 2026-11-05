@@ -1423,6 +1423,24 @@ async fn test_modifier_parity_suite() {
                 label: "Observation?subject:Patient=Group/p1",
                 expect: Expect::Ids(&["ob-grp"]),
             },
+            // PRE-EXISTING on main, not caused by #2394: the #1052 exact-`IN`
+            // shortcut (sqlite/search/query_builder.rs) is "exact-base only"
+            // for comma OR-lists, so a list returns LESS than each value alone
+            // (`Patient/p1` alone finds `ob-ver`; `Patient/p1,Patient/nobody`
+            // does not; the absolute URL alone finds `ob-abs-ver`; in a list it
+            // does not). To be fixed in a separate issue.
+            Divergence {
+                label: "Observation?subject=Patient/p1,Patient/nobody",
+                expect: Expect::Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat"]),
+            },
+            Divergence {
+                label: "Observation?subject=Patient/nobody,http://example.org/fhir/Patient/p1",
+                expect: Expect::Ids(&["ob-abs"]),
+            },
+            Divergence {
+                label: "Observation?subject=Group/p1,http://example.org/fhir/Patient/p1",
+                expect: Expect::Ids(&["ob-abs", "ob-grp"]),
+            },
         ],
     )
     .await;

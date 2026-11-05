@@ -1356,6 +1356,47 @@ async fn mongodb_modifier_parity() {
         &backend,
         "modifier-parity-1408",
         &[
+            // Plain `Type/id` stays an exact match on MongoDB (index plan), so
+            // it does not reach absolute URLs, versioned or foreign-base, and
+            // `:not` therefore does NOT exclude them. Deliberate (#2394);
+            // `ob-foreign` is likewise not matched here, unlike the other three
+            // backends, which ignore the base.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1,Patient/nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-grp",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1,Group/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            // `:above` a `_history/1` URL also finds the `_history/2` form
+            // (SQLite returns only the unversioned `ob-abs`): the version
+            // segment is not compared. Inconsistent across backends.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-abs", "ob-abs-ver"]),
+            },
             // MongoDB keeps the plain `Type/id` filter an exact match so it
             // stays on the reference index; its `_revinclude` has its own
             // filter that does reach absolute URLs.
@@ -19258,11 +19299,13 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
-const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
+/// Generation 5: `idx_search_reference_target_v2` is added (#2394).
+const CURRENT_BACKGROUND_NAMES: [&str; 10] = [
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
+    "idx_search_reference_target_v2",
     "idx_search_reference_v2",
     "idx_search_string_v2",
     "idx_search_token_display_v2",
@@ -19399,7 +19442,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(5)
     );
 }
 
@@ -19524,7 +19567,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(5)
     );
 }
 
@@ -19612,7 +19655,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(4));
+    assert_eq!(si.get_i32("generation"), Ok(5));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.

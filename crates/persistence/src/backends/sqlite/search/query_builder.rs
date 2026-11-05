@@ -281,6 +281,13 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
     // resource is a member when any one range holds for it, so the branches
     // are `EXISTS`-es joined by `OR`.
     if rows_sql.contains(" UNION ALL ") {
+        // A reference's absolute-URL arm: both selects read the same
+        // parameter's rows, and within one `resource_key` the `OR` is only a
+        // row filter, so one `EXISTS` answers both with a single lookup in
+        // `idx_search_composite` instead of two per non-matching outer row.
+        if let Some(merged) = reference_exists_predicate(rows_sql, outer_key) {
+            return Some(merged);
+        }
         let branches = rows_sql
             .split(" UNION ALL ")
             .map(|branch| parameter_exists_predicate(branch, outer_key))
@@ -288,6 +295,37 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
         return Some(format!("({})", branches.join(" OR ")));
     }
     parameter_exists_predicate(rows_sql, outer_key)
+}
+
+/// [`membership_exists_predicate`] for a reference parameter's two selects
+/// (`value_reference` test `UNION ALL` the `value_reference_target` test, see
+/// `build_parameter_condition`): one `EXISTS` whose row test is the `OR` of the
+/// two. `None` when `rows_sql` is not exactly that shape.
+fn reference_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    const TARGET_TEST: &str = "(value_reference_target IS NOT NULL AND value_reference_target IN (";
+    let (first, second) = rows_sql.split_once(" UNION ALL ")?;
+    if second.contains(" UNION ") {
+        return None;
+    }
+    let first_rest = first.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    let second_rest = second.strip_prefix(PARAMETER_ROWS_HEAD)?;
+    // `param_name = '<name>' AND (<cond>)` on both sides, same name.
+    let (name1, cond1) = first_rest.split_once(" AND (")?;
+    let (name2, cond2) = second_rest.split_once(" AND (")?;
+    if name1 != name2 || !name1.starts_with("param_name = ") {
+        return None;
+    }
+    let cond1 = cond1.strip_suffix(')')?;
+    let cond2 = cond2.strip_suffix(')')?;
+    if !cond2.starts_with(&TARGET_TEST[1..]) || cond2.contains("SELECT") || cond1.contains("SELECT")
+    {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} \
+         AND {name1} AND (({cond1}) OR ({cond2})))"
+    ))
 }
 
 /// [`membership_exists_predicate`] for one plain [`parameter_rows`] select.

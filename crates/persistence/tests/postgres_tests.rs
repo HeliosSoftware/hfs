@@ -12475,8 +12475,8 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/shared-id"]),
             )
             .await,
-            vec!["ref-prefixed", "ref-versioned"],
-            "Type/id remains exact and version-normalized"
+            vec!["ref-absolute", "ref-prefixed", "ref-versioned"],
+            "Type/id is exact, version-normalized and matches the absolute URL form"
         );
         assert_eq!(
             reference_search_ids(
@@ -34865,6 +34865,36 @@ mod postgres_integration {
                 Divergence {
                     label: "Observation?subject:Patient=Group/p1",
                     expect: Expect::Ids(&["ob-grp"]),
+                },
+                // SUSPECTED BUG (PostgreSQL): `build_reference_condition` has no
+                // `:not` arm, so `subject:not=X` behaves like `subject=X` (the
+                // positive match; `:not=Patient/nobody` returns nothing). SQLite,
+                // ES and MongoDB negate. Recorded, not endorsed.
+                Divergence {
+                    label: "Observation?subject:not=Patient/p1",
+                    expect: Expect::Ids(&["ob-abs", "ob-abs-ver", "ob-foreign", "ob-pat", "ob-ver"]),
+                },
+                Divergence {
+                    label: "Observation?subject:not=Patient/p1,Group/p1",
+                    expect: Expect::Ids(&[
+                        "ob-abs",
+                        "ob-abs-ver",
+                        "ob-foreign",
+                        "ob-grp",
+                        "ob-pat",
+                        "ob-ver",
+                    ]),
+                },
+                Divergence {
+                    label: "Observation?subject:not=Patient/nobody",
+                    expect: Expect::Ids(&[]),
+                },
+                // `:above` a `_history/1` URL also finds the `_history/2` form
+                // (the version segment is not compared); SQLite and ES return
+                // only the unversioned `ob-abs`.
+                Divergence {
+                    label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                    expect: Expect::Ids(&["ob-abs", "ob-abs-ver"]),
                 },
             ],
         )

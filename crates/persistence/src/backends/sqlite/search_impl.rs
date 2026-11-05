@@ -3365,11 +3365,163 @@ mod tests {
             // the parameter's rows.
             assert!(
                 plan.iter().any(|line| line.contains("idx_search_reference")
+                    && !line.contains("idx_search_reference_target")
                     && (line.contains("value_reference=?")
                         || (line.contains("value_reference>")
                             && line.contains("value_reference<")))),
                 "{}\n{plan:#?}",
                 fragment.sql
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_search_reference_target")
+                        && line.contains("value_reference_target=?")),
+                "target arm must seek idx_search_reference_target\n{}\n{plan:#?}",
+                fragment.sql
+            );
+            assert_reference_plan_is_seeks(&plan, &fragment.sql);
+        }
+
+        // The EXISTS-driven first page tests each outer row with one
+        // correlated lookup that answers both the `value_reference` and the
+        // `value_reference_target` arm.
+        let query = subject(vec![SearchValue::eq("Patient/p1")]);
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&query);
+        let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+            .expect("reference membership has an EXISTS form");
+        assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+        assert!(
+            exists.contains("value_reference IS NOT NULL")
+                && exists.contains("value_reference_target IN"),
+            "{exists}"
+        );
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT w.rk FROM (SELECT rowid AS rk FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+             WHERE {exists}"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new("t".to_string()),
+            Box::new("Observation".to_string()),
+        ];
+        for param in &fragment.params {
+            if let SqlParam::String(value) = param {
+                params.push(Box::new(value.clone()));
+            }
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let conn = backend.get_connection().unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("SEARCH")
+                && line.contains("idx_search_composite")
+                && line.contains("resource_key=?")),
+            "{exists}\n{plan:#?}"
+        );
+        assert_reference_plan_is_seeks(&plan, &exists);
+    }
+
+    /// The merged single-`EXISTS` reference predicate (chosen by the
+    /// `ExistsDriven` plan from 2001 matches, so the parity suite never runs
+    /// it) returns the same resources as the `rowid IN (… UNION ALL …)` form
+    /// it replaces, for relative, versioned and absolute references.
+    ///
+    /// Expectation, taken from running the `UNION ALL` form: `subject=
+    /// Patient/p1` matches the relative reference (a), the absolute reference
+    /// (c) and the absolute versioned reference (d) through
+    /// `value_reference_target`; the relative versioned reference (b) is
+    /// matched through the `Patient/p1/_history/` range of `value_reference`
+    /// (the `=`-or-`_history`-range test); a different patient (e) and a
+    /// missing subject (f) never match.
+    #[tokio::test]
+    async fn merged_reference_exists_returns_the_union_all_resources() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, subject) in [
+            ("a", Some("Patient/p1")),
+            ("b", Some("Patient/p1/_history/3")),
+            ("c", Some("http://example.org/fhir/Patient/p1")),
+            ("d", Some("http://example.org/fhir/Patient/p1/_history/2")),
+            ("e", Some("Patient/p2")),
+            ("f", None),
+        ] {
+            let mut obs = json!({"resourceType":"Observation","id":id,"status":"final","code":{"coding":[{"code":"A"}]}});
+            if let Some(subject) = subject {
+                obs["subject"] = json!({ "reference": subject });
+            }
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("Patient/p1")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&query);
+        let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+            .expect("reference membership has an EXISTS form");
+        assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+        assert!(fragment.sql.contains(" UNION ALL "), "{}", fragment.sql);
+
+        let run = |predicate: &str| -> BTreeSet<String> {
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(tenant.tenant_id().as_str().to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let merged = run(&exists);
+        let union_all = run(&format!("w.rk IN ({})", fragment.sql));
+        assert_eq!(merged, union_all, "{exists}");
+        assert!(!merged.is_empty(), "{merged:?}");
+        // Observed from the UNION ALL form: (b) matches too.
+        for id in ["a", "b", "c", "d"] {
+            assert!(merged.contains(id), "{id} missing from {merged:?}");
+        }
+        for id in ["e", "f"] {
+            assert!(!merged.contains(id), "{id} must not match: {merged:?}");
+        }
+    }
+
+    /// No plan line scans `search_index`: every access to it is a `SEARCH`
+    /// through an index.
+    fn assert_reference_plan_is_seeks(plan: &[String], sql: &str) {
+        for line in plan {
+            assert!(
+                !(line.starts_with("SCAN") && line.contains("search_index"))
+                    && !line.starts_with("SCAN si"),
+                "full scan of search_index in {line:?}\n{sql}\n{plan:#?}"
             );
         }
     }

@@ -653,9 +653,12 @@ pub(crate) fn absolute_reference_target_sql(value: &str) -> String {
 /// `value_reference` keeps the reference as written, so `Patient?_id=p1&
 /// _revinclude=Provenance:target` and `subject=Patient/p1` never matched
 /// `http://example.org/fhir/Patient/p1`. The writer now also stores the `Type/id`
-/// in this column (the same value the MongoDB backend stores), and readers OR
-/// `value_reference_target = <Type/id>` onto the equality. It is `NULL` for
-/// relative references, so the partial index stays small.
+/// in this column (the same value the MongoDB backend stores), and readers match
+/// `value_reference_target = <Type/id>` as a second arm `OR`ed next to the
+/// equality. A `UNION ALL` form was measured on 1.2M rows and was 145x slower for
+/// a patient with 100k referrers (the sublink hides the `last_updated` order, so
+/// the planner no longer stops early under `LIMIT`), so the `OR` stays. The
+/// column is `NULL` for relative references, so the partial index stays small.
 ///
 /// Steps, each safe to repeat: add the column in a short transaction under a
 /// `lock_timeout`; backfill rows with an absolute `value_reference` in committed
@@ -685,6 +688,16 @@ async fn migrate_v54_to_v55(client: &mut deadpool_postgres::Client) -> StorageRe
         .await;
     result?;
     restore.map_err(|e| failed("restore statement_timeout", &e))?;
+
+    // Best-effort, bounded like v43: the planner needs statistics on the new
+    // column (and its partial index) before the first reference search.
+    if let Err(e) =
+        analyze_search_index_with_timeout(client, post_migration_analyze_timeout()).await
+    {
+        tracing::warn!(
+            "Migration v54->v55: optional ANALYZE failed ({e}); the planner has no statistics on value_reference_target until autovacuum analyzes search_index"
+        );
+    }
     Ok(())
 }
 
@@ -727,6 +740,7 @@ async fn build_reference_target(client: &mut deadpool_postgres::Client) -> Stora
         format!(
             "UPDATE search_index SET value_reference_target = {expr} \
              WHERE value_reference ~ '^https?://' AND value_reference_target IS NULL \
+             AND {expr} IS NOT NULL \
              AND ctid >= '({first_block},0)'::tid AND ctid < '({},0)'::tid",
             first_block + block_count
         )

@@ -177,8 +177,7 @@ fn native_patient_code_predicate_with_guard(
              (SELECT patient.resource_id AS id FROM search_index patient \
              WHERE patient.tenant_id = resources.tenant_id AND patient.resource_type = 'Observation' \
              AND patient.param_name = 'patient' AND patient.is_contained = FALSE \
-             AND (patient.value_reference = 'Patient/' || resources.id \
-             OR patient.value_reference_target = 'Patient/' || resources.id)) \
+             AND patient.value_reference = 'Patient/' || resources.id) \
              SELECT 1 FROM referenced_observations source WHERE {guard})",
         ),
         vec![SqlParam::text(system), SqlParam::text(code)],
