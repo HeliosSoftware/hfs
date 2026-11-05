@@ -9464,12 +9464,33 @@ impl MongoBackend {
                 let oldest_live = self
                     .reindex_oldest_live_last_updated(&resources, tenant_id, resource_type)
                     .await?;
-                if reindex_time_floor_covers_whole_type(oldest_live, floor) {
-                    // Every live row is inside the window, so the window is
-                    // the whole type: walk it in id order (sequential
-                    // `search_index` inserts, prefetch) exactly as an
-                    // unscoped walk does, instead of in `(last_updated, id)`
-                    // order, which visits ids at random.
+                // Every live row is inside the window, so the window is the
+                // whole type: walk it in id order (sequential `search_index`
+                // inserts, prefetch) exactly as an unscoped walk does, instead
+                // of in `(last_updated, id)` order, which visits ids at
+                // random. The id phase only reads rows older than the
+                // catch-up margin, so a type written within that margin would
+                // leave its id phase empty and fall back to the slow walk:
+                // wait out the rest of the margin when the writes have
+                // stopped, and keep the time walk while they are still landing.
+                let settle = if reindex_time_floor_covers_whole_type(oldest_live, floor) {
+                    let newest_live = self
+                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                        .await?;
+                    reindex_settle_wait(newest_live, Utc::now(), margin)
+                } else {
+                    SettleWait::Active
+                };
+                if !matches!(settle, SettleWait::Active) {
+                    if let SettleWait::Wait(wait) = settle {
+                        tracing::info!(
+                            tenant = %tenant_id,
+                            resource_type = %resource_type,
+                            wait_ms = wait.as_millis() as u64,
+                            "mongodb reindex waiting for the newest write to leave the catch-up margin"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
                     tracing::info!(
                         tenant = %tenant_id,
                         resource_type = %resource_type,
@@ -10530,7 +10551,7 @@ impl ReindexTarget for MongoBackend {
         if self.is_search_offloaded() {
             usize::MAX
         } else {
-            (self.config().max_connections.unwrap_or(1) as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
+            (self.config().effective_max_pool_size() as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
         }
     }
 
@@ -10867,6 +10888,51 @@ fn reindex_time_floor_covers_whole_type(
     floor: DateTime<Utc>,
 ) -> bool {
     oldest_live.is_none_or(|oldest| oldest >= floor)
+}
+
+/// How long a whole-type id walk waits for the type's newest write to leave
+/// the catch-up margin (#945).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleWait {
+    /// The newest write is already older than the margin (or there is none):
+    /// the id phase covers the whole type, start now.
+    None,
+    /// The writes have stopped: sleep this long, then the id phase covers the
+    /// whole type.
+    Wait(std::time::Duration),
+    /// Writes are still landing (or are stamped in the future): keep the time
+    /// walk, which handles recent rows in `(last_updated, id)` order.
+    Active,
+}
+
+/// The newest write must be at least this old before a walk waits for it
+/// instead of falling back to the time walk (#945).
+const REINDEX_SETTLE_QUIET: chrono::Duration = chrono::Duration::seconds(10);
+
+/// Decides what a whole-type id walk does about a type written within the
+/// catch-up `margin` (#945): the id phase reads rows older than
+/// `t0 - margin`, so a newer row would otherwise push the whole type into the
+/// slow time walk. Waiting out the remainder of the margin keeps the margin's
+/// guarantee unchanged; a type still being written (newest write younger than
+/// [`REINDEX_SETTLE_QUIET`] or stamped ahead of `now`) is not waited for.
+fn reindex_settle_wait(
+    newest_live: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    margin: chrono::Duration,
+) -> SettleWait {
+    let Some(newest) = newest_live else {
+        return SettleWait::None;
+    };
+    let age = now - newest;
+    if age >= margin {
+        return SettleWait::None;
+    }
+    if age < REINDEX_SETTLE_QUIET.min(margin / 2) {
+        return SettleWait::Active;
+    }
+    // One extra millisecond: `newest + margin` itself still counts as inside.
+    let remaining = margin - age + chrono::Duration::milliseconds(1);
+    SettleWait::Wait(remaining.to_std().unwrap_or_default())
 }
 
 /// Whether the next round should run, or the walk is done (#1403).
@@ -11885,6 +11951,74 @@ mod reindex_walk_tests {
             Some(floor - ms),
             floor
         ));
+    }
+
+    #[test]
+    fn settle_wait_starts_at_once_when_the_newest_write_left_the_margin() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_settle_wait(None, now, margin), SettleWait::None);
+        assert_eq!(
+            reindex_settle_wait(Some(now - margin), now, margin),
+            SettleWait::None
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - margin - chrono::Duration::hours(1)), now, margin),
+            SettleWait::None
+        );
+    }
+
+    #[test]
+    fn settle_wait_sleeps_out_the_rest_of_the_margin_once_writes_stopped() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        // Written 92 s ago: 28 s of the margin left, plus the extra millisecond.
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(92)), now, margin),
+            SettleWait::Wait(std::time::Duration::from_millis(28_001))
+        );
+        // Exactly at the quiet threshold the writes count as stopped.
+        assert_eq!(
+            reindex_settle_wait(Some(now - REINDEX_SETTLE_QUIET), now, margin),
+            SettleWait::Wait(std::time::Duration::from_millis(110_001))
+        );
+    }
+
+    #[test]
+    fn settle_wait_keeps_the_time_walk_while_writes_are_landing() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(3)), now, margin),
+            SettleWait::Active
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now), now, margin),
+            SettleWait::Active
+        );
+        // Stamped ahead of this host's clock.
+        assert_eq!(
+            reindex_settle_wait(Some(now + chrono::Duration::seconds(5)), now, margin),
+            SettleWait::Active
+        );
+        // A margin shorter than twice the quiet period halves the threshold.
+        let short = chrono::Duration::seconds(8);
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(3)), now, short),
+            SettleWait::Active
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(5)), now, short),
+            SettleWait::Wait(std::time::Duration::from_millis(3_001))
+        );
+        assert_eq!(
+            reindex_settle_wait(
+                Some(now - chrono::Duration::seconds(3)),
+                now,
+                chrono::Duration::seconds(5)
+            ),
+            SettleWait::Wait(std::time::Duration::from_millis(2_001))
+        );
     }
 
     #[test]
