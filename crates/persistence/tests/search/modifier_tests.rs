@@ -1423,7 +1423,7 @@ async fn test_modifier_parity_suite() {
                 label: "Observation?subject:Patient=Group/p1",
                 expect: Expect::Ids(&["ob-grp"]),
             },
-            // PRE-EXISTING on main, not caused by #2394: the #1052 exact-`IN`
+            // PRE-EXISTING on main, not caused by #2394 (tracked in #2493): the #1052 exact-`IN`
             // shortcut (sqlite/search/query_builder.rs) is "exact-base only"
             // for comma OR-lists, so a list returns LESS than each value alone
             // (`Patient/p1` alone finds `ob-ver`; `Patient/p1,Patient/nobody`
