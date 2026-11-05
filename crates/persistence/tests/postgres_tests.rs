@@ -12441,6 +12441,16 @@ mod postgres_integration {
         create_subject_observation(&backend, &tenant, "ob-pat", "Patient/p1").await;
         create_subject_observation(&backend, &tenant, "ob-other", "Patient/p2").await;
         create_subject_observation(&backend, &tenant, "ob-grp", "Group/p1").await;
+        // Absolute-URL reference to Patient/p1: a bare id `p1` matches it
+        // positively, so `:not=p1` must exclude it too (and `Type/id` stays
+        // exact, so `:not=Patient/p1` keeps it).
+        create_subject_observation(
+            &backend,
+            &tenant,
+            "ob-abs",
+            "https://records.example.test/fhir/Patient/p1",
+        )
+        .await;
         backend
             .create(
                 &tenant,
@@ -12478,15 +12488,20 @@ mod postgres_integration {
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
-            vec!["ob-grp", "ob-none", "ob-other"],
+            vec!["ob-abs", "ob-grp", "ob-none", "ob-other"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["p1"])).await,
+            vec!["ob-none", "ob-other"],
+            "bare-id :not excludes prefixed, absolute and other-type matches"
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1", "Group/p1"])).await,
-            vec!["ob-none", "ob-other"],
+            vec!["ob-abs", "ob-none", "ob-other"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
-            vec!["ob-grp", "ob-none", "ob-other", "ob-pat"],
+            vec!["ob-abs", "ob-grp", "ob-none", "ob-other", "ob-pat"],
         );
     }
 
