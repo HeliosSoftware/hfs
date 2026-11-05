@@ -24,7 +24,7 @@ use elasticsearch::indices::{
     IndicesDeleteTemplateParts, IndicesExistsTemplateParts, IndicesGetMappingParts,
     IndicesGetSettingsParts, IndicesPutMappingParts, IndicesPutSettingsParts,
 };
-use elasticsearch::{Elasticsearch, IndexParts, SearchParts};
+use elasticsearch::{Elasticsearch, IndexParts, SearchParts, UpdateByQueryParts};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::elasticsearch::{
     ElasticsearchBackend, ElasticsearchConfig, SCHEMA_VERSION, SCHEMA_VERSION_META_KEY,
@@ -891,4 +891,180 @@ async fn count_on_a_missing_index_is_zero() {
     let counted = backend.search(&tenant(), &accurate).await.unwrap();
     assert!(counted.resources.items.is_empty());
     assert_eq!(counted.total, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// #2394: `reference_target` is filled in by the backend, with no `$reindex`.
+// ---------------------------------------------------------------------------
+
+/// References in every shape the writer's rule distinguishes. The expected
+/// `reference_target` of each is computed by the Rust function the writer uses,
+/// so the migration script and the writer cannot drift apart unnoticed.
+fn reference_forms() -> Vec<String> {
+    vec![
+        "Patient/p1".to_string(),
+        "Patient/p1/_history/3".to_string(),
+        "http://example.org/fhir/Patient/p1".to_string(),
+        "https://ehr.example.com/r4/Patient/p1/_history/2".to_string(),
+        "http://h/Patient/p.1?x=1#f".to_string(),
+        "http://h/Patient/p1/_history/3?x=1".to_string(),
+        "https://other-server.example/fhir/Patient/p2".to_string(),
+        "http://h/Patient/p-1/".to_string(),
+        "http://example.org/foo".to_string(),
+        "http://example.org/".to_string(),
+        "http://Patient/p1".to_string(),
+        "http://h/patient/p1".to_string(),
+        "http://h/Pat_ient/p1".to_string(),
+        format!("http://h/Patient/{}", "a".repeat(65)),
+        format!("http://h/Patient/{}", "a".repeat(64)),
+        "urn:uuid:1234".to_string(),
+    ]
+}
+
+/// `(_id, _version, reference, reference_target)` of the `subject` row of every
+/// Observation in `index`.
+async fn subject_rows(index: &str) -> Vec<(String, u64, String, Option<String>)> {
+    let body: Value = raw_client()
+        .await
+        .search(SearchParts::Index(&[index]))
+        .body(json!({ "size": 200, "version": true, "query": { "match_all": {} } }))
+        .send()
+        .await
+        .expect("search")
+        .json()
+        .await
+        .expect("search json");
+    let mut rows = Vec::new();
+    for hit in body["hits"]["hits"].as_array().expect("hits") {
+        let rows_of_doc = hit["_source"]["search_params"]["reference"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for r in rows_of_doc {
+            if r["name"] == "subject" {
+                rows.push((
+                    hit["_id"].as_str().unwrap().to_string(),
+                    hit["_version"].as_u64().unwrap(),
+                    r["reference"].as_str().unwrap().to_string(),
+                    r["reference_target"].as_str().map(str::to_string),
+                ));
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn expected_target(reference: &str) -> Option<String> {
+    helios_persistence::types::absolute_reference_target(reference)
+}
+
+fn subject_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        values: vec![SearchValue::eq(value)],
+        ..Default::default()
+    })
+}
+
+/// Documents indexed without `reference_target` (as before #2394) get it from
+/// the backend at startup, with exactly the value the writer computes, and the
+/// absolute references then match a plain `Type/id` search. A second start
+/// changes nothing.
+#[tokio::test]
+async fn startup_fills_reference_target_on_documents_indexed_before_it() {
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    let forms = reference_forms();
+    for (i, reference) in forms.iter().enumerate() {
+        first
+            .create(
+                &tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("ob{i}"),
+                    "status": "final",
+                    "code": { "text": "x" },
+                    "subject": { "reference": reference }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create");
+    }
+    let index = first.index_name("reconcile", "Observation");
+
+    // Today's writer already stores the field; take it away to get the shape an
+    // index written by an older HFS holds.
+    let stripped = raw_client()
+        .await
+        .update_by_query(UpdateByQueryParts::Index(&[&index]))
+        .refresh(true)
+        .wait_for_completion(true)
+        .body(json!({
+            "query": { "match_all": {} },
+            "script": { "lang": "painless", "source":
+                "for (def r : ctx._source.search_params.reference) { r.remove('reference_target'); }" }
+        }))
+        .send()
+        .await
+        .expect("strip");
+    assert!(stripped.status_code().is_success(), "strip failed");
+    let before = subject_rows(&index).await;
+    assert_eq!(before.len(), forms.len());
+    assert!(before.iter().all(|(_, _, _, target)| target.is_none()));
+    assert_eq!(
+        found_ids(&first, &subject_query("Patient/p1")).await,
+        vec!["ob0".to_string(), "ob1".to_string()],
+        "before the migration only the relative reference matches Patient/p1"
+    );
+
+    // Starting a backend on the index starts the migration in the background.
+    let second = started_backend_on(&prefix).await;
+    let mut after = Vec::new();
+    for _ in 0..120 {
+        after = subject_rows(&index).await;
+        if after
+            .iter()
+            .all(|(_, _, reference, target)| *target == expected_target(reference))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    for (_, _, reference, target) in &after {
+        assert_eq!(
+            *target,
+            expected_target(reference),
+            "reference_target of {reference:?}"
+        );
+    }
+    assert!(
+        after.iter().any(|(_, _, _, target)| target.is_some()),
+        "the table must contain absolute references that resolve"
+    );
+
+    // And the search the field exists for now finds them.
+    let found = found_ids(&second, &subject_query("Patient/p1")).await;
+    let mut want: Vec<String> = forms
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.as_str() == "Patient/p1"
+                || r.as_str() == "Patient/p1/_history/3"
+                || expected_target(r).as_deref() == Some("Patient/p1")
+        })
+        .map(|(i, _)| format!("ob{i}"))
+        .collect();
+    want.sort();
+    assert_eq!(found, want);
+
+    // A third start finds nothing left that can change: no document is rewritten.
+    let versions: Vec<u64> = subject_rows(&index).await.iter().map(|r| r.1).collect();
+    started_backend_on(&prefix).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let again: Vec<u64> = subject_rows(&index).await.iter().map(|r| r.1).collect();
+    assert_eq!(versions, again, "a finished migration rewrites nothing");
 }
