@@ -3737,6 +3737,8 @@ impl ResourceStorage for MongoBackend {
             .or_query_error("purge delete (secondary_sync_failures)")?;
         // SQL query terminology relations are tenant-keyed documents (#2185).
         self.purge_tenant_sof_terminology(id).await?;
+        // The tenant's `tuple_code` completeness markers (`search_layout`).
+        self.purge_composite_tuple_markers(&db, id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).

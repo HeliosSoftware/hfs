@@ -345,7 +345,7 @@ async fn an_upgraded_database_with_rows_and_no_recorded_generation_still_gets_on
             again.wait_for_search_index_build().await,
             Some(BuildOutcome::UpToDate)
         ),
-        "a database already at generation 5 is up to date"
+        "a database already at the current generation (5) is up to date"
     );
     assert_eq!(captured(logs, REINDEX_REMINDER).len(), 1);
 }

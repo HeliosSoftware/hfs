@@ -150,6 +150,22 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// Deletes the markers of `tenant_id` (tenant purge).
+    pub(super) async fn purge_composite_tuple_markers(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+    ) -> StorageResult<()> {
+        db.collection::<Document>(LAYOUT_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant_id })
+            .await
+            .map_err(|e| {
+                super::storage::internal_error(format!("Failed to purge layout markers: {e}"))
+            })?;
+        self.composite_marker_cache.forget_tenant(tenant_id);
+        Ok(())
+    }
+
     /// At boot, before the builder records this generation: a database
     /// recorded below [`COMPOSITE_TUPLE_GENERATION`] (or never recorded) was
     /// last booted by a binary that writes rows without `tuple_code`, or has
