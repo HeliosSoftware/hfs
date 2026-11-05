@@ -435,7 +435,9 @@ A run writes a marker only when it finishes with no error, and only when it rebu
 | `idStart` / `idEnd`, `clearOnly`, `metadataOnly`, a run limited to some search parameters or resources | none |
 | A run that is cancelled, fails, or skips a resource it could not read or index | none |
 
-Before writing the marker, HFS checks each type in scope for a quantity row of a token+quantity composite without `tuple_code` whose group has a coded token row. If it finds one (an older instance wrote it while the run went on), it writes no marker for that type, or no tenant marker, and logs a `warn`. The check reads each composite quantity row of the scope once.
+Before writing the marker, HFS checks each type in scope for a quantity row of a token+quantity composite without `tuple_code` whose group has a coded token row. If it finds one (an older instance wrote it while the run went on), it writes no marker for that type, or no tenant marker, and logs a `warn`. The check reads each composite quantity row of the scope once. It sees only rows written before it reads them: a row an older instance writes after that is the case [Deployment order](#deployment-order) rules out.
+
+After writing the markers, HFS reads `resources` once for the tenant. If the tenant has no resource left, a tenant purge ran during the run (on any instance), and HFS removes the markers it just wrote, so a tenant id reused later does not start out marked. A tenant that was empty when the run ended gets no marker either; that only means pair validation until its next `$reindex`.
 
 The planner also needs the recorded generation to be 5 or more, the value indexes ready, one composite value, no modifier, a token part that is a code or `system|code`, and a quantity prefix other than `ne`. Any other search keeps pair validation. Markers are cached per instance for 30 seconds.
 
@@ -453,9 +455,11 @@ db.search_layout.find({ tenant_id: "<tenant>" })
 3. Make sure no instance of an older binary is running against the database.
 4. Run `$reindex` for each tenant, or `POST /Observation/$reindex` (and the other types with token+quantity composites).
 
+A `$reindex` that completes before step 2 is done normally loses its markers: when HFS records generation 5 over generation 4 it first deletes every marker (see [Rollback and restore](#rollback-and-restore)), so run it again after step 2.
+
 An older instance that is still running writes rows without `tuple_code`. It records its generation only when it boots, so HFS cannot see it. If it writes after a tenant was marked, those rows are missing from tuple-path searches of that tenant until the next `$reindex`. Do not run the activating `$reindex` while one is alive.
 
 ### Rollback and restore
 
 - **Rollback.** An older binary records generation 4 at boot. Every instance of this binary stops trusting the markers within 30 seconds, and searches fall back to pair validation. When this binary records generation 5 again, it first deletes every marker; if it cannot delete them, it records nothing and the markers stay untrusted. After the return, run the activating `$reindex` again, in the order above.
-- **Restore.** A `mongorestore` into a database whose tenants are marked, or any tool that writes `search_index` directly, leaves rows without `tuple_code` behind a marker. After a restore, delete the markers and reindex: `db.search_layout.deleteMany({ layout: "composite_tuple_code_v2" })`, then `$reindex` per tenant. A tenant purge deletes that tenant's markers.
+- **Restore.** A `mongorestore` into a database whose tenants are marked, or any tool that writes `search_index` directly, leaves rows without `tuple_code` behind a marker. After a restore, delete the markers and reindex: `db.search_layout.deleteMany({ layout: "composite_tuple_code_v2" })`, then `$reindex` per tenant. A tenant purge deletes that tenant's markers, including one written by a `$reindex` of that tenant that finishes after the purge.

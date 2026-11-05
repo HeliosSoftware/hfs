@@ -467,6 +467,85 @@ async fn mongodb_a_quantity_row_without_tuple_code_blocks_the_marker() {
     assert!(tuple_path_used(&backend, &codeless).await);
 }
 
+/// Creates, updates and deletes of this binary while a `$reindex` runs write
+/// stamped rows, so they neither block the marker nor go missing behind it.
+/// The writes start right after the job does; the job pages 5 resources at a
+/// time, but nothing forces an overlap, so this checks the end state.
+#[tokio::test]
+async fn mongodb_writes_during_a_reindex_are_stamped_and_keep_the_marker() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_concurrent").await
+    else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("composite-tuple-concurrent");
+    let (tall, _) = seed(&backend, &tenant).await;
+    unstamp(&backend, "composite-tuple-concurrent", None).await;
+
+    let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"]).with_batch_size(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut expected: Vec<String> = tall.into_iter().filter(|id| id != "h-35").collect();
+    for n in 0..10 {
+        let id = format!("n-{n:02}");
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(&id, "8302-2", 200.0 + n as f64),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        expected.push(id);
+    }
+    let current = backend
+        .read(&tenant, "Observation", "h-05")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(&tenant, &current, observation("h-05", "8302-2", 300.0))
+        .await
+        .unwrap();
+    expected.push("h-05".to_string());
+    backend
+        .delete(&tenant, "Observation", "h-35")
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    assert_eq!(
+        markers(&backend).await,
+        vec!["composite-tuple-concurrent|Observation|composite_tuple_code_v2".to_string()]
+    );
+    let unstamped = raw_db(&backend)
+        .await
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": "composite-tuple-concurrent",
+            "param_name": "code-value-quantity",
+            "value_quantity_value": { "$exists": true },
+            "tuple_code": { "$exists": false },
+        })
+        .await
+        .unwrap();
+    assert_eq!(unstamped, 0);
+    assert!(tuple_path_used(&backend, &tenant).await);
+    assert_eq!(
+        found(&backend, &tenant, "8302-2$gt160").await,
+        sorted(expected)
+    );
+}
+
 /// A tenant purge that ran (on any instance) after a `$reindex` rebuilt the
 /// tenant but before its hook wrote the markers leaves no marker: the hook
 /// finds no resource of the tenant after writing and removes what it wrote.
