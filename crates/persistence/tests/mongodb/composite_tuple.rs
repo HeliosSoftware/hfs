@@ -237,7 +237,6 @@ async fn mongodb_a_fresh_database_has_no_all_tenant_marker_and_late_rows_stay_vi
     };
     let tenant = create_tenant("composite-tuple-fresh");
     let (tall, _) = seed(&backend, &tenant).await;
-    assert_eq!(markers(&backend).await, Vec::<String>::new());
     // A row restored after the boot, without `tuple_code`.
     unstamp(&backend, "composite-tuple-fresh", Some("h-30")).await;
     assert_eq!(
@@ -245,6 +244,7 @@ async fn mongodb_a_fresh_database_has_no_all_tenant_marker_and_late_rows_stay_vi
         sorted(tall.clone())
     );
     assert!(!tuple_path_used(&backend, &tenant).await);
+    assert_eq!(markers(&backend).await, Vec::<String>::new());
 }
 
 /// T1/I3: a real `$reindex` stamps rows written before `tuple_code` and marks
