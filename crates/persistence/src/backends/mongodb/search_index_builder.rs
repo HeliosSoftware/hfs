@@ -1552,4 +1552,30 @@ mod tuple_marker_record_tests {
         database.drop().await.unwrap();
         assert_eq!(markers, 1);
     }
+
+    /// N2: when the markers cannot be deleted, the generation that would
+    /// trust them is not recorded. The failure is a `search_layout` that is a
+    /// view: every delete on it fails.
+    #[tokio::test]
+    async fn a_failed_marker_delete_records_no_generation() {
+        let Some(database) = scratch_database("a_failed_marker_delete").await else {
+            return;
+        };
+        database
+            .collection::<Document>("schema_version")
+            .insert_one(doc! { "_id": "schema_version", "search_indexes": { "generation": 4 } })
+            .await
+            .unwrap();
+        database
+            .run_command(doc! { "create": "search_layout", "viewOn": "absent", "pipeline": [] })
+            .await
+            .unwrap();
+
+        let outcome = builder(&database).record_if_needed().await;
+
+        let recorded = get_search_index_generation(&database).await.unwrap();
+        database.drop().await.unwrap();
+        assert!(outcome.is_err(), "the delete on a view must fail");
+        assert_eq!(recorded, Some(4));
+    }
 }
