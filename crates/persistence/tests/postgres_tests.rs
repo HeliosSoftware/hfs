@@ -12487,11 +12487,11 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/p1"])
             )
             .await,
-            vec!["ob-pat", "ob-ver"],
+            vec!["ob-abs", "ob-pat", "ob-ver"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
-            vec!["ob-abs", "ob-grp", "ob-none", "ob-other"],
+            vec!["ob-grp", "ob-none", "ob-other"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["p1"])).await,
@@ -12500,7 +12500,7 @@ mod postgres_integration {
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1", "Group/p1"])).await,
-            vec!["ob-abs", "ob-none", "ob-other"],
+            vec!["ob-none", "ob-other"],
         );
         assert_eq!(
             reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
@@ -12564,8 +12564,8 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/shared-id"]),
             )
             .await,
-            vec!["ref-prefixed", "ref-versioned"],
-            "Type/id remains exact and version-normalized"
+            vec!["ref-absolute", "ref-prefixed", "ref-versioned"],
+            "Type/id is exact, version-normalized and matches the absolute URL form"
         );
         assert_eq!(
             reference_search_ids(
@@ -34897,32 +34897,16 @@ mod postgres_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` includes relative and versioned references
-    /// (PostgreSQL stores them version-stripped). PostgreSQL resolves includes
-    /// through the generic per-resource reference search, which does not match
-    /// absolute URLs; reported, not fixed, in this change.
+    /// #2296: `_revinclude` includes relative, versioned and absolute
+    /// references (PostgreSQL stores them version-stripped, with the `Type/id`
+    /// of an absolute URL in `value_reference_target`, #2394).
     #[tokio::test]
     async fn postgres_integration_revinclude_matches_every_reference_form() {
-        use super::revinclude_reference_forms_suite::Divergence;
-
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             &unique_base("revinclude_forms"),
-            &[
-                Divergence {
-                    id: "prov-abs",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-abs-ver",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-dot-abs",
-                    included: false,
-                },
-            ],
+            &[],
         )
         .await;
     }
@@ -34970,6 +34954,13 @@ mod postgres_integration {
                 Divergence {
                     label: "Observation?subject:Patient=Group/p1",
                     expect: Expect::Ids(&["ob-grp"]),
+                },
+                // `:above` a `_history/1` URL also finds the `_history/2` form
+                // (the version segment is not compared); SQLite and ES return
+                // only the unversioned `ob-abs`.
+                Divergence {
+                    label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                    expect: Expect::Ids(&["ob-abs", "ob-abs-ver"]),
                 },
             ],
         )

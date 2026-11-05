@@ -159,7 +159,7 @@ use crate::backends::postgres::schema::IndexLayout;
 use crate::backends::postgres::storage::internal_postgres_error;
 use crate::error::StorageResult;
 use crate::search::{converters::IndexValue, extractor::ExtractedValue};
-use crate::types::strip_reference_version;
+use crate::types::{absolute_reference_target, strip_reference_version};
 
 fn postgres_error_message(error: &tokio_postgres::Error) -> String {
     error.as_db_error().map_or_else(
@@ -286,6 +286,7 @@ pub(crate) struct IndexRow {
     value_quantity_canonical_value: Option<f64>,
     value_quantity_canonical_unit: Option<String>,
     value_reference: Option<String>,
+    value_reference_target: Option<String>,
     value_reference_display: Option<String>,
     value_identifier_type_system: Option<String>,
     value_identifier_type_code: Option<String>,
@@ -422,6 +423,13 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     column!(p, rows, "value_reference", "text[]", |r: &&IndexRow| r
         .value_reference
         .clone());
+    column!(
+        p,
+        rows,
+        "value_reference_target",
+        "text[]",
+        |r: &&IndexRow| r.value_reference_target.clone()
+    );
     column!(
         p,
         rows,
@@ -715,6 +723,9 @@ impl IndexRow {
                 // able to use a `/_history/<vid>` suffix, and three of them are
                 // silently broken by one.
                 row.value_reference = Some(strip_reference_version(reference).to_string());
+                // `Type/id` of an absolute http(s) reference, so a relative
+                // search value matches it (#2394); `None` otherwise.
+                row.value_reference_target = absolute_reference_target(reference);
                 row.value_reference_display = display.clone();
             }
             IndexValue::Uri(uri) => {
@@ -830,6 +841,7 @@ struct RowKey<'a> {
     value_quantity_canonical_value: Option<u64>,
     value_quantity_canonical_unit: Option<&'a String>,
     value_reference: Option<&'a String>,
+    value_reference_target: Option<&'a String>,
     value_reference_display: Option<&'a String>,
     value_identifier_type_system: Option<&'a String>,
     value_identifier_type_code: Option<&'a String>,
@@ -873,6 +885,7 @@ impl IndexRow {
             value_quantity_canonical_value,
             value_quantity_canonical_unit,
             value_reference,
+            value_reference_target,
             value_reference_display,
             value_identifier_type_system,
             value_identifier_type_code,
@@ -908,6 +921,7 @@ impl IndexRow {
             value_quantity_canonical_value: value_quantity_canonical_value.map(f64::to_bits),
             value_quantity_canonical_unit: value_quantity_canonical_unit.as_ref(),
             value_reference: value_reference.as_ref(),
+            value_reference_target: value_reference_target.as_ref(),
             value_reference_display: value_reference_display.as_ref(),
             value_identifier_type_system: value_identifier_type_system.as_ref(),
             value_identifier_type_code: value_identifier_type_code.as_ref(),
@@ -1794,6 +1808,9 @@ mod tests {
             }),
             ("value_reference", |r| {
                 r.value_reference = Some("P/1".into())
+            }),
+            ("value_reference_target", |r| {
+                r.value_reference_target = Some("P/1".into())
             }),
             ("value_reference_display", |r| {
                 r.value_reference_display = Some("d".into())

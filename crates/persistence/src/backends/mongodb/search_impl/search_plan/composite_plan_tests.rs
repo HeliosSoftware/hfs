@@ -1561,7 +1561,8 @@ fn compartment(reference: &str) -> CompartmentMembership {
 /// Patients with identifiers and the Observations that reference them: `c`
 /// ids with `n % 40 == 0` reference `Patient/p1` (30 of them), `n % 40 == 1`
 /// reference `Patient/p2`, and every Observation with `n % 40 == 5` performs
-/// for `Patient/p1/_history/3`. The 15 Observations with `n % 80 == 0` also
+/// for `Patient/p1/_history/3`, stored as the writer does (`Patient/p1`, the
+/// version stripped). The 15 Observations with `n % 80 == 0` also
 /// name `Patient/p1` as performer, so they reference it through two
 /// parameters: the compartment holds two index rows for each of them, and
 /// a page or a count must still list each one once.
@@ -1589,7 +1590,7 @@ async fn seed_references(fixture: &Fixture) {
             index.push(
                 doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation",
                 "resource_id": &id, "param_name": "performer",
-                "value_reference": "Patient/p1/_history/3" },
+                "value_reference": "Patient/p1" },
             );
         }
         if n % 80 == 0 {
@@ -1800,7 +1801,10 @@ async fn identifier_and_compartment_predicates_plan_like_plain_filters() {
         })
         .await
         .unwrap();
-    assert_eq!(direct_rows, 45, "30 subject rows and 15 performer rows");
+    assert_eq!(
+        direct_rows, 75,
+        "30 subject rows, 30 performer rows (versions stripped) and 15 duplicates"
+    );
     let mut whole = with_total(member.clone(), TotalMode::Accurate);
     whole.count = Some(200);
     let got = page(&fixture, &whole).await;

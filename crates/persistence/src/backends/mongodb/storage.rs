@@ -39,7 +39,7 @@ use crate::search::reindex::{
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, StoredResource,
+    SearchQuery, StoredResource, absolute_reference_target, strip_reference_version,
 };
 
 use super::MongoBackend;
@@ -5591,7 +5591,13 @@ impl MongoBackend {
             IndexValue::Reference {
                 reference, display, ..
             } => {
-                doc.insert("value_reference", reference.clone());
+                // Stored without the `/_history/<vid>` suffix, and absolute
+                // URLs also carry their `Type/id` in a side field, so readers
+                // match with exact `$in` and no regex arms (#2394).
+                doc.insert("value_reference", strip_reference_version(reference));
+                if let Some(target) = absolute_reference_target(reference) {
+                    doc.insert("value_reference_target", target);
+                }
                 if let Some(d) = display {
                     doc.insert("value_reference_display", d.clone());
                 }
@@ -15510,5 +15516,82 @@ mod unknown_commit_tests {
         let ceiling = Duration::from_millis(i32::MAX as u64);
         assert_eq!(settle_read_max_time(i32::MAX as u64), ceiling);
         assert_eq!(settle_read_max_time(u64::MAX), ceiling);
+    }
+}
+
+#[cfg(test)]
+mod reference_document_tests {
+    use super::*;
+
+    fn reference_document(reference: &str, contained: bool) -> Document {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "subject",
+            "http://hl7.org/fhir/SearchParameter/clinical-subject",
+            crate::types::SearchParamType::Reference,
+            IndexValue::reference(reference),
+        );
+        if contained {
+            backend
+                .build_contained_index_document(
+                    "t1",
+                    "Observation",
+                    "o1",
+                    "Patient",
+                    "c1",
+                    &extracted,
+                )
+                .expect("contained document")
+        } else {
+            backend
+                .build_search_index_document("t1", "Observation", "o1", &extracted)
+                .expect("document")
+        }
+    }
+
+    #[test]
+    fn relative_reference_is_stored_as_is_without_a_target() {
+        let doc = reference_document("Patient/p1", false);
+        assert_eq!(doc.get_str("value_reference"), Ok("Patient/p1"));
+        assert!(!doc.contains_key("value_reference_target"));
+    }
+
+    #[test]
+    fn versioned_reference_loses_its_version() {
+        let doc = reference_document("Patient/p1/_history/3", false);
+        assert_eq!(doc.get_str("value_reference"), Ok("Patient/p1"));
+        assert!(!doc.contains_key("value_reference_target"));
+    }
+
+    #[test]
+    fn absolute_reference_keeps_its_url_and_gains_a_target() {
+        let doc = reference_document("http://example.org/fhir/Patient/p1", false);
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("http://example.org/fhir/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
+    }
+
+    #[test]
+    fn absolute_versioned_reference_is_stripped_and_gains_a_target() {
+        let doc = reference_document("https://ehr.example.com/r4/Patient/p1/_history/2", false);
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("https://ehr.example.com/r4/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
+    }
+
+    #[test]
+    fn contained_documents_normalize_references_too() {
+        let doc = reference_document("https://ehr.example.com/r4/Patient/p1/_history/2", true);
+        assert_eq!(doc.get_str("contained_local_id"), Ok("c1"));
+        assert_eq!(
+            doc.get_str("value_reference"),
+            Ok("https://ehr.example.com/r4/Patient/p1")
+        );
+        assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
     }
 }

@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 47;
+pub const SCHEMA_VERSION: i32 = 48;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -32,7 +32,7 @@ pub const SCHEMA_VERSION: i32 = 47;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -64,6 +64,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
     (
         "idx_search_reference",
         "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+    ),
+    (
+        "idx_search_reference_target",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_target ON search_index(tenant_id, resource_type, param_name, value_reference_target) WHERE value_reference_target IS NOT NULL",
     ),
     (
         "idx_search_uri",
@@ -669,6 +673,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             44 => migrate_v44_to_v45(conn)?,
             45 => migrate_v45_to_v46(conn)?,
             46 => migrate_v46_to_v47(conn)?,
+            47 => migrate_v47_to_v48(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2548,6 +2553,82 @@ fn migrate_v46_to_v47(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 47 to 48: adds `search_index.value_reference_target`,
+/// the `Type/id` of a reference stored as an absolute http(s) URL (NULL for a
+/// relative one), so `subject=Patient/p1` and `_revinclude` also match
+/// `http://host/fhir/Patient/p1` (and `.../_history/2`). The value comes from
+/// [`crate::types::absolute_reference_target`], the same function the writer
+/// uses. The backfill runs in rowid batches of one transaction each and only
+/// visits absolute rows still without a target; the partial index is built
+/// afterwards over final data.
+fn migrate_v47_to_v48(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_reference_target")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_reference_target TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v48 add value_reference_target: {e}")))?;
+    }
+
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| migration_err(format!("v48 begin backfill batch: {e}")))?;
+        let rows: Vec<(i64, String)> = {
+            let mut select = tx
+                .prepare_cached(
+                    "SELECT rowid, value_reference FROM search_index
+                      WHERE rowid > ?1 AND value_reference_target IS NULL
+                        AND (value_reference LIKE 'http://%' OR value_reference LIKE 'https://%')
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v48 read reference rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| migration_err(format!("v48 read reference rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v48 read reference rows: {e}")))?
+        };
+        let Some(&(last, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+        {
+            let mut update = tx
+                .prepare_cached(
+                    "UPDATE search_index SET value_reference_target = ?2 WHERE rowid = ?1",
+                )
+                .map_err(|e| migration_err(format!("v48 backfill value_reference_target: {e}")))?;
+            for (rowid, value) in rows {
+                if let Some(target) = crate::types::absolute_reference_target(&value) {
+                    update
+                        .execute(rusqlite::params![rowid, target])
+                        .map_err(|e| {
+                            migration_err(format!("v48 backfill value_reference_target: {e}"))
+                        })?;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| migration_err(format!("v48 commit backfill batch: {e}")))?;
+    }
+
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        if name == "idx_search_reference_target" {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v48 create {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -4327,6 +4408,66 @@ mod tests {
         // A replay is a no-op.
         migrate_v46_to_v47(&conn).unwrap();
         assert_eq!(count(&conn), 1);
+    }
+
+    /// v47 -> v48 adds `value_reference_target`, backfills it for absolute
+    /// http(s) references only (stripping `_history`), indexes it, and a
+    /// replay is a no-op.
+    #[test]
+    fn migrate_v47_to_v48_backfills_absolute_reference_targets() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute("DROP INDEX idx_search_reference_target", [])
+            .unwrap();
+        conn.execute(
+            "ALTER TABLE search_index DROP COLUMN value_reference_target",
+            [],
+        )
+        .unwrap();
+        for (i, reference) in [
+            "Patient/rel",
+            "http://example.org/fhir/Patient/p1",
+            "https://h/r4/Patient/p2/_history/2",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
+                 VALUES ('t', 'Observation', ?1, 'subject', ?2)",
+                rusqlite::params![format!("o{i}"), reference],
+            )
+            .unwrap();
+        }
+        force_schema_version(&conn, 47).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let targets = |c: &Connection| -> Vec<Option<String>> {
+            c.prepare("SELECT value_reference_target FROM search_index ORDER BY resource_id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let expected = vec![
+            None,
+            Some("Patient/p1".to_string()),
+            Some("Patient/p2".to_string()),
+        ];
+        assert_eq!(targets(&conn), expected);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_search_reference_target'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        // A replay is a no-op.
+        migrate_v47_to_v48(&conn).unwrap();
+        assert_eq!(targets(&conn), expected);
     }
 
     /// v45 -> v46 drops the two extra code-first indexes of the earlier
