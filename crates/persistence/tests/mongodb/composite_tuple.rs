@@ -342,7 +342,8 @@ async fn mongodb_a_real_reindex_stamps_the_rows_and_enables_the_tuple_path() {
 
 /// I1: after a rollback (an older binary records its own, lower generation and
 /// writes rows without `tuple_code`) a running instance stops trusting the
-/// markers, and the next boot deletes them, so the rollback's rows are found.
+/// markers, and the next boot's builder deletes them, so the rollback's rows
+/// are found.
 #[tokio::test]
 async fn mongodb_a_rollback_invalidates_the_markers() {
     let Some(backend) = create_backend_with_full_registry("composite_tuple_rollback").await else {
@@ -370,8 +371,8 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         sorted(tall.clone())
     );
 
-    // The return to this binary: its boot deletes every marker before its
-    // builder records the current generation again.
+    // The return to this binary: its builder deletes every marker right
+    // before it records the current generation again.
     let returned = build_backend(backend.config().clone())
         .await
         .expect("second boot");

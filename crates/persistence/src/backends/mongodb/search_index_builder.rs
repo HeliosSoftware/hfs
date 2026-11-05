@@ -569,6 +569,10 @@ impl SearchIndexBuilder {
                     );
                 }
             }
+            // From the same read as this record: a rollback may have written
+            // rows without `tuple_code` that the markers would cover once
+            // this generation is recorded. Fails closed (`composite_layout`).
+            super::composite_layout::drop_untrusted_tuple_markers(&self.database, recorded).await?;
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;
         }
         Ok(())
@@ -1446,5 +1450,106 @@ mod builder_tests {
     fn off_mode_decision_is_none_when_nothing_missing_or_superseded() {
         let inspection = Inspection::default();
         assert_eq!(off_mode_decision(&inspection), None);
+    }
+}
+
+/// `record_if_needed` against a real server (`HFS_TEST_MONGODB_URL`; skipped
+/// without it unless `HFS_TEST_REQUIRE_MONGODB` is set): the `tuple_code`
+/// markers it must delete before it records the current generation.
+#[cfg(test)]
+mod tuple_marker_record_tests {
+    use super::*;
+
+    const MARKER: &str = "t|composite_tuple_code_v2";
+
+    /// A fresh database on the test server, `None` (and a skip line) without
+    /// one. The caller drops it.
+    async fn scratch_database(label: &str) -> Option<Database> {
+        let Ok(uri) = std::env::var("HFS_TEST_MONGODB_URL") else {
+            if std::env::var("HFS_TEST_REQUIRE_MONGODB").is_ok_and(|value| !value.is_empty()) {
+                panic!("{label}: HFS_TEST_MONGODB_URL unset");
+            }
+            eprintln!("Skipping {label}: HFS_TEST_MONGODB_URL unset");
+            return None;
+        };
+        let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+        Some(client.database(&format!(
+            "hfs_tuple_record_{}",
+            uuid::Uuid::new_v4().simple()
+        )))
+    }
+
+    /// A database whose recorded generation is `generation` and which holds
+    /// one tenant marker, as a binary of this generation left it.
+    async fn seed(database: &Database, generation: i32) {
+        database
+            .collection::<Document>("schema_version")
+            .insert_one(doc! {
+                "_id": "schema_version",
+                "search_indexes": { "generation": generation },
+            })
+            .await
+            .unwrap();
+        database
+            .collection::<Document>("search_layout")
+            .insert_one(doc! {
+                "_id": MARKER,
+                "tenant_id": "t",
+                "resource_type": Bson::Null,
+                "layout": "composite_tuple_code_v2",
+            })
+            .await
+            .unwrap();
+    }
+
+    fn builder(database: &Database) -> SearchIndexBuilder {
+        SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Off,
+            RowsAtBoot::DateRangesRecorded,
+        )
+    }
+
+    async fn marker_count(database: &Database) -> u64 {
+        database
+            .collection::<Document>("search_layout")
+            .count_documents(doc! { "_id": MARKER })
+            .await
+            .unwrap()
+    }
+
+    /// N1: this binary booted while generation 5 was recorded, so nothing at
+    /// boot touched the markers; then an older binary booted, recorded 4 and
+    /// wrote rows without `tuple_code`. When this builder records 5 the markers
+    /// must already be gone, or they would cover those rows for good.
+    #[tokio::test]
+    async fn recording_over_an_older_generation_deletes_the_markers_first() {
+        let Some(database) = scratch_database("recording_over_an_older_generation").await else {
+            return;
+        };
+        seed(&database, 4).await;
+
+        builder(&database).record_if_needed().await.unwrap();
+
+        let recorded = get_search_index_generation(&database).await.unwrap();
+        let markers = marker_count(&database).await;
+        database.drop().await.unwrap();
+        assert_eq!(recorded, Some(SEARCH_INDEX_GENERATION));
+        assert_eq!(markers, 0, "a marker survived the record of generation 5");
+    }
+
+    /// The markers of a database already at this generation are kept.
+    #[tokio::test]
+    async fn recording_nothing_new_keeps_the_markers() {
+        let Some(database) = scratch_database("recording_nothing_new").await else {
+            return;
+        };
+        seed(&database, SEARCH_INDEX_GENERATION).await;
+
+        builder(&database).record_if_needed().await.unwrap();
+
+        let markers = marker_count(&database).await;
+        database.drop().await.unwrap();
+        assert_eq!(markers, 1);
     }
 }

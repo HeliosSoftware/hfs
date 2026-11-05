@@ -27,9 +27,11 @@
 //! records its own, lower generation when it boots, so:
 //! * a running instance stops trusting the markers once an older instance
 //!   booted (within [`MARKER_TTL`]);
-//! * the next boot of this binary on a database recorded below that generation
-//!   (a rollback and a return) deletes every marker before its builder records
-//!   the current generation again ([`MongoBackend::drop_untrusted_tuple_markers_at_boot`]).
+//! * the builder of this binary, on a database recorded below that generation
+//!   (a rollback and a return), deletes every marker right before it records
+//!   the current generation again, from the same read of the recorded
+//!   generation ([`drop_untrusted_tuple_markers`]), and records nothing when
+//!   it cannot delete them.
 //!
 //! Reads are cached per tenant and type for [`MARKER_TTL`]; any error reads as
 //! "not complete", the pair-validation path.
@@ -61,6 +63,52 @@ fn type_marker_id(tenant_id: &str, resource_type: &str) -> String {
 /// generation (`None`: never recorded).
 fn markers_trusted(recorded_generation: Option<i32>) -> bool {
     recorded_generation.is_some_and(|generation| generation >= COMPOSITE_TUPLE_GENERATION)
+}
+
+/// Called by the `search_index` builder right before it records
+/// [`COMPOSITE_TUPLE_GENERATION`] or later over `recorded`, the generation it
+/// read for that record: a database recorded below it (or never recorded) was
+/// last booted by a binary that writes rows without `tuple_code`, or has not
+/// finished a build of this one, so every marker goes. Deciding from the same
+/// read the record replaces leaves no window in which an older binary records
+/// its generation and writes rows the markers would then cover. An error is
+/// returned, not logged: the builder must not record a generation that trusts
+/// markers it could not delete. The tenants they held need a `$reindex` to
+/// use `idx_search_composite_tuple_qty` again.
+pub(super) async fn drop_untrusted_tuple_markers(
+    db: &mongodb::Database,
+    recorded: Option<i32>,
+) -> StorageResult<()> {
+    if markers_trusted(recorded) {
+        return Ok(());
+    }
+    let deleted = db
+        .collection::<Document>(LAYOUT_COLLECTION)
+        .delete_many(doc! { "layout": LAYOUT_COMPOSITE_TUPLE_CODE })
+        .await
+        .map_err(|e| {
+            super::storage::internal_error(format!(
+                "Failed to remove the tuple_code markers before recording generation \
+                 {COMPOSITE_TUPLE_GENERATION}: {e}"
+            ))
+        })?;
+    if deleted.deleted_count > 0 {
+        tracing::warn!(
+            recorded_generation = ?recorded,
+            markers = deleted.deleted_count,
+            "search_index was last recorded below generation {COMPOSITE_TUPLE_GENERATION}, so \
+             rows without tuple_code may exist: removed the tuple_code markers; token+quantity \
+             composite searches use pair validation until `$reindex` rebuilds each tenant"
+        );
+    } else if recorded.is_some() {
+        tracing::info!(
+            recorded_generation = ?recorded,
+            "token+quantity composite searches use pair validation until `$reindex` \
+             rebuilds each tenant (rows written before generation \
+             {COMPOSITE_TUPLE_GENERATION} have no tuple_code)"
+        );
+    }
+    Ok(())
 }
 
 /// Per tenant and type TTL cache of "tuple codes complete".
@@ -164,52 +212,6 @@ impl MongoBackend {
             })?;
         self.composite_marker_cache.forget_tenant(tenant_id);
         Ok(())
-    }
-
-    /// At boot, before the builder records this generation: a database
-    /// recorded below [`COMPOSITE_TUPLE_GENERATION`] (or never recorded) was
-    /// last booted by a binary that writes rows without `tuple_code`, or has
-    /// not finished a build of this one, so every marker goes. The tenants it
-    /// held need a `$reindex` to use `idx_search_composite_tuple_qty` again.
-    pub(super) async fn drop_untrusted_tuple_markers_at_boot(&self, db: &mongodb::Database) {
-        let recorded = match super::schema::get_search_index_generation(db).await {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                // Read-time checks still refuse the markers until the
-                // generation reads as current.
-                tracing::warn!(%error, "could not read the search_index generation; tuple_code markers kept");
-                return;
-            }
-        };
-        if markers_trusted(recorded) {
-            return;
-        }
-        let deleted = db
-            .collection::<Document>(LAYOUT_COLLECTION)
-            .delete_many(doc! { "layout": LAYOUT_COMPOSITE_TUPLE_CODE })
-            .await;
-        match deleted {
-            Ok(result) if result.deleted_count > 0 => tracing::warn!(
-                recorded_generation = ?recorded,
-                markers = result.deleted_count,
-                "search_index was last recorded below generation {COMPOSITE_TUPLE_GENERATION}, so \
-                 rows without tuple_code may exist: removed the tuple_code markers; token+quantity \
-                 composite searches use pair validation until `$reindex` rebuilds each tenant"
-            ),
-            Ok(_) => {
-                if recorded.is_some() {
-                    tracing::info!(
-                        recorded_generation = ?recorded,
-                        "token+quantity composite searches use pair validation until `$reindex` \
-                         rebuilds each tenant (rows written before generation \
-                         {COMPOSITE_TUPLE_GENERATION} have no tuple_code)"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not remove the tuple_code markers at boot")
-            }
-        }
     }
 
     async fn upsert_layout_marker(
