@@ -116,7 +116,9 @@ const ALWAYS_INDEXED_PARAMS: &[&str] = &[
 /// refused earlier, each with its own message. Every other `_` name is refused
 /// here when registered — an allowlist, so a parameter a later spec revision
 /// adds is refused until a backend learns to evaluate it, instead of being
-/// dropped.
+/// dropped. That includes a tenant's own `SearchParameter` whose code starts
+/// with `_`: it may well be indexed and answer a plain search, but criteria
+/// that guard a write fail closed on any `_` name not listed here.
 const EVALUATED_UNDERSCORE_PARAMS: &[&str] = &[
     "_id",
     "_lastUpdated",
@@ -472,10 +474,9 @@ fn unevaluated_reason(name: &str, param_type: Option<SearchParamType>) -> Option
 
 fn unevaluated_parameter(resource_type: &str, name: &str, why: &str) -> StorageError {
     query_error(format!(
-        "conditional criteria name the search parameter '{name}', which is registered for \
-         {resource_type} but not evaluated by conditional criteria: {why}. Criteria guard a \
-         write, so such a parameter is an error rather than ignored, which would widen the \
-         match to every {resource_type} (Prefer: handling does not apply); nothing was written"
+        "'{name}' is registered for {resource_type} but not evaluated by conditional criteria \
+         ({why}); ignoring it would widen the match to every {resource_type}, so nothing was \
+         written"
     ))
 }
 

@@ -407,3 +407,102 @@ async fn evaluated_underscore_criteria_still_select_the_target() {
         assert!(families(&server).await.is_empty(), "DELETE {criteria}");
     }
 }
+
+/// `_type` on an all-types compartment search picks the member types to
+/// search; it is not passed on to the per-type queries, where SQLite would
+/// refuse it as a parameter it cannot evaluate (#866) and other backends used
+/// to ignore it and answer with every member type.
+#[tokio::test]
+async fn type_narrows_an_all_types_compartment_search() {
+    let server = test_server().await;
+    seed(&server).await;
+    for (resource_type, body) in [
+        (
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": "Patient/only"}
+            }),
+        ),
+        (
+            "Condition",
+            json!({
+                "resourceType": "Condition",
+                "subject": {"reference": "Patient/only"}
+            }),
+        ),
+    ] {
+        server
+            .post(&format!("/{resource_type}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&body)
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    let types_of = |bundle: Value| -> Vec<String> {
+        let mut types: Vec<String> = bundle["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| {
+                        e["resource"]["resourceType"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        types.sort();
+        types.dedup();
+        types
+    };
+
+    for (query, expected) in [
+        ("", vec!["Condition", "Observation"]),
+        ("?_type=Observation", vec!["Observation"]),
+        (
+            "?_type=Observation,Condition",
+            vec!["Condition", "Observation"],
+        ),
+        (
+            "?_type=Observation&_type=Condition",
+            vec!["Condition", "Observation"],
+        ),
+        // A resource type outside the compartment contributes nothing.
+        ("?_type=Organization", vec![]),
+    ] {
+        let response = server
+            .get(&format!("/Patient/only/*{query}"))
+            .add_header(X_TENANT_ID, tenant())
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{query}: {}",
+            response.text()
+        );
+        let bundle: Value = response.json();
+        if !query.is_empty() {
+            assert!(
+                bundle["link"][0]["url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("_type="),
+                "{query}: the self link keeps _type: {bundle}"
+            );
+        }
+        assert_eq!(types_of(bundle), expected, "{query}");
+    }
+
+    // Not a resource type at all is a 400 naming it.
+    let response = server
+        .get("/Patient/only/*?_type=Bogus")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    assert_rejected_naming(&response, "Bogus", "_type=Bogus");
+}
