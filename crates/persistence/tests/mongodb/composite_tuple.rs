@@ -360,8 +360,9 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
     reindex(&backend, &second, ReindexRequest::default()).await;
     assert!(tuple_path_used(&backend, &first).await);
 
-    // The rollback binary boots (records generation 4) and writes h-30 again.
-    set_recorded_generation(&backend, 4).await;
+    // The rollback binary (#2394, generation 5) boots, records its own
+    // generation and writes h-30 again.
+    set_recorded_generation(&backend, 5).await;
     unstamp(&backend, "composite-tuple-rollback-a", Some("h-30")).await;
     unstamp(&backend, "composite-tuple-rollback-b", Some("h-30")).await;
 
@@ -389,7 +390,7 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         .unwrap()
         .get_i32("generation")
         .unwrap();
-    assert_eq!(generation, 5);
+    assert_eq!(generation, 6);
     assert!(!tuple_path_used(&returned, &first).await);
     assert_eq!(
         found(&returned, &first, "8302-2$gt160").await,
@@ -932,4 +933,273 @@ async fn mongodb_tuple_path_answers_like_pair_validation() {
         let query = &queries.iter().find(|(label, _)| label == empty).unwrap().1;
         assert_eq!(answer(&backend, &fast, query).await.2, 0, "{empty}");
     }
+}
+
+/// What a database written by an earlier build looks like when this binary
+/// (search_index generation 6) first boots on it.
+#[derive(Clone, Copy, Debug)]
+enum EarlierBuild {
+    /// #2394 at generation 5: references normalized, no `tuple_code`, and a
+    /// stray tuple marker (as an experimental generation-5 build of cq-p3
+    /// left it) that must not be trusted.
+    ReferencesNormalized,
+    /// Generation 4 with the #2394 backfill not finished: reference rows in
+    /// the pre-#2394 shape, no completion record, neither new index.
+    Generation4MidBackfill,
+}
+
+const PATIENT_ABSOLUTE: &str = "http://example.org/fhir/Patient/p1/_history/2";
+const PATIENT_VERSIONED: &str = "Patient/p1/_history/3";
+
+fn referencing(id: &str, reference: &str, value: f64) -> serde_json::Value {
+    let mut resource = observation(id, "8302-2", value);
+    resource["subject"] = json!({ "reference": reference });
+    resource
+}
+
+async fn recorded_search_indexes(db: &mongodb::Database) -> Document {
+    db.collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap()
+        .get_document("search_indexes")
+        .unwrap()
+        .clone()
+}
+
+async fn subject_reference(db: &mongodb::Database, tenant: &str, id: &str) -> Document {
+    db.collection::<Document>("search_index")
+        .find_one(doc! { "tenant_id": tenant, "resource_id": id, "param_name": "subject" })
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no subject row for {id}"))
+}
+
+async fn assert_references_normalized(db: &mongodb::Database, tenant: &str) {
+    let absolute = subject_reference(db, tenant, "r-abs").await;
+    assert_eq!(
+        absolute.get_str("value_reference"),
+        Ok("http://example.org/fhir/Patient/p1")
+    );
+    assert_eq!(absolute.get_str("value_reference_target"), Ok("Patient/p1"));
+    let versioned = subject_reference(db, tenant, "r-ver").await;
+    assert_eq!(versioned.get_str("value_reference"), Ok("Patient/p1"));
+    assert!(!versioned.contains_key("value_reference_target"));
+}
+
+async fn unstamped_quantity_rows(db: &mongodb::Database, tenant: &str) -> u64 {
+    db.collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant,
+            "param_name": "code-value-quantity",
+            "value_quantity_value": { "$exists": true },
+            "tuple_code": { "$exists": false },
+        })
+        .await
+        .unwrap()
+}
+
+/// `subject=p1` and `Patient?_revinclude=Observation:subject` both reach the
+/// absolute and the versioned reference.
+async fn assert_references_found(backend: &MongoBackend, tenant: &TenantContext) {
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        values: vec![SearchValue::eq("p1")],
+        ..Default::default()
+    });
+    let mut ids: Vec<String> = backend
+        .search(tenant, &query)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_owned())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["r-abs".to_string(), "r-ver".to_string()]);
+
+    let reverse = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let query = SearchQuery::new("Patient").with_include(reverse);
+    let result = backend.search(tenant, &query).await.unwrap();
+    let mut included: Vec<String> = result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "Observation")
+        .map(|r| r.id().to_owned())
+        .collect();
+    included.sort();
+    assert_eq!(included, vec!["r-abs".to_string(), "r-ver".to_string()]);
+}
+
+/// Generation 6 on top of #2394's generation 5: a database an earlier build
+/// left behind boots into generation 6 with no trusted marker, and a full
+/// `$reindex` then marks the tenant, stamps every quantity row and keeps the
+/// references normalized (the backfill and the reindex do not undo each
+/// other); composite, reference and `_revinclude` searches stay correct.
+async fn upgrade_from(earlier: EarlierBuild) {
+    let label = format!("composite_tuple_upgrade_{earlier:?}").to_lowercase();
+    let Some(backend) = create_backend_with_full_registry(&label).await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant_id = "composite-tuple-upgrade";
+    let tenant = create_tenant(tenant_id);
+    let (mut tall, _) = seed(&backend, &tenant).await;
+    backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "p1" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for (id, reference, value) in [
+        ("r-abs", PATIENT_ABSOLUTE, 170.0),
+        ("r-ver", PATIENT_VERSIONED, 100.0),
+    ] {
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                referencing(id, reference, value),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    tall.push("r-abs".to_string());
+    let tall = sorted(tall);
+    let config = backend.config().clone();
+    let db = raw_db(&backend).await;
+    drop(backend);
+
+    // Put the database in the earlier build's state.
+    unstamp_all(&db, tenant_id).await;
+    let rows = db.collection::<Document>("search_index");
+    rows.drop_index(COMPOSITE_TUPLE_INDEX).await.unwrap();
+    let schema = db.collection::<Document>("schema_version");
+    match earlier {
+        EarlierBuild::ReferencesNormalized => {
+            schema
+                .update_one(
+                    doc! { "_id": "schema_version" },
+                    doc! { "$set": {
+                        "search_indexes.generation": 5,
+                        "search_indexes.references_normalized": true,
+                    } },
+                )
+                .await
+                .unwrap();
+            db.collection::<Document>(LAYOUT)
+                .insert_one(doc! {
+                    "_id": format!("{tenant_id}|composite_tuple_code_v2"),
+                    "tenant_id": tenant_id,
+                    "resource_type": Bson::Null,
+                    "layout": "composite_tuple_code_v2",
+                })
+                .await
+                .unwrap();
+            assert_references_normalized(&db, tenant_id).await;
+        }
+        EarlierBuild::Generation4MidBackfill => {
+            rows.drop_index("idx_search_reference_target_v2")
+                .await
+                .unwrap();
+            for (id, old) in [("r-abs", PATIENT_ABSOLUTE), ("r-ver", PATIENT_VERSIONED)] {
+                rows.update_one(
+                    doc! { "tenant_id": tenant_id, "resource_id": id, "param_name": "subject" },
+                    doc! {
+                        "$set": { "value_reference": old },
+                        "$unset": { "value_reference_target": "" },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            schema
+                .update_one(
+                    doc! { "_id": "schema_version" },
+                    doc! {
+                        "$set": { "search_indexes.generation": 4 },
+                        "$unset": { "search_indexes.references_normalized": "" },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // This binary boots on it.
+    let booted = Arc::new(build_backend(config).await.expect("upgrade boot"));
+    booted.wait_for_search_index_build().await;
+    let record = recorded_search_indexes(&db).await;
+    assert_eq!(record.get_i32("generation"), Ok(6), "{earlier:?}: {record}");
+    assert_eq!(
+        record.get_bool("references_normalized"),
+        Ok(true),
+        "{earlier:?}"
+    );
+    assert_eq!(markers(&booted).await, Vec::<String>::new(), "{earlier:?}");
+    assert!(
+        search_index_names(&db)
+            .await
+            .contains(&COMPOSITE_TUPLE_INDEX.to_string())
+    );
+    assert_references_normalized(&db, tenant_id).await;
+    assert!(unstamped_quantity_rows(&db, tenant_id).await > 0);
+    assert!(!tuple_path_used(&booted, &tenant).await, "{earlier:?}");
+    assert_eq!(found(&booted, &tenant, "8302-2$gt160").await, tall);
+    assert_references_found(&booted, &tenant).await;
+
+    // The activating `$reindex`.
+    reindex(&booted, &tenant, ReindexRequest::default()).await;
+    assert_eq!(
+        markers(&booted).await,
+        vec![format!("{tenant_id}|composite_tuple_code_v2")],
+        "{earlier:?}"
+    );
+    assert_eq!(unstamped_quantity_rows(&db, tenant_id).await, 0);
+    assert_references_normalized(&db, tenant_id).await;
+    assert_eq!(
+        recorded_search_indexes(&db)
+            .await
+            .get_bool("references_normalized"),
+        Ok(true)
+    );
+    assert!(tuple_path_used(&booted, &tenant).await, "{earlier:?}");
+    assert_eq!(found(&booted, &tenant, "8302-2$gt160").await, tall);
+    assert_references_found(&booted, &tenant).await;
+    db.drop().await.unwrap();
+}
+
+async fn unstamp_all(db: &mongodb::Database, tenant: &str) {
+    db.collection::<Document>("search_index")
+        .update_many(
+            doc! { "tenant_id": tenant },
+            doc! { "$unset": { "tuple_code": "" } },
+        )
+        .await
+        .unwrap();
+}
+
+const COMPOSITE_TUPLE_INDEX: &str = "idx_search_composite_tuple_qty";
+
+#[tokio::test]
+async fn mongodb_generation_6_over_a_generation_5_database_with_normalized_references() {
+    upgrade_from(EarlierBuild::ReferencesNormalized).await;
+}
+
+#[tokio::test]
+async fn mongodb_generation_6_over_a_generation_4_database_mid_reference_backfill() {
+    upgrade_from(EarlierBuild::Generation4MidBackfill).await;
 }
