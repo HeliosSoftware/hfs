@@ -4501,11 +4501,13 @@ async fn run_reindex(
     let type_scoped = request.resource_types.is_some();
     // Whether the run rebuilds every resource of its types (see
     // `ReindexTarget::reindex_run_completed`). `bulkIndexRebuild` and
-    // `clearExisting` rebuild every resource like any other run.
+    // `clearExisting` rebuild every resource like any other run. A run scoped
+    // by `updatedSince` rebuilds only its window, not the whole type.
     let rebuilds_whole_types = request.search_param_urls.is_none()
         && request.resource_ids.is_none()
         && request.id_start.is_none()
         && request.id_end.is_none()
+        && request.updated_since.is_none()
         && !request.clear_only
         && !request.metadata_only;
     let resource_types = match (&named_resources, request.resource_types.clone()) {
@@ -11743,6 +11745,13 @@ mod tests {
         assert_eq!(progress.updated_since, Some(at(7).to_rfc3339()));
         assert_eq!(*target.written.lock(), ["p7", "p8", "p9"]);
         assert_eq!(*source.floors.lock(), [at(7)]);
+        // The window is not the type: resources older than the floor were not
+        // rebuilt, so the run must not report whole-type coverage.
+        assert!(
+            target.completed.lock().is_empty(),
+            "a time-scoped run reported coverage: {:?}",
+            target.completed.lock()
+        );
     }
 
     #[tokio::test]
