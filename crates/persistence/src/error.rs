@@ -576,6 +576,33 @@ pub enum TransactionError {
         message: String,
     },
 
+    /// A conditional entry's resolved identity is also addressed by another
+    /// entry, so the whole bundle fails (R4 §3.1.0.11.2, #859).
+    ///
+    /// A variant of its own, not a [`BundleError`](Self::BundleError) with the
+    /// text written out, because it names *two* entries and a caller that
+    /// hands the executor a reordered list (the REST layer sorts a transaction
+    /// by method) has to translate both back to the client's Bundle positions
+    /// before they are shown (#922). `index` and `other` are positions in the
+    /// ordered list the executor received, as every index on this type is.
+    #[error(
+        "bundle processing error at entry {index}: {}",
+        Self::identity_overlap_description(entry, identity, *other, other_entry)
+    )]
+    OverlappingIdentity {
+        /// Zero-based index of the conditional entry whose resolved identity
+        /// is also addressed by `other`.
+        index: usize,
+        /// The conditional entry as `METHOD url`.
+        entry: String,
+        /// The `Type/id` the conditional entry resolved to.
+        identity: String,
+        /// Zero-based index of the other entry that addresses `identity`.
+        other: usize,
+        /// The other entry as `METHOD url`.
+        other_entry: String,
+    },
+
     /// A PATCH entry rejected a candidate and the whole bundle rolled back.
     /// Preserve the entry's status and full OperationOutcome for the REST layer.
     #[error("PATCH entry {index} failed with status {status}")]
@@ -632,6 +659,26 @@ pub enum TransactionError {
         /// Backend identifier (e.g., `s3`).
         backend_name: String,
     },
+}
+
+impl TransactionError {
+    /// The failure text of a [`TransactionError::OverlappingIdentity`].
+    ///
+    /// `other` is whichever index the caller means to show: a position in the
+    /// executor's list here, the client's Bundle index once the REST layer has
+    /// translated it. One definition, so the two cannot word it differently.
+    pub fn identity_overlap_description(
+        entry: &str,
+        identity: &str,
+        other: usize,
+        other_entry: &str,
+    ) -> String {
+        format!(
+            "{entry} resolves to {identity}, which entry {other} ({other_entry}) also \
+             addresses; a transaction whose resolved identities overlap fails as a whole \
+             (R4 §3.1.0.11.2)"
+        )
+    }
 }
 
 /// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).

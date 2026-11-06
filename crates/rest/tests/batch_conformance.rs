@@ -2155,6 +2155,83 @@ mod conditional_entries {
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
     }
 
+    /// The text of the first issue of a failed bundle's OperationOutcome.
+    fn outcome_text(body: &Value) -> &str {
+        body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("outcome text: {body}"))
+    }
+
+    /// #922: the overlap message names both entries by the client's Bundle
+    /// index. `DELETE` sorts before `PUT` in the server's processing order, so
+    /// the `DELETE` the client sent second is the first entry the executor sees
+    /// and the conditional `PUT` the client sent first is its second; the two
+    /// orders disagree about both entries.
+    #[tokio::test]
+    async fn the_overlap_message_names_the_clients_entry_indices() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![
+                put_entry(CRITERIA_URL, "ByCriteria"),
+                delete_entry("Patient/p1"),
+            ]),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        let text = outcome_text(&body);
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT "),
+            "the failing entry is the client's entry 0: {text}"
+        );
+        assert!(
+            text.contains("which entry 1 (DELETE Patient/p1) also addresses"),
+            "the entry it collides with is the client's entry 1: {text}"
+        );
+        assert_eq!(
+            family_of(&backend, "p1").await,
+            "Nguyen",
+            "neither write may land"
+        );
+    }
+
+    /// #922: the same, for two conditional entries that resolve to one
+    /// resource — the client sent the `PUT` first and the `DELETE` second, and
+    /// the executor sees them the other way round.
+    #[tokio::test]
+    async fn the_overlap_message_between_two_conditional_entries_names_the_clients_indices() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![
+                put_entry(CRITERIA_URL, "Again"),
+                delete_entry(CRITERIA_URL),
+            ]),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        let text = outcome_text(&body);
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT "),
+            "the failing entry is the client's entry 0: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "which entry 1 (DELETE {CRITERIA_URL}) also addresses"
+            )),
+            "the entry it collides with is the client's entry 1: {text}"
+        );
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
     /// A conditional PUT that matched is resolved before anything executes,
     /// so a `urn:uuid` reference to it resolves from any entry.
     #[tokio::test]
@@ -2382,6 +2459,43 @@ mod conditional_entries {
             before,
             "sibling POST rolled back"
         );
+        assert_eq!(family_of(&backend, "p1").await, "Nguyen");
+    }
+
+    /// #922: the `412` for an unsatisfied `ifMatch` names the client's entry,
+    /// not the entry's place in the server's processing order. `DELETE` sorts
+    /// before `POST` and `PUT`, so each case puts the guarded entry where the
+    /// two orders disagree about it.
+    #[tokio::test]
+    async fn a_stale_if_match_names_the_clients_entry_index() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+
+        let mut guarded_delete = delete_entry(CRITERIA_URL);
+        guarded_delete["request"]["ifMatch"] = json!("W/\"999\"");
+        let mut guarded_put = put_entry(CRITERIA_URL, "Guarded");
+        guarded_put["request"]["ifMatch"] = json!("W/\"999\"");
+
+        let cases = [
+            // The guarded DELETE is the client's entry 1 and the executor's
+            // entry 0.
+            (vec![sibling_post(), guarded_delete], 1),
+            // The guarded PUT is the client's entry 0 and the executor's
+            // entry 1.
+            (vec![guarded_put, delete_entry("Patient/other")], 0),
+        ];
+        for (entries, client_index) in cases {
+            let response = post_bundle(&server, transaction(entries)).await;
+
+            response.assert_status(StatusCode::PRECONDITION_FAILED);
+            let body: Value = response.json();
+            assert_eq!(body["issue"][0]["code"], "conflict", "{body}");
+            assert!(
+                outcome_text(&body)
+                    .starts_with(&format!("Transaction failed at entry {client_index}: ")),
+                "the guarded entry is the client's entry {client_index}: {body}"
+            );
+        }
         assert_eq!(family_of(&backend, "p1").await, "Nguyen");
     }
 
