@@ -1,4 +1,4 @@
-//! Reindex retries a transiently failed page from its delete and keeps the
+//! Reindex retries a transiently failed page from its row snapshot and keeps the
 //! failure retryable once the attempts run out; it never resends an insert batch.
 //! Failpoints share the suite's server-global lock, but match only this test's
 //! unique client application name and collection namespace.
@@ -432,7 +432,7 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
 }
 
 /// One transient failure of `command` on `collection` (`times: 1`): the page
-/// runs again from its delete, ends indexed, and holds exactly the rows a
+/// runs again from its snapshot, ends indexed, and holds exactly the rows a
 /// clean page holds, with no duplicate left by the failed run (#2290).
 async fn transient_page_failure_is_retried(
     overlap: bool,
@@ -547,10 +547,9 @@ async fn mongodb_integration_reindex_overlapped_insert_failure_is_retried_into_a
     transient_page_failure_is_retried(true, "insert", "search_index_contained", false).await;
 }
 
-/// Rows that appear after the page's delete and before its inserts are what
-/// a delete cut short by a chunk migration leaves behind. The page's
-/// verification finds them, removes them, counts them, and every resource
-/// still succeeds.
+/// Old rows that survive the page's delete are what a delete cut short by a
+/// chunk migration leaves behind. The page's verification finds them, removes
+/// them, counts them, and every resource still succeeds.
 async fn stale_rows_are_cleaned_up(overlap: bool) {
     let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
         skip_or_fail_unavailable("reindex stale-row fixture requires MongoDB");
@@ -566,8 +565,9 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
         // restore.
         let baseline_own = count("search_index", scope.clone()).await;
         let baseline_contained = count("search_index_contained", scope.clone()).await;
-        // Copies of three resources' rows, without their `_id`s, to plant as
-        // the old generation once the page's delete has run.
+        // Copies of three resources' rows, `_id`s included, to plant once the
+        // page's delete of the old rows has run: the same rows come back, as
+        // if the delete had skipped them.
         let planted_ids: Vec<&str> = page[..3].iter().map(|resource| resource.id()).collect();
         let mut planted_scope = scope.clone();
         planted_scope.insert("resource_id", doc! { "$in": &planted_ids });
@@ -580,65 +580,36 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
                 .unwrap()
                 .try_collect::<Vec<Document>>()
                 .await
-                .unwrap()
-                .into_iter()
-                .map(|mut row| {
-                    row.remove("_id");
-                    row
-                })
-                .collect();
+                .unwrap();
             assert!(!rows.is_empty(), "{collection} must hold rows to duplicate");
             copies.push((collection, rows));
         }
         let planted: u64 = copies.iter().map(|(_, rows)| rows.len() as u64).sum();
 
-        // Hold the post-delete snapshot before it executes, so the planted
-        // leftovers are observed before this page starts inserting rows.
-        let Some(failpoint) = FailPoint::enable(
-            backend.config().app_name_or_default(),
-            doc! {
-                "failCommands": ["find"],
-                "namespace": format!("{}.search_index", db.name()),
-                "blockConnection": true,
-                "blockTimeMS": 4000,
-            },
-            doc! { "times": 1 },
-        )
-        .await
-        else {
-            skip_or_fail_unavailable("reindex stale-row test requires enableTestCommands=1");
-            return;
-        };
-        let mut stats = ReindexPageStats::default();
-        let write = backend.write_search_entries_page_timed(&tenant, &page, &mut stats);
+        // Verification starts by reading the resources' versions, after the
+        // page's inserts and its delete of the old rows. Hold that read before
+        // it executes, so the planted survivors are there for verification to
+        // find.
         let plant = async {
-            failpoint.wait_until_entered(1).await;
-            // The page deletes `search_index` and then `search_index_contained`;
-            // both must be empty for the planted resources before the plant.
-            let deleted = || async {
-                count("search_index", planted_scope.clone()).await == 0
-                    && count("search_index_contained", planted_scope.clone()).await == 0
-            };
-            for _ in 0..200 {
-                if deleted().await {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(
-                deleted().await,
-                "the page's deletes must have run before the plant"
-            );
             for (collection, rows) in copies {
+                let present = count(collection, planted_scope.clone()).await;
+                assert_eq!(
+                    present,
+                    rows.len() as u64,
+                    "the page's delete removed only the old rows, so only the new ones are in {collection}"
+                );
                 db.collection::<Document>(collection)
                     .insert_many(rows)
                     .await
                     .unwrap();
             }
         };
-        let (outcomes, ()) = tokio::join!(write, plant);
-        let hits = failpoint.off_and_count().await;
-        assert_eq!(hits, 1, "the post-delete snapshot was held once");
+        let Some((outcomes, stats, ())) =
+            page_with_held_command_observing(&backend, &tenant, &page, &db, "resources", plant)
+                .await
+        else {
+            return;
+        };
         assert_eq!(outcomes.len(), page.len());
         assert!(
             outcomes.iter().all(|outcome| matches!(outcome, Ok(n) if *n > 0)),
@@ -692,7 +663,7 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         return;
     };
     let checked = AssertUnwindSafe(async {
-        // The page's first find on search_index is the post-delete snapshot;
+        // The page's first find on search_index is its pre-insert row snapshot;
         // skipping it fails the next one, the post-insert ID read.
         let Some(failpoint) = FailPoint::enable(
             backend.config().app_name_or_default(),
@@ -734,8 +705,9 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
 
 /// Runs a page write while one server command is held, and runs `during`
 /// once the page has reached that command. The hold lets a concurrent writer
-/// act at a chosen point of the page: before the post-delete snapshot (`find`),
-/// before its inserts (`insert`), or before verification versions (`resources`).
+/// act at a chosen point of the page: at its row snapshot (`find`), before its
+/// inserts (`insert`), before its old rows are deleted (`delete`), or before
+/// verification versions (`resources`).
 async fn page_with_held_command(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -744,6 +716,21 @@ async fn page_with_held_command(
     command: &str,
     during: impl std::future::Future<Output = ()>,
 ) -> Option<(Vec<StorageResult<usize>>, ReindexPageStats)> {
+    let (outcomes, stats, ()) =
+        page_with_held_command_observing(backend, tenant, page, db, command, during).await?;
+    Some((outcomes, stats))
+}
+
+/// [`page_with_held_command`], returning what `during` observed while the
+/// page was held.
+async fn page_with_held_command_observing<T>(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    page: &[StoredResource],
+    db: &mongodb::Database,
+    command: &str,
+    during: impl std::future::Future<Output = T>,
+) -> Option<(Vec<StorageResult<usize>>, ReindexPageStats, T)> {
     let (command, collection) = if command == "resources" {
         ("find", "resources")
     } else {
@@ -768,15 +755,15 @@ async fn page_with_held_command(
     let write = backend.write_search_entries_page_timed(tenant, page, &mut stats);
     let act = async {
         failpoint.wait_until_entered(1).await;
-        during.await;
+        during.await
     };
-    let (outcomes, ()) = tokio::join!(write, act);
+    let (outcomes, observed) = tokio::join!(write, act);
     assert_eq!(
         failpoint.off_and_count().await,
         1,
         "the command was held once"
     );
-    Some((outcomes, stats))
+    Some((outcomes, stats, observed))
 }
 
 fn observation(id: &str, status: &str, with_code: bool) -> serde_json::Value {
@@ -832,11 +819,11 @@ async fn rows_in(
         .unwrap()
 }
 
-/// An update that commits between the page's delete and its insert writes the
+/// An update that commits between the page's snapshot and its insert writes the
 /// newer version's rows first; the page's rows for that resource are the
 /// older generation and go, the newer rows stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mongodb_integration_reindex_update_between_delete_and_insert_keeps_the_newer_version() {
+async fn mongodb_integration_reindex_update_between_snapshot_and_insert_keeps_the_newer_version() {
     let Some((backend, tenant, page, db)) = failure_fixture(false, false).await else {
         skip_or_fail_unavailable("reindex concurrency fixture requires MongoDB");
         return;
@@ -1024,8 +1011,8 @@ async fn mongodb_integration_reindex_offsetting_rows_do_not_hide_unknown_ones() 
 }
 
 /// One resource's insert failure does not waive verification of its siblings:
-/// the failed resource keeps its insert error, a sibling with planted old rows
-/// is cleaned and succeeds.
+/// the failed resource keeps its insert error, a sibling whose old rows
+/// survive the delete is cleaned and succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification() {
     let Some((backend, tenant, page, db)) = failure_fixture(false, false).await else {
@@ -1035,6 +1022,8 @@ async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification()
     let checked = AssertUnwindSafe(async {
         let (failing, sibling) = (page[0].id().to_owned(), page[1].id().to_owned());
         let sibling_rows = rows_of(&db, &tenant, &sibling).await;
+        // The sibling's old rows, `_id`s included: planted again once the
+        // page has deleted them, they are old rows that survived the delete.
         let copies: Vec<Document> = db
             .collection::<Document>("search_index")
             .find(doc! { "tenant_id": tenant.tenant_id().as_str(), "resource_id": &sibling })
@@ -1042,13 +1031,7 @@ async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification()
             .unwrap()
             .try_collect::<Vec<Document>>()
             .await
-            .unwrap()
-            .into_iter()
-            .map(|mut row| {
-                row.remove("_id");
-                row
-            })
-            .collect();
+            .unwrap();
         db.run_command(doc! {
             "collMod": "search_index",
             "validator": {"resource_id": {"$ne": &failing}},
@@ -1062,7 +1045,8 @@ async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification()
                 .await
                 .unwrap();
         };
-        let result = page_with_held_command(&backend, &tenant, &page, &db, "find", plant).await;
+        let result =
+            page_with_held_command(&backend, &tenant, &page, &db, "resources", plant).await;
         db.run_command(doc! {"collMod": "search_index", "validator": {}})
             .await
             .unwrap();
@@ -1107,29 +1091,26 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
             "resource_id": &target,
         };
         let search_index = db.collection::<Document>("search_index");
+        // The resource's old rows, `_id`s included: planted again once the
+        // page has deleted them, they are old rows that survived the delete.
         let copies: Vec<Document> = search_index
             .find(scope.clone())
             .await
             .unwrap()
             .try_collect::<Vec<Document>>()
             .await
-            .unwrap()
-            .into_iter()
-            .map(|mut row| {
-                row.remove("_id");
-                row
-            })
-            .collect();
+            .unwrap();
         let planted = copies.len() as u64;
         // The update comes from another instance so the hold below never
         // applies to its own writes.
         let mut other_config = backend.config().clone();
         other_config.app_name = Some(format!("reindex-other-{}", uuid::Uuid::new_v4().simple()));
         let other = build_backend(other_config).await.unwrap();
-        // One hold per matching command on search_index after the page's own
-        // delete: the post-delete snapshot (1), the post-insert ID read (2),
-        // the cleanup delete (3), the cleanup's re-read (4) and the re-read
-        // after the version check explains the mismatch (5).
+        // One hold per matching command on search_index after the page's
+        // snapshot (a find) and its delete of the old rows, which pass: the
+        // post-insert ID read (1), the cleanup delete (2), the cleanup's
+        // re-read (3) and the re-read after the version check explains the
+        // mismatch (4).
         let Some(failpoint) = FailPoint::enable(
             backend.config().app_name_or_default(),
             doc! {
@@ -1138,7 +1119,7 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
                 "blockConnection": true,
                 "blockTimeMS": 1500,
             },
-            doc! { "skip": 1 },
+            doc! { "skip": 2 },
         )
         .await
         else {
@@ -1150,7 +1131,7 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
         let act = async {
             failpoint.wait_until_entered(1).await;
             search_index.insert_many(copies).await.unwrap();
-            failpoint.wait_until_entered(3).await;
+            failpoint.wait_until_entered(2).await;
             // A real foreground update, including resource/history, own rows
             // and contained rows, while cleanup's exact-ID delete waits.
             other
@@ -1167,8 +1148,8 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
         let (outcomes, ()) = tokio::join!(write, act);
         assert_eq!(
             failpoint.off_and_count().await,
-            5,
-            "the snapshot, the ID read, the cleanup delete, its re-read and the re-read after the version check were held"
+            4,
+            "the ID read, the cleanup delete, its re-read and the re-read after the version check were held"
         );
         assert!(
             outcomes.iter().all(|outcome| outcome.is_ok()),
@@ -1204,7 +1185,7 @@ async fn mongodb_integration_reindex_same_version_writer_rows_are_preserved() {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(String, Vec<Bson>)>::new()));
         let recorded = foreign_ids.clone();
         let during = async {
-            // First page's initial deletes and empty snapshot have completed.
+            // First page's old-row snapshot has completed (it saw no rows).
             // The other instance finishes its own page before the first inserts.
             let outcomes = other.write_search_entries_page(&tenant, &page[..1]).await;
             assert!(
@@ -1372,8 +1353,8 @@ async fn mongodb_integration_reindex_resource_without_version_keeps_the_page_row
 
 /// A failing cleanup delete is a page failure with the transient
 /// classification. The resource was updated before the page ran, so the
-/// cleanup has the page's own rows to remove; the page's initial delete is
-/// skipped and the cleanup delete fails.
+/// cleanup has the page's own rows to remove; the page's delete of the old rows
+/// is skipped and the cleanup delete fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
     let Some((backend, tenant, page, db)) = failure_fixture(false, false).await else {
@@ -1423,25 +1404,27 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-async fn update_at_version_observation_boundary(before_snapshot: bool) {
+async fn update_at_version_observation_boundary(after_snapshot: bool) {
     let Some((backend, tenant, page, db)) = failure_fixture(false, false).await else {
         skip_or_fail_unavailable("reindex observation boundary fixture requires MongoDB");
         return;
     };
     let checked = AssertUnwindSafe(async {
         let target = page[0].id();
-        // Before snapshot: the newer writer's IDs enter the old-ID snapshot.
+        // After snapshot: the page's old-row snapshot is taken and its inserts
+        // have not started, so the newer writer's IDs are outside the snapshot
+        // and the delete of the old rows cannot reach them.
         // Before resource read: snapshot and all page writes are complete, but
         // the resource version has not yet been observed by verification.
-        let collection = if before_snapshot {
-            "search_index"
+        let (command, collection) = if after_snapshot {
+            ("insert", "search_index")
         } else {
-            "resources"
+            ("find", "resources")
         };
         let Some(failpoint) = FailPoint::enable(
             backend.config().app_name_or_default(),
             doc! {
-                "failCommands": ["find"],
+                "failCommands": [command],
                 "namespace": format!("{}.{}", db.name(), collection),
                 "blockConnection": true, "blockTimeMS": 4000,
             },
@@ -1629,7 +1612,7 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
         let mut survivor = rows.find_one(scope.clone()).await.unwrap().unwrap();
         let survivor_id = Bson::ObjectId(mongodb::bson::oid::ObjectId::new());
         survivor.insert("_id", survivor_id.clone());
-        // Old snapshot, final ID verification, then the three cleanup rereads.
+        // Old-row snapshot, final ID verification, then the three cleanup rereads.
         let Some(failpoint) = FailPoint::enable(
             backend.config().app_name_or_default(),
             doc! {
@@ -1647,9 +1630,21 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
         let mut stats = ReindexPageStats::default();
         let write = backend.write_search_entries_page_timed(&tenant, &page, &mut stats);
         let act = async {
+            // Planted before the old-row snapshot executes, so that its id is
+            // one of the old rows the page deletes.
             failpoint.wait_until_entered(1).await;
             rows.insert_one(survivor.clone()).await.unwrap();
+            // The page's delete of the old rows has run: the survivor is gone
+            // with the rest, and comes back before verification reads it.
             failpoint.wait_until_entered(2).await;
+            assert_eq!(
+                rows.count_documents(doc! { "_id": &survivor_id })
+                    .await
+                    .unwrap(),
+                0,
+                "the delete of the old rows removes a row that was there at the snapshot"
+            );
+            rows.insert_one(survivor.clone()).await.unwrap();
             for read in 3..=5 {
                 failpoint.wait_until_entered(read).await;
                 assert_eq!(
@@ -1817,4 +1812,335 @@ async fn mongodb_integration_reindex_deleted_resource_cleanup_exhaustion_require
     for collection in ["search_index", "search_index_contained"] {
         changed_resource_cleanup_exhaustion_is_retryable(true, collection).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// #2424: a page's resources keep their search rows while the page is rewritten
+// ---------------------------------------------------------------------------
+//
+// A page write used to delete the page's rows and then insert the new ones, as
+// two commands with nothing between them to keep either. A search in that gap,
+// or a crash, a dropped future or a failed command, found the page's resources
+// with no rows at all, and nothing recorded it. The page now snapshots the ids
+// of the rows it will replace, inserts the new rows, and only then deletes
+// exactly those ids, so every resource has a complete set of rows (the old
+// one, the new one, or both) at every instant. The cases hold or fail the
+// command that used to open the gap and look at the rows and at what a search
+// returns.
+
+type RowsByResource = std::collections::BTreeMap<String, i64>;
+
+/// What a search over the fixture's Observations returns.
+#[derive(Debug, PartialEq, Eq)]
+struct SearchView {
+    /// Ids of `status=final`, sorted.
+    ids: Vec<String>,
+    /// The accurate total of that search.
+    total: Option<u64>,
+    /// First 15 ids of `status=final` sorted by `code`, in result order.
+    sorted_first_page: Vec<String>,
+}
+
+async fn search_view(backend: &MongoBackend, tenant: &TenantContext) -> SearchView {
+    let final_status = || SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("final")],
+        chain: vec![],
+        components: vec![],
+    };
+    let mut everything = SearchQuery::new("Observation")
+        .with_parameter(final_status())
+        .with_count(100);
+    everything.total = Some(TotalMode::Accurate);
+    let found = backend.search(tenant, &everything).await.unwrap();
+    let mut ids: Vec<String> = found
+        .resources
+        .items
+        .iter()
+        .map(|resource| resource.id().to_string())
+        .collect();
+    ids.sort();
+    let sorted = SearchQuery::new("Observation")
+        .with_parameter(final_status())
+        .with_sort(SortDirective {
+            parameter: "code".to_string(),
+            direction: helios_persistence::types::SortDirection::Ascending,
+            param_type: Some(SearchParamType::Token),
+        })
+        .with_count(15);
+    let sorted_first_page = backend
+        .search(tenant, &sorted)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|resource| resource.id().to_string())
+        .collect();
+    SearchView {
+        ids,
+        total: found.total,
+        sorted_first_page,
+    }
+}
+
+/// Rows per resource id of `collection` for the tenant's Observations.
+async fn rows_by_resource(
+    db: &mongodb::Database,
+    collection: &str,
+    tenant: &TenantContext,
+) -> RowsByResource {
+    db.collection::<Document>(collection)
+        .aggregate(vec![
+            doc! { "$match": {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+            } },
+            doc! { "$group": { "_id": "$resource_id", "rows": { "$sum": 1 } } },
+        ])
+        .await
+        .unwrap()
+        .try_collect::<Vec<Document>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let rows = match row.get("rows") {
+                Some(Bson::Int32(n)) => i64::from(*n),
+                Some(Bson::Int64(n)) => *n,
+                other => panic!("unexpected row count {other:?}"),
+            };
+            (row.get_str("_id").unwrap().to_owned(), rows)
+        })
+        .collect()
+}
+
+/// Both collections' rows per resource.
+async fn rows_in_both(
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+) -> (RowsByResource, RowsByResource) {
+    (
+        rows_by_resource(db, "search_index", tenant).await,
+        rows_by_resource(db, "search_index_contained", tenant).await,
+    )
+}
+
+/// Every resource holds `factor` times the rows of `baseline`, in both
+/// collections, and no other resource holds any.
+fn assert_rows_are(
+    context: &str,
+    now: &(RowsByResource, RowsByResource),
+    baseline: &(RowsByResource, RowsByResource),
+    factor: i64,
+) {
+    for (name, now, base) in [
+        ("search_index", &now.0, &baseline.0),
+        ("search_index_contained", &now.1, &baseline.1),
+    ] {
+        let expected: RowsByResource = base
+            .iter()
+            .map(|(id, rows)| (id.clone(), rows * factor))
+            .collect();
+        assert_eq!(*now, expected, "{context}: {name} rows per resource");
+    }
+}
+
+/// Between the page's snapshot and its first insert the old rows are all still
+/// there and a search finds every resource. This is the state a crash, a drop
+/// or a search at that instant meets, and what the delete-first order left
+/// empty.
+async fn page_stays_searchable_until_its_inserts_land(overlap: bool) {
+    let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
+        skip_or_fail_unavailable("reindex searchability fixture requires MongoDB");
+        return;
+    };
+    let checked = AssertUnwindSafe(async {
+        let baseline = rows_in_both(&db, &tenant).await;
+        assert_eq!(baseline.0.len(), page.len(), "{:?}", baseline.0);
+        let before = search_view(&backend, &tenant).await;
+        assert_eq!(before.ids.len(), page.len(), "{before:?}");
+
+        let observe = async {
+            (
+                rows_in_both(&db, &tenant).await,
+                search_view(&backend, &tenant).await,
+            )
+        };
+        let Some((outcomes, stats, (held_rows, held_search))) =
+            page_with_held_command_observing(&backend, &tenant, &page, &db, "insert", observe)
+                .await
+        else {
+            return;
+        };
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_ok()),
+            "{outcomes:?}"
+        );
+        assert_rows_are("while the first insert is held", &held_rows, &baseline, 1);
+        assert_eq!(
+            held_search, before,
+            "a search while the page's first insert is held must see every resource"
+        );
+        // Afterwards the page holds one generation, the new one.
+        assert_rows_are(
+            "after the page",
+            &rows_in_both(&db, &tenant).await,
+            &baseline,
+            1,
+        );
+        assert_eq!(search_view(&backend, &tenant).await, before);
+        if overlap {
+            assert!(stats.sub_batches > 1, "{stats:?}");
+        }
+    })
+    .catch_unwind()
+    .await;
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_page_stays_searchable_until_its_inserts_land() {
+    page_stays_searchable_until_its_inserts_land(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_page_stays_searchable_until_its_inserts_land() {
+    page_stays_searchable_until_its_inserts_land(true).await;
+}
+
+/// With the new rows in and the old rows not yet deleted, a resource has both
+/// generations. Searches must not tell: they group by resource id.
+async fn both_generations_search_like_one(overlap: bool) {
+    let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
+        skip_or_fail_unavailable("reindex duplicate-window fixture requires MongoDB");
+        return;
+    };
+    let checked = AssertUnwindSafe(async {
+        let baseline = rows_in_both(&db, &tenant).await;
+        let before = search_view(&backend, &tenant).await;
+        let observe = async {
+            (
+                rows_in_both(&db, &tenant).await,
+                search_view(&backend, &tenant).await,
+            )
+        };
+        let Some((outcomes, _, (held_rows, held_search))) =
+            page_with_held_command_observing(&backend, &tenant, &page, &db, "delete", observe)
+                .await
+        else {
+            return;
+        };
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_ok()),
+            "{outcomes:?}"
+        );
+        assert_rows_are(
+            "while the old rows' delete is held",
+            &held_rows,
+            &baseline,
+            2,
+        );
+        assert_eq!(
+            held_search, before,
+            "two generations of rows must search like one"
+        );
+        assert_rows_are(
+            "after the page",
+            &rows_in_both(&db, &tenant).await,
+            &baseline,
+            1,
+        );
+        assert_eq!(search_view(&backend, &tenant).await, before);
+    })
+    .catch_unwind()
+    .await;
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_two_generations_of_rows_search_like_one() {
+    both_generations_search_like_one(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_two_generations_of_rows_search_like_one() {
+    both_generations_search_like_one(true).await;
+}
+
+/// A page write that stops after its inserts and before its delete (a crash,
+/// a dropped future, a command error that is not retried) leaves both
+/// generations: searchable, and removed by the next write of the page. Stands
+/// in for the stop with a delete that fails without a retry.
+async fn interrupted_page_leaves_rows_the_next_write_replaces(overlap: bool) {
+    let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
+        skip_or_fail_unavailable("reindex interrupted-page fixture requires MongoDB");
+        return;
+    };
+    let checked = AssertUnwindSafe(async {
+        let baseline = rows_in_both(&db, &tenant).await;
+        let before = search_view(&backend, &tenant).await;
+
+        let data = doc! {
+            "failCommands": ["delete"],
+            "namespace": format!("{}.search_index", db.name()),
+            // A permanent command error: the page is not run again.
+            "errorCode": 2,
+        };
+        let Some((outcomes, _, hits)) = write_with_failpoint(&backend, &tenant, &page, data).await
+        else {
+            return;
+        };
+        assert_eq!(hits, 1, "a permanent failure ends the page at once");
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_err()),
+            "{outcomes:?}"
+        );
+        assert_rows_are(
+            "after the interrupted page",
+            &rows_in_both(&db, &tenant).await,
+            &baseline,
+            2,
+        );
+        assert_eq!(
+            search_view(&backend, &tenant).await,
+            before,
+            "an interrupted page must leave every resource searchable"
+        );
+
+        let mut stats = ReindexPageStats::default();
+        let rewritten = backend
+            .write_search_entries_page_timed(&tenant, &page, &mut stats)
+            .await;
+        assert!(
+            rewritten
+                .iter()
+                .all(|outcome| matches!(outcome, Ok(n) if *n > 0)),
+            "{rewritten:?}"
+        );
+        assert_rows_are(
+            "after the next write of the page",
+            &rows_in_both(&db, &tenant).await,
+            &baseline,
+            1,
+        );
+        assert_eq!(search_view(&backend, &tenant).await, before);
+        assert_eq!(stats.stale_rows_remaining, 0, "{stats:?}");
+    })
+    .catch_unwind()
+    .await;
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_interrupted_page_leaves_rows_the_next_write_replaces() {
+    interrupted_page_leaves_rows_the_next_write_replaces(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_interrupted_page_leaves_rows_the_next_write_replaces()
+ {
+    interrupted_page_leaves_rows_the_next_write_replaces(true).await;
 }

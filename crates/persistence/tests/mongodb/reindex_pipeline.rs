@@ -993,6 +993,45 @@ async fn indexed_resource_ids(
         .collect()
 }
 
+/// `search_index` rows per `resource_id` of the tenant's `resource_type`
+/// resources, from one aggregation: the number of rows each resource holds,
+/// not just whether it holds any (#2424).
+async fn rows_per_resource(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    resource_type: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index assertions");
+    let search_index = client
+        .database(&backend.config().database_name)
+        .collection::<Document>("search_index");
+    search_index
+        .aggregate(vec![
+            doc! { "$match": {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+            } },
+            doc! { "$group": { "_id": "$resource_id", "rows": { "$sum": 1_i32 } } },
+        ])
+        .await
+        .expect("failed to count rows per resource")
+        .try_collect::<Vec<Document>>()
+        .await
+        .expect("failed to read row counts")
+        .into_iter()
+        .map(|row| {
+            let rows = match row.get("rows") {
+                Some(Bson::Int32(n)) => i64::from(*n),
+                Some(Bson::Int64(n)) => *n,
+                other => panic!("unexpected row count {other:?}"),
+            };
+            (row.get_str("_id").unwrap().to_owned(), rows)
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongodb_integration_reindex_page_serial_pipeline_writes_a_large_page() {
     let Some(backend) = create_backend_with("reindex_serial_pipeline_large_page", |c| {
@@ -1318,8 +1357,29 @@ async fn mongodb_integration_reindex_page_overlapped_command_shape() {
         );
         return;
     }
+    db.run_command(doc! { "profile": 0_i32 })
+        .await
+        .expect("disable profiling");
 
+    // Old rows for the page to replace, written one resource at a time: unlike
+    // a page write, that records no per-type size hint, so the page below
+    // still splits as a type's first page does.
     let target: &dyn ReindexTarget = &*backend;
+    for resource in &page {
+        let seeded = target.write_search_entries(&tenant, resource).await;
+        assert!(seeded.is_ok(), "{seeded:?}");
+    }
+    let old_rows = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! { "tenant_id": tenant.tenant_id().as_str() })
+        .await
+        .unwrap();
+    assert!(old_rows > 0);
+
+    // Profile the rewrite alone.
+    db.run_command(doc! { "profile": 2_i32 })
+        .await
+        .expect("enable profiling");
     let mut stats = ReindexPageStats::default();
     let outcomes = target
         .write_search_entries_page_timed(&tenant, &page, &mut stats)
@@ -1355,16 +1415,19 @@ async fn mongodb_integration_reindex_page_overlapped_command_shape() {
     assert_eq!(
         removes.len(),
         1,
-        "exactly one delete_many for the page: {entries:?}"
+        "exactly one delete for the page's old rows: {entries:?}"
     );
     assert_eq!(inserts.len() as u64, stats.insert_commands, "{entries:?}");
     assert!(inserts.len() >= 2);
+    assert_eq!(stats.deleted_entries, old_rows, "{stats:?}");
+    // The old rows are deleted after the page's own rows are in, so that a stop
+    // between the two never leaves a resource without rows (#2424).
     let remove_ts = removes[0].get_datetime("ts").expect("remove ts");
     for insert in &inserts {
         let insert_ts = insert.get_datetime("ts").expect("insert ts");
         assert!(
-            remove_ts <= insert_ts,
-            "the delete must happen at or before every insert"
+            insert_ts <= remove_ts,
+            "every insert must happen at or before the delete of the old rows"
         );
     }
 }
@@ -1389,8 +1452,8 @@ async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_fa
     let tenant = create_tenant("reindex-overlap-fail-first-tenant");
     let page = build_test_patients(&tenant, "failfirst", 80);
 
-    // Seed the rows with the failpoint off, so the zero-row assertion below
-    // actually shows the page's delete removed something (#1403).
+    // Seed the rows with the failpoint off, so the assertion below shows the
+    // page's old rows being kept, not an already-empty collection (#1403).
     let target: &dyn ReindexTarget = &*backend;
     for resource in &page {
         let seeded = target.write_search_entries(&tenant, resource).await;
@@ -1398,8 +1461,9 @@ async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_fa
     }
     assert!(
         search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
-        "the seed write must have created rows, or the later zero-row assertion proves nothing"
+        "the seed write must have created rows, or the later kept-rows assertion proves nothing"
     );
+    let seeded_rows = rows_per_resource(&backend, &tenant, "Patient").await;
 
     let Some(failpoint) = FailPoint::enable(
         app_name,
@@ -1425,11 +1489,13 @@ async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_fa
             .all(|o| matches!(o, Err(e) if e.to_string().contains("Failed to insert search index entries"))),
         "{outcomes:?}"
     );
-    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
-    assert!(
-        indexed.is_empty(),
-        "every resource must have zero rows: the delete removed them and sub-batch 1's insert \
-         failed before any row could be re-inserted: {indexed:?}"
+    // Sub-batch 1's insert failed before any new row went in, so the page
+    // stopped with every resource's old rows and nothing else (#2424). The
+    // delete-first order left none.
+    assert_eq!(
+        rows_per_resource(&backend, &tenant, "Patient").await,
+        seeded_rows,
+        "every resource must keep exactly its old rows"
     );
 }
 
@@ -1464,6 +1530,7 @@ async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub
         search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
         "the seed write must have created rows, or the later prefix assertion proves nothing"
     );
+    let seeded_rows = rows_per_resource(&backend, &tenant, "Patient").await;
 
     let Some(failpoint) = FailPoint::enable(
         app_name,
@@ -1485,15 +1552,30 @@ async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub
 
     assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
 
-    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
-    let has_rows: Vec<bool> = page.iter().map(|r| indexed.contains(r.id())).collect();
-    let with_rows = has_rows.iter().filter(|b| **b).count();
+    // Every resource keeps its old rows, and the resources of the sub-batches
+    // that completed also hold the new ones: both generations, and no resource
+    // without rows (#2424). The delete-first order left only the new rows of
+    // the completed sub-batches.
+    let now = rows_per_resource(&backend, &tenant, "Patient").await;
+    let both: Vec<bool> = page
+        .iter()
+        .map(|r| {
+            let (before, now) = (seeded_rows[r.id()], now.get(r.id()).copied().unwrap_or(0));
+            assert!(
+                now == before || now == 2 * before,
+                "{} holds {now} rows, had {before}: old rows only, or old and new",
+                r.id()
+            );
+            now == 2 * before
+        })
+        .collect();
+    let with_new_rows = both.iter().filter(|b| **b).count();
     assert!(
-        with_rows > 0 && with_rows < page.len(),
-        "the rows must form a non-empty, proper prefix: {has_rows:?}"
+        with_new_rows > 0 && with_new_rows < page.len(),
+        "the new rows must form a non-empty, proper prefix: {both:?}"
     );
-    assert!(has_rows[..with_rows].iter().all(|b| *b), "{has_rows:?}");
-    assert!(has_rows[with_rows..].iter().all(|b| !*b), "{has_rows:?}");
+    assert!(both[..with_new_rows].iter().all(|b| *b), "{both:?}");
+    assert!(both[with_new_rows..].iter().all(|b| !*b), "{both:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1532,8 +1614,9 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
     }
     assert!(
         search_index_entry_count(&backend, &tenant, "Patient", page[0].id()).await > 0,
-        "the seed write must have created rows, or the later unchanged-rows assertion proves nothing"
+        "the seed write must have created rows, or the later kept-rows assertion proves nothing"
     );
+    let seeded_rows = rows_per_resource(&backend, &tenant, "Patient").await;
 
     let Some(failpoint) = FailPoint::enable(
         app_name,
@@ -1552,12 +1635,10 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
         .await;
     failpoint.off().await;
 
-    // Unlike the two insert-failure tests below, `sub_batches` cannot prove
-    // the overlapped writer ran: both writers join the page's delete right
-    // after extracting only their first sub-batch, so a delete failure is
-    // always caught with `sub_batches == 1`, whichever writer is running.
-    // This test instead relies on its config (`reindex_overlap = true`, a
-    // multi-thread runtime, and a 40-resource page) to route it through
+    // The page's delete is the delete of its old rows, and it runs after
+    // every insert (#2424), so the failure reaches a page that has written all
+    // its new rows. This test relies on its config (`reindex_overlap = true`,
+    // a multi-thread runtime, and a 40-resource page) to route it through
     // `write_page_overlapped` (#1403).
     assert!(
         outcomes.iter().all(
@@ -1565,16 +1646,20 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
         ),
         "{outcomes:?}"
     );
-    assert_eq!(
-        stats.insert_commands, 0,
-        "no insert may be spawned once the delete has failed"
+    assert!(
+        stats.insert_commands > 0,
+        "the old rows' delete comes after the inserts: {stats:?}"
     );
-    let indexed = indexed_resource_ids(&backend, &tenant, "Patient").await;
-    let expected: std::collections::BTreeSet<String> =
-        page.iter().map(|r| r.id().to_string()).collect();
+    assert_eq!(stats.deleted_entries, 0, "{stats:?}");
+    // The failed delete leaves both generations, and no resource without rows.
+    let now = rows_per_resource(&backend, &tenant, "Patient").await;
+    let doubled: std::collections::BTreeMap<String, i64> = seeded_rows
+        .iter()
+        .map(|(id, rows)| (id.clone(), rows * 2))
+        .collect();
     assert_eq!(
-        indexed, expected,
-        "the failed delete must leave every resource's rows exactly as seeded"
+        now, doubled,
+        "the failed delete must leave every resource its old rows and its new ones"
     );
 }
 
