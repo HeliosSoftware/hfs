@@ -95,7 +95,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
-| `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
+| `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning, and the `/_history/[vid]` in a create's `Location` |
 | `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates and deletes |
 
 ## Natural-Language Search

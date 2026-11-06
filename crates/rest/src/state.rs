@@ -537,6 +537,33 @@ impl<S: ResourceStorage> AppState<S> {
         self.public_url.with_segments(all_segments)
     }
 
+    /// The `Location` of a stored resource version, as a create (or an update
+    /// that created) answers it: `[base]/[type]/[id]/_history/[vid]` (#2517).
+    ///
+    /// R4, R4B and R5 http.html#create: "The Location header should be as
+    /// specific as possible - if the server understands versioning, the
+    /// version is included. If a server does not track versions, the Location
+    /// header will just contain [base]/[type]/[id]." With
+    /// `HFS_ENABLE_VERSIONING=false` the server sends no `ETag` and so
+    /// advertises no version; the `Location` then drops it too.
+    pub(crate) fn location_for_request(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        stored: &helios_persistence::types::StoredResource,
+    ) -> String {
+        let resource = [stored.resource_type(), stored.id()];
+        if self.versioning_enabled() {
+            self.public_url_for_request(
+                tenant,
+                resource
+                    .into_iter()
+                    .chain(["_history", stored.version_id()]),
+            )
+        } else {
+            self.public_url_for_request(tenant, resource)
+        }
+    }
+
     /// Builds a request-bound public URL and retains an encoded query string.
     pub(crate) fn public_url_for_request_with_query<'a>(
         &self,

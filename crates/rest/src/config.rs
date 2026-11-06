@@ -1280,7 +1280,8 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_RETURN_GONE", default_value = "true")]
     pub return_gone: bool,
 
-    /// Enable versioning (ETag support).
+    /// Enable versioning (ETag support, and the `/_history/[vid]` a create's
+    /// `Location` names).
     #[arg(long, env = "HFS_ENABLE_VERSIONING", default_value = "true")]
     pub enable_versioning: bool,
 

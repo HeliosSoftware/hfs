@@ -873,8 +873,8 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
 `DELETE [type]?[criteria]`, `PATCH [type]?[criteria]`):
 
 - In a `batch`, they are **resolved** with the status mapping the resource
-  endpoints use. `PUT`: one match updates (`200`, `location` = `[type]/[id]`), no
-  match creates (`201`), several matches `412`. `DELETE`: deleted or no match
+  endpoints use. `PUT`: one match updates (`200`, `location` = the updated version,
+  `[type]/[id]/_history/[vid]`, as in a transaction), no match creates (`201`), several matches `412`. `DELETE`: deleted or no match
   `204`, several matches `412` (`/metadata` elects `conditionalDelete: "single"`).
   `PATCH`: one match is patched (`200`), no match `404`, several matches `412`.
   The criteria are percent-decoded like a request URL's query, with repeated
