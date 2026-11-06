@@ -461,7 +461,7 @@ impl SqliteBackend {
             let builder = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
                 .with_composite_rewrite(composite_rewrite);
-            let fragment = builder.build(query);
+            let fragment = builder.build(query)?;
             if !fragment.sql.is_empty() {
                 Some(fragment)
             } else {
@@ -949,7 +949,7 @@ fn search_ids_on_plan(
         let fragment = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(param_offset)
             .with_composite_rewrite(composite_rewrite)
-            .build(query);
+            .build(query)?;
         if fragment.sql.is_empty() {
             None
         } else {
@@ -1048,7 +1048,7 @@ fn search_reference_values_on(
     reference_param: &str,
 ) -> StorageResult<Vec<String>> {
     reject_legacy_composites(conn, tenant, query)?;
-    let (sql, params) = reference_values_statement(tenant, query, reference_param);
+    let (sql, params) = reference_values_statement(tenant, query, reference_param)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn
         .prepare(&sql)
@@ -1066,15 +1066,19 @@ fn reference_values_statement(
     tenant: &TenantContext,
     query: &SearchQuery,
     reference_param: &str,
-) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+) -> StorageResult<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
 
-    let fragment = (!query.parameters.is_empty()).then(|| {
-        QueryBuilder::new(tenant_id, resource_type)
-            .with_param_offset(2)
-            .build(query)
-    });
+    let fragment = if query.parameters.is_empty() {
+        None
+    } else {
+        Some(
+            QueryBuilder::new(tenant_id, resource_type)
+                .with_param_offset(2)
+                .build(query)?,
+        )
+    };
     let filter = fragment
         .as_ref()
         .filter(|fragment| !fragment.sql.is_empty())
@@ -1112,7 +1116,7 @@ fn reference_values_statement(
            AND si.is_contained = 0 \
            AND si.value_reference IS NOT NULL"
     );
-    (sql, params)
+    Ok((sql, params))
 }
 
 fn search_count_on(
@@ -1143,7 +1147,7 @@ fn search_count_on_plan(
         let builder = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(2)
             .with_composite_rewrite(composite_rewrite);
-        let fragment = builder.build(query);
+        let fragment = builder.build(query)?;
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
@@ -2252,6 +2256,98 @@ mod tests {
         }
     }
 
+    /// #866: a search parameter the query builder can build no condition for
+    /// must fail the search. Dropped, it left a query with no conditions, which
+    /// matches every indexed resource of the type: `DELETE Patient?_query=x`
+    /// deleted the only Patient on file, and a plain search answered with
+    /// everything.
+    #[tokio::test]
+    async fn a_parameter_without_a_condition_is_an_error_not_a_dropped_filter() {
+        use crate::types::{SearchParamType, SearchValue};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in ["a", "b"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Control: with no parameters both Patients are the answer, and a
+        // parameter that does filter narrows it.
+        let count = |query: &SearchQuery| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let query = query.clone();
+            async move { backend.search(tenant, &query).await }
+        };
+        assert_eq!(
+            count(&SearchQuery::new("Patient"))
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            2
+        );
+        let by_id = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("a")],
+            ..Default::default()
+        });
+        assert_eq!(count(&by_id).await.unwrap().resources.items.len(), 1);
+
+        // `_query` and `_type` are registered by the spec and indexed by
+        // nothing; `_made_up` is registered by nobody; `near` is a `special`
+        // parameter. None has a condition to build.
+        for (name, param_type) in [
+            ("_query", SearchParamType::Token),
+            ("_type", SearchParamType::Token),
+            ("_made_up", SearchParamType::Token),
+            ("near", SearchParamType::Special),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                values: vec![SearchValue::eq("x")],
+                ..Default::default()
+            });
+
+            let error = count(&query).await.expect_err(&format!(
+                "{name}: search must not answer with every Patient"
+            ));
+            assert!(
+                matches!(
+                    error,
+                    StorageError::Search(SearchError::QueryParseError { ref message })
+                        if message.contains(&format!("'{name}'"))
+                ),
+                "{name}: {error:?}"
+            );
+            assert!(
+                backend.search_count(&tenant, &query).await.is_err(),
+                "{name}: the count is gated the same way"
+            );
+        }
+
+        // A parameter with no values asks for nothing, so it constrains nothing.
+        let nothing_asked = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_query".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![],
+            ..Default::default()
+        });
+        assert_eq!(
+            count(&nothing_asked).await.unwrap().resources.items.len(),
+            2
+        );
+    }
+
     fn composite_query(v: &str) -> SearchQuery {
         use crate::types::{CompositeSearchComponent, SearchParamType, SearchValue};
         SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -3281,7 +3377,7 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let (sql, params) = reference_values_statement(&tenant, &query, "patient");
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient").unwrap();
         let conn = backend.get_connection().unwrap();
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -3336,7 +3432,8 @@ mod tests {
         ] {
             let fragment = QueryBuilder::new("t", "Observation")
                 .with_param_offset(2)
-                .build(&query);
+                .build(&query)
+                .unwrap();
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
@@ -3388,7 +3485,8 @@ mod tests {
         let query = subject(vec![SearchValue::eq("Patient/p1")]);
         let fragment = QueryBuilder::new("t", "Observation")
             .with_param_offset(2)
-            .build(&query);
+            .build(&query)
+            .unwrap();
         let exists = membership_exists_predicate(&fragment.sql, "w.rk")
             .expect("reference membership has an EXISTS form");
         assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
@@ -3472,7 +3570,8 @@ mod tests {
         });
         let fragment = QueryBuilder::new("t", "Observation")
             .with_param_offset(2)
-            .build(&query);
+            .build(&query)
+            .unwrap();
         let exists = membership_exists_predicate(&fragment.sql, "w.rk")
             .expect("reference membership has an EXISTS form");
         assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
@@ -3660,7 +3759,8 @@ mod tests {
         ] {
             let fragment = QueryBuilder::new("t", "Observation")
                 .with_param_offset(2)
-                .build(&query);
+                .build(&query)
+                .unwrap();
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
@@ -4331,7 +4431,8 @@ mod tests {
         let conn = backend.get_connection().unwrap();
         let fragment = QueryBuilder::new(tenant.tenant_id().as_str(), &query.resource_type)
             .with_param_offset(2)
-            .build(query);
+            .build(query)
+            .unwrap();
         choose_first_page_plan(
             &conn,
             tenant.tenant_id().as_str(),
@@ -4599,6 +4700,7 @@ mod tests {
                 .with_param_offset(2)
                 .with_composite_rewrite(rewrite)
                 .build(&SearchQuery::new("Observation").with_parameter(cvq(values)))
+                .unwrap()
         };
         assert!(
             build(&["C3$gt1"], true)
