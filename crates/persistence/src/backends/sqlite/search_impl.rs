@@ -3613,6 +3613,314 @@ mod tests {
         }
     }
 
+    /// Binds a fragment's string parameters after `?1`/`?2` (tenant, type).
+    fn bind_reference_params(
+        tenant: &str,
+        fragment: &crate::backends::sqlite::search::SqlFragment,
+    ) -> Vec<Box<dyn rusqlite::ToSql>> {
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant.to_string()),
+            Box::new("Observation".to_string()),
+        ];
+        for param in &fragment.params {
+            if let SqlParam::String(value) = param {
+                params.push(Box::new(value.clone()));
+            }
+        }
+        params
+    }
+
+    /// #2493: a comma list of references returns exactly the union of each
+    /// value's single-value result, including stored `_history` references
+    /// that the old exact-`IN` shortcut dropped, through the end-to-end
+    /// search, the `rowid IN (…)` form and the merged `EXISTS` form.
+    #[tokio::test]
+    async fn reference_comma_list_is_the_union_of_its_values() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, subject) in [
+            ("ob-pat", Some("Patient/p1")),
+            ("ob-ver", Some("Patient/p1/_history/3")),
+            ("ob-p2", Some("Patient/p2")),
+            ("ob-none", None),
+        ] {
+            let mut obs =
+                json!({"resourceType":"Observation","id":id,"status":"final","code":{"text":"x"}});
+            if let Some(subject) = subject {
+                obs["subject"] = json!({ "reference": subject });
+            }
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let query_for = |values: &[&str]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        async fn search_ids(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            query: SearchQuery,
+        ) -> BTreeSet<String> {
+            use crate::core::SearchProvider;
+            backend
+                .search(tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect()
+        }
+        let sql_ids = |values: &[&str], exists_form: bool| -> BTreeSet<String> {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query_for(values));
+            let predicate = if exists_form {
+                membership_exists_predicate(&fragment.sql, "w.rk")
+                    .unwrap_or_else(|| panic!("no EXISTS form for {values:?}: {}", fragment.sql))
+            } else {
+                format!("w.rk IN ({})", fragment.sql)
+            };
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let params = bind_reference_params(tenant.tenant_id().as_str(), &fragment);
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|s| s.to_string()).collect() };
+
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["Patient/p1"], &["ob-pat", "ob-ver"]),
+            (&["Patient/p1", "Patient/nobody"], &["ob-pat", "ob-ver"]),
+            (&["Patient/nobody", "Patient/p1"], &["ob-pat", "ob-ver"]),
+            (
+                &["Patient/p1", "Patient/p2"],
+                &["ob-pat", "ob-ver", "ob-p2"],
+            ),
+            (
+                &["Patient/p1/_history/3", "Patient/nobody"],
+                &["ob-pat", "ob-ver"],
+            ),
+        ];
+        for (values, expected) in cases {
+            let expected = set(expected);
+            let mut union = BTreeSet::new();
+            for v in values {
+                union.extend(search_ids(&backend, &tenant, query_for(&[v])).await);
+            }
+            assert_eq!(union, expected, "union of singles for {values:?}");
+            assert_eq!(
+                search_ids(&backend, &tenant, query_for(values)).await,
+                expected,
+                "search {values:?}"
+            );
+            assert_eq!(sql_ids(values, false), expected, "rowid IN {values:?}");
+            assert_eq!(sql_ids(values, true), expected, "EXISTS {values:?}");
+        }
+    }
+
+    /// #2493: a list of more than `VERSION_ROWS_CHUNK` (50) references splits
+    /// the `_history` arm into several `UNION ALL`-ed selects; the result must
+    /// still be the union of the values, in the end-to-end search, the
+    /// `rowid IN (…)` form and the merged `EXISTS` form (which collapses the
+    /// chunks back into one test).
+    #[tokio::test]
+    async fn reference_comma_list_beyond_one_chunk_is_the_union_of_its_values() {
+        use std::collections::BTreeSet;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        // 120 bases = chunks of 50 + 50 + 20. One versioned and one plain
+        // stored reference in each chunk, plus unrelated ones.
+        let stored = [
+            ("ob-v10", "Patient/q10/_history/2"),
+            ("ob-p20", "Patient/q20"),
+            ("ob-v70", "Patient/q70/_history/9"),
+            ("ob-p60", "Patient/q60"),
+            ("ob-v110", "Patient/q110/_history/1"),
+            ("ob-p119", "Patient/q119"),
+            ("ob-other", "Patient/other"),
+            ("ob-other-v", "Patient/other/_history/1"),
+        ];
+        for (id, subject) in stored {
+            let obs = json!({"resourceType":"Observation","id":id,"status":"final",
+                "code":{"text":"x"},"subject":{"reference":subject}});
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let query_for = |values: &[String]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(v.as_str())).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let search_ids = |values: Vec<String>| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let query = query_for(&values);
+            async move {
+                use crate::core::SearchProvider;
+                backend
+                    .search(tenant, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect::<BTreeSet<String>>()
+            }
+        };
+        let sql_ids = |values: &[String], exists_form: bool| -> BTreeSet<String> {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query_for(values));
+            let predicate = if exists_form {
+                membership_exists_predicate(&fragment.sql, "w.rk")
+                    .unwrap_or_else(|| panic!("no EXISTS form: {}", fragment.sql))
+            } else {
+                format!("w.rk IN ({})", fragment.sql)
+            };
+            let sql = format!(
+                "SELECT w.rid FROM (SELECT rowid AS rk, id AS rid FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {predicate}"
+            );
+            let params = bind_reference_params(tenant.tenant_id().as_str(), &fragment);
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|s| s.to_string()).collect() };
+
+        let all: Vec<String> = (0..120).map(|i| format!("Patient/q{i}")).collect();
+        // Only the versioned reference of the last chunk matches.
+        let mut last_only: Vec<String> = (0..119).map(|i| format!("Patient/nobody{i}")).collect();
+        last_only.push("Patient/q110".to_string());
+        // The matching value sits in the middle chunk.
+        let mut middle: Vec<String> = (0..119).map(|i| format!("Patient/nobody{i}")).collect();
+        middle.insert(60, "Patient/q70".to_string());
+
+        let cases: [(&Vec<String>, BTreeSet<String>); 3] = [
+            (
+                &all,
+                set(&["ob-v10", "ob-p20", "ob-v70", "ob-p60", "ob-v110", "ob-p119"]),
+            ),
+            (&last_only, set(&["ob-v110"])),
+            (&middle, set(&["ob-v70"])),
+        ];
+        for (values, expected) in cases {
+            // The property: the list equals the union of its single values.
+            let mut union = BTreeSet::new();
+            for v in values.iter() {
+                union.extend(search_ids(vec![v.clone()]).await);
+            }
+            assert_eq!(union, expected, "union of singles");
+            assert_eq!(search_ids(values.clone()).await, expected, "search");
+            assert_eq!(sql_ids(values, false), expected, "rowid IN");
+            assert_eq!(sql_ids(values, true), expected, "EXISTS");
+        }
+    }
+
+    /// #2493: the lists that now also match `_history` references still seek
+    /// an index: no plan line scans `search_index`, in the `rowid IN (…)` form
+    /// and in the merged `EXISTS` form.
+    #[test]
+    fn reference_comma_list_with_versions_does_not_scan_search_index() {
+        let backend = create_test_backend();
+        let abs = "http://example.org/fhir/Patient/p1";
+        let lists: Vec<Vec<&str>> = vec![
+            vec!["Patient/p1", "Patient/nobody"],
+            vec!["Patient/p1/_history/3", "Patient/nobody"],
+            vec!["Patient/p1", "Patient/p2", "Patient/p3"],
+            vec!["Patient/nobody", abs],
+            vec!["Group/p1", abs],
+        ];
+        let plan_of = |sql: &str, params: &[Box<dyn rusqlite::ToSql>]| -> Vec<String> {
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for values in lists {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query);
+            let params = bind_reference_params("t", &fragment);
+
+            let rows_sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let plan = plan_of(&rows_sql, &params);
+            assert!(
+                plan.iter().any(|l| l.contains("idx_search_reference")),
+                "{values:?}\n{}\n{plan:#?}",
+                fragment.sql
+            );
+            assert_reference_plan_is_seeks(&plan, &fragment.sql);
+
+            let exists = membership_exists_predicate(&fragment.sql, "w.rk")
+                .unwrap_or_else(|| panic!("no EXISTS form for {values:?}: {}", fragment.sql));
+            assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+            let exists_sql = format!(
+                "EXPLAIN QUERY PLAN SELECT w.rk FROM (SELECT rowid AS rk FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0) AS w \
+                 WHERE {exists}"
+            );
+            let plan = plan_of(&exists_sql, &params);
+            assert!(
+                plan.iter().any(|l| l.contains("SEARCH")
+                    && l.contains("idx_search_composite")
+                    && l.contains("resource_key=?")),
+                "{values:?}\n{exists}\n{plan:#?}"
+            );
+            assert_reference_plan_is_seeks(&plan, &exists);
+        }
+    }
+
     /// No plan line scans `search_index`: every access to it is a `SEARCH`
     /// through an index.
     fn assert_reference_plan_is_seeks(plan: &[String], sql: &str) {

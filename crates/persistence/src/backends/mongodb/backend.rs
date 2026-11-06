@@ -157,6 +157,8 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 pub struct MongoBackend {
     /// Bounded index-row observations used only to choose query execution order.
     pub(super) probe_cache: super::probe_cache::ProbeCache,
+    /// Per-tenant cache of the `tuple_code` completeness marker.
+    pub(super) composite_marker_cache: super::composite_layout::MarkerCache,
     /// The Bulk Data Submit writes of each manifest that are running on this
     /// instance (see [`super::bulk_submit::ManifestWritesInFlight`], #2310).
     pub(super) manifest_writes: super::bulk_submit::ManifestWritesInFlight,
@@ -1332,6 +1334,7 @@ impl MongoBackend {
 
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
+            composite_marker_cache: Default::default(),
             manifest_writes: super::bulk_submit::ManifestWritesInFlight::default(),
             config,
             client: Arc::new(OnceCell::new()),
