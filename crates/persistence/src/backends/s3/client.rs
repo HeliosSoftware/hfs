@@ -206,6 +206,9 @@ pub trait S3Api: Send + Sync {
                 break;
             }
         }
+        // Key order, as S3 returns it, whatever order a test double lists in:
+        // the reindex source's key cursor relies on it.
+        items.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(ListObjectsResult {
             items,
             next_continuation_token: None,

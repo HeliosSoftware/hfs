@@ -1628,7 +1628,7 @@ pub(super) fn document_to_value(doc: &Document) -> StorageResult<Value> {
         .map_err(|e| serialization_error(format!("Failed to deserialize resource: {}", e)))
 }
 
-fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
+pub(super) fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or_else(Utc::now)
 }
 
@@ -9302,6 +9302,38 @@ impl MongoBackend {
         }
     }
 
+    /// The oldest-live probe (#945): the forward mirror of
+    /// [`Self::reindex_newest_live_last_updated`], a covered scan of
+    /// `idx_resources_type_scan` for the `last_updated` of the oldest live
+    /// resource of `resource_type`, or `None` if it has no live resource.
+    async fn reindex_oldest_live_last_updated(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .sort(doc! { "last_updated": 1, "id": 1 })
+            .projection(doc! { "_id": 0, "last_updated": 1 })
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .map_err(|e| read_driver_error("Failed to probe oldest resource", e))?;
+        match found {
+            Some(doc) => {
+                let ts = doc
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                Ok(Some(bson_to_chrono(ts)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// One hinted, sorted, limited find (#1403). The page is drained up to
     /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
     /// next row — the first row is always admitted.
@@ -9417,7 +9449,17 @@ impl MongoBackend {
     /// `None` on its own account. `fetch_resources_page` and
     /// `fetch_resources_page_capped` are both thin calls to this method.
     /// `range` bounds the ids of every id-phase page and catch-up round
-    /// (#1739).
+    /// (#1739). `since` (#945 L3) skips the id phase: the walk
+    /// starts at the first catch-up round with `since` as its floor, so it
+    /// reads `[since, ceiling)` in `(last_updated, id)` order on
+    /// `idx_resources_type_scan` — exactly the round a whole-type walk runs
+    /// for what was written during it, now over the manifest's window — and
+    /// the usual rounds then catch what lands while it runs. When no live
+    /// row of the type is older than `since` (a fresh load), the window is
+    /// the whole type, so the walk is the unscoped one instead (id phase,
+    /// prefetch, then the same catch-up rounds): it reads the same rows,
+    /// but in id order, which keeps the `search_index` inserts sequential.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_reindex_page(
         &self,
         tenant: &TenantContext,
@@ -9426,6 +9468,7 @@ impl MongoBackend {
         limit: u32,
         max_bytes: u64,
         range: Option<&ReindexIdRange>,
+        since: Option<DateTime<Utc>>,
     ) -> StorageResult<ResourcePage> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -9433,9 +9476,60 @@ impl MongoBackend {
         let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
         let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
 
-        let mut step = match cursor {
-            None => WalkStep::Start,
-            Some(c) => WalkStep::from(ReindexWalkCursor::parse(c)?),
+        let mut step = match (cursor, since) {
+            (None, Some(since)) => {
+                let floor = truncate_to_millis(since);
+                let oldest_live = self
+                    .reindex_oldest_live_last_updated(&resources, tenant_id, resource_type)
+                    .await?;
+                // Every live row is inside the window, so the window is the
+                // whole type: walk it in id order (sequential `search_index`
+                // inserts, prefetch) exactly as an unscoped walk does, instead
+                // of in `(last_updated, id)` order, which visits ids at
+                // random. The id phase only reads rows older than the
+                // catch-up margin, so a type written within that margin would
+                // leave its id phase empty and fall back to the slow walk:
+                // wait out the rest of the margin when the writes have
+                // stopped, and keep the time walk while they are still landing.
+                let settle = if reindex_time_floor_covers_whole_type(oldest_live, floor) {
+                    let newest_live = self
+                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                        .await?;
+                    reindex_settle_wait(newest_live, Utc::now(), margin)
+                } else {
+                    SettleWait::Active
+                };
+                if !matches!(settle, SettleWait::Active) {
+                    if let SettleWait::Wait(wait) = settle {
+                        tracing::info!(
+                            tenant = %tenant_id,
+                            resource_type = %resource_type,
+                            wait_ms = wait.as_millis() as u64,
+                            "mongodb reindex waiting for the newest write to leave the catch-up margin"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        oldest_live = %oldest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        "mongodb reindex time floor covers the whole type; walking by id"
+                    );
+                    WalkStep::Start
+                } else {
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        oldest_live = %oldest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        "mongodb reindex walk started at a time floor"
+                    );
+                    WalkStep::RoundStart { round: 1, floor }
+                }
+            }
+            (None, None) => WalkStep::Start,
+            (Some(c), _) => WalkStep::from(ReindexWalkCursor::parse(c)?),
         };
 
         loop {
@@ -9675,6 +9769,120 @@ impl MongoBackend {
             .await
             .or_query_error("Failed to count resources")
     }
+
+    /// Live resources of `resource_type` stored at or after `since`
+    /// (#945 L3): a range of `idx_resources_type_scan`, whose keys are
+    /// `(tenant_id, resource_type, is_deleted, last_updated, id)`.
+    async fn count_reindex_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+            "last_updated": { "$gte": chrono_to_bson(truncate_to_millis(since)) },
+        };
+        db.collection::<Document>(Self::RESOURCES_COLLECTION)
+            .count_documents(filter)
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .or_query_error("Failed to count resources")
+    }
+}
+
+/// A time-scoped view of a [`MongoBackend`] (#945 L3): its count and pages
+/// read only resources whose `last_updated` is at or after `since`. The walk
+/// is the backend's own catch-up walk from that floor, with the backend's
+/// own cursors — or, when no live row of the type predates the floor, the
+/// backend's whole-type id walk, which reads the same rows.
+struct SinceMongoReindexSource {
+    backend: std::sync::Arc<MongoBackend>,
+    since: DateTime<Utc>,
+}
+
+#[async_trait]
+impl ReindexSource for SinceMongoReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_since(tenant, resource_type, self.since)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_page(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                None,
+                Some(self.since),
+            )
+            .await
+    }
+
+    /// A time-scoped walk holds catch-up round cursors, which the backend
+    /// never runs ahead of the write in flight — unless its window covers
+    /// the whole type, where it runs the unscoped walk and its id-phase
+    /// cursors prefetch exactly as they do there.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.backend.may_prefetch_page(cursor)
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        self.backend
+            .fetch_reindex_page_ahead(tenant, resource_type, cursor, limit, max_bytes, None)
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, ids)
+            .await
+    }
 }
 
 /// An id-range view of a [`MongoBackend`] (#1739): every count, page,
@@ -9728,6 +9936,7 @@ impl ReindexSource for RangedMongoReindexSource {
                 limit,
                 max_bytes,
                 Some(&self.range),
+                None,
             )
             .await
     }
@@ -9849,6 +10058,12 @@ fn reindex_page_from_docs(
 /// SQLite's; this mirrors PostgreSQL's constant of the same name and value.
 const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 
+/// Page streams this writer accepts per run at most
+/// ([`ReindexTarget::max_streams`]). Measured on the 72k mix: the rebuild
+/// scales almost linearly to four streams and still 2× from four to eight
+/// (16.97 → 5.92 → 3.97 s); past that mongod's B-tree inserts are the bound.
+const MONGO_MAX_REINDEX_STREAMS: usize = 8;
+
 #[async_trait]
 impl ReindexSource for MongoBackend {
     fn with_id_range(
@@ -9858,6 +10073,16 @@ impl ReindexSource for MongoBackend {
         Ok(std::sync::Arc::new(RangedMongoReindexSource {
             backend: self,
             range,
+        }))
+    }
+
+    fn with_updated_since(
+        self: std::sync::Arc<Self>,
+        since: DateTime<Utc>,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(SinceMongoReindexSource {
+            backend: self,
+            since,
         }))
     }
 
@@ -9887,6 +10112,58 @@ impl ReindexSource for MongoBackend {
         self.count(tenant, Some(resource_type)).await
     }
 
+    /// Split points over `idx_resources_identity`'s id order (see
+    /// [`crate::search::reindex_split`]): a few bounded index walks, and a
+    /// count only when the ids are not UUIDs. Each stream then walks its own
+    /// range through [`Self::with_id_range`], catch-up rounds included.
+    async fn id_range_boundaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        streams: usize,
+        min_per_stream: u64,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        crate::search::reindex_split::split_boundaries(
+            streams,
+            min_per_stream,
+            |offset, limit, descending| async move {
+                let db = self.get_database().await?;
+                let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+                let filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "is_deleted": false,
+                };
+                let mut cursor = resources
+                    .find(filter)
+                    .sort(doc! { "id": if descending { -1 } else { 1 } })
+                    .skip(offset)
+                    .limit(limit.min(i64::MAX as u64) as i64)
+                    .projection(doc! { "id": 1, "_id": 0 })
+                    .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to read resource ids: {e}")))?;
+                let mut ids = Vec::new();
+                while cursor
+                    .advance()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+                {
+                    let doc: Document = cursor
+                        .deserialize_current()
+                        .map_err(|e| internal_error(format!("Failed to read resource id: {e}")))?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.push(id.to_string());
+                    }
+                }
+                Ok(ids)
+            },
+            || self.count(tenant, Some(resource_type)),
+        )
+        .await
+    }
+
     /// Two phases per type (#1403): an id phase over live resources stamped
     /// before the floor, keyset on id and hinted to idx_resources_identity,
     /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
@@ -9902,7 +10179,7 @@ impl ReindexSource for MongoBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0, None)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0, None, None)
             .await
     }
 
@@ -9920,7 +10197,7 @@ impl ReindexSource for MongoBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes, None)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes, None, None)
             .await
     }
 
@@ -10313,6 +10590,25 @@ impl ReindexTarget for MongoBackend {
     /// already-completed sub-batches — and any chunk of the failing
     /// sub-batch that committed before the failure — inserted remain in the
     /// database.
+    /// Up to [`MONGO_MAX_REINDEX_STREAMS`] streams, and no more than the
+    /// connection pool holds: each stream keeps an `insert_many` in flight
+    /// with its delete and prefetch beside it, and the driver's pool queues
+    /// the rest. An offloaded writer no-ops and must not cap the writer
+    /// that works.
+    fn max_streams(&self) -> usize {
+        if self.is_search_offloaded() {
+            usize::MAX
+        } else {
+            (self.config().effective_max_pool_size() as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
+        }
+    }
+
+    /// Pages are plain `delete_many`/`insert_many` commands; no foreground
+    /// writer waits on a process-wide lock here.
+    fn wants_page_yield(&self) -> bool {
+        false
+    }
+
     async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
@@ -10629,6 +10925,71 @@ fn reindex_catch_up_ceiling(
         Some(newest) => by_margin.max(newest + chrono::Duration::milliseconds(1)),
         None => by_margin,
     }
+}
+
+/// Whether a time-scoped walk's window `[floor, ..)` holds every live row of
+/// the type (#945), so it can run as the whole-type id walk: true when the
+/// type has no live row, or its oldest live `last_updated` is at or after
+/// `floor`.
+fn reindex_time_floor_covers_whole_type(
+    oldest_live: Option<DateTime<Utc>>,
+    floor: DateTime<Utc>,
+) -> bool {
+    oldest_live.is_none_or(|oldest| oldest >= floor)
+}
+
+/// How long a whole-type id walk waits for the type's newest write to leave
+/// the catch-up margin (#945).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleWait {
+    /// The newest write is already older than the margin (or there is none):
+    /// the id phase covers the whole type, start now.
+    None,
+    /// The writes have stopped: sleep this long, then the id phase covers the
+    /// whole type.
+    Wait(std::time::Duration),
+    /// Writes are still landing (or are stamped in the future): keep the time
+    /// walk, which handles recent rows in `(last_updated, id)` order.
+    Active,
+}
+
+/// The newest write must be at least this old before a walk waits for it
+/// instead of falling back to the time walk (#945).
+const REINDEX_SETTLE_QUIET: chrono::Duration = chrono::Duration::seconds(10);
+
+/// The longest a whole-type id walk sleeps for the catch-up margin to pass
+/// (#945). Beyond it the walk starts at once on the time walk.
+const REINDEX_SETTLE_MAX_WAIT: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Decides what a whole-type id walk does about a type written within the
+/// catch-up `margin` (#945): the id phase reads rows older than
+/// `t0 - margin`, so a newer row would otherwise push the whole type into the
+/// slow time walk. Waiting out the remainder of the margin keeps the margin's
+/// guarantee unchanged; a type still being written (newest write younger than
+/// [`REINDEX_SETTLE_QUIET`] or stamped ahead of `now`) is not waited for.
+fn reindex_settle_wait(
+    newest_live: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    margin: chrono::Duration,
+) -> SettleWait {
+    let Some(newest) = newest_live else {
+        return SettleWait::None;
+    };
+    let age = now - newest;
+    if age >= margin {
+        return SettleWait::None;
+    }
+    if age < REINDEX_SETTLE_QUIET.min(margin / 2) {
+        return SettleWait::Active;
+    }
+    // One extra millisecond: `newest + margin` itself still counts as inside.
+    let remaining = margin - age + chrono::Duration::milliseconds(1);
+    // A longer wait is not worth it: the time walk is slower, but it starts
+    // now and a cancelled job does not sit asleep holding its slots.
+    if remaining > REINDEX_SETTLE_MAX_WAIT {
+        return SettleWait::Active;
+    }
+    SettleWait::Wait(remaining.to_std().unwrap_or_default())
 }
 
 /// Whether the next round should run, or the walk is done (#1403).
@@ -11630,6 +11991,100 @@ mod reindex_walk_tests {
         assert_eq!(
             reindex_catch_up_ceiling(now, Some(newest), margin),
             newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn time_floor_covers_whole_type_only_when_no_live_row_predates_it() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ms = chrono::Duration::milliseconds(1);
+        assert!(reindex_time_floor_covers_whole_type(None, floor));
+        assert!(reindex_time_floor_covers_whole_type(Some(floor), floor));
+        assert!(reindex_time_floor_covers_whole_type(
+            Some(floor + ms),
+            floor
+        ));
+        assert!(!reindex_time_floor_covers_whole_type(
+            Some(floor - ms),
+            floor
+        ));
+    }
+
+    #[test]
+    fn settle_wait_starts_at_once_when_the_newest_write_left_the_margin() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_settle_wait(None, now, margin), SettleWait::None);
+        assert_eq!(
+            reindex_settle_wait(Some(now - margin), now, margin),
+            SettleWait::None
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - margin - chrono::Duration::hours(1)), now, margin),
+            SettleWait::None
+        );
+    }
+
+    #[test]
+    fn settle_wait_sleeps_out_the_rest_of_the_margin_once_writes_stopped() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        // Written 92 s ago: 28 s of the margin left, plus the extra millisecond.
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(92)), now, margin),
+            SettleWait::Wait(std::time::Duration::from_millis(28_001))
+        );
+        // The longest wait is 30 s: 91 s old leaves 29.001 s, 90 s old leaves
+        // 30.001 s and keeps the time walk.
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(91)), now, margin),
+            SettleWait::Wait(std::time::Duration::from_millis(29_001))
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(90)), now, margin),
+            SettleWait::Active
+        );
+        // Quiet for exactly the threshold, but the wait would be 110 s.
+        assert_eq!(
+            reindex_settle_wait(Some(now - REINDEX_SETTLE_QUIET), now, margin),
+            SettleWait::Active
+        );
+    }
+
+    #[test]
+    fn settle_wait_keeps_the_time_walk_while_writes_are_landing() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(3)), now, margin),
+            SettleWait::Active
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now), now, margin),
+            SettleWait::Active
+        );
+        // Stamped ahead of this host's clock.
+        assert_eq!(
+            reindex_settle_wait(Some(now + chrono::Duration::seconds(5)), now, margin),
+            SettleWait::Active
+        );
+        // A margin shorter than twice the quiet period halves the threshold.
+        let short = chrono::Duration::seconds(8);
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(3)), now, short),
+            SettleWait::Active
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(5)), now, short),
+            SettleWait::Wait(std::time::Duration::from_millis(3_001))
+        );
+        assert_eq!(
+            reindex_settle_wait(
+                Some(now - chrono::Duration::seconds(3)),
+                now,
+                chrono::Duration::seconds(5)
+            ),
+            SettleWait::Wait(std::time::Duration::from_millis(2_001))
         );
     }
 
