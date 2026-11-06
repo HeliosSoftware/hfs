@@ -279,6 +279,18 @@ Ordered roughly by impact:
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
    also assumes a `Type/id` reference shape.
+   - **Known backend difference (#2495):** reference `:above` with a versioned URL
+     (`subject:above=http://example.org/fhir/Patient/p1/_history/1`) does not strip the version from
+     the query value on any backend. PostgreSQL and MongoDB strip `/_history/<vid>` from the stored
+     reference when writing, so they also return a resource stored as `.../Patient/p1/_history/2`;
+     SQLite and Elasticsearch store the reference as written and return only the unversioned one.
+     Documented, not aligned; the divergences are recorded in the shared modifier parity suite.
+   - **Upgrade note (#2495):** the shared extractor now parses versioned references
+     (`.../Type/id/_history/N`, optionally with `?query`/`#fragment`) to their target `Type/id`.
+     Elasticsearch documents indexed before the upgrade carry the wrong `resource_type`/`resource_id`
+     for such references (`_history`/`N`, or none), so run a tenant-wide `POST /$reindex` after
+     upgrading for `:Type` and bare-id reference searches to find them (the same limitation applies
+     to the `reference_target` field added by #2394).
 10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
     prefixes now match against the search value's implicit-precision range boundaries per spec:
     `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,
