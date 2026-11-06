@@ -889,8 +889,10 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
 - In a `transaction`, they are **resolved inside the open transaction** (#859).
   Before anything executes, the criteria are parsed by the same builder the batch
   arm and the resource endpoints use (`search::build_conditional_query`), so a
-  transaction admits what a batch admits: an unknown parameter, a modifier the
-  parameter's type does not define, or a valueless criterion is a `400` for the
+  transaction admits what a batch admits: an unknown parameter, a registered
+  parameter no backend evaluates (`_query`, `_type`, `_filter`, a `special`-typed
+  one such as `Location.near`; #866), a modifier the parameter's type does not
+  define, or a valueless criterion is a `400` for the
   whole bundle, a chain is `501`, and result parameters (`_format`, `_count`,
   `_sort`, …) are dropped. Criteria that leave nothing to match on are a `400`
   rather than "matches nothing", which on a `PUT` would create. The typed
