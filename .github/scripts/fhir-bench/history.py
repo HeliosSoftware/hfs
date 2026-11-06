@@ -353,15 +353,6 @@ def _clean(s):
     return re.sub(r'["\[\]\n|`]', "", s).strip()
 
 
-def headline_leg(legs, data):
-    """First leg with a value in every plotted run (never invent a point)."""
-    for lg in legs:
-        vs = data.get(lg) or []
-        if len(vs) >= 2 and all(v is not None for v in vs):
-            return lg
-    return None
-
-
 def y_unit(label):
     """Axis unit from the row label, e.g. '(resources/s)'; plain rows are requests/s."""
     l = label.lower()
@@ -372,8 +363,10 @@ def y_unit(label):
 
 
 def render_chart(label, leg, vals, xlabels):
-    """Single-series trend chart; the title names the row and the leg."""
-    if len(vals) < 2 or any(v is None for v in vals):
+    """Single-series trend chart; the title names the row and the leg.
+
+    vals/xlabels are the runs where the leg has a value (never a None point)."""
+    if len(vals) < 2 or len(vals) != len(xlabels) or any(v is None for v in vals):
         return ""
     return "\n".join([
         "```mermaid", "xychart-beta",
@@ -393,6 +386,15 @@ LEGEND_MODE = ('_Change in these rows is only computed against runs with the sam
                'the other legs always defer); today\'s Elasticsearch legs index '
                'inline during ingest. For Elasticsearch compare "Bulk Import … until '
                'searchable (resources/s)", which covers load plus indexing in both modes._')
+
+
+def leg_chart(label, leg, vals, xlabels):
+    """Chart of one leg over the runs where it has a value, or "" when the leg has
+    fewer than 2 points (a line needs two)."""
+    pts = [(x, v) for x, v in zip(xlabels, vals) if v is not None]
+    if len(pts) < 2:
+        return ""
+    return render_chart(label, leg, [v for _, v in pts], [x for x, _ in pts])
 
 
 def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_data_fn=None):
@@ -551,15 +553,16 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
             sec.append("\n" + hl)
         out.append("\n".join(sec) + "\n")
         if _is_chart_row(lab) and len(charts) < MAX_CHARTS:
-            lg = headline_leg(legs, data)
-            c = render_chart(lab, lg, data[lg], xlabels) if lg else ""
-            if c:
-                charts.append(c)
+            row_charts = [c for c in (leg_chart(lab, lg, data[lg], xlabels) for lg in legs) if c]
+            if row_charts:
+                charts.append(row_charts)  # MAX_CHARTS counts rows, not charts
 
     if charts:
-        out.append("Trend of the headline leg per row (runs oldest to newest; "
-                   "the other legs are in the tables above):\n")
-        out.extend(charts)
+        out.append("Trend per leg and row (runs oldest to newest; a chart only has the runs "
+                   "where that leg has a value; a leg with fewer than 2 such runs has none - "
+                   "its table row still shows every value):\n")
+        for row_charts in charts:
+            out.extend(row_charts)
     return _finish(out)
 
 
@@ -591,7 +594,7 @@ def main(argv=None):
     ap.add_argument("--current", required=True)
     ap.add_argument("--artifact-name", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--max-runs", type=int, default=5)
+    ap.add_argument("--max-runs", type=int, default=10)
     ap.add_argument("--workflow", default="fhir-benchmark.yml")
     ap.add_argument("--data-dir", default=None)
     # timestamp of the current run (defaults to now); decides if a host change is in the span
