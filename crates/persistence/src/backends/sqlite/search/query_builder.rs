@@ -2704,8 +2704,9 @@ mod tests {
                 false,
             ),
         ] {
-            let fragment =
-                QueryBuilder::new("default", "Observation").build(&multi_reference_query(&values));
+            let fragment = QueryBuilder::new("default", "Observation")
+                .build(&multi_reference_query(&values))
+                .unwrap();
             let rows = fragment
                 .sql
                 .strip_prefix("resource_key IN (")
@@ -2747,7 +2748,8 @@ mod tests {
         .unwrap();
         let fragment = QueryBuilder::new("t", "Observation")
             .with_param_offset(2)
-            .build(&multi_reference_query(&["Patient/p1", "Patient/p2"]));
+            .build(&multi_reference_query(&["Patient/p1", "Patient/p2"]))
+            .unwrap();
         let start = fragment.sql.find("SELECT resource_key").unwrap();
         let rows_sql = &fragment.sql[start..];
         let mut stmt = conn

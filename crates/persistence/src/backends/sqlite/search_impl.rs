@@ -3684,7 +3684,8 @@ mod tests {
         let sql_ids = |values: &[&str], exists_form: bool| -> BTreeSet<String> {
             let fragment = QueryBuilder::new("t", "Observation")
                 .with_param_offset(2)
-                .build(&query_for(values));
+                .build(&query_for(values))
+                .unwrap();
             let predicate = if exists_form {
                 membership_exists_predicate(&fragment.sql, "w.rk")
                     .unwrap_or_else(|| panic!("no EXISTS form for {values:?}: {}", fragment.sql))
@@ -3798,7 +3799,8 @@ mod tests {
         let sql_ids = |values: &[String], exists_form: bool| -> BTreeSet<String> {
             let fragment = QueryBuilder::new("t", "Observation")
                 .with_param_offset(2)
-                .build(&query_for(values));
+                .build(&query_for(values))
+                .unwrap();
             let predicate = if exists_form {
                 membership_exists_predicate(&fragment.sql, "w.rk")
                     .unwrap_or_else(|| panic!("no EXISTS form: {}", fragment.sql))
@@ -3885,7 +3887,8 @@ mod tests {
             });
             let fragment = QueryBuilder::new("t", "Observation")
                 .with_param_offset(2)
-                .build(&query);
+                .build(&query)
+                .unwrap();
             let params = bind_reference_params("t", &fragment);
 
             let rows_sql = format!(
