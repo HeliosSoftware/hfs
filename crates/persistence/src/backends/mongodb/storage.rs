@@ -10957,6 +10957,10 @@ enum SettleWait {
 /// instead of falling back to the time walk (#945).
 const REINDEX_SETTLE_QUIET: chrono::Duration = chrono::Duration::seconds(10);
 
+/// The longest a whole-type id walk sleeps for the catch-up margin to pass
+/// (#945). Beyond it the walk starts at once on the time walk.
+const REINDEX_SETTLE_MAX_WAIT: chrono::Duration = chrono::Duration::seconds(30);
+
 /// Decides what a whole-type id walk does about a type written within the
 /// catch-up `margin` (#945): the id phase reads rows older than
 /// `t0 - margin`, so a newer row would otherwise push the whole type into the
@@ -10980,6 +10984,11 @@ fn reindex_settle_wait(
     }
     // One extra millisecond: `newest + margin` itself still counts as inside.
     let remaining = margin - age + chrono::Duration::milliseconds(1);
+    // A longer wait is not worth it: the time walk is slower, but it starts
+    // now and a cancelled job does not sit asleep holding its slots.
+    if remaining > REINDEX_SETTLE_MAX_WAIT {
+        return SettleWait::Active;
+    }
     SettleWait::Wait(remaining.to_std().unwrap_or_default())
 }
 
@@ -12025,10 +12034,20 @@ mod reindex_walk_tests {
             reindex_settle_wait(Some(now - chrono::Duration::seconds(92)), now, margin),
             SettleWait::Wait(std::time::Duration::from_millis(28_001))
         );
-        // Exactly at the quiet threshold the writes count as stopped.
+        // The longest wait is 30 s: 91 s old leaves 29.001 s, 90 s old leaves
+        // 30.001 s and keeps the time walk.
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(91)), now, margin),
+            SettleWait::Wait(std::time::Duration::from_millis(29_001))
+        );
+        assert_eq!(
+            reindex_settle_wait(Some(now - chrono::Duration::seconds(90)), now, margin),
+            SettleWait::Active
+        );
+        // Quiet for exactly the threshold, but the wait would be 110 s.
         assert_eq!(
             reindex_settle_wait(Some(now - REINDEX_SETTLE_QUIET), now, margin),
-            SettleWait::Wait(std::time::Duration::from_millis(110_001))
+            SettleWait::Active
         );
     }
 
