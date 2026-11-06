@@ -343,8 +343,7 @@ where
         "Resource updated"
     );
 
-    let location = created
-        .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
+    let location = created.then(|| state.location_for_request(&tenant, &stored));
     build_update_response(
         status,
         &stored,
@@ -527,8 +526,7 @@ where
                 None,
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            let location =
-                state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
+            let location = state.location_for_request(&tenant, &stored);
             build_update_response(
                 StatusCode::CREATED,
                 &stored,
