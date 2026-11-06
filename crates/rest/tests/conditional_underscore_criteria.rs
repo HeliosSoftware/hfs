@@ -329,6 +329,35 @@ async fn query_in_transaction_entry_criteria_fails_the_bundle() {
     }
 }
 
+/// The SQLite backstop, seen from the REST layer. `_type` is a search parameter
+/// the router lets through (it means something to a system-level search, which
+/// is not routed), but SQLite has no condition for it: dropped, a type-level
+/// search for `_type=Observation` answered with the Patient. A parameter a
+/// backend cannot evaluate is a `400` naming it, not the unfiltered result set.
+#[tokio::test]
+async fn a_search_parameter_sqlite_cannot_evaluate_is_a_400_not_the_unfiltered_set() {
+    let server = test_server().await;
+    seed(&server).await;
+
+    let response = server
+        .get("/Patient?_type=Observation")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    assert_rejected_naming(&response, "_type", "GET /Patient?_type=Observation");
+
+    // The count path is gated the same way.
+    let response = server
+        .get("/Patient?_type=Observation&_summary=count")
+        .add_header(X_TENANT_ID, tenant())
+        .await;
+    assert_rejected_naming(
+        &response,
+        "_type",
+        "GET /Patient?_type=Observation&_summary=count",
+    );
+    assert_eq!(families(&server).await, untouched());
+}
+
 /// What must keep working: the `_` parameters the backends evaluate select
 /// their target in every conditional interaction.
 #[tokio::test]
