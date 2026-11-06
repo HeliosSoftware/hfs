@@ -278,10 +278,11 @@ async fn conditional_update_create_location_is_versioned() {
     );
 }
 
-/// `HFS_ENABLE_VERSIONING=false` advertises no version (no ETag), so the
-/// Location is the "does not track versions" `[base]/[type]/[id]`.
+/// `HFS_ENABLE_VERSIONING=false` drops only the `ETag`: HFS still keeps every
+/// version, so the Location still names the created one, and a GET on it is a
+/// vread of that version.
 #[tokio::test]
-async fn versioning_disabled_keeps_the_unversioned_location() {
+async fn versioning_disabled_still_sends_the_versioned_location() {
     let server = server_with(ServerConfig {
         enable_versioning: false,
         ..ServerConfig::for_testing()
@@ -290,19 +291,32 @@ async fn versioning_disabled_keeps_the_unversioned_location() {
     created.assert_status(StatusCode::CREATED);
     assert!(created.headers().get("etag").is_none());
     let id = created.json::<Value>()["id"].as_str().unwrap().to_string();
-    assert_eq!(location(&created), format!("{BASE}/Patient/{id}"));
+    let created_location = location(&created);
+    assert_eq!(created_location, format!("{BASE}/Patient/{id}/_history/1"));
 
     let upserted = put_patient(
         &server,
-        "loc-unversioned",
-        json!({"resourceType": "Patient", "id": "loc-unversioned"}),
+        "loc-unflagged",
+        json!({"resourceType": "Patient", "id": "loc-unflagged"}),
     )
     .await;
     upserted.assert_status(StatusCode::CREATED);
+    let upserted_location = location(&upserted);
     assert_eq!(
-        location(&upserted),
-        format!("{BASE}/Patient/loc-unversioned")
+        upserted_location,
+        format!("{BASE}/Patient/loc-unflagged/_history/1")
     );
+
+    for (location, id) in [
+        (created_location, id.as_str()),
+        (upserted_location, "loc-unflagged"),
+    ] {
+        let vread = server.get(path_of(&location)).await;
+        vread.assert_status_ok();
+        let body = vread.json::<Value>();
+        assert_eq!(body["id"], id);
+        assert_eq!(body["meta"]["versionId"], "1");
+    }
 }
 
 /// A header-routed tenant leaves the public base alone; the Location is
