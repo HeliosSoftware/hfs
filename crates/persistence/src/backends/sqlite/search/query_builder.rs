@@ -244,6 +244,50 @@ fn parameter_rows(name: &str, condition: &str) -> String {
 const PARAMETER_ROWS_HEAD: &str =
     "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND ";
 
+/// What a [`reference_versions_rows`] select starts with. Unlike
+/// [`PARAMETER_ROWS_HEAD`] its first term is parenthesized, which tells the
+/// two apart.
+const VERSION_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE (tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// How many bases one select of [`reference_versions_rows`] ORs together: the
+/// `OR` is a flat chain, so this bounds the expression depth, and the number
+/// of selects stays far below SQLite's compound-select limit (500).
+const VERSION_ROWS_CHUNK: usize = 50;
+
+/// The `_history` arm of a plain multi-value reference search (#2493):
+/// `resource_key`s whose stored reference is `<base>/_history/<n>` for one of
+/// the `count` bases bound at `?first..`. Every `OR` branch repeats the
+/// tenant, type and parameter tests, so SQLite plans each as its own bounded
+/// range seek on `idx_search_reference` (a `MULTI-INDEX OR`), never a scan
+/// (#1017, #1955); a `VALUES` join of the bases only seeks the prefix and
+/// reads every reference of the parameter. Selects of
+/// [`VERSION_ROWS_CHUNK`] bases are `UNION ALL`-ed. Binds nothing of its own:
+/// the placeholders are the ones of the exact `IN`.
+fn reference_versions_rows(name: &str, first: usize, count: usize) -> String {
+    let name = sql_string_literal(name);
+    let branches: Vec<String> = (0..count)
+        .map(|i| {
+            let p = first + i;
+            format!(
+                "(tenant_id = ?1 AND resource_type = ?2 AND param_name = {name} \
+                 AND value_reference >= ?{p} || '/_history/' \
+                 AND value_reference < ?{p} || '/_history0')"
+            )
+        })
+        .collect();
+    branches
+        .chunks(VERSION_ROWS_CHUNK)
+        .map(|chunk| {
+            format!(
+                "SELECT resource_key FROM search_index WHERE {}",
+                chunk.join(" OR ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
 /// Whether `sql` is exactly one [`parameter_rows`] select: a single
 /// parameter's membership, nothing intersected with it.
 pub(crate) fn is_parameter_rows(sql: &str) -> bool {
@@ -297,34 +341,74 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
     parameter_exists_predicate(rows_sql, outer_key)
 }
 
-/// [`membership_exists_predicate`] for a reference parameter's two selects
-/// (`value_reference` test `UNION ALL` the `value_reference_target` test, see
-/// `build_parameter_condition`): one `EXISTS` whose row test is the `OR` of the
-/// two. `None` when `rows_sql` is not exactly that shape.
+/// [`membership_exists_predicate`] for a reference parameter's selects (see
+/// `parameter_condition`): the `value_reference` test, optionally the
+/// `_history` arm of a plain multi-value list ([`reference_versions_rows`]),
+/// optionally the `value_reference_target` test, `UNION ALL`-ed in that order.
+/// One `EXISTS` whose row test is the `OR` of them. The `_history` arm becomes
+/// a flat filter on the version-stripped stored reference: the row is already
+/// pinned by `resource_key`, so there is nothing left to seek. `None` when
+/// `rows_sql` is not exactly that shape.
 fn reference_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
-    const TARGET_TEST: &str = "(value_reference_target IS NOT NULL AND value_reference_target IN (";
-    let (first, second) = rows_sql.split_once(" UNION ALL ")?;
-    if second.contains(" UNION ") {
-        return None;
-    }
+    const TARGET_TEST: &str = "value_reference_target IS NOT NULL AND value_reference_target IN (";
+    const BASES_TEST: &str = "value_reference IN (";
+    let mut arms = rows_sql.split(" UNION ALL ");
+    let first = arms.next()?;
     let first_rest = first.strip_prefix(PARAMETER_ROWS_HEAD)?;
-    let second_rest = second.strip_prefix(PARAMETER_ROWS_HEAD)?;
-    // `param_name = '<name>' AND (<cond>)` on both sides, same name.
-    let (name1, cond1) = first_rest.split_once(" AND (")?;
-    let (name2, cond2) = second_rest.split_once(" AND (")?;
-    if name1 != name2 || !name1.starts_with("param_name = ") {
+    // `param_name = '<name>' AND (<cond>)` on every select, same name.
+    let (name, cond1) = first_rest.split_once(" AND (")?;
+    if !name.starts_with("param_name = ") {
         return None;
     }
     let cond1 = cond1.strip_suffix(')')?;
-    let cond2 = cond2.strip_suffix(')')?;
-    if !cond2.starts_with(&TARGET_TEST[1..]) || cond2.contains("SELECT") || cond1.contains("SELECT")
-    {
+    if cond1.contains("SELECT") {
+        return None;
+    }
+    let mut tests = vec![format!("({cond1})")];
+    let mut seen_versions = false;
+    let mut seen_target = false;
+    for arm in arms {
+        if let Some(rest) = arm.strip_prefix(VERSION_ROWS_HEAD) {
+            if !rest.starts_with(name) {
+                return None;
+            }
+            // Only after the exact `IN`, once, and only when `cond1` is one.
+            let bases = cond1.strip_prefix(BASES_TEST)?;
+            if seen_target || !bases.ends_with(')') {
+                return None;
+            }
+            // One select per chunk of bases; they all collapse into one test.
+            if seen_versions {
+                continue;
+            }
+            seen_versions = true;
+            tests.push(format!(
+                "(instr(value_reference, '/_history/') > 0 AND \
+                 substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN ({bases})"
+            ));
+            continue;
+        }
+        let rest = arm.strip_prefix(PARAMETER_ROWS_HEAD)?;
+        let (arm_name, cond) = rest.split_once(" AND (")?;
+        let cond = cond.strip_suffix(')')?;
+        if seen_target
+            || arm_name != name
+            || !cond.starts_with(TARGET_TEST)
+            || cond.contains("SELECT")
+        {
+            return None;
+        }
+        seen_target = true;
+        tests.push(format!("({cond})"));
+    }
+    if tests.len() < 2 {
         return None;
     }
     Some(format!(
         "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} \
-         AND {name1} AND (({cond1}) OR ({cond2})))"
+         AND {name} AND ({}))",
+        tests.join(" OR ")
     ))
 }
 
@@ -1030,9 +1114,11 @@ impl QueryBuilder {
         // nested one level per term — ~18 ms/value (250 refs ≈ 4.6 s) and the
         // parse-depth blow-up behind #943; a flat `IN` is a single indexed
         // lookup of any length at ~1 node. Version-stripped bases are matched
-        // exactly, which covers every unversioned stored reference (references
-        // are stored unversioned in practice); the single-value path below
-        // keeps the full `_history` range match for the rare versioned case.
+        // exactly by the `IN`; a stored versioned reference (`Type/id/_history/n`)
+        // is matched by a second `UNION ALL`-ed select that seeks one `_history`
+        // range per base ([`reference_versions_rows`]), reusing the same
+        // placeholders. Without it a list returned less than one of its own
+        // values did (#2493): the list must be the union of its values.
         let is_plain_multi_reference = matches!(param.param_type, SearchParamType::Reference)
             && param.modifier.is_none()
             && param.values.len() >= 2
@@ -1099,6 +1185,14 @@ impl QueryBuilder {
         };
         let mut sql = parameter_rows(&param.name, &combined.sql);
         let mut params = combined.params;
+        if is_plain_multi_reference {
+            sql.push_str(" UNION ALL ");
+            sql.push_str(&reference_versions_rows(
+                &param.name,
+                param_offset + 1,
+                param.values.len(),
+            ));
+        }
         if !targets.is_empty() {
             let first = param_offset + params.len() + 1;
             let placeholders: Vec<String> = (0..targets.len())
@@ -2446,20 +2540,132 @@ mod tests {
             "expected a flat IN list, got: {}",
             fragment.sql
         );
-        // No per-value OR branches, and no `_history` range scan.
+        // The exact arm is the flat IN (no OR); only the `_history` arm ORs,
+        // one flat chain of prefixed ranges (one per value).
+        assert_eq!(fragment.sql.matches(" OR ").count(), 2, "{}", fragment.sql);
+        // Versioned stored references are matched by one `_history` select
+        // over the same placeholders (#2493), not by one range per value.
         assert!(
-            !fragment.sql.contains(" OR "),
-            "should not OR: {}",
+            fragment
+                .sql
+                .contains("value_reference >= ?3 || '/_history/'")
+                && fragment
+                    .sql
+                    .contains("value_reference < ?5 || '/_history0'"),
+            "expected the _history arm: {}",
             fragment.sql
         );
-        assert!(
-            !fragment.sql.contains("_history"),
-            "multi-value IN path is exact-base only: {}",
-            fragment.sql
-        );
+        assert_eq!(fragment.sql.matches("/_history/").count(), 3);
         // tenant, resource_type, + one base per value, + the same bases again
-        // for the `value_reference_target` select
+        // for the `value_reference_target` select; the `_history` arm binds
+        // nothing of its own.
         assert_eq!(fragment.params.len(), 8);
+    }
+
+    fn multi_reference_query(values: &[&str]) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        query
+    }
+
+    #[test]
+    fn test_multi_value_reference_exists_merge_keeps_versions() {
+        // The merged `EXISTS` form must keep the `_history` arm (#2493), as a
+        // flat filter, and still be a single `EXISTS`.
+        for (values, with_target) in [
+            (vec!["Patient/p1", "Patient/p2"], true),
+            // absolute URLs have no `value_reference_target` arm
+            (
+                vec![
+                    "http://example.org/fhir/Patient/p1",
+                    "https://other.example/fhir/Patient/p1",
+                ],
+                false,
+            ),
+        ] {
+            let fragment =
+                QueryBuilder::new("default", "Observation").build(&multi_reference_query(&values));
+            let rows = fragment
+                .sql
+                .strip_prefix("resource_key IN (")
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(&fragment.sql);
+            let exists = membership_exists_predicate(rows, "w.rk")
+                .unwrap_or_else(|| panic!("no EXISTS for {values:?}: {}", fragment.sql));
+            assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+            assert!(
+                exists.contains("INDEXED BY idx_search_composite"),
+                "{exists}"
+            );
+            assert!(
+                exists.contains("substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN (?3, ?4)"),
+                "{exists}"
+            );
+            assert_eq!(
+                exists.contains("value_reference_target IN"),
+                with_target,
+                "{exists}"
+            );
+            assert_eq!(exists.matches("(SELECT").count(), 1, "{exists}");
+        }
+    }
+
+    #[test]
+    fn test_multi_value_reference_versions_arm_seeks_the_index() {
+        // The `_history` arm must bound `value_reference` on the index per
+        // base, never scan `search_index` (#1017, #1955, #2493).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_index (tenant_id TEXT, resource_type TEXT, resource_key INTEGER, \
+               param_name TEXT, value_reference TEXT, value_reference_target TEXT);
+             CREATE INDEX idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) \
+               WHERE value_reference IS NOT NULL;
+             CREATE INDEX idx_search_reference_target ON search_index(tenant_id, resource_type, param_name, value_reference_target) \
+               WHERE value_reference_target IS NOT NULL;",
+        )
+        .unwrap();
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&multi_reference_query(&["Patient/p1", "Patient/p2"]));
+        let start = fragment.sql.find("SELECT resource_key").unwrap();
+        let rows_sql = &fragment.sql[start..];
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {rows_sql}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![
+                    "t",
+                    "Observation",
+                    "Patient/p1",
+                    "Patient/p2",
+                    "Patient/p1",
+                    "Patient/p2"
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN") && l.contains("search_index")),
+            "scan in plan: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.contains("idx_search_reference ")
+                && l.contains("value_reference>?")
+                && l.contains("value_reference<?")),
+            "no bounded range seek in plan: {plan:#?}"
+        );
     }
 
     #[test]
