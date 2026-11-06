@@ -88,6 +88,47 @@ const ALWAYS_INDEXED_PARAMS: &[&str] = &[
     "_source",
 ];
 
+/// The `_`-prefixed parameters a conditional criterion may name: the ones the
+/// storage backends *evaluate*, or refuse by name, but never drop (#866).
+///
+/// A registered `_` parameter is not enough. The spec registers `_query`
+/// (`Resource-query`, a token with no expression), `_type` (R4B and later) and
+/// `_filter`, and the loader keeps expressionless `_` parameters, so they are
+/// known to the registry — yet nothing indexes them, and a backend asked to
+/// filter on one has nothing to filter with. SQLite built no condition for it
+/// and a query without conditions matches every indexed resource of the type,
+/// so `DELETE Patient?_query=x` deleted the only Patient on file and
+/// `PUT Patient?_query=x` overwrote it. PostgreSQL drops a `special`-typed
+/// parameter the same way (`_query` and `_type` are `special` from R5) and finds
+/// nothing for a `token` one, which turns a conditional `PUT` into a create.
+///
+/// What each backend actually answers, read from its builders:
+///
+/// - `_id`, `_lastUpdated` — the resource row, on all of them;
+/// - `_tag`, `_profile`, `_security`, `_source`, `_language` — the extractor
+///   indexes them from `meta` (and `Resource.language`) like any typed
+///   parameter, so the regular token / uri path answers them;
+/// - `_text`, `_content` — full text, on SQLite and PostgreSQL; MongoDB refuses
+///   them with `TextSearchNotAvailable`, which is a failure, not a widening.
+///
+/// `_filter` is not in the list: only SQLite parses it, PostgreSQL drops it
+/// from R5 on and MongoDB cannot build it. `_has`, `_list` and `_in` are
+/// refused earlier, each with its own message. Every other `_` name is refused
+/// here when registered — an allowlist, so a parameter a later spec revision
+/// adds is refused until a backend learns to evaluate it, instead of being
+/// dropped.
+const EVALUATED_UNDERSCORE_PARAMS: &[&str] = &[
+    "_id",
+    "_lastUpdated",
+    "_tag",
+    "_profile",
+    "_security",
+    "_source",
+    "_language",
+    "_text",
+    "_content",
+];
+
 /// Splits form-urlencoded conditional criteria into decoded `(name, value)`
 /// pairs.
 ///
@@ -177,6 +218,19 @@ pub fn reject_empty_criterion_values(pairs: &[(String, String)]) -> StorageResul
 /// lands on a resource the client did not name. FHIR defines `Prefer: handling`
 /// for searches and is silent on conditional interactions, so the header is
 /// deliberately not consulted.
+///
+/// # Registered parameters nothing evaluates
+///
+/// A *known* parameter can be just as unusable (#866): `_query` is registered by
+/// the spec and indexed by nothing, so a backend handed it dropped the condition
+/// and the criteria matched every resource of the type. So a `_` parameter
+/// other than `_id`, `_lastUpdated`, `_tag`, `_profile`, `_security`, `_source`,
+/// `_language`, `_text` and `_content` — that is, `_query`, `_type`, `_filter`
+/// and whatever a later spec revision adds — and a `special`-typed parameter
+/// (`Location.near`) are refused by name, whatever their modifier and whatever
+/// else the criteria say, with the same `400` as an unknown one. SQLite refuses
+/// to build a query with such a parameter too, so a caller that bypasses this
+/// builder still cannot widen a match.
 pub fn build_conditional_parameters(
     registry: &SearchParameterRegistry,
     resource_type: &str,
@@ -240,6 +294,12 @@ pub fn build_conditional_parameters(
             .or_else(|| registry.get_param("Resource", name));
         if definition.is_none() && !ALWAYS_INDEXED_PARAMS.contains(&name) {
             return Err(unknown_parameter(resource_type, name));
+        }
+        // Registered, but nothing a backend can filter on: `_query`, `_type`,
+        // `_filter`, a `special`-typed parameter such as `Location.near`. Past
+        // this point every criterion is one a backend evaluates (#866).
+        if let Some(why) = unevaluated_reason(name, definition.as_ref().map(|d| d.param_type)) {
+            return Err(unevaluated_parameter(resource_type, name, why));
         }
         let raw_values = split_unescaped_commas(raw_value);
 
@@ -392,6 +452,30 @@ fn unknown_parameter(resource_type: &str, name: &str) -> StorageError {
         "conditional criteria name the search parameter '{name}', which is not known for \
          {resource_type}. Criteria guard a write, so an unknown parameter is an error rather \
          than ignored (Prefer: handling does not apply); nothing was written"
+    ))
+}
+
+/// Why conditional criteria cannot evaluate the *registered* parameter `name`
+/// of type `param_type` (`None` when it is unregistered — the fallback table
+/// then types it), or `None` when they can. See
+/// [`EVALUATED_UNDERSCORE_PARAMS`].
+fn unevaluated_reason(name: &str, param_type: Option<SearchParamType>) -> Option<&'static str> {
+    if name.starts_with('_') {
+        return (!EVALUATED_UNDERSCORE_PARAMS.contains(&name))
+            .then_some("no storage backend filters on it");
+    }
+    // The extractor writes no index row for a `special` parameter, so there is
+    // nothing for a backend to match: `Location.near`, `Composition.section-text`.
+    (param_type == Some(SearchParamType::Special))
+        .then_some("it is of type `special`, which nothing indexes")
+}
+
+fn unevaluated_parameter(resource_type: &str, name: &str, why: &str) -> StorageError {
+    query_error(format!(
+        "conditional criteria name the search parameter '{name}', which is registered for \
+         {resource_type} but not evaluated by conditional criteria: {why}. Criteria guard a \
+         write, so such a parameter is an error rather than ignored, which would widen the \
+         match to every {resource_type} (Prefer: handling does not apply); nothing was written"
     ))
 }
 
@@ -653,14 +737,224 @@ mod tests {
             // The fallback table's bare-name heuristics (`patient`, `subject`,
             // …) do not make a parameter known for this type.
             ("subject=Patient/1", "subject"),
-            // Not a result parameter, and nothing this layer evaluates.
-            ("_type=Patient", "_type"),
-            ("_query=mine", "_query"),
+            // A `_` name is no exception: it is known only if registered.
+            // (`_query` and `_type` are *not* here: the spec registers them, so
+            // they are not unknown — see
+            // `registered_but_unevaluated_parameters_are_refused_by_name`. This
+            // test used to list them and passed only because the fixture
+            // registry above does not define them, which is not the registry a
+            // backend has.)
+            ("_nickname=Lee", "_nickname"),
         ] {
             let error = build_conditional_query(&registry, "Patient", criteria)
                 .expect_err(criteria)
                 .to_string();
             assert!(error.contains(&format!("'{name}'")), "{criteria}: {error}");
+            assert!(
+                error.contains("is not known for Patient"),
+                "{criteria}: {error}"
+            );
+        }
+    }
+
+    /// The versions this build enables, so the checks below run against each
+    /// spec bundle the build can load.
+    // With one version enabled the pushes are the only statements clippy sees.
+    #[allow(clippy::vec_init_then_push)]
+    fn enabled_versions() -> Vec<helios_fhir::FhirVersion> {
+        let mut versions = Vec::new();
+        #[cfg(feature = "R4")]
+        versions.push(helios_fhir::FhirVersion::R4);
+        #[cfg(feature = "R4B")]
+        versions.push(helios_fhir::FhirVersion::R4B);
+        #[cfg(feature = "R5")]
+        versions.push(helios_fhir::FhirVersion::R5);
+        #[cfg(feature = "R6")]
+        versions.push(helios_fhir::FhirVersion::R6);
+        versions
+    }
+
+    /// The registry a backend with the spec files has: the embedded fallbacks,
+    /// then the version's spec bundle from the workspace `data/` directory.
+    /// Unlike [`registry`], it defines `_query`, `_type` and `_filter` exactly
+    /// as the spec does.
+    fn spec_registry(version: helios_fhir::FhirVersion) -> SearchParameterRegistry {
+        let loader = crate::search::SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+        for param in loader.load_embedded().expect("embedded fallbacks") {
+            let _ = registry.register(param);
+        }
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data")
+            .canonicalize()
+            .expect("workspace data dir");
+        for param in loader.load_from_spec_file(&data_dir).expect("spec bundle") {
+            let _ = registry.register(param);
+        }
+        registry
+    }
+
+    /// [`registry`] plus the spec's own definitions of the `_` parameters that
+    /// are registered but evaluated by no backend (#866): `Resource-query`
+    /// (token, no expression), `Resource-type`, `Resource-filter`, and the
+    /// `special`-typed `Location-near`.
+    fn registry_with_unevaluated_spec_parameters() -> SearchParameterRegistry {
+        let mut registry = registry();
+        for (code, param_type, base) in [
+            ("_query", SearchParamType::Token, "Resource"),
+            ("_type", SearchParamType::Token, "Resource"),
+            ("_filter", SearchParamType::Token, "Resource"),
+            ("near", SearchParamType::Special, "Location"),
+        ] {
+            registry
+                .register(
+                    SearchParameterDefinition::new(
+                        format!("http://hl7.org/fhir/SearchParameter/{base}-{code}"),
+                        code,
+                        param_type,
+                        "",
+                    )
+                    .with_base([base]),
+                )
+                .expect("register");
+        }
+        registry
+    }
+
+    /// #866: `_query` is a registered spec parameter with no expression, and a
+    /// backend that is handed it has nothing to filter on — SQLite dropped the
+    /// condition, so `DELETE Patient?_query=x` matched every Patient. Criteria
+    /// that guard a write must refuse such a parameter by name, whatever its
+    /// modifier, and whatever other criteria stand beside it.
+    #[test]
+    fn registered_but_unevaluated_parameters_are_refused_by_name() {
+        let fixture = registry_with_unevaluated_spec_parameters();
+        for (criteria, name) in [
+            ("_query=mine", "_query"),
+            ("_query:not=mine", "_query"),
+            ("_query:missing=true", "_query"),
+            ("family=Neal&_query=mine", "_query"),
+            ("_query=mine&family=Neal", "_query"),
+            ("_type=Patient", "_type"),
+            ("_filter=family eq \"Neal\"", "_filter"),
+        ] {
+            let error = build_conditional_query(&fixture, "Patient", criteria)
+                .expect_err(criteria)
+                .to_string();
+            assert!(error.contains(&format!("'{name}'")), "{criteria}: {error}");
+            // Refused for what it is, not as an unknown parameter: it is known.
+            assert!(!error.contains("is not known for"), "{criteria}: {error}");
+            assert!(
+                error.contains("not evaluated by conditional criteria"),
+                "{criteria}: {error}"
+            );
+        }
+
+        // The same for a `special` parameter that is not a `_` name: nothing
+        // indexes it, so a backend has no row to match.
+        let error = build_conditional_query(&fixture, "Location", "near=1|2|3|km")
+            .expect_err("near")
+            .to_string();
+        assert!(error.contains("'near'"), "{error}");
+        assert!(
+            error.contains("not evaluated by conditional criteria"),
+            "{error}"
+        );
+
+        // The refusal maps to the same error shape as every other refused
+        // criterion, which REST answers with a 400.
+        assert!(matches!(
+            build_conditional_query(&fixture, "Patient", "_query=mine"),
+            Err(StorageError::Search(SearchError::QueryParseError { .. }))
+        ));
+
+        // The decoded-pairs entry point is no way around it.
+        let pairs = vec![("_query".to_string(), "mine".to_string())];
+        assert!(build_conditional_query_from_pairs(&fixture, "Patient", &pairs).is_err());
+        assert!(
+            build_conditional_parameters(&fixture, "Patient", &pairs, scope()).is_err(),
+            "build_conditional_parameters is what every backend calls"
+        );
+    }
+
+    /// The same against the registry of a real backend, for every version this
+    /// build enables: the spec registers `_query` on all four, `_type` from R4B,
+    /// and `_filter` from R4B — so the refusal is not an artefact of a fixture.
+    #[test]
+    fn the_specs_unevaluated_parameters_are_refused_against_the_spec_registry() {
+        for version in enabled_versions() {
+            let registry = spec_registry(version);
+            let scope = ResourceTypeScope::version(version);
+            assert!(
+                registry.get_param("Resource", "_query").is_some(),
+                "FHIR {version} registers _query on Resource; the registry must reflect it"
+            );
+            for name in ["_query", "_type", "_filter"] {
+                let registered = registry.get_param("Resource", name).is_some();
+                for criteria in [format!("{name}=x"), format!("{name}:not=x")] {
+                    let error =
+                        super::build_conditional_query(&registry, "Patient", &criteria, scope)
+                            .expect_err(&criteria)
+                            .to_string();
+                    assert!(
+                        error.contains(&format!("'{name}'")),
+                        "FHIR {version} {criteria}: {error}"
+                    );
+                    // A name the version does not register is unknown, which
+                    // is refused too; a registered one is refused for what it is.
+                    assert_eq!(
+                        error.contains("not evaluated by conditional criteria"),
+                        registered,
+                        "FHIR {version} {criteria}: {error}"
+                    );
+                }
+            }
+            // The special-typed spec parameter on Location.
+            assert!(
+                registry.get_param("Location", "near").is_some(),
+                "FHIR {version} registers Location near"
+            );
+            let error =
+                super::build_conditional_query(&registry, "Location", "near=1|2|3|km", scope)
+                    .expect_err("near")
+                    .to_string();
+            assert!(error.contains("'near'"), "FHIR {version}: {error}");
+        }
+    }
+
+    /// What must keep working: the `_` parameters every backend answers from
+    /// its index or the resource row. Run against the spec registry so they are
+    /// accepted for the reason a backend accepts them.
+    #[test]
+    fn evaluated_underscore_parameters_are_accepted_against_the_spec_registry() {
+        for version in enabled_versions() {
+            let registry = spec_registry(version);
+            let scope = ResourceTypeScope::version(version);
+            let mut names = vec![
+                ("_id=p1", "_id"),
+                ("_lastUpdated=gt2020-01-01", "_lastUpdated"),
+                ("_tag=http://example.org/t|gold", "_tag"),
+                ("_profile=http://example.org/p", "_profile"),
+                ("_security=R", "_security"),
+                ("_source=http://example.org/feed", "_source"),
+                ("_content=fracture", "_content"),
+            ];
+            // Registered from R5 only; unregistered, it is an unknown name.
+            if registry.get_param("Resource", "_language").is_some() {
+                names.push(("_language=en", "_language"));
+            }
+            for (criteria, name) in names {
+                let query = super::build_conditional_query(&registry, "Patient", criteria, scope)
+                    .unwrap_or_else(|e| panic!("FHIR {version} {criteria} must be accepted: {e}"))
+                    .expect("some criteria");
+                assert_eq!(query.parameters.len(), 1, "FHIR {version} {criteria}");
+                assert_eq!(query.parameters[0].name, name, "FHIR {version} {criteria}");
+            }
+            // An evaluated parameter beside the refused one does not rescue it.
+            assert!(
+                super::build_conditional_query(&registry, "Patient", "_id=p1&_query=x", scope)
+                    .is_err()
+            );
         }
     }
 
