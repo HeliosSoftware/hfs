@@ -476,6 +476,27 @@ mod tests {
         }
         assert!(markers_trusted(Some(COMPOSITE_TUPLE_GENERATION)));
         assert!(markers_trusted(Some(COMPOSITE_TUPLE_GENERATION + 1)));
+        // #2394's generation 5 predates `tuple_code`.
+        assert!(!markers_trusted(Some(5)));
+    }
+
+    /// The hand-written 6 -> 5 rollback script names what this code uses.
+    #[test]
+    fn the_rollback_script_matches_the_names_in_the_code() {
+        let script = include_str!("../../../mongodb/composite-tuple-rollback.mongosh.js");
+        assert!(script.contains(&format!(
+            "db.{LAYOUT_COLLECTION}.deleteMany({{ layout: \"{LAYOUT_COMPOSITE_TUPLE_CODE}\" }})"
+        )));
+        let index = super::super::search_index_catalog::COMPOSITE_TUPLE_INDEX;
+        assert!(script.contains(&format!(
+            "db.{}.dropIndex(\"{index}\")",
+            SEARCH_INDEX_COLLECTION
+        )));
+        assert!(script.contains(&format!(
+            "\"search_indexes.generation\": {COMPOSITE_TUPLE_GENERATION} }}"
+        )));
+        assert!(script.contains(&format!("NumberInt({})", COMPOSITE_TUPLE_GENERATION - 1)));
+        assert!(script.contains("process.env.HFS_MONGODB_DATABASE"));
     }
 
     #[test]

@@ -1518,24 +1518,31 @@ mod tuple_marker_record_tests {
             .unwrap()
     }
 
-    /// N1: this binary booted while generation 5 was recorded, so nothing at
-    /// boot touched the markers; then an older binary booted, recorded 4 and
-    /// wrote rows without `tuple_code`. When this builder records 5 the markers
-    /// must already be gone, or they would cover those rows for good.
+    /// N1: this binary booted while generation 6 was recorded, so nothing at
+    /// boot touched the markers; then an older binary booted, recorded its own
+    /// generation (5 for #2394, 4 before it) and wrote rows without
+    /// `tuple_code`. When this builder records 6 the markers must already be
+    /// gone, or they would cover those rows for good.
     #[tokio::test]
     async fn recording_over_an_older_generation_deletes_the_markers_first() {
-        let Some(database) = scratch_database("recording_over_an_older_generation").await else {
-            return;
-        };
-        seed(&database, 4).await;
+        for older in [4, 5] {
+            let Some(database) = scratch_database("recording_over_an_older_generation").await
+            else {
+                return;
+            };
+            seed(&database, older).await;
 
-        builder(&database).record_if_needed().await.unwrap();
+            builder(&database).record_if_needed().await.unwrap();
 
-        let recorded = get_search_index_generation(&database).await.unwrap();
-        let markers = marker_count(&database).await;
-        database.drop().await.unwrap();
-        assert_eq!(recorded, Some(SEARCH_INDEX_GENERATION));
-        assert_eq!(markers, 0, "a marker survived the record of generation 5");
+            let recorded = get_search_index_generation(&database).await.unwrap();
+            let markers = marker_count(&database).await;
+            database.drop().await.unwrap();
+            assert_eq!(recorded, Some(SEARCH_INDEX_GENERATION));
+            assert_eq!(
+                markers, 0,
+                "a marker survived the record of generation {SEARCH_INDEX_GENERATION} over {older}"
+            );
+        }
     }
 
     /// The markers of a database already at this generation are kept.
@@ -1563,7 +1570,7 @@ mod tuple_marker_record_tests {
         };
         database
             .collection::<Document>("schema_version")
-            .insert_one(doc! { "_id": "schema_version", "search_indexes": { "generation": 4 } })
+            .insert_one(doc! { "_id": "schema_version", "search_indexes": { "generation": 5 } })
             .await
             .unwrap();
         database
@@ -1576,6 +1583,6 @@ mod tuple_marker_record_tests {
         let recorded = get_search_index_generation(&database).await.unwrap();
         database.drop().await.unwrap();
         assert!(outcome.is_err(), "the delete on a view must fail");
-        assert_eq!(recorded, Some(4));
+        assert_eq!(recorded, Some(5));
     }
 }

@@ -31,7 +31,7 @@
 //! match both shapes with exact `$in` lookups and no regex. It is purely
 //! additive: nothing from generation 4 is superseded.
 //!
-//! Generation 5 adds `idx_search_composite_tuple_qty`, a partial index over the
+//! Generation 6 adds `idx_search_composite_tuple_qty`, a partial index over the
 //! `tuple_code` that the quantity row of a token+quantity composite group
 //! carries (the codes of the group's token row), so `code=X AND value>N` is one
 //! covered range scan. Rows written before it have no `tuple_code`; the planner
@@ -69,8 +69,8 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// over the stored range `[value_date, value_date_end)` stays covered (#1391).
 /// Generation 5 = generation 4 plus `idx_search_reference_target_v2` over the
 /// absolute-reference side field `value_reference_target` (#2394).
-/// Generation 5 = generation 4 plus [`COMPOSITE_TUPLE_INDEX`].
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 5;
+/// Generation 6 = generation 5 plus [`COMPOSITE_TUPLE_INDEX`] (cq-p3).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 6;
 
 /// The generation that added `value_date_end` to every date row (#1391), and
 /// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
@@ -89,7 +89,9 @@ const _: () = assert!(DATE_RANGE_GENERATION <= SEARCH_INDEX_GENERATION);
 /// database recorded below it was last booted by a binary that writes rows
 /// without `tuple_code`, so its `tuple_code` markers are not trusted
 /// (`composite_layout`).
-pub(crate) const COMPOSITE_TUPLE_GENERATION: i32 = 5;
+/// Generation 5 (#2394) only normalized references, so a database recorded at
+/// 5 was last booted by a binary that writes no `tuple_code` either.
+pub(crate) const COMPOSITE_TUPLE_GENERATION: i32 = 6;
 
 const _: () = assert!(COMPOSITE_TUPLE_GENERATION <= SEARCH_INDEX_GENERATION);
 
@@ -196,7 +198,7 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             "idx_search_quantity_v2",
             &["value_quantity_value", "value_quantity_unit"],
         ),
-        // Generation 5: equality on the group's code, then the quantity range,
+        // Generation 6: equality on the group's code, then the quantity range,
         // then `resource_id` (ESR), so a code+value composite is covered.
         // `tuple_code` is an array (the bare code and `system|code` of each
         // coding), hence one entry per form; partial on its presence.
@@ -486,7 +488,8 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 5);
+        assert_eq!(SEARCH_INDEX_GENERATION, 6);
+        assert_eq!(COMPOSITE_TUPLE_GENERATION, 6);
     }
 
     #[test]

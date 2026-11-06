@@ -207,7 +207,7 @@ async fn a_fresh_database_written_during_its_first_background_build_logs_no_remi
     assert!(captured(logs, UNKNOWN_ROWS_REMINDER).is_empty());
 
     let record = search_indexes_record(&cs, &db_name).await;
-    assert_eq!(record.get_i32("generation"), Ok(5));
+    assert_eq!(record.get_i32("generation"), Ok(6));
     assert!(
         !record.contains_key("empty_at_generation"),
         "recording the generation removes the marker: {record:?}"
@@ -243,7 +243,7 @@ async fn rows_written_before_the_first_recorded_generation_log_no_reminder_on_th
     );
     assert_eq!(
         record.get_i32("empty_at_generation"),
-        Ok(5),
+        Ok(6),
         "the first boot found search_index empty with no generation: {record:?}"
     );
 
@@ -277,7 +277,7 @@ async fn rows_written_before_the_first_recorded_generation_log_no_reminder_on_th
     assert!(captured(logs, UNKNOWN_ROWS_REMINDER).is_empty());
 
     let record = search_indexes_record(&cs, &db_name).await;
-    assert_eq!(record.get_i32("generation"), Ok(5));
+    assert_eq!(record.get_i32("generation"), Ok(6));
     assert!(!record.contains_key("empty_at_generation"), "{record:?}");
 }
 
@@ -329,7 +329,7 @@ async fn an_upgraded_database_with_rows_and_no_recorded_generation_still_gets_on
     assert!(captured(logs, UNKNOWN_ROWS_REMINDER).is_empty());
 
     let record = search_indexes_record(&cs, &db_name).await;
-    assert_eq!(record.get_i32("generation"), Ok(5));
+    assert_eq!(record.get_i32("generation"), Ok(6));
     assert!(!record.contains_key("empty_at_generation"), "{record:?}");
 
     // A later boot is on the current generation: up to date, and silent.
@@ -345,7 +345,7 @@ async fn an_upgraded_database_with_rows_and_no_recorded_generation_still_gets_on
             again.wait_for_search_index_build().await,
             Some(BuildOutcome::UpToDate)
         ),
-        "a database already at the current generation (5) is up to date"
+        "a database already at the current generation (6) is up to date"
     );
     assert_eq!(captured(logs, REINDEX_REMINDER).len(), 1);
 }
@@ -401,7 +401,7 @@ async fn a_failed_boot_count_logs_the_hedged_reminder_and_records_no_marker() {
     );
 
     let record = search_indexes_record(&cs, &db_name).await;
-    assert_eq!(record.get_i32("generation"), Ok(5));
+    assert_eq!(record.get_i32("generation"), Ok(6));
     assert!(
         !record.contains_key("empty_at_generation"),
         "a failed count records no marker: {record:?}"

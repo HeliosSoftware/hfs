@@ -7,7 +7,7 @@ HFS records its MongoDB schema version in the `schema_version` collection of eac
 The collection holds exactly one document:
 
 ```javascript
-{ _id: "schema_version", version: 17, search_indexes: { generation: 5, completed_at: ISODate("..."), contained_rows_moved: true, references_normalized: true } }
+{ _id: "schema_version", version: 17, search_indexes: { generation: 6, completed_at: ISODate("..."), contained_rows_moved: true, references_normalized: true } }
 ```
 
 `search_indexes.empty_at_generation` appears only before the first build records a generation. `search_indexes.reference_normalize_last_id` holds the resume point, per collection, of the version 17 reference backfill while it runs; `search_indexes.references_normalized` is set when it finishes.
@@ -48,7 +48,7 @@ MongoDB keeps every index current on writes whichever build runs. An older build
 | 16 | `bulk_submission_changes.idx_bulk_changes_resource`, used by a resource or type purge (#2279) | after v0.2.6 | ignores the index, but not the purge behaviour that arrived with it (#2279): a build that records a version below 16 (every release up to v0.2.6) purges less. Its resource purge (`DELETE /{type}/{id}/$purge`) and type purge (`POST /{type}/$purge`) leave the prior resource bodies that a `$bulk-submit` kept in `bulk_submission_changes.previous_content` and the `secondary_sync_failures` records of what they purged. Its tenant purge (`DELETE /admin/tenants/{id}?purge=true`) also leaves the tenant's documents in `bulk_submission_changes`, `bulk_entry_results`, `bulk_submit_files`, `bulk_manifests` and `bulk_submissions`, its `secondary_sync_failures` records and its bulk export and submit output files. The newer build's instance `$purge` cannot finish the job afterwards: it answers NotFound for a resource with no `resources` or `resource_history` rows. Run no purge while the older build serves; if one ran, follow [Crossed 16](#crossed-16-after-a-purge). |
 | 17 | Reference normalization (#2394): `search_index.value_reference` is stored without `/_history/N`, absolute `http(s)` references also carry `value_reference_target` (`Type/id`), and the partial index `idx_search_reference_target_v2` (search-index generation 5) serves it. A background backfill rewrites existing rows in `search_index` and `search_index_contained`; `search_indexes.references_normalized` marks it done. Until the marker and the index exist, readers keep the regex arms. | after v0.2.6 | refuses to start where it is from #2352 on (it knows only 16), so lower `version` as in [Rolling back](#rolling-back-to-an-older-build). Normalized rows still match exact `Type/id` references. Any reference an older build writes with `/_history/N` is not normalized, and the older build's own `_history` arms find it; the newer build finds it only in legacy mode. Follow [Crossed 17](#crossed-17-reference-normalization). |
 
-A change that raises `SCHEMA_VERSION` adds its row here. The `SCHEMA_VERSION` doc comment in `crates/persistence/src/backends/mongodb/schema.rs` lists the versions from 7 on too.
+A change that raises `SCHEMA_VERSION` adds its row here. A change that only adds a `search_index` index raises `search_indexes.generation` instead, as the `SCHEMA_VERSION` doc comment says; those changes are listed under [search_index generations after v0.2.6](#search_index-generations-after-v026). The `SCHEMA_VERSION` doc comment in `crates/persistence/src/backends/mongodb/schema.rs` lists the versions from 7 on too.
 
 The version does not cover:
 
@@ -64,6 +64,16 @@ The version does not cover:
 | v0.2.4 | 11 | 4 | no |
 | v0.2.5 | 13 | 4 | no |
 | v0.2.6 | 15 | 4 | no |
+
+### search_index generations after v0.2.6
+
+| Change | `version` | `search_indexes.generation` | Adds |
+|---|---|---|---|
+| #2352 | 16 | 4 | – |
+| #2394 | 17 | 5 | `idx_search_reference_target_v2`, reference backfill |
+| cq-p3 | 17 | 6 | `idx_search_composite_tuple_qty`, `tuple_code` on token+quantity composite rows, the `search_layout` markers |
+
+cq-p3 keeps `SCHEMA_VERSION` at 17 on purpose. Everything it adds is guarded by the generation, not the version: a build at generation 5 (or lower) that starts on the database records its own generation, every generation-6 instance then stops trusting the `tuple_code` markers within 30 seconds, and the next generation-6 boot deletes them before it records 6 again. A version 18 would add nothing to that and would make a rollback to a #2394 build also lower `version` by hand. `search_layout` holds only those markers and needs no schema step: MongoDB creates it on the first marker write. See [Token+quantity composites](search-indexes.md#tokenquantity-composites-generation-6).
 
 Builds from #2352 on refuse a newer version; the build that introduced the refusal (#2352) has `SCHEMA_VERSION` 16, and a later build may have a higher one. There are two ways to read another build's value:
 
@@ -154,7 +164,7 @@ Each mongosh command connects with the URL alone, so a URL with a query string s
    - `NumberInt` stores a 32-bit integer, the type HFS writes.
    - Change only `version`; `search_indexes` belongs to the generation steps.
 
-6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are generation 4 up to v16, and generation 5 from v17.
+6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are generation 4 up to v16, generation 5 from v17, and generation 6 from cq-p3 (still v17); see [search_index generations after v0.2.6](#search_index-generations-after-v026).
 
 7. Start the older build. Its schema steps create nothing new, except that v0.2.0 and v0.2.1 build `idx_resources_type_deleted` and the generation-1 indexes. It records its own version and ignores what the table lists above its version. v0.2.0 and v0.2.1 also replace the whole `schema_version` document at each start, which removes `search_indexes` (the generation and `contained_rows_moved`) along with the old version. The newer build then treats the generation as unrecorded: it moves the contained rows again and logs the `$reindex` reminder for #1391.
 
@@ -173,7 +183,7 @@ Then follow up:
 - Crossed 16, and a purge ran while the older build served: run the cleanup in [Crossed 16: after a purge](#crossed-16-after-a-purge). Until then the prior resource bodies the purge was meant to erase are still in `bulk_submission_changes`. With no purge, no action.
 - The older build was v0.2.3 or earlier (`search_indexes.generation` 3 or lower, or none recorded for v0.2.0 and v0.2.1, see [Releases](#releases)) and took writes: run a full `POST /$reindex`. These builds write date rows without `value_date_end` (#1391) and composite rows without `composite_slot`. Until the rows are rewritten, date searches with the `eq`, `ne`, `gt`, `ge`, `le`, `eb` and `ap` prefixes miss them, and a same-type composite search fails with an error asking for `$reindex`. The newer build logs a `warn` naming `$reindex` at that first start. See [Upgrading: reindex the date rows](search-indexes.md#upgrading-reindex-the-date-rows) and, for the tenant-wide route the composite rows need, [Composite parameters](search-indexes.md#composite-parameters). The full `$reindex` also rewrites `missing_params`, so the metadata-only reindex below is not needed then.
 - The older build was v0.2.4 or v0.2.5 and took writes: run the metadata-only reindex without `skipExistingMetadata`.
-- The rollback crossed `search_index` generation 5: the newer build deletes the token+quantity markers before it records generation 5 again. Run the activating `$reindex` again; see [Token+quantity composites](search-indexes.md#rollback-and-restore).
+- The rollback crossed `search_index` generation 6: the newer build deletes the token+quantity markers before it records generation 6 again. Run the activating `$reindex` again; see [Token+quantity composites](search-indexes.md#rollback-and-restore).
 
 CI pins the boot behaviour this relies on in `crates/persistence/tests/mongodb/schema_version_guard.rs`.
 

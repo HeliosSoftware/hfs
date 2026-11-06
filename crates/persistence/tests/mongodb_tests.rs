@@ -19454,7 +19454,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(5)
+        Ok(6)
     );
 }
 
@@ -19579,7 +19579,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(5)
+        Ok(6)
     );
 }
 
@@ -19667,7 +19667,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(5));
+    assert_eq!(si.get_i32("generation"), Ok(6));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
