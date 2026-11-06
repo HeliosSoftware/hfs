@@ -4,7 +4,7 @@ Scripts for `.github/workflows/fhir-benchmark.yml`. The workflow runs one job pe
 
 ## Legs
 
-Six legs: `sqlite`, `postgres`, `mongodb`, `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch` (`resolve-matrix.sh` maps the `backend` input to legs).
+Six legs: `sqlite`, `postgres`, `mongodb`, `sqlite-elasticsearch`, `postgres-elasticsearch`, `mongodb-elasticsearch` (`resolve-matrix.sh` maps the `backend` input to legs). `backend` is a comma-separated list: any leg or alias (`core`/`all`, `sqlite-postgres`, `elasticsearch`), and a `-` prefix removes legs, e.g. `core,-sqlite,-sqlite-elasticsearch` or `all,-elasticsearch`. Inclusions are unioned, then exclusions subtracted (only exclusions start from `core`); the result keeps the canonical leg order. An unknown token or an empty result fails in `setup` before the build.
 
 ## Suites, in run order
 
@@ -36,7 +36,7 @@ On the Elasticsearch legs the rows `↳ search indexing (seconds)` read `(= inge
 Each run produces, in this order:
 
 - **Job summary text.** The comparison tables (unchanged), then a collapsed `### Charts` section: one for the compare job (`md_charts.py compare --in comparison.md`) and one per leg (`md_charts.py leg --box ... --leg ... --run-dir ...`). Both are display only and never fail the job.
-- **Run history block** (`history.py`): the last 5 runs of the branch plus the latest `main` run, as tables and Mermaid charts. Old and new row labels are joined (see `LABEL_ALIASES`); the old (deferred-indexing) Elasticsearch ingest and index cells are shown with the marker `ᵈ`, and their change is only computed against runs with the same indexing mode. See [Run history](#run-history).
+- **Run history block** (`history.py`): the last 10 runs of the branch plus the latest `main` run, as tables and one Mermaid chart per leg and row. Old and new row labels are joined (see `LABEL_ALIASES`); the old (deferred-indexing) Elasticsearch ingest and index cells are shown with the marker `ᵈ`, and their change is only computed against runs with the same indexing mode. See [Run history](#run-history).
 - **Standalone HTML report**, artifact `fhir-bench-report-<run id>`: one dark file (`report_html.py`, template `report_template.html`), uploaded with `archive: false` so it is not zipped. It opens in the browser through the `Full report (HTML)` link on the last line of the summary; that link works for signed-in viewers of the repository only.
   Sections: run summary, 1 Is this run valid?, 2 Results, 3 Detail (timeline and host load, Bulk Import and Batch/Transaction Import by phase, import comparison, `$sql-run` by view, trend), 4 Full data. CI passes `--no-shapes`, so there is no "Search by query shape" section.
 - **Report data**, artifact `fhir-bench-report-data-<run id>` (`report-data.json`). Later runs read it (`history.py --data-dir`) for the trend in the HTML report.
@@ -45,7 +45,7 @@ All four artifacts and the summary are best effort (`continue-on-error`); a fail
 
 ## Run history
 
-How many earlier runs: the workflow input `history_runs` (number, default 5, clamped to 1..20; anything that is not an integer falls back to 5). It sets `history.py --max-runs` and, plus one for the current run, `report_html.py --trend-max`. Besides that many runs of the branch the block also takes the latest `main` run. Runs with no benchmark artifact left (never uploaded, or expired) are skipped and do not use up a slot.
+How many earlier runs: the workflow input `history_runs` (number, default 10, clamped to 1..20; anything that is not an integer falls back to 10). It sets `history.py --max-runs` and, plus one for the current run, `report_html.py --trend-max`. Besides that many runs of the branch the block also takes the latest `main` run. Runs with no benchmark artifact left (never uploaded, or expired) are skipped and do not use up a slot.
 
 Runs before 2026-10-27 have no `fhir-bench-report-data` artifact, so the HTML trend would be empty. As a TEMPORARY fallback `history.py` (flag `--legacy-trend`, on by default) derives one point per leg from that run's `comparison.md` with `legacy_points.py` and writes `<data-dir>/<run id>/legacy-point.json`; `report_html.py` reads it when `report-data.json` is absent. Nothing is invented: values come only from the tables, are whole numbers (`"rounded": true`), `n/a` cells and failed legs give no point, and the date is the run start passed by the caller, not a value from the file. The fallback stops on its own after `legacy_points.EXPIRES` (2026-12-15) with a `::warning::`.
 
@@ -58,7 +58,7 @@ In the ingest (`↳ ingest, until Completed ...`) and index (`↳ search indexin
 - non-Elasticsearch legs: always `deferred`, before and after #2248, so they stay comparable;
 - `*+ES` legs: `inline` when the run's `comparison.md` has the row `↳ search indexing (seconds)` (its ES cells read `N s (= ingest)`); `deferred` when it has an old index row (`Bulk Import: index rebuild`, `bulk-import initial index`, `↳ search-index rebuild after Completed`); otherwise `unknown`, which only compares with `unknown`.
 
-Old Elasticsearch values of deferred runs are shown, with `ᵈ` after the number (`313ᵈ`), only in those two blocks and only on ES legs. Every block carries an italic legend line under the table explaining the change rule; the ingest and index blocks add a second line about the mode and `ᵈ` when they have at least one ES leg with data. For Elasticsearch compare `Bulk Import ... until searchable (resources/s)`, which covers load plus indexing in both modes. Mermaid charts are unchanged. No block is removed or hidden (the `reindex, $reindex Encounter` block stays).
+Old Elasticsearch values of deferred runs are shown, with `ᵈ` after the number (`313ᵈ`), only in those two blocks and only on ES legs. Every block carries an italic legend line under the table explaining the change rule; the ingest and index blocks add a second line about the mode and `ᵈ` when they have at least one ES leg with data. For Elasticsearch compare `Bulk Import ... until searchable (resources/s)`, which covers load plus indexing in both modes. Mermaid charts are drawn per leg: each chart has only the runs where that leg has a value, and a leg gets a chart only when it is missing from at most 50% of the plotted runs (the current run counts) and has at least 2 points; its table row always shows every value. At most 6 rows get charts. No block is removed or hidden (the `reindex, $reindex Encounter` block stays).
 
 ### Host changes
 
@@ -112,7 +112,7 @@ Every leg uses the remote Docker daemon from the `DOCKER_HOST` secret, shared wi
 
 ## Run workflow form
 
-`Use workflow from` selects the branch whose workflow and scripts run. Fields: `backend`, `tests`, `vus`, `duration`, `run_id`, `history_runs`, `log_level`; Postgres: `pg_shared_buffers`, `pg_effective_cache_size`, `pg_work_mem`, `pg_max_wal_size`, `pg_min_wal_size`, `pg_wal_buffers`, `pg_checkpoint_timeout`, `hfs_pg_max_connections`; `max_parallel` (1..2); `es_heap`, `es_sync_mode`; `mongo_wt_cache_gb`, `hfs_mongo_max_connections`. The indexing recipes are fixed per leg type in `bulk-import.sh` (see above) and are deliberately not form fields.
+`Use workflow from` selects the branch whose workflow and scripts run. Fields: `backend` (free-text list, see above), `tests`, `vus`, `duration`, `run_id`, `history_runs`, `log_level`; Postgres: `pg_shared_buffers`, `pg_effective_cache_size`, `pg_work_mem`, `pg_max_wal_size`, `pg_min_wal_size`, `pg_wal_buffers`, `pg_checkpoint_timeout`, `hfs_pg_max_connections`; `max_parallel` (1..2); `es_heap`, `es_sync_mode`; `mongo_wt_cache_gb`, `hfs_mongo_max_connections`. The indexing recipes are fixed per leg type in `bulk-import.sh` (see above) and are deliberately not form fields.
 
 ## Tests
 

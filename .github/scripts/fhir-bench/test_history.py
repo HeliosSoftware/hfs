@@ -43,7 +43,7 @@ def run(n, date="2026-10-0%d", branch="feat"):
 
 def args(**kw):
     d = dict(repo="o/r", workflow="w.yml", branch="feat", run_id="999",
-             artifact_name="a", max_runs=5)
+             artifact_name="a", max_runs=10)
     d.update(kw)
     d["artifact_name"] = d.get("artifact_name")
     return types.SimpleNamespace(**d)
@@ -110,8 +110,9 @@ class T(unittest.TestCase):
         fr, fc = self._fetch()
         out = history.build(args(), fr, fc, FIXTURE)
         n = out.count("```mermaid")
-        self.assertTrue(1 <= n <= history.MAX_CHARTS)
-        self.assertEqual(n, 5)  # prewarm, sub-row and seconds row excluded
+        self.assertTrue(1 <= n <= history.MAX_CHARTS * 6)
+        # 5 chart rows x 6 legs; prewarm, sub-row and seconds row excluded
+        self.assertEqual(n, 30)
         self.assertIn("xychart-beta", out)
         self.assertNotIn('title "prewarm', out)
         self.assertIn("(+", out)  # change vs previous run
@@ -122,7 +123,8 @@ class T(unittest.TestCase):
         md = "### Throughput\n\n| Suite | a | b |\n|---|---:|---:|\n" + rows + "\n"
         out = history.build(args(), lambda *a: [run(1), run(2)],
                             lambda *a: md, md)
-        self.assertEqual(out.count("```mermaid"), history.MAX_CHARTS)
+        # 2 legs per row; MAX_CHARTS counts rows
+        self.assertEqual(out.count("```mermaid"), history.MAX_CHARTS * 2)
 
     def test_deterministic(self):
         fr, fc = self._fetch()
@@ -218,6 +220,17 @@ class T(unittest.TestCase):
         self.assertIn('title "crud - sqlite"', out)
         c = history.render_chart("r", "leg", [1.0, None], ["a", "b"])
         self.assertEqual(c, "")
+
+    def test_default_max_runs_is_10(self):
+        ap_defaults = {}
+        orig = history.argparse.ArgumentParser.add_argument
+
+        def spy(self, *a, **k):
+            ap_defaults[a[0]] = k.get("default")
+            return orig(self, *a, **k)
+        with mock.patch.object(history.argparse.ArgumentParser, "add_argument", spy):
+            history.main(["--bogus"])
+        self.assertEqual(ap_defaults["--max-runs"], 10)
 
     def test_main_exit_zero(self):
         self.assertEqual(history.main(["--bogus"]), 0)
@@ -618,6 +631,67 @@ class YAxisUnit(unittest.TestCase):
             self.assertIn('y-axis "%s"' % u, c)
             self.assertNotIn('y-axis "value"', c)
             self.assertNotIn("`", c.split("title")[1].split("\n")[0])
+
+
+
+def _md(rows, legs):
+    head = "### Throughput\n\n| Suite | " + " | ".join(legs) + " |\n|---|" + "---:|" * len(legs) + "\n"
+    return head + "\n".join(
+        "| " + lab + " | " + " | ".join(vals) + " |" for lab, vals in rows) + "\n"
+
+
+def _mermaid_blocks(out):
+    return [b.split("```")[0] for b in out.split("```mermaid")[1:]]
+
+
+class PerLegCharts(unittest.TestCase):
+    LEGS = ["a", "b", "c"]
+
+    def _build(self, present, n=10):
+        """n runs (last = current); present[leg] = set of 1-based positions with a value."""
+        def text(pos):
+            vals = [str(10 * (i + 1) + pos) if pos in present[lg] else "n/a"
+                    for i, lg in enumerate(self.LEGS)]
+            return _md([("crud", vals)], self.LEGS)
+        return history.build(args(), lambda *a: [run(i) for i in range(1, n)],
+                             lambda repo, r, nm: text(r["number"]), text(n))
+
+    def test_mixed_full_and_partial_run(self):
+        legs = ["sqlite", "postgres", "mongodb"]
+        full = _md([("crud", ["1", "2", "3"])], legs)
+        part = _md([("crud", ["n/a", "5", "6"])], legs)
+        texts = {1: full, 2: part, 3: full}
+        out = history.build(args(), lambda *a: [run(1), run(2), run(3)],
+                            lambda repo, r, n: texts[r["number"]], full)
+        blocks = _mermaid_blocks(out)
+        self.assertEqual(len(blocks), 3)
+        by = {b.split("\n")[2]: b for b in blocks}
+        self.assertEqual(by['    title "crud - postgres"'].count('"#'), 3)
+        self.assertEqual(len(by['    title "crud - postgres"'].split("line [")[1].split("]")[0].split(",")), 4)
+        self.assertEqual(len(by['    title "crud - sqlite"'].split("line [")[1].split("]")[0].split(",")), 3)
+        for b in blocks:
+            for bad in ("None", "nan", ",,"):
+                self.assertNotIn(bad, b)
+
+    def test_threshold_half_missing_draws(self):
+        present = {"a": set(range(1, 11)), "b": set(range(1, 6)), "c": set(range(1, 5))}
+        out = self._build(present)
+        titles = [b.split("\n")[2] for b in _mermaid_blocks(out)]
+        self.assertIn('    title "crud - a"', titles)
+        self.assertIn('    title "crud - b"', titles)   # 5 of 10
+        self.assertNotIn('    title "crud - c"', titles)  # 4 of 10
+        self.assertIn("| `c` |", out)  # table still shows it
+
+    def test_single_point_never_charts(self):
+        present = {"a": set(range(1, 11)), "b": {10}, "c": {9}}
+        out = self._build(present)
+        titles = [b.split("\n")[2] for b in _mermaid_blocks(out)]
+        self.assertEqual(titles, ['    title "crud - a"'])
+
+    def test_no_headline_leg(self):
+        self.assertFalse(hasattr(history, "headline_leg"))
+
+
 
 if __name__ == "__main__":
     unittest.main()
