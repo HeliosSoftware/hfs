@@ -13,8 +13,7 @@ on:
   # instead of on the release tag. Each of those jobs is a matrix over
   # `matrix.os`: one `Linux` leg for pushes and PRs, a `macOS` leg here.
   # Windows has its own nightly, windows-nightly.yml, at the same time and
-  # without a Windows agent. The `runner.os == 'Windows'` steps left in this
-  # file only run if a Windows agent is ever added back.
+  # without a Windows agent; nothing in this file runs on Windows.
   # 06:30 UTC sits in the quietest stretch of the week's runner demand
   # (06:00-11:00 UTC).
   # Check the latest nightlies are green before cutting a `v*` tag.
@@ -90,20 +89,20 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Test Rust' || format('Test Rust ({0})', matrix.os) }}
     # Linux for pushes and pull requests; macOS for the nightly /
     # manual pass (see `on.schedule`). Pinned rather than bare `[self-hosted]`:
-    # unpinned, this job and the other unpinned ones spread over the Windows and
-    # macOS agents too, and starved the jobs that can only run there.
+    # unpinned, this job and the other unpinned ones spread over the macOS
+    # agent too, and starved the jobs that can only run there.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     # Bound the whole job so a genuine hang fails fast instead of parking a
-    # runner for hours. Healthy runs on the slower runners (the Windows agent)
-    # take ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
+    # runner for hours. Healthy runs on the slowest runner (the old Windows
+    # agent) took ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
     timeout-minutes: 180
     steps:
       - name: Verify DOCKER_HOST is set
@@ -123,22 +122,10 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -193,16 +180,7 @@ jobs:
       #   * `pysof` — excluded from the default workspace build (`cargo test
       #     --workspace` skips it), so its own dead `tests/integration/` subtree is
       #     tracked separately rather than gating this job.
-      # This is bash (`set -euo pipefail`, `< <(find ...)` process substitution),
-      # which the Windows runner's default PowerShell cannot parse. A bare
-      # `shell: bash` resolves to WSL bash on the self-hosted Windows agent, which
-      # has no distro installed and aborts before running a line — so, exactly like
-      # the MinIO step below, split into a Unix step (`shell: bash`) and a Windows
-      # step pointed at Git Bash via the space-free 8.3 short path. Both run the
-      # identical script; the "Test Rust" job runs on Windows nightly, and exactly one
-      # fires per run via the `runner.os` guard.
       - name: Guard against unreferenced test subdirectories
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -223,37 +201,15 @@ jobs:
             exit 1
           fi
           echo "All test subdirectories are wired into a top-level test binary."
-      - name: Guard against unreferenced test subdirectories (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
-        run: |
-          set -euo pipefail
-          fail=0
-          while IFS= read -r modrs; do
-            dir=$(basename "$(dirname "$modrs")")
-            tests_dir=$(dirname "$(dirname "$modrs")")
-            crate=$(echo "$modrs" | sed -E 's#^crates/([^/]+)/.*#\1#')
-            [ "$dir" = "common" ] && continue
-            [ "$crate" = "pysof" ] && continue
-            if ! grep -rqE "^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;" "$tests_dir"/*.rs 2>/dev/null; then
-              echo "::error file=${modrs}::${modrs} exists but no top-level ${tests_dir}/*.rs declares 'mod ${dir};' — this suite never compiles or runs (see issue #306)."
-              fail=1
-            fi
-          done < <(find crates/*/tests -mindepth 2 -maxdepth 2 -name mod.rs | sort)
-          if [ "$fail" -ne 0 ]; then
-            echo "Unreferenced test subdirectories found. Add a top-level 'tests/<dir>_suite.rs' with 'mod <dir>;'."
-            exit 1
-          fi
-          echo "All test subdirectories are wired into a top-level test binary."
 
-      # Make room before the build, not after it fails. On the Windows agents
-      # this build grows target/ by 130-150GB, and the end-of-job sweep below
-      # only caps what is left between jobs; a run that started with ~150GB
-      # free ran out mid-link (run 38627332199). 175 covers the largest growth
-      # seen plus margin. A cold all-features build grows the Linux build dir
-      # by ~52-70GB on disk (ZFS-compressed), so 90 there: with the 100GB
-      # on-disk cap the 300GB Linux disks idle around 150-180GB free, and 175
-      # would evict on most runs. See "Pre-build headroom" in
+      # Make room before the build, not after it fails. On the old Windows
+      # agents this build grew target/ by 130-150GB, and the end-of-job sweep
+      # below only caps what is left between jobs; a run that started with
+      # ~150GB free ran out mid-link (run 38627332199). 175 (kept for macOS)
+      # covers the largest growth seen plus margin. A cold all-features build
+      # grows the Linux build dir by ~52-70GB on disk (ZFS-compressed), so 90
+      # there: with the 100GB on-disk cap the 300GB Linux disks idle around
+      # 150-180GB free, and 175 would evict on most runs. See "Pre-build headroom" in
       # .github/actions/cargo-target-gc.
       - name: Ensure build headroom
         uses: ./.github/actions/cargo-target-gc
@@ -270,12 +226,7 @@ jobs:
       # report, so a change to CARGO_BUILD_JOBS or the runners can be checked
       # against numbers.
       - name: Build tests with all features
-        if: runner.os != 'Windows'
         shell: bash
-        run: bash .github/scripts/test-rust.sh build
-      - name: Build tests with all features (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: bash .github/scripts/test-rust.sh build
 
       - name: Upload cargo build timings
@@ -293,7 +244,6 @@ jobs:
       # feature ever stops being enabled, `r5_suite_must_not_be_a_noop` fails
       # instead of the suite quietly verifying nothing (issue #307).
       - name: Run tests with all features
-        if: runner.os != 'Windows'
         shell: bash
         env:
           HFS_REQUIRE_R5: "1"
@@ -325,14 +275,6 @@ jobs:
           # suite pass vacuously for its entire existence (#390).
           RUN_MINIO_S3_ES_TESTS: "1"
         run: bash .github/scripts/test-rust.sh run
-      - name: Run tests with all features (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
-        env:
-          # Same as the step above; see its comments.
-          HFS_REQUIRE_R5: "1"
-          RUN_MINIO_S3_ES_TESTS: "1"
-        run: bash .github/scripts/test-rust.sh run
 
       # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
       # full S3 resource-CRUD tests are slow. The per-user settings subset is not
@@ -360,26 +302,7 @@ jobs:
       # self-skips when RUN_MINIO_S3_TESTS is unset — so a renamed test or a
       # typo'd variable would leave a green step that verified nothing at all.
       # Assert the expected number of tests actually ran.
-      # This block is bash (`\` continuation, `| tee`, `if ! grep`,
-      # `set -o pipefail`), which the Windows runner's default PowerShell cannot
-      # parse, so it needs `shell: bash`. But a bare `shell: bash` resolves to the
-      # first `bash` on PATH, and on the self-hosted Windows agent that is WSL's
-      # `C:\Windows\System32\bash.exe`; with no WSL distro installed it aborts
-      # ("Windows Subsystem for Linux has no installed distributions") before it
-      # can run a single line. Git is present on every agent (checkout uses it),
-      # so point Windows at Git Bash explicitly and keep plain `shell: bash` for
-      # the Unix agents. The two steps run the identical script; exactly one fires
-      # per run via the `runner.os` guard.
-      #
-      # The Windows path MUST use the 8.3 short name `C:\Progra~1` rather than
-      # `C:\Program Files`. The runner parses a custom `shell:` string by
-      # splitting on the FIRST space into (executable, args). A space inside the
-      # executable path splits it as ("C:\Program", "Files\...bash.exe ..."), and
-      # resolving that broken "C:\Program" fragment throws "Second path fragment
-      # must not be a drive or UNC name" before the script ever runs. The
-      # space-free short path avoids the mis-split entirely.
       - name: Verify S3 conditional writes against MinIO (per-user settings)
-        if: runner.os != 'Windows'
         shell: bash
         timeout-minutes: 15
         env:
@@ -396,52 +319,12 @@ jobs:
             echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
             exit 1
           fi
-      - name: Verify S3 conditional writes against MinIO (per-user settings) (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
-        timeout-minutes: 15
-        env:
-          RUN_MINIO_S3_TESTS: "1"
-          EXPECTED_MINIO_SETTINGS_TESTS: "5"
-          # This step used to set AWS_REQUEST_CHECKSUM_CALCULATION and
-          # AWS_RESPONSE_CHECKSUM_VALIDATION to "WHEN_REQUIRED". That was not a
-          # preference — it was a workaround for crc-fast 1.6.0, which gates its
-          # software fallback behind `#[cfg(target_arch = "x86")]` and so panics
-          # ("x86 features missing (SSE4.1 && PCLMULQDQ)") on this virtualized
-          # x86_64 guest, whose CPU advertises neither. The AWS S3 SDK reaches it
-          # on every upload via aws-sdk-s3 -> aws-smithy-checksums -> crc-fast.
-          #
-          # Opting out dodged the panic but also disabled the SDK's default
-          # integrity protection, so this leg tested a different SDK
-          # configuration than the Linux leg above — and the checksum path, the
-          # part that was actually broken, was the one thing Windows never
-          # exercised. crc-fast 1.9.0 (via aws-sdk-s3 1.122.0) has a working
-          # software fallback, so the panic is gone and both legs can run the
-          # same defaults.
-          #
-          # Do not re-add the opt-out to silence a checksum panic; that would
-          # mean the SDK has been downgraded below crc-fast 1.7.1.
-        # The nightly pass runs this job on the Windows runner, where `run:` defaults to PowerShell and cannot parse this bash
-        # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
-        # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
-        # plain `shell: bash` alias is unreliable on this self-hosted runner.
-        run: |
-          set -o pipefail
-          cargo test --workspace --all-features \
-            --test minio_s3_tests test_minio_settings -- --nocapture \
-            | tee minio-settings.log
-          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
-            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
-            echo "::error::A green step here with a different count means the conditional-write"
-            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
-            exit 1
-          fi
 
       # Last step, and non-fatal by construction. `clean: false` above keeps the
       # target dir warm across runs, which is what makes this job fit in 120
       # minutes — but cargo never evicts the artifacts a bump or a toolchain
       # update orphans, so that cache only ever grows. The macOS runner hit its
-      # disk ceiling this way, then the Windows one did.
+      # disk ceiling this way, then the (since retired) Windows one did.
       # See .github/actions/cargo-target-gc.
       - name: Cap target dir size
         if: always()
@@ -546,10 +429,10 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Test Python' || format('Test Python ({0})', matrix.os) }}
     # Same Linux / nightly macOS matrix as `test-rust`.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -567,22 +450,10 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -659,10 +530,10 @@ jobs:
     # keeps clippy honest on `cfg(windows)` and `cfg(target_os = "macos")`
     # code, which a Linux run never compiles.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -679,8 +550,7 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -695,10 +565,10 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Linting (clippy)' || format('Linting (clippy) ({0})', matrix.os) }}
     # Same Linux / nightly macOS matrix as `lint`.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -734,7 +604,6 @@ jobs:
       # merge, so reproduce that checkout shape here and prove the build
       # scripts' workspace-path fallback still compiles.
       - name: Check UI crates build without symlink support (#1257)
-        if: runner.os != 'Windows'
         run: |
           links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
           restore() { git checkout-index --force -- $links; }
@@ -755,10 +624,10 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Linting (backend feature sets)' || format('Linting (backend feature sets) ({0})', matrix.os) }}
     # Same Linux / nightly macOS matrix as `lint`.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -792,25 +661,8 @@ jobs:
       # per backend on its own, with warnings denied so a helper left unused by
       # a subset fails here too. `--no-default-features` is required: the
       # default set enables `sqlite`.
-      #
-      # The loop is bash, and a bare `shell: bash` resolves to WSL's
-      # `C:\Windows\System32\bash.exe` on the self-hosted Windows agent, which
-      # aborts with "Windows Subsystem for Linux has no installed distributions".
-      # Same split as the MinIO steps above: Git Bash via the space-free 8.3
-      # path on Windows, plain `shell: bash` elsewhere. The two steps run the
-      # identical script; exactly one fires per run via the `runner.os` guard.
       - name: Check hfs builds with single-backend feature sets (#1291)
-        if: runner.os != 'Windows'
         shell: bash
-        run: |
-          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
-            echo "::group::helios-hfs --no-default-features --features $features"
-            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
-            echo "::endgroup::"
-          done
-      - name: Check hfs builds with single-backend feature sets (#1291) (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
           for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
             echo "::group::helios-hfs --no-default-features --features $features"
@@ -827,10 +679,10 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Linting (FHIR version feature sets)' || format('Linting (FHIR version feature sets) ({0})', matrix.os) }}
     # Same Linux / nightly macOS matrix as `lint`.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -871,41 +723,8 @@ jobs:
       # own features. With `ui` dropped, an R5-without-R4B set never compiled it
       # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
       # still two model builds.
-      #
-      # Same Windows/non-Windows split as the #1291 step in `lint-backends`: a bare
-      # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
-        if: runner.os != 'Windows'
         shell: bash
-        run: |
-          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
-            set -- $spec
-            echo "::group::$1 --no-default-features --features $2"
-            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
-            echo "::endgroup::"
-          done
-          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
-          # neither spec above still compiles a crate whose own features lack a
-          # variant helios-fhir has. helios-persistence R5 does not enable its
-          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
-          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
-          # #1367-style E0004 coverage for them. It ends up with the same
-          # FHIR version set as the helios-hfs spec above.
-          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
-          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
-          echo "::endgroup::"
-          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
-          # validator catch-all arm that panicked for a FHIR version helios-fhir
-          # had enabled (through helios-audit R5) but the validator was built
-          # without. The regression test only fails in an R5/R6 build that does
-          # not enable R4B; default features (R4 only) and --all-features
-          # (every version) cannot fail it, so run it under R5 here.
-          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
-          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
-          echo "::endgroup::"
-      - name: Check builds with FHIR version feature subsets (#1367) (Windows)
-        if: runner.os == 'Windows'
-        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         run: |
           for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
             set -- $spec
@@ -942,10 +761,10 @@ jobs:
     name: ${{ matrix.os == 'Linux' && 'Linting (pysof)' || format('Linting (pysof) ({0})', matrix.os) }}
     # Same Linux / nightly macOS matrix as `lint`.
     strategy:
-      # A Windows failure must not cancel the macOS leg, or the reverse.
+      # One OS's failure must not cancel the other's leg.
       fail-fast: false
       matrix:
-        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # `Linux` for pushes and PRs, `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
         os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
@@ -1004,22 +823,10 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -1201,22 +1008,10 @@ jobs:
       - name: Renormalize the working tree
         uses: ./.github/actions/renormalize-eol
 
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -1374,13 +1169,9 @@ jobs:
 
   test-fhirpath:
     name: Test FHIRPath
-    # Same Linux / nightly macOS matrix as `test-rust`. The HL7 FHIRPath
-    # validator is published for both (HeliosSoftware/Hl7.Fhir.FhirPath.Validator
-    # ships win-x64 .zip and linux-x64 .tar.gz), so each OS-specific step below
-    # comes as a Linux / Windows pair picked by `runner.os`.
-    # The validator ships no macOS build, and there is no Windows agent any
-    # more (the Windows nightly is windows-nightly.yml, which runs the
-    # FHIRPath crate's own tests on Windows), so this runs on Linux always.
+    # Linux always. The HL7 FHIRPath validator
+    # (HeliosSoftware/Hl7.Fhir.FhirPath.Validator) ships no macOS build, and
+    # the FHIRPath crate's own tests run on Windows in windows-nightly.yml.
     runs-on: [self-hosted, Linux]
     needs: [test-rust]
     # This job had no ceiling at all, so a hang held a scarce self-hosted
@@ -1417,9 +1208,7 @@ jobs:
 
             console.log(`Latest FhirPath Validator release: ${release.tag_name}`);
 
-            // Pick the archive for this runner's OS.
-            const isWindows = process.platform === 'win32';
-            const [rid, ext] = isWindows ? ['win-x64', '.zip'] : ['linux-x64', '.tar.gz'];
+            const [rid, ext] = ['linux-x64', '.tar.gz'];
             const asset = release.assets.find(asset =>
               asset.name.includes(rid) && asset.name.endsWith(ext)
             );
@@ -1464,12 +1253,9 @@ jobs:
             const toolsDir = 'tools/fhirpath-validator';
             fs.mkdirSync(toolsDir, { recursive: true });
 
-            // tar reads both archives: bsdtar on Windows 10+ opens the .zip,
-            // GNU tar on Linux the .tar.gz.
-            const isWindows = process.platform === 'win32';
-            const archive = isWindows ? 'fhirpath-validator.zip' : 'fhirpath-validator.tar.gz';
-            const exeName = isWindows ? 'Test.Fhir.R5.FhirPath.Validator.exe' : 'Test.Fhir.R5.FhirPath.Validator';
-            const target = isWindows ? 'fhirpath-validator.exe' : 'fhirpath-validator';
+            const archive = 'fhirpath-validator.tar.gz';
+            const exeName = 'Test.Fhir.R5.FhirPath.Validator';
+            const target = 'fhirpath-validator';
             // A reused workspace (clean: false) keeps the previous release's files.
             fs.rmSync(toolsDir, { recursive: true, force: true });
             fs.mkdirSync(toolsDir, { recursive: true });
@@ -1508,7 +1294,7 @@ jobs:
 
               // Verify it works
               try {
-                execSync(isWindows ? '.\\fhirpath-validator.exe --help' : './fhirpath-validator --help', { stdio: 'pipe' });
+                execSync('./fhirpath-validator --help', { stdio: 'pipe' });
                 console.log('Validator help command successful');
               } catch (error) {
                 console.log('Validator help not available, but binary extracted');
@@ -1516,34 +1302,19 @@ jobs:
             } else {
               console.log('Validator executable not found');
               console.log('Directory contents:');
-              execSync(isWindows ? `dir /s ${toolsDir}` : `ls -laR ${toolsDir}`, { stdio: 'inherit' });
+              execSync(`ls -laR ${toolsDir}`, { stdio: 'inherit' });
               throw new Error('Validator executable not found');
             }
 
-      - name: Install Rust toolchain (Linux)
-        if: runner.os != 'Windows'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
-
-      # Default shell on either OS (bash / PowerShell); the command is the same.
       - name: Build fhirpath-server (R5)
         run: cargo build -p helios-fhirpath --features R5 --bin fhirpath-server
 
-      # For PS scripts, run with Bypass
-      - name: Start fhirpath-server (Linux)
-        if: runner.os != 'Windows'
+      - name: Start fhirpath-server
         shell: bash
         run: |
           exe="$CARGO_TARGET_DIR/debug/fhirpath-server"
@@ -1552,19 +1323,7 @@ jobs:
           echo $! > "$RUNNER_TEMP/fhirpath_server.pid"
           echo "fhirpath-server PID: $!"
 
-      - name: Start fhirpath-server (Windows)
-        if: runner.os == 'Windows'
-        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
-        run: |
-          $exe = Join-Path $env:CARGO_TARGET_DIR "debug\fhirpath-server.exe"
-          Write-Host "Starting server: $exe"
-          $p = Start-Process -FilePath $exe -ArgumentList "--port 3000 --host 127.0.0.1" -PassThru
-          $pidFile = "$env:RUNNER_TEMP\fhirpath_server.pid"
-          $p.Id | Out-File -FilePath $pidFile -Encoding ascii
-          Write-Host "fhirpath-server PID: $($p.Id)"
-
-      - name: Wait for fhirpath-server to be ready (Linux)
-        if: runner.os != 'Windows'
+      - name: Wait for fhirpath-server to be ready
         shell: bash
         run: |
           for _ in $(seq 1 30); do
@@ -1578,32 +1337,13 @@ jobs:
           tail -50 "$RUNNER_TEMP/fhirpath_server.log" || true
           exit 1
 
-      - name: Wait for fhirpath-server to be ready (Windows)
-        if: runner.os == 'Windows'
-        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
-        run: |
-          $deadline = (Get-Date).AddSeconds(30)
-          do {
-            try {
-              $resp = Invoke-RestMethod -Uri http://127.0.0.1:3000/health -UseBasicParsing -TimeoutSec 2
-              if ($resp.status -eq 'ok') { Write-Host 'FHIRPath server is ready'; exit 0 }
-            } catch { }
-            Start-Sleep -Seconds 1
-          } while ((Get-Date) -lt $deadline)
-          # Was Write-Warning + an implicit exit 0: a server that never started produced
-          # a warning, and the validator then ran 1048 tests against a dead socket and
-          # reported them as ordinary failures. Fail here instead (#287).
-          Write-Host "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and debug\fhirpath-server.exe under CARGO_TARGET_DIR."
-          exit 1
-
       # Must run BEFORE the validator. The validator MERGES into this file (read, upsert
       # by group/test name, rewrite), this runner checks out with clean:false, and
       # fhirpath-results/ is untracked -- so a previous run's results survive here. A test
       # that STOPS executing would keep its stale PASSING entry indefinitely, and the
       # coverage audit below would happily verify last week's data. Purge, don't
       # mkdir-if-missing (#287).
-      - name: Purge stale FhirPath results (Linux)
-        if: runner.os != 'Windows'
+      - name: Purge stale FhirPath results
         shell: bash
         run: |
           set -euo pipefail
@@ -1620,35 +1360,10 @@ jobs:
           fi
           mkdir "$dir"
 
-          # Freshness watermark for the audit, same format and 2s slack as the
-          # Windows step.
+          # Freshness watermark for the audit (2s slack).
           stamp=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%S.%3NZ)
           echo "$stamp" > "$RUNNER_TEMP/fhirpath_job_start.txt"
           echo "Run watermark: $stamp"
-
-      - name: Purge stale FhirPath results (Windows)
-        if: runner.os == 'Windows'
-        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
-        run: |
-          $dir = Join-Path $env:GITHUB_WORKSPACE 'fhirpath-results'
-          if (Test-Path $dir) {
-            Write-Host "Removing stale results directory from a previous run: $dir"
-            Get-ChildItem -Recurse -Force $dir | ForEach-Object { Write-Host "  stale: $($_.Name)" }
-            Remove-Item -Recurse -Force $dir -ErrorAction Stop
-          }
-          # Don't trust Remove-Item's status alone: a file lock (AV scanner, a lingering
-          # validator) can leave it in place, and a silently-surviving file is the whole bug.
-          if (Test-Path $dir) {
-            throw "Failed to purge $dir - refusing to run, because results would be indistinguishable from a previous run's."
-          }
-          New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
-
-          # Freshness watermark for the audit. 2s of slack for filesystem timestamp
-          # granularity. Belt-and-braces with the purge: the purge can be defeated by a
-          # lock, this can be defeated by a clock, and they don't fail together.
-          $stamp = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString('o')
-          $stamp | Out-File -FilePath "$env:RUNNER_TEMP\fhirpath_job_start.txt" -Encoding ascii
-          Write-Host "Run watermark: $stamp"
 
       # Establishes out-of-band ground truth BEFORE the suite runs. This is what makes the
       # failure taxonomy possible: fhirpath-server returns 422 + OperationOutcome for BOTH
@@ -1804,7 +1519,7 @@ jobs:
 
             try {
               // Run the validator as a console application with CLI arguments
-              const exe = process.platform === 'win32' ? 'fhirpath-validator.exe' : './fhirpath-validator';
+              const exe = './fhirpath-validator';
               const command = `${exe} --fhir-test-file "${testFilePath}" --fhir-test-base-path "${basePath}" --known-failures "${knownFailuresPath}" --fhirpath-results-path "${resultsPath}" --url "${url}" --server`;
               console.log(`Executing: ${command}`);
               
@@ -1996,8 +1711,8 @@ jobs:
               core.notice(`All ${expected.length} declared FHIRPath tests are accounted for; ${txExpected.length} terminology tests executed against ${process.env.FHIRPATH_TERMINOLOGY_SERVER}. HTS pre-flight: 3/3.`);
             }
 
-      - name: Cleanup fhirpath-server (Linux)
-        if: always() && runner.os != 'Windows'
+      - name: Cleanup fhirpath-server
+        if: always()
         shell: bash
         run: |
           pid_file="$RUNNER_TEMP/fhirpath_server.pid"
@@ -2008,19 +1723,7 @@ jobs:
             rm -f "$pid_file"
           fi
 
-      - name: Cleanup fhirpath-server (Windows)
-        if: always() && runner.os == 'Windows'
-        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
-        run: |
-          $pidFile = "$env:RUNNER_TEMP\fhirpath_server.pid"
-          if (Test-Path $pidFile) {
-            $serverPid = Get-Content $pidFile | Select-Object -First 1
-            Write-Host "Stopping fhirpath-server PID $serverPid"
-            Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
-            Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-          }
-
-      # This job is the reason the action had to learn Windows. It used to be
+      # This job is why the action has a Windows path. It used to be
       # pinned to the Windows agent with `clean: false`, and the then-unpinned
       # `runs-on: [self-hosted]` jobs landed there too — so its target dir grew unbounded until the disk filled and the
       # NEXT run died in "Set up job", before any step could run. Must come
