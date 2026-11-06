@@ -15,7 +15,7 @@ use crate::error::{BackendError, StorageResult};
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2367).
-pub const SCHEMA_VERSION: i32 = 54;
+pub const SCHEMA_VERSION: i32 = 55;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -587,6 +587,9 @@ async fn migrate_schema(
             }
             52 => migrate_v52_to_v53(client).await?,
             53 => migrate_v53_to_v54(client).await?,
+            // Not transactional: batched backfill and a concurrent index
+            // build; the common loop stamps the marker after they finish.
+            54 => migrate_v54_to_v55(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -613,6 +616,215 @@ async fn migrate_v53_to_v54(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| pg_error(format!("Migration v53->v54 failed: {}", e)))?;
     Ok(())
+}
+
+/// Name of the v55 partial index on `value_reference_target`.
+const REFERENCE_TARGET_INDEX_NAME: &str = "idx_search_reference_target_v2";
+
+/// Heap blocks per committed batch of the v55 backfill.
+const REFERENCE_TARGET_BACKFILL_BLOCKS: u64 = 2_000;
+
+/// Rows per statement of the v55 final sweep.
+const REFERENCE_TARGET_SWEEP_ROWS: u64 = 10_000;
+
+/// SQL expression deriving `value_reference_target` from the text expression
+/// `value` (a column or a bound parameter), byte-for-byte equivalent to
+/// [`crate::types::absolute_reference_target`]: for an absolute `http(s)`
+/// reference `<base>/<Type>/<id>[/_history/<vid>][?query][#fragment]` it is
+/// `Type/id`, otherwise `NULL`.
+///
+/// Steps, in the order the Rust function takes them: drop the scheme, cut at the
+/// first `?` or `#`, cut at the first `/_history/`, then require a base segment
+/// (any text, possibly empty, before a `/`) followed by a `Type` that starts
+/// with an ASCII capital and continues alphanumeric, then an `id` of 1..=64
+/// `[A-Za-z0-9.-]`. The single capture group is `Type/id`.
+pub(crate) fn absolute_reference_target_sql(value: &str) -> String {
+    format!(
+        "(CASE WHEN {value} ~ '^https?://' THEN \
+         substring(split_part(substring(regexp_replace({value}, '^https?://', '') \
+         from '^[^?#]*'), '/_history/', 1) \
+         from '^.*/([A-Z][A-Za-z0-9]*/[A-Za-z0-9.-]{{1,64}})$') END)"
+    )
+}
+
+/// v54 -> v55: `value_reference_target`, the `Type/id` of a reference stored as
+/// an absolute `http(s)` URL (#2394).
+///
+/// `value_reference` keeps the reference as written, so `Patient?_id=p1&
+/// _revinclude=Provenance:target` and `subject=Patient/p1` never matched
+/// `http://example.org/fhir/Patient/p1`. The writer now also stores the `Type/id`
+/// in this column (the same value the MongoDB backend stores), and readers match
+/// `value_reference_target = <Type/id>` as a second arm `OR`ed next to the
+/// equality. A `UNION ALL` form was measured on 1.2M rows and was 145x slower for
+/// a patient with 100k referrers (the sublink hides the `last_updated` order, so
+/// the planner no longer stops early under `LIMIT`), so the `OR` stays. The
+/// column is `NULL` for relative references, so the partial index stays small.
+///
+/// Steps, each safe to repeat: add the column in a short transaction under a
+/// `lock_timeout`; backfill rows with an absolute `value_reference` in committed
+/// batches of heap blocks selected by `ctid` range; build the partial index
+/// `CONCURRENTLY` (an invalid leftover of an interrupted build is dropped
+/// first); sweep rows written meanwhile by an instance that was not yet
+/// upgraded. `statement_timeout` is disabled for the step and restored.
+async fn migrate_v54_to_v55(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let failed = |what: &str, e: &dyn std::fmt::Display| {
+        pg_error(format!("Migration v54->v55 failed ({what}): {e}"))
+    };
+    let previous_timeout: String = client
+        .query_one("SELECT current_setting('statement_timeout')", &[])
+        .await
+        .map_err(|e| failed("read statement_timeout", &e))?
+        .get(0);
+    client
+        .batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| failed("disable statement_timeout", &e))?;
+    let result = build_reference_target(client).await;
+    let restore = client
+        .execute(
+            "SELECT set_config('statement_timeout', $1, false)",
+            &[&previous_timeout],
+        )
+        .await;
+    result?;
+    restore.map_err(|e| failed("restore statement_timeout", &e))?;
+
+    // Best-effort, bounded like v43: the planner needs statistics on the new
+    // column (and its partial index) before the first reference search.
+    if let Err(e) =
+        analyze_search_index_with_timeout(client, post_migration_analyze_timeout()).await
+    {
+        tracing::warn!(
+            "Migration v54->v55: optional ANALYZE failed ({e}); the planner has no statistics on value_reference_target until autovacuum analyzes search_index"
+        );
+    }
+    Ok(())
+}
+
+async fn build_reference_target(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let failed = |what: &str, e: &dyn std::fmt::Display| {
+        pg_error(format!("Migration v54->v55 failed ({what}): {e}"))
+    };
+
+    // 1. The column, behind a bounded lock wait, retried.
+    const ATTEMPTS: u32 = 60;
+    for attempt in 1..=ATTEMPTS {
+        let outcome: Result<(), tokio_postgres::Error> = async {
+            let tx = client.transaction().await?;
+            tx.batch_execute("SET LOCAL lock_timeout = '2s'").await?;
+            tx.batch_execute(
+                "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_reference_target TEXT",
+            )
+            .await?;
+            tx.commit().await
+        }
+        .await;
+        match outcome {
+            Ok(()) => break,
+            Err(e)
+                if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+                    && attempt < ATTEMPTS =>
+            {
+                tracing::warn!(
+                    "Migration v54->v55: waiting for a lock on search_index, attempt {attempt}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(failed("add column", &e)),
+        }
+    }
+
+    // 2. Backfill by block range.
+    let expr = absolute_reference_target_sql("value_reference");
+    let batch_sql = |first_block: u64, block_count: u64| {
+        format!(
+            "UPDATE search_index SET value_reference_target = {expr} \
+             WHERE value_reference ~ '^https?://' AND value_reference_target IS NULL \
+             AND {expr} IS NOT NULL \
+             AND ctid >= '({first_block},0)'::tid AND ctid < '({},0)'::tid",
+            first_block + block_count
+        )
+    };
+    let mut first_block = 0_u64;
+    loop {
+        let blocks: i64 = client
+            .query_one(
+                "SELECT pg_relation_size('search_index') / current_setting('block_size')::bigint",
+                &[],
+            )
+            .await
+            .map_err(|e| failed("table size", &e))?
+            .get(0);
+        if first_block >= blocks.max(0) as u64 {
+            break;
+        }
+        let sql = batch_sql(first_block, REFERENCE_TARGET_BACKFILL_BLOCKS);
+        client
+            .execute(sql.as_str(), &[])
+            .await
+            .map_err(|e| failed("backfill", &e))?;
+        first_block += REFERENCE_TARGET_BACKFILL_BLOCKS;
+    }
+
+    // 3. The index, built without blocking writers.
+    let invalid: Option<bool> = client
+        .query_opt(
+            "SELECT NOT (i.indisvalid AND i.indisready) FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = current_schema() AND c.relname = $1",
+            &[&REFERENCE_TARGET_INDEX_NAME],
+        )
+        .await
+        .map_err(|e| failed("inspect index", &e))?
+        .map(|row| row.get(0));
+    if invalid == Some(true) {
+        client
+            .batch_execute(&format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {REFERENCE_TARGET_INDEX_NAME}"
+            ))
+            .await
+            .map_err(|e| failed("drop invalid index", &e))?;
+    }
+    if let Err(e) = client
+        .batch_execute(&format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {REFERENCE_TARGET_INDEX_NAME} \
+             ON search_index (tenant_id, resource_type, param_name, value_reference_target) \
+             WHERE value_reference_target IS NOT NULL"
+        ))
+        .await
+    {
+        if let Err(drop_error) = client
+            .batch_execute(&format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {REFERENCE_TARGET_INDEX_NAME}"
+            ))
+            .await
+        {
+            tracing::warn!(%drop_error, "Could not drop the invalid {REFERENCE_TARGET_INDEX_NAME}");
+        }
+        return Err(failed("create index", &e));
+    }
+
+    // 4. Rows written during the build by a not-yet-upgraded instance. The
+    // `expr IS NOT NULL` conjunct makes the loop terminate: an `http(s)` value
+    // that is not a FHIR reference never matches and is never selected.
+    let sweep = format!(
+        "UPDATE search_index SET value_reference_target = {expr} \
+         WHERE ctid = ANY (ARRAY( \
+             SELECT ctid FROM search_index \
+             WHERE value_reference ~ '^https?://' AND value_reference_target IS NULL \
+               AND {expr} IS NOT NULL \
+             LIMIT {REFERENCE_TARGET_SWEEP_ROWS}))"
+    );
+    loop {
+        let filled = client
+            .execute(sweep.as_str(), &[])
+            .await
+            .map_err(|e| failed("sweep", &e))?;
+        if filled == 0 {
+            return Ok(());
+        }
+    }
 }
 
 /// v1 -> v2: Add new columns for enhanced search.
@@ -7351,6 +7563,142 @@ mod postgres_integration_migrations {
         assert_eq!(index_count(&client).await, 2);
     }
 
+    /// Every reference shape the Rust function is tested with, plus edges
+    /// (empty base, query/fragment, `_history`, 64/65-char ids, `%` in id).
+    fn reference_target_vectors() -> Vec<String> {
+        let mut v: Vec<String> = [
+            "http://example.org/fhir/Patient/p1",
+            "https://ehr.example.com/r4/Patient/p1",
+            "https://ehr.example.com/r4/Patient/p1/_history/2",
+            "http://h/Patient/p.1?x=1#f",
+            "http://h/Patient/p-1/",
+            "Patient/p1",
+            "Patient/p1/_history/3",
+            "urn:uuid:1234",
+            "http://example.org/",
+            "http://example.org/foo",
+            "http://Patient/p1",
+            "http://h/patient/p1",
+            "http://h/Pat_ient/p1",
+            "http:///Patient/p1",
+            "http://h//Patient/p1",
+            "https://h/a/b/c/Observation/o-1.2",
+            "https://h/Patient/p1#frag/Patient/p2",
+            "https://h/Patient/p1?next=/Patient/p2",
+            "https://h/Patient/p%201",
+            "https://h/Patient/",
+            "https://h/Patient/p_1",
+            "HTTP://h/Patient/p1",
+            "https://",
+            "http://h/Patient/p1/_history/",
+            "http://h/_history/Patient/p1",
+            "bare-id",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        v.push(format!("http://h/Patient/{}", "a".repeat(64)));
+        v.push(format!("http://h/Patient/{}", "a".repeat(65)));
+        v
+    }
+
+    /// The v55 backfill expression gives exactly what
+    /// `absolute_reference_target` gives, for every vector.
+    #[tokio::test]
+    async fn postgres_integration_reference_target_sql_matches_rust() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_reftarget_sql_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        let sql = format!("SELECT {}", absolute_reference_target_sql("$1::text"));
+        for vector in reference_target_vectors() {
+            let got: Option<String> = client
+                .query_one(sql.as_str(), &[&vector])
+                .await
+                .expect("evaluate the SQL expression")
+                .get(0);
+            assert_eq!(
+                got,
+                crate::types::absolute_reference_target(&vector),
+                "SQL and Rust disagree on {vector:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v54_to_v55_backfills_reference_target() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v55_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP INDEX idx_search_reference_target_v2;
+                 ALTER TABLE search_index DROP COLUMN value_reference_target;",
+            )
+            .await
+            .expect("take v55 back out of the fixture");
+        force_schema_version(&client, 54).await.unwrap();
+        let vectors = reference_target_vectors();
+        for (i, vector) in vectors.iter().enumerate() {
+            client
+                .execute(
+                    "INSERT INTO search_index
+                     (tenant_id, resource_type, resource_id, param_name, value_reference)
+                     VALUES ('t', 'Provenance', $1, 'target', $2)",
+                    &[&format!("pv{i}"), vector],
+                )
+                .await
+                .expect("seed a pre-v55 reference row");
+        }
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v54 to v55");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 55);
+        for (i, vector) in vectors.iter().enumerate() {
+            let got: Option<String> = client
+                .query_one(
+                    "SELECT value_reference_target FROM search_index
+                     WHERE tenant_id = 't' AND resource_id = $1",
+                    &[&format!("pv{i}")],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                got,
+                crate::types::absolute_reference_target(vector),
+                "backfill of {vector:?}"
+            );
+        }
+        let definition = index_definition(&client, "idx_search_reference_target_v2")
+            .await
+            .expect("v55 index must exist");
+        assert!(
+            definition.contains("value_reference_target")
+                && definition.contains("WHERE (value_reference_target IS NOT NULL)"),
+            "unexpected v55 index: {definition}"
+        );
+
+        // A restart that kept the column and index but lost the marker.
+        force_schema_version(&client, 54).await.unwrap();
+        initialize_schema(&mut client).await.expect("re-run v55");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+    }
+
     #[tokio::test]
     async fn postgres_integration_v41_to_v42_builds_valid_idempotent_index() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
@@ -8536,7 +8884,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 54);
+        assert_eq!(SCHEMA_VERSION, 55);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)

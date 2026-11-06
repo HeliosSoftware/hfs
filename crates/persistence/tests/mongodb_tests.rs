@@ -1322,6 +1322,11 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
+/// #2394: `value_reference` is stored normalized and old rows are rewritten
+/// by the search-index builder.
+#[path = "mongodb/reference_normalize.rs"]
+mod reference_normalize;
+
 /// #2283: a total is reported only when `_total` asks for one.
 #[tokio::test]
 async fn mongodb_total_mode_reported_only_when_requested() {
@@ -1353,7 +1358,84 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
-        &[],
+        &[
+            // Plain `Type/id` stays an exact match on MongoDB (index plan), so
+            // it does not reach absolute URLs, versioned or foreign-base, and
+            // `:not` therefore does NOT exclude them. Deliberate (#2394);
+            // `ob-foreign` is likewise not matched here, unlike the other three
+            // backends, which ignore the base.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject=Patient/p1,Patient/nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-grp",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:not=Patient/p1,Group/p1",
+                expect: modifier_parity_suite::Expect::Ids(&[
+                    "ob-abs",
+                    "ob-abs-ver",
+                    "ob-foreign",
+                    "ob-logical",
+                    "ob-nosubj",
+                ]),
+            },
+            // `:above` a `_history/1` URL also finds the `_history/2` form
+            // (SQLite returns only the unversioned `ob-abs`): the version
+            // segment is not compared. Inconsistent across backends.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-abs", "ob-abs-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=Patient/p1/_history/2",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1,nobody",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-pat", "ob-ver"]),
+            },
+            // MongoDB keeps the plain `Type/id` filter an exact match so it
+            // stays on the reference index; its `_revinclude` has its own
+            // filter that does reach absolute URLs.
+            modifier_parity_suite::Divergence {
+                label: "Observation?subject:Patient=p1&code=9999-9",
+                expect: modifier_parity_suite::Expect::Ids(&["ob-ver"]),
+            },
+        ],
     )
     .await;
 }
@@ -12663,6 +12745,135 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
     );
 }
 
+/// #2394: the normalized `_revinclude` filter is a two-field `$or`
+/// (`value_reference` / `value_reference_target`). The same shape once defeated
+/// the index on the plain reference search, so check on a real server that the
+/// recorded `find` never falls back to a collection scan and examines only
+/// about as many documents as it returns.
+#[tokio::test]
+async fn mongodb_revinclude_normalized_or_filter_uses_indexes() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_or_explain").await else {
+        eprintln!(
+            "Skipping mongodb_revinclude_normalized_or_filter_uses_indexes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-revinclude-explain");
+    let patient = backend
+        .seed_create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "target"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..1500 {
+        let reference = match i {
+            0..=2 => format!("Patient/{}", patient.id()),
+            3 => format!("http://example.org/fhir/Patient/{}", patient.id()),
+            _ => format!("Patient/other-{i}"),
+        };
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": format!("c-{i}")}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend.wait_for_search_index_build().await;
+
+    let Some(cs) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let db = raw_test_client(&cs)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("server refused {{profile: 2}}; skipping");
+        return;
+    }
+    let revinclude = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let result = backend
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&revinclude),
+        )
+        .await
+        .expect("resolve_revincludes");
+    db.run_command(doc! { "profile": 0_i32 }).await.unwrap();
+    assert_eq!(result.len(), 4, "3 relative + 1 absolute referrer");
+
+    use futures::stream::TryStreamExt;
+    let profile = db.collection::<Document>("system.profile");
+    let entries: Vec<Document> = profile
+        .find(doc! {
+            "ns": format!("{}.search_index", db.name()),
+            "command.find": "search_index",
+        })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2, "one find per reference field");
+    let mut total_docs = 0;
+    for entry in &entries {
+        let command = entry.get_document("command").unwrap();
+        let mut inner = Document::new();
+        for key in ["find", "filter", "sort", "limit", "projection", "hint"] {
+            if let Some(v) = command.get(key) {
+                inner.insert(key, v.clone());
+            }
+        }
+        let explain = db
+            .run_command(doc! { "explain": inner, "verbosity": "executionStats" })
+            .await
+            .unwrap();
+        let plan = format!(
+            "{:?}",
+            explain
+                .get_document("queryPlanner")
+                .unwrap()
+                .get("winningPlan")
+        );
+        let stats = explain.get_document("executionStats").unwrap();
+        let num = |k: &str| {
+            stats
+                .get_i64(k)
+                .or_else(|_| stats.get_i32(k).map(i64::from))
+                .unwrap()
+        };
+        let (keys, docs) = (num("totalKeysExamined"), num("totalDocsExamined"));
+        eprintln!(
+            "REVINCLUDE-EXPLAIN filter={:?} keys={keys} docs={docs}",
+            command.get("filter")
+        );
+        assert!(!plan.contains("COLLSCAN"), "collection scan: {plan}");
+        total_docs += docs;
+    }
+    assert!(
+        total_docs <= 50,
+        "examined {total_docs} documents for 4 matches"
+    );
+}
+
 /// #1061 part (b): the referring set must be bounded at
 /// `max_included_resources`, applied per directive, with truncation signaled
 /// by a synthetic `OperationOutcome` (`search.mode = outcome`) rather than
@@ -19214,11 +19425,13 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
-const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
+/// Generation 5: `idx_search_reference_target_v2` is added (#2394).
+const CURRENT_BACKGROUND_NAMES: [&str; 10] = [
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
+    "idx_search_reference_target_v2",
     "idx_search_reference_v2",
     "idx_search_string_v2",
     "idx_search_token_display_v2",
@@ -19355,7 +19568,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(5)
     );
 }
 
@@ -19480,7 +19693,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(4)
+        Ok(5)
     );
 }
 
@@ -19568,7 +19781,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(4));
+    assert_eq!(si.get_i32("generation"), Ok(5));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.

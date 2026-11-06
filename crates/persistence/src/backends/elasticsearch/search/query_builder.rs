@@ -278,6 +278,14 @@ impl<'a> EsQueryBuilder<'a> {
 
         let base = strip_reference_version(&comp.reference);
 
+        // Also match a reference indexed as an absolute URL, through the
+        // `Type/id` the writer stores for those (#2394).
+        let should = json!([
+            { "term": { "search_params.reference.reference": base } },
+            { "prefix": { "search_params.reference.reference": format!("{base}/_history/") } },
+            { "term": { "search_params.reference.reference_target": base } }
+        ]);
+
         Some(json!({
             "nested": {
                 "path": "search_params.reference",
@@ -287,10 +295,7 @@ impl<'a> EsQueryBuilder<'a> {
                             { "terms": { "search_params.reference.name": comp.params } },
                             {
                                 "bool": {
-                                    "should": [
-                                        { "term": { "search_params.reference.reference": base } },
-                                        { "prefix": { "search_params.reference.reference": format!("{base}/_history/") } }
-                                    ],
+                                    "should": should,
                                     "minimum_should_match": 1
                                 }
                             }
@@ -636,6 +641,21 @@ pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQue
 mod tests {
     use super::*;
     use crate::types::{CursorValue, SearchValue, SortDirection};
+
+    /// #2394: compartment membership also matches absolute references through
+    /// the stored `Type/id`.
+    #[test]
+    fn compartment_clause_matches_absolute_reference_target() {
+        let comp = CompartmentMembership {
+            params: vec!["patient".to_string()],
+            reference: "Patient/p1/_history/3".to_string(),
+        };
+        let s = serde_json::to_string(&EsQueryBuilder::build_compartment_clause(&comp).unwrap())
+            .unwrap();
+        assert!(
+            s.contains(r#"{"term":{"search_params.reference.reference_target":"Patient/p1"}}"#)
+        );
+    }
 
     /// Encodes a `Previous` cursor at the given resource ID, used to
     /// exercise the backward-paging path of `build`.

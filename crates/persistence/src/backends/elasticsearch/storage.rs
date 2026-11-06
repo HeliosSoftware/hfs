@@ -692,6 +692,9 @@ pub(crate) fn build_es_document(
                 if let Some(ri) = ref_id {
                     ref_doc["resource_id"] = json!(ri);
                 }
+                if let Some(target) = crate::types::absolute_reference_target(reference) {
+                    ref_doc["reference_target"] = json!(target);
+                }
                 if let Some(d) = display {
                     ref_doc["display"] = json!(d);
                 }

@@ -36,7 +36,11 @@ use super::search_index_catalog::{
 /// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
 /// deferred-rebuild marker's startup scan (#1283). v16 adds
 /// `idx_bulk_changes_resource`, which serves a single-resource or
-/// single-type purge's erasure of `previous_content` (#2279).
+/// single-type purge's erasure of `previous_content` (#2279). v17 records
+/// that `search_index.value_reference` is stored normalized (version suffix
+/// stripped, absolute URLs also carried as `value_reference_target`, #2394):
+/// a v16 build would write unnormalized rows after the backfill, so it must
+/// refuse to start on a v17 database.
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
@@ -44,7 +48,7 @@ use super::search_index_catalog::{
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2352).
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -1000,6 +1004,74 @@ pub(super) async fn set_contained_rows_moved(database: &Database) -> StorageResu
         .update_one(
             doc! { "_id": "schema_version" },
             doc! { "$set": { "search_indexes.contained_rows_moved": true } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// Whether the one-time normalization of `search_index` /
+/// `search_index_contained` `value_reference` rows has completed on this
+/// database (#2394).
+#[allow(dead_code)]
+pub(super) async fn references_normalized(database: &Database) -> StorageResult<bool> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_bool("references_normalized").ok())
+        .unwrap_or(false))
+}
+
+/// Records that [`references_normalized`] is now true. Dotted `$set` for the
+/// same reason as [`set_search_index_generation`].
+#[allow(dead_code)]
+pub(super) async fn set_references_normalized(database: &Database) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes.references_normalized": true } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// The last `_id` the reference backfill finished in `collection`, so an
+/// interrupted run resumes by `_id` range instead of rescanning (#2394).
+/// `None` when no checkpoint is recorded for `collection`.
+#[allow(dead_code)]
+pub(super) async fn get_reference_normalize_last_id(
+    database: &Database,
+    collection: &str,
+) -> StorageResult<Option<Bson>> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_document("reference_normalize_last_id").ok())
+        .and_then(|c| c.get(collection).cloned()))
+}
+
+/// Stores the backfill checkpoint for `collection`.
+#[allow(dead_code)]
+pub(super) async fn set_reference_normalize_last_id(
+    database: &Database,
+    collection: &str,
+    last_id: Bson,
+) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { format!("search_indexes.reference_normalize_last_id.{collection}"): last_id } },
         )
         .upsert(true)
         .await?;

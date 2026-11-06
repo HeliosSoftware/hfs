@@ -7,10 +7,10 @@ HFS records its MongoDB schema version in the `schema_version` collection of eac
 The collection holds exactly one document:
 
 ```javascript
-{ _id: "schema_version", version: 16, search_indexes: { generation: 4, completed_at: ISODate("..."), contained_rows_moved: true } }
+{ _id: "schema_version", version: 17, search_indexes: { generation: 5, completed_at: ISODate("..."), contained_rows_moved: true, references_normalized: true } }
 ```
 
-`search_indexes.empty_at_generation` appears only before the first build records a generation.
+`search_indexes.empty_at_generation` appears only before the first build records a generation. `search_indexes.reference_normalize_last_id` holds the resume point, per collection, of the version 17 reference backfill while it runs; `search_indexes.references_normalized` is set when it finishes.
 
 Every boot of a build from #2352 on does this, in order:
 
@@ -46,6 +46,7 @@ MongoDB keeps every index current on writes whichever build runs. An older build
 | 14 | `sof_terminology_registry` and `sof_terminology_rows`, the stored ValueSet and ConceptMap tables of SQL-on-FHIR Libraries (#2185) | v0.2.6 | does not read or write them. While it runs, `$sql-run` and `$sql-export` of a SQLQuery or SQLView Library that depends on a ValueSet or ConceptMap fail, even if the newer build already stored tables for it: v0.2.5 answers `501` (the MongoDB terminology store is new in v0.2.6, #2185), and v0.2.4 and earlier do not accept such a dependency at all. Library writes still succeed but store no tables. |
 | 15 | `bulk_manifests.idx_bulk_manifests_index_pending` (#1283); a manifest whose deferred search-index rebuild is unfinished carries `index_pending: true` and `index_pending_types` | v0.2.6 | neither sets nor reads the marker, so it does not resume a rebuild a stopped server left outstanding; check before rolling back. The newer build resumes marked rebuilds at its next start. |
 | 16 | `bulk_submission_changes.idx_bulk_changes_resource`, used by a resource or type purge (#2279) | after v0.2.6 | ignores the index, but not the purge behaviour that arrived with it (#2279): a build that records a version below 16 (every release up to v0.2.6) purges less. Its resource purge (`DELETE /{type}/{id}/$purge`) and type purge (`POST /{type}/$purge`) leave the prior resource bodies that a `$bulk-submit` kept in `bulk_submission_changes.previous_content` and the `secondary_sync_failures` records of what they purged. Its tenant purge (`DELETE /admin/tenants/{id}?purge=true`) also leaves the tenant's documents in `bulk_submission_changes`, `bulk_entry_results`, `bulk_submit_files`, `bulk_manifests` and `bulk_submissions`, its `secondary_sync_failures` records and its bulk export and submit output files. The newer build's instance `$purge` cannot finish the job afterwards: it answers NotFound for a resource with no `resources` or `resource_history` rows. Run no purge while the older build serves; if one ran, follow [Crossed 16](#crossed-16-after-a-purge). |
+| 17 | Reference normalization (#2394): `search_index.value_reference` is stored without `/_history/N`, absolute `http(s)` references also carry `value_reference_target` (`Type/id`), and the partial index `idx_search_reference_target_v2` (search-index generation 5) serves it. A background backfill rewrites existing rows in `search_index` and `search_index_contained`; `search_indexes.references_normalized` marks it done. Until the marker and the index exist, readers keep the regex arms. | after v0.2.6 | refuses to start where it is from #2352 on (it knows only 16), so lower `version` as in [Rolling back](#rolling-back-to-an-older-build). Normalized rows still match exact `Type/id` references. Any reference an older build writes with `/_history/N` is not normalized, and the older build's own `_history` arms find it; the newer build finds it only in legacy mode. Follow [Crossed 17](#crossed-17-reference-normalization). |
 
 A change that raises `SCHEMA_VERSION` adds its row here. The `SCHEMA_VERSION` doc comment in `crates/persistence/src/backends/mongodb/schema.rs` lists the versions from 7 on too.
 
@@ -153,7 +154,7 @@ Each mongosh command connects with the URL alone, so a URL with a query string s
    - `NumberInt` stores a 32-bit integer, the type HFS writes.
    - Change only `version`; `search_indexes` belongs to the generation steps.
 
-6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are all generation 4 so far.
+6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are generation 4 up to v16, and generation 5 from v17.
 
 7. Start the older build. Its schema steps create nothing new, except that v0.2.0 and v0.2.1 build `idx_resources_type_deleted` and the generation-1 indexes. It records its own version and ignores what the table lists above its version. v0.2.0 and v0.2.1 also replace the whole `schema_version` document at each start, which removes `search_indexes` (the generation and `contained_rows_moved`) along with the old version. The newer build then treats the generation as unrecorded: it moves the contained rows again and logs the `$reindex` reminder for #1391.
 
@@ -168,6 +169,7 @@ Then follow up:
 - Crossed 13: the repair finishes leftover ledger documents; no action.
 - Crossed 14: write the SQLQuery and SQLView Libraries created or updated meanwhile again. Until they are written again, the newer build expands the dependencies they lack through the terminology server (`HFS_TERMINOLOGY_SERVER`) on demand, when one is set. A Library deleted meanwhile keeps its stored tables, because the older build never released them. Writing a Library again refreshes the tables it uses; to release the deleted one's tables, create it again with the same id and delete it again, or leave them.
 - Crossed 15: marked rebuilds resume at start; no action.
+- Crossed 17: run [Crossed 17](#crossed-17-reference-normalization) if the older build took writes. With no writes, no action.
 - Crossed 16, and a purge ran while the older build served: run the cleanup in [Crossed 16: after a purge](#crossed-16-after-a-purge). Until then the prior resource bodies the purge was meant to erase are still in `bulk_submission_changes`. With no purge, no action.
 - The older build was v0.2.3 or earlier (`search_indexes.generation` 3 or lower, or none recorded for v0.2.0 and v0.2.1, see [Releases](#releases)) and took writes: run a full `POST /$reindex`. These builds write date rows without `value_date_end` (#1391) and composite rows without `composite_slot`. Until the rows are rewritten, date searches with the `eq`, `ne`, `gt`, `ge`, `le`, `eb` and `ap` prefixes miss them, and a same-type composite search fails with an error asking for `$reindex`. The newer build logs a `warn` naming `$reindex` at that first start. See [Upgrading: reindex the date rows](search-indexes.md#upgrading-reindex-the-date-rows) and, for the tenant-wide route the composite rows need, [Composite parameters](search-indexes.md#composite-parameters). The full `$reindex` also rewrites `missing_params`, so the metadata-only reindex below is not needed then.
 - The older build was v0.2.4 or v0.2.5 and took writes: run the metadata-only reindex without `skipExistingMetadata`.
@@ -226,3 +228,17 @@ What these commands do not reach:
 
 - The tenant's bulk export and submit output files. The newer tenant purge deletes them from the configured output stores before it removes the rows (#2279); an older build leaves them. mongosh cannot remove them. With the newer build, register the tenant again (`POST /admin/tenants` with `{"id": "<tenant>"}`) and purge it (`DELETE /admin/tenants/<tenant>?purge=true`): without the registration the purge answers 404, because the tenant is neither registered nor holds resources. That purge deletes everything the tenant holds at that point, so it is only for a tenant that is still meant to be empty.
 - The leftovers of a resource or type purge whose resources you cannot name. Nothing in the database marks them: the purge removed the rows that showed the resource existed. No command is given for them, because blanking `previous_content` for resources that still exist would disable the `$bulk-submit` rollback of their updates.
+
+### Crossed 17: reference normalization
+
+Version 17 (#2394) rewrites `value_reference` in place, in the background. Rolling back and forward again needs these points:
+
+- **Rolling back needs no data revert.** An older build reads normalized rows correctly for exact `Type/id` references. It ignores `value_reference_target` and `idx_search_reference_target_v2`.
+- **Rows the older build writes are not normalized.** A reference with `/_history/N` keeps its suffix, and an absolute URL has no `value_reference_target`. The older build's own `_history` arms still find them. The newer build finds them only in legacy mode.
+- **Reset the marker after the older build took writes.** Run `crates/persistence/mongodb/reference-normalize-rollback.mongosh.js`. It unsets `search_indexes.references_normalized` and `search_indexes.reference_normalize_last_id`, so the next v17 start runs the backfill again and readers stay on the regex arms until it finishes. The backfill is idempotent and skips rows that are already normalized.
+
+    mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/reference-normalize-rollback.mongosh.js
+
+### Rolling deploys
+
+The schema-17 refusal stops a v16 build from starting on a v17 database, but it does not stop a v16 instance that is already running. Such an instance keeps writing `/_history/N` references after the marker is set, and in normalized mode those rows are missed. During an upgrade, stop every pre-17 instance before the backfill finishes. If one wrote after the marker was set, run the reset script above and restart.

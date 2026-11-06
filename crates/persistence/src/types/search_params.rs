@@ -831,6 +831,33 @@ pub fn strip_reference_version(reference: &str) -> &str {
     }
 }
 
+/// For an absolute `http(s)` FHIR reference
+/// (`<base>/<Type>/<id>[/_history/<vid>]`, optional query/fragment), returns
+/// `Type/id`; `None` for relative references and anything that does not end in
+/// a FHIR `Type/id`. The MongoDB writer stores it as `value_reference_target`
+/// and the backfill derives it with this same function (#2394).
+pub fn absolute_reference_target(reference: &str) -> Option<String> {
+    let rest = reference
+        .strip_prefix("https://")
+        .or_else(|| reference.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let rest = strip_reference_version(rest);
+    let mut segments = rest.rsplit('/');
+    let id = segments.next()?;
+    let resource_type = segments.next()?;
+    // A base must precede `Type/id`: `http://host/Patient/1` has `host`
+    // before it, a bare `http://Patient/1` does not.
+    segments.next()?;
+    let type_ok = resource_type.starts_with(|c: char| c.is_ascii_uppercase())
+        && resource_type.chars().all(|c| c.is_ascii_alphanumeric());
+    let id_ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    (type_ok && id_ok).then(|| format!("{resource_type}/{id}"))
+}
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -1295,5 +1322,41 @@ mod tests {
             iterate: false,
         });
         assert!(with_include.requires_advanced_features());
+    }
+
+    #[test]
+    fn absolute_reference_target_extracts_type_and_id() {
+        let t = |r: &str| absolute_reference_target(r);
+        assert_eq!(
+            t("http://example.org/fhir/Patient/p1").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("https://ehr.example.com/r4/Patient/p1").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("https://ehr.example.com/r4/Patient/p1/_history/2").as_deref(),
+            Some("Patient/p1")
+        );
+        assert_eq!(
+            t("http://h/Patient/p.1?x=1#f").as_deref(),
+            Some("Patient/p.1")
+        );
+        assert_eq!(t("http://h/Patient/p-1/").as_deref(), None);
+    }
+
+    #[test]
+    fn absolute_reference_target_rejects_non_fhir_and_relative() {
+        let t = |r: &str| absolute_reference_target(r);
+        assert_eq!(t("Patient/p1"), None);
+        assert_eq!(t("Patient/p1/_history/3"), None);
+        assert_eq!(t("urn:uuid:1234"), None);
+        assert_eq!(t("http://example.org/"), None);
+        assert_eq!(t("http://example.org/foo"), None);
+        assert_eq!(t("http://Patient/p1"), None, "no base before Type/id");
+        assert_eq!(t("http://h/patient/p1"), None, "type must be capitalised");
+        assert_eq!(t("http://h/Pat_ient/p1"), None);
+        assert_eq!(t(&format!("http://h/Patient/{}", "a".repeat(65))), None);
     }
 }

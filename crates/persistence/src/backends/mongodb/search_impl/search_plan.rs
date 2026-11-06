@@ -791,6 +791,7 @@ impl MongoBackend {
             tenant_id,
             resource_type,
             compartment,
+            self.references_normalized(),
         ));
         let definition_scope = Bson::Document(doc! {
             "fhir_version": self.config().fhir_version.as_str(),

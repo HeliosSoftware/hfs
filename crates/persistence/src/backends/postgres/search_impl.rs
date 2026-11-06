@@ -1382,8 +1382,8 @@ impl RevincludeProvider for PostgresBackend {
                     AND r.resource_type = si.resource_type
                     AND r.id = si.resource_id
                  WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE
-                 AND si.param_name = {}
-                 AND si.value_reference IN ({})",
+                 AND si.param_name = {0}
+                 AND (si.value_reference IN ({1}) OR si.value_reference_target IN ({1}))",
                 sql_string_literal(&revinclude.search_param),
                 placeholders.join(", ")
             );

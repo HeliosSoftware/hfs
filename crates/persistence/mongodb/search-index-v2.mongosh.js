@@ -107,6 +107,21 @@ db.runCommand({
         "tenant_id": 1,
         "resource_type": 1,
         "param_name": 1,
+        "value_reference_target": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_reference_target_v2",
+      "partialFilterExpression": {
+        "value_reference_target": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
         "value_uri": 1,
         "resource_id": 1
       },

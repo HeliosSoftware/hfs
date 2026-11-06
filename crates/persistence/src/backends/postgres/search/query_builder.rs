@@ -731,6 +731,13 @@ impl SqlFragment {
 /// PostgreSQL search query builder.
 pub struct PostgresQueryBuilder;
 
+/// True for a relative `Type/id` search value (not an absolute URL), the only
+/// form that can match a stored absolute reference through
+/// `value_reference_target` (#2394).
+fn is_relative_type_id(value: &str) -> bool {
+    !value.starts_with("http://") && !value.starts_with("https://")
+}
+
 impl PostgresQueryBuilder {
     /// Builds a search query for finding matching resource IDs.
     ///
@@ -1173,7 +1180,7 @@ impl PostgresQueryBuilder {
             format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
-                 AND value_reference = ${p1})"
+                 AND (value_reference = ${p1} OR value_reference_target = ${p1}))"
             ),
             vec![SqlParam::text(&base)],
         ))
@@ -1422,7 +1429,10 @@ impl PostgresQueryBuilder {
                     .join(", ");
                 offset += 1;
                 branches.push((
-                    format!("(param_name IN ({in_list}) AND value_reference = ${offset})"),
+                    format!(
+                        "(param_name IN ({in_list}) AND (value_reference = ${offset} \
+                         OR value_reference_target = ${offset}))"
+                    ),
                     false,
                 ));
                 params.push(SqlParam::text(strip_reference_version(&comp.reference)));
@@ -3318,14 +3328,24 @@ impl PostgresQueryBuilder {
         // together — see `build_token_condition` for why (an OR'd sublink is left as
         // a re-executable SubPlan instead of being pulled up into a semi-join). The
         // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
-        Some(SqlFragment::with_params(
-            format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
-                sql_string_literal(&param.name),
-                conditions.join(" OR ")
-            ),
-            params,
-        ))
+        let membership = format!(
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
+            sql_string_literal(&param.name),
+            conditions.join(" OR ")
+        );
+        // `:not` negates the whole membership (#2494), as the token builder
+        // does and as SQLite's `resource_key NOT IN (...)` does: resources with
+        // no index row for the parameter match, and a comma list means "not A
+        // and not B". `resource_id` is never NULL, so the negation is safe. The
+        // `NOT (` prefix also keeps the fragment out of the `id IN (` shortcuts
+        // (`simple_membership_arm`, `single_index_predicate`), which would
+        // otherwise treat it as a positive match.
+        let sql = if matches!(param.modifier.as_ref(), Some(SearchModifier::Not)) {
+            format!("NOT ({membership})")
+        } else {
+            membership
+        };
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// The bare row predicate for one value of a reference search (every form
@@ -3395,7 +3415,13 @@ impl PostgresQueryBuilder {
                     let exact = *param_num + 1;
                     *param_num += 1;
                     params.push(SqlParam::text(&base));
-                    format!("value_reference = ${exact}")
+                    if is_relative_type_id(&base) {
+                        // A relative `Type/id` also matches the absolute
+                        // reference stored with that target (#2394).
+                        format!("(value_reference = ${exact} OR value_reference_target = ${exact})")
+                    } else {
+                        format!("value_reference = ${exact}")
+                    }
                 } else {
                     // Bare logical id: compare with the final reference segment.
                     // The explicit NULL check matches the v42 partial index.
@@ -6182,14 +6208,15 @@ mod tests {
         let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(placeholders(filter), vec![1, 2, 3, 4]);
+        assert_eq!(placeholders(filter), vec![1, 2, 3, 4, 4]);
         assert_eq!(frag.params.len(), 2);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
         assert_eq!(
             having,
             "bool_or(param_name = 'code' AND (value_token_code = $3)) AND \
-             bool_or(param_name IN ('subject', 'performer') AND value_reference = $4)"
+             bool_or(param_name IN ('subject', 'performer') AND \
+             (value_reference = $4 OR value_reference_target = $4))"
         );
         assert!(
             matches!(&frag.params[1], SqlParam::Text(s) if s == "Patient/p1"),
@@ -6426,7 +6453,8 @@ mod tests {
                 "p1"
             )),
             (
-                "(param_name = 'subject' AND ((value_reference = $3)))".to_string(),
+                "(param_name = 'subject' AND (((value_reference = $3 OR value_reference_target = $3))))"
+                    .to_string(),
                 1
             )
         );
@@ -7705,6 +7733,95 @@ mod tests {
         assert_eq!(frag.params.len(), 2);
     }
 
+    fn reference_not_sql(values: &[&str]) -> (String, SqlFragment) {
+        let build = |modifier| {
+            let param = SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: values
+                    .iter()
+                    .map(|v| SearchValue::new(SearchPrefix::Eq, *v))
+                    .collect(),
+                chain: vec![],
+                components: vec![],
+            };
+            PostgresQueryBuilder::build_search_query(
+                &SearchQuery::new("Observation").with_parameter(param),
+                2,
+            )
+            .expect("reference condition")
+        };
+        (build(None).sql, build(Some(SearchModifier::Not)))
+    }
+
+    #[test]
+    fn reference_not_negates_the_whole_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    #[test]
+    fn reference_not_comma_list_is_one_negated_sublink() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1", "Group/p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert_eq!(negated.sql.matches("id IN (SELECT").count(), 1);
+        assert_eq!(negated.params.len(), 2);
+    }
+
+    #[test]
+    fn reference_not_bare_id_negates_the_bare_id_predicate() {
+        let (positive, negated) = reference_not_sql(&["p1"]);
+        assert_eq!(negated.sql, format!("NOT ({positive})"));
+        assert!(
+            negated.sql.starts_with("NOT (id IN (SELECT"),
+            "{}",
+            negated.sql
+        );
+    }
+
+    #[test]
+    fn reference_not_is_not_an_index_only_membership() {
+        let (positive, negated) = reference_not_sql(&["Patient/p1"]);
+        assert!(PostgresQueryBuilder::single_index_predicate(&positive).is_some());
+        assert_eq!(
+            PostgresQueryBuilder::single_index_predicate(&negated.sql),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_reference_not_is_not_folded_into_an_intersect() {
+        let not = |v: &str| reference_param("subject", Some(SearchModifier::Not), v);
+        let query = SearchQuery::new("Observation")
+            .with_parameter(not("Patient/p1"))
+            .with_parameter(not("Patient/p2"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("two :not");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert_eq!(
+            frag.sql.matches("NOT (id IN (SELECT").count(),
+            2,
+            "{}",
+            frag.sql
+        );
+    }
+
+    #[test]
+    fn reference_positive_and_not_are_not_folded_into_an_intersect() {
+        let query = SearchQuery::new("Observation")
+            .with_parameter(reference_param("subject", None, "Patient/p1"))
+            .with_parameter(reference_param(
+                "subject",
+                Some(SearchModifier::Not),
+                "Patient/p2",
+            ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("mixed");
+        assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
+        assert!(frag.sql.contains("NOT (id IN (SELECT"), "{}", frag.sql);
+        assert_eq!(frag.sql.matches("id IN (SELECT").count(), 2, "{}", frag.sql);
+    }
+
     #[test]
     fn reference_or_list_is_a_single_sublink() {
         let param = SearchParameter {
@@ -7761,7 +7878,7 @@ mod tests {
         );
         assert!(
             frag.sql.contains(&format!(
-                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR value_reference = $4"
+                "(value_reference IS NOT NULL AND {REFERENCE_TARGET_ID_EXPR} = $3) OR (value_reference = $4 OR value_reference_target = $4)"
             )),
             "each OR arm must use its assigned placeholder: {}",
             frag.sql
@@ -7878,14 +7995,14 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
 
         assert!(
-            frag.sql.contains("value_reference = $3"),
+            frag.sql
+                .contains("(value_reference = $3 OR value_reference_target = $3)"),
             "must be an equality on the bound base: {}",
             frag.sql
         );
         assert!(
-            !frag.sql.contains("LIKE") && !frag.sql.contains(" OR "),
-            "no disjunction: an OR is index-usable only when every arm is, and \
-             the `/_history/%` arm was the one that never matched: {}",
+            !frag.sql.contains("LIKE") && frag.sql.matches(" OR ").count() == 1,
+            "only the two-column OR (both arms indexed, #2394), no LIKE arm: {}",
             frag.sql
         );
         assert_eq!(frag.params.len(), 1);

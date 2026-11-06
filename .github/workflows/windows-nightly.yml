@@ -1,0 +1,249 @@
+name: Windows nightly
+
+# The nightly Windows pass, without a Windows agent. It replaces the Windows
+# legs `ci.yml` used to run on agent4 each night (Test Rust, Test Python and
+# the Linting jobs); the macOS legs stay there, on agent5.
+#
+#   * Lint: clippy for `x86_64-pc-windows-msvc`, cross-checked with cargo-xwin
+#     on a self-hosted Linux agent. The same commands as ci.yml's clippy
+#     jobs. This is what catches code that does not compile, or warns, only
+#     on Windows. (fmt, ruff and mypy do not depend on the OS and run on every
+#     pull request.)
+#   * Test Rust: built and run natively on GitHub's `windows-latest`. Not
+#     cross-built: many tests find their fixtures through
+#     `env!("CARGO_MANIFEST_DIR")`, which a Linux build would bake in as a
+#     Linux path. Runs the tests that do not need Docker, chosen by
+#     .github/scripts/docker-free-tests.py: a GitHub-hosted runner cannot
+#     reach the Docker host (`DOCKER_HOST`) the testcontainers-backed tests
+#     use. Those exercise PostgreSQL, MongoDB and Elasticsearch, which run
+#     the same from Linux, where they are tested on every pull request.
+#   * Test Python: pysof's tests on `windows-latest`.
+#
+# Runs at the time the nightly always has; check it is green before cutting a
+# `v*` tag. Also by hand (Actions -> Windows nightly -> Run workflow), and on
+# a pull request that changes it or the test selection.
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-nightly.yml
+      - .github/scripts/docker-free-tests.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-nightly-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  # The 16 MB main-thread stack the Windows builds link with (ci.yml's
+  # "Configure Rust to use LLD (Windows)"); deep FHIR recursion needs it.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/STACK:16777216"
+  CLIPPY_ARGS: >-
+    -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant
+    -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if
+    -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items
+    -A clippy::doc-lazy-continuation
+
+jobs:
+  lint:
+    name: Linting (clippy, Windows target)
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 180
+    env:
+      # Its own dir next to the checkout, kept warm between nights and capped
+      # by cargo-target-gc: nothing is shared with the Linux builds.
+      CARGO_TARGET_DIR: ${{ github.workspace }}-target-xwin-lint
+      CARGO_BUILD_JOBS: 4
+      # cargo-xwin downloads the MSVC CRT and Windows SDK from Microsoft and
+      # needs their license accepted. Setting this accepts it for this repo's
+      # CI: https://go.microsoft.com/fwlink/?LinkId=2086102
+      XWIN_ACCEPT_LICENSE: "1"
+      # `--workspace` includes pysof, and PyO3 cannot ask a Windows Python for
+      # its version here.
+      PYO3_CROSS_PYTHON_VERSION: "3.12"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      # Build scripts and proc macros are compiled for this Linux host.
+      - name: Configure Rust to use LLD (Linux host)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      # clang 19 or newer: the MSVC C++ headers reject older clang (STL1000),
+      # which `mimalloc` hits. The agents' distro clang is 18. Same as the
+      # Windows leg of release-build.yml.
+      - name: Install LLVM 19
+        run: |
+          set -euo pipefail
+          ver=19.1.7
+          sha=4a5ec53951a584ed36f80240f6fbf8fdd46b4cf6c7ee87cc2d5018dc37caf679
+          dir="$RUNNER_TOOL_CACHE/llvm-$ver"
+          if [ ! -x "$dir/bin/clang-cl" ]; then
+            tmp=$(mktemp -d)
+            curl -sSfL --retry 5 -o "$tmp/llvm.tar.xz" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-Linux-X64.tar.xz"
+            echo "$sha  $tmp/llvm.tar.xz" | sha256sum -c -
+            rm -rf "$dir.partial"
+            mkdir -p "$dir.partial"
+            tar -xJf "$tmp/llvm.tar.xz" --strip-components=1 -C "$dir.partial"
+            rm -rf "$dir" "$tmp"
+            mv "$dir.partial" "$dir"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-xwin
+        run: |
+          set -euo pipefail
+          want=0.23.1
+          if ! cargo xwin --version 2>/dev/null | grep -q " $want$"; then
+            cargo install --locked cargo-xwin --version "$want"
+          fi
+          cargo xwin --version
+
+      # Same three checks as ci.yml's `lint-clippy`, `lint-backends` and
+      # `lint-fhir-versions`, for the Windows target.
+      - name: Run clippy (all targets, all features)
+        run: cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- $CLIPPY_ARGS
+
+      - name: Check hfs builds with single-backend feature sets (#1291)
+        run: |
+          set -euo pipefail
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo xwin clippy --target x86_64-pc-windows-msvc -p helios-hfs --no-default-features --features "$features" -- $CLIPPY_ARGS
+            echo "::endgroup::"
+          done
+
+      - name: Check builds with FHIR version feature subsets (#1367)
+        run: |
+          set -euo pipefail
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui" "helios-persistence R5,sqlite"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo xwin clippy --target x86_64-pc-windows-msvc -p "$1" --no-default-features --features "$2" -- $CLIPPY_ARGS
+            echo "::endgroup::"
+          done
+
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  test-rust:
+    name: Test Rust (Windows, no Docker)
+    runs-on: windows-latest
+    # GitHub's limit is 6 h; this is a cold build every night.
+    timeout-minutes: 350
+    env:
+      # 4 vCPUs and 16 GB. Debug rustc processes are far smaller than release
+      # ones, but helios-fhir with all four FHIR versions is still several GB.
+      CARGO_BUILD_JOBS: 3
+      # As in ci.yml's Test Rust: with --all-features the R5 FHIRPath suite is
+      # live, and this makes a silently disabled one fail (#307).
+      HFS_REQUIRE_R5: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Runner resources
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors
+          "{0:N1} GB RAM" -f ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+
+      - name: Select the tests that do not need Docker
+        run: |
+          set -euo pipefail
+          python .github/scripts/docker-free-tests.py --list
+          python .github/scripts/docker-free-tests.py > "$RUNNER_TEMP/test-args.txt"
+
+      # Built and run as separate steps so each gets its own timing.
+      - name: Build tests
+        run: |
+          set -euo pipefail
+          mapfile -t args < <(tr -d '\r' < "$RUNNER_TEMP/test-args.txt")
+          # Everything before `--` selects targets; the rest is for the harness.
+          sel=()
+          for a in "${args[@]}"; do [ "$a" = "--" ] && break; sel+=("$a"); done
+          start=$(date +%s)
+          cargo test --workspace --all-features --no-run "${sel[@]}"
+          echo "build: $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          mapfile -t args < <(tr -d '\r' < "$RUNNER_TEMP/test-args.txt")
+          start=$(date +%s)
+          cargo test --workspace --all-features "${args[@]}"
+          echo "tests: $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Disk after build
+        if: always()
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+
+  test-python:
+    name: Test Python (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 4
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/pysof
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install -q uv
+
+      - name: Build pysof
+        run: uv run maturin develop
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Run Python tests
+        run: uv run python -m pytest python-tests/ -v

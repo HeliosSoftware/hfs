@@ -708,7 +708,10 @@ async fn postgres_contained_modifiers_reference_and_uri_are_strict() {
                 Some(SearchModifier::Type("Patient".into())),
                 "target",
             ),
-            vec!["positive"],
+            // The contained branch also matches `value_reference_target`, so
+            // the DiagnosticReport whose contained Observation points at the
+            // absolute URL `http://example.org/fhir/Patient/target` is found.
+            vec!["absolute", "positive"],
         ),
         (
             "Observation",

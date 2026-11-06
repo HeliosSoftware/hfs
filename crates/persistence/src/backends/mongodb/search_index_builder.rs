@@ -76,7 +76,7 @@ mod mode_tests {
 
 use std::time::Duration;
 
-use futures::stream::TryStreamExt;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use mongodb::{
     Database,
     bson::{Bson, Document, doc},
@@ -85,15 +85,17 @@ use mongodb::{
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::schema::{
-    contained_rows_moved, drop_index_if_present, get_search_index_boot_record,
-    get_search_index_generation, set_contained_rows_moved, set_search_index_empty_at_generation,
-    set_search_index_generation,
+    contained_rows_moved, drop_index_if_present, get_reference_normalize_last_id,
+    get_search_index_boot_record, get_search_index_generation, references_normalized,
+    set_contained_rows_moved, set_reference_normalize_last_id, set_references_normalized,
+    set_search_index_empty_at_generation, set_search_index_generation,
 };
 use super::search_index_catalog::{
     DATE_RANGE_GENERATION, IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
     SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
     superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
 };
+use crate::types::{absolute_reference_target, strip_reference_version};
 
 /// What one run of the builder did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +141,17 @@ pub(super) const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 6
 /// boot, large enough that moving even a sizeable backlog of contained rows
 /// takes few round trips.
 const MOVE_PAGE: usize = 1_000;
+
+/// Page size for [`SearchIndexBuilder::normalize_reference_rows`] (#2394).
+const NORMALIZE_PAGE: usize = 1_000;
+
+/// The reference backfill records its `_id` checkpoint every this many
+/// pages. A crash replays at most this many pages, which is harmless: the
+/// rewrite is idempotent.
+const NORMALIZE_CHECKPOINT_PAGES: usize = 10;
+
+/// Concurrent `update_many` calls per page in the reference backfill.
+const NORMALIZE_UPDATE_CONCURRENCY: usize = 8;
 
 /// `listIndexes` option keys, beyond `v`/`key`/`name`/`partialFilterExpression`,
 /// that change query results or index maintenance if present on a
@@ -294,6 +307,9 @@ pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
     rows_at_boot: RowsAtBoot,
+    /// Published to `MongoBackend` once the reference backfill is complete
+    /// (#2394). `None` in tests that do not care.
+    references_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SearchIndexBuilder {
@@ -302,7 +318,18 @@ impl SearchIndexBuilder {
             database,
             mode,
             rows_at_boot,
+            references_flag: None,
         }
+    }
+
+    /// Sets the flag [`Self::normalize_reference_rows`] raises when the
+    /// `value_reference` backfill is complete.
+    pub(super) fn with_references_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.references_flag = Some(flag);
+        self
     }
 
     /// What `search_index` held at boot (#2268). `init_schema` awaits this
@@ -378,6 +405,23 @@ impl SearchIndexBuilder {
             tracing::info!(
                 moved,
                 "moved contained search_index rows to search_index_contained"
+            );
+        }
+
+        // Same class of fix as the move above: runs in every mode, ahead of
+        // the index work, and wraps its errors so `run` does not report them
+        // as an index-build failure (#2394).
+        let normalized = self.normalize_reference_rows().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("reference normalization failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })?;
+        if normalized > 0 {
+            tracing::info!(
+                normalized,
+                "normalized value_reference rows in search_index / search_index_contained"
             );
         }
 
@@ -633,6 +677,132 @@ impl SearchIndexBuilder {
         }
         set_contained_rows_moved(&self.database).await?;
         Ok(moved)
+    }
+
+    /// One-time rewrite of `value_reference` to its normalized form (#2394):
+    /// version suffix stripped, and `value_reference_target` (`Type/id`) set
+    /// for absolute URLs. Covers `search_index` and
+    /// `search_index_contained`. Walks each collection by ascending `_id` in
+    /// pages, computing the new values with the same helpers the writer
+    /// uses, so the two cannot diverge. Idempotent (a normalized row is
+    /// left alone) and resumable (an `_id` checkpoint is recorded). Runs in
+    /// every mode. On completion records the marker and raises the
+    /// in-memory flag. Returns the number of rows rewritten.
+    async fn normalize_reference_rows(&self) -> StorageResult<u64> {
+        if references_normalized(&self.database).await? {
+            self.publish_references_normalized();
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+            total += self.normalize_collection(collection).await?;
+        }
+        set_references_normalized(&self.database).await?;
+        self.publish_references_normalized();
+        Ok(total)
+    }
+
+    fn publish_references_normalized(&self) {
+        if let Some(flag) = &self.references_flag {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn normalize_collection(&self, name: &str) -> StorageResult<u64> {
+        let coll = self.database.collection::<Document>(name);
+        let mut last = get_reference_normalize_last_id(&self.database, name).await?;
+        let mut rewritten = 0u64;
+        let mut pages = 0usize;
+        loop {
+            let mut filter = doc! { "value_reference": { "$exists": true } };
+            if let Some(last) = &last {
+                filter.insert("_id", doc! { "$gt": last.clone() });
+            }
+            let mut cursor = coll
+                .find(filter)
+                .projection(doc! { "value_reference": 1, "value_reference_target": 1 })
+                .sort(doc! { "_id": 1 })
+                .limit(NORMALIZE_PAGE as i64)
+                .await?;
+            let mut page = Vec::with_capacity(NORMALIZE_PAGE);
+            while let Some(row) = cursor.try_next().await? {
+                page.push(row);
+            }
+            let Some(page_last) = page.last().and_then(|r| r.get("_id").cloned()) else {
+                break;
+            };
+            let full_page = page.len() == NORMALIZE_PAGE;
+
+            // Group the rows that need a rewrite by their new values.
+            let mut groups: std::collections::HashMap<(String, Option<String>), Vec<Bson>> =
+                std::collections::HashMap::new();
+            for row in &page {
+                let Ok(old) = row.get_str("value_reference") else {
+                    continue;
+                };
+                let new_value = strip_reference_version(old);
+                let target = absolute_reference_target(old);
+                let current_target = row.get_str("value_reference_target").ok();
+                if new_value == old && target.as_deref() == current_target {
+                    continue;
+                }
+                if let Some(id) = row.get("_id") {
+                    groups
+                        .entry((new_value.to_string(), target))
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
+            let updates: Vec<(Document, Document)> = groups
+                .into_iter()
+                .map(|((value, target), ids)| {
+                    let mut set = doc! { "value_reference": value };
+                    let mut update = Document::new();
+                    match target {
+                        Some(t) => {
+                            set.insert("value_reference_target", t);
+                        }
+                        None => {
+                            update.insert("$unset", doc! { "value_reference_target": "" });
+                        }
+                    }
+                    update.insert("$set", set);
+                    (doc! { "_id": { "$in": ids } }, update)
+                })
+                .collect();
+            let results: Vec<u64> = stream::iter(updates)
+                .map(|(filter, update)| {
+                    let coll = coll.clone();
+                    async move {
+                        let r = coll.update_many(filter, update).await?;
+                        Ok::<u64, StorageError>(r.modified_count)
+                    }
+                })
+                .buffer_unordered(NORMALIZE_UPDATE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            rewritten += results.iter().sum::<u64>();
+
+            last = Some(page_last);
+            pages += 1;
+            if pages.is_multiple_of(NORMALIZE_CHECKPOINT_PAGES)
+                && let Some(last) = &last
+            {
+                set_reference_normalize_last_id(&self.database, name, last.clone()).await?;
+                tracing::info!(
+                    collection = name,
+                    rewritten,
+                    "normalizing value_reference rows"
+                );
+            }
+            if !full_page {
+                break;
+            }
+        }
+        if let Some(last) = last {
+            set_reference_normalize_last_id(&self.database, name, last).await?;
+        }
+        Ok(rewritten)
     }
 }
 

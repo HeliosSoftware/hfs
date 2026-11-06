@@ -7,28 +7,30 @@ on:
       - "v*"
   pull_request:
     branches: [main]
-  # Nightly Windows + macOS pass. Pull requests and pushes run on Linux only;
-  # this run is the one place `Test Rust`, `Test Python` and the `Linting` jobs
-  # still execute on the Windows (agent4) and macOS (agent5, ARM64) runners, so
-  # an OS-only break surfaces within a day instead of on the release tag, where
-  # those binaries are built but never tested. Each of those jobs is a matrix
-  # over `matrix.os`: one `Linux` leg for pushes and PRs, a `Windows` and a
-  # `macOS` leg here. The two legs run side by side, one per agent.
+  # Nightly macOS pass. Pull requests and pushes run on Linux only; this run
+  # is the one place `Test Rust`, `Test Python` and the `Linting` jobs execute
+  # on macOS (agent5, ARM64), so an OS-only break surfaces within a day
+  # instead of on the release tag. Each of those jobs is a matrix over
+  # `matrix.os`: one `Linux` leg for pushes and PRs, a `macOS` leg here.
+  # Windows has its own nightly, windows-nightly.yml, at the same time and
+  # without a Windows agent. The `runner.os == 'Windows'` steps left in this
+  # file only run if a Windows agent is ever added back.
   # 06:30 UTC sits in the quietest stretch of the week's runner demand
-  # (06:00-11:00 UTC), and the run takes ~3 h on the single Windows agent.
-  # Check the latest nightly is green before cutting a `v*` tag.
+  # (06:00-11:00 UTC).
+  # Check the latest nightlies are green before cutting a `v*` tag.
   schedule:
     - cron: "30 6 * * *"
-  # Manual run, e.g. to check a branch on Windows or macOS before merging a
-  # fix for a nightly failure: Actions -> HFS Continuous Integration -> Run
-  # workflow, pick the branch and the OS. `Windows and macOS` is the nightly.
+  # Manual run, e.g. to check a branch on macOS before merging a fix for a
+  # nightly failure: Actions -> HFS Continuous Integration -> Run workflow,
+  # pick the branch and the OS. `macOS` is the nightly. For Windows, run
+  # "Windows nightly" the same way.
   workflow_dispatch:
     inputs:
       os:
-        description: "OS for Test Rust / Test Python / Linting"
+        description: "OS for Test Rust / Test Python / Linting (Windows: run windows-nightly.yml)"
         type: choice
-        options: [Windows and macOS, Windows, macOS, Linux]
-        default: Windows and macOS
+        options: [macOS, Linux]
+        default: macOS
 
 # One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
 # every intermediate run is superseded by the next one — so a new push cancels
@@ -86,7 +88,7 @@ env:
 jobs:
   test-rust:
     name: ${{ matrix.os == 'Linux' && 'Test Rust' || format('Test Rust ({0})', matrix.os) }}
-    # Linux for pushes and pull requests; Windows + macOS for the nightly /
+    # Linux for pushes and pull requests; macOS for the nightly /
     # manual pass (see `on.schedule`). Pinned rather than bare `[self-hosted]`:
     # unpinned, this job and the other unpinned ones spread over the Windows and
     # macOS agents too, and starved the jobs that can only run there.
@@ -97,7 +99,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. Healthy runs on the slower runners (the Windows agent)
@@ -542,7 +544,7 @@ jobs:
 
   test-python:
     name: ${{ matrix.os == 'Linux' && 'Test Python' || format('Test Python ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `test-rust`.
+    # Same Linux / nightly macOS matrix as `test-rust`.
     strategy:
       # A Windows failure must not cancel the macOS leg, or the reverse.
       fail-fast: false
@@ -550,7 +552,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     needs: [test-rust]
     steps:
@@ -653,7 +655,7 @@ jobs:
   # `lint` need all five.
   lint:
     name: ${{ matrix.os == 'Linux' && 'Linting' || format('Linting ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `test-rust`. The nightly
+    # Same Linux / nightly macOS matrix as `test-rust`. The nightly
     # keeps clippy honest on `cfg(windows)` and `cfg(target_os = "macos")`
     # code, which a Linux run never compiles.
     strategy:
@@ -663,7 +665,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
@@ -691,7 +693,7 @@ jobs:
 
   lint-clippy:
     name: ${{ matrix.os == 'Linux' && 'Linting (clippy)' || format('Linting (clippy) ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    # Same Linux / nightly macOS matrix as `lint`.
     strategy:
       # A Windows failure must not cancel the macOS leg, or the reverse.
       fail-fast: false
@@ -699,7 +701,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
@@ -751,7 +753,7 @@ jobs:
 
   lint-backends:
     name: ${{ matrix.os == 'Linux' && 'Linting (backend feature sets)' || format('Linting (backend feature sets) ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    # Same Linux / nightly macOS matrix as `lint`.
     strategy:
       # A Windows failure must not cancel the macOS leg, or the reverse.
       fail-fast: false
@@ -759,7 +761,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
@@ -823,7 +825,7 @@ jobs:
 
   lint-fhir-versions:
     name: ${{ matrix.os == 'Linux' && 'Linting (FHIR version feature sets)' || format('Linting (FHIR version feature sets) ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    # Same Linux / nightly macOS matrix as `lint`.
     strategy:
       # A Windows failure must not cancel the macOS leg, or the reverse.
       fail-fast: false
@@ -831,7 +833,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
@@ -938,7 +940,7 @@ jobs:
 
   lint-pysof:
     name: ${{ matrix.os == 'Linux' && 'Linting (pysof)' || format('Linting (pysof) ({0})', matrix.os) }}
-    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    # Same Linux / nightly macOS matrix as `lint`.
     strategy:
       # A Windows failure must not cancel the macOS leg, or the reverse.
       fail-fast: false
@@ -946,7 +948,7 @@ jobs:
         # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
         # the one OS a manual dispatch picked. Kept identical across the
         # matrix jobs; see `on.schedule`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os == 'macOS')) && '["macOS"]' || '["Linux"]') }}
     runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
@@ -1372,13 +1374,14 @@ jobs:
 
   test-fhirpath:
     name: Test FHIRPath
-    # Same Linux / nightly Windows + macOS matrix as `test-rust`. The HL7 FHIRPath
+    # Same Linux / nightly macOS matrix as `test-rust`. The HL7 FHIRPath
     # validator is published for both (HeliosSoftware/Hl7.Fhir.FhirPath.Validator
     # ships win-x64 .zip and linux-x64 .tar.gz), so each OS-specific step below
     # comes as a Linux / Windows pair picked by `runner.os`.
-    # The validator ships no macOS build, so the nightly runs this on Windows
-    # only and a macOS-only dispatch runs it on Linux.
-    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && contains(inputs.os, 'Windows'))) && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    # The validator ships no macOS build, and there is no Windows agent any
+    # more (the Windows nightly is windows-nightly.yml, which runs the
+    # FHIRPath crate's own tests on Windows), so this runs on Linux always.
+    runs-on: [self-hosted, Linux]
     needs: [test-rust]
     # This job had no ceiling at all, so a hang held a scarce self-hosted
     # runner until GitHub's 6h default fired. Green runs are ~15-20 min (#287).
@@ -2047,16 +2050,13 @@ jobs:
     uses: ./.github/workflows/hts-ig-conformance.yml
     secrets: inherit
 
+  # Every release artifact, smoke-tested on a GitHub-hosted machine of its
+  # own platform; see release-build.yml for where each target builds. Windows
+  # and Linux ARM64 are cross-compiled on Linux agents, macOS builds on the
+  # Mac. The jobs below publish what it uploads (`hfs-<target>`,
+  # `pysof-<target>`, `test_report`).
   build:
     name: Build Release
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 1440
-    env:
-      # In-checkout, unlike the rest of this workflow (see the top-level env):
-      # the release-artifact upload and packaging steps below name
-      # `target/release/...` and `target/<triple>/release/...` directly, and a
-      # tag build is a from-scratch release build either way.
-      CARGO_TARGET_DIR: target
     needs:
       [
         coverage,
@@ -2067,232 +2067,7 @@ jobs:
         hts-ig-conformance,
       ]
     if: startsWith(github.ref, 'refs/tags/v')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: Linux-x86
-            runner: [self-hosted, Linux]
-            target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - os: Linux-ARM64
-            runner: [self-hosted, macOS]
-            target: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - os: Windows
-            runner: [self-hosted, Windows]
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
-          - os: macOS
-            runner: [self-hosted, macOS]
-            target: aarch64-apple-darwin
-            archive_ext: tar.gz
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
-
-      - name: Configure Rust to use LLD (Linux x86)
-        if: matrix.os == 'Linux-x86'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
-
-      - name: Configure cross-compile linker (Linux ARM64)
-        if: matrix.os == 'Linux-ARM64'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-unknown-linux-gnu-gcc"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
-
-      - name: Configure Rust linker (macOS)
-        if: matrix.os == 'macOS'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
-          # stable makes `linker_messages` warn-by-default, and ld64 prints
-          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
-          # offsets in compact unwind table" for every large debug test binary
-          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
-          # unwinding falls back to the DWARF tables, which only matters for
-          # panic-heavy hot paths, and these are test builds.
-          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
-          # No custom linker flags on macOS. Two that were tried here both
-          # broke the build:
-          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
-          #     invalid for executables/test binaries. On Apple Silicon it
-          #     yields Mach-O binaries dyld cannot map against the shared cache
-          #     ("syscall to map cache into shared region failed" ->
-          #     SystemConfiguration.framework fails to load -> SIGABRT).
-          #   * `-stack_size` is rejected by ld64 on any non-main-executable
-          #     link ("-stack_size option can only be used when linking a main
-          #     executable"), and cargo applies rustflags to proc-macro/cdylib
-          #     links too (e.g. serde_derive), so it fails the build outright.
-          # The main-thread stack already defaults to 8 MB on macOS, matching
-          # the Linux `-zstack-size=8388608`, so no override is needed.
-
-      - name: Build Release (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
-        run: cargo build --workspace --all-features --release
-
-      - name: Build Release (Cross-compile)
-        if: matrix.os == 'Linux-ARM64'
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-unknown-linux-gnu-gcc
-          PYO3_CROSS_PYTHON_VERSION: "3.14"
-        run: cargo build --workspace --all-features --release --target ${{ matrix.target }}
-
-      - name: Build Release (Unix)
-        if: matrix.os != 'Windows' && matrix.os != 'Linux-ARM64'
-        run: cargo build --workspace --all-features --release
-
-      # Only the binaries `release` packages and `docker` copies (keep this list
-      # in sync with the `for bin in ...` loop in `release`). Everything else in
-      # target/release/ — pysof.dll (shipped as a wheel), the codegen tools,
-      # validator-cli — used to ride along at ~0.3 GB per tag. Both consumers run
-      # in this same workflow run, so 3 days only has to cover re-running them.
-      - name: Upload Rust build artifacts to GitHub
-        if: matrix.os != 'Linux-ARM64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: hfs-${{ matrix.target }}
-          path: |
-            target/release/hfs
-            target/release/hfs.exe
-            target/release/fhirpath-server
-            target/release/fhirpath-server.exe
-            target/release/fhirpath-cli
-            target/release/fhirpath-cli.exe
-            target/release/sof-server
-            target/release/sof-server.exe
-            target/release/sof-cli
-            target/release/sof-cli.exe
-            target/release/config-advisor
-            target/release/config-advisor.exe
-            target/release/hts
-            target/release/hts.exe
-            data/
-          retention-days: 3
-
-      - name: Upload Rust build artifacts to GitHub (Cross-compile)
-        if: matrix.os == 'Linux-ARM64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: hfs-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/hfs
-            target/${{ matrix.target }}/release/fhirpath-server
-            target/${{ matrix.target }}/release/fhirpath-cli
-            target/${{ matrix.target }}/release/sof-server
-            target/${{ matrix.target }}/release/sof-cli
-            target/${{ matrix.target }}/release/config-advisor
-            target/${{ matrix.target }}/release/hts
-            data/
-          retention-days: 3
-
-      # NOTE: `run_comprehensive_test_suite` is invoked here BY NAME as a substring
-      # filter, and `cargo test` exits 0 when a filter matches nothing. This job is
-      # also tag-only (`if: startsWith(github.ref, 'refs/tags/v')`), so a rename
-      # would not surface on any PR — the first symptom would be a release whose
-      # published conformance report is missing or stale. Rename only together with
-      # this step, and keep the verification step below.
-      - name: Generate test_report.json file
-        if: matrix.os == 'Linux-x86'
-        run: cargo test -p helios-sof run_comprehensive_test_suite
-
-      # Anti-vacuity gate (issue #307). The report is deployed to GitHub Pages by
-      # `publish-report`, so "the step was green" must mean "a real report exists".
-      # Before this, a filter that matched no test, or a suite that returned early
-      # on a missing fixture directory, produced a green step, a warn-only upload,
-      # and a Pages deploy with no report. Nobody was paged.
-      - name: Verify SOF conformance report is present and non-vacuous
-        if: matrix.os == 'Linux-x86'
-        shell: bash
-        run: |
-          set -euo pipefail
-          report=crates/sof/test_report.json
-          if [ ! -f "$report" ]; then
-            echo "::error::[REPORT-MISSING] $report was not produced. Either the test-name filter in the previous step matched nothing (cargo test exits 0 in that case), or run_comprehensive_test_suite bailed before writing. Do not ship a release whose published conformance report is absent."
-            exit 1
-          fi
-          # Count recorded cases across all fixture files. The corpus is 22 files /
-          # 144 cases; a floor of 100 catches a shrunken or half-written report
-          # without breaking on a modest upstream trim.
-          cases=$(python3 -c "import json,sys; d=json.load(open('$report')); print(sum(len(v.get('tests',[])) for v in d.values()))")
-          echo "SOF conformance report records $cases case(s)."
-          if [ "$cases" -lt 100 ]; then
-            echo "::error::[REPORT-VACUOUS] $report records only $cases case(s), expected >=100. The fixture corpus did not fully load, so this report would understate what was verified."
-            exit 1
-          fi
-
-      - name: Upload test_report.json to GitHub
-        if: matrix.os == 'Linux-x86'
-        uses: actions/upload-artifact@v7
-        with:
-          name: test_report
-          path: crates/sof/test_report.json
-          # Default is `warn`, which let a missing report pass silently and then
-          # deploy a Pages site without it.
-          if-no-files-found: error
-
-      - name: Build pysof wheel (Linux with sdist)
-        if: matrix.os == 'Linux-x86'
-        working-directory: crates/pysof
-        run: uv run maturin build --release --sdist -o dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
-
-      - name: Build pysof wheel (Windows/macOS)
-        if: runner.os != 'Linux' && matrix.os != 'Linux-ARM64'
-        working-directory: crates/pysof
-        run: uv run maturin build --release -o dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
-
-      - name: Build pysof wheel (Linux ARM64)
-        if: matrix.os == 'Linux-ARM64'
-        working-directory: crates/pysof
-        env:
-          PYO3_CROSS_PYTHON_VERSION: "3.14"
-        run: uv run maturin build --release -o dist --target aarch64-unknown-linux-gnu -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
-
-      - name: Upload pysof artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: pysof-${{ matrix.target }}
-          path: crates/pysof/dist/*
-          retention-days: 3
-
-      # Runs after every upload above, so eviction can never race an artifact
-      # this job still has to publish. Unlike the jobs above this one checks out
-      # clean, so it does not accumulate across runs — but two of its four
-      # matrix legs (`Linux-ARM64` and `macOS`) land on the macOS runner and
-      # park a full release target dir there until the next tag. Bounding that
-      # is free: cargo-sweep does nothing when the dir is already under the cap.
-      - name: Cap target dir size
-        if: always()
-        uses: ./.github/actions/cargo-target-gc
+    uses: ./.github/workflows/release-build.yml
 
   publish-pypi:
     name: Publish to PyPI
@@ -2337,7 +2112,7 @@ jobs:
 
       - name: Install mdBook
         run: |
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz --directory /usr/local/bin mdbook
 
       - name: Build book

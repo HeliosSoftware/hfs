@@ -12431,6 +12431,95 @@ mod postgres_integration {
             .unwrap()
     }
 
+    /// #2494: `:not` on a reference parameter negates the whole membership,
+    /// so resources without the parameter match too, and a comma list means
+    /// "not A and not B" (same as SQLite).
+    ///
+    /// NOTE for #2394: once `feat/2394-perf-mongodb-normalize-reference` lands,
+    /// its three `Observation?subject:not=...` PostgreSQL `Divergence` entries
+    /// in the shared modifier parity suite must be deleted (the suite fails on
+    /// a stale divergence).
+    #[tokio::test]
+    async fn postgres_integration_search_reference_not_modifier_negates_membership() {
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reference-not-2494");
+
+        create_subject_observation(&backend, &tenant, "ob-pat", "Patient/p1").await;
+        create_subject_observation(&backend, &tenant, "ob-other", "Patient/p2").await;
+        create_subject_observation(&backend, &tenant, "ob-grp", "Group/p1").await;
+        // Absolute-URL reference to Patient/p1: a bare id `p1` matches it
+        // positively, so `:not=p1` must exclude it too (and `Type/id` stays
+        // exact, so `:not=Patient/p1` keeps it).
+        create_subject_observation(
+            &backend,
+            &tenant,
+            "ob-abs",
+            "https://records.example.test/fhir/Patient/p1",
+        )
+        .await;
+        // Versioned stored reference: `Patient/p1` matches it positively, so
+        // `:not=Patient/p1` must exclude it.
+        create_subject_observation(&backend, &tenant, "ob-ver", "Patient/p1/_history/3").await;
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "ob-none",
+                    "code": {"coding": [{"code": "8867-4"}]},
+                    "status": "final"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let not_query = |values: &[&str]| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier: Some(SearchModifier::Not),
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        assert_eq!(
+            reference_search_ids(
+                &backend,
+                &tenant,
+                &observation_reference_query("subject", &["Patient/p1"])
+            )
+            .await,
+            vec!["ob-abs", "ob-pat", "ob-ver"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1"])).await,
+            vec!["ob-grp", "ob-none", "ob-other"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["p1"])).await,
+            vec!["ob-none", "ob-other"],
+            "bare-id :not excludes prefixed, absolute and other-type matches"
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/p1", "Group/p1"])).await,
+            vec!["ob-none", "ob-other"],
+        );
+        assert_eq!(
+            reference_search_ids(&backend, &tenant, &not_query(&["Patient/nobody"])).await,
+            vec![
+                "ob-abs", "ob-grp", "ob-none", "ob-other", "ob-pat", "ob-ver"
+            ],
+        );
+    }
+
     /// Bare ids match the last path segment without losing exact-reference
     /// semantics for `Type/id` searches.
     #[tokio::test]
@@ -12485,8 +12574,8 @@ mod postgres_integration {
                 &observation_reference_query("subject", &["Patient/shared-id"]),
             )
             .await,
-            vec!["ref-prefixed", "ref-versioned"],
-            "Type/id remains exact and version-normalized"
+            vec!["ref-absolute", "ref-prefixed", "ref-versioned"],
+            "Type/id is exact, version-normalized and matches the absolute URL form"
         );
         assert_eq!(
             reference_search_ids(
@@ -35503,32 +35592,16 @@ mod postgres_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` includes relative and versioned references
-    /// (PostgreSQL stores them version-stripped). PostgreSQL resolves includes
-    /// through the generic per-resource reference search, which does not match
-    /// absolute URLs; reported, not fixed, in this change.
+    /// #2296: `_revinclude` includes relative, versioned and absolute
+    /// references (PostgreSQL stores them version-stripped, with the `Type/id`
+    /// of an absolute URL in `value_reference_target`, #2394).
     #[tokio::test]
     async fn postgres_integration_revinclude_matches_every_reference_form() {
-        use super::revinclude_reference_forms_suite::Divergence;
-
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             &unique_base("revinclude_forms"),
-            &[
-                Divergence {
-                    id: "prov-abs",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-abs-ver",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-dot-abs",
-                    included: false,
-                },
-            ],
+            &[],
         )
         .await;
     }
@@ -35576,6 +35649,13 @@ mod postgres_integration {
                 Divergence {
                     label: "Observation?subject:Patient=Group/p1",
                     expect: Expect::Ids(&["ob-grp"]),
+                },
+                // `:above` a `_history/1` URL also finds the `_history/2` form
+                // (the version segment is not compared); SQLite and ES return
+                // only the unversioned `ob-abs`.
+                Divergence {
+                    label: "Observation?subject:above=http://example.org/fhir/Patient/p1/_history/1",
+                    expect: Expect::Ids(&["ob-abs", "ob-abs-ver"]),
                 },
             ],
         )

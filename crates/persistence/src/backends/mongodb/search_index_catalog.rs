@@ -23,6 +23,13 @@
 //! `eb`, ...) stays a covered scan. Generation 2's `idx_search_date_v2`
 //! ([`superseded_date_v2_spec`]) is superseded: the builder drops it once the
 //! generation-4 set is ready.
+//!
+//! Generation 5 (#2394) stores `value_reference` without any `/_history/N`
+//! suffix and writes `value_reference_target` (`Type/id`) on rows whose
+//! reference was an absolute URL. `idx_search_reference_target_v2` is a
+//! partial index over those rows only, so reference searches and `_revinclude`
+//! match both shapes with exact `$in` lookups and no regex. It is purely
+//! additive: nothing from generation 4 is superseded.
 
 use mongodb::{
     IndexModel,
@@ -51,7 +58,9 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// Generation 4 = generation 3 with `idx_search_date_v2` replaced by
 /// `idx_search_date_v3`, which also carries `value_date_end`, so a date search
 /// over the stored range `[value_date, value_date_end)` stays covered (#1391).
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 4;
+/// Generation 5 = generation 4 plus `idx_search_reference_target_v2` over the
+/// absolute-reference side field `value_reference_target` (#2394).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 5;
 
 /// The generation that added `value_date_end` to every date row (#1391), and
 /// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
@@ -169,6 +178,13 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             &["value_quantity_value", "value_quantity_unit"],
         ),
         value_v2("idx_search_reference_v2", &["value_reference"]),
+        // Generation 5 (#2394): partial on `value_reference_target`, which only
+        // absolute-URL reference rows carry, so the index grows with the number
+        // of absolute references and not with the collection.
+        value_v2(
+            "idx_search_reference_target_v2",
+            &["value_reference_target"],
+        ),
         value_v2("idx_search_uri_v2", &["value_uri"]),
         value_v2("idx_search_token_display_v2", &["value_token_display"]),
         value_v2(
@@ -424,6 +440,7 @@ mod tests {
                 "idx_search_number_v2",
                 "idx_search_quantity_v2",
                 "idx_search_reference_v2",
+                "idx_search_reference_target_v2",
                 "idx_search_uri_v2",
                 "idx_search_token_display_v2",
                 "idx_search_identifier_type_v2",
@@ -432,7 +449,7 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 4);
+        assert_eq!(SEARCH_INDEX_GENERATION, 5);
     }
 
     #[test]
@@ -699,7 +716,7 @@ mod tests {
         let cmd = create_indexes_command(&background);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index"));
         let indexes = cmd.get_array("indexes").unwrap();
-        assert_eq!(indexes.len(), 9);
+        assert_eq!(indexes.len(), 10);
         let first = indexes[0].as_document().unwrap();
         assert_eq!(first.get_str("name"), Ok("idx_search_string_v2"));
         assert_eq!(first.get_document("key").unwrap(), &background[0].keys);

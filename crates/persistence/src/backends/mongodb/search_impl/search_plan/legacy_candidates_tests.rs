@@ -599,7 +599,7 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
             "patient",
             SearchParamType::Reference,
             "Patient/selected",
-            doc! { "value_reference": "Patient/selected/_history/2" },
+            doc! { "value_reference": "Patient/selected" },
             doc! { "value_reference": "Patient/other" },
         ),
         (

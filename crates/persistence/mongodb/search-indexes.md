@@ -3,7 +3,8 @@
 HFS keeps two kinds of index on the `search_index` collection.
 
 - **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
-- **Generation 4** is the current generation: nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
+- **Generation 5** is the current generation. It is generation 4 plus one partial index, `idx_search_reference_target_v2` on `(tenant_id, resource_type, param_name, value_reference_target, resource_id)`, which holds only rows that carry `value_reference_target` (absolute `http(s)` references, #2394). It is built in the same background `createIndexes` as the others; see "Reference normalization (generation 5)" below.
+- **Generation 4** (the base of generation 5) is nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
 
 Why: a generation-1 value index carried one entry for every row of the collection, even rows that had no value of that type, and no value index carried `resource_id`, so every search fetched one document per matching key. Generation-2 indexes are partial (one entry per row that has the value) and end in `resource_id`, so a value-filtered scan is covered. Issues #1059 and #1084 have the measurements.
 
@@ -48,6 +49,14 @@ Rows extracted from a resource's `contained` entries live in their own collectio
 
 On the first boot of a generation-3 binary HFS moves any contained rows still in `search_index` into the new collection, in pages of 1,000, in every `HFS_MONGODB_INDEX_BUILD` mode (it is a correctness fix, not an index build), records `search_indexes.contained_rows_moved: true`, and then drops the old partial `idx_search_contained` from `search_index` under the usual mode rules (in `off` mode it warns and names the `dropIndex` command). Most deployments have no contained rows, so the move is one empty find. On a deployment that has contained resources and takes writes during boot, run that first generation-3 boot with `HFS_MONGODB_INDEX_BUILD=inline`, or run `$reindex` afterwards: a container updated while the background move is paging can get its pre-update contained rows re-inserted.
 
+## Reference normalization (generation 5)
+
+Since #2394 (schema version 17) `search_index.value_reference` is written without a `/_history/N` suffix, and an absolute `http(s)://<base>/Type/id[/_history/N]` reference also gets `value_reference_target: "Type/id"`. Relative references add no field, so the new partial index grows only with the number of absolute references. `_revinclude` matches with exact `$in` on `value_reference` and `value_reference_target`, and bare-id reference filters (`subject=p1`) use the same two fields, with no regex. A plain `Type/id` filter (`subject=Patient/p1`) stays an exact match on `value_reference` and does not reach absolute URLs; the other backends do match them.
+
+The `SearchIndexBuilder` rewrites existing rows of `search_index` and `search_index_contained` at start, after the contained-row move and in every `HFS_MONGODB_INDEX_BUILD` mode. It walks `_id` in pages, resumes from `search_indexes.reference_normalize_last_id`, and sets `search_indexes.references_normalized` at the end. It is idempotent. Readers use the exact form only when the marker is set and `idx_search_reference_target_v2` is built; before that, and with `HFS_MONGODB_INDEX_BUILD=off` (which does not build the index), they keep the regex arms, so results are complete throughout.
+
+To rerun the backfill, use `reference-normalize-rollback.mongosh.js`; see [Crossed 17](schema-version.md#crossed-17-reference-normalization).
+
 ## Search offloaded to Elasticsearch (`mongodb-elasticsearch`)
 
 When MongoDB runs with search offloaded to Elasticsearch, every search goes to Elasticsearch and `search_index` and `search_index_contained` stay empty (offloaded writes only `$unset` the `missing_params` fields). Nothing reads the indexes below, so in this mode HFS neither builds them nor requires them:
@@ -67,6 +76,7 @@ HFS does not drop indexes that already exist, so a deployment moved to this mode
 
 `dropIndexes()` with no argument drops every index on the collection except `_id`; the two collections are empty in this mode. If you only want the missing-params saving, drop the last two and leave the others. `dropIndex` fails with "index not found" for an index that was never built; that is safe to ignore. If you later switch the database back to the standalone backend, the next boot recreates the inline indexes and rebuilds the rest, and you must run `$reindex` because the search rows were never written.
 
+
 ## Downgrading
 
 These steps cover the `search_index` generations. The MongoDB schema version is recorded separately: builds from #2352 on refuse to start on a database whose `schema_version` records a newer version than their own, so a rollback across a schema version also needs the steps in [Rolling back to an older build](schema-version.md#rolling-back-to-an-older-build).
@@ -81,9 +91,11 @@ A binary from before generation 3 reads contained matches from `search_index` on
 
 That script also resets the `schema_version` generation record, so rolling forward again re-runs the contained-row move instead of skipping it.
 
+A binary from before generation 5 needs no script: it ignores `idx_search_reference_target_v2` and `value_reference_target`, and still matches exact `Type/id` references on normalized rows. For rows it writes afterwards, see [Crossed 17](schema-version.md#crossed-17-reference-normalization).
+
 A binary from before generation 4 needs no script: it sees `idx_search_date_v2` missing and rebuilds it in the background like any other missing generation-2 index, and ignores `idx_search_date_v3`.
 
-All four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
+The first four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
 
 ## How `$reindex` walks a type (#1403)
 

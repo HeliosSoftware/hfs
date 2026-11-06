@@ -2292,30 +2292,15 @@ mod es_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` runs one reference search per resource, which does
-    /// not match absolute references; reported, not fixed, in this change.
+    /// #2296 / #2394: `_revinclude` matches relative and absolute reference
+    /// forms alike; no divergence from the shared expectation remains.
     #[tokio::test]
     async fn es_revinclude_matches_every_reference_form() {
-        use super::revinclude_reference_forms_suite::Divergence;
-
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             "revinclude-forms-2296",
-            &[
-                Divergence {
-                    id: "prov-abs",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-abs-ver",
-                    included: false,
-                },
-                Divergence {
-                    id: "prov-dot-abs",
-                    included: false,
-                },
-            ],
+            &[],
         )
         .await;
     }
@@ -2365,26 +2350,42 @@ mod es_integration {
                     label: "Observation?code:below=http://loinc.org|1234-5",
                     expect: Expect::Ids(&["ob-pat"]),
                 },
-                // `:[type]` filters on the indexed `resource_type`, which a versioned
-                // reference does not carry, and a bare id also matches an absolute URL.
+                // `:[type]` filters on the indexed `resource_type`. A versioned reference
+                // (relative `ob-ver`, absolute `ob-abs-ver`) does not carry one:
+                // `parse_reference` (search/converters.rs, tracked in #2495) turns the versioned
+                // absolute URL into resource_type "_history", so neither the
+                // `:Patient` modifier nor a bare id finds `ob-abs-ver`. A bare id
+                // also matches an absolute URL, including a foreign-base one
+                // (`ob-foreign`). Known divergence, kept explicit; the plain
+                // `subject=Patient/p1` cell (no modifier) agrees with the matrix.
                 Divergence {
                     label: "Observation?subject:Patient=p1",
-                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-foreign", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=Patient/p1",
-                    expect: Expect::Ids(&["ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-foreign", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=Patient/p1/_history/2",
-                    expect: Expect::Ids(&["ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-foreign", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=p1,nobody",
-                    expect: Expect::Ids(&["ob-abs", "ob-pat"]),
+                    expect: Expect::Ids(&["ob-abs", "ob-foreign", "ob-pat"]),
                 },
                 Divergence {
                     label: "Observation?subject:Patient=p1&code=9999-9",
+                    expect: Expect::Ids(&["ob-abs", "ob-foreign"]),
+                },
+                // The versioned absolute URL as a `:Patient` value: only the exact
+                // unversioned one is found (same `_history` parsing).
+                Divergence {
+                    label: "Observation?subject:Patient=http://example.org/fhir/Patient/p1",
+                    expect: Expect::Ids(&["ob-abs"]),
+                },
+                Divergence {
+                    label: "Observation?subject:Patient=http://example.org/fhir/Patient/p1/_history/2",
                     expect: Expect::Ids(&["ob-abs"]),
                 },
                 // `:identifier` looks for token rows under the reference parameter's own
