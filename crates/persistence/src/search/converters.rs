@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::{DatePrecision, SearchParamType};
+use crate::types::{DatePrecision, SearchParamType, strip_reference_version};
 
 use super::errors::ExtractionError;
 
@@ -284,18 +284,35 @@ impl IndexValue {
 }
 
 /// Parses a reference string into (resource_type, resource_id).
+///
+/// A `?query`, `#fragment` and a `/_history/<vid>` suffix are dropped first, so
+/// a versioned reference parses to its target `Type/id` exactly like the
+/// unversioned form (#2495). A relative value must have exactly the `Type/id`
+/// shape; an absolute one takes the last two path segments and needs a base
+/// before them.
 fn parse_reference(reference: &str) -> (Option<String>, Option<String>) {
+    let without_suffix = reference.split(['?', '#']).next().unwrap_or("");
+    let base = strip_reference_version(without_suffix);
+
     // Handle URL references (e.g., "http://example.com/fhir/Patient/123")
-    if reference.starts_with("http://") || reference.starts_with("https://") {
-        let parts: Vec<&str> = reference.rsplitn(3, '/').collect();
-        if parts.len() >= 2 {
-            return (Some(parts[1].to_string()), Some(parts[0].to_string()));
+    if let Some(rest) = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+    {
+        let mut segments = rest.rsplit('/');
+        if let (Some(id), Some(resource_type), Some(_base)) =
+            (segments.next(), segments.next(), segments.next())
+            && !id.is_empty()
+            && !resource_type.is_empty()
+        {
+            return (Some(resource_type.to_string()), Some(id.to_string()));
         }
+        return (None, None);
     }
 
     // Handle relative references (e.g., "Patient/123")
-    let parts: Vec<&str> = reference.split('/').collect();
-    if parts.len() == 2 {
+    let parts: Vec<&str> = base.split('/').collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
         return (Some(parts[0].to_string()), Some(parts[1].to_string()));
     }
 
@@ -804,6 +821,42 @@ mod tests {
         let (rt, id) = parse_reference("http://example.com/fhir/Patient/456");
         assert_eq!(rt, Some("Patient".to_string()));
         assert_eq!(id, Some("456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_reference_versioned_and_suffixes() {
+        let p1 = (Some("Patient".to_string()), Some("p1".to_string()));
+        for input in [
+            "Patient/p1",
+            "http://example.org/fhir/Patient/p1",
+            "http://example.org/fhir/Patient/p1/_history/2",
+            "Patient/p1/_history/3",
+            "https://h/fhir/Patient/p1/_history/2?x=y",
+            "http://h/fhir/Patient/p1#f",
+            "Patient/p1?x=y",
+        ] {
+            assert_eq!(parse_reference(input), p1, "input: {input}");
+        }
+        for input in ["Patient", "a/b/c", "#p1", "", "Patient/", "/p1"] {
+            assert_eq!(parse_reference(input), (None, None), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_reference_keeps_raw_value_when_versioned() {
+        match IndexValue::reference("Patient/p1/_history/3") {
+            IndexValue::Reference {
+                reference,
+                resource_type,
+                resource_id,
+                ..
+            } => {
+                assert_eq!(reference, "Patient/p1/_history/3");
+                assert_eq!(resource_type.as_deref(), Some("Patient"));
+                assert_eq!(resource_id.as_deref(), Some("p1"));
+            }
+            other => panic!("expected reference, got {other:?}"),
+        }
     }
 
     #[test]
