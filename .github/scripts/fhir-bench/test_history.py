@@ -673,13 +673,13 @@ class PerLegCharts(unittest.TestCase):
             for bad in ("None", "nan", ",,"):
                 self.assertNotIn(bad, b)
 
-    def test_threshold_half_missing_draws(self):
-        present = {"a": set(range(1, 11)), "b": set(range(1, 6)), "c": set(range(1, 5))}
+    def test_sparse_leg_still_draws_with_two_points(self):
+        present = {"a": set(range(1, 11)), "b": {9, 10}, "c": {10}}
         out = self._build(present)
         titles = [b.split("\n")[2] for b in _mermaid_blocks(out)]
         self.assertIn('    title "crud - a"', titles)
-        self.assertIn('    title "crud - b"', titles)   # 5 of 10
-        self.assertNotIn('    title "crud - c"', titles)  # 4 of 10
+        self.assertIn('    title "crud - b"', titles)  # 2 of 10 still draws
+        self.assertNotIn('    title "crud - c"', titles)  # 1 point never
         self.assertIn("| `c` |", out)  # table still shows it
 
     def test_single_point_never_charts(self):

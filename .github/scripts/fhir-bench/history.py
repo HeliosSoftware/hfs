@@ -389,10 +389,10 @@ LEGEND_MODE = ('_Change in these rows is only computed against runs with the sam
 
 
 def leg_chart(label, leg, vals, xlabels):
-    """Chart of one leg over the runs where it has a value, or "" when the leg is
-    missing from more than half of the plotted runs or has fewer than 2 points."""
+    """Chart of one leg over the runs where it has a value, or "" when the leg has
+    fewer than 2 points (a line needs two)."""
     pts = [(x, v) for x, v in zip(xlabels, vals) if v is not None]
-    if len(pts) < 2 or (len(vals) - len(pts)) * 2 > len(vals):
+    if len(pts) < 2:
         return ""
     return render_chart(label, leg, [v for _, v in pts], [x for x, _ in pts])
 
@@ -559,8 +559,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
 
     if charts:
         out.append("Trend per leg and row (runs oldest to newest; a chart only has the runs "
-                   "where that leg has a value, and a leg missing from more than half of "
-                   "the runs has none - its table row still shows every value):\n")
+                   "where that leg has a value; a leg with fewer than 2 such runs has none - "
+                   "its table row still shows every value):\n")
         for row_charts in charts:
             out.extend(row_charts)
     return _finish(out)
