@@ -251,6 +251,12 @@ impl Fixture {
             "fixture needs completed search indexes"
         );
         let db = backend.get_database().await.unwrap();
+        // The corpus below is raw rows without `tuple_code`: keep composite
+        // searches on the pair-validation plans these tests pin.
+        db.collection::<Document>("search_layout")
+            .delete_many(doc! {})
+            .await
+            .unwrap();
         let tenant =
             TenantContext::new(TenantId::new(PLAN_TENANT), TenantPermissions::full_access());
         let rows: Vec<_> = (0..count)

@@ -673,6 +673,14 @@ fn cases() -> Vec<Case> {
             "http://example.org/fhir/Patient",
             Ids(&["ob-abs", "ob-abs-ver"]),
         ),
+        // `:above` a versioned URL (#2495). No backend strips the version from
+        // the query value; the difference is in what is stored. PostgreSQL and
+        // MongoDB strip `/_history/<vid>` when writing, so `ob-abs-ver` is
+        // stored as `.../Patient/p1`, is one of the parent URIs, and also
+        // matches (see their divergence entries). SQLite and Elasticsearch
+        // store the reference as written, so only `ob-abs` matches. The
+        // matrix records the as-written answer; aligning the backends is
+        // deliberately left to a separate change.
         case(
             "Observation",
             "subject",

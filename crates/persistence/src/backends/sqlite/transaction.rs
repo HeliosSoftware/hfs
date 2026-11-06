@@ -817,6 +817,20 @@ impl Transaction for SqliteTransaction {
             params![tenant_id, resource_type, id, new_version_str, data, deleted_at, fhir_version_str],
         )
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
+
+        // Clear the deleted resource's search entries on this same connection,
+        // so they commit or roll back with the delete (#864) — the direct
+        // delete does the same (`soft_delete`). The soft delete keeps the
+        // `resources` row, so the helper's key subquery resolves. It covers
+        // contained rows (they share the container's `resource_key`) and the
+        // FTS row, and does nothing while search is offloaded to a secondary
+        // backend. Left behind, the rows are read with no `is_deleted` filter
+        // by the `_contained` and `reference:identifier` paths.
+        {
+            let _span = perf::span(Phase::IndexDelete);
+            self.backend
+                .delete_search_index(&conn, tenant_id, resource_type, id)?;
+        }
         drop(conn);
 
         // A SearchParameter delete invalidates this tenant's cached registry
@@ -1110,9 +1124,9 @@ mod tests {
         assert!(deleted.is_deleted());
         assert!(deleted.deleted_at().is_some());
         assert_eq!(deleted.version_id(), "2");
-        // Transactional delete retains index rows; searches exclude them using
-        // the resource's deleted state. Restore must replace those old rows.
-        assert_restore_rows(&tx, &[("1", false), ("2", true)], Some("original"));
+        // Transactional delete clears the index rows with the soft delete
+        // (#864), as the direct delete does; restore re-indexes from scratch.
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None);
         Box::new(tx).commit().await.unwrap();
 
         let mut tx = backend
@@ -1151,7 +1165,7 @@ mod tests {
                 .version_id(),
             "2"
         );
-        assert_restore_rows(&tx, &[("1", false), ("2", true)], Some("original"));
+        assert_restore_rows(&tx, &[("1", false), ("2", true)], None);
         tx.restore(&deleted, body("committed")).await.unwrap();
         Box::new(tx).commit().await.unwrap();
 
@@ -1217,7 +1231,7 @@ mod tests {
         assert_restore_rows(
             &tx,
             &[("1", false), ("2", true), ("3", false), ("4", true)],
-            Some("committed"),
+            None,
         );
         Box::new(tx).rollback().await.unwrap();
     }
@@ -1547,6 +1561,69 @@ mod tests {
             result,
             Err(StorageError::Resource(ResourceError::Gone { .. }))
         ));
+    }
+
+    /// #864: `delete` clears the resource's search entries on the
+    /// transaction's own connection, so the cleanup is as atomic as the
+    /// soft delete — a rollback keeps both, a commit applies both.
+    #[tokio::test]
+    async fn delete_clears_index_rows_atomically_with_the_soft_delete() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let rows = |id: &str| -> i64 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_index
+                  WHERE resource_type = 'Patient' AND resource_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for id in ["p1", "p2"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "meta": {"tag": [{"system": "http://example.com/tags", "code": "t"}]}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let indexed = rows("p1");
+        assert!(indexed > 0, "precondition: the create indexed p1");
+        assert_eq!(rows("p2"), indexed, "precondition: p2 is indexed alike");
+
+        // A rolled-back delete leaves the index as it was.
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.delete("Patient", "p1").await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
+        assert_eq!(rows("p1"), indexed, "a rollback keeps the index rows");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "p1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A committed delete takes only its own resource's rows.
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.delete("Patient", "p1").await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+        assert_eq!(rows("p1"), 0, "a commit removes the index rows");
+        assert_eq!(rows("p2"), indexed, "another resource's rows stay");
     }
 
     #[tokio::test]

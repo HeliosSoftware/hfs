@@ -12580,4 +12580,411 @@ mod tests {
             .unwrap();
         assert_eq!(list_all(&backend, &tenant, 2).await, ["p1", "p3"]);
     }
+
+    // ---- #864: a Bundle's DELETE must clear the resource's search index ----
+
+    /// `search_index` rows keyed to the `resources` row of `id`, contained
+    /// rows included (they share their container's key).
+    fn index_rows_for(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> i64 {
+        let conn = backend.get_connection().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM search_index
+              WHERE tenant_id = ?1 AND resource_type = ?2
+                AND resource_key = (SELECT rowid FROM resources
+                                     WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3)",
+            params![tenant.tenant_id().as_str(), resource_type, id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn fts_rows_for(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> i64 {
+        let conn = backend.get_connection().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM resource_fts
+              WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant.tenant_id().as_str(), resource_type, id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn mrn_patient(id: &str, value: &str) -> Value {
+        json!({
+            "resourceType": "Patient",
+            "id": id,
+            "identifier": [{"system": "http://example.org/mrn", "value": value}],
+            "name": [{"family": "Deleted", "given": ["Ann"]}]
+        })
+    }
+
+    fn instance_delete(url: &str) -> BundleEntry {
+        BundleEntry {
+            method: BundleMethod::Delete,
+            url: url.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn identifier_query(resource_type: &str, value: &str) -> SearchQuery {
+        SearchQuery::new(resource_type).with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(value)],
+            ..Default::default()
+        })
+    }
+
+    /// An instance `DELETE Patient/{id}` entry soft-deletes the resource and
+    /// must take its index rows (and FTS row) with it, as the direct delete
+    /// does for the index; a sibling's rows stay.
+    #[tokio::test]
+    async fn bundle_instance_delete_clears_the_search_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for (id, value) in [("gone", "864-a"), ("kept", "864-b")] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    mrn_patient(id, value),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let kept_rows = index_rows_for(&backend, &tenant, "Patient", "kept");
+        assert!(
+            index_rows_for(&backend, &tenant, "Patient", "gone") > 0,
+            "precondition: the create indexed the resource"
+        );
+        assert!(
+            fts_rows_for(&backend, &tenant, "Patient", "gone") > 0,
+            "precondition: the create wrote an FTS row"
+        );
+
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![instance_delete("Patient/gone")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 204);
+
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "Patient", "gone"),
+            0,
+            "a Bundle DELETE must clear the deleted resource's search_index rows"
+        );
+        assert_eq!(
+            fts_rows_for(&backend, &tenant, "Patient", "gone"),
+            0,
+            "a Bundle DELETE must clear the deleted resource's FTS row"
+        );
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "Patient", "kept"),
+            kept_rows,
+            "the delete must not touch another resource's rows"
+        );
+        let found = backend
+            .search(
+                &tenant,
+                &identifier_query("Patient", "http://example.org/mrn|864-a"),
+            )
+            .await
+            .unwrap();
+        assert!(found.resources.items.is_empty());
+        let found = backend
+            .search(
+                &tenant,
+                &identifier_query("Patient", "http://example.org/mrn|864-b"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.resources.items.len(), 1, "the sibling is still found");
+    }
+
+    /// The conditional arm (`DELETE Patient?identifier=…`) reaches the same
+    /// `Transaction::delete`.
+    #[tokio::test]
+    async fn bundle_conditional_delete_clears_the_search_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                mrn_patient("cond-gone", "864-cond"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(index_rows_for(&backend, &tenant, "Patient", "cond-gone") > 0);
+
+        let entry = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient?identifier=http://example.org/mrn|864-cond".to_string(),
+            criteria: Some(
+                identifier_query("Patient", "http://example.org/mrn|864-cond").parameters,
+            ),
+            ..Default::default()
+        };
+        let result = backend
+            .process_transaction(&tenant, vec![entry], FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 204);
+        assert!(
+            matches!(
+                backend.read(&tenant, "Patient", "cond-gone").await,
+                Err(StorageError::Resource(ResourceError::Gone { .. }))
+            ),
+            "the conditional delete must have matched and deleted the resource"
+        );
+
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "Patient", "cond-gone"),
+            0,
+            "a conditional Bundle DELETE must clear the search_index rows"
+        );
+        assert_eq!(fts_rows_for(&backend, &tenant, "Patient", "cond-gone"), 0);
+    }
+
+    /// The cleanup commits or rolls back with the delete: a Bundle that fails
+    /// after the DELETE entry restores the resource, index rows included.
+    #[tokio::test]
+    async fn bundle_delete_rollback_keeps_the_search_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                mrn_patient("rolled-back", "864-rb"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let before = index_rows_for(&backend, &tenant, "Patient", "rolled-back");
+        assert!(before > 0);
+
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    instance_delete("Patient/rolled-back"),
+                    // Deleting an id that does not exist fails the whole Bundle.
+                    instance_delete("Patient/never-existed"),
+                ],
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(result.is_err(), "the second entry must fail the Bundle");
+
+        assert!(
+            backend
+                .read(&tenant, "Patient", "rolled-back")
+                .await
+                .unwrap()
+                .is_some(),
+            "the failed Bundle must roll the delete back"
+        );
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "Patient", "rolled-back"),
+            before,
+            "the rolled-back delete must leave the index rows in place"
+        );
+    }
+
+    /// While search is offloaded to a secondary backend the transaction path
+    /// skips local index cleanup, exactly as the direct delete does.
+    #[tokio::test]
+    async fn bundle_delete_skips_index_cleanup_when_search_is_offloaded() {
+        let mut backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                mrn_patient("offloaded", "864-off"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let before = index_rows_for(&backend, &tenant, "Patient", "offloaded");
+        assert!(before > 0);
+
+        backend.set_search_offloaded(true);
+        backend
+            .process_transaction(
+                &tenant,
+                vec![instance_delete("Patient/offloaded")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "Patient", "offloaded"),
+            before,
+            "an offloaded backend leaves local index cleanup to the secondary"
+        );
+    }
+
+    /// The `_contained` reader has no `is_deleted` filter, so a container
+    /// deleted by a Bundle must not leave contained rows behind: a stale key
+    /// made `search_contained`'s follow-up read hit `Gone` and fail the page,
+    /// and `_total` counted it.
+    #[tokio::test]
+    async fn bundle_delete_of_a_container_leaves_contained_search_intact() {
+        use crate::types::{ContainedMode, TotalMode};
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in ["dr-gone", "dr-live"] {
+            backend
+                .create(
+                    &tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "panel"},
+                        "contained": [{
+                            "resourceType": "Observation",
+                            "id": "o1",
+                            "status": "final",
+                            "code": {"coding": [{"system": "http://loinc.org", "code": "X864"}]}
+                        }]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("X864")],
+            ..Default::default()
+        });
+        query.contained = ContainedMode::On;
+        query.total = Some(TotalMode::Accurate);
+        let ids = |result: &crate::core::SearchResult| {
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let before = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            ids(&before),
+            ["dr-gone", "dr-live"],
+            "precondition: both containers match through their contained Observation"
+        );
+
+        backend
+            .process_transaction(
+                &tenant,
+                vec![instance_delete("DiagnosticReport/dr-gone")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let after = backend
+            .search(&tenant, &query)
+            .await
+            .expect("a deleted container must not fail the _contained search");
+        assert_eq!(ids(&after), ["dr-live"]);
+        assert_eq!(
+            after.total,
+            Some(1),
+            "_total must not count the deleted container"
+        );
+        assert_eq!(
+            index_rows_for(&backend, &tenant, "DiagnosticReport", "dr-gone"),
+            0,
+            "the contained rows share the container's key and must go with it"
+        );
+    }
+
+    /// `Observation?subject:identifier=…` resolves the target through
+    /// `search_index` with no `is_deleted` join, so a Patient deleted by a
+    /// Bundle must leave no identifier rows behind.
+    #[tokio::test]
+    async fn bundle_delete_of_the_target_stops_subject_identifier_matching() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                mrn_patient("target", "864-ref"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "about-target",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "864"}]},
+                    "subject": {"reference": "Patient/target"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(crate::types::SearchModifier::Identifier),
+            values: vec![SearchValue::eq("http://example.org/mrn|864-ref")],
+            ..Default::default()
+        });
+        let before = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            before.resources.items.len(),
+            1,
+            "precondition: subject:identifier resolves the live Patient"
+        );
+
+        backend
+            .process_transaction(
+                &tenant,
+                vec![instance_delete("Patient/target")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let after = backend.search(&tenant, &query).await.unwrap();
+        assert!(
+            after.resources.items.is_empty(),
+            "a deleted Patient must not satisfy subject:identifier"
+        );
+    }
 }

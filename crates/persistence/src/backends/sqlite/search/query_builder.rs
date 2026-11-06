@@ -244,6 +244,50 @@ fn parameter_rows(name: &str, condition: &str) -> String {
 const PARAMETER_ROWS_HEAD: &str =
     "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND ";
 
+/// What a [`reference_versions_rows`] select starts with. Unlike
+/// [`PARAMETER_ROWS_HEAD`] its first term is parenthesized, which tells the
+/// two apart.
+const VERSION_ROWS_HEAD: &str =
+    "SELECT resource_key FROM search_index WHERE (tenant_id = ?1 AND resource_type = ?2 AND ";
+
+/// How many bases one select of [`reference_versions_rows`] ORs together: the
+/// `OR` is a flat chain, so this bounds the expression depth, and the number
+/// of selects stays far below SQLite's compound-select limit (500).
+const VERSION_ROWS_CHUNK: usize = 50;
+
+/// The `_history` arm of a plain multi-value reference search (#2493):
+/// `resource_key`s whose stored reference is `<base>/_history/<n>` for one of
+/// the `count` bases bound at `?first..`. Every `OR` branch repeats the
+/// tenant, type and parameter tests, so SQLite plans each as its own bounded
+/// range seek on `idx_search_reference` (a `MULTI-INDEX OR`), never a scan
+/// (#1017, #1955); a `VALUES` join of the bases only seeks the prefix and
+/// reads every reference of the parameter. Selects of
+/// [`VERSION_ROWS_CHUNK`] bases are `UNION ALL`-ed. Binds nothing of its own:
+/// the placeholders are the ones of the exact `IN`.
+fn reference_versions_rows(name: &str, first: usize, count: usize) -> String {
+    let name = sql_string_literal(name);
+    let branches: Vec<String> = (0..count)
+        .map(|i| {
+            let p = first + i;
+            format!(
+                "(tenant_id = ?1 AND resource_type = ?2 AND param_name = {name} \
+                 AND value_reference >= ?{p} || '/_history/' \
+                 AND value_reference < ?{p} || '/_history0')"
+            )
+        })
+        .collect();
+    branches
+        .chunks(VERSION_ROWS_CHUNK)
+        .map(|chunk| {
+            format!(
+                "SELECT resource_key FROM search_index WHERE {}",
+                chunk.join(" OR ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
 /// Whether `sql` is exactly one [`parameter_rows`] select: a single
 /// parameter's membership, nothing intersected with it.
 pub(crate) fn is_parameter_rows(sql: &str) -> bool {
@@ -297,34 +341,74 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
     parameter_exists_predicate(rows_sql, outer_key)
 }
 
-/// [`membership_exists_predicate`] for a reference parameter's two selects
-/// (`value_reference` test `UNION ALL` the `value_reference_target` test, see
-/// `build_parameter_condition`): one `EXISTS` whose row test is the `OR` of the
-/// two. `None` when `rows_sql` is not exactly that shape.
+/// [`membership_exists_predicate`] for a reference parameter's selects (see
+/// `parameter_condition`): the `value_reference` test, optionally the
+/// `_history` arm of a plain multi-value list ([`reference_versions_rows`]),
+/// optionally the `value_reference_target` test, `UNION ALL`-ed in that order.
+/// One `EXISTS` whose row test is the `OR` of them. The `_history` arm becomes
+/// a flat filter on the version-stripped stored reference: the row is already
+/// pinned by `resource_key`, so there is nothing left to seek. `None` when
+/// `rows_sql` is not exactly that shape.
 fn reference_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
-    const TARGET_TEST: &str = "(value_reference_target IS NOT NULL AND value_reference_target IN (";
-    let (first, second) = rows_sql.split_once(" UNION ALL ")?;
-    if second.contains(" UNION ") {
-        return None;
-    }
+    const TARGET_TEST: &str = "value_reference_target IS NOT NULL AND value_reference_target IN (";
+    const BASES_TEST: &str = "value_reference IN (";
+    let mut arms = rows_sql.split(" UNION ALL ");
+    let first = arms.next()?;
     let first_rest = first.strip_prefix(PARAMETER_ROWS_HEAD)?;
-    let second_rest = second.strip_prefix(PARAMETER_ROWS_HEAD)?;
-    // `param_name = '<name>' AND (<cond>)` on both sides, same name.
-    let (name1, cond1) = first_rest.split_once(" AND (")?;
-    let (name2, cond2) = second_rest.split_once(" AND (")?;
-    if name1 != name2 || !name1.starts_with("param_name = ") {
+    // `param_name = '<name>' AND (<cond>)` on every select, same name.
+    let (name, cond1) = first_rest.split_once(" AND (")?;
+    if !name.starts_with("param_name = ") {
         return None;
     }
     let cond1 = cond1.strip_suffix(')')?;
-    let cond2 = cond2.strip_suffix(')')?;
-    if !cond2.starts_with(&TARGET_TEST[1..]) || cond2.contains("SELECT") || cond1.contains("SELECT")
-    {
+    if cond1.contains("SELECT") {
+        return None;
+    }
+    let mut tests = vec![format!("({cond1})")];
+    let mut seen_versions = false;
+    let mut seen_target = false;
+    for arm in arms {
+        if let Some(rest) = arm.strip_prefix(VERSION_ROWS_HEAD) {
+            if !rest.starts_with(name) {
+                return None;
+            }
+            // Only after the exact `IN`, once, and only when `cond1` is one.
+            let bases = cond1.strip_prefix(BASES_TEST)?;
+            if seen_target || !bases.ends_with(')') {
+                return None;
+            }
+            // One select per chunk of bases; they all collapse into one test.
+            if seen_versions {
+                continue;
+            }
+            seen_versions = true;
+            tests.push(format!(
+                "(instr(value_reference, '/_history/') > 0 AND \
+                 substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN ({bases})"
+            ));
+            continue;
+        }
+        let rest = arm.strip_prefix(PARAMETER_ROWS_HEAD)?;
+        let (arm_name, cond) = rest.split_once(" AND (")?;
+        let cond = cond.strip_suffix(')')?;
+        if seen_target
+            || arm_name != name
+            || !cond.starts_with(TARGET_TEST)
+            || cond.contains("SELECT")
+        {
+            return None;
+        }
+        seen_target = true;
+        tests.push(format!("({cond})"));
+    }
+    if tests.len() < 2 {
         return None;
     }
     Some(format!(
         "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} \
-         AND {name1} AND (({cond1}) OR ({cond2})))"
+         AND {name} AND ({}))",
+        tests.join(" OR ")
     ))
 }
 
@@ -394,6 +478,22 @@ fn composite_pair_rows(
     ))
 }
 
+/// The refusal for a parameter [`QueryBuilder::build`] has values for but no
+/// condition to build from (#866): the `_ => None` arm of
+/// `build_special_parameter_condition` (`_query`, `_type`, any `_` name nothing
+/// indexes), a `special`-typed parameter, a composite without its components.
+/// Skipped, it would leave the query with fewer conditions than were asked for —
+/// with none at all, every indexed resource of the type.
+fn unevaluable_parameter(param: &SearchParameter, resource_type: &str) -> SearchError {
+    SearchError::QueryParseError {
+        message: format!(
+            "search parameter '{}' cannot be evaluated by the SQLite backend: no condition can be \
+             built for it, and ignoring it would widen the search to every {resource_type}",
+            param.name
+        ),
+    }
+}
+
 /// Builds SQL queries from FHIR search parameters.
 pub struct QueryBuilder {
     /// The tenant ID for the query.
@@ -459,7 +559,15 @@ impl QueryBuilder {
     /// Returns SQL that selects the `resource_key` of every matching resource
     /// from the search_index table, for the caller's `rowid IN (…)`. A key can
     /// be listed more than once.
-    pub fn build(&self, query: &SearchQuery) -> SqlFragment {
+    ///
+    /// # Errors
+    ///
+    /// A parameter that carries values but for which no condition can be built
+    /// is an error, never skipped (#866): a query with no conditions matches
+    /// every indexed resource of the type, so skipping it turned `DELETE
+    /// Patient?_query=x` into "delete every Patient". A parameter with no values
+    /// asks for nothing and constrains nothing.
+    pub fn build(&self, query: &SearchQuery) -> Result<SqlFragment, SearchError> {
         let mut conditions = Vec::new();
 
         // Base conditions: tenant and resource type
@@ -489,9 +597,17 @@ impl QueryBuilder {
         // Build conditions for each parameter, tracking how many params we've added
         let mut current_offset = search_param_offset;
         for param in &query.parameters {
-            if let Some(condition) = self.parameter_condition(param, current_offset) {
-                current_offset += condition.param_count();
-                conditions.push(condition);
+            match self.parameter_condition(param, current_offset) {
+                Some(condition) => {
+                    current_offset += condition.param_count();
+                    conditions.push(condition);
+                }
+                // Nothing was asked for, so nothing is constrained.
+                None if param.values.is_empty() => {}
+                // Something was asked for and cannot be answered. Answering
+                // anyway, without it, would be a wider question than the one
+                // asked.
+                None => return Err(unevaluable_parameter(param, &self.resource_type)),
             }
         }
 
@@ -541,7 +657,7 @@ impl QueryBuilder {
                 for condition in conditions {
                     base.params.extend(condition.into_params());
                 }
-                return base;
+                return Ok(base);
             }
         }
 
@@ -556,7 +672,7 @@ impl QueryBuilder {
             base.params.extend(combined.params);
         }
 
-        base
+        Ok(base)
     }
 
     /// Builds the `_contained` match subquery.
@@ -993,7 +1109,8 @@ impl QueryBuilder {
         // Anything added to this list must have a working regular path, and
         // anything left off it must have an arm in
         // `build_special_parameter_condition` — the `_ => None` fallback there
-        // drops the filter rather than narrowing it.
+        // yields no condition, which `build` refuses (#866) rather than
+        // dropping the filter and widening the result.
         if param.name.starts_with('_')
             && !matches!(
                 param.name.as_str(),
@@ -1030,9 +1147,11 @@ impl QueryBuilder {
         // nested one level per term — ~18 ms/value (250 refs ≈ 4.6 s) and the
         // parse-depth blow-up behind #943; a flat `IN` is a single indexed
         // lookup of any length at ~1 node. Version-stripped bases are matched
-        // exactly, which covers every unversioned stored reference (references
-        // are stored unversioned in practice); the single-value path below
-        // keeps the full `_history` range match for the rare versioned case.
+        // exactly by the `IN`; a stored versioned reference (`Type/id/_history/n`)
+        // is matched by a second `UNION ALL`-ed select that seeks one `_history`
+        // range per base ([`reference_versions_rows`]), reusing the same
+        // placeholders. Without it a list returned less than one of its own
+        // values did (#2493): the list must be the union of its values.
         let is_plain_multi_reference = matches!(param.param_type, SearchParamType::Reference)
             && param.modifier.is_none()
             && param.values.len() >= 2
@@ -1099,6 +1218,14 @@ impl QueryBuilder {
         };
         let mut sql = parameter_rows(&param.name, &combined.sql);
         let mut params = combined.params;
+        if is_plain_multi_reference {
+            sql.push_str(" UNION ALL ");
+            sql.push_str(&reference_versions_rows(
+                &param.name,
+                param_offset + 1,
+                param.values.len(),
+            ));
+        }
         if !targets.is_empty() {
             let first = param_offset + params.len() + 1;
             let placeholders: Vec<String> = (0..targets.len())
@@ -1324,12 +1451,15 @@ impl QueryBuilder {
             }
             _ => {
                 // Not "fall through to regular handling", as this comment used
-                // to claim: the caller returns whatever this yields, so `None`
-                // *drops* the parameter and the search answers with every
-                // resource of the type. That is how `_tag`/`_profile`/
-                // `_security`/`_source` came to be unfiltered (#474). Anything
-                // that must actually filter belongs in an arm above, or in the
-                // caller's exclusion list so it never reaches here.
+                // to claim: the caller takes whatever this yields, and `None`
+                // is "no condition for a parameter that has values", which
+                // `QueryBuilder::build` turns into an error. It used to drop
+                // the parameter, so the search answered with every resource of
+                // the type: how `_tag`/`_profile`/`_security`/`_source` came to
+                // be unfiltered (#474), and how `DELETE Patient?_query=x`
+                // deleted the only Patient on file (#866). Anything that must
+                // actually filter belongs in an arm above, or in the caller's
+                // exclusion list so it never reaches here.
                 None
             }
         }
@@ -1876,12 +2006,77 @@ mod tests {
         );
     }
 
+    /// #866: a parameter with values and no condition to build is an error from
+    /// `build`, not a skipped term. `_query` and `_type` are registered by the
+    /// spec and indexed by nothing, so they reach the `_ => None` arm of
+    /// `build_special_parameter_condition`; a `special`-typed parameter reaches
+    /// the matching arm of `build_value_condition`. Skipped, a query with no
+    /// other condition matches every indexed resource of the type.
+    #[test]
+    fn a_parameter_with_values_but_no_condition_is_an_error_not_a_skipped_term() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = |name: &str, param_type| SearchParameter {
+            name: name.to_string(),
+            param_type,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        };
+
+        for (name, param_type) in [
+            ("_query", SearchParamType::Token),
+            ("_type", SearchParamType::Token),
+            ("_filter_typo", SearchParamType::Token),
+            ("near", SearchParamType::Special),
+        ] {
+            let unevaluable = param(name, param_type);
+            assert!(
+                builder.build_parameter_condition(&unevaluable, 2).is_none(),
+                "{name} is the case where there is no condition"
+            );
+
+            // Alone, and beside one that does filter: either way the query is
+            // wider than the one asked, so neither builds.
+            for query in [
+                SearchQuery::new("Patient").with_parameter(unevaluable.clone()),
+                SearchQuery::new("Patient")
+                    .with_parameter(param("_id", SearchParamType::Token))
+                    .with_parameter(unevaluable.clone()),
+                SearchQuery::new("Patient")
+                    .with_parameter(unevaluable.clone())
+                    .with_parameter(param("_id", SearchParamType::Token)),
+            ] {
+                match builder.build(&query) {
+                    Err(SearchError::QueryParseError { message }) => {
+                        assert!(message.contains(&format!("'{name}'")), "{message}");
+                        assert!(message.contains("widen"), "{message}");
+                    }
+                    other => panic!("{name}: expected a refusal, got {other:?}"),
+                }
+            }
+        }
+
+        // A parameter that asks for nothing constrains nothing.
+        let mut nothing_asked = param("_query", SearchParamType::Token);
+        nothing_asked.values.clear();
+        let fragment = builder
+            .build(&SearchQuery::new("Patient").with_parameter(nothing_asked))
+            .expect("a parameter without values is not an error");
+        assert!(fragment.sql.contains("search_index"));
+
+        // And an evaluable parameter still builds.
+        builder
+            .build(
+                &SearchQuery::new("Patient").with_parameter(param("_id", SearchParamType::Token)),
+            )
+            .expect("_id has a condition");
+    }
+
     #[test]
     fn test_query_builder_basic() {
         let builder = QueryBuilder::new("tenant1", "Patient");
 
         let query = SearchQuery::new("Patient");
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         assert!(fragment.sql.contains("search_index"));
         assert!(fragment.sql.contains("tenant_id"));
@@ -1902,7 +2097,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         assert!(fragment.sql.contains("param_name = 'name'"));
     }
@@ -1931,7 +2126,9 @@ mod tests {
         let query =
             SearchQuery::new("Encounter").with_parameter(date_param(SearchPrefix::Eq, None));
 
-        let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+        let fragment = QueryBuilder::new("tenant1", "Encounter")
+            .build(&query)
+            .unwrap();
         assert_eq!(
             fragment.sql,
             "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 \
@@ -1943,7 +2140,8 @@ mod tests {
         // Embedded in an outer query, the numbering continues from its offset.
         let fragment = QueryBuilder::new("tenant1", "Encounter")
             .with_param_offset(4)
-            .build(&query);
+            .build(&query)
+            .unwrap();
         assert!(
             fragment.sql.ends_with("AND value_date_end <= ?6))"),
             "{}",
@@ -1980,7 +2178,9 @@ mod tests {
             ),
         ] {
             let query = SearchQuery::new("Encounter").with_parameter(date_param(prefix, None));
-            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
             assert_eq!(
                 fragment.sql,
                 format!("{rows}{first} UNION ALL {rows}{second}"),
@@ -2001,7 +2201,9 @@ mod tests {
             // Under `:not` the same union is the set the resource must avoid.
             let query = SearchQuery::new("Encounter")
                 .with_parameter(date_param(prefix, Some(SearchModifier::Not)));
-            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
             assert!(
                 fragment.sql.ends_with(&format!(
                     "AND (resource_key NOT IN ({rows}{first} UNION ALL {rows}{second}))"
@@ -2024,7 +2226,9 @@ mod tests {
             ("not a date", not_a_date, "AND (1 = 0)"),
         ] {
             let query = SearchQuery::new("Encounter").with_parameter(param);
-            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
             assert!(!fragment.sql.contains("UNION"), "{name}: {}", fragment.sql);
             assert!(fragment.sql.contains(condition), "{name}: {}", fragment.sql);
         }
@@ -2047,7 +2251,9 @@ mod tests {
             ("not", negated),
             ("not beside positive", negated_beside_positive),
         ] {
-            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
             assert!(
                 fragment.sql.starts_with(wrapped),
                 "{name}: {}",
@@ -2075,7 +2281,9 @@ mod tests {
             ("_id", id, 0),
             ("compartment", in_compartment, 1),
         ] {
-            let fragment = QueryBuilder::new("tenant1", "Encounter").build(&query);
+            let fragment = QueryBuilder::new("tenant1", "Encounter")
+                .build(&query)
+                .unwrap();
             assert!(
                 !fragment.sql.contains("DISTINCT"),
                 "{name}: {}",
@@ -2117,7 +2325,7 @@ mod tests {
                 components: vec![],
             });
 
-            let fragment = builder.build(&query);
+            let fragment = builder.build(&query).unwrap();
 
             assert!(
                 fragment.sql.contains(membership),
@@ -2379,7 +2587,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         // ID-only reference search is version-agnostic: exact, `%/id`, and
         // `%/id/_history/%`, so three params (?3, ?4, ?5) after ?1 tenant / ?2
@@ -2406,7 +2614,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
 
         // Each ID-only value now binds 3 params (exact, `%/id`, `%/id/_history/%`):
         // first value ?3..?5, second value ?6..?8.
@@ -2437,7 +2645,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
             fragment.sql.contains("value_reference IN (?3, ?4, ?5)")
                 && fragment
@@ -2446,20 +2654,134 @@ mod tests {
             "expected a flat IN list, got: {}",
             fragment.sql
         );
-        // No per-value OR branches, and no `_history` range scan.
+        // The exact arm is the flat IN (no OR); only the `_history` arm ORs,
+        // one flat chain of prefixed ranges (one per value).
+        assert_eq!(fragment.sql.matches(" OR ").count(), 2, "{}", fragment.sql);
+        // Versioned stored references are matched by one `_history` select
+        // over the same placeholders (#2493), not by one range per value.
         assert!(
-            !fragment.sql.contains(" OR "),
-            "should not OR: {}",
+            fragment
+                .sql
+                .contains("value_reference >= ?3 || '/_history/'")
+                && fragment
+                    .sql
+                    .contains("value_reference < ?5 || '/_history0'"),
+            "expected the _history arm: {}",
             fragment.sql
         );
-        assert!(
-            !fragment.sql.contains("_history"),
-            "multi-value IN path is exact-base only: {}",
-            fragment.sql
-        );
+        assert_eq!(fragment.sql.matches("/_history/").count(), 3);
         // tenant, resource_type, + one base per value, + the same bases again
-        // for the `value_reference_target` select
+        // for the `value_reference_target` select; the `_history` arm binds
+        // nothing of its own.
         assert_eq!(fragment.params.len(), 8);
+    }
+
+    fn multi_reference_query(values: &[&str]) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        query
+    }
+
+    #[test]
+    fn test_multi_value_reference_exists_merge_keeps_versions() {
+        // The merged `EXISTS` form must keep the `_history` arm (#2493), as a
+        // flat filter, and still be a single `EXISTS`.
+        for (values, with_target) in [
+            (vec!["Patient/p1", "Patient/p2"], true),
+            // absolute URLs have no `value_reference_target` arm
+            (
+                vec![
+                    "http://example.org/fhir/Patient/p1",
+                    "https://other.example/fhir/Patient/p1",
+                ],
+                false,
+            ),
+        ] {
+            let fragment = QueryBuilder::new("default", "Observation")
+                .build(&multi_reference_query(&values))
+                .unwrap();
+            let rows = fragment
+                .sql
+                .strip_prefix("resource_key IN (")
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(&fragment.sql);
+            let exists = membership_exists_predicate(rows, "w.rk")
+                .unwrap_or_else(|| panic!("no EXISTS for {values:?}: {}", fragment.sql));
+            assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+            assert!(
+                exists.contains("INDEXED BY idx_search_composite"),
+                "{exists}"
+            );
+            assert!(
+                exists.contains("substr(value_reference, 1, instr(value_reference, '/_history/') - 1) IN (?3, ?4)"),
+                "{exists}"
+            );
+            assert_eq!(
+                exists.contains("value_reference_target IN"),
+                with_target,
+                "{exists}"
+            );
+            assert_eq!(exists.matches("(SELECT").count(), 1, "{exists}");
+        }
+    }
+
+    #[test]
+    fn test_multi_value_reference_versions_arm_seeks_the_index() {
+        // The `_history` arm must bound `value_reference` on the index per
+        // base, never scan `search_index` (#1017, #1955, #2493).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_index (tenant_id TEXT, resource_type TEXT, resource_key INTEGER, \
+               param_name TEXT, value_reference TEXT, value_reference_target TEXT);
+             CREATE INDEX idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) \
+               WHERE value_reference IS NOT NULL;
+             CREATE INDEX idx_search_reference_target ON search_index(tenant_id, resource_type, param_name, value_reference_target) \
+               WHERE value_reference_target IS NOT NULL;",
+        )
+        .unwrap();
+        let fragment = QueryBuilder::new("t", "Observation")
+            .with_param_offset(2)
+            .build(&multi_reference_query(&["Patient/p1", "Patient/p2"]))
+            .unwrap();
+        let start = fragment.sql.find("SELECT resource_key").unwrap();
+        let rows_sql = &fragment.sql[start..];
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {rows_sql}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![
+                    "t",
+                    "Observation",
+                    "Patient/p1",
+                    "Patient/p2",
+                    "Patient/p1",
+                    "Patient/p2"
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SCAN") && l.contains("search_index")),
+            "scan in plan: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.contains("idx_search_reference ")
+                && l.contains("value_reference>?")
+                && l.contains("value_reference<?")),
+            "no bounded range seek in plan: {plan:#?}"
+        );
     }
 
     #[test]
@@ -2480,7 +2802,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
             fragment.sql.contains("value_reference IN (?3, ?4)"),
             "{}",
@@ -2515,7 +2837,7 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let fragment = builder.build(&query);
+        let fragment = builder.build(&query).unwrap();
         assert!(
             !fragment.sql.contains("value_reference IN (?3, ?4)"),
             "bare ids must not take the flat-IN path: {}",

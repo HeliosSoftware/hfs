@@ -63,6 +63,16 @@ impl PredicateAccess {
         }
     }
 
+    /// A composite token+quantity predicate over `tuple_code`: MongoDB picks
+    /// `idx_search_composite_tuple_qty` itself, the only index holding the code
+    /// and the value together, for discovery and for candidate-ID membership.
+    pub(super) fn composite_tuple() -> Self {
+        Self {
+            discovery: IndexAccess::Automatic,
+            membership: MembershipAccess::Automatic,
+        }
+    }
+
     pub(super) fn discovery_hint(self) -> Option<Hint> {
         match self.discovery {
             IndexAccess::Automatic => None,

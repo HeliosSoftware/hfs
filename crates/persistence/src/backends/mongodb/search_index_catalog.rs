@@ -30,6 +30,13 @@
 //! partial index over those rows only, so reference searches and `_revinclude`
 //! match both shapes with exact `$in` lookups and no regex. It is purely
 //! additive: nothing from generation 4 is superseded.
+//!
+//! Generation 6 adds `idx_search_composite_tuple_qty`, a partial index over the
+//! `tuple_code` that the quantity row of a token+quantity composite group
+//! carries (the codes of the group's token row), so `code=X AND value>N` is one
+//! covered range scan. Rows written before it have no `tuple_code`; the planner
+//! uses the index only for a tenant whose rows are known complete
+//! (`composite_layout`).
 
 use mongodb::{
     IndexModel,
@@ -47,6 +54,8 @@ pub(crate) const SEARCH_DATE_RANGE_INDEX: &str = "idx_search_date_v3";
 
 /// The composite search index that composite and filtered sort queries hint.
 pub(crate) const SEARCH_COMPOSITE_INDEX: &str = "idx_search_composite";
+/// Token+quantity composite groups, keyed by the group's token codes.
+pub(crate) const COMPOSITE_TUPLE_INDEX: &str = "idx_search_composite_tuple_qty";
 pub(crate) const COMPOSITE_SLOT_PROBE_INDEX: &str = "idx_search_composite_slot_probe";
 pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
     "idx_search_contained_composite_slot_probe";
@@ -60,7 +69,8 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// over the stored range `[value_date, value_date_end)` stays covered (#1391).
 /// Generation 5 = generation 4 plus `idx_search_reference_target_v2` over the
 /// absolute-reference side field `value_reference_target` (#2394).
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 5;
+/// Generation 6 = generation 5 plus [`COMPOSITE_TUPLE_INDEX`] (cq-p3).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 6;
 
 /// The generation that added `value_date_end` to every date row (#1391), and
 /// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
@@ -73,6 +83,17 @@ pub(crate) const DATE_RANGE_GENERATION: i32 = 4;
 // The reminder is given on the way to the current generation, so the
 // generation it is about can never be ahead of it.
 const _: () = assert!(DATE_RANGE_GENERATION <= SEARCH_INDEX_GENERATION);
+
+/// The generation that writes `tuple_code` on token+quantity composite rows
+/// ([`COMPOSITE_TUPLE_INDEX`]). Pinned like [`DATE_RANGE_GENERATION`]: a
+/// database recorded below it was last booted by a binary that writes rows
+/// without `tuple_code`, so its `tuple_code` markers are not trusted
+/// (`composite_layout`).
+/// Generation 5 (#2394) only normalized references, so a database recorded at
+/// 5 was last booted by a binary that writes no `tuple_code` either.
+pub(crate) const COMPOSITE_TUPLE_GENERATION: i32 = 6;
+
+const _: () = assert!(COMPOSITE_TUPLE_GENERATION <= SEARCH_INDEX_GENERATION);
 
 /// When an index is created relative to boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +198,23 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             "idx_search_quantity_v2",
             &["value_quantity_value", "value_quantity_unit"],
         ),
+        // Generation 6: equality on the group's code, then the quantity range,
+        // then `resource_id` (ESR), so a code+value composite is covered.
+        // `tuple_code` is an array (the bare code and `system|code` of each
+        // coding), hence one entry per form; partial on its presence.
+        SearchIndexSpec {
+            name: COMPOSITE_TUPLE_INDEX,
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "resource_type": 1_i32,
+                "param_name": 1_i32,
+                "tuple_code": 1_i32,
+                "value_quantity_value": 1_i32,
+                "resource_id": 1_i32,
+            },
+            partial: Some(doc! { "tuple_code": { "$exists": true } }),
+            build: IndexBuild::Background,
+        },
         value_v2("idx_search_reference_v2", &["value_reference"]),
         // Generation 5 (#2394): partial on `value_reference_target`, which only
         // absolute-URL reference rows carry, so the index grows with the number
@@ -439,6 +477,7 @@ mod tests {
                 "idx_search_date_v3",
                 "idx_search_number_v2",
                 "idx_search_quantity_v2",
+                COMPOSITE_TUPLE_INDEX,
                 "idx_search_reference_v2",
                 "idx_search_reference_target_v2",
                 "idx_search_uri_v2",
@@ -449,7 +488,8 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 5);
+        assert_eq!(SEARCH_INDEX_GENERATION, 6);
+        assert_eq!(COMPOSITE_TUPLE_GENERATION, 6);
     }
 
     #[test]
@@ -716,7 +756,7 @@ mod tests {
         let cmd = create_indexes_command(&background);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index"));
         let indexes = cmd.get_array("indexes").unwrap();
-        assert_eq!(indexes.len(), 10);
+        assert_eq!(indexes.len(), 11);
         let first = indexes[0].as_document().unwrap();
         assert_eq!(first.get_str("name"), Ok("idx_search_string_v2"));
         assert_eq!(first.get_document("key").unwrap(), &background[0].keys);

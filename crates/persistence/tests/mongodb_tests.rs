@@ -4084,6 +4084,7 @@ async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
         "bulk_submission_changes",
         "bulk_submit_files",
         "secondary_sync_failures",
+        "search_layout",
     ];
     // Tenant-keyed collections that may legitimately be empty or absent here.
     const MAY_BE_EMPTY: &[&str] = &[
@@ -4132,6 +4133,15 @@ async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
             .await
             .unwrap();
         purge_record_sync_failure(&backend, tenant, created.id()).await;
+        // A `tuple_code` completeness marker, as a clean `$reindex` writes it.
+        db.collection::<Document>("search_layout")
+            .insert_one(doc! {
+                "_id": format!("{tenant}|composite_tuple_code_v2"),
+                "tenant_id": tenant,
+                "layout": "composite_tuple_code_v2",
+            })
+            .await
+            .unwrap();
     }
 
     let tenant_filter = |t: &str| doc! { "$or": [ { "tenant_id": t }, { "_id.tenant_id": t } ] };
@@ -19426,7 +19436,9 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// (see [`index_names`] calls against that collection instead).
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
-const CURRENT_BACKGROUND_NAMES: [&str; 10] = [
+/// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
+const CURRENT_BACKGROUND_NAMES: [&str; 11] = [
+    "idx_search_composite_tuple_qty",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
@@ -19568,7 +19580,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(5)
+        Ok(6)
     );
 }
 
@@ -19643,7 +19655,7 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
 
 /// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
 /// `value_date` alone. The builder must build `idx_search_date_v3` (and only
-/// that), then drop `idx_search_date_v2`, and record generation 4.
+/// that), then drop `idx_search_date_v2`, and record the current generation (5).
 #[tokio::test]
 async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
     let Some(cs) = shared_mongo::connection_string().await else {
@@ -19693,7 +19705,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(5)
+        Ok(6)
     );
 }
 
@@ -19781,7 +19793,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(5));
+    assert_eq!(si.get_i32("generation"), Ok(6));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -25208,6 +25220,10 @@ mod covered_membership;
 /// the pair check's hint; the ignored over-cap harness.
 #[path = "mongodb/composite_plan.rs"]
 mod composite_plan;
+
+/// `tuple_code` of token+quantity composites and the one-scan search it enables.
+#[path = "mongodb/composite_tuple.rs"]
+mod composite_tuple;
 
 /// #2254: searches and view runs restricted to one stored FHIR version. The
 /// same type is stored under R4 and R5, so both features are needed.

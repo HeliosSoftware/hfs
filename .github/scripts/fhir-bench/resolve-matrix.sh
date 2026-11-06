@@ -14,7 +14,7 @@
 # inputs already carry, limited today to people with write access).
 #
 # Required environment (exported by the workflow step's env:):
-#   IN_BACKEND                      inputs.backend
+#   IN_BACKEND                      inputs.backend (comma list, `-` excludes)
 #   IN_MAX_PARALLEL                 inputs.max_parallel
 #   IN_ES_HEAP                      inputs.es_heap
 #   IN_ES_SYNC_MODE                 inputs.es_sync_mode
@@ -44,20 +44,67 @@ port_for() {
   esac
 }
 
-case "$BACKEND" in
-  # core (the default) = all six storage setups; `all` is kept as an alias of
-  # it for existing scripts and dispatches. sqlite-postgres is the quick
-  # two-setup run that `core` used to be.
-  core|all)      LEGS="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
-  sqlite-postgres) LEGS="sqlite postgres" ;;
-  elasticsearch) LEGS="sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
-  sqlite|postgres|mongodb|sqlite-elasticsearch|postgres-elasticsearch|mongodb-elasticsearch)
-                 LEGS="$BACKEND" ;;
-  *)
-    echo "::error::Unknown backend selection '$BACKEND'"
+# `backend` is a comma-separated list of tokens. A token is one of the six
+# legs or an alias (core/all, sqlite-postgres, elasticsearch); a leading `-`
+# removes the leg(s) it names. Inclusions are unioned, then exclusions are
+# subtracted; with only exclusions the start is `core`. The result is
+# de-duplicated and emitted in the canonical order below. A single legacy
+# value (`core`, `postgres`, ...) resolves exactly as before.
+CANONICAL="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch"
+
+expand_token() {
+  case "$1" in
+    core|all)        echo "$CANONICAL" ;;
+    sqlite-postgres) echo "sqlite postgres" ;;
+    elasticsearch)   echo "sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
+    sqlite|postgres|mongodb|sqlite-elasticsearch|postgres-elasticsearch|mongodb-elasticsearch)
+                     echo "$1" ;;
+    *)               return 1 ;;
+  esac
+}
+
+INCLUDE=" "
+EXCLUDE=" "
+HAVE_INCLUDE=0
+IFS=',' read -r -a TOKENS <<< "$BACKEND"
+for raw in "${TOKENS[@]}"; do
+  tok="${raw//[[:space:]]/}"
+  neg=0
+  if [[ "$tok" == -* ]]; then
+    neg=1
+    tok="${tok#-}"
+  fi
+  if [ -z "$tok" ]; then
+    echo "::error::Empty backend token in '$BACKEND'"
     FAIL=1
-    LEGS="" ;;
-esac
+    continue
+  fi
+  if ! expanded=$(expand_token "$tok"); then
+    echo "::error::Unknown backend token '$tok' in '$BACKEND' (legs: $CANONICAL; aliases: core, all, sqlite-postgres, elasticsearch; prefix a token with - to exclude it)"
+    FAIL=1
+    continue
+  fi
+  if [ "$neg" -eq 1 ]; then
+    EXCLUDE="$EXCLUDE$expanded "
+  else
+    HAVE_INCLUDE=1
+    INCLUDE="$INCLUDE$expanded "
+  fi
+done
+if [ "$HAVE_INCLUDE" -eq 0 ]; then
+  INCLUDE=" $CANONICAL "
+fi
+
+LEGS=""
+for leg in $CANONICAL; do
+  if [[ "$INCLUDE" == *" $leg "* && "$EXCLUDE" != *" $leg "* ]]; then
+    LEGS="${LEGS:+$LEGS }$leg"
+  fi
+done
+if [ -z "$LEGS" ] && [ "$FAIL" -eq 0 ]; then
+  echo "::error::backend '$BACKEND' selects no legs"
+  FAIL=1
+fi
 
 ITEMS=""
 for b in $LEGS; do

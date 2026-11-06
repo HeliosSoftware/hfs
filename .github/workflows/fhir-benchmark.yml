@@ -34,14 +34,17 @@ name: FHIR Server Benchmark
 #       - sqlite-/postgres-/mongodb-elasticsearch (8084/8085/8086) — the same
 #         primary plus a single-node Elasticsearch that serves every search; the
 #         primary's own search index is not written (set_search_offloaded).
-#   • `backend`: core (default) = all six storage setups, about 3 h for
+#   • `backend`: a comma-separated list of legs; a token starting with `-`
+#     removes legs (inclusions are unioned, then exclusions subtracted; with
+#     only exclusions it starts from `core`). Tokens are the six legs or an
+#     alias: core (default) = all six storage setups, about 3 h for
 #     prewarm/import/crud/search, plus up to ~70 min per leg for bulk-import
-#     (part of tests=all, see below);
-#     sqlite-postgres = the quick two-setup run (sqlite + postgres);
-#     elasticsearch = the three composites; or any single leg; all = same as
-#     core (an alias, kept for existing scripts and dispatches). `max_parallel`
-#     (default 1, so legs run one at a time; clamped to 1..2) caps how many
-#     legs share the Docker host at once.
+#     (part of tests=all, see below); sqlite-postgres = the quick two-setup
+#     run (sqlite + postgres); elasticsearch = the three composites; all =
+#     same as core (an alias, kept for existing scripts and dispatches).
+#     Example: `core,-sqlite,-sqlite-elasticsearch`. Legs always run in the
+#     canonical order. `max_parallel` (default 1, so legs run one at a time;
+#     clamped to 1..2) caps how many legs share the Docker host at once.
 #   • s3 / s3-elasticsearch are not benchmarked: bare s3 has no search
 #     (persistence/src/backends/s3/storage.rs:1763-1775) — its only
 #     conditional support is identifier-scoped conditional create
@@ -130,21 +133,10 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Backend legs: core (default) = all 6 storage setups, about 3 h without bulk-import (tests=all adds up to ~70 min per leg; tests=prewarm,import,crud,search skips it); sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
-        type: choice
+        description: "Backend legs, a comma-separated list; a token starting with - removes legs. Tokens: sqlite, postgres, mongodb, sqlite-elasticsearch, postgres-elasticsearch, mongodb-elasticsearch, or an alias: core (default) = all 6 storage setups, about 3 h without bulk-import (tests=all adds up to ~70 min per leg; tests=prewarm,import,crud,search skips it); all = same as core; sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites. Examples: core,-sqlite,-sqlite-elasticsearch | all,-elasticsearch | postgres,mongodb. Exclusions only start from core. Unknown tokens or an empty result fail in setup."
+        type: string
         required: false
         default: core
-        options:
-          - core
-          - all
-          - sqlite-postgres
-          - elasticsearch
-          - sqlite
-          - postgres
-          - mongodb
-          - sqlite-elasticsearch
-          - postgres-elasticsearch
-          - mongodb-elasticsearch
       tests:
         description: "Suites to run: 'all' = prewarm,import,crud,search,sql-run,insert,bulk-import | comma-separated from those. sql-run is HFS's own read-only SQL-on-FHIR suite (10 VUs x 1 min, five views, never patient/group); it follows search only with 'all', and with an explicit list it runs where listed (useless on an empty database). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and search-index rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,sql-run,insert' skips it"
         required: false
@@ -165,7 +157,7 @@ on:
         description: "How many earlier runs the history and the HTML trend compare against (1-20)"
         type: number
         required: false
-        default: 5
+        default: 10
       log_level:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
@@ -2363,8 +2355,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HISTORY_RUNS: ${{ inputs.history_runs }}
         run: |
-          # integer 1..20, else 5; the HTML trend gets one more point for this run
-          N=5
+          # integer 1..20, else 10; the HTML trend gets one more point for this run
+          N=10
           case "$HISTORY_RUNS" in
             ''|*[!0-9]*) ;;
             ????????*) N=20 ;;
@@ -2405,7 +2397,7 @@ jobs:
             --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
-            --trend-max $(( ${HISTORY_RUNS_N:-5} + 1 )) \
+            --trend-max $(( ${HISTORY_RUNS_N:-10} + 1 )) \
             --no-shapes
 
       # archive: false uploads the single .html as-is (not zipped), so it opens

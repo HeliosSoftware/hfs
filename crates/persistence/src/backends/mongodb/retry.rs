@@ -49,8 +49,8 @@ pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
 };
 
 /// Reindex page policy (#2290): 100, 200, 400 ms between the four runs of one
-/// page, about 0.7 s of sleep at most. A run starts at the page's delete, so
-/// it clears what the previous run left behind. The pause also gives a command
+/// page, about 0.7 s of sleep at most. A run starts at the page's row snapshot,
+/// so it clears what the previous run left behind. The pause also gives a command
 /// the failed run had in flight time to land before the next snapshot.
 pub(super) const REINDEX_PAGE_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 4,

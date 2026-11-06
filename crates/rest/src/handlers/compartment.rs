@@ -236,7 +236,14 @@ where
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
     crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
-    let mut search_params = SearchParams::from_pairs(pairs);
+    // `_type` picks which member types are searched; it is not a filter any
+    // backend evaluates. Left in the per-type queries, SQLite refuses it as a
+    // parameter it cannot build a condition for (#866), and other backends
+    // ignored it and answered with every member type.
+    let requested_types = requested_types(&pairs, fhir_version)?;
+    let (type_pairs, other_pairs): (Vec<_>, Vec<_>) =
+        pairs.into_iter().partition(|(name, _)| name == "_type");
+    let mut search_params = SearchParams::from_pairs(other_pairs);
 
     // Member types of this compartment, resolved once: they decide both which
     // searches run below and which parameters count as unknown.
@@ -247,6 +254,11 @@ where
             .filter(|target_type| {
                 !helios_fhir::get_compartment_params(fhir_version, &compartment_type, target_type)
                     .is_empty()
+            })
+            .filter(|target_type| {
+                requested_types
+                    .as_ref()
+                    .is_none_or(|types| types.iter().any(|t| t == target_type))
             })
             .collect();
 
@@ -387,7 +399,13 @@ where
         &compartment_type,
         &compartment_id,
         "*",
-        &search_params,
+        &SearchParams::from_pairs(
+            search_params
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .chain(type_pairs)
+                .collect(),
+        ),
     );
     let match_count = result.resources.len();
     let mut bundle = result.into_bundle(&public_base, &self_link);
@@ -493,6 +511,33 @@ fn validate_out_of_band(
     }
 
     Ok(())
+}
+
+/// The resource types a `_type` parameter of an all-types compartment search
+/// restricts it to, or `None` without one. Repeated `_type` parameters and
+/// comma-separated lists are unioned. A name that is not a resource type of
+/// `fhir_version` is a `400`, as it is for `$everything`; a resource type that
+/// is not a member of the compartment simply contributes no results.
+fn requested_types(
+    pairs: &[(String, String)],
+    fhir_version: helios_fhir::FhirVersion,
+) -> RestResult<Option<Vec<String>>> {
+    let mut types: Option<Vec<String>> = None;
+    for (_, value) in pairs.iter().filter(|(name, _)| name == "_type") {
+        let types = types.get_or_insert_with(Vec::new);
+        for t in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if !crate::fhir_types::is_valid_resource_type_for_version(t, fhir_version) {
+                return Err(RestError::InvalidParameter {
+                    param: "_type".to_string(),
+                    message: format!("'{t}' is not a resource type in FHIR {fhir_version}"),
+                });
+            }
+            if !types.iter().any(|x| x == t) {
+                types.push(t.to_string());
+            }
+        }
+    }
+    Ok(types)
 }
 
 /// Applies FHIR unknown-parameter handling to a compartment search.
