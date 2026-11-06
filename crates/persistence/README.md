@@ -491,8 +491,12 @@ would keep the document of a dropped `contained[]` entry). When the run complete
 lists the resource ids each writer indexed and deletes the entries of those the source no longer
 holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
 crashes, is cancelled or fails is therefore left with the old index plus the pages already
-rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
-its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+rebuilt: searchable, at worst holding stale rows for deleted resources. That holds for the page in
+flight too on MongoDB: a page snapshots the ids of the rows it replaces, inserts the new rows and
+only then deletes the snapshotted ids (#2424), so a stop in between leaves each resource with its
+old rows, its new rows or both, never none. Two generations of rows search as one, and the next
+write of the page removes the surplus. A writer that cannot list its index skips the sweep with a
+warning. A run named by resource ids deletes the entries of the
 named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
 before the run fails.
 

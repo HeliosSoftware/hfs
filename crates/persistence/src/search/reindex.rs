@@ -136,7 +136,8 @@ pub struct ReindexPageStats {
     /// Search-parameter extraction and building the page's index entries.
     pub extract: Duration,
     /// Removing the page's stale entries (every delete command of the page,
-    /// including a failed one).
+    /// including a failed one). MongoDB also books here its read of the rows
+    /// the page replaces, and deletes them after the page's inserts (#2424).
     pub delete: Duration,
     /// Writing the page's new entries (every insert command of the page,
     /// including a failed one).

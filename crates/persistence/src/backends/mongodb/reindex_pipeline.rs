@@ -361,8 +361,10 @@ fn flatten_sub_batch(
 
 /// Groups resources into one `{tenant_id, resource_type, resource_id: {$in:
 /// ids}}` filter per distinct resource type in the page, in first-seen type
-/// order (#1403).
-fn delete_filters(tenant_id: &str, resources: &[StoredResource]) -> Vec<Document> {
+/// order (#1403). They scope the page's row snapshot and its verification.
+/// Nothing deletes by them: the page deletes by exact `_id`, after its new rows
+/// are in (#2424).
+fn page_filters(tenant_id: &str, resources: &[StoredResource]) -> Vec<Document> {
     let mut order: Vec<&str> = Vec::new();
     let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
     for resource in resources {
@@ -402,7 +404,7 @@ fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Docume
 /// errors until the public writer boundary. The saved insert batch is never
 /// sent again: a command may have applied despite an uncertain reply, and a
 /// resend would double-insert. A transient failure instead re-runs the whole
-/// page from its delete ([`MongoBackend::write_page_with_retry`]), which
+/// page from its row snapshot ([`MongoBackend::write_page_with_retry`]), which
 /// extracts it afresh, removes what the failed run left and assigns new ids.
 #[derive(Debug)]
 pub(super) struct PageFailure {
@@ -436,7 +438,7 @@ impl PageFailure {
         }
     }
 
-    /// A driver failure that re-running the page from its delete can recover:
+    /// A driver failure that re-running the page from its snapshot can recover:
     /// one the runner would also count as transient (`Unavailable`, a
     /// connection or pool failure, a timeout). Extraction failures do not matter: a
     /// re-run extracts the page again and reproduces them, so one unextractable
@@ -852,13 +854,17 @@ struct InsertedIds {
 type ResourceKey = (String, String);
 type ResourceRowIds = HashMap<ResourceKey, Vec<Bson>>;
 
-/// Rows observed after both initial deletes and before any page insert.
-/// Cleanup never acquires ownership of rows discovered after this snapshot.
+/// The rows the page's resources held before its first insert, by `_id`: the
+/// generation this page replaces (#2424). The page deletes exactly these ids,
+/// and only once its own rows are in ([`delete_old_rows`]), so a resource has a
+/// complete set of rows at every instant. Cleanup never acquires ownership of
+/// rows discovered after this snapshot.
 #[derive(Default)]
 struct PreviousIds {
     own: ResourceRowIds,
     contained: ResourceRowIds,
-    /// Rows the page's initial deletes removed, across both collections.
+    /// Rows [`delete_old_rows`] removed, across both collections. Zero until
+    /// it has run.
     deleted: u64,
     /// A re-run of a page whose earlier run may have left an insert in
     /// flight: an empty snapshot no longer proves there is nothing to verify.
@@ -866,11 +872,10 @@ struct PreviousIds {
 }
 
 impl PreviousIds {
-    /// The page found nothing to replace: its deletes removed no rows and
-    /// none were left behind. A delete cannot miss rows that were never
-    /// there, so post-insert verification has nothing to protect. This is
-    /// the first build into an empty index, including the deferred rebuild
-    /// after `$bulk-submit`.
+    /// The page found nothing to replace: no rows before its inserts, so none
+    /// to delete and none a delete could miss. Post-insert verification has
+    /// nothing to protect. This is the first build into an empty index,
+    /// including the deferred rebuild after `$bulk-submit`.
     fn nothing_replaced(&self) -> bool {
         !self.force_verify && self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
     }
@@ -1097,59 +1102,117 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Deletes a page's stale rows from both `search_index` and
-/// `search_index_contained`: one `delete_many` per resource type in the page
-/// (from `filters`), per collection. Runs before any insert is spawned for
-/// the page. A delete failure reports `Err` for the whole page — the caller
-/// cannot tell which resources' rows the delete would have reached, so it
-/// fans that failure out to every resource rather than guessing (#1403).
-async fn delete_page(
+/// Snapshots, before any insert, the ids of the rows the page's resources hold
+/// now in `search_index` and `search_index_contained`: one `find` per resource
+/// type in the page (from `filters`), per collection. These are the rows the
+/// page replaces. Nothing is deleted here: [`delete_old_rows`] removes exactly
+/// these ids once the page's new rows are in, so that a stop between the two
+/// steps leaves every resource with its old rows, its new rows or both, never
+/// with none (#2424). A read failure reports `Err` for the whole page — the
+/// caller cannot tell which resources' rows it would have reached, so it fans
+/// that failure out to every resource rather than guessing.
+///
+/// Its time is booked as `delete`, the phase that finds and removes the rows
+/// a page replaces.
+async fn snapshot_page(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
     filters: Vec<Document>,
 ) -> DbTask<PreviousIds> {
     let started = std::time::Instant::now();
     let mut stats = ReindexPageStats::default();
-    for filter in &filters {
-        match own.delete_many(filter.clone()).await {
-            Ok(result) => stats.deleted_entries += result.deleted_count,
-            Err(e) => {
-                stats.delete += started.elapsed();
-                return DbTask {
-                    stats,
-                    result: Err(PageFailure::driver("Failed to delete search entries", e)),
-                };
-            }
-        }
-        match contained.delete_many(filter.clone()).await {
-            Ok(result) => stats.deleted_entries += result.deleted_count,
-            Err(e) => {
-                stats.delete += started.elapsed();
-                return DbTask {
-                    stats,
-                    result: Err(PageFailure::driver(
-                        "Failed to delete search_index_contained entries",
-                        e,
-                    )),
-                };
-            }
-        }
-    }
-    stats.delete += started.elapsed();
-    let started = std::time::Instant::now();
     let result = async {
         let own = snapshot_row_ids(&own, &filters, "search index").await?;
         let contained = snapshot_row_ids(&contained, &filters, "search_index_contained").await?;
         Ok(PreviousIds {
             own,
             contained,
-            deleted: stats.deleted_entries,
+            deleted: 0,
             force_verify: false,
         })
     }
     .await;
-    stats.verify += started.elapsed();
+    stats.delete += started.elapsed();
     DbTask { stats, result }
+}
+
+/// Most ids one [`delete_old_rows`] command names, so a page with many old
+/// rows stays at a bounded command size.
+const OLD_ROW_DELETE_CHUNK: usize = 5_000;
+
+/// Deletes the rows `previous` captured, by exact `_id`, from both collections:
+/// the generation the page replaces, now that its own rows are in (#2424).
+/// Deleting by id, not by resource, means it can only remove rows that existed
+/// before the page's first insert: rows another writer adds meanwhile are left
+/// for verification to report. The resources in `keep` (the ones whose new rows
+/// did not all land) keep their old rows, so a resource whose insert failed is
+/// never left with fewer rows than it had.
+///
+/// A delete failure reports `Err` for the whole page. The new rows are already
+/// in by then, so nothing is lost: the resources hold both generations until a
+/// later write of the page removes the old one (a re-run snapshots both and
+/// deletes both).
+async fn delete_old_rows(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    tenant_id: &str,
+    previous: &PreviousIds,
+    keep: &HashSet<ResourceKey>,
+) -> DbTask<u64> {
+    let started = std::time::Instant::now();
+    let mut stats = ReindexPageStats::default();
+    let result = async {
+        for (collection, rows, context) in [
+            (&own, &previous.own, "Failed to delete search entries"),
+            (
+                &contained,
+                &previous.contained,
+                "Failed to delete search_index_contained entries",
+            ),
+        ] {
+            let ids = replaced_row_ids(rows, keep);
+            for chunk in ids.chunks(OLD_ROW_DELETE_CHUNK) {
+                let result = collection
+                    .delete_many(doc! { "tenant_id": tenant_id, "_id": { "$in": chunk.to_vec() } })
+                    .await
+                    .map_err(|e| PageFailure::driver(context, e))?;
+                stats.deleted_entries += result.deleted_count;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    stats.delete += started.elapsed();
+    let deleted = stats.deleted_entries;
+    DbTask {
+        stats,
+        result: result.map(|()| deleted),
+    }
+}
+
+/// The captured ids [`delete_old_rows`] removes: every one but those of the
+/// resources in `keep`.
+fn replaced_row_ids(rows: &ResourceRowIds, keep: &HashSet<ResourceKey>) -> Vec<Bson> {
+    rows.iter()
+        .filter(|(key, _)| !keep.contains(*key))
+        .flat_map(|(_, ids)| ids.iter().cloned())
+        .collect()
+}
+
+/// The page positions in `owners` as resource keys, for [`delete_old_rows`].
+fn owner_keys(
+    resources: &[StoredResource],
+    owners: &HashMap<usize, String>,
+) -> HashSet<ResourceKey> {
+    owners
+        .keys()
+        .map(|&position| {
+            (
+                resources[position].resource_type().to_owned(),
+                resources[position].id().to_owned(),
+            )
+        })
+        .collect()
 }
 
 async fn snapshot_row_ids(
@@ -1163,12 +1226,12 @@ async fn snapshot_row_ids(
             .find(filter.clone())
             .projection(doc! { "_id": 1, "resource_type": 1, "resource_id": 1 })
             .await
-            .map_err(|e| {
-                PageFailure::driver(&format!("Failed to snapshot remaining {context} rows"), e)
-            })?;
-        while let Some(row) = cursor.try_next().await.map_err(|e| {
-            PageFailure::driver(&format!("Failed to read remaining {context} rows"), e)
-        })? {
+            .map_err(|e| PageFailure::driver(&format!("Failed to snapshot {context} rows"), e))?;
+        while let Some(row) = cursor
+            .try_next()
+            .await
+            .map_err(|e| PageFailure::driver(&format!("Failed to read {context} rows"), e))?
+        {
             let key = (
                 row.get_str("resource_type")
                     .map_err(|_| PageFailure::from("snapshot row without resource type"))?
@@ -1326,7 +1389,7 @@ impl PageRows<'_> {
 }
 
 /// One index collection as verification sees it: the rows this page wrote
-/// into it and the rows left in it after the page's delete.
+/// into it and the rows it held before the page's first insert.
 struct IndexCollection<'a> {
     collection: &'a mongodb::Collection<Document>,
     inserted: &'a [(usize, Bson)],
@@ -1853,10 +1916,11 @@ impl super::MongoBackend {
         Ok((outcomes, matched, parameter_failures))
     }
 
-    /// Writes one page, running it again from its delete when a run fails
-    /// transiently (#2290). Every run extracts the page afresh, deletes its
-    /// rows by resource id (which removes what the failed run landed), takes a
-    /// new snapshot and assigns new `_id`s, so the failed run's insert batch is
+    /// Writes one page, running it again from its row snapshot when a run
+    /// fails transiently (#2290). Every run extracts the page afresh, takes a
+    /// new snapshot of the rows the page's resources hold (which includes
+    /// whatever the failed run landed, so this run deletes it with the old
+    /// rows) and assigns new `_id`s, so the failed run's insert batch is
     /// never resent. A run that fails with a document-level (permanent)
     /// outcome, or with anything but a transient driver error, ends the loop.
     ///
@@ -1927,9 +1991,11 @@ impl super::MongoBackend {
         }
     }
 
-    /// Serial writer: extracts every resource, deletes the page's stale
-    /// entries, then inserts the new ones, one command at a time (own rows,
-    /// then contained rows). Uses the rayon pool only for pages of at least
+    /// Serial writer: extracts every resource, snapshots the ids of the rows
+    /// the page replaces, inserts the new ones, one command at a time (own
+    /// rows, then contained rows), and only then deletes the snapshotted rows,
+    /// so a stop at any point leaves each resource with its old rows, its new
+    /// rows or both, never none (#2424). Uses the rayon pool only for pages of at least
     /// `REINDEX_SERIAL_POOL_MIN_PAGE` on a multi-thread runtime; the pool
     /// accessor is never called otherwise, so single-resource
     /// `write_search_entries` calls and current-thread tests never build one
@@ -1979,10 +2045,12 @@ impl super::MongoBackend {
         stats.sub_batches += 1;
         stats.pool_sub_batches += u64::from(on_pool);
 
-        let filters = delete_filters(tenant_id, resources);
-        let done = delete_page(own.clone(), contained.clone(), filters.clone()).await;
+        // The rows this page replaces are only read here; they go once the
+        // page's own rows are in (#2424).
+        let filters = page_filters(tenant_id, resources);
+        let done = snapshot_page(own.clone(), contained.clone(), filters.clone()).await;
         absorb_db_task(stats, &done.stats);
-        let previous = match done.result {
+        let mut previous = match done.result {
             Ok(previous) => PreviousIds {
                 force_verify: replay,
                 ..previous
@@ -2004,6 +2072,20 @@ impl super::MongoBackend {
             }
             Err(msg) => return Err(msg.with_outcomes(extract_failures, HashMap::new())),
         };
+        let done = delete_old_rows(
+            own.clone(),
+            contained.clone(),
+            tenant_id,
+            &previous,
+            &owner_keys(resources, &insert_failures),
+        )
+        .await;
+        absorb_db_task(stats, &done.stats);
+        stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+        match done.result {
+            Ok(deleted) => previous.deleted = deleted,
+            Err(msg) => return Err(msg.with_outcomes(extract_failures, insert_failures)),
+        }
         let page = PageRows {
             filters: &filters,
             tenant_id,
@@ -2062,12 +2144,14 @@ impl super::MongoBackend {
 
     /// Overlapped writer (#1403): while sub-batch k's insert runs on a
     /// spawned task, the page's own thread extracts sub-batch k+1 inside
-    /// `block_in_place`; the page's delete runs on its own task while
+    /// `block_in_place`; the page's row snapshot runs on its own task while
     /// sub-batch 1 is extracted. Caller guarantees a multi-thread runtime,
     /// `resources.len() > REINDEX_SUBBATCH_FIRST`, and search not offloaded.
     /// At most one insert is ever in flight: every loop iteration joins the
     /// previous sub-batch's insert before spawning the next, and the
-    /// trailing drain after the loop joins the last one.
+    /// trailing drain after the loop joins the last one. The rows the page
+    /// replaces are deleted only after that drain, by exact id, so no
+    /// resource is ever without rows (#2424).
     pub(super) async fn write_page_overlapped(
         &self,
         db: &mongodb::Database,
@@ -2090,14 +2174,14 @@ impl super::MongoBackend {
         } else {
             1
         };
-        let filters = delete_filters(tenant_id, resources);
+        let filters = page_filters(tenant_id, resources);
         let page_type: Option<&str> = (filters.len() == 1).then(|| resources[0].resource_type());
         let seed = page_type.and_then(|t| self.reindex_docs_seed(t));
         let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
 
-        // The page's delete runs on its own task while sub-batch 1 is
+        // The page's row snapshot runs on its own task while sub-batch 1 is
         // extracted below.
-        let mut delete = Some(AbortOnDrop::spawn(delete_page(
+        let mut snapshot = Some(AbortOnDrop::spawn(snapshot_page(
             own.clone(),
             contained.clone(),
             filters.clone(),
@@ -2131,15 +2215,17 @@ impl super::MongoBackend {
             stats.pool_sub_batches += u64::from(on_pool);
             planner.record(range.len(), batch.len());
 
-            // No insert may start before the page's delete has finished.
-            if let Some(mut task) = delete.take() {
+            // No insert may start before the page's snapshot has finished:
+            // a row the snapshot saw is an old row, and one it did not see
+            // is never the page's to delete.
+            if let Some(mut task) = snapshot.take() {
                 let waited = std::time::Instant::now();
                 let joined = task.join().await;
                 add_db_wait(stats, &mut page_wait, waited.elapsed());
                 let done = match joined {
                     Ok(done) => done,
                     Err(e) => {
-                        return Err(join_failure(e, "delete")
+                        return Err(join_failure(e, "snapshot")
                             .with_outcomes(extract_failures, insert_failures));
                     }
                 };
@@ -2184,6 +2270,22 @@ impl super::MongoBackend {
             .await
         {
             return Err(msg.with_outcomes(extract_failures, insert_failures));
+        }
+        // Every new row is in. Only now do the rows the page replaces go.
+        let waited = std::time::Instant::now();
+        let done = delete_old_rows(
+            own.clone(),
+            contained.clone(),
+            tenant_id,
+            &previous,
+            &owner_keys(resources, &insert_failures),
+        )
+        .await;
+        add_db_wait(stats, &mut page_wait, waited.elapsed());
+        absorb_db_task(stats, &done.stats);
+        match done.result {
+            Ok(deleted) => previous.deleted = deleted,
+            Err(msg) => return Err(msg.with_outcomes(extract_failures, insert_failures)),
         }
         let waited = std::time::Instant::now();
         let page = PageRows {
@@ -2369,6 +2471,48 @@ mod tests {
             ..Default::default()
         };
         assert!(!contained_left.nothing_replaced());
+    }
+
+    #[test]
+    fn old_rows_are_deleted_except_those_of_resources_whose_new_rows_failed() {
+        let patient = |id: &str| {
+            StoredResource::new(
+                "Patient",
+                id,
+                crate::tenant::TenantId::new("t"),
+                serde_json::json!({"resourceType": "Patient", "id": id}),
+                helios_fhir::FhirVersion::default(),
+            )
+        };
+        let page = [patient("a"), patient("b"), patient("c")];
+        let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let key = |id: &str| ("Patient".to_string(), id.to_string());
+        let rows: ResourceRowIds = HashMap::from([
+            (key("a"), vec![Bson::ObjectId(a)]),
+            (key("b"), vec![Bson::ObjectId(b), Bson::ObjectId(c)]),
+        ]);
+
+        // Nothing failed: every captured id goes.
+        let mut all = replaced_row_ids(&rows, &owner_keys(&page, &HashMap::new()));
+        all.sort_by_key(|id| id.to_string());
+        let mut expected = vec![Bson::ObjectId(a), Bson::ObjectId(b), Bson::ObjectId(c)];
+        expected.sort_by_key(|id| id.to_string());
+        assert_eq!(all, expected);
+
+        // Resource `b`'s insert failed (position 1): its old rows stay.
+        let failed = HashMap::from([(1usize, "insert failed".to_string())]);
+        assert_eq!(
+            replaced_row_ids(&rows, &owner_keys(&page, &failed)),
+            vec![Bson::ObjectId(a)]
+        );
+
+        // A failed resource that held no rows costs nothing.
+        let failed = HashMap::from([(2usize, "insert failed".to_string())]);
+        assert_eq!(
+            replaced_row_ids(&rows, &owner_keys(&page, &failed)).len(),
+            3
+        );
+        assert!(replaced_row_ids(&HashMap::new(), &HashSet::new()).is_empty());
     }
 
     #[test]

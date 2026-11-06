@@ -10226,13 +10226,25 @@ impl ReindexTarget for MongoBackend {
         Ok(result.deleted_count + contained_result.deleted_count)
     }
 
-    /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)
-    /// `insert_many`, instead of the default's two `delete_many` plus one
+    /// Rebuilds a whole page in one row snapshot, one (possibly chunked)
+    /// `insert_many` and one (possibly chunked) delete of the replaced rows by
+    /// `_id`, instead of the default's two `delete_many` plus one
     /// `insert_many` PER RESOURCE — `delete_search_entries` above, then
     /// `write_search_entries` -> `index_resource`'s own delete-then-insert
     /// (#1064). For a 100-resource page that was 300 sequential round trips;
-    /// this is two (three only if a page mixes resource types, which no
-    /// production caller does — see the precondition below).
+    /// this is a handful per collection (more only if a page mixes resource
+    /// types, which no production caller does — see the precondition below).
+    ///
+    /// The page's old rows are deleted after its new rows are in, never before
+    /// (#2424): the snapshot records the ids of the rows the page's resources
+    /// hold, the inserts add the new generation, and the delete removes exactly
+    /// the snapshotted ids. A stop at any point (a crash, a dropped future, a
+    /// failed command) leaves each resource with its old rows, its new rows or
+    /// both, and a search in between still finds it. Searches group the rows
+    /// of a resource by resource id, so two generations of rows return the
+    /// resource once; the next write of the page (a re-run snapshots both
+    /// generations) or of the resource removes the surplus. A resource whose
+    /// new rows did not all land keeps its old rows.
     ///
     /// Building every resource's documents through
     /// [`Self::search_index_documents_checked`] keeps a rebuild and the CRUD
@@ -10254,22 +10266,22 @@ impl ReindexTarget for MongoBackend {
     ///
     /// Precondition: `resources` must hold each `(resource_type, id)` at most
     /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
-    /// would double-insert, because the delete for the whole page runs once
-    /// per run, up front. The production caller, `fetch_resources_page`, guarantees
+    /// would double-insert, because the snapshot of the rows to replace is
+    /// taken once per run, up front. The production caller, `fetch_resources_page`, guarantees
     /// it: an id-phase page walks the unique `idx_resources_identity` in key
     /// order, and a catch-up page is de-duplicated by id (keeping the newest
     /// version) before it is returned (#1403). The same resource in two
     /// different calls is expected — a catch-up round rewrites what the id
     /// phase wrote.
     ///
-    /// A transient driver failure of the delete, the snapshot, an insert or
+    /// A transient driver failure of the snapshot, an insert, the delete or
     /// the verification is first retried by running the whole page again from
-    /// its delete (`write_page_with_retry`, #2290): the saved insert batch is
+    /// its snapshot (`write_page_with_retry`, #2290): the saved insert batch is
     /// never resent, so the rows a failed run landed are removed by the next
-    /// run's delete rather than duplicated.
+    /// run's delete, with the old rows, rather than duplicated.
     ///
     /// A page-level failure that survives that — getting the database handle,
-    /// the grouped delete, or an insert error the driver does not attribute to
+    /// the snapshot, the delete of the old rows, or an insert error the driver does not attribute to
     /// a specific document — reports the same `Err` for every resource in the page,
     /// because the failure cannot be attributed to individual documents
     /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
@@ -10281,11 +10293,13 @@ impl ReindexTarget for MongoBackend {
     ///
     /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
     /// on a current-thread runtime, always runs through the serial writer:
-    /// one delete phase, then one insert phase (own rows, then contained
+    /// one snapshot phase, then one insert phase (own rows, then contained
     /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
-    /// commands). The delete completes fully before the insert phase starts,
-    /// but a chunked insert can still leave some rows behind even when it
-    /// goes on to fail: an earlier chunk that already committed keeps its
+    /// commands), then the delete of the old rows. The snapshot completes
+    /// fully before the insert phase starts and the delete only after it
+    /// ends, and a chunked insert can still leave some new rows behind even
+    /// when it goes on to fail (alongside the old rows, which are then not
+    /// deleted): an earlier chunk that already committed keeps its
     /// rows, and the chunk that actually errored may keep some, all, or none
     /// of its own — an unordered `insert_many` failure (for example a
     /// write-concern error reported after the documents were written, or a
