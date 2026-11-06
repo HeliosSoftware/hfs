@@ -6,6 +6,10 @@
 //! vread, create, update, validate or capability statement got a `500`
 //! while history and delete answered `406`. With the feature on, the same
 //! requests answer FHIR XML.
+//!
+//! Patch is on the same footing (#863): it built its response with `Json(..)`
+//! directly and never negotiated, so a client asking for `application/fhir+xml`
+//! got JSON.
 
 use std::sync::Arc;
 
@@ -21,6 +25,11 @@ const FHIR_JSON: HeaderValue = HeaderValue::from_static("application/fhir+json")
 
 const PATIENT: &str = r#"{"resourceType":"Patient","id":"p1","name":[{"family":"Probe"}]}"#;
 const NEW_PATIENT: &str = r#"{"resourceType":"Patient","name":[{"family":"New"}]}"#;
+
+const JSON_PATCH: &str = "application/json-patch+json";
+const MERGE_PATCH: &str = "application/merge-patch+json";
+const RENAME_PATCH: &str = r#"[{"op":"replace","path":"/name/0/family","value":"Patched"}]"#;
+const ACTIVATE_PATCH: &str = r#"{"active":true}"#;
 
 fn server() -> TestServer {
     let backend =
@@ -47,6 +56,8 @@ struct Case {
     method: Method,
     path: &'static str,
     body: Option<&'static str>,
+    /// The request `Content-Type`: a patch names its patch format here.
+    content_type: &'static str,
     prefer: Option<&'static str>,
     #[cfg_attr(not(feature = "xml"), allow(dead_code))]
     produced: StatusCode,
@@ -58,18 +69,31 @@ fn cases() -> Vec<Case> {
         method,
         path,
         body,
+        content_type: "application/fhir+json",
         prefer: None,
         produced,
     };
-    // The `Prefer: return=OperationOutcome` answers of create and update are
-    // formatted by their own call site.
+    // The `Prefer: return=OperationOutcome` answers of create, update and
+    // patch are formatted by their own call site.
     let outcome = |label, method, path, body, produced| Case {
         label,
         method,
         path,
         body,
+        content_type: "application/fhir+json",
         prefer: Some("return=OperationOutcome"),
         produced,
+    };
+    // `PATCH [type]/[id]` and `PATCH [type]?[criteria]`, each carrying its body
+    // in the patch format `content_type` names.
+    let patch = |label, path, content_type, body, prefer| Case {
+        label,
+        method: Method::PATCH,
+        path,
+        body: Some(body),
+        content_type,
+        prefer,
+        produced: StatusCode::OK,
     };
     vec![
         case("read", Method::GET, "/Patient/p1", None, StatusCode::OK),
@@ -150,6 +174,28 @@ fn cases() -> Vec<Case> {
             Some(PATIENT),
             StatusCode::OK,
         ),
+        patch("patch", "/Patient/p1", JSON_PATCH, RENAME_PATCH, None),
+        patch(
+            "patch, return=OperationOutcome",
+            "/Patient/p1",
+            JSON_PATCH,
+            RENAME_PATCH,
+            Some("return=OperationOutcome"),
+        ),
+        patch(
+            "conditional patch",
+            "/Patient?_id=p1",
+            MERGE_PATCH,
+            ACTIVATE_PATCH,
+            None,
+        ),
+        patch(
+            "conditional patch, return=OperationOutcome",
+            "/Patient?_id=p1",
+            MERGE_PATCH,
+            ACTIVATE_PATCH,
+            Some("return=OperationOutcome"),
+        ),
     ]
 }
 
@@ -162,7 +208,7 @@ async fn send(server: &TestServer, case: &Case) -> axum_test::TestResponse {
     }
     if let Some(body) = case.body {
         request = request
-            .add_header(CONTENT_TYPE, FHIR_JSON)
+            .add_header(CONTENT_TYPE, HeaderValue::from_static(case.content_type))
             .bytes(body.into());
     }
     request.await
@@ -209,5 +255,34 @@ async fn every_xml_request_answers_xml_when_xml_is_built() {
             "{}: the body is XML: {text}",
             case.label
         );
+    }
+}
+
+/// `Prefer: return=minimal` sends no body, so no format is needed to answer it:
+/// patch stays `200` with its `ETag` on a build without the `xml` feature too,
+/// as create and update do.
+#[tokio::test]
+async fn patch_return_minimal_needs_no_format() {
+    let server = server();
+    seed(&server).await;
+    for (label, path, content_type, body) in [
+        ("patch", "/Patient/p1", JSON_PATCH, RENAME_PATCH),
+        (
+            "conditional patch",
+            "/Patient?_id=p1",
+            MERGE_PATCH,
+            ACTIVATE_PATCH,
+        ),
+    ] {
+        let response = server
+            .patch(path)
+            .add_header(ACCEPT, FHIR_XML)
+            .add_header(PREFER, HeaderValue::from_static("return=minimal"))
+            .add_header(CONTENT_TYPE, HeaderValue::from_static(content_type))
+            .bytes(body.into())
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK, "{label}");
+        assert!(response.text().is_empty(), "{label}: no body");
+        assert!(response.headers().get("etag").is_some(), "{label}: ETag");
     }
 }
