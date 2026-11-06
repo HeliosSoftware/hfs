@@ -3737,6 +3737,8 @@ impl ResourceStorage for MongoBackend {
             .or_query_error("purge delete (secondary_sync_failures)")?;
         // SQL query terminology relations are tenant-keyed documents (#2185).
         self.purge_tenant_sof_terminology(id).await?;
+        // The tenant's `tuple_code` completeness markers (`search_layout`).
+        self.purge_composite_tuple_markers(&db, id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
@@ -5208,7 +5210,7 @@ impl MongoBackend {
             .extract_with_missing(resource, resource_type)
         {
             Ok(extraction) => {
-                let own = extraction
+                let mut own = extraction
                     .values
                     .iter()
                     .filter_map(|value| {
@@ -5220,6 +5222,16 @@ impl MongoBackend {
                         )
                     })
                     .collect::<Vec<_>>();
+                // The quantity row of a token+quantity composite group carries
+                // its group's codes (`idx_search_composite_tuple_qty`). Only
+                // two-component composites: no longer one is read that way.
+                let pairs: HashSet<&str> = extraction
+                    .values
+                    .iter()
+                    .filter(|value| value.composite_arity == Some(2))
+                    .map(|value| value.param_name.as_str())
+                    .collect();
+                super::composite_search::stamp_tuple_codes(&mut own, |param| pairs.contains(param));
                 // A parameter whose values all failed to build a row (an
                 // unparseable date, a Period end that is not a date) is as
                 // absent as one that extracted nothing: without this it would
@@ -10140,6 +10152,22 @@ impl ReindexTarget for MongoBackend {
             })?;
 
         Ok(result.deleted_count + contained_result.deleted_count)
+    }
+
+    async fn reindex_run_completed(
+        &self,
+        tenant: &TenantContext,
+        coverage: crate::search::ReindexCoverage<'_>,
+    ) {
+        if self.is_search_offloaded() {
+            return;
+        }
+        if let Err(error) = self
+            .record_composite_tuple_codes_complete(tenant.tenant_id().as_str(), coverage)
+            .await
+        {
+            tracing::warn!(%error, "could not record the tuple_code marker");
+        }
     }
 
     async fn write_search_entries(
