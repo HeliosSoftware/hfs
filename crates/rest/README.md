@@ -321,7 +321,11 @@ Points worth knowing before raising it:
   may process batch entries in any order, and at a bound above 1 it does. Two
   entries writing the same id, or an entry reading what another entry in the
   same bundle writes, resolve by timing. Put ordered work in a `transaction`, or
-  in separate requests.
+  in separate requests. Timing decides *which* entry wins, never whether an
+  `ifMatch` is honoured: two entries that carry the same `ifMatch` for one id
+  write once (#2527). The other answers `409 Conflict` if it was checked before
+  the winner wrote, or `412` if it was checked after (always the case at a bound
+  of 1, as on SQLite).
 - **Response entries stay positional** regardless: response entry *i* always
   answers request entry *i*.
 - **A bundle that writes a `StructureDefinition` drops to sequential**
@@ -854,6 +858,16 @@ and an unusable value does not apply.
 - `ifMatch` — **supported.** ETag for optimistic locking on `PUT`, `PATCH` **and
   `DELETE`** entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
   list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
+  A tag that does not match is a `412` entry. In a `batch`, an instance entry whose
+  `ifMatch` holds writes against the version it was checked against, as the
+  single `PUT`, `PATCH` and `DELETE` with `If-Match` do (#2527): if another writer
+  changed the resource after the check, the entry is `409 Conflict` and that
+  writer's version survives, and a `PUT` on a resource deleted after the check is
+  `404` and the resource stays deleted. Before #2527 a batch `PUT` or `DELETE`
+  wrote over whatever was current then, so it could overwrite or delete a version
+  the client never saw, or bring a deleted resource back (`201`). Entries without
+  `ifMatch` are unchanged: last writer wins, and a `PUT` on a deleted resource
+  brings it back.
 - `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
   `BundleEntry.if_none_match`; no handler or backend reads it.
 - `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
