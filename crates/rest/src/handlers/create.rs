@@ -169,14 +169,19 @@ where
                     terminology,
                 )
                 .await;
-                // Counted, but conditional writes announce nothing.
+                // A conditional create that created announces like the
+                // unconditional one (#862). The `Exists` arm below wrote
+                // nothing and reports nothing.
                 super::write_event::report(
                     &state,
                     tenant.context(),
                     fhir_version,
                     &resource_type,
                     1,
-                    None,
+                    Some(super::write_event::stored_notice(
+                        WriteKind::Create,
+                        &stored,
+                    )),
                 );
                 // Stored StructureDefinitions feed the tenant's profile
                 // registry.
