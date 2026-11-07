@@ -1381,6 +1381,11 @@ impl Transaction for PostgresTransaction {
                 (v, d, f)
             }
             None => {
+                // Nothing to delete. Only a `SELECT` has run since the flush,
+                // so the transaction is as usable as before this call, and a
+                // caller that answers this as a no-op (#2523) must still be able
+                // to commit.
+                self.poisoned = false;
                 return Err(StorageError::Resource(ResourceError::NotFound {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),

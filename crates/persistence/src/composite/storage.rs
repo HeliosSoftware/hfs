@@ -1298,11 +1298,21 @@ impl ResourceStorage for CompositeStorage {
     ) -> StorageResult<()> {
         let result = self.primary.delete(tenant, resource_type, id).await;
 
+        // Nothing to delete (`NotFound`) is the primary answering, not the
+        // primary failing. The REST layer turns it into a `204` no-op (#2523),
+        // so clients may repeat deletes freely; counting each repeat as a
+        // failure would let them mark the primary unhealthy. Nothing changed,
+        // so nothing is synced to the secondaries either.
+        let refused = matches!(result, Err(StorageError::Resource(_)));
         let primary_id = self.config.primary_id().unwrap_or("primary");
         self.update_health(
             primary_id,
-            result.is_ok(),
-            result.as_ref().err().map(|e| e.to_string()),
+            result.is_ok() || refused,
+            result
+                .as_ref()
+                .err()
+                .filter(|_| !refused)
+                .map(|e| e.to_string()),
         );
 
         result?;
@@ -4784,6 +4794,59 @@ mod tests {
         let health = composite.backend_health("primary").unwrap();
         assert!(!health.healthy);
         assert_eq!(health.failure_count, threshold);
+    }
+
+    /// #2523: a delete with nothing to delete is a `204` no-op on the wire, so
+    /// clients may repeat it. The primary's `NotFound` is the primary
+    /// answering; counting it as a failure let repeated deletes mark a healthy
+    /// primary unhealthy. Still `NotFound` to the caller, which is what the
+    /// REST layer turns into the no-op.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn delete_with_nothing_to_delete_keeps_the_primary_healthy() {
+        use crate::backends::sqlite::SqliteBackend;
+
+        let primary = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        primary.init_schema().expect("init schema");
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+        let tenant = make_tenant();
+
+        composite
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        composite.delete(&tenant, "Patient", "p1").await.unwrap();
+
+        let threshold = composite.config.health_config.failure_threshold;
+        for id in std::iter::repeat_n(["p1", "never-existed"], threshold as usize).flatten() {
+            let err = composite
+                .delete(&tenant, "Patient", id)
+                .await
+                .expect_err("nothing to delete");
+            assert!(
+                matches!(
+                    err,
+                    StorageError::Resource(crate::error::ResourceError::NotFound { .. })
+                ),
+                "{id}: {err:?}"
+            );
+        }
+
+        let health = composite.backend_health("primary").unwrap();
+        assert!(health.healthy, "{health:?}");
+        assert_eq!(health.failure_count, 0);
+        assert!(health.last_error.is_none());
     }
 
     #[test]

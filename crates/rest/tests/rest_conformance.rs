@@ -1132,15 +1132,18 @@ mod conditional_delete {
         }
     }
 
-    /// CONTROL — a precondition-less delete of an already-deleted resource
-    /// keeps answering 404, exactly as it did before #312.
+    /// CONTROL — a precondition-less delete of an already-deleted resource is
+    /// a successful no-op, `204` (#2523): "Performing this interaction on a
+    /// resource that is already deleted has no effect, and the server should
+    /// return either a 200 OK if the response contains a payload, or a 204 No
+    /// Content" (R4/R4B/R5 http.html#delete). It was `404` until then.
     ///
-    /// This is the cell that pins the trap: evaluating the precondition needs a
-    /// `read()`, and `read()` returns `Gone` for a tombstone. Propagating that
-    /// instead of mapping it to "no current version" would have silently made
-    /// 410 the answer here in every build.
+    /// This is also the cell that pins the trap #312 named: evaluating the
+    /// precondition needs a `read()`, and `read()` returns `Gone` for a
+    /// tombstone. Propagating that instead of mapping it to "no current
+    /// version" would make `410` the answer here in every build.
     #[tokio::test]
-    async fn absent_if_match_on_a_soft_deleted_resource_is_still_404() {
+    async fn absent_if_match_on_a_soft_deleted_resource_is_a_no_op_204() {
         let (server, backend) = create_test_server().await;
         seed_patient(&backend, "patient-1", "Smith").await;
 
@@ -1148,9 +1151,9 @@ mod conditional_delete {
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
-        delete_req(&server, "patient-1")
-            .await
-            .assert_status(StatusCode::NOT_FOUND);
+        let again = delete_req(&server, "patient-1").await;
+        again.assert_status(StatusCode::NO_CONTENT);
+        assert!(again.text().is_empty(), "a 204 has no body");
     }
 
     /// REGRESSION — `HFS_REQUIRE_IF_MATCH` was honored only by the update
