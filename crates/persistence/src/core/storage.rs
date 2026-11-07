@@ -612,8 +612,13 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Errors
     ///
-    /// * `StorageError::Resource(NotFound)` - If the resource doesn't exist
-    /// * `StorageError::Resource(Gone)` - If already deleted
+    /// * `StorageError::Resource(NotFound)` - If there is no live resource to
+    ///   delete: it never existed, or it is already deleted. Every backend
+    ///   reports both as `NotFound`, and nothing is written for either — no
+    ///   history version, no tombstone, no `lastUpdated` change. The REST layer
+    ///   answers this as a successful no-op (`204`), as FHIR's delete
+    ///   interaction asks (#2523); it is an error here so that a caller can tell
+    ///   a delete that removed something from one that did not.
     /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
     async fn delete(
         &self,
@@ -650,8 +655,7 @@ pub trait ResourceStorage: Send + Sync {
     /// # Errors
     ///
     /// * `StorageError::Resource(NotFound)` - If no live resource exists
-    ///   (never created, or already deleted; S3 reports the latter as `Gone`,
-    ///   as its `delete` does)
+    ///   (never created, or already deleted), as for [`delete`](Self::delete)
     /// * `StorageError::Concurrency(VersionConflict)` - If the current version
     ///   is not `expected_version`; nothing is deleted. S3 reports a writer
     ///   that lands after its comparison as `OptimisticLockFailure`.

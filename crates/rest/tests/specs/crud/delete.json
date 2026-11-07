@@ -36,13 +36,24 @@
     },
     {
       "name": "delete_nonexistent_patient",
-      "description": "Should return 404 for non-existent resource",
+      "description": "Nothing to delete is a successful no-op: 204, as R4/R4B/R5 http.html#delete say for a resource that does not exist at all (#2523)",
       "request": {
         "method": "DELETE",
         "path": "/Patient/nonexistent"
       },
       "expect": {
-        "status": 404
+        "status": 204
+      }
+    },
+    {
+      "name": "delete_already_deleted_patient",
+      "description": "Deleting an already-deleted resource has no effect: 204 (#2523)",
+      "request": {
+        "method": "DELETE",
+        "path": "/Patient/delete-test-1"
+      },
+      "expect": {
+        "status": 204
       }
     },
     {
