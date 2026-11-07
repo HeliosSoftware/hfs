@@ -383,3 +383,13 @@ the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
 standalone (no search index exists to rebuild) and its job state is per-process,
 so poll the node you kicked off against. See the
 [helios-rest README](../../../crates/rest/README.md#administrative-operations).
+
+A `batch` `PUT`/`DELETE` entry with `request.ifMatch` answers like the same
+request with `If-Match` (#2527): a stale tag is a `412` entry; a satisfied one
+writes against the version it was checked against, so another writer landing
+after the check makes the entry `409` (its version survives), and a `PUT` on a
+resource deleted after the check is `404` (no revive). Two entries with the same
+`ifMatch` for one id write once; the other is `409` if checked before the winner
+wrote, `412` if after (always `412` on SQLite, which runs entries serially).
+Entries without `ifMatch` stay last-writer-wins. Code: `check_entry_if_match` in
+`crates/rest/src/handlers/batch.rs`; tests: `crates/rest/tests/if_match_write_race.rs`.
