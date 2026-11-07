@@ -1160,8 +1160,12 @@ fn transaction_write_event_type(method: BundleMethod, status: u16) -> Option<Wri
 /// `StoredResource`s, so the notice is built from the entry's method and the
 /// result's stored JSON. Only 2xx write entries announce; a POST or a PUT that
 /// created answers 201 (Create), an update answers 200 (Update). A 2xx DELETE
-/// carries no body, so its type and id come from the entry URL; a conditional
-/// delete that resolved to no id has nothing to announce.
+/// carries no body, so its id comes from the entry URL — or, for a conditional
+/// delete whose URL carries criteria rather than an id, from the `location`
+/// the backend names the resource it deleted through (#859, #862); a
+/// conditional delete that matched nothing has no location and nothing to
+/// announce. Conditional POST, PUT and PATCH entries return their resource, so
+/// they announce through the same arm as their unconditional siblings.
 fn transaction_entry_notice(
     entry: &BundleEntry,
     result: &BundleEntryResult,
@@ -1174,6 +1178,16 @@ fn transaction_entry_notice(
         }
         BundleMethod::Delete if (200..300).contains(&result.status) => {
             let (_, id) = parse_request_url(&entry.url).ok()?;
+            let id = if id.is_empty() {
+                entry
+                    .criteria
+                    .as_ref()
+                    .and(result.location.as_deref())
+                    .and_then(AuditTarget::from_location)?
+                    .id
+            } else {
+                id
+            };
             (!id.is_empty()).then(|| super::write_event::delete_notice(&id, None))
         }
         _ => None,
@@ -1484,14 +1498,17 @@ where
                     .await
                 {
                     Ok(ConditionalCreateResult::Created(stored)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional POST below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1595,14 +1612,17 @@ where
                     .await
                 {
                     Ok(ConditionalUpdateResult::Updated(stored)) => {
-                        // Conditional writes announce nothing.
+                        // Announced like the unconditional PUT below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             0,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Update,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         let location = format!("{}/{}", stored.resource_type(), stored.id());
@@ -1611,13 +1631,17 @@ where
                         result
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
+                        // The upsert created: announced as a create (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1738,14 +1762,19 @@ where
                     .await
                 {
                     Ok(ConditionalDeleteResult::Deleted(deleted)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional DELETE below (#862),
+                        // naming the resource the criteria resolved to, with the
+                        // pre-delete content the result carries.
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             -1,
-                            None,
+                            Some(super::write_event::delete_notice(
+                                deleted.id(),
+                                Some(deleted.content().clone()),
+                            )),
                         );
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
@@ -1942,9 +1971,10 @@ where
         stored.fhir_version(),
         resource_type,
         0,
-        criteria
-            .is_none()
-            .then(|| super::write_event::stored_notice(WriteKind::Update, &stored)),
+        Some(super::write_event::stored_notice(
+            WriteKind::Update,
+            &stored,
+        )),
     );
     record_stored_profile(state, tenant, stored.fhir_version(), &stored);
     let mut result = BundleEntryResult::updated(stored);
@@ -5674,6 +5704,57 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// #862: a conditional DELETE entry's URL carries criteria, not an id, so
+    /// its notice names the resource the backend resolved, through `location`.
+    /// One that matched nothing has no location and announces nothing.
+    #[test]
+    fn transaction_conditional_delete_notice_names_the_resolved_resource() {
+        let conditional = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient?identifier=x".to_string(),
+            criteria: Some(Vec::new()),
+            ..Default::default()
+        };
+        let result = |location: Option<&str>, effect: BundleEntryEffect| BundleEntryResult {
+            location: location.map(str::to_string),
+            effect,
+            ..BundleEntryResult::deleted()
+        };
+
+        let deleted = transaction_entry_write(
+            &conditional,
+            &result(Some("Patient/p9/_history/3"), BundleEntryEffect::Deleted),
+        )
+        .expect("a delete that resolved a resource is a write");
+        assert_eq!(deleted.0, "Patient");
+        assert_eq!(deleted.1, -1);
+        let notice = deleted.2.expect("announced");
+        assert_eq!(notice.kind, WriteKind::Delete);
+        assert_eq!(notice.resource_id, "p9");
+        assert!(notice.version_id.is_empty());
+        assert!(notice.resource.is_none());
+
+        // No match: a 204 with no location, nothing deleted, nothing announced.
+        assert!(
+            transaction_entry_write(&conditional, &result(None, BundleEntryEffect::NotFound))
+                .is_none()
+        );
+
+        // Criteria-less entries still announce from the URL, never from a
+        // location.
+        let instance = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient/p1".to_string(),
+            ..Default::default()
+        };
+        let notice = transaction_entry_notice(
+            &instance,
+            &result(Some("Patient/other/_history/1"), BundleEntryEffect::Deleted),
+        )
+        .expect("announced");
+        assert_eq!(notice.resource_id, "p1");
     }
 
     #[test]

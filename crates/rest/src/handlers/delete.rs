@@ -375,14 +375,18 @@ where
                 deleted.id(),
             )
             .await;
-            // Counted, but conditional writes announce nothing.
+            // Announced like the instance delete (#862), with the pre-delete
+            // content the result carries as that path does.
             super::write_event::report(
                 &state,
                 tenant.context(),
                 deleted.fhir_version(),
                 &resource_type,
                 -1,
-                None,
+                Some(super::write_event::delete_notice(
+                    deleted.id(),
+                    Some(deleted.content().clone()),
+                )),
             );
             debug!(
                 resource_type = %resource_type,
