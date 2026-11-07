@@ -4100,7 +4100,10 @@ impl SqliteBackend {
                 // Parse resource type and ID from URL
                 let (resource_type, id) = self.parse_url(&entry.url)?;
                 match tx.read(&resource_type, &id).await? {
-                    Some(resource) => Ok(BundleEntryResult::ok(resource)),
+                    Some(resource) => Ok(crate::core::bundle_read_result(
+                        resource,
+                        entry.if_none_match.as_deref(),
+                    )),
                     None => Ok(BundleEntryResult::error(
                         404,
                         serde_json::json!({

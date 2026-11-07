@@ -854,8 +854,15 @@ and an unusable value does not apply.
 - `ifMatch` — **supported.** ETag for optimistic locking on `PUT`, `PATCH` **and
   `DELETE`** entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
   list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
-- `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
-  `BundleEntry.if_none_match`; no handler or backend reads it.
+- `ifNoneMatch` — **supported on `GET [type]/[id]` entries,** in both `batch` and
+  `transaction` bundles: the conditional read, answered as `GET [type]/[id]`
+  answers `If-None-Match`. A tag naming the current version (weak or strong form,
+  any member of a comma-separated list, or `*`) answers `304 Not Modified` with no
+  resource; any other tag, or a value that is not a list of entity-tags, answers
+  the full `200`. A read of a missing resource is the same `404` it is without the
+  tag. Search, vread and history `GET` entries ignore it, as their direct
+  endpoints do, and it has no meaning on a write entry (conditional creates use
+  `ifNoneExist`).
 - `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
   `transaction` bundles, on every backend that implements `ConditionalStorage`
   (SQLite, PostgreSQL, MongoDB; on S3 only `_id` and `identifier` criteria, by
