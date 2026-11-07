@@ -99,6 +99,43 @@ pub fn shutdown() {
     }
 }
 
+/// Parent `span` on the caller's W3C `traceparent`, if the request carries a
+/// valid one, so the request joins the caller's trace instead of starting a new
+/// one. A missing or malformed header leaves the span as a new root. The
+/// caller's sampled flag is honored, as with any OpenTelemetry server.
+#[cfg(feature = "otel")]
+pub(crate) fn adopt_remote_parent(span: &tracing::Span, headers: &http::HeaderMap) {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    // Most requests carry no header; skip the extract on the hot path.
+    if !headers.contains_key("traceparent") {
+        return;
+    }
+    let cx = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .extract(&HeaderExtractor(headers));
+    if cx.span().span_context().is_valid()
+        && let Err(err) = span.set_parent(cx)
+    {
+        tracing::debug!(error = ?err, "request span could not join the caller's trace");
+    }
+}
+
+#[cfg(feature = "otel")]
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+#[cfg(feature = "otel")]
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
 /// Build an OTLP-exporting tracer provider, or `None` when
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` is not set (export disabled).
 #[cfg(feature = "otel")]
