@@ -376,6 +376,14 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | everything, instance | GET/POST | `/Patient/[id]/$everything` |
 | everything, type | GET/POST | `/Patient/$everything` |
 
+`DELETE [type]/[id]` of a resource that never existed or is already deleted
+is a no-op success (#2523): `204`, or `200` with an informational
+OperationOutcome under `Prefer: return=OperationOutcome`, as a conditional
+delete with no match answers. Batch and transaction entries answer `204` too,
+and the rest of a transaction commits. It used to be `404` (`410` on S3, and a
+`400` for the whole transaction). `If-Match` on an absent or deleted resource
+is still `412`; a read of a deleted resource is still `410`.
+
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require
 the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
@@ -383,3 +391,13 @@ the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
 standalone (no search index exists to rebuild) and its job state is per-process,
 so poll the node you kicked off against. See the
 [helios-rest README](../../../crates/rest/README.md#administrative-operations).
+
+A `batch` `PUT`/`DELETE` entry with `request.ifMatch` answers like the same
+request with `If-Match` (#2527): a stale tag is a `412` entry; a satisfied one
+writes against the version it was checked against, so another writer landing
+after the check makes the entry `409` (its version survives), and a `PUT` on a
+resource deleted after the check is `404` (no revive). Two entries with the same
+`ifMatch` for one id write once; the other is `409` if checked before the winner
+wrote, `412` if after (always `412` on SQLite, which runs entries serially).
+Entries without `ifMatch` stay last-writer-wins. Code: `check_entry_if_match` in
+`crates/rest/src/handlers/batch.rs`; tests: `crates/rest/tests/if_match_write_race.rs`.

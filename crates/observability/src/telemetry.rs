@@ -99,6 +99,58 @@ pub fn shutdown() {
     }
 }
 
+/// Parent `span` on the caller's W3C `traceparent`, if the request carries a
+/// valid one, so the request joins the caller's trace instead of starting a new
+/// one. A missing or malformed header leaves the span as a new root. The
+/// caller's sampled flag is honored, as with any OpenTelemetry server.
+#[cfg(feature = "otel")]
+pub(crate) fn adopt_remote_parent(span: &tracing::Span, headers: &http::HeaderMap) {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    // Most requests carry no header; skip the extract on the hot path.
+    if !headers.contains_key("traceparent") {
+        return;
+    }
+    let cx = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .extract(&HeaderExtractor(headers));
+    if cx.span().span_context().is_valid()
+        && let Err(err) = span.set_parent(cx)
+    {
+        tracing::debug!(error = ?err, "request span could not join the caller's trace");
+    }
+}
+
+/// Longest `tracestate` the request span takes from a caller. W3C Trace Context
+/// lets a server drop a `tracestate` over 512 characters. The OpenTelemetry SDK
+/// does not enforce the spec's 32-member limit, and the parsed state is copied
+/// onto every span in the trace. Without this cap one client sending
+/// hundreds-of-KB headers made OTLP batches exceed the collector's 4 MB gRPC
+/// limit, so whole batches, other users' spans included, were rejected.
+#[cfg(feature = "otel")]
+const MAX_TRACESTATE_LEN: usize = 512;
+
+#[cfg(feature = "otel")]
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+#[cfg(feature = "otel")]
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        let value = self.0.get(key)?.to_str().ok()?;
+        // An oversized tracestate is dropped whole: the request still joins
+        // the caller's trace through `traceparent`.
+        if key == "tracestate" && value.len() > MAX_TRACESTATE_LEN {
+            return None;
+        }
+        Some(value)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
 /// Build an OTLP-exporting tracer provider, or `None` when
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` is not set (export disabled).
 #[cfg(feature = "otel")]
@@ -162,5 +214,47 @@ mod tests {
     fn unparseable_rust_log_falls_back_to_default_level() {
         // `@@@` is not a valid directive; fall back rather than panic.
         assert_eq!(env_filter_from(Some("@@@"), "info").to_string(), "info");
+    }
+
+    /// A caller's tracestate is kept up to `MAX_TRACESTATE_LEN` and dropped
+    /// whole past it, while the traceparent is still adopted either way.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn oversized_tracestate_is_dropped_but_trace_is_still_joined() {
+        use super::{HeaderExtractor, MAX_TRACESTATE_LEN};
+        use opentelemetry::propagation::TextMapPropagator as _;
+        use opentelemetry::trace::TraceContextExt as _;
+
+        const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+        let extract = |tracestate: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                format!("00-{TRACE_ID}-b7ad6b7169203331-01")
+                    .parse()
+                    .unwrap(),
+            );
+            headers.insert("tracestate", tracestate.parse().unwrap());
+            let cx = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .extract(&HeaderExtractor(&headers));
+            let sc = cx.span().span_context().clone();
+            assert!(sc.is_valid());
+            assert_eq!(sc.trace_id().to_string(), TRACE_ID);
+            sc.trace_state().header()
+        };
+
+        // Exactly at the cap: kept.
+        let at_cap = format!("a={},b={}", "v".repeat(253), "v".repeat(254));
+        assert_eq!(at_cap.len(), MAX_TRACESTATE_LEN);
+        assert_eq!(extract(&at_cap), at_cap);
+
+        // One member over the cap (each member is within the SDK's 256-char
+        // limit, so the SDK alone would accept it): dropped.
+        let over_cap = (0..3)
+            .map(|i| format!("k{i}={}", "v".repeat(200)))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(over_cap.len() > MAX_TRACESTATE_LEN);
+        assert_eq!(extract(&over_cap), "");
     }
 }

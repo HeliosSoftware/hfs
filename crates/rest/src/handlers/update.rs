@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -343,8 +343,7 @@ where
         "Resource updated"
     );
 
-    let location = created
-        .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
+    let location = created.then(|| state.location_for_request(&tenant, &stored));
     build_update_response(
         status,
         &stored,
@@ -484,14 +483,17 @@ where
     }
     match result {
         ConditionalUpdateResult::Updated(stored) => {
-            // Conditional writes announce nothing.
+            // Announced like the unconditional update (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 fhir_version,
                 &resource_type,
                 0,
-                None,
+                Some(super::write_event::stored_notice(
+                    WriteKind::Update,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_update_response(
@@ -518,17 +520,20 @@ where
             })
         }
         ConditionalUpdateResult::Created(stored) => {
+            // The upsert created: announced as a create (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 fhir_version,
                 &resource_type,
                 1,
-                None,
+                Some(super::write_event::stored_notice(
+                    WriteKind::Create,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            let location =
-                state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
+            let location = state.location_for_request(&tenant, &stored);
             build_update_response(
                 StatusCode::CREATED,
                 &stored,

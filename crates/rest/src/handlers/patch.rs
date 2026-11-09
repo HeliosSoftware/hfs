@@ -10,7 +10,6 @@
 //! - FHIRPath Patch - application/fhir+json with Parameters resource
 
 use axum::{
-    Json,
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
@@ -24,8 +23,10 @@ use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
+use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
+use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
 
@@ -44,12 +45,17 @@ use crate::state::AppState;
 ///   - `application/merge-patch+json` - JSON Merge Patch (RFC 7386)
 ///   - `application/fhir+json` - FHIRPath Patch (Parameters resource)
 /// - `If-Match` - Optimistic locking (ETag)
+/// - `Accept` - Response format (`application/fhir+json` or
+///   `application/fhir+xml`), negotiated as on update. The patch document
+///   itself is always JSON.
 ///
 /// # Response
 ///
 /// - `200 OK` - Resource patched successfully
 /// - `400 Bad Request` - Invalid patch document
 /// - `404 Not Found` - Resource does not exist
+/// - `406 Not Acceptable` - XML was requested from a build without the `xml`
+///   feature
 /// - `412 Precondition Failed` - If-Match condition not met
 /// - `415 Unsupported Media Type` - Unknown patch format
 #[allow(clippy::too_many_arguments)]
@@ -73,6 +79,11 @@ where
             resource_type: resource_type.to_string(),
         });
     }
+
+    // Negotiate response format from Accept header, and refuse a format this
+    // build cannot write before anything is patched.
+    let negotiated = negotiate_format(&headers, None);
+    require_writable_answer(negotiated.format, &prefer)?;
 
     debug!(
         resource_type = %resource_type,
@@ -193,7 +204,7 @@ where
         )),
     );
 
-    build_patch_response(&stored, headers, &prefer).map(|mut response| {
+    build_patch_response(&stored, headers, &prefer, negotiated.format).map(|mut response| {
         response
             .extensions_mut()
             .insert(helios_audit::AuditResponseContext {
@@ -230,6 +241,8 @@ where
 ///   invalid patch document
 /// - `404 Not Found` - nothing matched; nothing is created
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+/// - `406 Not Acceptable` - XML was requested from a build without the `xml`
+///   feature
 /// - `412 Precondition Failed` - more than one resource matched, or `If-Match`
 ///   was supplied and is not satisfied
 /// - `415 Unsupported Media Type` - unknown patch format
@@ -268,6 +281,11 @@ where
             resource_type: resource_type.to_string(),
         });
     }
+
+    // Negotiate response format from Accept header, and refuse a format this
+    // build cannot write before anything is patched.
+    let negotiated = negotiate_format(&headers, None);
+    require_writable_answer(negotiated.format, &prefer)?;
 
     // The raw query, as written: every occurrence of a repeated parameter
     // (#1321), decoded once by the shared criteria builder (#1322).
@@ -338,29 +356,34 @@ where
                     stored.content(),
                 );
             }
-            // Conditional writes announce nothing.
+            // Announced like the instance patch above (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 stored.fhir_version(),
                 &resource_type,
                 0,
-                None,
+                Some(super::write_event::stored_notice(
+                    helios_persistence::core::WriteKind::Update,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
-            build_patch_response(&stored, headers, &prefer).map(|mut response| {
-                response
-                    .extensions_mut()
-                    .insert(helios_audit::AuditResponseContext {
-                        resource_type: Some(resource_type.clone()),
-                        resource_id: Some(stored.id().to_string()),
-                        patient_reference: extract_patient_from_resource(
-                            &resource_type,
-                            stored.content(),
-                        ),
-                    });
-                response
-            })
+            build_patch_response(&stored, headers, &prefer, negotiated.format).map(
+                |mut response| {
+                    response
+                        .extensions_mut()
+                        .insert(helios_audit::AuditResponseContext {
+                            resource_type: Some(resource_type.clone()),
+                            resource_id: Some(stored.id().to_string()),
+                            patient_reference: extract_patient_from_resource(
+                                &resource_type,
+                                stored.content(),
+                            ),
+                        });
+                    response
+                },
+            )
         }
         ConditionalPatchPreparation::NoMatch => Err(RestError::NotFound {
             resource_type,
@@ -399,29 +422,54 @@ fn parse_patch_format(content_type: &str, body: &Bytes) -> RestResult<PatchForma
     }
 }
 
+/// Refuses, before the patch is applied, an answer this build cannot write.
+///
+/// Without the `xml` feature an XML answer can only be refused, and refusing
+/// it after the write leaves a `406` over a committed change. A patch is not
+/// idempotent (a JSON Patch `add` to an array appends again), so a client
+/// retrying that `406` would apply it twice. `Prefer: return=minimal` sends no
+/// body, so it needs no format and is let through.
+fn require_writable_answer(format: FhirFormat, prefer: &PreferHeader) -> RestResult<()> {
+    let needs_body = prefer.return_preference() != Some("minimal");
+    if needs_body && !cfg!(feature = "xml") && format == FhirFormat::Xml {
+        return Err(RestError::NotAcceptable {
+            message: "XML format is not supported (xml feature not enabled)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Builds the response for a successful patch.
+///
+/// The body, when there is one, is written in the negotiated `format` through
+/// [`format_resource_response`], as on create and update, so a build without
+/// the `xml` feature refuses an XML request with `406`. `Prefer:
+/// return=minimal` sends no body and needs no format.
 fn build_patch_response(
     stored: &helios_persistence::types::StoredResource,
     headers: ResourceHeaders,
     prefer: &PreferHeader,
+    format: FhirFormat,
 ) -> RestResult<Response> {
-    let header_map = headers.to_header_map();
+    let content = match prefer.return_preference() {
+        Some("minimal") => return Ok((StatusCode::OK, headers.to_header_map()).into_response()),
+        Some("OperationOutcome") => serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "information",
+                "code": "informational",
+                "details": {
+                    "text": format!("Resource patched: {}/{}", stored.resource_type(), stored.id())
+                }
+            }]
+        }),
+        _ => stored.content_with_meta(),
+    };
 
-    match prefer.return_preference() {
-        Some("minimal") => Ok((StatusCode::OK, header_map).into_response()),
-        Some("OperationOutcome") => {
-            let outcome = serde_json::json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{
-                    "severity": "information",
-                    "code": "informational",
-                    "details": {
-                        "text": format!("Resource patched: {}/{}", stored.resource_type(), stored.id())
-                    }
-                }]
-            });
-            Ok((StatusCode::OK, header_map, Json(outcome)).into_response())
-        }
-        _ => Ok((StatusCode::OK, header_map, Json(stored.content_with_meta())).into_response()),
-    }
+    // `ResourceHeaders` defaults to `application/fhir+json`, and its
+    // Content-Type replaces the one the body would set: an XML body must say so.
+    let header_map = headers
+        .with_content_type(format.mime_type())
+        .to_header_map();
+    format_resource_response(StatusCode::OK, header_map, &content, format)
 }

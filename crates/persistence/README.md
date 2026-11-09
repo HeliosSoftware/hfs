@@ -179,7 +179,7 @@ helios-persistence/
     │   └── capabilities.rs # Capability test helpers
     ├── crud/            # CRUD operation tests
     │   ├── create_tests.rs, read_tests.rs, update_tests.rs
-    │   ├── delete_tests.rs, conditional_tests.rs
+    │   └── delete_tests.rs
     ├── search/          # Search parameter tests
     │   ├── string_tests.rs, token_tests.rs, date_tests.rs
     │   ├── number_tests.rs, quantity_tests.rs, reference_tests.rs

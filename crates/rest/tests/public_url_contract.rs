@@ -126,10 +126,21 @@ async fn url_path_requests_advertise_prefix_and_tenant() {
         }))
         .await;
     created.assert_status(StatusCode::CREATED);
-    let location = created.headers()["location"].to_str().unwrap();
-    assert!(location.starts_with("https://public.example/fhir/acme/Patient/"));
+    let location = created.headers()["location"].to_str().unwrap().to_string();
     let patient: Value = created.json();
     let id = patient["id"].as_str().unwrap();
+    // http.html#create: `[base]/[type]/[id]/_history/[vid]` (#2517), the
+    // tenant segment part of `[base]`.
+    assert_public_url(&location, &format!("/Patient/{id}/_history/1"));
+    let vread = server
+        .get(
+            location
+                .strip_prefix("https://public.example/fhir")
+                .unwrap(),
+        )
+        .await;
+    vread.assert_status_ok();
+    assert_eq!(vread.json::<Value>()["meta"]["versionId"], "1");
 
     let updated = server
         .put("/acme/Observation/public-url-observation")
@@ -148,7 +159,7 @@ async fn url_path_requests_advertise_prefix_and_tenant() {
     updated.assert_status(StatusCode::CREATED);
     assert_public_url(
         updated.headers()["location"].to_str().unwrap(),
-        "/Observation/public-url-observation",
+        "/Observation/public-url-observation/_history/1",
     );
 
     let search = server.get("/acme/Patient?_count=1").await;
@@ -177,11 +188,13 @@ async fn url_path_requests_advertise_prefix_and_tenant() {
         .json(&conditional_body)
         .await;
     conditional_created.assert_status(StatusCode::CREATED);
-    assert!(
-        conditional_created.headers()["location"]
-            .to_str()
-            .unwrap()
-            .starts_with("https://public.example/fhir/acme/Patient/")
+    let conditional_id = conditional_created.json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_public_url(
+        conditional_created.headers()["location"].to_str().unwrap(),
+        &format!("/Patient/{conditional_id}/_history/1"),
     );
 
     let conditional_updated = server

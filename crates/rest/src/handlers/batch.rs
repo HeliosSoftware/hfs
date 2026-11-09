@@ -21,15 +21,16 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
-    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
-    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider,
-    SystemHistoryProvider, WriteKind, WriteNotice, apply_patch_for_version, bundle_if_match_gate,
-    bundle_read_result, decode_bundle_patch_resource,
+    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
+    EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
+    apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
+    decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
 };
-use helios_persistence::types::SearchParameter;
+use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -1017,26 +1018,11 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
-            let e = match e {
-                TransactionError::BundleError { index, message } => TransactionError::BundleError {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    message,
-                },
-                TransactionError::PatchEntry {
-                    index,
-                    status,
-                    outcome,
-                } => TransactionError::PatchEntry {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    status,
-                    outcome,
-                },
-                other => other,
-            };
+            let e = with_client_entry_indices(e, |index| {
+                indexed_entries
+                    .get(index)
+                    .map_or(index, |(original, _, _)| *original)
+            });
             // Derive a sanitized reason so backend detail carried by a
             // rolled-back/internal transaction error never reaches the client
             // response, the audit trail, or the entry outcome. The raw detail is
@@ -1084,37 +1070,51 @@ where
     }
 }
 
+/// A batch entry's `ifMatch` that held: the precondition, and the stored row it
+/// was evaluated against. The entry's write is pinned to `current`.
+struct HeldIfMatch {
+    precondition: EntityTagPrecondition,
+    current: StoredResource,
+}
+
 /// Evaluates a batch entry's `ifMatch` precondition against stored state.
 ///
-/// Returns `Some` when the entry must not proceed — either the 412 the gate
-/// produced, or a storage error rendered as an entry result. Returns `None`
-/// when there was no precondition to check, or it was satisfied.
+/// Returns `Err` when the entry must not proceed — either the 412 the gate
+/// produced, or a storage error rendered as an entry result. Returns
+/// `Ok(None)` when there was no precondition to check, and `Ok(Some(held))`
+/// when it was satisfied, carrying the row it was satisfied by.
 ///
 /// `ifMatch` is a list, satisfied when any listed tag matches (#311), and `*`
 /// requires a current representation — so a supplied `ifMatch` against an
 /// absent or deleted resource fails rather than silently creating.
 ///
-/// **This is a read-then-write check, not an atomic compare-and-swap.** The
-/// backends reach an atomic re-check through `update_with_match`, which lives on
-/// [`VersionedStorage`]; this gate does not use it, so a writer can land between
-/// the read and the write. The window is the same one `handlers::update`
-/// already carries for single-resource updates, with one addition worth naming:
-/// entries within a bundle now run concurrently, so two entries carrying
-/// `ifMatch` for the same id can both pass this gate and both write.
+/// **The caller writes against `held.current`, not against whatever is current
+/// when it writes** (#2527). The `PUT` arm hands it to
+/// [`ResourceStorage::update`] and the `DELETE` arm to
+/// [`delete_under_precondition`], whose compare-and-swap is keyed on its
+/// version, as `handlers::update` and `handlers::delete` do for the single
+/// requests (#1404). A writer that lands between this read and the write, from
+/// another request or from another entry of the same bundle (entries run
+/// concurrently, #505), therefore ends the entry in `VersionConflict` → 409
+/// rather than in a write over a version the client never saw; a resource
+/// deleted in that window is 404 for a `PUT`, not a revival. Before #2527 the
+/// row was dropped here and the arms wrote unconditionally.
 ///
-/// [`VersionedStorage`]: helios_persistence::core::VersionedStorage
+/// [`delete_under_precondition`]: helios_persistence::core::delete_under_precondition
 async fn check_entry_if_match<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     resource_type: &str,
     id: &str,
     if_match: Option<&str>,
-) -> Option<BundleEntryResult>
+) -> Result<Option<HeldIfMatch>, Box<BundleEntryResult>>
 where
     S: ResourceStorage + Send + Sync,
 {
     // Entries that send no precondition pay nothing — not even the read.
-    if_match?;
+    let Some(raw) = if_match else {
+        return Ok(None);
+    };
 
     let current = match state
         .storage()
@@ -1126,10 +1126,27 @@ where
         // precondition rather than a storage error — the same mapping
         // `handlers::update` and the backends' own batch arms make.
         Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-        Err(e) => return Some(entry_storage_failure(e)),
+        Err(e) => return Err(Box::new(entry_storage_failure(e))),
     };
 
-    bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+    if let Some(failure) = bundle_if_match_gate(Some(raw), current.as_ref().map(|r| r.version_id()))
+    {
+        return Err(Box::new(failure));
+    }
+
+    // The gate parsed `raw` and found it satisfied, so this parse succeeds and
+    // `current` is `Some`: `*` requires a current version and no tag matches
+    // `None`. Neither fallback can run; both fail closed rather than panic.
+    let precondition = conditional_entry_if_match(Some(raw))?;
+    let current = current.ok_or_else(|| {
+        Box::new(precondition_failed_entry(
+            "If-Match precondition failed: the resource has no current version",
+        ))
+    })?;
+    Ok(Some(HeldIfMatch {
+        precondition,
+        current,
+    }))
 }
 
 /// The notice kind a committed transaction write announces, or `None` when
@@ -1160,9 +1177,15 @@ fn transaction_write_event_type(method: BundleMethod, status: u16) -> Option<Wri
 /// The atomic transaction path returns `BundleEntryResult`s rather than
 /// `StoredResource`s, so the notice is built from the entry's method and the
 /// result's stored JSON. Only 2xx write entries announce; a POST or a PUT that
-/// created answers 201 (Create), an update answers 200 (Update). A 2xx DELETE
-/// carries no body, so its type and id come from the entry URL; a conditional
-/// delete that resolved to no id has nothing to announce.
+/// created answers 201 (Create), an update answers 200 (Update). A DELETE
+/// carries no body, so its id comes from the entry URL — or, for a conditional
+/// delete whose URL carries criteria rather than an id, from the `location`
+/// the backend names the resource it deleted through (#859, #862). It
+/// announces only when it removed a live resource: a delete of something
+/// absent or already deleted is a `204` no-op (#2523) and announces nothing,
+/// and a conditional delete that matched nothing has no location and nothing
+/// to announce. Conditional POST, PUT and PATCH entries return their resource,
+/// so they announce through the same arm as their unconditional siblings.
 fn transaction_entry_notice(
     entry: &BundleEntry,
     result: &BundleEntryResult,
@@ -1173,8 +1196,18 @@ fn transaction_entry_notice(
             let (_, notice) = super::write_event::json_notice(kind, result.resource.as_ref()?)?;
             Some(notice)
         }
-        BundleMethod::Delete if (200..300).contains(&result.status) => {
+        BundleMethod::Delete if result.effect == BundleEntryEffect::Deleted => {
             let (_, id) = parse_request_url(&entry.url).ok()?;
+            let id = if id.is_empty() {
+                entry
+                    .criteria
+                    .as_ref()
+                    .and(result.location.as_deref())
+                    .and_then(AuditTarget::from_location)?
+                    .id
+            } else {
+                id
+            };
             (!id.is_empty()).then(|| super::write_event::delete_notice(&id, None))
         }
         _ => None,
@@ -1487,14 +1520,17 @@ where
                     .await
                 {
                     Ok(ConditionalCreateResult::Created(stored)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional POST below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1598,29 +1634,35 @@ where
                     .await
                 {
                     Ok(ConditionalUpdateResult::Updated(stored)) => {
-                        // Conditional writes announce nothing.
+                        // Announced like the unconditional PUT below (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             0,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Update,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
-                        let location = format!("{}/{}", stored.resource_type(), stored.id());
-                        let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(location);
-                        result
+                        // The versioned location, as the transaction path's
+                        // `conditional_update_entry` answers it (#2517).
+                        conditional_update_entry(stored)
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
+                        // The upsert created: announced as a create (#862).
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             1,
-                            None,
+                            Some(super::write_event::stored_notice(
+                                WriteKind::Create,
+                                &stored,
+                            )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
@@ -1662,11 +1704,11 @@ where
             // Ahead of validation, because every backend evaluates `ifMatch`
             // first: a stale precondition carrying an invalid body is a 412,
             // not a 422.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
@@ -1677,17 +1719,31 @@ where
                 return entry_failure(e);
             }
 
-            match state
-                .storage()
-                .create_or_update(
-                    tenant.context(),
-                    &resource_type,
-                    &id,
-                    resource,
-                    fhir_version,
-                )
-                .await
-            {
+            // With a held `ifMatch` the write is a compare-and-swap against the
+            // row the precondition was evaluated on, as `handlers::update`
+            // does (#2527): a version written since is `VersionConflict` → 409,
+            // a delete since is `NotFound` → 404 rather than a revival.
+            // Without one it is the last-writer-wins upsert it always was.
+            let written = match held {
+                Some(held) => state
+                    .storage()
+                    .update(tenant.context(), &held.current, resource)
+                    .await
+                    .map(|stored| (stored, false)),
+                None => {
+                    state
+                        .storage()
+                        .create_or_update(
+                            tenant.context(),
+                            &resource_type,
+                            &id,
+                            resource,
+                            fhir_version,
+                        )
+                        .await
+                }
+            };
+            match written {
                 Ok((stored, created)) => {
                     super::write_event::report(
                         state,
@@ -1705,8 +1761,11 @@ where
                         BundleEntryResult::created(stored)
                     } else {
                         // For updates, include location with versioned URL
+                        // (#2517): `[type]/[id]/_history/[vid]`, the form the
+                        // created arm and every conditional arm answer.
+                        let location = stored.versioned_url();
                         let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(format!("{}/{}", resource_type, id));
+                        result.location = Some(location);
                         result
                     }
                 }
@@ -1741,14 +1800,19 @@ where
                     .await
                 {
                     Ok(ConditionalDeleteResult::Deleted(deleted)) => {
-                        // Counted, but conditional writes announce nothing.
+                        // Announced like the unconditional DELETE below (#862),
+                        // naming the resource the criteria resolved to, with the
+                        // pre-delete content the result carries.
                         super::write_event::report(
                             state,
                             tenant.context(),
                             fhir_version,
                             &resource_type,
                             -1,
-                            None,
+                            Some(super::write_event::delete_notice(
+                                deleted.id(),
+                                Some(deleted.content().clone()),
+                            )),
                         );
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
@@ -1778,18 +1842,34 @@ where
 
             // Honour `ifMatch` on DELETE: a client asking to delete only the
             // version it reviewed must not destroy a concurrent amendment.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
-            // Delete operation
-            match state
-                .storage()
-                .delete(tenant.context(), &resource_type, &id)
-                .await
-            {
+            // With a held `ifMatch` the delete is pinned to the version just
+            // evaluated, as `handlers::delete` does (#1404, #2527): a version
+            // written since is `VersionConflict` → 409 and survives. Without
+            // one it is the plain delete it always was.
+            let deleted = match held {
+                Some(held) => {
+                    delete_under_precondition(
+                        state.storage(),
+                        tenant.context(),
+                        &held.precondition,
+                        &held.current,
+                    )
+                    .await
+                }
+                None => {
+                    state
+                        .storage()
+                        .delete(tenant.context(), &resource_type, &id)
+                        .await
+                }
+            };
+            match deleted {
                 Ok(()) => {
                     super::write_event::report(
                         state,
@@ -1801,6 +1881,16 @@ where
                     );
                     BundleEntryResult::deleted()
                 }
+                // Nothing to delete — never there, or already deleted — is the
+                // same successful no-op as `DELETE [type]/[id]` (#2523) and the
+                // conditional no-match above: `204`, and nothing announced.
+                // With `ifMatch` the same error is not a no-op: an absent
+                // resource already answered `412` at the gate, and one deleted
+                // after the gate lost a delete pinned to a version, so it keeps
+                // its storage mapping (`404`), as `handlers::delete` does.
+                Err(StorageError::Resource(
+                    ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+                )) if if_match.is_none() => BundleEntryResult::delete_not_found(),
                 Err(e) => entry_storage_failure(e),
             }
         }
@@ -1945,15 +2035,15 @@ where
         stored.fhir_version(),
         resource_type,
         0,
-        criteria
-            .is_none()
-            .then(|| super::write_event::stored_notice(WriteKind::Update, &stored)),
+        Some(super::write_event::stored_notice(
+            WriteKind::Update,
+            &stored,
+        )),
     );
     record_stored_profile(state, tenant, stored.fhir_version(), &stored);
+    let location = criteria.is_none().then(|| stored.versioned_url());
     let mut result = BundleEntryResult::updated(stored);
-    if criteria.is_none() {
-        result.location = Some(format!("{resource_type}/{id}"));
-    }
+    result.location = location;
     result
 }
 
@@ -3579,6 +3669,69 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
+/// Renames the entries a failed transaction names from the position the
+/// executor saw them at to the position the client sent them at (#922).
+///
+/// The executor receives the entries sorted by [`method_processing_order`], so
+/// every index it reports is a position in that list; the client can act only
+/// on the index in its own Bundle. `client_index` maps the first to the second.
+///
+/// Deliberately exhaustive, with no `other => other`: a variant that names an
+/// entry and was left to fall through reported the wrong one until it was
+/// mapped (`PreconditionFailed`, #922), so a new variant has to be classified
+/// here on purpose.
+fn with_client_entry_indices(
+    err: TransactionError,
+    client_index: impl Fn(usize) -> usize,
+) -> TransactionError {
+    match err {
+        TransactionError::BundleError { index, message } => TransactionError::BundleError {
+            index: client_index(index),
+            message,
+        },
+        TransactionError::PatchEntry {
+            index,
+            status,
+            outcome,
+        } => TransactionError::PatchEntry {
+            index: client_index(index),
+            status,
+            outcome,
+        },
+        TransactionError::PreconditionFailed { index, message } => {
+            TransactionError::PreconditionFailed {
+                index: client_index(index),
+                message,
+            }
+        }
+        // Names two entries, and both are positions in the executor's list.
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => TransactionError::OverlappingIdentity {
+            index: client_index(index),
+            entry,
+            identity,
+            other: client_index(other),
+            other_entry,
+        },
+        // These name no entry.
+        unindexed @ (TransactionError::Timeout { .. }
+        | TransactionError::RolledBack { .. }
+        | TransactionError::Transient { .. }
+        | TransactionError::CommitOutcomeUnknown { .. }
+        | TransactionError::TooLargeForCache { .. }
+        | TransactionError::InvalidTransaction
+        | TransactionError::NestedNotSupported
+        | TransactionError::MultipleMatches { .. }
+        | TransactionError::UnsupportedIsolationLevel { .. }
+        | TransactionError::AtomicityUnsupported { .. }) => unindexed,
+    }
+}
+
 /// The text an audit event or an entry outcome carries for a failed
 /// transaction: the sanitized `reason` from [`transaction_error_response_parts`]
 /// under a prefix that says what is known about the writes.
@@ -3641,6 +3794,29 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::BAD_REQUEST,
             "processing",
             format!("Transaction failed at entry {}: {}", index, message),
+        ),
+        // The same 400 `processing` the overlap was reported as while it was a
+        // `BundleError`: only the two entry numbers it names have changed
+        // (#922).
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => (
+            StatusCode::BAD_REQUEST,
+            "processing",
+            format!(
+                "Transaction failed at entry {}: {}",
+                index,
+                TransactionError::identity_overlap_description(
+                    entry,
+                    identity,
+                    *other,
+                    other_entry
+                )
+            ),
         ),
         TransactionError::RolledBack { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4281,6 +4457,107 @@ mod tests {
                 level: "serializable".to_string(),
             });
         assert!(msg.contains("serializable"), "isolation message: {msg}");
+    }
+
+    /// The executor's entry positions become the client's Bundle indices for
+    /// every variant that names an entry, and both of an overlap's (#922).
+    /// `PreconditionFailed` was the variant that fell through unmapped.
+    #[test]
+    fn with_client_entry_indices_renames_every_entry_a_failure_names() {
+        // The executor saw the client's entries 2, 0 and 1 as its 0, 1 and 2.
+        let client_index = |index: usize| [2, 0, 1][index];
+
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 0,
+                message: "boom".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::BundleError { index: 2, message } if message == "boom"),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PatchEntry {
+                index: 1,
+                status: 422,
+                outcome: serde_json::json!({"resourceType": "OperationOutcome"}),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(
+                &renamed,
+                TransactionError::PatchEntry {
+                    index: 0,
+                    status: 422,
+                    ..
+                }
+            ),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PreconditionFailed {
+                index: 0,
+                message: "stale".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::PreconditionFailed { index: 2, message } if message == "stale"),
+            "{renamed:?}"
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(code, "conflict");
+        assert_eq!(text, "Transaction failed at entry 2: stale");
+
+        let renamed = with_client_entry_indices(
+            TransactionError::OverlappingIdentity {
+                index: 1,
+                entry: "PUT Patient?identifier=x".to_string(),
+                identity: "Patient/p1".to_string(),
+                other: 0,
+                other_entry: "DELETE Patient/p1".to_string(),
+            },
+            client_index,
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "processing");
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT Patient?identifier=x resolves to Patient/p1, which entry 2 (DELETE Patient/p1) also addresses;"),
+            "{text}"
+        );
+
+        // An index the sort did not produce is left as it was.
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 7,
+                message: "m".to_string(),
+            },
+            |index| [2, 0, 1].get(index).copied().unwrap_or(index),
+        );
+        assert!(
+            matches!(renamed, TransactionError::BundleError { index: 7, .. }),
+            "{renamed:?}"
+        );
+
+        // A failure that names no entry is returned as it came.
+        let renamed = with_client_entry_indices(
+            TransactionError::MultipleMatches {
+                operation: "delete".to_string(),
+                count: 2,
+            },
+            client_index,
+        );
+        assert!(
+            matches!(renamed, TransactionError::MultipleMatches { count: 2, .. }),
+            "{renamed:?}"
+        );
     }
 
     /// A failed entry carries the issue code the single-resource endpoint
@@ -5651,18 +5928,14 @@ mod tests {
                 Some((WriteKind::Delete, "p1".to_string(), String::new()))
             ))
         );
-        // A delete of something that was not there moves no count, but its
-        // 2xx still announces from the URL as before.
+        // A delete of something that was not there is a `204` no-op (#2523):
+        // it moves no count and announces nothing, though its status is 2xx.
         assert_eq!(
             summary(transaction_entry_write(
                 &entry(BundleMethod::Delete, "Patient/p1"),
                 &result(204, None, BundleEntryEffect::NotFound)
             )),
-            Some((
-                "Patient".to_string(),
-                0,
-                Some((WriteKind::Delete, "p1".to_string(), String::new()))
-            ))
+            None
         );
         assert_eq!(
             summary(transaction_entry_write(
@@ -5685,6 +5958,57 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// #862: a conditional DELETE entry's URL carries criteria, not an id, so
+    /// its notice names the resource the backend resolved, through `location`.
+    /// One that matched nothing has no location and announces nothing.
+    #[test]
+    fn transaction_conditional_delete_notice_names_the_resolved_resource() {
+        let conditional = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient?identifier=x".to_string(),
+            criteria: Some(Vec::new()),
+            ..Default::default()
+        };
+        let result = |location: Option<&str>, effect: BundleEntryEffect| BundleEntryResult {
+            location: location.map(str::to_string),
+            effect,
+            ..BundleEntryResult::deleted()
+        };
+
+        let deleted = transaction_entry_write(
+            &conditional,
+            &result(Some("Patient/p9/_history/3"), BundleEntryEffect::Deleted),
+        )
+        .expect("a delete that resolved a resource is a write");
+        assert_eq!(deleted.0, "Patient");
+        assert_eq!(deleted.1, -1);
+        let notice = deleted.2.expect("announced");
+        assert_eq!(notice.kind, WriteKind::Delete);
+        assert_eq!(notice.resource_id, "p9");
+        assert!(notice.version_id.is_empty());
+        assert!(notice.resource.is_none());
+
+        // No match: a 204 with no location, nothing deleted, nothing announced.
+        assert!(
+            transaction_entry_write(&conditional, &result(None, BundleEntryEffect::NotFound))
+                .is_none()
+        );
+
+        // Criteria-less entries still announce from the URL, never from a
+        // location.
+        let instance = BundleEntry {
+            method: BundleMethod::Delete,
+            url: "Patient/p1".to_string(),
+            ..Default::default()
+        };
+        let notice = transaction_entry_notice(
+            &instance,
+            &result(Some("Patient/other/_history/1"), BundleEntryEffect::Deleted),
+        )
+        .expect("announced");
+        assert_eq!(notice.resource_id, "p1");
     }
 
     #[test]
@@ -6006,7 +6330,7 @@ mod tests {
         );
         let entry = &response["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/existing");
+        assert_eq!(entry["response"]["location"], "Patient/existing/_history/1");
         assert_eq!(entry["resource"]["id"], "existing");
 
         let state = state_with(DelayStorage::conditional(ConditionalReply::Created));

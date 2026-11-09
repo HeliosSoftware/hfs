@@ -1774,7 +1774,7 @@ async fn transaction_overlapping_targets_and_changed_forward_references_roll_bac
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. }),
         "{error:?}"
     );
     assert_eq!(
@@ -1814,7 +1814,8 @@ async fn transaction_overlapping_targets_and_changed_forward_references_roll_bac
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference") || message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. })
+            || matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference")),
         "{error:?}"
     );
     assert!(
@@ -2191,5 +2192,6 @@ sqlite_bundle_identity_test!(post_resolves_a_later_if_none_exist_match);
 sqlite_bundle_identity_test!(put_then_patch_on_one_id_rolls_back);
 sqlite_bundle_identity_test!(two_puts_on_one_id_roll_back);
 sqlite_bundle_identity_test!(conditional_delete_without_a_match_reports_not_found);
+sqlite_bundle_identity_test!(instance_delete_with_nothing_to_delete_reports_not_found);
 sqlite_bundle_identity_test!(changed_conditional_target_after_a_written_reference_rolls_back);
 sqlite_bundle_identity_test!(put_over_a_deleted_id_restores_it);

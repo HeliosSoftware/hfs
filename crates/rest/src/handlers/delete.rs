@@ -39,14 +39,42 @@ use crate::state::AppState;
 ///
 /// # Response
 ///
-/// - `204 No Content` - Resource deleted successfully
-/// - `200 OK` - Resource deleted, and `Prefer: return=OperationOutcome` was sent;
-///   the body is an informational OperationOutcome
-/// - `404 Not Found` - Resource does not exist, or is already deleted
+/// - `204 No Content` - Resource deleted successfully, **or there was nothing
+///   to delete**: it never existed, or is already deleted (#2523)
+/// - `200 OK` - as `204`, but `Prefer: return=OperationOutcome` was sent; the
+///   body is an informational OperationOutcome saying which of the two happened
 /// - `412 Precondition Failed` - `If-Match` was supplied and is not satisfied
 /// - `409 Conflict` - `If-Match` was satisfied, but another writer changed the
 ///   resource before the delete landed (#1404); nothing is deleted
 /// - `405 Method Not Allowed` - `AuditEvent` resources are immutable
+///
+/// # Nothing to delete
+///
+/// FHIR R4, R4B and R5 word it identically
+/// ([delete](https://hl7.org/fhir/R4/http.html#delete)): "Upon successful
+/// deletion, or if the resource does not exist at all, the server should
+/// return either a 200 OK if the response contains a payload, or a 204 No
+/// Content with no response payload", and "Performing this interaction on a
+/// resource that is already deleted has no effect, and the server should return
+/// either a 200 OK if the response contains a payload, or a 204 No Content with
+/// no response payload". A delete without a precondition of something absent or
+/// already deleted is therefore a successful no-op: `204`, or `200` with an
+/// informational OperationOutcome under `Prefer: return=OperationOutcome` — the
+/// answer [`conditional_delete_handler`] gives when nothing matches. Until #2523
+/// it was `404` (`410` on S3), which nobody chose: it fell out of the generic
+/// storage-error mapping.
+///
+/// A no-op changes nothing, so it does none of what a delete does afterwards:
+/// no write event, no subscription delete notice, no SQL Library release, and
+/// no audit enrichment. The audit middleware still records the request — IHE
+/// BALP audits every RESTful interaction — as a successful delete of the
+/// addressed `Type/id`, with no patient reference taken from content, because
+/// there is none.
+///
+/// With `If-Match` none of this applies: no current representation satisfies a
+/// precondition, so an absent or deleted resource is `412`, and a resource
+/// deleted by another writer between the precondition and the delete keeps the
+/// error it always had.
 ///
 /// # The `If-Match` precondition
 ///
@@ -140,9 +168,9 @@ where
     // including `*`, must fail against a tombstone. Mapping it here rather than
     // propagating with `?` is load-bearing twice over: it produces that 412, and
     // it keeps a *precondition-less* delete of an already-deleted resource
-    // falling through to `delete()`'s own `NotFound` -> 404, which is what stock
-    // builds have always returned. Propagating `Gone` instead would have made
-    // 410 the answer in every build, silently, as a side effect of this fix.
+    // falling through to `delete()`, whose "nothing to delete" is the no-op
+    // `204` below (#2523). Propagating `Gone` instead would answer `410`, which
+    // the spec does not give a delete.
     let existing_resource = match state
         .storage()
         .read(tenant.context(), &resource_type, &id)
@@ -155,7 +183,7 @@ where
 
     // A `patient/` scope deletes inside the launch patient's compartment only
     // (#1618), judged on the current payload. An absent resource falls through
-    // to the `404` below, as for any other caller.
+    // to the no-op `204` below, as for any other caller.
     if let Some(current) = existing_resource.as_ref() {
         compartment.assert_member(
             || state.storage().search_param_registry(tenant.context()),
@@ -202,8 +230,8 @@ where
     // (#1404). Losing that race is `VersionConflict` -> 409, what `PUT` with
     // `If-Match` answers for the same race. A satisfied precondition implies a
     // current resource, so the `None` arm is the precondition-less delete of
-    // something absent: storage's own `NotFound` -> 404, as before.
-    match existing_resource.as_ref() {
+    // something absent.
+    let deleted = match existing_resource.as_ref() {
         Some(current) => {
             helios_persistence::core::delete_under_precondition(
                 state.storage(),
@@ -211,14 +239,43 @@ where
                 if_match,
                 current,
             )
-            .await?
+            .await
         }
         None => {
             state
                 .storage()
                 .delete(tenant.context(), &resource_type, &id)
-                .await?
+                .await
         }
+    };
+    match deleted {
+        Ok(()) => {}
+        // Nothing to delete, and no precondition: a successful no-op (#2523).
+        // It covers the resource that was never there and the one already
+        // deleted (`None` above), and the one another writer deleted after the
+        // read — the outcome the client asked for, but not this request's
+        // doing, so nothing below runs. Storage answers `NotFound` for both;
+        // `Gone` is accepted too, for a backend that tells them apart. With
+        // `If-Match` the same error keeps its old mapping: that delete was
+        // pinned to a version, and losing it is not a no-op.
+        Err(StorageError::Resource(
+            ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+        )) if !if_match.is_present() => {
+            debug!(
+                resource_type = %resource_type,
+                id = %id,
+                "Nothing to delete; answering as a successful no-op"
+            );
+            return Ok(delete_response(
+                &prefer,
+                &req_headers,
+                &format!(
+                    "Resource {resource_type}/{id} does not exist or is already deleted; \
+                     nothing was deleted"
+                ),
+            ));
+        }
+        Err(e) => return Err(e.into()),
     }
 
     debug!(
@@ -239,7 +296,8 @@ where
         .and_then(|stored| super::extract_patient_from_resource(&resource_type, stored.content()));
 
     // `delete` only succeeds against a live resource (an already-deleted or
-    // missing one is `NotFound`), so a success always removes one.
+    // missing one is `NotFound`, answered as a no-op above), so a success
+    // always removes one.
     super::write_event::report(
         &state,
         tenant.context(),
@@ -278,7 +336,8 @@ where
 ///
 /// # Response
 ///
-/// - `204 No Content` - the single match was deleted, **or nothing matched**
+/// - `204 No Content` - the single match was deleted, **or nothing matched**,
+///   as [`delete_handler`] answers for a resource that is not there (#2523)
 /// - `200 OK` - as `204`, but `Prefer: return=OperationOutcome` was sent: the
 ///   body is an informational OperationOutcome saying which of the two happened
 /// - `400 Bad Request` - criteria that cannot be evaluated (unknown parameter,
@@ -375,14 +434,18 @@ where
                 deleted.id(),
             )
             .await;
-            // Counted, but conditional writes announce nothing.
+            // Announced like the instance delete (#862), with the pre-delete
+            // content the result carries as that path does.
             super::write_event::report(
                 &state,
                 tenant.context(),
                 deleted.fhir_version(),
                 &resource_type,
                 -1,
-                None,
+                Some(super::write_event::delete_notice(
+                    deleted.id(),
+                    Some(deleted.content().clone()),
+                )),
             );
             debug!(
                 resource_type = %resource_type,
