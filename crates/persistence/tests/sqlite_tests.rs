@@ -3650,7 +3650,8 @@ async fn test_reindex_fetch_resources_by_ids() {
 // ============================================================================
 
 use helios_persistence::core::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
+    ConditionalUpdateResult, PatchFormat,
 };
 
 #[tokio::test]
@@ -3933,6 +3934,294 @@ async fn test_conditional_operations_tenant_isolation() {
         matches!(result, ConditionalCreateResult::Created(_)),
         "Conditional create should succeed in different tenant"
     );
+}
+
+/// Seeds a Patient carrying `identifier=http://hospital.org/mrn|<mrn>` into
+/// `tenant` for the cross-tenant conditional update/delete/patch tests below.
+async fn create_mrn_patient(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    mrn: &str,
+    family: &str,
+) -> helios_persistence::types::StoredResource {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://hospital.org/mrn", "value": mrn}],
+                "name": [{"family": family}],
+                "active": false
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A conditional update resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, B's upsert creates
+/// B's own row instead of overwriting A's, and once both exist the same
+/// criteria still resolve to exactly one row per tenant.
+#[tokio::test]
+async fn test_conditional_update_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-UPDATE";
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-UPDATE", "TenantA").await;
+
+    let replacement = |family: &str| {
+        json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-ISO-UPDATE"}],
+            "name": [{"family": family}]
+        })
+    };
+
+    // Without upsert tenant B has nothing the criteria can match.
+    let result = backend
+        .conditional_update(
+            &tenant_b,
+            "Patient",
+            replacement("TenantB"),
+            criteria,
+            false,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalUpdateResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+
+    // With upsert tenant B creates its own row; A's is not overwritten.
+    let result = backend
+        .conditional_update(
+            &tenant_b,
+            "Patient",
+            replacement("TenantB"),
+            criteria,
+            true,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Created(patient_b) = result else {
+        panic!("upsert in tenant B should create B's own patient, got {result:?}");
+    };
+    assert_ne!(patient_b.id(), patient_a.id());
+
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must survive tenant B's conditional updates");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["name"][0]["family"], "TenantA");
+
+    // Both tenants now hold the identifier; A's update still finds exactly its
+    // own row and leaves B's alone.
+    let result = backend
+        .conditional_update(
+            &tenant_a,
+            "Patient",
+            replacement("TenantAUpdated"),
+            criteria,
+            false,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Updated(updated) = result else {
+        panic!("tenant A's own conditional update should match one row, got {result:?}");
+    };
+    assert_eq!(updated.id(), patient_a.id());
+    assert_eq!(updated.version_id(), "2");
+
+    let b_after = backend
+        .read(&tenant_b, "Patient", patient_b.id())
+        .await
+        .unwrap()
+        .expect("tenant B's patient must still exist");
+    assert_eq!(b_after.version_id(), "1");
+    assert_eq!(b_after.content()["name"][0]["family"], "TenantB");
+}
+
+/// A conditional delete resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, and when B holds the
+/// same identifier B's delete removes B's own row and nothing of A's.
+#[tokio::test]
+async fn test_conditional_delete_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-DELETE";
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-DELETE", "TenantA").await;
+
+    // Tenant B has nothing matching: no-match, and A's row is still there.
+    let result = backend
+        .conditional_delete(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalDeleteResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+    assert!(
+        backend
+            .exists(&tenant_a, "Patient", patient_a.id())
+            .await
+            .unwrap(),
+        "tenant A's patient must survive tenant B's conditional delete"
+    );
+
+    // Same identifier in B: B's delete takes exactly B's row (not
+    // MultipleMatches across tenants) and A's row is still untouched.
+    let patient_b = create_mrn_patient(&backend, &tenant_b, "MRN-ISO-DELETE", "TenantB").await;
+    let result = backend
+        .conditional_delete(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalDeleteResult::Deleted(deleted) = result else {
+        panic!("tenant B's own conditional delete should match one row, got {result:?}");
+    };
+    assert_eq!(deleted.id(), patient_b.id());
+    assert!(
+        !backend
+            .exists(&tenant_b, "Patient", patient_b.id())
+            .await
+            .unwrap()
+    );
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must survive tenant B's conditional delete");
+    assert_eq!(a_after.version_id(), "1");
+
+    // Control: the same criteria do match in A.
+    let result = backend
+        .conditional_delete(
+            &tenant_a,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalDeleteResult::Deleted(deleted) = result else {
+        panic!("tenant A's own conditional delete should match one row, got {result:?}");
+    };
+    assert_eq!(deleted.id(), patient_a.id());
+}
+
+/// A conditional patch resolves its criteria inside the caller's tenant only
+/// (#867): tenant A's patient is a no-match for tenant B, and when B holds the
+/// same identifier B's patch lands on B's own row and nothing of A's.
+#[tokio::test]
+async fn test_conditional_patch_tenant_isolation() {
+    let backend = create_backend();
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+    let criteria = "identifier=http://hospital.org/mrn|MRN-ISO-PATCH";
+    let patch = PatchFormat::JsonPatch(json!([
+        {"op": "replace", "path": "/active", "value": true}
+    ]));
+
+    let patient_a = create_mrn_patient(&backend, &tenant_a, "MRN-ISO-PATCH", "TenantA").await;
+
+    // Tenant B has nothing matching: no-match, and A's row is unpatched.
+    let result = backend
+        .conditional_patch(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ConditionalPatchResult::NoMatch),
+        "tenant B must not resolve tenant A's patient, got {result:?}"
+    );
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must still exist");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["active"], json!(false));
+
+    // Same identifier in B: B's patch lands on B's row alone (not
+    // MultipleMatches across tenants) and A's row is still unpatched.
+    let patient_b = create_mrn_patient(&backend, &tenant_b, "MRN-ISO-PATCH", "TenantB").await;
+    let result = backend
+        .conditional_patch(
+            &tenant_b,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalPatchResult::Patched(patched) = result else {
+        panic!("tenant B's own conditional patch should match one row, got {result:?}");
+    };
+    assert_eq!(patched.id(), patient_b.id());
+    assert_eq!(patched.content()["active"], json!(true));
+
+    let a_after = backend
+        .read(&tenant_a, "Patient", patient_a.id())
+        .await
+        .unwrap()
+        .expect("tenant A's patient must still exist");
+    assert_eq!(a_after.version_id(), "1");
+    assert_eq!(a_after.content()["active"], json!(false));
+
+    // Control: the same criteria do match in A, and that patch leaves B's
+    // already-patched row at its own version.
+    let result = backend
+        .conditional_patch(
+            &tenant_a,
+            "Patient",
+            criteria,
+            &patch,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    let ConditionalPatchResult::Patched(patched) = result else {
+        panic!("tenant A's own conditional patch should match one row, got {result:?}");
+    };
+    assert_eq!(patched.id(), patient_a.id());
+    assert_eq!(patched.version_id(), "2");
+
+    let b_after = backend
+        .read(&tenant_b, "Patient", patient_b.id())
+        .await
+        .unwrap()
+        .expect("tenant B's patient must still exist");
+    assert_eq!(b_after.version_id(), "2");
 }
 
 #[tokio::test]

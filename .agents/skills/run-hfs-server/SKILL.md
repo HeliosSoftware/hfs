@@ -376,6 +376,14 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | everything, instance | GET/POST | `/Patient/[id]/$everything` |
 | everything, type | GET/POST | `/Patient/$everything` |
 
+`DELETE [type]/[id]` of a resource that never existed or is already deleted
+is a no-op success (#2523): `204`, or `200` with an informational
+OperationOutcome under `Prefer: return=OperationOutcome`, as a conditional
+delete with no match answers. Batch and transaction entries answer `204` too,
+and the rest of a transaction commits. It used to be `404` (`410` on S3, and a
+`400` for the whole transaction). `If-Match` on an absent or deleted resource
+is still `412`; a read of a deleted resource is still `410`.
+
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require
 the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.

@@ -825,6 +825,72 @@ async fn crud_happy_path_and_count() {
     assert_eq!(count_after_delete, 0);
 }
 
+/// #2523: nothing to delete is `NotFound` on S3, as on every other backend
+/// and as `ResourceStorage::delete` documents — also for a tombstone, which
+/// used to be `Gone` (`410` on a repeated `DELETE`, where the other backends
+/// answered `404`). Nothing is written for it: no history version, no new
+/// tombstone. The REST layer answers it as a `204` no-op.
+#[tokio::test]
+async fn delete_with_nothing_to_delete_is_not_found_and_writes_nothing() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "p1").await.unwrap();
+
+    let history = || async {
+        backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "p1",
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.resource.version_id().to_string(),
+                    item.resource.last_modified(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = history().await;
+    assert_eq!(before.len(), 2, "{before:?}");
+
+    for id in ["p1", "p1", "never-existed"] {
+        let err = backend
+            .delete(&tenant, "Patient", id)
+            .await
+            .expect_err("nothing to delete");
+        assert!(
+            matches!(err, StorageError::Resource(ResourceError::NotFound { .. })),
+            "{id}: {err:?}"
+        );
+        let err = backend
+            .delete_versioned(&tenant, "Patient", id, "2")
+            .await
+            .expect_err("nothing to delete");
+        assert!(
+            matches!(err, StorageError::Resource(ResourceError::NotFound { .. })),
+            "{id}: {err:?}"
+        );
+    }
+    assert_eq!(history().await, before);
+}
+
 /// Regression test for #787 on the S3 backend specifically: creating a
 /// SearchParameter must make it immediately visible in that tenant's
 /// registry — S3's `create()`/`update()`/`delete()` never invalidated any

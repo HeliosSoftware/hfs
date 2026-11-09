@@ -664,7 +664,8 @@ async fn batch_delete_with_if_match_on_a_resource_deleted_after_the_check_is_not
 }
 
 /// A satisfied `ifMatch` with nobody racing still answers what it answered
-/// before #2527: `200`, `location` `Type/id`, the new version's `etag`.
+/// before #2527: `200`, the versioned `location` (#2517), the new version's
+/// `etag`.
 #[tokio::test]
 async fn batch_put_with_a_satisfied_if_match_still_updates() {
     let (server, _primary) = server();
@@ -673,7 +674,10 @@ async fn batch_put_with_a_satisfied_if_match_still_updates() {
     let body = post_batch(&server, vec![put_entry("ok", "Updated", Some("W/\"1\""))]).await;
 
     assert_eq!(entry_status(&body, 0), "200 OK", "{body}");
-    assert_eq!(entry_response(&body, 0)["location"], "Patient/ok");
+    assert_eq!(
+        entry_response(&body, 0)["location"],
+        "Patient/ok/_history/2"
+    );
     assert_eq!(entry_response(&body, 0)["etag"], "W/\"2\"");
     let read = server.get("/Patient/ok").await.json::<Value>();
     assert_eq!(read["meta"]["versionId"], "2");
