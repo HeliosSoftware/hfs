@@ -308,6 +308,72 @@ def fetch_data(repo, run, data_dir, artifact_name="fhir-bench-comparison", legac
         print(f"history: legacy point failed for {run.get('id')}: {e}", file=sys.stderr)
 
 
+# ---- version trend: earlier release tags (--version-dir) ----
+
+VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+VERSION_LIST_PAGES = 3  # 300 most recent completed runs of the workflow, every branch
+
+
+def version_key(tag):
+    """Sort key of a release tag vMAJOR.MINOR.PATCH[-pre], or None for any other ref.
+    A pre-release sorts before its release."""
+    m = VERSION_RE.match(tag or "")
+    if not m:
+        return None
+    pre = m.group(4)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if pre else 1, pre or "")
+
+
+def fetch_version_runs(repo, workflow, cur_tag, exclude_id, max_versions):
+    """One run per release tag OLDER than cur_tag: the newest run of that tag that still has a
+    benchmark artifact, newest versions first, at most max_versions - 1 (the current run is the
+    last point of the version trend). [] when cur_tag is not a release tag."""
+    cur = version_key(cur_tag)
+    if cur is None or max_versions < 2:
+        return []
+    by_tag = {}
+    for page in range(1, VERSION_LIST_PAGES + 1):
+        r = _gh(["api", f"repos/{repo}/actions/workflows/{workflow}/runs"
+                 f"?status=completed&per_page=100&page={page}"])
+        if r.returncode != 0:
+            break
+        runs = json.loads(r.stdout).get("workflow_runs", [])
+        for x in runs:
+            k = version_key(x.get("head_branch") or "")
+            if (k is None or k >= cur or int(x["id"]) == int(exclude_id)
+                    or x.get("conclusion") not in ("success", "failure")):
+                continue
+            by_tag.setdefault(x["head_branch"], []).append(x)
+        if len(runs) < 100:
+            break
+    out = []
+    for tag in sorted(by_tag, key=version_key, reverse=True):
+        if len(out) >= max_versions - 1:
+            break
+        newest_first = sorted(by_tag[tag], key=lambda x: x.get("created_at") or "", reverse=True)
+        out.extend(_with_artifacts(repo, newest_first, 1, exclude_id))
+    return out
+
+
+def fetch_versions(repo, workflow, cur_tag, exclude_id, max_versions, version_dir,
+                   list_fn=None, data_fn=None):
+    """Best effort: report-data.json of the earlier versions into version_dir/<run id>/.
+    Returns the number of runs fetched; a run that is not a release tag fetches nothing."""
+    list_fn = list_fn or fetch_version_runs
+    data_fn = data_fn or (lambda r, run, d: fetch_data(r, run, d, legacy=False))
+    try:
+        runs = list_fn(repo, workflow, cur_tag, exclude_id, max_versions)
+    except Exception as e:  # noqa: BLE001
+        print(f"history: version run list failed: {e}", file=sys.stderr)
+        return 0
+    for run in runs:
+        try:
+            data_fn(repo, run, version_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"history: version data failed for {run.get('id')}: {e}", file=sys.stderr)
+    return len(runs)
+
+
 def suites_of(text):
     """The `suites:` text of a comparison.md header, or None when not parseable."""
     m = re.search(r"^.*\bsuites:\s*([^·\n]+?)\s*(?:·|$)", text or "", re.M)
@@ -601,10 +667,19 @@ def main(argv=None):
     ap.add_argument("--created-at", default=None)
     # TEMPORARY: derive trend points from comparison.md of runs without report-data
     ap.add_argument("--legacy-trend", action=argparse.BooleanOptionalAction, default=True)
+    # On a release-tag run (vX.Y.Z): report-data.json of the newest run of each earlier version,
+    # for the version trend of the HTML report. Nothing is fetched for a branch run.
+    ap.add_argument("--version-dir", default=None)
+    ap.add_argument("--max-versions", type=int, default=10,
+                    help="versions in the version trend, the current run included")
     try:
         args = ap.parse_args(argv)
     except SystemExit:
         return 0
+    if args.version_dir and version_key(args.branch) is not None:
+        n = fetch_versions(args.repo, args.workflow, args.branch, args.run_id,
+                           args.max_versions, args.version_dir)
+        print(f"history: {n} earlier version run(s) for the version trend", file=sys.stderr)
     try:
         if not args.created_at:
             args.created_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

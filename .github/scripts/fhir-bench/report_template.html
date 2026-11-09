@@ -230,6 +230,15 @@ figure{margin:0}
   <div class="grid2" id="trend"></div>
   <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
   <p class="note" id="trendHost"></p>
+
+  <div id="vtrendBlock" style="display:none">
+  <h3 id="vtrendTitle"></h3>
+  <p class="note" id="vtrendNote"></p>
+  <p class="how"><b>How to read this:</b> one point per release version (its newest benchmark run), oldest version on the left; the leg buttons above pick the leg. Leg colour = this run, orange = earlier versions; higher is better except seconds. Runs of different versions may have run on different runners, so a step between two versions is a lead to check, not a proven regression.</p>
+  <div class="grid2" id="vtrend"></div>
+  <div class="card scroll" style="margin-top:10px"><table id="vtrendCtx"></table></div>
+  <p class="note" id="vtrendHost"></p>
+  </div>
 </section>
 
 <section id="data">
@@ -824,13 +833,14 @@ function renderShapes(){
 }
 
 /* ---------- trend ---------- */
-function trendPanel(el, key, title, unit){
-  const T = trendOf();
+// T: the points to chart (default: this branch's runs); byVersion: one point per release version, labelled with its tag
+function trendPanel(el, key, title, unit, T = trendOf(), byVersion = false){
   const vals = T.map(t => key==="bulk" ? (t.bulk?t.bulk.rps:null) : key==="bulk_ingest" ? (t.bulk?t.bulk.ingest_rps:null) : key==="bulk_index" ? (t.bulk?t.bulk.index_eff:null) : (t.suites[key]?t.suites[key].rps:null));
   if(!vals.some(ok)){ el.innerHTML = NODATA; return; }
   const w = widthOf(el), ml = 8, mr = 8, mt = 18, ph = 90, mb = 24, pw = w-ml-mr;
   const max = Math.max(...vals.filter(ok))*1.15;
-  const X = i => T.length===1 ? ml+pw/2 : ml+30+i*(pw-60)/(T.length-1), Y = v => mt+ph-v/max*ph;
+  const step = T.length>1 ? (pw-60)/(T.length-1) : pw;
+  const X = i => T.length===1 ? ml+pw/2 : ml+30+i*step, Y = v => mt+ph-v/max*ph;
   let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
   // ingest / indexing seconds only join across runs that indexed the same way (inline vs deferred)
   const modeSeries = key==="bulk_ingest" || key==="bulk_index";
@@ -840,9 +850,11 @@ function trendPanel(el, key, title, unit){
   const bad = t => idxSeries && (t.index_status==="failed" || t.index_status==="cancelled");
   for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])&&!bad(T[i-1])&&!bad(T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
   T.forEach((t,i)=>{
-    const cur = String(t.run)===String(D.run), br = D.ref && t.branch!==D.ref;
-    b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
-    if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
+    const cur = String(t.run)===String(D.run), br = !byVersion && D.ref && t.branch!==D.ref;
+    // version tags are wider than dates: drop the "v" and, when the points are close, label every other one (always the last)
+    const vlab = byVersion && (cur || step >= 42 || (T.length-1-i)%2===0);
+    if(!byVersion || vlab) b += txt(X(i), mt+ph+15, byVersion ? (t.branch||"n/a").replace(/^v/,"") : short(t.date)+(br?" *":""), {anchor:"middle", size:byVersion?10.5:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
+    if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, byVersion ? "–" : "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
     const col = cur?legCol(sel.trend):"var(--prev)";
     const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
                      : bad(t) ? `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
@@ -854,7 +866,7 @@ function trendPanel(el, key, title, unit){
     b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
     b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
   });
-  el.innerHTML = svg(w, mt+ph+mb, b, "Trend "+title);
+  el.innerHTML = svg(w, mt+ph+mb, b, (byVersion?"Version trend ":"Trend ")+title);
 }
 const trendOf = () => (L[sel.trend] && L[sel.trend].trend) || [];
 function renderTrend(){
@@ -890,6 +902,39 @@ function renderTrend(){
   const hs = HOSTCH.filter(c => TT.some(t => hostBefore(t.date, c)) && TT.some(t => !hostBefore(t.date, c)));
   $("trendHost").textContent = hs.map(c => c.legend).join(" ");
   P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
+}
+/* version trend: only on a run of a release tag (D.version); same leg buttons as the trend above */
+const vtrendOf = () => (L[sel.trend] && L[sel.trend].vtrend) || [];
+function renderVTrend(){
+  $("vtrendBlock").style.display = D.version ? "" : "none";
+  if(!D.version) return;
+  const VT = vtrendOf();
+  $("vtrendTitle").textContent = "Trend of "+LBL(sel.trend)+" across versions ("+VT.length+" version"+(VT.length===1?"":"s")+", up to "+D.version+")";
+  $("vtrend").dataset.built = ""; $("vtrendCtx").dataset.built = "";
+  $("vtrendNote").textContent = VT.length < 2
+    ? "Only "+VT.length+" version with data for this leg ("+(D.version_runs||0)+" earlier version run"+(D.version_runs===1?"":"s")+" found): a trend needs at least 2 versions, so the charts below show what exists without drawing a line."
+    : "";
+  if(!VT.length){ $("vtrend").innerHTML = NODATA; $("vtrendCtx").innerHTML = ""; return; }
+  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
+  panels("vtrend","vtr",P);
+  if(!$("vtrendCtx").dataset.built){
+    let h = `<thead><tr><th>Version</th><th>Run</th><th>Start</th><th>Commit</th><th>Runner</th><th class="n">Load at crud start</th><th class="n">pg ms/call in crud</th><th>Notes</th></tr></thead><tbody>`;
+    VT.forEach(t=>{
+      const notes = [];
+      if(!t.suites.import) notes.push("no import");
+      if(!t.suites.search) notes.push("no search");
+      if(t.bulk && t.index_inline === false && isEs(sel.trend)) notes.push("deferred indexing (before #2248)");
+      if(HOSTCH.some(c => hostBefore(t.date, c))) notes.push("older Docker host");
+      if(t.partial_run) notes.push("run failed: some legs missing");
+      (t.notes||[]).forEach(x => notes.push(esc(x)));
+      if(String(t.run)===String(D.run)) notes.push("this run");
+      h += `<tr><td class="mono">${esc(t.branch||"n/a")}</td><td class="mono">${esc(t.run)}</td><td>${fdate(t.date)}</td><td class="mono">${esc(String(t.sha||"n/a").slice(0,9))}</td><td>${esc(t.runner||"n/a")}</td><td class="n">${n1(t.crud_load)}</td><td class="n">${ok(t.pg_ms)?NF2.format(t.pg_ms):"n/a"}</td><td>${notes.join("; ")}</td></tr>`;
+    });
+    $("vtrendCtx").innerHTML = h+"</tbody>"; $("vtrendCtx").dataset.built = 1;
+  }
+  const hs = HOSTCH.filter(c => VT.some(t => hostBefore(t.date, c)) && VT.some(t => !hostBefore(t.date, c)));
+  $("vtrendHost").textContent = hs.map(c => c.legend).join(" ");
+  P.forEach(([k,t,u])=>trendPanel($("vtr-"+k), k, t, u.split(" ")[0], VT, true));
 }
 
 /* ---------- tables ---------- */
@@ -1016,9 +1061,9 @@ function renderLegKey(){
   $("legkey").innerHTML = LEGS.map(l=>`<span><svg width="26" height="10" aria-hidden="true"><line x1="1" y1="5" x2="25" y2="5" stroke="var(--leg-${esc(l)})" stroke-width="3"${isES(l)?' stroke-dasharray="6 3"':""}/></svg>${esc(LBL(l))}</span>`).join("")+
     `<span class="note">Each leg keeps its colour everywhere; dashed line = with Elasticsearch.</span>`;
 }
-function drawCharts(){ legVars(); [renderLegKey, renderThr, renderLat, renderTimeline, renderBulk, renderBatch, renderBatchLat, renderImpCmp, renderSqlViews, renderShapes, renderTrend].forEach(safe); }
+function drawCharts(){ legVars(); [renderLegKey, renderThr, renderLat, renderTimeline, renderBulk, renderBatch, renderBatchLat, renderImpCmp, renderSqlViews, renderShapes, renderTrend, renderVTrend].forEach(safe); }
 [renderHeader, renderSummary, renderValidity, renderKpis].forEach(safe);
-if(LEGS.length){ seg("segKpi","kpi",renderKpis); seg("segTime","time",renderTimeline,true); seg("segShape","shape",renderShapes); seg("segTrend","trend",renderTrend); }
+if(LEGS.length){ seg("segKpi","kpi",renderKpis); seg("segTime","time",renderTimeline,true); seg("segShape","shape",renderShapes); seg("segTrend","trend",()=>{ safe(renderTrend); safe(renderVTrend); }); }
 drawCharts();
 [renderFull, renderHealth, renderCounts].forEach(safe);
 $("foot").innerHTML = `Generated by <span class="mono">report_html.py</span> from the artifacts of run <span class="mono">${esc(D.run)}</span>${D.ref?" on <span class='mono'>"+esc(D.ref)+"</span>":""} (k6 <span class="mono">--summary-export</span>, the <span class="mono">*.txt</span> files of each leg and, if present, <span class="mono">search-points.json</span> read as a stream). Numbers use a comma for thousands and a dot for decimals, as in the GitHub summary. Works offline.`;

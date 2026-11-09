@@ -3,7 +3,7 @@
 
     python3 report_html.py --run-dir DIR --run-id ID --repo OWNER/REPO --branch BRANCH --sha SHA \
                            --out fhir-bench-report-ID.html --dump-json report-data.json \
-                           [--trend-dir DIR] [--no-shapes] [--headline-leg LEG]
+                           [--trend-dir DIR] [--version-dir DIR] [--no-shapes] [--headline-leg LEG]
 
 DIR holds the results of every leg, either as `fhir-benchmark-<leg>-<run id>/<leg>/` (what
 `actions/download-artifact` with a pattern leaves) or as `<leg>/` (already extracted); legs are
@@ -12,7 +12,9 @@ folder of DIR, or next to it) feeds the summary tables at the top.
 
 --trend-dir holds `<run id>/report-data.json` of EARLIER runs (the --dump-json output of this
 script); the Trend section charts what is there. --no-shapes skips the heavy search-points.json
-(search-by-shape.md is used when present).
+(search-by-shape.md is used when present). On a run of a release tag (--branch vX.Y.Z), --version-dir
+holds `<run id>/report-data.json` of earlier versions (one run each) and the Trend section also charts
+the version trend: the last --version-max versions, this run's included.
 
 Standard library only. Every number and every validity flag comes from the artifacts, with the
 thresholds of compare_legs.py. A missing file or leg is shown as "no data". The exit code is
@@ -711,27 +713,34 @@ def nearest_reference(metric, cur_point, older):
     return None
 
 
+def history_point(leg, name, doc):
+    """The trend point of `leg` in an earlier run's report-data.json, normalised, or None."""
+    lg = doc["legs"].get(leg)
+    pt = lg.get("point") if isinstance(lg, dict) else None
+    if not (isinstance(pt, dict) and isinstance(pt.get("suites"), dict)):
+        return None
+    pt = dict(pt)
+    # older report-data.json points lack the indexing mode: take it from the leg's bulk block
+    bk = lg.get("bulk") or {}
+    pt.setdefault("index_inline", bk.get("index_inline"))
+    pt.setdefault("index_status", bk.get("index_status"))
+    if index_invalid(pt.get("index_status")):
+        mk = dict(pt.get("markers") or {})
+        if "‡" not in (mk.get("bulk") or ""):
+            mk["bulk"] = (mk.get("bulk") or "") + "‡"
+        pt["markers"] = mk
+    pt["run"] = pt.get("run") or doc.get("run") or name
+    return pt
+
+
 def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
     """(previous point or None, trend list including the current run, {metric: reference point or None}).
     Nothing assumes earlier runs exist."""
     pts = []
     for name, doc in history:
-        lg = doc["legs"].get(leg)
-        pt = lg.get("point") if isinstance(lg, dict) else None
-        if isinstance(pt, dict) and isinstance(pt.get("suites"), dict):
-            pt = dict(pt)
-            # older report-data.json points lack the indexing mode: take it from the leg's bulk block
-            bk = lg.get("bulk") or {}
-            pt.setdefault("index_inline", bk.get("index_inline"))
-            pt.setdefault("index_status", bk.get("index_status"))
-            if index_invalid(pt.get("index_status")):
-                mk = dict(pt.get("markers") or {})
-                if "‡" not in (mk.get("bulk") or ""):
-                    mk["bulk"] = (mk.get("bulk") or "") + "‡"
-                pt["markers"] = mk
-            pt["run"] = pt.get("run") or doc.get("run") or name
-            if str(pt["run"]) != str(run):
-                pts.append(pt)
+        pt = history_point(leg, name, doc)
+        if pt is not None and str(pt["run"]) != str(run):
+            pts.append(pt)
     seen, trend = set(), []
     for t in sorted(pts, key=run_key)[-(max(1, trend_max) - 1):] + ([cur_point] if cur_point else []):
         if str(t["run"]) not in seen:
@@ -745,6 +754,47 @@ def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
         for m in REF_METRICS:
             prev_by[m] = nearest_reference(m, cur_point, older)
     return prev, trend, prev_by
+
+
+# ── version trend ─────────────────────────────────────────────────────
+# Only on a run of a release tag (vX.Y.Z): one point per version, the current run last. The
+# earlier versions come from --version-dir (history.py --version-dir: the newest run of each).
+
+VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+VERSION_MAX = 10
+
+
+def version_key(tag):
+    """Sort key of a release tag vMAJOR.MINOR.PATCH[-pre], or None for any other ref (as in history.py)."""
+    m = VERSION_RE.match(tag or "")
+    if not m:
+        return None
+    pre = m.group(4)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if pre else 1, pre or "")
+
+
+def version_trend(leg, cur_point, history, run, max_versions=VERSION_MAX):
+    """Points of `leg` over release versions, oldest first, ending with the current run's point:
+    one point per version older than the current one (its newest run), at most max_versions in
+    all. [] unless the current point belongs to a release tag."""
+    cur = version_key((cur_point or {}).get("branch"))
+    if cur is None:
+        return []
+    best = {}
+    for name, doc in history:
+        pt = history_point(leg, name, doc)
+        if pt is None or str(pt["run"]) == str(run):
+            continue
+        tag = pt.get("branch") or doc.get("ref") or ""
+        k = version_key(tag)
+        if k is None or k >= cur:
+            continue
+        pt["branch"] = tag
+        if tag not in best or run_key(pt) > run_key(best[tag]):
+            best[tag] = pt
+    older = sorted(best.values(), key=lambda t: version_key(t["branch"]))
+    keep = max(1, max_versions) - 1
+    return (older[-keep:] if keep else []) + [cur_point]
 
 
 # ── palette ────────────────────────────────────────────────────────────
@@ -819,9 +869,14 @@ def build_data(a):
         pt = trend_point(l, dict(legs[l], run=run, ref=a.branch or legs[l]["ref"]))
         legs[l]["point"] = pt
         legs[l]["prev"], legs[l]["trend"], legs[l]["prev_by"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
+    version = a.branch if version_key(a.branch) else None
+    vhistory = load_history(getattr(a, "version_dir", None)) if version else []
+    for l in order:
+        legs[l]["vtrend"] = version_trend(l, legs[l]["point"], vhistory, run,
+                                          getattr(a, "version_max", VERSION_MAX)) if version else []
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
-    dates = [t.get("date") for l in order for t in legs[l]["trend"] if t.get("date")]
+    dates = [t.get("date") for l in order for t in legs[l]["trend"] + legs[l]["vtrend"] if t.get("date")]
     changes = host_changes.changes_between(min(dates), max(dates)) if dates else []
     hchg = [{"at": c["at"], "approximate": bool(c.get("approximate")), "note": c["note"],
              "legend": host_changes.legend(c)} for c in changes]
@@ -833,6 +888,7 @@ def build_data(a):
             "ref": a.branch or first.get("ref"), "repo": a.repo, "docker_cpus": docker_cpus,
             "docker_ram_gb": docker_ram, "headline": head, "order": order, "missing": missing, "legs": legs,
             "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history), "host_changes": hchg,
+            "version": version, "version_runs": len(vhistory),
             "palette": palette(order), "comparison": parse_comparison(find_comparison(a.run_dir)),
             "verdict_all": verdict_all(legs, order, docker_cpus, missing, timing),
             "thresholds": {"import_target": IMPORT_TARGET, "err_pct_high": ERR_PCT_HIGH,
@@ -888,6 +944,10 @@ def main(argv=None):
     ap.add_argument("--dump-json")
     ap.add_argument("--trend-dir")
     ap.add_argument("--trend-max", type=int, default=TREND_MAX, help="most runs (including this one) charted per leg")
+    ap.add_argument("--version-dir", help="<run id>/report-data.json of earlier release-tag runs (history.py "
+                    "--version-dir); read only when --branch is a release tag vX.Y.Z")
+    ap.add_argument("--version-max", type=int, default=VERSION_MAX,
+                    help="most versions (including this run's) in the version trend")
     ap.add_argument("--timing-json", default=None, help="run_timing.py output: waiting vs working time")
     ap.add_argument("--no-shapes", action="store_true", help="do not read the heavy search-points.json")
     ap.add_argument("--headline-leg", default=None, help="leg preselected in the tiles (default: first leg with results)")
@@ -900,7 +960,7 @@ def main(argv=None):
         a = argparse.Namespace(run_dir="", run_id="", repo="", branch="", sha="", out="fhir-bench-report.html",
                                dump_json=None, trend_dir=None, no_shapes=True, headline_leg=None,
                                docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None,
-                               trend_max=TREND_MAX)
+                               trend_max=TREND_MAX, version_dir=None, version_max=VERSION_MAX)
     text, data, size_legs = None, None, 0
     try:
         data = build_data(a)
@@ -913,7 +973,7 @@ def main(argv=None):
         try:
             dump = dict(data) if data else {"run": a.run_id, "legs": {}, "order": []}
             dump.pop("timing_view", None)
-            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev", "prev_by")}
+            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "vtrend", "prev", "prev_by")}
                             for l, lg in dump["legs"].items()}
             with open(a.dump_json, "w", encoding="utf-8") as fh:
                 json.dump(dump, fh, ensure_ascii=False, separators=(",", ":"))

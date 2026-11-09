@@ -25,7 +25,10 @@ name: Windows nightly
 
 on:
   schedule:
-    - cron: "30 6 * * *"
+    # Not on Mondays, like ci.yml's nightly: the Lint job runs on a
+    # self-hosted Linux agent, and on Monday those belong to the Sunday
+    # release and its benchmark (see the slot list in ci-extended.yml).
+    - cron: "30 6 * * 0,2-6"
   workflow_dispatch:
   pull_request:
     branches: [main]
