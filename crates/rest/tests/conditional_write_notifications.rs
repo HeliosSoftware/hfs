@@ -506,6 +506,7 @@ async fn transaction_conditional_entries_announce_after_commit() {
 async fn rolled_back_transaction_announces_nothing() {
     let h = harness();
     h.seed("r-del", "r-del", true).await;
+    h.seed("r-pin", "r-pin", true).await;
 
     let bundle = json!({
         "resourceType": "Bundle",
@@ -519,8 +520,12 @@ async fn rolled_back_transaction_announces_nothing() {
             {
                 "request": {"method": "DELETE", "url": "Patient?identifier=r-del"}
             },
-            {   // fails: nothing to delete, which a transaction refuses
-                "request": {"method": "DELETE", "url": "Observation/never-existed"}
+            {   // fails: a version precondition that does not hold (412).
+                // PUT runs after the DELETE and POST entries, so both have
+                // executed inside the transaction before it rolls back. (A
+                // delete of something absent no longer fails, #2523.)
+                "resource": {"resourceType": "Patient", "id": "r-pin", "active": false},
+                "request": {"method": "PUT", "url": "Patient/r-pin", "ifMatch": "W/\"99\""}
             }
         ]
     });
@@ -538,7 +543,7 @@ async fn rolled_back_transaction_announces_nothing() {
         .add_header(X_TENANT_ID, tenant())
         .await
         .json();
-    let ids: Vec<&str> = remaining["entry"]
+    let mut ids: Vec<&str> = remaining["entry"]
         .as_array()
         .map(|entries| {
             entries
@@ -547,5 +552,6 @@ async fn rolled_back_transaction_announces_nothing() {
                 .collect()
         })
         .unwrap_or_default();
-    assert_eq!(ids, ["r-del"]);
+    ids.sort_unstable();
+    assert_eq!(ids, ["r-del", "r-pin"]);
 }

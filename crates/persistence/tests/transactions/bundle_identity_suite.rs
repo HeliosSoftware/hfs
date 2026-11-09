@@ -331,6 +331,100 @@ pub async fn conditional_delete_without_a_match_reports_not_found<B: BundleProvi
     assert_eq!(result.entries[0].effect.live_count_delta(), 0);
 }
 
+/// An instance `DELETE` with nothing to delete — an id never stored, and one
+/// already deleted — answers `204` and reports that nothing was deleted, and
+/// the rest of the transaction commits (#2523). SQLite and PostgreSQL used to
+/// fail the whole Bundle as "resource not found"; MongoDB already answered
+/// this. Nothing is written for it: the tombstone keeps its history and its
+/// `lastUpdated`, and the never-stored id gets no tombstone.
+pub async fn instance_delete_with_nothing_to_delete_reports_not_found<B>(
+    backend: &B,
+    tenant: &TenantContext,
+) where
+    B: BundleProvider + helios_persistence::core::InstanceHistoryProvider,
+{
+    use helios_persistence::core::HistoryParams;
+
+    backend
+        .seed_create(
+            tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "tombstone"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed");
+    backend
+        .seed_delete(tenant, "Patient", "tombstone")
+        .await
+        .expect("soft delete");
+
+    let history = |id: &'static str| async move {
+        backend
+            .history_instance(
+                tenant,
+                "Patient",
+                id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .map(|page| {
+                page.items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.resource.version_id().to_string(),
+                            item.resource.last_modified(),
+                            item.resource.is_deleted(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let before = history("tombstone").await;
+    assert_eq!(before.len(), 2, "create + delete: {before:?}");
+
+    let delete = |url: &str| BundleEntry {
+        method: BundleMethod::Delete,
+        url: url.to_string(),
+        ..Default::default()
+    };
+    let result = backend
+        .process_transaction(
+            tenant,
+            vec![
+                delete("Patient/never-stored"),
+                delete("Patient/tombstone"),
+                put(
+                    "committed",
+                    json!({"resourceType": "Patient", "id": "committed"}),
+                    None,
+                ),
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("nothing to delete does not fail the transaction");
+    for entry in &result.entries[..2] {
+        assert_eq!(entry.status, 204, "{entry:?}");
+        assert_eq!(entry.effect, BundleEntryEffect::NotFound, "{entry:?}");
+        assert_eq!(entry.effect.live_count_delta(), 0);
+    }
+    assert_eq!(result.entries[2].status, 201, "{:?}", result.entries[2]);
+
+    assert!(
+        backend
+            .read(tenant, "Patient", "committed")
+            .await
+            .expect("read")
+            .is_some(),
+        "the rest of the transaction committed"
+    );
+    assert_eq!(history("tombstone").await, before);
+    assert!(history("never-stored").await.is_empty());
+}
+
 /// A forward-referenced `ifNoneExist` create pins the id it would create
 /// under. When an intervening entry creates a match, the reference an earlier
 /// entry already wrote is stale, so the bundle rolls back.

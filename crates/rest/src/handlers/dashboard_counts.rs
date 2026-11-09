@@ -393,19 +393,18 @@ mod tests {
             .assert_status(StatusCode::NO_CONTENT);
         assert_eq!(h.live(TENANT, "Patient"), 0);
 
-        // Already gone / never existed: no live-count change.
-        let again = h
-            .server
-            .delete(&format!("/Patient/{id}"))
-            .add_header(X_TENANT_ID, header(TENANT))
-            .await;
-        assert!(!again.status_code().is_success());
-        let missing = h
-            .server
-            .delete("/Patient/never-existed")
-            .add_header(X_TENANT_ID, header(TENANT))
-            .await;
-        assert!(!missing.status_code().is_success());
+        // Already gone / never existed: a `204` no-op (#2523), with no
+        // live-count change.
+        for path in [
+            format!("/Patient/{id}"),
+            "/Patient/never-existed".to_string(),
+        ] {
+            h.server
+                .delete(&path)
+                .add_header(X_TENANT_ID, header(TENANT))
+                .await
+                .assert_status(StatusCode::NO_CONTENT);
+        }
         assert_eq!(h.live(TENANT, "Patient"), 0);
     }
 
@@ -500,7 +499,13 @@ mod tests {
                     "request": {"method": "POST", "url": "Patient"}
                 },
                 {
-                    "request": {"method": "DELETE", "url": "Observation/never-existed"}
+                    // An `ifMatch` nothing can satisfy fails the Bundle; a plain
+                    // delete of an absent id no longer does (#2523).
+                    "request": {
+                        "method": "DELETE",
+                        "url": "Observation/never-existed",
+                        "ifMatch": "W/\"1\""
+                    }
                 }
             ]
         });
@@ -561,7 +566,7 @@ mod tests {
             .json(&bundle)
             .await;
         response.assert_status_ok();
-        // +1 POST, +1 update-as-create, 0 update, -1 delete, 0 failed delete.
+        // +1 POST, +1 update-as-create, 0 update, -1 delete, 0 no-op delete (#2523).
         assert_eq!(h.live(TENANT, "Patient"), 2);
     }
 

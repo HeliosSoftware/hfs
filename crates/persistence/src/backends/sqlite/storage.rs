@@ -3997,7 +3997,11 @@ impl BundleProvider for SqliteBackend {
                         break;
                     }
 
-                    if !search_param_overlay_changed {
+                    // A delete that found nothing to delete is a `204` like a
+                    // real one, but changed nothing (#2523).
+                    if !search_param_overlay_changed
+                        && entry_result.effect != crate::core::BundleEntryEffect::NotFound
+                    {
                         search_param_overlay_changed =
                             match entry_result.status {
                                 // Created (POST, or PUT-as-create): only overlay-affecting
@@ -4239,8 +4243,19 @@ impl SqliteBackend {
                     }
                 }
 
-                tx.delete(&resource_type, &id).await?;
-                Ok(BundleEntryResult::deleted())
+                // Nothing to delete — never there, or already deleted — is a
+                // `204` no-op (#2523), the entry MongoDB and a conditional no-match
+                // already answer, not a failure of the whole Bundle. The
+                // transaction's `delete` returns `NotFound` from its existence
+                // check, before it writes anything. With `ifMatch` the gate above
+                // has already answered an absent resource.
+                match tx.delete(&resource_type, &id).await {
+                    Ok(()) => Ok(BundleEntryResult::deleted()),
+                    Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
+                        Ok(BundleEntryResult::delete_not_found())
+                    }
+                    Err(e) => Err(e),
+                }
             }
             BundleMethod::Patch => {
                 // A conditional patch (`PATCH [type]?[criteria]`) was resolved,
@@ -11526,8 +11541,13 @@ mod tests {
                 &tenant,
                 vec![
                     instance_delete("Patient/rolled-back"),
-                    // Deleting an id that does not exist fails the whole Bundle.
-                    instance_delete("Patient/never-existed"),
+                    // An `ifMatch` no resource can satisfy fails the whole
+                    // Bundle. (A plain delete of an id that does not exist no
+                    // longer does: it is a `204` no-op, #2523.)
+                    BundleEntry {
+                        if_match: Some("W/\"1\"".to_string()),
+                        ..instance_delete("Patient/never-existed")
+                    },
                 ],
                 FhirVersion::default(),
             )

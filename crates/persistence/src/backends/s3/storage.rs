@@ -82,23 +82,23 @@ impl S3Backend {
         let location = self.resource_location(tenant).await?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
-        let Some(actual) = self
+        // Never stored and already deleted are one answer, `NotFound`, as
+        // every other backend gives and `ResourceStorage::delete` documents.
+        // This was `Gone` for a tombstone, which surfaced as `410` on a
+        // repeated `DELETE` where the other backends answered `404`; the REST
+        // layer answers both as a no-op `204` now (#2523).
+        let actual = match self
             .load_current_with_meta(tenant, resource_type, id)
             .await?
-        else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
+        {
+            Some(actual) if !actual.resource.is_deleted() => actual,
+            _ => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
         };
-
-        if actual.resource.is_deleted() {
-            return Err(StorageError::Resource(ResourceError::Gone {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-                deleted_at: actual.resource.deleted_at(),
-            }));
-        }
 
         if let Some(expected) = expected_version
             && expected != actual.resource.version_id()

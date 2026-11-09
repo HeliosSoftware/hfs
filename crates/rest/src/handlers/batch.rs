@@ -24,7 +24,7 @@ use helios_persistence::core::{
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
     PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider,
     SystemHistoryProvider, WriteKind, WriteNotice, apply_patch_for_version, bundle_if_match_gate,
-    decode_bundle_patch_resource,
+    conditional_update_entry, decode_bundle_patch_resource,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
@@ -1159,13 +1159,15 @@ fn transaction_write_event_type(method: BundleMethod, status: u16) -> Option<Wri
 /// The atomic transaction path returns `BundleEntryResult`s rather than
 /// `StoredResource`s, so the notice is built from the entry's method and the
 /// result's stored JSON. Only 2xx write entries announce; a POST or a PUT that
-/// created answers 201 (Create), an update answers 200 (Update). A 2xx DELETE
+/// created answers 201 (Create), an update answers 200 (Update). A DELETE
 /// carries no body, so its id comes from the entry URL — or, for a conditional
 /// delete whose URL carries criteria rather than an id, from the `location`
-/// the backend names the resource it deleted through (#859, #862); a
-/// conditional delete that matched nothing has no location and nothing to
-/// announce. Conditional POST, PUT and PATCH entries return their resource, so
-/// they announce through the same arm as their unconditional siblings.
+/// the backend names the resource it deleted through (#859, #862). It
+/// announces only when it removed a live resource: a delete of something
+/// absent or already deleted is a `204` no-op (#2523) and announces nothing,
+/// and a conditional delete that matched nothing has no location and nothing
+/// to announce. Conditional POST, PUT and PATCH entries return their resource,
+/// so they announce through the same arm as their unconditional siblings.
 fn transaction_entry_notice(
     entry: &BundleEntry,
     result: &BundleEntryResult,
@@ -1176,7 +1178,7 @@ fn transaction_entry_notice(
             let (_, notice) = super::write_event::json_notice(kind, result.resource.as_ref()?)?;
             Some(notice)
         }
-        BundleMethod::Delete if (200..300).contains(&result.status) => {
+        BundleMethod::Delete if result.effect == BundleEntryEffect::Deleted => {
             let (_, id) = parse_request_url(&entry.url).ok()?;
             let id = if id.is_empty() {
                 entry
@@ -1625,10 +1627,9 @@ where
                             )),
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
-                        let location = format!("{}/{}", stored.resource_type(), stored.id());
-                        let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(location);
-                        result
+                        // The versioned location, as the transaction path's
+                        // `conditional_update_entry` answers it (#2517).
+                        conditional_update_entry(stored)
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
                         // The upsert created: announced as a create (#862).
@@ -1726,8 +1727,11 @@ where
                         BundleEntryResult::created(stored)
                     } else {
                         // For updates, include location with versioned URL
+                        // (#2517): `[type]/[id]/_history/[vid]`, the form the
+                        // created arm and every conditional arm answer.
+                        let location = stored.versioned_url();
                         let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(format!("{}/{}", resource_type, id));
+                        result.location = Some(location);
                         result
                     }
                 }
@@ -1827,6 +1831,14 @@ where
                     );
                     BundleEntryResult::deleted()
                 }
+                // Nothing to delete — never there, or already deleted — is the
+                // same successful no-op as `DELETE [type]/[id]` (#2523) and the
+                // conditional no-match above: `204`, and nothing announced.
+                // `ifMatch` cannot reach here for an absent resource; its gate
+                // above has already answered `412`.
+                Err(StorageError::Resource(
+                    ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+                )) if if_match.is_none() => BundleEntryResult::delete_not_found(),
                 Err(e) => entry_storage_failure(e),
             }
         }
@@ -1977,10 +1989,9 @@ where
         )),
     );
     record_stored_profile(state, tenant, stored.fhir_version(), &stored);
+    let location = criteria.is_none().then(|| stored.versioned_url());
     let mut result = BundleEntryResult::updated(stored);
-    if criteria.is_none() {
-        result.location = Some(format!("{resource_type}/{id}"));
-    }
+    result.location = location;
     result
 }
 
@@ -5670,18 +5681,14 @@ mod tests {
                 Some((WriteKind::Delete, "p1".to_string(), String::new()))
             ))
         );
-        // A delete of something that was not there moves no count, but its
-        // 2xx still announces from the URL as before.
+        // A delete of something that was not there is a `204` no-op (#2523):
+        // it moves no count and announces nothing, though its status is 2xx.
         assert_eq!(
             summary(transaction_entry_write(
                 &entry(BundleMethod::Delete, "Patient/p1"),
                 &result(204, None, BundleEntryEffect::NotFound)
             )),
-            Some((
-                "Patient".to_string(),
-                0,
-                Some((WriteKind::Delete, "p1".to_string(), String::new()))
-            ))
+            None
         );
         assert_eq!(
             summary(transaction_entry_write(
@@ -6076,7 +6083,7 @@ mod tests {
         );
         let entry = &response["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/existing");
+        assert_eq!(entry["response"]["location"], "Patient/existing/_history/1");
         assert_eq!(entry["resource"]["id"], "existing");
 
         let state = state_with(DelayStorage::conditional(ConditionalReply::Created));

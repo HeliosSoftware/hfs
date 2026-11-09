@@ -193,8 +193,7 @@ where
                     );
                 }
                 let headers = ResourceHeaders::from_stored(&stored, &state);
-                let location =
-                    state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
+                let location = state.location_for_request(&tenant, &stored);
 
                 debug!(
                     resource_type = %resource_type,
@@ -226,6 +225,12 @@ where
             }
             ConditionalCreateResult::Exists(stored) => {
                 let headers = ResourceHeaders::from_stored(&stored, &state);
+                // R5 http.html#ccreate, one match: "returns 200 OK, with
+                // headers and body populated as they would have been if a
+                // create had actually occurred. (i.e. ... location and etag
+                // headers set, etc.)" — so the match's `Location`, as the
+                // batch arm's `ifNoneExist` match already answers it.
+                let location = state.location_for_request(&tenant, &stored);
 
                 debug!(
                     resource_type = %resource_type,
@@ -234,8 +239,8 @@ where
                 );
 
                 // Return 200 OK with the existing resource
-                build_existing_response(&stored, headers, &prefer, negotiated.format).map(
-                    |mut response| {
+                build_existing_response(&stored, headers, &location, &prefer, negotiated.format)
+                    .map(|mut response| {
                         response
                             .extensions_mut()
                             .insert(helios_audit::AuditResponseContext {
@@ -247,8 +252,7 @@ where
                                 ),
                             });
                         response
-                    },
-                )
+                    })
             }
             ConditionalCreateResult::MultipleMatches(count) => Err(RestError::MultipleMatches {
                 operation: "create".to_string(),
@@ -291,7 +295,7 @@ where
     }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
-    let location = state.public_url_for_request(&tenant, [resource_type.as_str(), stored.id()]);
+    let location = state.location_for_request(&tenant, &stored);
 
     debug!(
         resource_type = %resource_type,
@@ -357,10 +361,12 @@ fn build_create_response(
 fn build_existing_response(
     stored: &helios_persistence::types::StoredResource,
     headers: ResourceHeaders,
+    location: &str,
     prefer: &PreferHeader,
     format: FhirFormat,
 ) -> RestResult<Response> {
-    let header_map = headers.to_header_map();
+    let mut header_map = headers.to_header_map();
+    header_map.insert(header::LOCATION, location.parse().unwrap());
 
     match prefer.return_preference() {
         Some("minimal") => Ok((StatusCode::OK, header_map).into_response()),
