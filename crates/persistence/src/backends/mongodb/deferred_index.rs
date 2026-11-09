@@ -28,15 +28,56 @@
 //!   them as `Type/id`. They commit or abort with the Bundle and add a bounded
 //!   number of documents, however many rows the Bundle would have written.
 //! - **Post-commit step.** The request that ran the Bundle rewrites the rows
-//!   and `missing_params` from the resources' current state, in batches of
-//!   [`DEFERRED_INDEX_BATCH_RESOURCES`] resources, before it answers, and then
+//!   and `missing_params` from the resources' current state, in batches of up
+//!   to [`DEFERRED_INDEX_BATCH_RESOURCES`] resources and about
+//!   [`DEFERRED_INDEX_BATCH_ROWS`] rows (#2031), before it answers, and then
 //!   deletes the ledger documents. It runs on the Bundle's own session and ends
-//!   at the first batch that fails for good or at the Bundle's deadline,
+//!   at the first chunk that fails for good or at the Bundle's deadline,
 //!   whichever comes first; what is left stays in the ledger.
 //! - **Repair.** Ledger documents left behind by a crash, a cancelled request
 //!   or a failed batch are finished by `repair_deferred_search_index`, which
 //!   the server runs at startup and periodically. It claims a document before
-//!   working on it and goes on past a failed batch.
+//!   working on it and goes on past a failed chunk.
+//!
+//! **Batches by rows, and a cache overflow (#2031).** A chunk of up to 256 ids
+//! of one type is written by one or more batch transactions, each its own
+//! transaction on the session:
+//!
+//! - A transaction takes the chunk's resources in the order its cursor returns
+//!   them until the rows it has built reach [`DEFERRED_INDEX_BATCH_ROWS`]; the
+//!   resource that reaches the budget is the last one it takes (a soft cut,
+//!   and a resource with more rows than the budget is a batch of its own).
+//!   The ids it did not take go to the next transaction. Each resource's rows
+//!   are extracted once, by the transaction that takes it; the cursor is not
+//!   read past the cut.
+//! - A transaction of more than one resource that the server refuses because
+//!   of the cache ([`is_cache_overflow_failure`]: `TransactionTooLargeForCache`
+//!   (388), or a rollback for cache pressure: 365, or a `WriteConflict` naming
+//!   the eviction) is not replayed as it was: the same writes meet the same
+//!   cache. It is retried with half of the resources it held, down to one, and
+//!   the smaller size is kept for the rest of the chunk.
+//! - A single resource refused on its own cannot be split: its stale-row
+//!   delete, its row insert and its marker clear are one transaction (see
+//!   `index_deferred_batch_once`). What happens next depends on the refusal.
+//!   388 is about that transaction's own write set ([`is_too_large_for_cache_failure`]),
+//!   so a replay would fail the same way: it fails alone after one attempt,
+//!   and the failure (the log, the ledger's `last_error`) says that
+//!   `Type/id` with N rows is too large for one transaction. A cache-pressure
+//!   rollback is the cache's load at that moment, which another writer's work
+//!   changes, so it is replayed at the same size up to
+//!   [`DEFERRED_INDEX_BATCH_ATTEMPTS`] times like any other failure, and only
+//!   then left alone, with a failure that says the resource was rolled back
+//!   for cache pressure that many times in a transaction of its own. Either
+//!   way the chunk's other resources are written and the resource stays marked.
+//! - A failure before the transaction has read its resources (starting it, the
+//!   `find`), or any failure that is not a cache refusal, has nothing to
+//!   shrink and is replayed at the same size, up to
+//!   [`DEFERRED_INDEX_BATCH_ATTEMPTS`] times, as it always was.
+//!
+//! The live step and the repair share one implementation of all this
+//! ([`MongoBackend::index_deferred_refs`]) and differ only in
+//! [`OnBatchFailure`]: the step stops at the first chunk that did not finish,
+//! the repair goes on.
 //!
 //! The transaction path lives in `storage.rs`. This module holds the constants
 //! and the pure helpers, the post-commit step and the repair.
@@ -50,13 +91,14 @@ use mongodb::bson::{Bson, Document, doc, oid::ObjectId};
 use mongodb::{ClientSession, Database};
 
 use crate::core::{BundleEntry, BundleMethod};
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 
 use super::MongoBackend;
 use super::retry::retry_transient;
 use super::storage::{
     SEARCH_INDEX_INSERT_CHUNK, chrono_to_bson, document_to_value, internal_driver_error,
-    internal_error, with_missing_metadata_update,
+    internal_error, is_cache_overflow_failure, is_too_large_for_cache_failure,
+    with_missing_metadata_update,
 };
 use super::transaction_bundle_gate::{
     DEFAULT_MAX_CONCURRENT_TRANSACTION_BUNDLES, DEFAULT_TRANSACTION_BUNDLE_WEIGHT_ENTRIES,
@@ -77,19 +119,49 @@ pub(super) const SEARCH_ROWS_PENDING_FIELD: &str = "search_rows_pending";
 /// limit, and a 50,000-entry Bundle adds ten of them.
 pub(super) const LEDGER_CHUNK_REFS: usize = 5_000;
 
-/// The most resources one post-commit batch transaction rewrites: about 5,000
-/// rows, far from the cache limit.
+/// The most resources one post-commit batch transaction rewrites. It is a cap
+/// on the count, not on the weight: [`DEFERRED_INDEX_BATCH_ROWS`] cuts a batch
+/// of heavy resources earlier, and a cache overflow halves it
+/// ([`halved_resource_limit`]).
 pub(super) const DEFERRED_INDEX_BATCH_RESOURCES: usize = 256;
 
+/// The rows a post-commit batch transaction may build before it takes no further
+/// resource (#2031). The resource that reaches the budget is the last one the
+/// transaction takes, so a batch holds at most one resource's rows more than
+/// this, and a resource with more rows than this is a batch of its own.
+///
+/// Why 5,000: it is the rows of one `insert_many` (`SEARCH_INDEX_INSERT_CHUNK`,
+/// the chunk the inline create path also sends), the size the README gives a
+/// batch, and it keeps a batch of ordinary resources whole. 256 resources at
+/// the benchmark's average of 18.6 rows are 4,762 rows, under it, so a typical
+/// Bundle is cut by its resource count exactly as before and only rows-heavy
+/// resources (a ValueSet expansion, a CodeSystem) are split. It is also a
+/// fraction of the roughly 30,000 rows (1,846-1,851 entries at the ceiling
+/// fixture's 16 rows each) that an inline Bundle held, with its resources and
+/// history, when it stopped fitting a 0.5 GB cache in the README's ceiling
+/// runs. The budget is not a guarantee: a resource can overflow the cache on
+/// its own, which is the single-resource failure of
+/// [`MongoBackend::index_deferred_refs`].
+pub(super) const DEFERRED_INDEX_BATCH_ROWS: usize = 5_000;
+
 /// How often one batch is tried before it is left to the repair. A batch is
-/// idempotent, so a retry only repeats work.
+/// idempotent, so a retry only repeats work. A replay is skipped only when it
+/// cannot help ([`replay_can_help`]): a cache refusal of a transaction of more
+/// than one resource is answered with a smaller transaction, and a
+/// `TransactionTooLargeForCache` (388) of a lone resource is final, since the
+/// same writes meet the same cache. Every other failure, a lone resource's
+/// cache-pressure rollback and a failure before the resources were read
+/// included, gets all of these attempts.
 pub(super) const DEFERRED_INDEX_BATCH_ATTEMPTS: u32 = 5;
 
-/// How many batches in a row may run out of attempts before the repair gives up
-/// on the rest of a ledger document. One poisoned resource fails one batch and
-/// the healthy batches around it still commit; a MongoDB that is down fails
-/// every batch, and this keeps the repair from paying every attempt of every
-/// batch of the document.
+/// How many batches in a row may fail for good before the repair gives up on
+/// the rest of a ledger document, and how many resources in a row may fail
+/// alone, with no batch committing between them, before a chunk gives up on
+/// the rest of its resources. One poisoned resource fails one batch and the
+/// healthy batches around it still commit; a MongoDB that is down fails every
+/// batch, and this keeps the repair from paying every attempt of every batch of
+/// the document. A cache that is full of other work refuses every single
+/// resource the same way, and this keeps a chunk from trying all 256 of them.
 pub(super) const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 3;
 
 /// The longest `last_error` a ledger document keeps, in characters.
@@ -353,10 +425,16 @@ pub(super) struct DeferredIndexStats {
     pub(super) indexed: usize,
     /// Rows inserted (`search_index` and `search_index_contained`).
     pub(super) rows: u64,
-    /// Batch transactions that committed.
+    /// Batch transactions that committed and wrote at least one resource. A
+    /// transaction that found every resource already done writes nothing and
+    /// is not counted.
     pub(super) batches: u64,
-    /// Batch attempts that failed and were tried again.
+    /// Batch attempts that failed and were tried again at the same size.
     pub(super) retries: u64,
+    /// Batch transactions of more than one resource the cache refused, each
+    /// followed by a smaller one ([`halved_resource_limit`]). A lone resource
+    /// the cache refuses cannot be made smaller and is not counted.
+    pub(super) shrinks: u64,
     /// Ledger documents deleted because every batch of theirs committed.
     pub(super) cleared_chunks: usize,
     /// Ledger documents left for the repair.
@@ -368,19 +446,200 @@ pub(super) struct DeferredIndexStats {
     pub(super) last_error: Option<String>,
 }
 
-/// What [`MongoBackend::index_deferred_refs`] does once a batch has run out of
-/// attempts.
+/// What [`MongoBackend::index_deferred_refs`] does once a chunk of up to
+/// [`DEFERRED_INDEX_BATCH_RESOURCES`] ids has not finished: a batch ran out of
+/// attempts, or the cache refuses a resource in a transaction of its own (a
+/// [`ChunkEnd::Refused`] chunk). A chunk with such a resource is first finished
+/// (its other resources are written) and a chunk whose batch ran out of
+/// attempts is left where it stopped, whichever of the two this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OnBatchFailure {
-    /// Return the failure at once and start no further batch. The post-commit
+    /// Return the failure at once and start no further chunk. The post-commit
     /// step uses it: the request is waiting, and a MongoDB that cannot take one
-    /// batch will not take the next.
+    /// batch will not take the next. The chunks after it, and the resource the
+    /// cache refused, are left to the repair.
     Stop,
-    /// Go on with the remaining batches and return the first failure at the
-    /// end (or when [`MAX_CONSECUTIVE_BATCH_FAILURES`] batches in a row have
-    /// failed). The repair uses it: one poisoned resource must not hold up the
-    /// healthy ones in its ledger document.
+    /// Go on with the remaining chunks and return the first failure at the end
+    /// (or when [`MAX_CONSECUTIVE_BATCH_FAILURES`] chunks in a row have run out
+    /// of attempts). The repair uses it: one poisoned resource, or one the cache
+    /// refuses, must not hold up the healthy ones in its ledger document. A
+    /// chunk that failed only because the cache refused a resource shows the
+    /// server is answering, so it does not count toward that limit.
     Continue,
+}
+
+/// What one batch transaction did, once committed.
+struct BatchCommit {
+    /// Resources whose rows it rewrote and whose marker it cleared.
+    indexed: usize,
+    /// Rows it inserted.
+    rows: u64,
+    /// The ids it was given and did not take, because the row budget
+    /// ([`DEFERRED_INDEX_BATCH_ROWS`]) cut it. They are still marked, so the
+    /// next transaction takes them. Empty when it read every marked resource
+    /// of its ids.
+    left: Vec<String>,
+}
+
+/// The resources a batch transaction held when it failed, once it had read
+/// them: the ids it was writing and the rows it had built for them.
+struct HeldResources {
+    ids: Vec<String>,
+    rows: u64,
+}
+
+/// A batch transaction that failed, with what it held.
+struct BatchFailure {
+    error: StorageError,
+    /// `None` when it failed before it had read its resources (starting, or
+    /// reading them): nothing says whether they fit.
+    held: Option<HeldResources>,
+}
+
+impl BatchFailure {
+    /// Boxed, since a `StorageError` is large and a batch's `Result` is not
+    /// the place to carry it by value.
+    fn boxed(error: StorageError, held: Option<HeldResources>) -> Box<Self> {
+        Box::new(Self { error, held })
+    }
+}
+
+/// What a batch's attempts came to ([`MongoBackend::index_deferred_batch_attempts`]).
+enum BatchAttempt {
+    /// A transaction committed; `left` is [`BatchCommit::left`].
+    Committed { left: Vec<String> },
+    /// The attempts ran out, or the failure is one that a replay cannot help
+    /// ([`replay_can_help`]). `attempts` is how many transactions were tried.
+    Failed {
+        failure: Box<BatchFailure>,
+        attempts: u32,
+    },
+    /// The deadline cut it: no further transaction starts.
+    Deadline,
+}
+
+/// How one chunk of ids ended ([`MongoBackend::index_deferred_batch`]).
+enum ChunkEnd {
+    /// Every resource of the chunk is written (or was already).
+    Done,
+    /// The deadline cut it.
+    Deadline,
+    /// Every resource the cache lets through is written. The message names the
+    /// ones it refuses in a transaction of their own, which stay marked: a
+    /// resource refused as too large for one transaction ([`too_large_message`])
+    /// and one rolled back for cache pressure on every attempt
+    /// ([`cache_pressure_message`]).
+    Refused(String),
+    /// A batch ran out of attempts (or the cache refused too many single
+    /// resources in a row). What it had not written yet stays marked.
+    Failed(String),
+}
+
+/// The transaction size after the cache refused one that held `held`
+/// resources: half of them, and at least one. Strictly smaller than `held`
+/// from two resources up, so a chunk reaches one resource, where a failure is
+/// the resource's own.
+fn halved_resource_limit(held: usize) -> usize {
+    (held / 2).max(1)
+}
+
+/// Whether running a failed batch transaction again at the same size can help.
+/// `held` is the number of resources it had read when it failed (zero when it
+/// failed before that), `too_large` that the failure is a
+/// `TransactionTooLargeForCache` ([`is_too_large_for_cache_failure`]) and
+/// `cache_refused` that it is any cache failure ([`is_cache_overflow_failure`]).
+///
+/// - More than one resource, refused by the cache: no. The caller halves the
+///   transaction, which is what can help.
+/// - One resource, refused with 388: no. It is that resource's own write set
+///   against this cache, and the same writes fail the same way.
+/// - Everything else: yes. A failure that says nothing about the cache is
+///   transient like any other; so is a cache-pressure rollback of a lone
+///   resource (365, a labelled 112), which is the cache's load at that moment,
+///   not the resource's size; and a failure before the resources were read has
+///   nothing to shrink.
+fn replay_can_help(held: usize, too_large: bool, cache_refused: bool) -> bool {
+    match held {
+        0 => true,
+        1 => !too_large,
+        _ => !cache_refused,
+    }
+}
+
+/// The ids of `ids` that a transaction did not take, in their order.
+fn ids_not_taken(ids: &[String], taken: &[String]) -> Vec<String> {
+    let taken: HashSet<&str> = taken.iter().map(String::as_str).collect();
+    ids.iter()
+        .filter(|id| !taken.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// What the log and the ledger say about a resource whose rows the server
+/// refuses as too large for the cache (`TransactionTooLargeForCache`, 388) in a
+/// transaction of their own: it cannot be made smaller, since its stale-row
+/// delete, its row insert and its marker clear are one transaction. `error` is
+/// the server's, which follows.
+fn too_large_message(resource_type: &str, id: &str, rows: u64, error: &StorageError) -> String {
+    format!(
+        "{resource_type}/{id} with {rows} rows is too large for one transaction and cannot be \
+         split: {error}"
+    )
+}
+
+/// What the log and the ledger say about a resource that the cache rolled back
+/// for pressure ([`is_cache_overflow_failure`] without 388) in a transaction of
+/// its own on each of `attempts` attempts. Unlike 388 this does not say the
+/// resource is too large: the rollback is about the cache's load, which a
+/// writer elsewhere can cause, so the message says what was seen and that the
+/// resource cannot be made smaller. `error` is the server's, which follows.
+fn cache_pressure_message(
+    resource_type: &str,
+    id: &str,
+    rows: u64,
+    attempts: u32,
+    error: &StorageError,
+) -> String {
+    format!(
+        "{resource_type}/{id} with {rows} rows was rolled back for cache pressure in a \
+         transaction of its own, {attempts} times, and cannot be split: {error}"
+    )
+}
+
+/// The chunk's failure for the resources the cache refused in a transaction of
+/// their own: the first one's message, and how many others there were.
+fn refused_summary(messages: &[String]) -> String {
+    match messages {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!(
+            "{first} (and {} more resources of the chunk were refused by the cache in a \
+             transaction of their own)",
+            rest.len()
+        ),
+    }
+}
+
+/// What a batch transaction reads, before it writes anything: the resources it
+/// takes with the rows and the `update` statements built from them.
+#[derive(Default)]
+struct DeferredReads {
+    /// The ids it takes, in the order the cursor returned them.
+    marked: Vec<String>,
+    /// One statement per taken resource ([`deferred_resource_update`]).
+    updates: Vec<Document>,
+    /// The `search_index` rows of the taken resources.
+    own: Vec<Document>,
+    /// Their `search_index_contained` rows.
+    contained: Vec<Document>,
+    /// The ids it did not take ([`BatchCommit::left`]).
+    left: Vec<String>,
+}
+
+impl DeferredReads {
+    fn rows(&self) -> usize {
+        self.own.len() + self.contained.len()
+    }
 }
 
 /// What [`MongoBackend::repair_deferred_search_index`] did in one pass.
@@ -409,10 +668,11 @@ pub struct DeferredIndexRepairReport {
 }
 
 impl MongoBackend {
-    /// One attempt to write the search rows of up to
-    /// [`DEFERRED_INDEX_BATCH_RESOURCES`] resources of one type, in one small
-    /// transaction on `session`. Returns the resources rewritten and the rows
-    /// inserted.
+    /// One attempt to write the search rows of the resources among `ids` (up to
+    /// [`DEFERRED_INDEX_BATCH_RESOURCES`] of them, all of one type) that still
+    /// carry the marker, in one small transaction on `session`. Returns what
+    /// it did ([`BatchCommit`]) or what it held when it failed
+    /// ([`BatchFailure`]).
     ///
     /// The transaction reads the resources that still carry the
     /// [`SEARCH_ROWS_PENDING_FIELD`] marker, deletes their rows, inserts rows
@@ -424,6 +684,14 @@ impl MongoBackend {
     /// has none until this write (#1975, #2035): its Bundle's transaction
     /// extracted nothing, so the metadata is built, like the rows, with the
     /// registry as it is after its SearchParameters were reloaded.
+    ///
+    /// It takes the resources in its cursor's order and stops reading once the
+    /// rows built so far reach [`DEFERRED_INDEX_BATCH_ROWS`], so a batch of
+    /// rows-heavy resources is several transactions (#2031). The resource that
+    /// reaches the budget is the last one it takes, each resource is extracted
+    /// once, and the cursor is not read past the cut: no resource is extracted
+    /// and then left. The ids it did not take come back in
+    /// [`BatchCommit::left`], for the next transaction.
     ///
     /// **Why this is safe next to other writers.** The marker is cleared, and
     /// `missing_params` written, in the same transaction that rewrites the
@@ -441,6 +709,11 @@ impl MongoBackend {
     /// aborts, and finds no marker on its retry; a batch that has already
     /// cleared its markers holds those documents, and the purge waits for its
     /// commit before it deletes the rows (#2259).
+    ///
+    /// The same write is why one resource cannot be split across transactions:
+    /// its stale-row delete, its row insert and its marker clear must commit
+    /// together, or a reader or a racing writer could see its rows gone, or
+    /// doubled, with the marker still set.
     async fn index_deferred_batch_once(
         &self,
         db: &Database,
@@ -448,41 +721,67 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         ids: &[String],
-    ) -> StorageResult<(usize, u64)> {
+    ) -> Result<BatchCommit, Box<BatchFailure>> {
         session.start_transaction().await.map_err(|e| {
-            internal_driver_error("Failed to start the deferred search rows transaction", e)
+            BatchFailure::boxed(
+                internal_driver_error("Failed to start the deferred search rows transaction", e),
+                None,
+            )
         })?;
-        let outcome = self
-            .rewrite_deferred_batch(db, session, tenant_id, resource_type, ids)
-            .await;
-        match outcome {
-            Ok(counts) => match session.commit_transaction().await {
-                Ok(()) => Ok(counts),
+        let mut reads = match self
+            .read_deferred_batch(db, session, tenant_id, resource_type, ids)
+            .await
+        {
+            Ok(reads) => reads,
+            Err(error) => {
+                let _ = session.abort_transaction().await;
+                return Err(BatchFailure::boxed(error, None));
+            }
+        };
+        let commit = BatchCommit {
+            indexed: reads.marked.len(),
+            rows: reads.rows() as u64,
+            left: std::mem::take(&mut reads.left),
+        };
+        let held = HeldResources {
+            ids: reads.marked.clone(),
+            rows: commit.rows,
+        };
+        match self
+            .write_deferred_batch(db, session, tenant_id, resource_type, reads)
+            .await
+        {
+            Ok(()) => match session.commit_transaction().await {
+                Ok(()) => Ok(commit),
                 Err(e) => {
                     let _ = session.abort_transaction().await;
-                    Err(internal_driver_error(
-                        "Failed to commit the deferred search rows transaction",
-                        e,
+                    Err(BatchFailure::boxed(
+                        internal_driver_error(
+                            "Failed to commit the deferred search rows transaction",
+                            e,
+                        ),
+                        Some(held),
                     ))
                 }
             },
-            Err(e) => {
+            Err(error) => {
                 let _ = session.abort_transaction().await;
-                Err(e)
+                Err(BatchFailure::boxed(error, Some(held)))
             }
         }
     }
 
-    /// The operations of [`Self::index_deferred_batch_once`], inside its open
-    /// transaction.
-    async fn rewrite_deferred_batch(
+    /// The reads of [`Self::index_deferred_batch_once`], inside its open
+    /// transaction: the marked resources among `ids`, up to the row budget, with
+    /// their rows built (once each) and their `update` statements.
+    async fn read_deferred_batch(
         &self,
         db: &Database,
         session: &mut ClientSession,
         tenant_id: &str,
         resource_type: &str,
         ids: &[String],
-    ) -> StorageResult<(usize, u64)> {
+    ) -> StorageResult<DeferredReads> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let mut cursor = resources
             .find(doc! {
@@ -497,10 +796,7 @@ impl MongoBackend {
                 internal_driver_error("Failed to read the resources with deferred search rows", e)
             })?;
 
-        let mut marked: Vec<String> = Vec::new();
-        let mut updates: Vec<Document> = Vec::new();
-        let mut own: Vec<Document> = Vec::new();
-        let mut contained: Vec<Document> = Vec::new();
+        let mut reads = DeferredReads::default();
         while cursor.advance(&mut *session).await.map_err(|e| {
             internal_driver_error("Failed to advance the deferred search rows cursor", e)
         })? {
@@ -526,17 +822,17 @@ impl MongoBackend {
                 let content = document_to_value(data)?;
                 let (rows, _failure) =
                     self.search_index_documents_checked(tenant_id, resource_type, &id, &content);
-                updates.push(deferred_resource_update(
+                reads.updates.push(deferred_resource_update(
                     tenant_id,
                     resource_type,
                     &id,
                     rows.missing_params.as_deref(),
                     rows.missing_fp.as_deref(),
                 ));
-                own.extend(rows.own);
-                contained.extend(rows.contained);
+                reads.own.extend(rows.own);
+                reads.contained.extend(rows.contained);
             } else {
-                updates.push(deferred_resource_update(
+                reads.updates.push(deferred_resource_update(
                     tenant_id,
                     resource_type,
                     &id,
@@ -544,15 +840,40 @@ impl MongoBackend {
                     Some(&self.stamp_missing_fingerprint(tenant_id, resource_type)),
                 ));
             }
-            marked.push(id);
+            reads.marked.push(id);
+            if reads.rows() >= DEFERRED_INDEX_BATCH_ROWS {
+                // The budget is reached, and this resource, the one that
+                // reached it, is in. The cursor is dropped unread: nothing
+                // past the cut is extracted.
+                reads.left = ids_not_taken(ids, &reads.marked);
+                break;
+            }
         }
         drop(cursor);
+        Ok(reads)
+    }
 
+    /// The writes of [`Self::index_deferred_batch_once`], inside its open
+    /// transaction, for the resources [`Self::read_deferred_batch`] took.
+    async fn write_deferred_batch(
+        &self,
+        db: &Database,
+        session: &mut ClientSession,
+        tenant_id: &str,
+        resource_type: &str,
+        reads: DeferredReads,
+    ) -> StorageResult<()> {
+        let DeferredReads {
+            marked,
+            updates,
+            own,
+            contained,
+            left: _,
+        } = reads;
         if marked.is_empty() {
-            return Ok((0, 0));
+            return Ok(());
         }
 
-        let rows = (own.len() + contained.len()) as u64;
         let stale = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
@@ -614,25 +935,132 @@ impl MongoBackend {
                     e,
                 )
             })?;
-        check_deferred_update_reply(&reply, marked.len())?;
-
-        Ok((marked.len(), rows))
+        check_deferred_update_reply(&reply, marked.len())
     }
 
-    /// [`Self::index_deferred_batch_once`], tried up to
-    /// [`DEFERRED_INDEX_BATCH_ATTEMPTS`] times and counted into `stats`. Every
-    /// error is retried: the batch is idempotent, so a retry after an abort, a
-    /// write conflict or a commit of unknown outcome only repeats work (a batch
-    /// that did commit finds no marker the second time). The last failure is
-    /// returned as text.
+    /// [`Self::index_deferred_batch_once`] for `ids`, tried up to
+    /// [`DEFERRED_INDEX_BATCH_ATTEMPTS`] times and counted into `stats`. A
+    /// failed attempt is retried at the same size, with a growing pause, unless
+    /// a replay cannot help ([`replay_can_help`]): the batch is idempotent, so
+    /// a retry after an abort, a write conflict or a commit of unknown outcome
+    /// only repeats work (a batch that did commit finds no marker the second
+    /// time). The failures handed back at once are the cache's refusals
+    /// ([`is_cache_overflow_failure`]) of a transaction of more than one
+    /// resource, for [`Self::index_deferred_batch`] to make smaller, and a
+    /// lone resource's `TransactionTooLargeForCache`
+    /// ([`is_too_large_for_cache_failure`]), whose same writes meet the same
+    /// cache. Everything else gets every attempt: a failure that says nothing
+    /// about the cache, a failure before the resources were read (there is
+    /// nothing to shrink), and a lone resource's cache-pressure rollback (365,
+    /// a labelled 112), which is the cache's load at that moment and not the
+    /// resource's size. [`BatchAttempt::Failed`] says how many attempts it
+    /// took.
     ///
     /// `stop_at` bounds the batch itself, not only the start of it. It is
     /// checked before every attempt, and an attempt still running at that
     /// instant is cut. Either way the batch notes `stopped_at_deadline` in
-    /// `stats` and returns `Ok(false)` without starting another transaction on
-    /// the session, and without awaiting an abort of the one it cut: that
-    /// could hang past the deadline, and dropping the session aborts the
-    /// server-side transaction. `Ok(true)` means the batch committed.
+    /// `stats` and returns [`BatchAttempt::Deadline`] without starting another
+    /// transaction on the session, and without awaiting an abort of the one it
+    /// cut: that could hang past the deadline, and dropping the session aborts
+    /// the server-side transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn index_deferred_batch_attempts(
+        &self,
+        db: &Database,
+        session: &mut ClientSession,
+        tenant_id: &str,
+        resource_type: &str,
+        ids: &[String],
+        stop_at: Option<tokio::time::Instant>,
+        stats: &mut DeferredIndexStats,
+    ) -> BatchAttempt {
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            if stop_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                stats.stopped_at_deadline = true;
+                return BatchAttempt::Deadline;
+            }
+            let once = self.index_deferred_batch_once(db, session, tenant_id, resource_type, ids);
+            let outcome = match stop_at {
+                Some(at) => match tokio::time::timeout_at(at, once).await {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => {
+                        stats.stopped_at_deadline = true;
+                        return BatchAttempt::Deadline;
+                    }
+                },
+                None => once.await,
+            };
+            match outcome {
+                Ok(commit) => {
+                    stats.indexed += commit.indexed;
+                    stats.rows += commit.rows;
+                    if commit.indexed > 0 {
+                        stats.batches += 1;
+                    }
+                    return BatchAttempt::Committed { left: commit.left };
+                }
+                Err(failure) => {
+                    let held = failure.held.as_ref().map_or(0, |held| held.ids.len());
+                    if attempt >= DEFERRED_INDEX_BATCH_ATTEMPTS
+                        || !replay_can_help(
+                            held,
+                            is_too_large_for_cache_failure(&failure.error),
+                            is_cache_overflow_failure(&failure.error),
+                        )
+                    {
+                        return BatchAttempt::Failed {
+                            failure,
+                            attempts: attempt,
+                        };
+                    }
+                    stats.retries += 1;
+                    tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+
+    /// Writes the search rows of one chunk: `ids` (at most
+    /// [`DEFERRED_INDEX_BATCH_RESOURCES`], all of one type), in as many batch
+    /// transactions as the row budget and the cache need (#2031).
+    ///
+    /// - A batch transaction takes resources until their rows reach
+    ///   [`DEFERRED_INDEX_BATCH_ROWS`] (see [`Self::index_deferred_batch_once`]),
+    ///   and the ids it leaves are the next transaction's.
+    /// - A transaction of more than one resource that the cache refuses
+    ///   ([`is_cache_overflow_failure`]) is followed by one with half of the
+    ///   resources it held ([`halved_resource_limit`]), and so on down to one.
+    ///   The smaller size is kept for the rest of the chunk: the cache said
+    ///   that size does not fit, and nothing says it has changed.
+    /// - A single resource that the cache refuses on its own cannot be made
+    ///   smaller. With `TransactionTooLargeForCache` (388,
+    ///   [`is_too_large_for_cache_failure`]) it fails after one attempt, since
+    ///   the same writes meet the same cache; with a cache-pressure rollback
+    ///   (365, a labelled 112), the cache's load and not the resource's size, it
+    ///   gets the same attempts as any other failure
+    ///   ([`Self::index_deferred_batch_attempts`]) and fails when they run out.
+    ///   Either way it is left marked and the chunk goes on with the others,
+    ///   which are written; the chunk ends as [`ChunkEnd::Refused`] and names it
+    ///   and its rows, as [`too_large_message`] or, for the rollback,
+    ///   [`cache_pressure_message`] (which does not call it too large).
+    ///   [`MAX_CONSECUTIVE_BATCH_FAILURES`] of them in a row, with no
+    ///   transaction committing between them, mean the cache is full of other
+    ///   work, not that those resources are heavy: the chunk gives up the rest
+    ///   ([`ChunkEnd::Failed`]).
+    /// - Any other failure, and one before the transaction has read its
+    ///   resources (nothing to shrink), is retried at the same size, and a
+    ///   batch that runs out of attempts ends the chunk as [`ChunkEnd::Failed`]
+    ///   with the rest of it still marked. Transactions that committed before
+    ///   stay committed.
+    ///
+    /// A retry extracts its resources again, as a retry always has: the failed
+    /// transaction's rows were never committed, and nothing is carried over.
+    ///
+    /// `stop_at` is the live step's deadline (see
+    /// [`Self::index_deferred_batch_attempts`]); once it has passed the chunk
+    /// ends as [`ChunkEnd::Deadline`].
     #[allow(clippy::too_many_arguments)]
     async fn index_deferred_batch(
         &self,
@@ -643,54 +1071,122 @@ impl MongoBackend {
         ids: &[String],
         stop_at: Option<tokio::time::Instant>,
         stats: &mut DeferredIndexStats,
-    ) -> Result<bool, String> {
-        let mut message = String::new();
-        for attempt in 1..=DEFERRED_INDEX_BATCH_ATTEMPTS {
-            if stop_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
-                stats.stopped_at_deadline = true;
-                return Ok(false);
-            }
-            let once = self.index_deferred_batch_once(db, session, tenant_id, resource_type, ids);
-            let outcome = match stop_at {
-                Some(at) => match tokio::time::timeout_at(at, once).await {
-                    Ok(outcome) => outcome,
-                    Err(_elapsed) => {
-                        stats.stopped_at_deadline = true;
-                        return Ok(false);
-                    }
-                },
-                None => once.await,
-            };
-            match outcome {
-                Ok((indexed, rows)) => {
-                    stats.indexed += indexed;
-                    stats.rows += rows;
-                    stats.batches += 1;
-                    return Ok(true);
+    ) -> ChunkEnd {
+        let mut pending: Vec<String> = ids.to_vec();
+        let mut limit = DEFERRED_INDEX_BATCH_RESOURCES;
+        let mut refused: Vec<String> = Vec::new();
+        let mut refused_in_a_row = 0_u32;
+        while !pending.is_empty() {
+            let take = limit.min(pending.len());
+            let attempt = self
+                .index_deferred_batch_attempts(
+                    db,
+                    session,
+                    tenant_id,
+                    resource_type,
+                    &pending[..take],
+                    stop_at,
+                    stats,
+                )
+                .await;
+            let (failure, attempts) = match attempt {
+                BatchAttempt::Deadline => return ChunkEnd::Deadline,
+                BatchAttempt::Committed { left } => {
+                    // What the transaction took, and what it found already
+                    // done, leaves `pending`; what it did not reach goes first.
+                    refused_in_a_row = 0;
+                    drop(pending.splice(..take, left));
+                    continue;
                 }
-                Err(e) => {
-                    message = e.to_string();
-                    if attempt < DEFERRED_INDEX_BATCH_ATTEMPTS {
-                        stats.retries += 1;
-                        tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                BatchAttempt::Failed { failure, attempts } => (failure, attempts),
+            };
+
+            let cache_refused = is_cache_overflow_failure(&failure.error);
+            let held = failure.held.as_ref().filter(|_| cache_refused);
+            match held.map(|held| (held.ids.as_slice(), held.rows)) {
+                Some((held_ids, rows)) if held_ids.len() > 1 => {
+                    limit = halved_resource_limit(held_ids.len());
+                    stats.shrinks += 1;
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        resource_type,
+                        resources = held_ids.len(),
+                        rows,
+                        next_batch_resources = limit,
+                        error = %failure.error,
+                        "deferred search rows batch refused by the cache; \
+                         retrying with fewer resources"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Some(([only], rows)) => {
+                    // The one resource the cache refuses on its own: 388 after
+                    // one attempt, a cache-pressure rollback after all of them.
+                    let id = only.clone();
+                    let too_large = is_too_large_for_cache_failure(&failure.error);
+                    let message = if too_large {
+                        too_large_message(resource_type, &id, rows, &failure.error)
+                    } else {
+                        cache_pressure_message(resource_type, &id, rows, attempts, &failure.error)
+                    };
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        resource = %format!("{resource_type}/{id}"),
+                        rows,
+                        attempts,
+                        too_large,
+                        error = %failure.error,
+                        "deferred search rows of one resource are refused by the cache in a \
+                         transaction of its own; it stays marked for the repair and the chunk \
+                         goes on"
+                    );
+                    pending.retain(|pending_id| *pending_id != id);
+                    refused.push(message);
+                    refused_in_a_row += 1;
+                    if refused_in_a_row >= MAX_CONSECUTIVE_BATCH_FAILURES {
+                        return ChunkEnd::Failed(format!(
+                            "{}; gave up the rest of the chunk after {refused_in_a_row} \
+                             resources in a row that the cache refuses alone",
+                            refused_summary(&refused)
+                        ));
                     }
+                }
+                _ => {
+                    let message = failure.error.to_string();
+                    return ChunkEnd::Failed(if refused.is_empty() {
+                        message
+                    } else {
+                        format!("{}; {message}", refused_summary(&refused))
+                    });
                 }
             }
         }
-        Err(message)
+        if refused.is_empty() {
+            ChunkEnd::Done
+        } else {
+            ChunkEnd::Refused(refused_summary(&refused))
+        }
     }
 
-    /// Writes the search rows of `refs` (all of one tenant) in batches of
-    /// [`DEFERRED_INDEX_BATCH_RESOURCES`] resources of one type each.
+    /// Writes the search rows of `refs` (all of one tenant) in chunks of up to
+    /// [`DEFERRED_INDEX_BATCH_RESOURCES`] resources of one type each, each
+    /// chunk in as many transactions as its rows and the cache need
+    /// ([`Self::index_deferred_batch`]).
     ///
-    /// `stop_at` is the live step's deadline (see `index_deferred_batch`): once
-    /// it has passed no further batch starts, the one in flight is cut, and the
-    /// result is `Ok(false)` with `stopped_at_deadline` noted in `stats`. The
-    /// repair passes `None`. `Ok(true)` means every batch committed. An `Err` is
-    /// the failure of a batch that ran out of attempts; the batches that
-    /// committed stay committed. What follows such a failure is `on_failure`'s:
-    /// [`OnBatchFailure::Stop`] returns it at once, [`OnBatchFailure::Continue`]
-    /// goes on and returns the first one at the end.
+    /// `stop_at` is the live step's deadline (see
+    /// `index_deferred_batch_attempts`): once it has passed no further batch
+    /// starts, the one in flight is cut, and the result is `Ok(false)` with
+    /// `stopped_at_deadline` noted in `stats`. The repair passes `None`.
+    /// `Ok(true)` means every chunk is written. An `Err` is the failure of a
+    /// chunk that did not finish: a batch that ran out of attempts, or a
+    /// resource the cache refuses in a transaction of its own, as too large (388,
+    /// after one attempt) or rolled back for cache pressure on every attempt
+    /// (its message names it and its rows; its chunk's other resources are
+    /// written). The
+    /// transactions that committed stay committed. What follows such a failure
+    /// is `on_failure`'s: [`OnBatchFailure::Stop`] returns it at once,
+    /// [`OnBatchFailure::Continue`] goes on and returns the first one at the
+    /// end.
     #[allow(clippy::too_many_arguments)]
     async fn index_deferred_refs(
         &self,
@@ -705,22 +1201,31 @@ impl MongoBackend {
         let mut first_failure: Option<String> = None;
         let mut failed_in_a_row = 0_u32;
         'types: for (resource_type, ids) in group_refs_by_type(refs) {
-            for batch in ids.chunks(DEFERRED_INDEX_BATCH_RESOURCES) {
+            for chunk in ids.chunks(DEFERRED_INDEX_BATCH_RESOURCES) {
                 match self
                     .index_deferred_batch(
                         db,
                         session,
                         tenant_id,
                         &resource_type,
-                        batch,
+                        chunk,
                         stop_at,
                         stats,
                     )
                     .await
                 {
-                    Ok(true) => failed_in_a_row = 0,
-                    Ok(false) => return Ok(false),
-                    Err(message) => {
+                    ChunkEnd::Done => failed_in_a_row = 0,
+                    ChunkEnd::Deadline => return Ok(false),
+                    ChunkEnd::Refused(message) => {
+                        if on_failure == OnBatchFailure::Stop {
+                            return Err(message);
+                        }
+                        first_failure.get_or_insert(message);
+                        // The chunk's other resources were written: the
+                        // server is answering, and no poison is spreading.
+                        failed_in_a_row = 0;
+                    }
+                    ChunkEnd::Failed(message) => {
                         if on_failure == OnBatchFailure::Stop {
                             return Err(message);
                         }
@@ -753,11 +1258,18 @@ impl MongoBackend {
     /// with `w:1`), and a batch that finds no marker was finished by another
     /// rewriter.
     ///
+    /// Each chunk of up to 256 ids is written by as many batch transactions as
+    /// its rows and the cache need, and a batch the cache refuses is retried
+    /// with fewer resources (see `index_deferred_batch`, #2031).
+    ///
     /// It never fails the Bundle, which has committed. A batch that cannot be
-    /// written and the `stop_at` deadline both stop the step: the chunk in hand
-    /// and every later chunk stay in the ledger for the repair, and are logged.
-    /// A stalled MongoDB therefore costs one batch's attempts, not one per
-    /// chunk. No attempt outlives `stop_at` (see `index_deferred_batch`). The
+    /// written, a resource the cache refuses in a transaction of its own (its
+    /// chunk's other resources are written first; the log names it) and the
+    /// `stop_at` deadline all stop the step: what the chunk in hand did not
+    /// write and every later chunk stay in the ledger for the repair, and are
+    /// logged. A stalled MongoDB therefore costs one batch's attempts, not one
+    /// per chunk. No attempt outlives `stop_at` (see
+    /// `index_deferred_batch_attempts`). The
     /// session is not used again after that, so its transaction, if one is
     /// still open, is aborted by the drop. Dropping the future aborts only the
     /// batch in flight; the batches before it have committed and the ledger
@@ -835,6 +1347,7 @@ impl MongoBackend {
             rows = stats.rows,
             batches = stats.batches,
             retries = stats.retries,
+            shrinks = stats.shrinks,
             ms = elapsed_ms,
             "transaction bundle search rows written after commit"
         );
@@ -874,13 +1387,21 @@ impl MongoBackend {
     /// current state with the same marker-gated batch transactions the
     /// post-commit step uses (no deadline), then deletes the document.
     ///
+    /// The batches are cut by rows and shrunk on a cache overflow exactly as the
+    /// step's are: both run `index_deferred_refs` (#2031).
+    ///
     /// A batch that runs out of attempts does not stop the document: the healthy
     /// batches are still written, and the document is kept with `not_before` set
     /// to now, `last_error` set and `attempts` incremented, so it is tried again
-    /// after another `min_age`. A document with no `refs` array, or with refs
-    /// that cannot be read, is kept the same way after its readable refs are
-    /// indexed. A document is never dropped without all of its resources being
-    /// indexed.
+    /// after another `min_age`. So does a resource the cache refuses in a
+    /// transaction of its own, as too large for one transaction (388, after one
+    /// attempt) or rolled back for cache pressure on each of its five attempts:
+    /// the others are written, the document is kept, and `last_error` names it
+    /// and its rows. Rebuilt from the ledger, its batch reads only the resources
+    /// still marked, so on the next pass that resource is tried alone, in one
+    /// transaction. A document with no `refs` array, or with refs that cannot be
+    /// read, is kept the same way after its readable refs are indexed. A
+    /// document is never dropped without all of its resources being indexed.
     ///
     /// Safe to call while a client write or a live request's post-commit step is
     /// working on the same resources: the batches are gated on the marker and
@@ -1460,6 +1981,127 @@ mod tests {
         for reply in failures {
             assert!(check_deferred_update_reply(&reply, 3).is_err(), "{reply:?}");
         }
+    }
+
+    /// #2031: the budget leaves a batch of ordinary resources whole. 256
+    /// resources at the benchmark's average of 18.6 rows are 4,762 rows, so a
+    /// typical Bundle is still cut by its resource count alone; and the budget
+    /// is one insert chunk, so a batch that stays under it is one `insert_many`.
+    #[test]
+    fn the_row_budget_keeps_an_average_batch_whole() {
+        const AVERAGE_ROWS_PER_RESOURCE_TENTHS: usize = 186;
+        let average_batch = DEFERRED_INDEX_BATCH_RESOURCES * AVERAGE_ROWS_PER_RESOURCE_TENTHS / 10;
+        assert_eq!(average_batch, 4_761);
+        assert!(
+            average_batch < DEFERRED_INDEX_BATCH_ROWS,
+            "{average_batch} rows of an average batch against a budget of {DEFERRED_INDEX_BATCH_ROWS}"
+        );
+        assert_eq!(DEFERRED_INDEX_BATCH_ROWS, SEARCH_INDEX_INSERT_CHUNK);
+        const {
+            assert!(DEFERRED_INDEX_BATCH_RESOURCES > 1 && DEFERRED_INDEX_BATCH_ROWS > 1);
+        }
+    }
+
+    #[test]
+    fn a_cache_refusal_halves_the_batch_down_to_one_resource() {
+        assert_eq!(halved_resource_limit(256), 128);
+        assert_eq!(halved_resource_limit(6), 3);
+        assert_eq!(halved_resource_limit(3), 1);
+        assert_eq!(halved_resource_limit(2), 1);
+        // One resource cannot be made smaller; the caller treats it as the
+        // resource's own failure and never asks.
+        assert_eq!(halved_resource_limit(1), 1);
+        assert_eq!(halved_resource_limit(0), 1);
+        // From two resources up the limit strictly shrinks, so a chunk always
+        // reaches one resource.
+        let mut held = DEFERRED_INDEX_BATCH_RESOURCES;
+        let mut steps = 0;
+        while held > 1 {
+            let next = halved_resource_limit(held);
+            assert!(next < held);
+            held = next;
+            steps += 1;
+        }
+        assert_eq!(steps, 8, "256 resources reach one in eight halvings");
+    }
+
+    #[test]
+    fn the_ids_a_cut_batch_leaves_are_the_ones_it_did_not_take_in_order() {
+        let ids: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let taken = vec!["d".to_string(), "a".to_string()];
+        assert_eq!(ids_not_taken(&ids, &taken), ["b", "c", "e"]);
+        assert_eq!(ids_not_taken(&ids, &[]), ids);
+        assert!(ids_not_taken(&ids, &ids).is_empty());
+        assert!(ids_not_taken(&[], &taken).is_empty());
+    }
+
+    #[test]
+    fn a_resource_that_does_not_fit_is_named_with_its_rows_and_the_servers_error() {
+        let error =
+            internal_error("Failed to insert deferred search index entries: 388".to_string());
+        let message = too_large_message("ValueSet", "vs-1", 123_456, &error);
+        assert!(
+            message.starts_with("ValueSet/vs-1 with 123456 rows is too large"),
+            "{message}"
+        );
+        assert!(message.contains("cannot be split"), "{message}");
+        assert!(message.ends_with(&error.to_string()), "{message}");
+
+        assert_eq!(refused_summary(&[]), "");
+        assert_eq!(refused_summary(&["one".to_string()]), "one");
+        assert_eq!(
+            refused_summary(&["one".to_string(), "two".to_string(), "three".to_string()]),
+            "one (and 2 more resources of the chunk were refused by the cache in a transaction \
+             of their own)"
+        );
+    }
+
+    /// A lone resource that a cache-pressure rollback left after all its
+    /// attempts is named with its rows and the attempts, and is not called too
+    /// large: the rollback is the cache's load, not the resource's size.
+    #[test]
+    fn a_resource_rolled_back_for_cache_pressure_is_not_called_too_large() {
+        let error =
+            internal_error("Failed to insert deferred search index entries: 365".to_string());
+        let message = cache_pressure_message("Organization", "o-1", 20, 5, &error);
+        assert!(
+            message.starts_with("Organization/o-1 with 20 rows was rolled back for cache pressure"),
+            "{message}"
+        );
+        assert!(message.contains("5 times"), "{message}");
+        assert!(message.contains("cannot be split"), "{message}");
+        assert!(!message.contains("too large"), "{message}");
+        assert!(message.ends_with(&error.to_string()), "{message}");
+        // Both messages begin `Type/id with N rows`.
+        let too_large = too_large_message("Organization", "o-1", 20, &error);
+        assert_eq!(
+            too_large.split(" is ").next(),
+            message.split(" was ").next(),
+            "{too_large} / {message}"
+        );
+    }
+
+    /// #2031: a replay is skipped only when it cannot help. Arguments: the
+    /// resources the failed transaction held, whether it was 388, whether it was
+    /// any cache failure (388 is one).
+    #[test]
+    fn a_failed_batch_is_replayed_unless_a_replay_cannot_help() {
+        // More than one resource, any cache failure: hand it back to be halved.
+        assert!(!replay_can_help(2, true, true));
+        assert!(!replay_can_help(256, false, true));
+        // A failure that is not the cache's is replayed at any size.
+        assert!(replay_can_help(2, false, false));
+        assert!(replay_can_help(256, false, false));
+        // One resource: 388 is that resource's own write set, final at once.
+        assert!(!replay_can_help(1, true, true));
+        // A cache-pressure rollback of a lone resource is the cache's load.
+        assert!(replay_can_help(1, false, true));
+        // Any other failure of a lone resource.
+        assert!(replay_can_help(1, false, false));
+        // Failed before it had read its resources (nothing to shrink): replayed
+        // whatever the failure was, a cache rollback included.
+        assert!(replay_can_help(0, false, true));
+        assert!(replay_can_help(0, false, false));
     }
 
     #[test]

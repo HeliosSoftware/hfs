@@ -1932,17 +1932,55 @@ Bundle changed SearchParameters, and then rewrites the rows:
   at or after the Bundle's commit, so a marker cannot be missed because the commit is not yet
   visible to it (for example under `readConcernLevel=majority` with `w:1`). A batch that finds no
   marker was finished by another rewriter.
-- Resources are taken in batches of up to 256 of one type. Each batch is its own small
-  transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
-  their old rows and inserts the new ones. It then makes one update per resource that removes the
+- Resources are taken in batches of up to 256 of one type, and a batch is cut by rows as well
+  (#2031): it takes resources until the rows built so far reach 5,000, and the resource that
+  reaches it is the last one it takes, so the budget is a soft cut, not a ceiling (a resource with
+  20,000 rows ends its batch, with whatever came before it). The 5,000 is the rows of one `insert_many` and a
+  little over the 4,762 rows of 256 resources at the benchmark's 18.6 rows each, so a batch of
+  ordinary resources is still 256 and only rows-heavy resources (a ValueSet expansion, a
+  CodeSystem) are split. The resources a batch leaves are the next batch's, in order. Each batch is
+  its own small transaction that selects the resources still carrying the marker, deletes their old
+  rows and inserts the new ones. It then makes one update per resource that removes the
   marker and writes `missing_params` and its fingerprint from the same extraction as the rows
   (a created, updated or restored resource has none until then): `[]` for a deleted
   resource, and removed when the extraction failed, as on every other write path. A batch that
   fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
   a ledger document are done, the document is deleted.
-- A batch that runs out of its five attempts stops the step: the rest of that ledger document and
-  every later one are left to the repair, so a stalled MongoDB costs one batch's attempts, not
-  one per document.
+- A batch of more than one resource whose transaction the server refuses because of the cache is
+  not tried again as it was (#2031): `TransactionTooLargeForCache` (388) and a rollback for cache
+  pressure (365, or a `WriteConflict` that names the eviction or the cache overflow) are not
+  replayed at that size, because the same writes meet the same cache. The retry takes half of the
+  resources the failed one held, again and again down to one resource, and the smaller size is kept
+  for the rest of that chunk of up to 256. The `shrinks` field of the log line counts these
+  retries. A failure that is not the cache's, and a failure before the batch has read its resources
+  (starting the transaction, the `find`: there is nothing to shrink), is tried again as before, at
+  the same size, up to five times.
+- One resource whose own transaction the cache refuses cannot be split: its old rows' delete, its
+  rows' insert and its marker's removal are one transaction (see below). What happens depends on
+  the refusal. With 388 the transaction's own write set is the cause, so a replay would fail the
+  same way: it fails after one attempt. With a cache-pressure rollback (365, or the labelled
+  `WriteConflict`) the cause is the cache's load at that moment, which another writer's work
+  changes, so it is tried again at the same size, five times in all, like any other failure, and
+  fails only when they run out. Either way the resource fails alone: every other resource of its
+  chunk is written, the resource stays marked, and its ledger document is kept. The `WARN` of the
+  step and the document's `last_error` name it. For 388 they say `Patient/<id> with N rows is too
+  large for one transaction and cannot be split`; for the rollback they say `Patient/<id> with N
+  rows was rolled back for cache pressure in a transaction of its own, 5 times, and cannot be
+  split`, which does not claim the resource is too large. The server's error follows. Finishing it
+  needs a larger cache, less competing load (or a smaller resource); the repair tries it again every
+  pass (one attempt for 388, five for a rollback), and the ledger's `attempts` counts those passes.
+  There is no terminal state: the document stays until the resource is written or deleted.
+  Measured on the test harness's mongod (`--wiredTigerCacheSizeGB 0.25`, the ignored test
+  `a_resource_whose_rows_overflow_the_real_cache_fails_alone`): a Patient of 20,004 rows committed
+  in one transaction, and one of 80,004 rows was refused with code 388 (`transaction is too large
+  and will not fit in the storage engine cache`; the whole live step took 6.2 s, one Bundle and
+  one refused transaction) and was left alone as described.
+- A batch that runs out of its five attempts, and a chunk with a resource the cache refuses in a
+  transaction of its own, both stop the step: the rest of that ledger document and every later one
+  are left to the repair, so a stalled MongoDB costs one batch's attempts, not one per document.
+  (The chunk with a refused resource is first finished: its other resources are written.) Three
+  such resources in a row, with no batch between them that committed, end the chunk too: the cache,
+  not one resource, is the problem.
 - The step starts no new attempt after the Bundle's own deadline (`bundle_transaction_deadline`:
   `HFS_REQUEST_TIMEOUT` less 2 s, counted from the call), and an attempt still running at the
   deadline is cut, so a committed Bundle is answered instead of timing out with `408` and being
@@ -1951,7 +1989,8 @@ Bundle changed SearchParameters, and then rewrites the rows:
   for the repair, and cancelling the request mid-step aborts only the batch in flight, since the
   batches before it have committed.
 - It logs one `INFO` line per Bundle, "transaction bundle search rows written after commit", with
-  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches`, `retries` and `ms`.
+  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches` (the batch
+  transactions that wrote resources), `retries`, `shrinks` and `ms`.
   If anything is left it also logs a `WARN`, "transaction bundle search rows not all written after
   commit; the deferred index repair will finish them", with `left_chunks`, `stopped_at_deadline`
   and `last_error`.
@@ -2030,11 +2069,18 @@ step that is still running.
   overlapping call) that read the same document finds the claim taken and skips it: that is the
   `skipped` field of `DeferredIndexRepairReport`, which is not counted in `examined`. A claimer
   that crashes leaves a document that is due again after `min_age`.
-- It runs the same marker-gated batches with no deadline. A batch that runs out of attempts does
-  not stop the document: the healthy batches are still written (up to three failed batches in a
-  row, so a MongoDB that is down does not cost every attempt of every batch), and the document is
-  kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
-  increased, and is retried after another `min_age`.
+- It runs the same marker-gated batches with no deadline, cut by rows and shrunk on a cache
+  overflow exactly as the step's are (one implementation, #2031). A batch that runs out of attempts
+  does not stop the document: the healthy batches are still written (up to three failed batches in
+  a row, so a MongoDB that is down does not cost every attempt of every batch), and the document
+  is kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
+  increased, and is retried after another `min_age`. A resource the cache refuses in a
+  transaction of its own (too large for one transaction with 388, after one attempt; rolled back
+  for cache pressure on each of five attempts) does not stop the document either, and does not
+  count toward those three (it shows the server is answering): the other resources and the later
+  chunks are written, and the document is kept with `last_error` naming the first such resource.
+  The rebuilt batch of a repair reads only the resources still marked, so after a pass that wrote
+  the others it is that one resource alone, in one transaction.
 - A document with no `refs` array, or with refs that cannot be read, is kept the same way, after
   its readable refs are indexed. Documents are never dropped before all of their resources are
   indexed. Every instance may run the repair.

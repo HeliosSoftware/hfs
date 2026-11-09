@@ -953,6 +953,37 @@ fn is_too_large_for_cache(err: &MongoError) -> bool {
     has_server_code(err, TRANSACTION_TOO_LARGE_FOR_CACHE_CODE)
 }
 
+/// True when `err` kept a driver error that says the cache could not hold the
+/// transaction's writes: `TransactionTooLargeForCache` ([`is_too_large_for_cache`])
+/// or a rollback under cache pressure ([`is_eviction_rollback`]: code 365, or a
+/// labelled `WriteConflict` that names the eviction or the cache overflow).
+/// These are the two classes the Bundle path refuses to replay (#1837, #1895):
+/// the same writes meet the same cache.
+///
+/// The deferred search rows' batch transaction (`deferred_index.rs`) answers
+/// this with a smaller transaction instead of a replay of the same one, and
+/// leaves a single resource that fails like this to fail alone (#2031). It
+/// walks the error's source chain, so it sees the driver error only where the
+/// failing site kept it ([`internal_driver_error`]), as every write of that
+/// batch does.
+pub(super) fn is_cache_overflow_failure(err: &StorageError) -> bool {
+    kept_driver_error(err)
+        .is_some_and(|driver| is_too_large_for_cache(driver) || is_eviction_rollback(driver))
+}
+
+/// True when `err` kept a `TransactionTooLargeForCache` (388), the one class of
+/// [`is_cache_overflow_failure`] that is about the transaction's own write set
+/// rather than the cache's load at that moment: WiredTiger rolled the
+/// transaction back because it holds most of the dirty cache by itself, so the
+/// same writes fail the same way (#1837). An eviction rollback (365, or a
+/// labelled 112) is the cache's load, which another writer's work can change.
+///
+/// The deferred rows' batch (#2031) refuses to replay a lone resource that
+/// fails with this, and replays one that fails with the other class.
+pub(super) fn is_too_large_for_cache_failure(err: &StorageError) -> bool {
+    kept_driver_error(err).is_some_and(is_too_large_for_cache)
+}
+
 /// The driver error `err` kept as its [`source`](std::error::Error::source), the
 /// first one found walking the chain. `None` when the failing site stringified
 /// it ([`internal_error`]) or never had one.
@@ -13424,6 +13455,88 @@ mod transient_abort_tests {
         ] {
             assert!(!is_eviction_rollback(&driver), "{driver}");
         }
+    }
+
+    /// #2031: the deferred rows' batch tells a cache failure, which it answers
+    /// with a smaller transaction, from every other failure, which it replays
+    /// at the same size. The classes are the Bundle path's own: 388 and the
+    /// eviction rollbacks, read off the driver error the failing write kept.
+    #[test]
+    fn a_cache_overflow_failure_is_388_or_an_eviction_rollback_and_nothing_else() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            too_large_write_error(),
+            insert_many_write_error(388),
+            command_error(365, "TemporarilyUnavailable"),
+            temporarily_unavailable_write_error(),
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CACHE_OVERFLOW_112),
+            write_conflict_write_error(CACHE_OVERFLOW_112),
+        ] {
+            let err =
+                internal_driver_error("Failed to insert deferred search index entries", driver);
+            assert!(is_cache_overflow_failure(&err), "{err}");
+        }
+        for driver in [
+            // A lost race is not the cache.
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            write_conflict_write_error(
+                "WriteConflict error: this operation conflicted with another operation.",
+            ),
+            command_error(2, "BadValue"),
+            insert_many_write_error(11000),
+            MongoError::custom("boom"),
+        ] {
+            let err =
+                internal_driver_error("Failed to insert deferred search index entries", driver);
+            assert!(!is_cache_overflow_failure(&err), "{err}");
+        }
+        // A failing site that stringified the driver error kept nothing to read.
+        assert!(!is_cache_overflow_failure(&internal_error(
+            "TransactionTooLargeForCache".to_string()
+        )));
+    }
+
+    /// #2031: of the cache failures only 388 is about the transaction's own
+    /// write set, so only it is refused a replay when it is a lone resource's.
+    /// An eviction rollback (365, a labelled 112) is the cache's load at that
+    /// moment and says nothing about the resource.
+    #[test]
+    fn only_388_is_a_too_large_for_cache_failure() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            too_large_write_error(),
+            insert_many_write_error(388),
+        ] {
+            let err =
+                internal_driver_error("Failed to insert deferred search index entries", driver);
+            assert!(is_too_large_for_cache_failure(&err), "{err}");
+            assert!(is_cache_overflow_failure(&err), "{err}");
+        }
+        for driver in [
+            command_error(365, "TemporarilyUnavailable"),
+            temporarily_unavailable_write_error(),
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CACHE_OVERFLOW_112),
+            write_conflict_write_error(CACHE_OVERFLOW_112),
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            command_error(2, "BadValue"),
+            insert_many_write_error(11000),
+            MongoError::custom("boom"),
+        ] {
+            let err =
+                internal_driver_error("Failed to insert deferred search index entries", driver);
+            assert!(!is_too_large_for_cache_failure(&err), "{err}");
+        }
+        // The eviction classes are still cache overflows, which is the point.
+        let eviction = internal_driver_error(
+            "Failed to insert deferred search index entries",
+            command_error(365, "TemporarilyUnavailable"),
+        );
+        assert!(is_cache_overflow_failure(&eviction));
+        assert!(!is_too_large_for_cache_failure(&internal_error(
+            "TransactionTooLargeForCache".to_string()
+        )));
     }
 
     #[test]

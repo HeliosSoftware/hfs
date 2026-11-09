@@ -1503,6 +1503,861 @@ async fn a_deferred_bundle_indexes_a_type_in_several_batches() {
         .collect();
     cleared.sort_unstable();
     assert_eq!(cleared, vec![1, 44, 256], "markers cleared per batch");
+
+    // A typical Bundle is cut by its resource count alone (#2031): the rows of
+    // an ordinary batch stay under the row budget, so the budget leaves the
+    // batch boundaries as they were. The Observations are the weight of the
+    // benchmark's average resource or more.
+    let rows = batch_txns(&oplog, &backend).await;
+    assert!(
+        rows.iter().all(|(_, rows)| *rows < ROW_BUDGET),
+        "no ordinary batch reaches the row budget: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The row budget and a cache overflow (#2031)
+// ---------------------------------------------------------------------------
+
+/// The rows a batch transaction may reach before it takes no further resource
+/// (`DEFERRED_INDEX_BATCH_ROWS`, which the test crate cannot read). The
+/// resource that reaches it is the last one the transaction takes.
+const ROW_BUDGET: usize = 5_000;
+
+/// A Patient with `identifiers` identifiers `H<tag>-<k>`: about that many
+/// search rows and a few dozen bytes of payload each.
+fn heavy_patient(tag: &str, identifiers: usize) -> Value {
+    let identifiers: Vec<Value> = (0..identifiers)
+        .map(|k| json!({"system": MRN_SYSTEM, "value": format!("H{tag}-{k}")}))
+        .collect();
+    json!({
+        "resourceType": "Patient",
+        "identifier": identifiers,
+        "name": [{"family": format!("Heavy{tag}")}],
+    })
+}
+
+/// `n` POST entries of [`heavy_patient`]s, each of its own tag.
+fn heavy_patients(n: usize, identifiers: usize) -> Vec<BundleEntry> {
+    (0..n)
+        .map(|k| {
+            post(
+                "Patient",
+                heavy_patient(&k.to_string(), identifiers),
+                &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            )
+        })
+        .collect()
+}
+
+/// The rows (own and contained) of a [`heavy_patient`] with `identifiers`
+/// identifiers, measured on a twin tenant, so a test computes where the budget
+/// cuts instead of hard-coding it.
+async fn rows_of_heavy_patient(backend: &MongoBackend, identifiers: usize) -> usize {
+    let twin = create_tenant("def-heavy-twin");
+    let lone = backend
+        .seed_create(
+            &twin,
+            "Patient",
+            heavy_patient("twin", identifiers),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create the twin Patient");
+    let (own, contained) =
+        row_counts(backend, twin.tenant_id().as_str(), "Patient", lone.id()).await;
+    (own + contained) as usize
+}
+
+/// `(resources cleared, search rows inserted)` of every post-commit batch
+/// transaction committed since the oplog window opened, in commit order: the
+/// transactions that insert no resource. A transaction that was aborted, or
+/// that found nothing to write, is not in the oplog.
+async fn batch_txns(oplog: &Oplog, backend: &MongoBackend) -> Vec<(usize, usize)> {
+    let db = backend.config().database_name.clone();
+    oplog
+        .committed(backend)
+        .await
+        .iter()
+        .filter(|ops| count_ops(ops, &db, "resources", "i") == 0)
+        .map(|ops| {
+            (
+                count_ops(ops, &db, "resources", "u"),
+                count_ops(ops, &db, "search_index", "i")
+                    + count_ops(ops, &db, "search_index_contained", "i"),
+            )
+        })
+        .collect()
+}
+
+/// The ids of the tenant's resources of `resource_type` that still carry the
+/// marker.
+async fn marked_ids(backend: &MongoBackend, tenant_id: &str, resource_type: &str) -> Vec<String> {
+    let rows: Vec<Document> = raw_db(backend)
+        .await
+        .collection::<Document>("resources")
+        .find(doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "search_rows_pending": { "$exists": true },
+        })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    sorted(
+        rows.iter()
+            .map(|row| row.get_str("id").unwrap().to_string())
+            .collect(),
+    )
+}
+
+/// Every resource of `stored` has exactly `per` rows and no marker, and the
+/// ledger is gone.
+async fn assert_every_patient_indexed(
+    backend: &MongoBackend,
+    tenant_id: &str,
+    stored: &[(String, String)],
+    per: usize,
+) {
+    assert_eq!(marker_count(backend, tenant_id).await, 0, "no marker");
+    assert_eq!(ledger_count(backend).await, 0, "no ledger document");
+    for (resource_type, id) in stored {
+        assert_eq!(
+            row_counts(backend, tenant_id, resource_type, id).await,
+            (per as u64, 0),
+            "{resource_type}/{id} has one row set"
+        );
+    }
+}
+
+/// The single ledger document.
+async fn the_ledger_document(backend: &MongoBackend) -> Document {
+    raw_db(backend)
+        .await
+        .collection::<Document>("search_index_pending")
+        .find_one(doc! {})
+        .await
+        .unwrap()
+        .expect("the ledger document is kept")
+}
+
+/// A transaction takes resources until their rows reach the budget, and the
+/// resource that reaches it is the last: `ceil(budget / rows)` Patients of
+/// `per` rows each. The Bundle's 2 * cut + 1 Patients are three batch
+/// transactions of `cut`, `cut` and 1 resources. The oplog is the proof: each
+/// committed batch holds its resources' rows, and without its last resource it
+/// was under the budget. Before the fix they were one transaction of all of
+/// them.
+#[tokio::test]
+async fn a_deferred_bundle_of_heavy_resources_is_indexed_in_row_budgeted_batches() {
+    const NAME: &str = "a_deferred_bundle_of_heavy_resources_is_indexed_in_row_budgeted_batches";
+    let Some(backend) = deferred_backend("def_rows", "def-rows", Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-rows");
+    let tenant_id = tenant.tenant_id().as_str();
+    const IDENTIFIERS: usize = 1_200;
+    let per = rows_of_heavy_patient(&backend, IDENTIFIERS).await;
+    let cut = ROW_BUDGET.div_ceil(per);
+    eprintln!("{NAME}: {per} rows per Patient; a batch takes {cut} of them");
+    assert!(
+        (2..40).contains(&cut),
+        "{per} rows per Patient: the budget cuts after {cut}, which must be more than one and \
+         well under the 256 of a full batch"
+    );
+    let oplog = Oplog::begin(&backend).await;
+
+    let n = 2 * cut + 1;
+    let Some(result) =
+        process_transaction_or_skip(&backend, &tenant, heavy_patients(n, IDENTIFIERS), NAME).await
+    else {
+        return;
+    };
+    let stored = located(&result);
+    assert_eq!(stored.len(), n);
+
+    assert_every_patient_indexed(&backend, tenant_id, &stored, per).await;
+    for k in [0, n - 1] {
+        assert_eq!(
+            search_ids(
+                &backend,
+                &tenant,
+                SearchQuery::new("Patient")
+                    .with_parameter(string_param("family", &format!("Heavy{k}")))
+            )
+            .await
+            .len(),
+            1,
+            "Patient?family=Heavy{k} finds its Patient"
+        );
+    }
+
+    let Some(oplog) = oplog else { return };
+    let batches = batch_txns(&oplog, &backend).await;
+    assert_eq!(
+        batches
+            .iter()
+            .map(|(cleared, _)| *cleared)
+            .collect::<Vec<_>>(),
+        vec![cut, cut, 1],
+        "three batch transactions: the budget cuts the {n} Patients after {cut}, {cut} and 1; \
+         rows per batch: {batches:?}"
+    );
+    for (cleared, rows) in &batches {
+        assert_eq!(*rows, cleared * per, "the batch holds its resources' rows");
+        assert!(
+            rows - per < ROW_BUDGET,
+            "without its last resource a batch is under the budget: {rows} rows"
+        );
+    }
+}
+
+/// What a Bundle of six Patients of about 500 rows each ran through when the
+/// batch's first `delete` (its first write) fails `times` times with
+/// `error_code`.
+struct SixPatients {
+    backend: MongoBackend,
+    tenant: TenantContext,
+    stored: Vec<(String, String)>,
+    per: usize,
+    /// How often the failpoint fired.
+    entered: i64,
+    /// `(resources cleared, rows)` of each committed batch, when the oplog is
+    /// readable.
+    batches: Option<Vec<(usize, usize)>>,
+}
+
+/// Six Patients of about 500 rows are 3,000 rows, under the budget: without a
+/// failure one batch transaction takes all six. The batch's first write, its
+/// stale-row `delete`, is failed `times` times with `error_code`. (A deferred
+/// POST-only Bundle sends no `delete` of its own, so the failpoint meets
+/// batches only.)
+async fn six_patients_through_a_failing_batch(
+    test: &str,
+    error_code: i32,
+    times: i64,
+) -> Option<SixPatients> {
+    let app = format!("fp-{test}");
+    let Some(backend) = deferred_backend(test, &app, Some(THRESHOLD), |_| {}).await else {
+        eprintln!("Skipping {test} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return None;
+    };
+    let tenant = create_tenant(test);
+    const IDENTIFIERS: usize = 500;
+    let per = rows_of_heavy_patient(&backend, IDENTIFIERS).await;
+    assert!(
+        6 * per < ROW_BUDGET,
+        "{per} rows per Patient: six of them must fit the budget"
+    );
+    let oplog = Oplog::begin(&backend).await;
+    let fail_point = FailPoint::enable(
+        &app,
+        doc! { "failCommands": ["delete"], "errorCode": error_code },
+        doc! { "times": times },
+    )
+    .await?;
+    let result = backend
+        .process_transaction(
+            &tenant,
+            heavy_patients(6, IDENTIFIERS),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if lacks_transactions(&result) {
+        return None;
+    }
+    let result = result.expect("a committed Bundle is not failed by its post-commit step");
+    let batches = match &oplog {
+        Some(oplog) => Some(batch_txns(oplog, &backend).await),
+        None => None,
+    };
+    Some(SixPatients {
+        stored: located(&result),
+        backend,
+        tenant,
+        per,
+        entered,
+        batches,
+    })
+}
+
+fn cleared_per_batch(batches: &[(usize, usize)]) -> Vec<usize> {
+    batches.iter().map(|(cleared, _)| *cleared).collect()
+}
+
+/// A batch whose transaction the server refuses as too large for the cache is
+/// not tried again as it was: the retry takes half of the resources (a replay
+/// of the same writes meets the same cache). Failed once, the six Patients are
+/// two batches of three; every resource ends with one row set. Before the fix
+/// the second attempt took all six again.
+async fn assert_a_failed_batch_is_retried_smaller(test: &str, error_code: i32) {
+    let Some(run) = six_patients_through_a_failing_batch(test, error_code, 1).await else {
+        return;
+    };
+    let tenant_id = run.tenant.tenant_id().as_str();
+    assert_eq!(run.entered, 1, "the failpoint fired once");
+    assert_every_patient_indexed(&run.backend, tenant_id, &run.stored, run.per).await;
+    let Some(batches) = run.batches else { return };
+    assert_eq!(
+        cleared_per_batch(&batches),
+        vec![3, 3],
+        "the retry took three of the six Patients, then the other three: {batches:?}"
+    );
+}
+
+/// `TransactionTooLargeForCache` (388).
+#[tokio::test]
+async fn a_batch_too_large_for_the_cache_is_retried_smaller() {
+    assert_a_failed_batch_is_retried_smaller("def_shrink_388", 388).await;
+}
+
+/// `TemporarilyUnavailable` (365), the code of a rollback for cache pressure
+/// (`is_eviction_rollback`; mongod also words it as a labelled 112).
+#[tokio::test]
+async fn a_batch_rolled_back_for_cache_pressure_is_retried_smaller() {
+    assert_a_failed_batch_is_retried_smaller("def_shrink_365", 365).await;
+}
+
+/// Failed twice the batch shrinks twice, 6, 3, 1: the six Patients end as six
+/// transactions of one, and the whole chunk is indexed. The smaller size is
+/// kept for the rest of the chunk.
+#[tokio::test]
+async fn a_batch_that_keeps_overflowing_the_cache_shrinks_to_one_resource() {
+    let Some(run) = six_patients_through_a_failing_batch("def_shrink_two", 388, 2).await else {
+        return;
+    };
+    let tenant_id = run.tenant.tenant_id().as_str();
+    assert_eq!(run.entered, 2);
+    assert_every_patient_indexed(&run.backend, tenant_id, &run.stored, run.per).await;
+    let Some(batches) = run.batches else { return };
+    assert_eq!(cleared_per_batch(&batches), vec![1; 6], "{batches:?}");
+}
+
+/// A failure that says nothing about the cache is tried again as it was: the
+/// second attempt is the same six resources in one transaction. (The attempt
+/// count of such a failure is pinned by
+/// `interrupted_post_commit_indexing_is_repaired_at_startup`.)
+#[tokio::test]
+async fn a_batch_that_fails_for_another_reason_is_retried_at_the_same_size() {
+    let Some(run) = six_patients_through_a_failing_batch("def_same_size", 2, 1).await else {
+        return;
+    };
+    let tenant_id = run.tenant.tenant_id().as_str();
+    assert_eq!(run.entered, 1);
+    assert_every_patient_indexed(&run.backend, tenant_id, &run.stored, run.per).await;
+    let Some(batches) = run.batches else { return };
+    assert_eq!(
+        cleared_per_batch(&batches),
+        vec![6],
+        "the retry takes the same six resources: {batches:?}"
+    );
+}
+
+/// One resource of a chunk whose own rows overflow the cache, as the live step
+/// (`via_repair` false) or the repair (true) meets it. Five Patients of about
+/// 2,000 rows are a batch of three (6,000 rows reach the budget) and one of
+/// two; a failpoint refuses the first two batch transactions as too large for
+/// the cache: the first of three Patients, then the first of those on its own.
+/// A resource that fails alone cannot be split (its stale-row delete, its row
+/// insert and its marker clear are one transaction), so it is the one left:
+/// the other four are indexed, one transaction each (the shrunken size is
+/// kept), and the failure names it.
+///
+/// Three Observations follow the Patients in the Bundle, in a chunk of their
+/// own. The live step stops at the failed chunk and leaves them (it keeps its
+/// contract: the repair finishes later); the repair goes on past it.
+///
+/// Before the fix the first batch took the five Patients in one transaction,
+/// which the failpoint refused, and five identical attempts later the whole
+/// chunk was left.
+async fn assert_one_resource_too_large_is_left_alone(test: &str, via_repair: bool) {
+    let app = format!("fp-{test}");
+    let Some(backend) = deferred_backend(test, &app, Some(THRESHOLD), |config| {
+        if via_repair {
+            // The live step starts no batch, and the ledger is the repair's.
+            config.bundle_transaction_deadline = Some(Duration::from_millis(1));
+        }
+    })
+    .await
+    else {
+        eprintln!("Skipping {test} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant(test);
+    let tenant_id = tenant.tenant_id().as_str();
+    const IDENTIFIERS: usize = 2_000;
+    let per = rows_of_heavy_patient(&backend, IDENTIFIERS).await;
+    assert!(
+        2 * per < ROW_BUDGET && 3 * per >= ROW_BUDGET,
+        "{per} rows per Patient: the budget must cut after three"
+    );
+    let mut entries = heavy_patients(5, IDENTIFIERS);
+    for n in 0..3 {
+        entries.push(post(
+            "Observation",
+            observation_json("Patient/def-big", n),
+            &format!("urn:uuid:def-big-{n}"),
+        ));
+    }
+    let oplog = Oplog::begin(&backend).await;
+
+    let repair_app = format!("fp-{test}-repair");
+    // The first failpoint is armed before the Bundle on the live path, whose
+    // step is the one refused; after it, for the repair's own client, on the
+    // repair path.
+    let first_app = if via_repair { &repair_app } else { &app };
+    let mut fail_point = None;
+    if !via_repair {
+        fail_point = FailPoint::enable(
+            first_app,
+            doc! { "failCommands": ["delete"], "errorCode": 388 },
+            doc! { "times": 2 },
+        )
+        .await;
+        if fail_point.is_none() {
+            return;
+        }
+    }
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
+    if lacks_transactions(&result) {
+        if let Some(fail_point) = fail_point {
+            fail_point.off().await;
+        }
+        return;
+    }
+    let result = result.expect("a committed Bundle is not failed by its post-commit step");
+    let stored = located(&result);
+    let patients: Vec<(String, String)> = stored[..5].to_vec();
+    let observations: Vec<(String, String)> = stored[5..].to_vec();
+    assert_eq!(patients[0].0, "Patient");
+    assert_eq!(observations[0].0, "Observation");
+
+    let repair = same_db_backend(&backend, &repair_app).await.unwrap();
+    if via_repair {
+        assert_eq!(marker_count(&backend, tenant_id).await, 8);
+        fail_point = FailPoint::enable(
+            first_app,
+            doc! { "failCommands": ["delete"], "errorCode": 388 },
+            doc! { "times": 2 },
+        )
+        .await;
+        if fail_point.is_none() {
+            return;
+        }
+        let report = repair
+            .repair_deferred_search_index(Duration::ZERO, 10)
+            .await
+            .unwrap();
+        let entered = fail_point.take().unwrap().off_and_count().await;
+        assert_eq!(entered, 2, "the first batch, then its first resource alone");
+        // The repair goes on past the chunk with the resource that does not fit.
+        assert_eq!(
+            (
+                report.examined,
+                report.reindexed,
+                report.cleared,
+                report.failed,
+                report.remaining
+            ),
+            (1, 7, 0, 1, 1),
+            "{report:?}"
+        );
+        assert_eq!(marker_count(&backend, tenant_id).await, 1);
+    } else {
+        let entered = fail_point.take().unwrap().off_and_count().await;
+        assert_eq!(entered, 2, "the first batch, then its first resource alone");
+        // The live step stops at the chunk that failed: the Observations stay.
+        assert_eq!(marker_count(&backend, tenant_id).await, 4);
+        assert_eq!(ledger_count(&backend).await, 1);
+        for observation in &observations {
+            assert_eq!(
+                row_counts(&backend, tenant_id, &observation.0, &observation.1).await,
+                (0, 0),
+                "the live step left the next chunk to the repair"
+            );
+        }
+    }
+
+    // Exactly one Patient is left, with no rows; the other four have theirs.
+    let left = marked_ids(&backend, tenant_id, "Patient").await;
+    assert_eq!(left.len(), 1, "one Patient does not fit: {left:?}");
+    let big = ("Patient".to_string(), left[0].clone());
+    assert_eq!(
+        row_counts(&backend, tenant_id, &big.0, &big.1).await,
+        (0, 0)
+    );
+    for patient in patients.iter().filter(|patient| **patient != big) {
+        assert_eq!(
+            row_counts(&backend, tenant_id, &patient.0, &patient.1).await,
+            (per as u64, 0),
+            "{}/{} is indexed",
+            patient.0,
+            patient.1
+        );
+    }
+    if let Some(oplog) = &oplog {
+        let batches = batch_txns(oplog, &backend).await;
+        let patient_batches: Vec<_> = batches.iter().filter(|(_, rows)| *rows == per).collect();
+        assert_eq!(
+            patient_batches.len(),
+            4,
+            "the other four Patients are one transaction each: {batches:?}"
+        );
+    }
+
+    // The repair writes the failure on the ledger document and names the
+    // resource. The live step only logs it, so the live path runs the repair
+    // once more, with one failure left in the failpoint: it meets the Patient
+    // alone, and the Observations are done with the repair's pass.
+    if !via_repair {
+        let fail_point = FailPoint::enable(
+            &repair_app,
+            doc! { "failCommands": ["delete"], "errorCode": 388 },
+            doc! { "times": 1 },
+        )
+        .await
+        .expect("the failpoint was available a moment ago");
+        let report = repair
+            .repair_deferred_search_index(Duration::ZERO, 10)
+            .await
+            .unwrap();
+        let entered = fail_point.off_and_count().await;
+        assert_eq!(
+            entered, 1,
+            "a lone resource that overflows the cache is not tried again as it was"
+        );
+        assert_eq!(
+            (
+                report.examined,
+                report.reindexed,
+                report.cleared,
+                report.failed,
+                report.remaining
+            ),
+            (1, 3, 0, 1, 1),
+            "the repair indexes the Observations the live step left: {report:?}"
+        );
+    }
+    let ledger = the_ledger_document(&backend).await;
+    assert_eq!(ledger.get_i32("attempts").unwrap(), 1);
+    let last_error = ledger.get_str("last_error").unwrap();
+    assert!(
+        last_error.contains(&format!("{}/{}", big.0, big.1))
+            && last_error.contains(&format!("{per} rows"))
+            && last_error.contains("too large for one transaction"),
+        "the ledger names the resource and its rows: {last_error}"
+    );
+    assert!(
+        ledger.get_datetime("not_before").unwrap() > ledger.get_datetime("created_at").unwrap(),
+        "the chunk waits another minimum age"
+    );
+    assert_eq!(marker_count(&backend, tenant_id).await, 1);
+    for observation in &observations {
+        assert!(
+            row_counts(&backend, tenant_id, &observation.0, &observation.1)
+                .await
+                .0
+                > 0,
+            "the Observations are indexed"
+        );
+    }
+
+    // Nothing is lost for good: with the cache clear, the next pass writes it.
+    let report = repair_until_clear(&repair).await;
+    assert_eq!((report.cleared, report.failed), (1, 0));
+    assert_every_patient_indexed(&backend, tenant_id, &patients, per).await;
+}
+
+#[tokio::test]
+async fn one_resource_too_large_for_one_transaction_is_left_alone_by_the_live_step() {
+    assert_one_resource_too_large_is_left_alone("def_big_live", false).await;
+}
+
+#[tokio::test]
+async fn one_resource_too_large_for_one_transaction_is_left_alone_by_the_repair() {
+    assert_one_resource_too_large_is_left_alone("def_big_repair", true).await;
+}
+
+/// A deferred Bundle whose first chunk is ONE resource: an ordinary Patient of
+/// about 400 rows, then four Observations in the next chunk. The batch's first
+/// `fail_command` is failed `times` times with `error_code` on the live step.
+struct LonePatient {
+    backend: MongoBackend,
+    tenant: TenantContext,
+    patient: (String, String),
+    observations: Vec<(String, String)>,
+    per: usize,
+    /// How often the failpoint fired.
+    entered: i64,
+    /// `(resources cleared, rows)` of each committed batch, when the oplog is
+    /// readable.
+    batches: Option<Vec<(usize, usize)>>,
+    repair_app: String,
+}
+
+/// Run a [`LonePatient`] Bundle with `fail_command` failed `times` times with
+/// `error_code`. A deferred POST-only Bundle sends no `delete` of its own, so a
+/// `delete` failpoint meets batches only; a `find` one may meet the Bundle's
+/// own reads first, which the caller's assertions would show.
+async fn lone_patient_through_a_failing_batch(
+    test: &str,
+    fail_command: &str,
+    error_code: i32,
+    times: i64,
+) -> Option<LonePatient> {
+    let app = format!("fp-{test}");
+    let Some(backend) = deferred_backend(test, &app, Some(THRESHOLD), |_| {}).await else {
+        eprintln!("Skipping {test} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return None;
+    };
+    let tenant = create_tenant(test);
+    const IDENTIFIERS: usize = 400;
+    let per = rows_of_heavy_patient(&backend, IDENTIFIERS).await;
+    assert!(per < ROW_BUDGET, "{per} rows: an ordinary resource");
+    let mut entries = vec![post(
+        "Patient",
+        heavy_patient("lone", IDENTIFIERS),
+        "urn:uuid:def-lone-patient",
+    )];
+    for n in 0..4 {
+        entries.push(post(
+            "Observation",
+            observation_json("Patient/def-lone", n),
+            &format!("urn:uuid:def-lone-{n}"),
+        ));
+    }
+    let oplog = Oplog::begin(&backend).await;
+    let fail_point = FailPoint::enable(
+        &app,
+        doc! { "failCommands": [fail_command], "errorCode": error_code },
+        doc! { "times": times },
+    )
+    .await?;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if lacks_transactions(&result) {
+        return None;
+    }
+    let result = result.expect("a committed Bundle is not failed by its post-commit step");
+    let stored = located(&result);
+    let batches = match &oplog {
+        Some(oplog) => Some(batch_txns(oplog, &backend).await),
+        None => None,
+    };
+    Some(LonePatient {
+        patient: stored[0].clone(),
+        observations: stored[1..].to_vec(),
+        repair_app: format!("{app}-repair"),
+        backend,
+        tenant,
+        per,
+        entered,
+        batches,
+    })
+}
+
+/// One repair pass, by a backend of its own, with the batch's `delete` failed
+/// `times` times with `error_code`. Returns the backend (for later passes), the
+/// report and how often the failpoint fired.
+async fn repair_with_failing_batch(
+    run: &LonePatient,
+    error_code: i32,
+    times: i64,
+) -> Option<(
+    MongoBackend,
+    helios_persistence::backends::mongodb::DeferredIndexRepairReport,
+    i64,
+)> {
+    let repair = same_db_backend(&run.backend, &run.repair_app)
+        .await
+        .unwrap();
+    let fail_point = FailPoint::enable(
+        &run.repair_app,
+        doc! { "failCommands": ["delete"], "errorCode": error_code },
+        doc! { "times": times },
+    )
+    .await?;
+    let report = repair
+        .repair_deferred_search_index(Duration::ZERO, 10)
+        .await
+        .unwrap();
+    let entered = fail_point.off_and_count().await;
+    Some((repair, report, entered))
+}
+
+/// The Patient and every Observation are indexed, nothing is marked and there
+/// is no ledger document.
+async fn assert_lone_patient_indexed(run: &LonePatient) {
+    let tenant_id = run.tenant.tenant_id().as_str();
+    assert_eq!(marker_count(&run.backend, tenant_id).await, 0, "no marker");
+    assert_eq!(ledger_count(&run.backend).await, 0, "no ledger document");
+    assert_eq!(
+        row_counts(&run.backend, tenant_id, &run.patient.0, &run.patient.1).await,
+        (run.per as u64, 0),
+        "the Patient has one row set"
+    );
+    for observation in &run.observations {
+        assert!(
+            row_counts(&run.backend, tenant_id, &observation.0, &observation.1)
+                .await
+                .0
+                > 0,
+            "{}/{} is indexed",
+            observation.0,
+            observation.1
+        );
+    }
+}
+
+/// The Patient and the four Observations are all still marked, with no rows,
+/// and the ledger document is kept.
+async fn assert_lone_patient_left_to_the_repair(run: &LonePatient) {
+    let tenant_id = run.tenant.tenant_id().as_str();
+    assert_eq!(marker_count(&run.backend, tenant_id).await, 5);
+    assert_eq!(ledger_count(&run.backend).await, 1);
+    for (resource_type, id) in std::iter::once(&run.patient).chain(&run.observations) {
+        assert_eq!(
+            row_counts(&run.backend, tenant_id, resource_type, id).await,
+            (0, 0),
+            "{resource_type}/{id} has no rows yet"
+        );
+    }
+}
+
+/// A chunk of ONE resource has nothing to shrink, and a rollback for cache
+/// pressure (365) says something about the cache's load at that moment, not
+/// about the resource: an ordinary Patient hit once by it is run again at the
+/// same size, like any other failure, and the live step indexes it. Before the
+/// follow-up of #2031 it was refused at once, written off as too large and the
+/// step stopped at its chunk.
+#[tokio::test]
+async fn a_lone_resource_rolled_back_once_for_cache_pressure_is_retried_at_the_same_size() {
+    let Some(run) = lone_patient_through_a_failing_batch("def_lone_once", "delete", 365, 1).await
+    else {
+        return;
+    };
+    assert_eq!(run.entered, 1, "the failpoint fired once");
+    assert_lone_patient_indexed(&run).await;
+    if let Some(batches) = &run.batches {
+        assert_eq!(
+            batches.first(),
+            Some(&(1, run.per)),
+            "the Patient is a batch of one, committed by the retry: {batches:?}"
+        );
+    }
+}
+
+/// The same lone resource rolled back for cache pressure on every attempt: it
+/// is tried five times (`DEFERRED_INDEX_BATCH_ATTEMPTS`), then left marked, and
+/// the live step stops at its chunk. The repair, with the same refusal on its
+/// five attempts, indexes the Observations the step left and keeps the ledger
+/// document, whose `last_error` says what happened: a cache-pressure rollback of
+/// a transaction of its own, not that the resource is too large.
+#[tokio::test]
+async fn a_lone_resource_rolled_back_for_cache_pressure_every_time_is_left_after_five_attempts() {
+    let Some(run) =
+        lone_patient_through_a_failing_batch("def_lone_always", "delete", 365, 100).await
+    else {
+        return;
+    };
+    assert_eq!(
+        run.entered, 5,
+        "five attempts at the same size, then the step stops at the chunk"
+    );
+    assert_lone_patient_left_to_the_repair(&run).await;
+
+    let Some((repair, report, entered)) = repair_with_failing_batch(&run, 365, 5).await else {
+        return;
+    };
+    assert_eq!(entered, 5, "the repair also tries the Patient five times");
+    assert_eq!(
+        (
+            report.examined,
+            report.reindexed,
+            report.cleared,
+            report.failed,
+            report.remaining
+        ),
+        (1, 4, 0, 1, 1),
+        "the Observations are written, the Patient is left: {report:?}"
+    );
+    let ledger = the_ledger_document(&run.backend).await;
+    let last_error = ledger.get_str("last_error").unwrap();
+    assert!(
+        last_error.starts_with(&format!(
+            "{}/{} with {} rows",
+            run.patient.0, run.patient.1, run.per
+        )) && last_error.contains("rolled back for cache pressure")
+            && !last_error.contains("too large"),
+        "the ledger names the resource and the cache pressure, and does not call it too large: \
+         {last_error}"
+    );
+
+    // Nothing is lost: once the cache is clear the next pass writes it.
+    let report = repair_until_clear(&repair).await;
+    assert_eq!((report.cleared, report.failed), (1, 0));
+    assert_lone_patient_indexed(&run).await;
+}
+
+/// `TransactionTooLargeForCache` (388) on a lone resource is different: the
+/// same writes meet the same cache, so it is refused after ONE attempt, by the
+/// step and by the repair alike, and the ledger says it is too large for one
+/// transaction.
+#[tokio::test]
+async fn a_lone_resource_refused_as_too_large_for_the_cache_is_tried_once() {
+    let Some(run) = lone_patient_through_a_failing_batch("def_lone_388", "delete", 388, 100).await
+    else {
+        return;
+    };
+    assert_eq!(
+        run.entered, 1,
+        "one attempt, then the step stops at the chunk"
+    );
+    assert_lone_patient_left_to_the_repair(&run).await;
+
+    let Some((repair, report, entered)) = repair_with_failing_batch(&run, 388, 100).await else {
+        return;
+    };
+    // The persistent failpoint also refuses the Observations' batch, in turn:
+    // what matters here is the Patient's one attempt, the first of the pass.
+    assert!(entered >= 1, "{entered}");
+    assert_eq!((report.examined, report.cleared, report.failed), (1, 0, 1));
+    let ledger = the_ledger_document(&run.backend).await;
+    let last_error = ledger.get_str("last_error").unwrap();
+    assert!(
+        last_error.starts_with(&format!(
+            "{}/{} with {} rows is too large for one transaction",
+            run.patient.0, run.patient.1, run.per
+        )) && !last_error.contains("cache pressure"),
+        "{last_error}"
+    );
+    let report = repair_until_clear(&repair).await;
+    assert_eq!((report.cleared, report.failed), (1, 0));
+    assert_lone_patient_indexed(&run).await;
+}
+
+/// A rollback for cache pressure before the batch has read its resources (the
+/// `find` of its first read) leaves nothing held and nothing to shrink: it is
+/// run again at the same size, and the chunk is indexed by the live step.
+/// Before the follow-up of #2031 it ended the chunk with no retry and the step
+/// left the whole Bundle to the repair.
+#[tokio::test]
+async fn a_cache_rollback_before_the_batch_has_read_its_resources_is_retried() {
+    let Some(run) = lone_patient_through_a_failing_batch("def_lone_find", "find", 365, 1).await
+    else {
+        return;
+    };
+    assert_eq!(run.entered, 1, "the failpoint fired once");
+    assert_lone_patient_indexed(&run).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -4718,4 +5573,116 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// #2031 on a real cache: one Patient whose rows alone overflow the test
+/// mongod's WiredTiger cache (`--wiredTigerCacheSizeGB 0.25`), next to four
+/// Observations. Its batch transaction is refused by the server as too large
+/// for the cache, with no failpoint, and it cannot be made smaller: it fails
+/// alone, naming itself, and the Observations are written (by the repair, the
+/// live step having stopped at the chunk that did not finish). Ignored: it
+/// pushes the shared mongod's cache to its limit, so run it by itself:
+///
+/// ```bash
+/// cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+///   a_resource_whose_rows_overflow_the_real_cache_fails_alone -- --ignored --nocapture
+/// ```
+///
+/// `HFS_TEST_DEFERRED_BIG_IDENTIFIERS` (default 80,000) is the Patient's
+/// identifiers, about one row each. A resource is capped at 16 MB of BSON, so
+/// a cache larger than the harness's cannot be overflowed by one resource; the
+/// test then says that the Patient fit and prints what it measured.
+#[tokio::test]
+#[ignore = "#2031: fills the test mongod's WiredTiger cache; run alone with --ignored --nocapture"]
+async fn a_resource_whose_rows_overflow_the_real_cache_fails_alone() {
+    const NAME: &str = "a_resource_whose_rows_overflow_the_real_cache_fails_alone";
+    let Some(backend) = deferred_backend(
+        "def_real_overflow",
+        "def-real-overflow",
+        Some(THRESHOLD),
+        |_| {},
+    )
+    .await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-real-overflow");
+    let tenant_id = tenant.tenant_id().as_str();
+    let identifiers = env_usize("HFS_TEST_DEFERRED_BIG_IDENTIFIERS", 80_000);
+    let mut entries = vec![post(
+        "Patient",
+        heavy_patient("big", identifiers),
+        "urn:uuid:def-real-big",
+    )];
+    for n in 0..4 {
+        entries.push(post(
+            "Observation",
+            observation_json("Patient/def-real", n),
+            &format!("urn:uuid:def-real-{n}"),
+        ));
+    }
+
+    let started = Instant::now();
+    let Some(result) = process_transaction_or_skip(&backend, &tenant, entries, NAME).await else {
+        return;
+    };
+    let live_secs = started.elapsed().as_secs_f64();
+    let stored = located(&result);
+    let big = stored[0].clone();
+    let rows = row_counts(&backend, tenant_id, &big.0, &big.1).await;
+    eprintln!(
+        "{NAME}: {identifiers} identifiers, live step {live_secs:.1} s, the Patient has {rows:?} \
+         rows, {} markers, {} ledger documents",
+        marker_count(&backend, tenant_id).await,
+        ledger_count(&backend).await
+    );
+    assert_eq!(
+        marked_ids(&backend, tenant_id, "Patient").await,
+        vec![big.1.clone()],
+        "the Patient fitted the cache after all: raise HFS_TEST_DEFERRED_BIG_IDENTIFIERS \
+         (rows written: {rows:?})"
+    );
+    assert_eq!(
+        rows,
+        (0, 0),
+        "the Patient has no rows: its transaction was refused"
+    );
+
+    let started = Instant::now();
+    let report = backend
+        .repair_deferred_search_index(Duration::ZERO, 10)
+        .await
+        .expect("repair pass");
+    eprintln!(
+        "{NAME}: repair pass {:.1} s: {report:?}",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        (
+            report.examined,
+            report.reindexed,
+            report.cleared,
+            report.failed
+        ),
+        (1, 4, 0, 1),
+        "{report:?}"
+    );
+    let ledger = the_ledger_document(&backend).await;
+    let last_error = ledger.get_str("last_error").unwrap();
+    eprintln!("{NAME}: last_error: {last_error}");
+    assert!(
+        last_error.contains(&format!("{}/{}", big.0, big.1))
+            && last_error.contains("too large for one transaction"),
+        "{last_error}"
+    );
+    for observation in &stored[1..] {
+        assert!(
+            row_counts(&backend, tenant_id, &observation.0, &observation.1)
+                .await
+                .0
+                > 0,
+            "the Observations are indexed"
+        );
+    }
 }
