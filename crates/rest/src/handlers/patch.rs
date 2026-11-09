@@ -80,8 +80,10 @@ where
         });
     }
 
-    // Negotiate response format from Accept header
+    // Negotiate response format from Accept header, and refuse a format this
+    // build cannot write before anything is patched.
     let negotiated = negotiate_format(&headers, None);
+    require_writable_answer(negotiated.format, &prefer)?;
 
     debug!(
         resource_type = %resource_type,
@@ -280,8 +282,10 @@ where
         });
     }
 
-    // Negotiate response format from Accept header
+    // Negotiate response format from Accept header, and refuse a format this
+    // build cannot write before anything is patched.
     let negotiated = negotiate_format(&headers, None);
+    require_writable_answer(negotiated.format, &prefer)?;
 
     // The raw query, as written: every occurrence of a repeated parameter
     // (#1321), decoded once by the shared criteria builder (#1322).
@@ -413,6 +417,23 @@ fn parse_patch_format(content_type: &str, body: &Bytes) -> RestResult<PatchForma
             content_type: content_type.to_string(),
         })
     }
+}
+
+/// Refuses, before the patch is applied, an answer this build cannot write.
+///
+/// Without the `xml` feature an XML answer can only be refused, and refusing
+/// it after the write leaves a `406` over a committed change. A patch is not
+/// idempotent (a JSON Patch `add` to an array appends again), so a client
+/// retrying that `406` would apply it twice. `Prefer: return=minimal` sends no
+/// body, so it needs no format and is let through.
+fn require_writable_answer(format: FhirFormat, prefer: &PreferHeader) -> RestResult<()> {
+    let needs_body = prefer.return_preference() != Some("minimal");
+    if needs_body && !cfg!(feature = "xml") && format == FhirFormat::Xml {
+        return Err(RestError::NotAcceptable {
+            message: "XML format is not supported (xml feature not enabled)".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Builds the response for a successful patch.

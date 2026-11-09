@@ -286,3 +286,52 @@ async fn patch_return_minimal_needs_no_format() {
         assert!(response.headers().get("etag").is_some(), "{label}: ETag");
     }
 }
+
+/// A patch is not idempotent, so a refused one must not have been applied: a
+/// `406` over a committed change invites a retry that applies it twice. The
+/// refusal comes before the write, and the stored version is untouched.
+#[cfg(not(feature = "xml"))]
+#[tokio::test]
+async fn refused_patch_is_not_applied() {
+    let server = server();
+    seed(&server).await;
+    let append = r#"[{"op":"add","path":"/name/-","value":{"family":"Appended"}}]"#;
+    for (label, path, content_type, body, prefer) in [
+        ("patch", "/Patient/p1", JSON_PATCH, append, None),
+        (
+            "patch, return=OperationOutcome",
+            "/Patient/p1",
+            JSON_PATCH,
+            append,
+            Some("return=OperationOutcome"),
+        ),
+        (
+            "conditional patch",
+            "/Patient?_id=p1",
+            MERGE_PATCH,
+            ACTIVATE_PATCH,
+            None,
+        ),
+    ] {
+        let mut request = server
+            .patch(path)
+            .add_header(ACCEPT, FHIR_XML)
+            .add_header(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        if let Some(prefer) = prefer {
+            request = request.add_header(PREFER, HeaderValue::from_static(prefer));
+        }
+        request
+            .bytes(body.into())
+            .await
+            .assert_status(StatusCode::NOT_ACCEPTABLE);
+
+        let stored = server
+            .get("/Patient/p1")
+            .add_header(ACCEPT, FHIR_JSON)
+            .await;
+        let stored: serde_json::Value = stored.json();
+        assert_eq!(stored["meta"]["versionId"], "1", "{label}: nothing written");
+        assert_eq!(stored["name"].as_array().map(Vec::len), Some(1), "{label}");
+        assert!(stored.get("active").is_none(), "{label}");
+    }
+}
