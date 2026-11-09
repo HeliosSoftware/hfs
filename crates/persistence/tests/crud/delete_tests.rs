@@ -179,10 +179,11 @@ async fn test_delete_already_deleted_fails() {
     let result = backend.delete(&tenant, "Patient", &id).await;
 
     assert!(result.is_err());
+    // One contract for "nothing to delete", never stored or already deleted:
+    // `NotFound` (#2523). The REST layer answers it as a `204` no-op.
     match result {
-        Err(StorageError::Resource(ResourceError::NotFound { .. }))
-        | Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
-        Err(e) => panic!("Expected NotFound or Gone error, got {:?}", e),
+        Err(StorageError::Resource(ResourceError::NotFound { .. })) => {}
+        Err(e) => panic!("Expected NotFound error, got {:?}", e),
         Ok(_) => panic!("Expected error"),
     }
 }

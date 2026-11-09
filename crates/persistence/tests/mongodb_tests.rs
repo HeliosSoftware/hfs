@@ -25163,6 +25163,10 @@ mongodb_bundle_identity_test!(
     conditional_delete_without_a_match_reports_not_found
 );
 mongodb_bundle_identity_test!(
+    mongodb_integration_instance_delete_with_nothing_to_delete_reports_not_found,
+    instance_delete_with_nothing_to_delete_reports_not_found
+);
+mongodb_bundle_identity_test!(
     mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
     changed_conditional_target_after_a_written_reference_rolls_back
 );

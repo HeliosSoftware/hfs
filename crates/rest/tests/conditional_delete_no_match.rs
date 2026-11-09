@@ -227,10 +227,12 @@ async fn prefer_operation_outcome_tells_deleted_from_no_match_in_every_fhir_vers
     }
 }
 
-/// Control: the instance delete honours the preference the same way, and a
-/// missing resource is still `404` rather than an informational `200`.
+/// The instance delete honours the preference the same way, and — like a
+/// conditional delete that matches nothing — answers a resource that is
+/// already deleted or never existed with the informational `200` (#2523),
+/// where it used to answer `404`.
 #[tokio::test]
-async fn instance_delete_honours_prefer_operation_outcome() {
+async fn instance_delete_honours_prefer_operation_outcome_also_with_nothing_to_delete() {
     let server = test_server().await;
     seed(&server).await;
 
@@ -245,14 +247,21 @@ async fn instance_delete_honours_prefer_operation_outcome() {
     );
     assert_eq!(ids(&server).await, ["b"]);
 
-    for missing in ["/Patient/a", "/Patient/never-existed"] {
-        server
-            .delete(missing)
+    for missing in ["a", "never-existed"] {
+        let response = server
+            .delete(&format!("/Patient/{missing}"))
             .add_header(X_TENANT_ID, tenant())
             .add_header(PREFER, RETURN_OUTCOME)
-            .await
-            .assert_status(StatusCode::NOT_FOUND);
+            .await;
+        assert_eq!(
+            informational_text(&response, missing),
+            format!(
+                "Resource Patient/{missing} does not exist or is already deleted; \
+                 nothing was deleted"
+            )
+        );
     }
+    assert_eq!(ids(&server).await, ["b"]);
 
     let response = server
         .delete("/Patient/b")
