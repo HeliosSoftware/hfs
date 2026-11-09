@@ -1898,22 +1898,27 @@ ends as `500` `too-costly`, and a transient abort is replayed as before); no ent
 it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
 the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update).
 
-A resource of a deferred type that the Bundle creates also carries no `missing_params` and no
-`missing_params_fp`
+A resource of a deferred type that the Bundle creates, updates or restores (a `PUT` to the id of a
+deleted resource) also carries no `missing_params` and no `missing_params_fp`
 ([missing-parameter metadata](mongodb/search-indexes.md#missing-parameter-metadata)) from
 the transaction (the `ifNoneExist` target types stay inline and keep their metadata in the
 transaction, see Conditional entries), and the transaction does not run the search extraction for
 it: the post-commit step (or the repair) writes the rows, `missing_params` and the fingerprint from
-one extraction, in the update that clears the marker. The array adds one multikey key per absent
-search parameter to `idx_resources_missing_params` (15.19 per resource, measured on the ceiling
-fixture's 267 entries) and the fingerprint one key to `idx_resources_missing_params_fp`, and
-WiredTiger holds every one of them in cache until the commit. Without them a create writes what an
-offloaded backend's create writes (the document, its history, one `null` key in
+one extraction, in the update that clears the marker (#2035; before it, an update or a restore
+extracted in the transaction and the step extracted again). The array adds one multikey key per
+absent search parameter to `idx_resources_missing_params` (15.19 per resource, measured on the
+ceiling fixture's 267 entries) and the fingerprint one key to `idx_resources_missing_params_fp`,
+and WiredTiger holds every one of them in cache until the commit. Without them a create writes what
+an offloaded backend's create writes (the document, its history, one `null` key in
 `idx_resources_missing_params`), plus the marker of about 60 bytes (measured: 1,736 bytes per
-`resources` document against 1,674). An update, a restore or a delete of an existing resource still
-writes its `missing_params` in the transaction, and the step rewrites it after the SearchParameter
-reload; every such update rewrites all of that resource's keys in `idx_resources_missing_params`,
-because `last_updated` is part of the index key. The collection and its `not_before` index
+`resources` document against 1,674). An update or a restore of an existing resource removes the
+`missing_params` and the fingerprint its previous version carried, so it ends in the state of a
+create: marked, with no metadata, until its batch. Because `last_updated` is part of the index key,
+that update still removes the resource's old keys from `idx_resources_missing_params` and leaves
+one `null` key, where an extracting update inserted every new key as well; the savings for an update
+are the extraction and the inserted keys, not a measured figure. A delete extracts nothing and
+still writes `missing_params: []` in the transaction, which is the smallest value of that index key,
+and the step writes the same `[]` with the fingerprint. The collection and its `not_before` index
 (`idx_search_index_pending_due`) are created at schema initialisation (schema version 13).
 
 **The step after the commit.** While it still holds its admission (so the next large Bundle does
@@ -1931,7 +1936,7 @@ Bundle changed SearchParameters, and then rewrites the rows:
   transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
   their old rows and inserts the new ones. It then makes one update per resource that removes the
   marker and writes `missing_params` and its fingerprint from the same extraction as the rows
-  (a created resource has none until then; an updated one is rewritten): `[]` for a deleted
+  (a created, updated or restored resource has none until then): `[]` for a deleted
   resource, and removed when the extraction failed, as on every other write path. A batch that
   fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
   a ledger document are done, the document is deleted.
@@ -1972,14 +1977,16 @@ that document serializes them: a loser starts again from the state the winner co
   deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
   Bundle deadline) plus up to one repair interval plus the time to write the rows.
 - A supported `:missing=true` search resolves on the resource document's `missing_params`. A
-  resource of a deferred type that the Bundle created has none until its batch commits (the
-  `ifNoneExist` target types keep theirs). It still carries the `search_rows_pending` marker
-  then, and `:missing=true` leaves a marked resource without `missing_params` out, like every other
-  search that reads rows, rather than answering it from rows that are not there yet (which would
-  list it as missing every parameter, so that `Patient?family:missing=true` found a Patient that
-  has a family). A conditional criterion with `:missing=true` from another client misses it the
-  same way during the lag. An updated resource keeps the `missing_params` its
-  transaction wrote, so it is answered at once, from its new content. `:missing=false` checks the
+  resource of a deferred type that the Bundle created, updated or restored has none until its
+  batch commits (the `ifNoneExist` target types keep theirs). It still carries the
+  `search_rows_pending` marker then, and `:missing=true` leaves a marked resource without
+  `missing_params` out, like every other search that reads rows, rather than answering it from rows
+  that are not there yet (which would list it as missing every parameter, so that
+  `Patient?family:missing=true` found a Patient that has a family). A conditional criterion with
+  `:missing=true` from another client misses it the same way during the lag. Before #2035 an
+  updated resource kept the `missing_params` its transaction wrote and was answered at once, from
+  its new content; it now waits for its batch like a created one, and is answered from its new
+  content once the batch has committed. `:missing=false` checks the
   rows, so like any other parameter it can miss the resources until their rows are written, and
   for an updated resource it sees the old rows. `:missing=true` reads rows too, and lags the same
   way, until `idx_resources_missing_params` is built, for a parameter the metadata route does not
@@ -1995,8 +2002,8 @@ that document serializes them: a loser starts again from the state the winner co
 - SearchParameters created or changed in the same Bundle apply to its deferred rows and to the
   `missing_params` the step writes, because the cache is reloaded after the commit and before the
   step. Rows and `missing_params` written inside a transaction are built before that reload: those
-  of an inline Bundle, of the `ifNoneExist` types of a deferred Bundle, and, until its batch
-  rewrites it, a deferred update's `missing_params`. A deferred create has none to rewrite.
+  of an inline Bundle and of the `ifNoneExist` types of a deferred Bundle. A deferred create,
+  update or restore has none to rewrite: its transaction writes none (#2035).
 
 **Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
 transaction through the search rows, so it must see an earlier entry of the same Bundle. A
