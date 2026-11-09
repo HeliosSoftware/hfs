@@ -1715,7 +1715,7 @@ async fn transaction_overlapping_targets_and_changed_forward_references_roll_bac
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. }),
         "{error:?}"
     );
     assert_eq!(
@@ -1755,7 +1755,8 @@ async fn transaction_overlapping_targets_and_changed_forward_references_roll_bac
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference") || message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. })
+            || matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference")),
         "{error:?}"
     );
     assert!(

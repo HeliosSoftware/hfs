@@ -1016,26 +1016,11 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
-            let e = match e {
-                TransactionError::BundleError { index, message } => TransactionError::BundleError {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    message,
-                },
-                TransactionError::PatchEntry {
-                    index,
-                    status,
-                    outcome,
-                } => TransactionError::PatchEntry {
-                    index: indexed_entries
-                        .get(index)
-                        .map_or(index, |(original, _, _)| *original),
-                    status,
-                    outcome,
-                },
-                other => other,
-            };
+            let e = with_client_entry_indices(e, |index| {
+                indexed_entries
+                    .get(index)
+                    .map_or(index, |(original, _, _)| *original)
+            });
             // Derive a sanitized reason so backend detail carried by a
             // rolled-back/internal transaction error never reaches the client
             // response, the audit trail, or the entry outcome. The raw detail is
@@ -3579,6 +3564,69 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
+/// Renames the entries a failed transaction names from the position the
+/// executor saw them at to the position the client sent them at (#922).
+///
+/// The executor receives the entries sorted by [`method_processing_order`], so
+/// every index it reports is a position in that list; the client can act only
+/// on the index in its own Bundle. `client_index` maps the first to the second.
+///
+/// Deliberately exhaustive, with no `other => other`: a variant that names an
+/// entry and was left to fall through reported the wrong one until it was
+/// mapped (`PreconditionFailed`, #922), so a new variant has to be classified
+/// here on purpose.
+fn with_client_entry_indices(
+    err: TransactionError,
+    client_index: impl Fn(usize) -> usize,
+) -> TransactionError {
+    match err {
+        TransactionError::BundleError { index, message } => TransactionError::BundleError {
+            index: client_index(index),
+            message,
+        },
+        TransactionError::PatchEntry {
+            index,
+            status,
+            outcome,
+        } => TransactionError::PatchEntry {
+            index: client_index(index),
+            status,
+            outcome,
+        },
+        TransactionError::PreconditionFailed { index, message } => {
+            TransactionError::PreconditionFailed {
+                index: client_index(index),
+                message,
+            }
+        }
+        // Names two entries, and both are positions in the executor's list.
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => TransactionError::OverlappingIdentity {
+            index: client_index(index),
+            entry,
+            identity,
+            other: client_index(other),
+            other_entry,
+        },
+        // These name no entry.
+        unindexed @ (TransactionError::Timeout { .. }
+        | TransactionError::RolledBack { .. }
+        | TransactionError::Transient { .. }
+        | TransactionError::CommitOutcomeUnknown { .. }
+        | TransactionError::TooLargeForCache { .. }
+        | TransactionError::InvalidTransaction
+        | TransactionError::NestedNotSupported
+        | TransactionError::MultipleMatches { .. }
+        | TransactionError::UnsupportedIsolationLevel { .. }
+        | TransactionError::AtomicityUnsupported { .. }) => unindexed,
+    }
+}
+
 /// The text an audit event or an entry outcome carries for a failed
 /// transaction: the sanitized `reason` from [`transaction_error_response_parts`]
 /// under a prefix that says what is known about the writes.
@@ -3641,6 +3689,29 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::BAD_REQUEST,
             "processing",
             format!("Transaction failed at entry {}: {}", index, message),
+        ),
+        // The same 400 `processing` the overlap was reported as while it was a
+        // `BundleError`: only the two entry numbers it names have changed
+        // (#922).
+        TransactionError::OverlappingIdentity {
+            index,
+            entry,
+            identity,
+            other,
+            other_entry,
+        } => (
+            StatusCode::BAD_REQUEST,
+            "processing",
+            format!(
+                "Transaction failed at entry {}: {}",
+                index,
+                TransactionError::identity_overlap_description(
+                    entry,
+                    identity,
+                    *other,
+                    other_entry
+                )
+            ),
         ),
         TransactionError::RolledBack { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4281,6 +4352,107 @@ mod tests {
                 level: "serializable".to_string(),
             });
         assert!(msg.contains("serializable"), "isolation message: {msg}");
+    }
+
+    /// The executor's entry positions become the client's Bundle indices for
+    /// every variant that names an entry, and both of an overlap's (#922).
+    /// `PreconditionFailed` was the variant that fell through unmapped.
+    #[test]
+    fn with_client_entry_indices_renames_every_entry_a_failure_names() {
+        // The executor saw the client's entries 2, 0 and 1 as its 0, 1 and 2.
+        let client_index = |index: usize| [2, 0, 1][index];
+
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 0,
+                message: "boom".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::BundleError { index: 2, message } if message == "boom"),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PatchEntry {
+                index: 1,
+                status: 422,
+                outcome: serde_json::json!({"resourceType": "OperationOutcome"}),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(
+                &renamed,
+                TransactionError::PatchEntry {
+                    index: 0,
+                    status: 422,
+                    ..
+                }
+            ),
+            "{renamed:?}"
+        );
+
+        let renamed = with_client_entry_indices(
+            TransactionError::PreconditionFailed {
+                index: 0,
+                message: "stale".to_string(),
+            },
+            client_index,
+        );
+        assert!(
+            matches!(&renamed, TransactionError::PreconditionFailed { index: 2, message } if message == "stale"),
+            "{renamed:?}"
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(code, "conflict");
+        assert_eq!(text, "Transaction failed at entry 2: stale");
+
+        let renamed = with_client_entry_indices(
+            TransactionError::OverlappingIdentity {
+                index: 1,
+                entry: "PUT Patient?identifier=x".to_string(),
+                identity: "Patient/p1".to_string(),
+                other: 0,
+                other_entry: "DELETE Patient/p1".to_string(),
+            },
+            client_index,
+        );
+        let (status, code, text) = transaction_error_response_parts(&renamed);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "processing");
+        assert!(
+            text.starts_with("Transaction failed at entry 0: PUT Patient?identifier=x resolves to Patient/p1, which entry 2 (DELETE Patient/p1) also addresses;"),
+            "{text}"
+        );
+
+        // An index the sort did not produce is left as it was.
+        let renamed = with_client_entry_indices(
+            TransactionError::BundleError {
+                index: 7,
+                message: "m".to_string(),
+            },
+            |index| [2, 0, 1].get(index).copied().unwrap_or(index),
+        );
+        assert!(
+            matches!(renamed, TransactionError::BundleError { index: 7, .. }),
+            "{renamed:?}"
+        );
+
+        // A failure that names no entry is returned as it came.
+        let renamed = with_client_entry_indices(
+            TransactionError::MultipleMatches {
+                operation: "delete".to_string(),
+                count: 2,
+            },
+            client_index,
+        );
+        assert!(
+            matches!(renamed, TransactionError::MultipleMatches { count: 2, .. }),
+            "{renamed:?}"
+        );
     }
 
     /// A failed entry carries the issue code the single-resource endpoint

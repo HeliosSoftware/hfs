@@ -226,7 +226,7 @@ async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. }),
         "{error:?}"
     );
     assert_eq!(
@@ -272,7 +272,8 @@ async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference") || message.contains("overlap")),
+        matches!(error, TransactionError::OverlappingIdentity { .. })
+            || matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference")),
         "{error:?}"
     );
     assert!(
