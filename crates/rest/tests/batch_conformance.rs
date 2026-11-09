@@ -1472,7 +1472,8 @@ mod conditional_entries {
 
         let entry = &body["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/p1");
+        // Versioned, as the transaction arm answers it (#2517).
+        assert_eq!(entry["response"]["location"], "Patient/p1/_history/2");
         assert_eq!(entry["resource"]["id"], "p1");
         assert_eq!(family_of(&backend, "p1").await, "Updated");
         assert_eq!(

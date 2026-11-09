@@ -24,7 +24,7 @@ use helios_persistence::core::{
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
     PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider,
     SystemHistoryProvider, WriteKind, WriteNotice, apply_patch_for_version, bundle_if_match_gate,
-    decode_bundle_patch_resource,
+    conditional_update_entry, decode_bundle_patch_resource,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
@@ -1605,10 +1605,9 @@ where
                             None,
                         );
                         record_stored_profile(state, tenant, fhir_version, &stored);
-                        let location = format!("{}/{}", stored.resource_type(), stored.id());
-                        let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(location);
-                        result
+                        // The versioned location, as the transaction path's
+                        // `conditional_update_entry` answers it (#2517).
+                        conditional_update_entry(stored)
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
                         super::write_event::report(
@@ -1702,8 +1701,11 @@ where
                         BundleEntryResult::created(stored)
                     } else {
                         // For updates, include location with versioned URL
+                        // (#2517): `[type]/[id]/_history/[vid]`, the form the
+                        // created arm and every conditional arm answer.
+                        let location = stored.versioned_url();
                         let mut result = BundleEntryResult::updated(stored);
-                        result.location = Some(format!("{}/{}", resource_type, id));
+                        result.location = Some(location);
                         result
                     }
                 }
@@ -1947,10 +1949,9 @@ where
             .then(|| super::write_event::stored_notice(WriteKind::Update, &stored)),
     );
     record_stored_profile(state, tenant, stored.fhir_version(), &stored);
+    let location = criteria.is_none().then(|| stored.versioned_url());
     let mut result = BundleEntryResult::updated(stored);
-    if criteria.is_none() {
-        result.location = Some(format!("{resource_type}/{id}"));
-    }
+    result.location = location;
     result
 }
 
@@ -5995,7 +5996,7 @@ mod tests {
         );
         let entry = &response["entry"][0];
         assert_eq!(entry["response"]["status"], "200 OK", "{entry}");
-        assert_eq!(entry["response"]["location"], "Patient/existing");
+        assert_eq!(entry["response"]["location"], "Patient/existing/_history/1");
         assert_eq!(entry["resource"]["id"], "existing");
 
         let state = state_with(DelayStorage::conditional(ConditionalReply::Created));
