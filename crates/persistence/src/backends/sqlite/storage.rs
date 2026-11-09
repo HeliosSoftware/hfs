@@ -5550,11 +5550,12 @@ mod tests {
         }
         let backend = create_test_backend();
         let tenant = create_test_tenant();
-        let conn = backend.get_connection().unwrap();
+        let mut conn = backend.get_connection().unwrap();
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(record),
-        );
+        )
+        .unwrap();
         drop(conn);
         // The in-memory pool may hand the same connection back; if not, the
         // trace is on another and the assertion below says so.
