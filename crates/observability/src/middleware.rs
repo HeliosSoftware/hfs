@@ -230,6 +230,8 @@ pub async fn track(req: Request, next: Next) -> Response {
             tenant = %tenant,
             http.status_code = tracing::field::Empty,
         );
+        #[cfg(feature = "otel")]
+        crate::telemetry::adopt_remote_parent(&span, req.headers());
         let response = next.run(req).instrument(span.clone()).await;
         span.record("http.status_code", response.status().as_u16());
         response
