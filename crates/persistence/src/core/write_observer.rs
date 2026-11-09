@@ -13,9 +13,9 @@
 //! - [`ResourceWrite::live_delta`] — how the number of live resources of the
 //!   type changed. Counters read only this.
 //! - [`ResourceWrite::notice`] — what resource notifications should say about
-//!   the write, decided by the write path exactly as notifications were decided
-//!   before this funnel existed. `None` is a deliberate "do not notify" (for
-//!   example conditional writes), not a missing value.
+//!   the write, decided by the write path. `None` is a deliberate "do not
+//!   notify" (the write is counted but not announced), not a missing value.
+//!   Conditional writes announce like their unconditional counterparts (#862).
 //!
 //! Observers are called synchronously right after the write committed, on the
 //! request or worker thread: implementations must be cheap and must never

@@ -356,14 +356,17 @@ where
                     stored.content(),
                 );
             }
-            // Conditional writes announce nothing.
+            // Announced like the instance patch above (#862).
             super::write_event::report(
                 &state,
                 tenant.context(),
                 stored.fhir_version(),
                 &resource_type,
                 0,
-                None,
+                Some(super::write_event::stored_notice(
+                    helios_persistence::core::WriteKind::Update,
+                    &stored,
+                )),
             );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_patch_response(&stored, headers, &prefer, negotiated.format).map(

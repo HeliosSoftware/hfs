@@ -649,9 +649,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_create_reports_plus_one_without_a_notice() {
+    async fn conditional_create_reports_plus_one_and_a_create_notice() {
         let h = harness();
-        h.server
+        let created = h
+            .server
             .post("/Patient")
             .add_header(X_TENANT_ID, header(TENANT))
             .add_header(
@@ -659,12 +660,16 @@ mod tests {
                 HeaderValue::from_static("_id=obs-none"),
             )
             .json(&json!({"resourceType": "Patient"}))
-            .await
-            .assert_status(StatusCode::CREATED);
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let id = created.json::<serde_json::Value>()["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
         assert_eq!(
             summarize(&h.recording.take()),
-            vec![("Patient".to_string(), 1, None, None)],
-            "conditional writes keep announcing nothing"
+            vec![("Patient".to_string(), 1, Some(WriteKind::Create), Some(id))],
+            "a conditional create announces like a plain one (#862)"
         );
     }
 
