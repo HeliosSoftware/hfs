@@ -21,15 +21,16 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
-    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
-    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider,
-    SystemHistoryProvider, WriteKind, WriteNotice, apply_patch_for_version, bundle_if_match_gate,
-    conditional_update_entry, decode_bundle_patch_resource,
+    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
+    EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
+    apply_patch_for_version, bundle_if_match_gate, conditional_update_entry,
+    decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
 };
-use helios_persistence::types::SearchParameter;
+use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -1068,37 +1069,51 @@ where
     }
 }
 
+/// A batch entry's `ifMatch` that held: the precondition, and the stored row it
+/// was evaluated against. The entry's write is pinned to `current`.
+struct HeldIfMatch {
+    precondition: EntityTagPrecondition,
+    current: StoredResource,
+}
+
 /// Evaluates a batch entry's `ifMatch` precondition against stored state.
 ///
-/// Returns `Some` when the entry must not proceed — either the 412 the gate
-/// produced, or a storage error rendered as an entry result. Returns `None`
-/// when there was no precondition to check, or it was satisfied.
+/// Returns `Err` when the entry must not proceed — either the 412 the gate
+/// produced, or a storage error rendered as an entry result. Returns
+/// `Ok(None)` when there was no precondition to check, and `Ok(Some(held))`
+/// when it was satisfied, carrying the row it was satisfied by.
 ///
 /// `ifMatch` is a list, satisfied when any listed tag matches (#311), and `*`
 /// requires a current representation — so a supplied `ifMatch` against an
 /// absent or deleted resource fails rather than silently creating.
 ///
-/// **This is a read-then-write check, not an atomic compare-and-swap.** The
-/// backends reach an atomic re-check through `update_with_match`, which lives on
-/// [`VersionedStorage`]; this gate does not use it, so a writer can land between
-/// the read and the write. The window is the same one `handlers::update`
-/// already carries for single-resource updates, with one addition worth naming:
-/// entries within a bundle now run concurrently, so two entries carrying
-/// `ifMatch` for the same id can both pass this gate and both write.
+/// **The caller writes against `held.current`, not against whatever is current
+/// when it writes** (#2527). The `PUT` arm hands it to
+/// [`ResourceStorage::update`] and the `DELETE` arm to
+/// [`delete_under_precondition`], whose compare-and-swap is keyed on its
+/// version, as `handlers::update` and `handlers::delete` do for the single
+/// requests (#1404). A writer that lands between this read and the write, from
+/// another request or from another entry of the same bundle (entries run
+/// concurrently, #505), therefore ends the entry in `VersionConflict` → 409
+/// rather than in a write over a version the client never saw; a resource
+/// deleted in that window is 404 for a `PUT`, not a revival. Before #2527 the
+/// row was dropped here and the arms wrote unconditionally.
 ///
-/// [`VersionedStorage`]: helios_persistence::core::VersionedStorage
+/// [`delete_under_precondition`]: helios_persistence::core::delete_under_precondition
 async fn check_entry_if_match<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     resource_type: &str,
     id: &str,
     if_match: Option<&str>,
-) -> Option<BundleEntryResult>
+) -> Result<Option<HeldIfMatch>, Box<BundleEntryResult>>
 where
     S: ResourceStorage + Send + Sync,
 {
     // Entries that send no precondition pay nothing — not even the read.
-    if_match?;
+    let Some(raw) = if_match else {
+        return Ok(None);
+    };
 
     let current = match state
         .storage()
@@ -1110,10 +1125,27 @@ where
         // precondition rather than a storage error — the same mapping
         // `handlers::update` and the backends' own batch arms make.
         Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-        Err(e) => return Some(entry_storage_failure(e)),
+        Err(e) => return Err(Box::new(entry_storage_failure(e))),
     };
 
-    bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+    if let Some(failure) = bundle_if_match_gate(Some(raw), current.as_ref().map(|r| r.version_id()))
+    {
+        return Err(Box::new(failure));
+    }
+
+    // The gate parsed `raw` and found it satisfied, so this parse succeeds and
+    // `current` is `Some`: `*` requires a current version and no tag matches
+    // `None`. Neither fallback can run; both fail closed rather than panic.
+    let precondition = conditional_entry_if_match(Some(raw))?;
+    let current = current.ok_or_else(|| {
+        Box::new(precondition_failed_entry(
+            "If-Match precondition failed: the resource has no current version",
+        ))
+    })?;
+    Ok(Some(HeldIfMatch {
+        precondition,
+        current,
+    }))
 }
 
 /// The notice kind a committed transaction write announces, or `None` when
@@ -1645,11 +1677,11 @@ where
             // Ahead of validation, because every backend evaluates `ifMatch`
             // first: a stale precondition carrying an invalid body is a 412,
             // not a 422.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
@@ -1660,17 +1692,31 @@ where
                 return entry_failure(e);
             }
 
-            match state
-                .storage()
-                .create_or_update(
-                    tenant.context(),
-                    &resource_type,
-                    &id,
-                    resource,
-                    fhir_version,
-                )
-                .await
-            {
+            // With a held `ifMatch` the write is a compare-and-swap against the
+            // row the precondition was evaluated on, as `handlers::update`
+            // does (#2527): a version written since is `VersionConflict` → 409,
+            // a delete since is `NotFound` → 404 rather than a revival.
+            // Without one it is the last-writer-wins upsert it always was.
+            let written = match held {
+                Some(held) => state
+                    .storage()
+                    .update(tenant.context(), &held.current, resource)
+                    .await
+                    .map(|stored| (stored, false)),
+                None => {
+                    state
+                        .storage()
+                        .create_or_update(
+                            tenant.context(),
+                            &resource_type,
+                            &id,
+                            resource,
+                            fhir_version,
+                        )
+                        .await
+                }
+            };
+            match written {
                 Ok((stored, created)) => {
                     super::write_event::report(
                         state,
@@ -1764,18 +1810,34 @@ where
 
             // Honour `ifMatch` on DELETE: a client asking to delete only the
             // version it reviewed must not destroy a concurrent amendment.
-            if let Some(failure) =
-                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
-            {
-                return failure;
-            }
+            let held =
+                match check_entry_if_match(state, tenant, &resource_type, &id, if_match).await {
+                    Ok(held) => held,
+                    Err(failure) => return *failure,
+                };
 
-            // Delete operation
-            match state
-                .storage()
-                .delete(tenant.context(), &resource_type, &id)
-                .await
-            {
+            // With a held `ifMatch` the delete is pinned to the version just
+            // evaluated, as `handlers::delete` does (#1404, #2527): a version
+            // written since is `VersionConflict` → 409 and survives. Without
+            // one it is the plain delete it always was.
+            let deleted = match held {
+                Some(held) => {
+                    delete_under_precondition(
+                        state.storage(),
+                        tenant.context(),
+                        &held.precondition,
+                        &held.current,
+                    )
+                    .await
+                }
+                None => {
+                    state
+                        .storage()
+                        .delete(tenant.context(), &resource_type, &id)
+                        .await
+                }
+            };
+            match deleted {
                 Ok(()) => {
                     super::write_event::report(
                         state,
@@ -1790,8 +1852,10 @@ where
                 // Nothing to delete — never there, or already deleted — is the
                 // same successful no-op as `DELETE [type]/[id]` (#2523) and the
                 // conditional no-match above: `204`, and nothing announced.
-                // `ifMatch` cannot reach here for an absent resource; its gate
-                // above has already answered `412`.
+                // With `ifMatch` the same error is not a no-op: an absent
+                // resource already answered `412` at the gate, and one deleted
+                // after the gate lost a delete pinned to a version, so it keeps
+                // its storage mapping (`404`), as `handlers::delete` does.
                 Err(StorageError::Resource(
                     ResourceError::NotFound { .. } | ResourceError::Gone { .. },
                 )) if if_match.is_none() => BundleEntryResult::delete_not_found(),

@@ -99,6 +99,49 @@ async fn log_and_off_modes_do_not_reject() {
     }
 }
 
+/// A batch `PUT` checks its `ifMatch` before it validates the body, as every
+/// backend's own bundle arm does: a stale tag carrying an invalid body is
+/// `412`, and the same body under a satisfied tag is `422` (#505, #2527).
+#[tokio::test]
+async fn batch_put_if_match_is_checked_before_validation() {
+    let server = create_test_server("enforce").await;
+    let seeded = server
+        .put("/Patient/guarded")
+        .json(&json!({"resourceType": "Patient", "id": "guarded", "active": true}))
+        .await;
+    assert_eq!(seeded.status_code(), 201, "{}", seeded.text());
+
+    let mut invalid = invalid_patient();
+    invalid["id"] = json!("guarded");
+    let response = server
+        .post("/")
+        .json(&json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                {
+                    "request": { "method": "PUT", "url": "Patient/guarded", "ifMatch": "W/\"7\"" },
+                    "resource": invalid.clone()
+                },
+                {
+                    "request": { "method": "PUT", "url": "Patient/guarded", "ifMatch": "W/\"1\"" },
+                    "resource": invalid
+                }
+            ]
+        }))
+        .await;
+    response.assert_status_ok();
+    let bundle: Value = response.json();
+    let status = |i: usize| {
+        bundle["entry"][i]["response"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(status(0).starts_with("412"), "stale tag first: {bundle:#}");
+    assert!(status(1).starts_with("422"), "then validation: {bundle:#}");
+}
+
 #[tokio::test]
 async fn enforce_mode_rejects_invalid_batch_entries_individually() {
     let server = create_test_server("enforce").await;
