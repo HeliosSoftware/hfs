@@ -1602,4 +1602,4 @@ backend_id="postgres" failures=3` twice on `pg-es`. A client-caused `Gone` is co
 failure; this is the tracked issue #2532 (evidence added there). The warning is harmless for the pass.
 
 **Result:** T0-T9 completed. One new application issue (finding 12, #2547) and one known one (finding 13, #2532); everything else is
-documented behavior, script/matrix corrections, or settings outside the recipe.
+documented behavior, corrections to the matrix text, or settings outside the recipe.

@@ -5,7 +5,7 @@ Everything here was produced by the run described in `RESULTS.md`. Sizes are app
 | Path | What it is |
 |---|---|
 | `RESULTS.md` | Result, deviations, findings with their classification, every row |
-| `shots/` | 321 screenshots, 1280x800, named `Tn-<row>-<what>-NN.png` (`-rerun` = repeated row) |
+| `shots/` | 324 screenshots, 1280x800, named `Tn-<row>-<what>-NN.png` (`-rerun` = repeated row) |
 | `outputs/` | API responses, manifests, exports and counts saved by the scripts (165 entries); `t3-pg-counts.tsv` and `t3-es-counts.tsv` are the per-type counts of T3 |
 | `samples/` | one small download per export kind (the 84 MB JSON exports of 7.big-json are not committed) |
 | `logs/` | HFS server log (`hfs-pg-es.log`), per-step console output, run progress, build tail |
@@ -15,8 +15,8 @@ Everything here was produced by the run described in `RESULTS.md`. Sizes are app
 ## Screenshots by step
 
 - **T1**: 3 files
-- **T2**: 22 files
-- **T3**: 7 files
+- **T2**: 24 files
+- **T3**: 8 files
 - **T4**: 107 files
 - **T5**: 55 files
 - **T6**: 21 files
