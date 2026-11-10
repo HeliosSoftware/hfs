@@ -1570,14 +1570,15 @@ commit, since every attempt meets the same cache, and answers `500` with a `too-
 OperationOutcome that names the WiredTiger cache and the Bundle's entry count and says that
 resubmitting it unchanged will fail the same way. It also names the ways out: smaller transaction
 Bundles with client-assigned ids (PUT), `$bulk-submit` if the server enables it, or a larger cache.
-The driver's text stays in the server log (#1837); a commit-time 388 is logged with the prefix
-`Commit failed:`. Size `--wiredTigerCacheSizeGB` with the rule above, or use one of the
-alternatives listed there. In the HFS benchmark at `--wiredTigerCacheSizeGB 2` (runs 40728433458
-and 40772360813), the four Bundles above 30,000 entries end with `TooLargeForCache` on both
-MongoDB legs, at entries 28,627-31,983, and on the `mongodb` leg the 49,027-entry Bundle ends as a
-lone eviction rollback (described below). The first benchmark with the search rows deferred (run
-39657850695) had the `mongodb` leg abort lower, at 19,200-21,100 entries. The ignored ceiling test
-of the
+The driver's text stays in the server log (#1837); the log reason's prefix says where it happened:
+`Entry N processing failed:` for an entry's write, `Deferred search index ledger write failed:` for
+the ledger of a deferred Bundle (below), and `Commit failed:` for a commit-time 388 (#2037). Size
+`--wiredTigerCacheSizeGB` with the rule above, or use one of the alternatives listed there. In the
+HFS benchmark at `--wiredTigerCacheSizeGB 2` (runs 40728433458 and 40772360813), the four Bundles
+above 30,000 entries end with `TooLargeForCache` on both MongoDB legs, at entries 28,627-31,983, and
+on the `mongodb` leg the 49,027-entry Bundle ends as a lone eviction rollback (described below). The
+first benchmark with the search rows deferred (run 39657850695) had the `mongodb` leg abort lower,
+at 19,200-21,100 entries. The ignored ceiling test of the
 [deferred-indexing section](#deferred-search-indexing-for-large-mongodb-transaction-bundles) shows
 that a deferred create's transaction then wrote each resource's `missing_params` and its
 `idx_resources_missing_params` keys (15.19 per resource on its fixture), which an offloaded backend
@@ -1628,15 +1629,21 @@ that an unchanged resubmit will fail: the room bounds only this instance's trans
 while single-resource writes, batch Bundles, other HFS instances and other clients share the same
 cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
 rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
-`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). With chunked creates
-(#1977), `failed_entry`, and the "Entry N" of the log-only reasons, is the entry whose document the
-server refused when the error names one, and otherwise the first entry of the chunk being sent, so
-an abort position reads up to 99 entries before the entry the server was writing. The
-`Transaction failed` `ERROR` line names the cause: `write set too large` for 388,
-`lone eviction rollback` here. Bundles that shared the room, and plain write conflicts, are still
-replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
-weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
-per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+`failed_entry` (set only when an entry was being written), `failed_at` (`entry`, `ledger` or
+`commit`: a deferred Bundle's ledger is written after the last entry and before the commit, and a
+rollback there is neither), `error_code` and `attempt` (#1895, #2037). The log-only reason of the
+`TooLargeForCache` it returns starts `Entry N rolled back for eviction while the Bundle ran alone;
+not replayed: `, `Deferred search index ledger write rolled back for eviction while the Bundle ran
+alone; not replayed: ` or `Commit rolled back for eviction while the Bundle ran alone; not
+replayed: `, by where it arrived. With chunked creates (#1977), `failed_entry`, and the "Entry N" of
+the log-only reasons, is the entry whose document the server refused when the error names one, and
+otherwise the first entry of the chunk being sent, so an abort position reads up to 99 entries
+before the entry the server was writing. The `Transaction failed` `ERROR` line names the cause:
+`write set too large` for 388, `lone eviction rollback` here. Bundles that shared the room, and
+plain write conflicts, are still replayed. With a weight of `0` or no limit no Bundle counts as
+alone. Raising the limit x the weight above the largest Bundle restores the replays, at the cost of
+sharing the cache. The room is per backend instance: Bundles sent to another HFS instance on the
+same MongoDB are not seen.
 
 **Refusing an oversized Bundle before it runs (#2351).** With
 `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
@@ -1895,8 +1902,10 @@ chunk of creates (#1977) and before the commit, and it commits or aborts with th
 aborted or replayed attempt leaves neither a ledger nor markers. A failure to write the ledger is a
 server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
 ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
-it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
-the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update).
+it, and the log reason of a cache failure or a transient abort there starts `Deferred search index
+ledger write ...`, never `Entry N` or `Commit` (#2037). The transaction does not insert
+`search_index` or `search_index_contained` rows, and it skips the deletes of old rows that an inline
+Bundle sends once per chunk of creates (or per update).
 
 A resource of a deferred type that the Bundle creates, updates or restores (a `PUT` to the id of a
 deleted resource) also carries no `missing_params` and no `missing_params_fp`
@@ -1980,7 +1989,13 @@ Bundle changed SearchParameters, and then rewrites the rows:
   are left to the repair, so a stalled MongoDB costs one batch's attempts, not one per document.
   (The chunk with a refused resource is first finished: its other resources are written.) Three
   such resources in a row, with no batch between them that committed, end the chunk too: the cache,
-  not one resource, is the problem.
+  not one resource, is the problem. A Bundle of more than 5,000 resources leaves more than one
+  ledger document, and the step goes through them in order, deleting each when its batches are
+  done. Tests send a real Bundle of 5,040 resources (5,000 Patients and 40 Observations: two
+  documents) through each way the step can end (#2032): both documents finished; cut by the
+  deadline before the first batch (both left, `left_chunks` 2); a failed batch in the second
+  document (the first deleted, the second left, `left_chunks` 1); and a failed batch in the first
+  (both left, `left_chunks` 2). In each, one repair pass finishes what is left.
 - The step starts no new attempt after the Bundle's own deadline (`bundle_transaction_deadline`:
   `HFS_REQUEST_TIMEOUT` less 2 s, counted from the call), and an attempt still running at the
   deadline is cut, so a committed Bundle is answered instead of timing out with `408` and being
@@ -2121,10 +2136,12 @@ Not measured:
   the cache's limit at 2 GB is not known), a cache between 0.25 GB and 2 GB (the smallest cache
   that commits 6,141 entries was not found) or above 2 GB, and a debug build at 2 GB.
 - At 0.25 GB, 4,005 to 4,539 entries committed. 5,073 and 6,141 entries were rolled back by the
-  server as `TooLargeForCache` (`Commit rolled back for eviction while the Bundle ran alone` while
-  the ledger was written: MongoDB error 112, `WriteConflict`, reason `transaction rolled back
-  because of cache overflow`), and 30,171 entries failed at entry 12,729 with the write set refused
-  (code 388). Those sizes did not commit at 0.25 GB, so no step was timed for them there.
+  server as `TooLargeForCache` (while the ledger was written: MongoDB error 112, `WriteConflict`,
+  reason `transaction rolled back because of cache overflow`; the log reason of those runs read
+  `Commit rolled back for eviction while the Bundle ran alone`, which blamed the commit, and now
+  reads `Deferred search index ledger write rolled back for eviction while the Bundle ran alone`,
+  #2037), and 30,171 entries failed at entry 12,729 with the write set refused (code 388). Those
+  sizes did not commit at 0.25 GB, so no step was timed for them there.
 - The benchmark host, a server under other load, and a replica set of more than one member (a
   single member has no replication to wait for). What the benchmark host would measure for this
   step is not known.
@@ -2330,14 +2347,16 @@ index keys per resource with `validate`. It prints one `DEFERRED_CEILING_PROBE` 
 (`missing_keys_per_resource` and `fp_keys_per_resource` are the keys of
 `idx_resources_missing_params` and `idx_resources_missing_params_fp`, `resource_keys_per_resource`
 all keys of `resources`), and then one `DEFERRED_CEILING` line per variant with `outcome`,
-`cause`, `abort_entry` (the entry the transaction ended at, `commit`, or `na` for a committed
-Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by), the resources,
-rows, ledger documents and markers left, and the server's eviction-rollback delta.
+`cause`, `abort_entry` (the entry the transaction ended at, `ledger`, `commit`, or `na` for a
+committed Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by; the
+entries written are all of them for `ledger`), the resources, rows, ledger documents and markers
+left, and the server's eviction-rollback delta.
 
 `abort_entry` is accurate to about one create chunk (100 entries): a failed chunk is charged to the
-entry the server names, or else to its first entry, so it can read up to 99 entries low. A 388
-while the ledger is written reads as `abort_entry=<entries>`, because `ledger_attempt_error` reuses
-`entry_attempt_error(entries, entries, ..)`.
+entry the server names, or else to its first entry, so it can read up to 99 entries low. A failure
+while the ledger is written reads as `abort_entry=ledger` (#2037). Before that it read as
+`abort_entry=<entries>` for a 388, because `ledger_attempt_error` passed the entry count as an
+entry index, and as `abort_entry=commit` for an eviction rollback.
 
 Knobs (defaults in parentheses): `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (`0.5`),
 `HFS_TEST_DEFERRED_CEILING_COPIES` (`15`), `HFS_TEST_DEFERRED_CEILING_VARIANTS` (`inline,deferred`),

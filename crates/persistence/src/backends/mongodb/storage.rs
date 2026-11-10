@@ -206,6 +206,66 @@ pub(crate) const MONGO_BULK_WRITE_CONCURRENCY: usize = 8;
 /// entries are never re-run.
 const BUNDLE_COMMIT_RETRIES: u32 = 2;
 
+/// Where in one bundle attempt a failure arrived (#2037): at an entry's write,
+/// at the write of the deferred-search-index ledger (#1975), which goes in after
+/// the last entry and before the commit, or at the commit.
+///
+/// One typed fact, so a log field or a reason text can say the ledger for a
+/// ledger failure instead of reading `None` as "the commit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedAt {
+    /// The write of the entry at this position.
+    Entry(usize),
+    /// The write of the deferred-search-index ledger.
+    Ledger,
+    /// The commit.
+    Commit,
+}
+
+impl FailedAt {
+    /// The position of the entry, when it was an entry that failed.
+    fn entry(self) -> Option<usize> {
+        match self {
+            FailedAt::Entry(index) => Some(index),
+            FailedAt::Ledger | FailedAt::Commit => None,
+        }
+    }
+
+    /// The place as one word, for the `failed_at` log field.
+    fn place(self) -> &'static str {
+        match self {
+            FailedAt::Entry(_) => "entry",
+            FailedAt::Ledger => "ledger",
+            FailedAt::Commit => "commit",
+        }
+    }
+
+    /// What a log-only reason says failed, naming the entry where it was one:
+    /// `Entry N processing failed`, `Deferred search index ledger write failed`
+    /// or `Commit failed`. A reason is this, a colon and the driver detail.
+    fn failed(self) -> String {
+        match self {
+            FailedAt::Entry(index) => format!("Entry {index} processing failed"),
+            FailedAt::Ledger => LEDGER_WRITE_FAILED.to_string(),
+            FailedAt::Commit => "Commit failed".to_string(),
+        }
+    }
+
+    /// [`Self::failed`] without the entry's number, as the reason of a transient
+    /// abort at an entry and the message of a [`TransactionError::BundleError`]
+    /// (which carries the index in a field of its own) have always said it.
+    fn failed_unnumbered(self) -> String {
+        match self {
+            FailedAt::Entry(_) => "Entry processing failed".to_string(),
+            FailedAt::Ledger | FailedAt::Commit => self.failed(),
+        }
+    }
+}
+
+/// What a reason says failed when the deferred-search-index ledger could not be
+/// written ([`FailedAt::Ledger`], #2037).
+const LEDGER_WRITE_FAILED: &str = "Deferred search index ledger write failed";
+
 /// Why one attempt at a bundle transaction did not commit (#1586).
 #[derive(Debug)]
 enum BundleAttemptError {
@@ -216,9 +276,9 @@ enum BundleAttemptError {
     /// is the bundle loop's call: it does not replay an eviction rollback of a
     /// Bundle that held the whole admission room (#1895).
     TransientAbort {
-        /// Position of the entry that was running when the abort arrived, or
-        /// `None` when it arrived at commit.
-        entry: Option<usize>,
+        /// Where the abort arrived: the entry that was running, the ledger
+        /// write or the commit.
+        at: FailedAt,
         /// The server's error code, when the driver error carries one.
         code: Option<i32>,
         /// True when WiredTiger rolled the transaction back for cache pressure
@@ -235,9 +295,9 @@ enum BundleAttemptError {
     /// [`TransactionError::Transient`] (a retryable `503`) without replaying it:
     /// the next write asks `hello` again.
     TransactionsRefused {
-        /// Position of the entry that was running when the refusal arrived, or
-        /// `None` when it arrived at commit or in the ledger.
-        entry: Option<usize>,
+        /// Where the refusal arrived: the entry that was running, the ledger
+        /// write or the commit.
+        at: FailedAt,
         /// Raw driver detail. Log-only.
         reason: String,
     },
@@ -250,9 +310,10 @@ enum BundleAttemptError {
     /// session aborts in the background, so the Bundle answers after one
     /// selection timeout, not two.
     NoUsableServer {
-        /// Position of the entry that was running when the failure arrived, or
-        /// `None` when it arrived in the ledger.
-        entry: Option<usize>,
+        /// Where the failure arrived: the entry that was running or the ledger
+        /// write (a commit's selection failure is not this variant, see
+        /// `CommitAttempts::after_failure`).
+        at: FailedAt,
         /// Raw driver detail. Log-only.
         reason: String,
     },
@@ -1016,7 +1077,8 @@ fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
         .filter(|driver| is_write_conflict(driver) || is_temporarily_unavailable(driver))
 }
 
-/// Why an error raised by a bundle entry counts as a transient abort.
+/// Why an error raised by a bundle entry or by the ledger write counts as a
+/// transient abort.
 #[derive(Debug)]
 struct TransientEntryAbort {
     /// The server's error code, when a driver error that carries one was kept.
@@ -1028,8 +1090,11 @@ struct TransientEntryAbort {
     reason: String,
 }
 
-/// Whether the error an entry raised means the server aborted the bundle
-/// transaction for a transient reason, so the bundle may be run again (#1586).
+/// Whether the error a bundle entry (or the ledger write, #2037) raised means
+/// the server aborted the bundle transaction for a transient reason, so the
+/// bundle may be run again (#1586). `at` says which of the two it was: it words
+/// the reason (`Entry processing failed: ` or `Deferred search index ledger
+/// write failed: `), and nothing else.
 ///
 /// The classifier the bundle loop uses; two shapes qualify:
 ///
@@ -1054,12 +1119,13 @@ struct TransientEntryAbort {
 /// `BackendError` keep the shape the rest of the backend and the REST layer
 /// rely on. A `Timeout` is not here; it is the server stopping work at its own
 /// deadline, which a replay would only meet again.
-fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
+fn transient_abort(err: &StorageError, at: FailedAt) -> Option<TransientEntryAbort> {
+    let failed = at.failed_unnumbered();
     if let Some(driver) = transient_transaction_abort(err) {
         return Some(TransientEntryAbort {
             code: driver_error_code(driver),
             eviction: is_eviction_rollback(driver),
-            reason: format!("Entry processing failed: {err}"),
+            reason: format!("{failed}: {err}"),
         });
     }
     // `Unavailable`'s `Display` is `backend unavailable: {backend_name}: {message}`;
@@ -1069,7 +1135,7 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
         return Some(TransientEntryAbort {
             code: None,
             eviction: false,
-            reason: format!("Entry processing failed: {message}"),
+            reason: format!("{failed}: {message}"),
         });
     }
     None
@@ -1084,8 +1150,9 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 /// another cause and is built in [`lone_eviction_failure`] (#1895).
 ///
 /// `entries` is the Bundle's entry count. `reason` is the raw driver detail
-/// behind a prefix that says where it happened (`Entry N processing failed: `
-/// or `Commit failed: `). It is for the log only.
+/// behind a prefix that says where it happened (`Entry N processing failed: `,
+/// `Deferred search index ledger write failed: ` or `Commit failed: `, see
+/// [`FailedAt::failed`]). It is for the log only.
 ///
 /// It carries [`TooLargeForCacheCause::WriteSetTooLarge`];
 /// [`lone_eviction_failure`] carries [`TooLargeForCacheCause::LoneEviction`]
@@ -1098,8 +1165,13 @@ fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionE
     }
 }
 
-/// Why a bundle attempt failed, given the error entry `index` raised in a
-/// transaction of `entries` entries (#1586, #1837).
+/// The verdicts a bundle entry's write and the ledger's write share, given the
+/// error `err` raised at `at` in a transaction of `entries` entries (#1586,
+/// #1837, #2037). `None` is "anything else", which the two callers answer
+/// differently ([`entry_attempt_error`], [`ledger_attempt_error`]). `at` words
+/// the log-only reasons and is carried into the transient verdicts; it is an
+/// entry or the ledger, since the commit classifies its own failures
+/// ([`CommitAttempts::after_failure`]).
 ///
 /// - A refused transaction (`IllegalOperation`, 20, [`transactions_refused`]) comes
 ///   before everything: it is [`BundleAttemptError::TransactionsRefused`], not an
@@ -1112,40 +1184,51 @@ fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionE
 ///   it: the Bundle's own write set does not fit WiredTiger's cache, so it is
 ///   [`TransactionError::TooLargeForCache`] and is never replayed, because every
 ///   replay would meet the same cache. No entry is blamed for it.
-/// - A transient abort ([`transient_entry_abort`]) is handed back for a replay.
+/// - A transient abort ([`transient_abort`]) is handed back for a replay.
 ///   It carries whether it was an eviction rollback; whether to replay is the
 ///   loop's call (#1895).
-/// - Anything else is a [`TransactionError::BundleError`] at the entry.
-fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
+fn shared_attempt_error(
+    at: FailedAt,
+    entries: usize,
+    err: &StorageError,
+) -> Option<BundleAttemptError> {
     if transactions_refused(err).is_some() {
-        return BundleAttemptError::TransactionsRefused {
-            entry: Some(index),
-            reason: format!("Entry {index} processing failed: {err}"),
-        };
+        return Some(BundleAttemptError::TransactionsRefused {
+            at,
+            reason: format!("{}: {err}", at.failed()),
+        });
     }
     if no_usable_server(err).is_some() {
-        return BundleAttemptError::NoUsableServer {
-            entry: Some(index),
-            reason: format!("Entry {index} processing failed: {err}"),
-        };
+        return Some(BundleAttemptError::NoUsableServer {
+            at,
+            reason: format!("{}: {err}", at.failed()),
+        });
     }
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
-        return BundleAttemptError::Failed(write_set_too_large_for_cache(
+        return Some(BundleAttemptError::Failed(write_set_too_large_for_cache(
             entries,
-            format!("Entry {index} processing failed: {err}"),
-        ));
+            format!("{}: {err}", at.failed()),
+        )));
     }
-    if let Some(abort) = transient_entry_abort(err) {
-        return BundleAttemptError::TransientAbort {
-            entry: Some(index),
-            code: abort.code,
-            eviction: abort.eviction,
-            reason: abort.reason,
-        };
-    }
-    BundleAttemptError::Failed(TransactionError::BundleError {
-        index,
-        message: format!("Entry processing failed: {err}"),
+    transient_abort(err, at).map(|abort| BundleAttemptError::TransientAbort {
+        at,
+        code: abort.code,
+        eviction: abort.eviction,
+        reason: abort.reason,
+    })
+}
+
+/// Why a bundle attempt failed, given the error entry `index` raised in a
+/// transaction of `entries` entries (#1586, #1837).
+///
+/// The verdicts are [`shared_attempt_error`]'s, at [`FailedAt::Entry`]. Anything
+/// else is a [`TransactionError::BundleError`] at the entry.
+fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
+    shared_attempt_error(FailedAt::Entry(index), entries, err).unwrap_or_else(|| {
+        BundleAttemptError::Failed(TransactionError::BundleError {
+            index,
+            message: format!("{}: {err}", FailedAt::Entry(index).failed_unnumbered()),
+        })
     })
 }
 
@@ -1177,43 +1260,22 @@ async fn abort_failed_attempt(
 /// Why a bundle attempt failed when its deferred-search-index ledger could not
 /// be written, given a transaction of `entries` entries (#1975).
 ///
-/// The ledger belongs to no entry, so no entry is blamed for it. A cache
-/// failure (388) is [`TransactionError::TooLargeForCache`] and a transient abort
-/// is handed back as [`entry_attempt_error`] does, with no entry named, so the
-/// bundle loop's rules for a replay and for a lone eviction (#1895) apply to it
-/// unchanged. Anything else rolled the Bundle back on the server's side, a
-/// [`TransactionError::RolledBack`] (HTTP 500). A [`TransactionError::BundleError`]
-/// would answer 400 about an entry the client never sent.
+/// The ledger belongs to no entry, so no entry is blamed for it: every log-only
+/// reason it produces says `Deferred search index ledger write failed: `, never
+/// `Entry N ...` and never the commit (#2037). The verdicts are
+/// [`shared_attempt_error`]'s, at [`FailedAt::Ledger`]: a cache failure (388) is
+/// [`TransactionError::TooLargeForCache`] and a transient abort is handed back
+/// as [`entry_attempt_error`] does, so the bundle loop's rules for a replay and
+/// for a lone eviction (#1895) apply to it unchanged. Anything else rolled the
+/// Bundle back on the server's side, a [`TransactionError::RolledBack`] (HTTP
+/// 500). A [`TransactionError::BundleError`] would answer 400 about an entry the
+/// client never sent.
 fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptError {
-    match entry_attempt_error(entries, entries, err) {
-        BundleAttemptError::TransientAbort {
-            code,
-            eviction,
-            reason,
-            ..
-        } => BundleAttemptError::TransientAbort {
-            entry: None,
-            code,
-            eviction,
-            reason,
-        },
-        BundleAttemptError::TransactionsRefused { reason, .. } => {
-            BundleAttemptError::TransactionsRefused {
-                entry: None,
-                reason,
-            }
-        }
-        BundleAttemptError::NoUsableServer { reason, .. } => BundleAttemptError::NoUsableServer {
-            entry: None,
-            reason,
-        },
-        too_large @ BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. }) => {
-            too_large
-        }
-        BundleAttemptError::Failed(_) => BundleAttemptError::Failed(TransactionError::RolledBack {
+    shared_attempt_error(FailedAt::Ledger, entries, err).unwrap_or_else(|| {
+        BundleAttemptError::Failed(TransactionError::RolledBack {
             reason: format!("Failed to write the deferred search index ledger: {err}"),
-        }),
-    }
+        })
+    })
 }
 
 /// #1895: the error a transient abort ends the Bundle with instead of a replay,
@@ -1228,22 +1290,31 @@ fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptErro
 /// transaction Bundles and other writes share the cache, so the client is not
 /// told that a resubmit must fail (#1993). A Bundle that shared the room, or a
 /// plain `WriteConflict`, is replayed as before.
+///
+/// `at` is where the abort arrived, and the reason's prefix names it: `Entry N`,
+/// `Deferred search index ledger write` or `Commit`, then ` rolled back for
+/// eviction while the Bundle ran alone; not replayed: ` (#2037). The ledger is
+/// written before the commit, so a rollback there is not the commit's.
 fn lone_eviction_failure(
     holds_whole_room: bool,
     eviction: bool,
     entries: usize,
-    entry: Option<usize>,
+    at: FailedAt,
     reason: &str,
 ) -> Option<TransactionError> {
     (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
         cause: TooLargeForCacheCause::LoneEviction,
         entries,
-        reason: match entry {
-            Some(index) => format!(
+        reason: match at {
+            FailedAt::Entry(index) => format!(
                 "Entry {index} rolled back for eviction while the Bundle ran alone; \
                  not replayed: {reason}"
             ),
-            None => format!(
+            FailedAt::Ledger => format!(
+                "Deferred search index ledger write rolled back for eviction while the \
+                 Bundle ran alone; not replayed: {reason}"
+            ),
+            FailedAt::Commit => format!(
                 "Commit rolled back for eviction while the Bundle ran alone; \
                  not replayed: {reason}"
             ),
@@ -1429,13 +1500,13 @@ impl CommitAttempts {
         // `no_usable_server` does not apply here and it keeps its handling below.
         if !self.outcome_unknown && refuses_transactions(err) {
             return CommitStep::Stop(BundleAttemptError::TransactionsRefused {
-                entry: None,
+                at: FailedAt::Commit,
                 reason: format!("Commit failed: {err}"),
             });
         }
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
-                entry: None,
+                at: FailedAt::Commit,
                 code: driver_error_code(err),
                 eviction: is_eviction_rollback(err),
                 reason: format!("Commit failed: {err}"),
@@ -4043,19 +4114,21 @@ impl MongoBackend {
     /// transaction as an illegal operation (code 20, what a server without
     /// transactions answers, [`ILLEGAL_OPERATION_CODE`]), and logs it once: a
     /// warning when an answer was actually forgotten, a debug line when a write
-    /// in flight at the same change finds it already forgotten. `entry` is the
-    /// Bundle entry that was running, when there is one.
+    /// in flight at the same change finds it already forgotten. `at` is where in the
+    /// Bundle attempt it arrived (`failed_entry` is set for an entry, `failed_at` says
+    /// `entry`, `ledger` or `commit`), or `None` for a single-resource write.
     fn note_refused_transaction(
         &self,
         what: &str,
-        entry: Option<usize>,
+        at: Option<FailedAt>,
         detail: &dyn std::fmt::Display,
     ) {
         let forgot = self.write_topology.forget_transactional_answer();
         if forgot {
             tracing::warn!(
                 error_code = ILLEGAL_OPERATION_CODE,
-                failed_entry = entry,
+                failed_entry = at.and_then(FailedAt::entry),
+                failed_at = at.map(FailedAt::place),
                 kept_answer_forgotten = forgot,
                 "mongodb refused the {what}'s transaction as an illegal operation, as a server \
                  without transactions does: nothing was applied, the request is answered as \
@@ -4064,7 +4137,8 @@ impl MongoBackend {
         } else {
             tracing::debug!(
                 error_code = ILLEGAL_OPERATION_CODE,
-                failed_entry = entry,
+                failed_entry = at.and_then(FailedAt::entry),
+                failed_at = at.map(FailedAt::place),
                 kept_answer_forgotten = forgot,
                 "mongodb refused the {what}'s transaction as an illegal operation, as a server \
                  without transactions does: nothing was applied, the request is answered as \
@@ -4077,18 +4151,19 @@ impl MongoBackend {
     /// server ([`no_usable_server`]), and logs it once: a warning when an answer
     /// was actually forgotten, a debug line when a write in flight at the same
     /// outage finds it already forgotten. The first write after the outage asks
-    /// `hello` again. `entry` is the Bundle entry that was running, when there is
-    /// one.
+    /// `hello` again. `at` is where in the Bundle attempt it arrived (the fields of
+    /// [`Self::note_refused_transaction`]), or `None` for a single-resource write.
     fn note_no_usable_server(
         &self,
         what: &str,
-        entry: Option<usize>,
+        at: Option<FailedAt>,
         detail: &dyn std::fmt::Display,
     ) {
         let forgot = self.write_topology.forget_transactional_answer();
         if forgot {
             tracing::warn!(
-                failed_entry = entry,
+                failed_entry = at.and_then(FailedAt::entry),
+                failed_at = at.map(FailedAt::place),
                 kept_answer_forgotten = forgot,
                 "mongodb found no usable server for the {what}: nothing was applied, it is \
                  not run again, the request is answered as retryable, and the next write asks \
@@ -4096,7 +4171,8 @@ impl MongoBackend {
             );
         } else {
             tracing::debug!(
-                failed_entry = entry,
+                failed_entry = at.and_then(FailedAt::entry),
+                failed_at = at.map(FailedAt::place),
                 kept_answer_forgotten = forgot,
                 "mongodb found no usable server for the {what}: nothing was applied, it is \
                  not run again, the request is answered as retryable, and the next write asks \
@@ -6458,7 +6534,7 @@ impl BundleProvider for MongoBackend {
                 )
                 .await;
             let attempt_duration = attempt_started.elapsed();
-            let (entry, code, eviction, reason) = match attempt {
+            let (at, code, eviction, reason) = match attempt {
                 Ok(committed) => break committed,
                 Err(BundleAttemptError::Failed(error)) => {
                     // The commit may have stored the Bundle's SearchParameter
@@ -6471,27 +6547,27 @@ impl BundleProvider for MongoBackend {
                     }
                     return Err(error);
                 }
-                Err(BundleAttemptError::TransactionsRefused { entry, reason }) => {
+                Err(BundleAttemptError::TransactionsRefused { at, reason }) => {
                     // Nothing was applied; the Bundle is answered as retryable
                     // and not replayed, and the next write asks `hello` again
                     // (#2308).
-                    self.note_refused_transaction("transaction bundle", entry, &reason);
+                    self.note_refused_transaction("transaction bundle", Some(at), &reason);
                     return Err(TransactionError::Transient { attempts, reason });
                 }
-                Err(BundleAttemptError::NoUsableServer { entry, reason }) => {
+                Err(BundleAttemptError::NoUsableServer { at, reason }) => {
                     // The attempt waited out the server-selection timeout and
                     // nothing was applied; another attempt would wait the same
                     // timeout, so the Bundle is answered as retryable at once
                     // and the next write asks `hello` again (#2308).
-                    self.note_no_usable_server("transaction bundle", entry, &reason);
+                    self.note_no_usable_server("transaction bundle", Some(at), &reason);
                     return Err(TransactionError::Transient { attempts, reason });
                 }
                 Err(BundleAttemptError::TransientAbort {
-                    entry,
+                    at,
                     code,
                     eviction,
                     reason,
-                }) => (entry, code, eviction, reason),
+                }) => (at, code, eviction, reason),
             };
 
             // Before the backoff: a lone eviction ends as `TooLargeForCache`
@@ -6500,14 +6576,15 @@ impl BundleProvider for MongoBackend {
                 admission.holds_whole_room(),
                 eviction,
                 entries.len(),
-                entry,
+                at,
                 &reason,
             ) {
                 tracing::warn!(
                     attempt = attempts,
                     max_attempts = BUNDLE_TRANSACTION_RETRY.max_attempts,
                     entries = entries.len(),
-                    failed_entry = entry,
+                    failed_entry = at.entry(),
+                    failed_at = at.place(),
                     error_code = code,
                     attempt_ms = attempt_duration.as_millis() as u64,
                     queued_ms = queued.as_millis() as u64,
@@ -6530,7 +6607,8 @@ impl BundleProvider for MongoBackend {
                 attempt = attempts,
                 max_attempts = BUNDLE_TRANSACTION_RETRY.max_attempts,
                 entries = entries.len(),
-                failed_entry = entry,
+                failed_entry = at.entry(),
+                failed_at = at.place(),
                 error_code = code,
                 backoff_ms = backoff.as_millis() as u64,
                 attempt_ms = attempt_duration.as_millis() as u64,
@@ -12372,7 +12450,7 @@ mod transient_abort_tests {
     fn the_bundle_classifier_treats_unavailable_as_a_transient_entry_abort() {
         // A transport failure inside the transaction: the driver itself
         // labels it TransientTransactionError, and the transaction is gone.
-        let abort = transient_entry_abort(&classified_io_error())
+        let abort = transient_abort(&classified_io_error(), FailedAt::Entry(0))
             .expect("a network error mid-transaction is a transient abort");
         assert_eq!(abort.code, None, "a transport error carries no server code");
         assert!(!abort.eviction, "a transport error is not an eviction");
@@ -12401,7 +12479,8 @@ mod transient_abort_tests {
             backend_name: "mongodb".to_string(),
             message: "no suitable server".to_string(),
         });
-        let abort = transient_entry_abort(&unavailable).expect("Unavailable is transient");
+        let abort =
+            transient_abort(&unavailable, FailedAt::Entry(0)).expect("Unavailable is transient");
         assert!(
             abort.reason.contains("no suitable server"),
             "{}",
@@ -12429,7 +12508,7 @@ mod transient_abort_tests {
                 matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
                 "code {code} should be Unavailable, got {err:?}"
             );
-            let Some(abort) = transient_entry_abort(&err) else {
+            let Some(abort) = transient_abort(&err, FailedAt::Entry(0)) else {
                 panic!("code {code}: an Unavailable entry error should be a transient abort");
             };
             assert_eq!(abort.code, None, "code {code}");
@@ -12476,7 +12555,8 @@ mod transient_abort_tests {
             "Failed to insert resource in transaction",
             command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
         );
-        let abort = transient_entry_abort(&err).expect("a write conflict is transient");
+        let abort =
+            transient_abort(&err, FailedAt::Entry(0)).expect("a write conflict is transient");
         assert_eq!(abort.code, Some(WRITE_CONFLICT_CODE));
         assert!(abort.reason.contains("Entry processing failed"));
     }
@@ -13225,7 +13305,8 @@ mod transient_abort_tests {
         ] {
             assert!(driver.labels().is_empty());
             let err = internal_driver_error("Failed to insert resource in transaction", driver);
-            let abort = transient_entry_abort(&err).expect("code 365 is a transient abort");
+            let abort =
+                transient_abort(&err, FailedAt::Entry(0)).expect("code 365 is a transient abort");
             assert_eq!(abort.code, Some(365));
             assert!(abort.reason.contains("Entry processing failed"));
         }
@@ -13240,21 +13321,21 @@ mod transient_abort_tests {
     fn the_bundle_classifier_still_does_not_retry_real_failures() {
         // BadValue, an unlabelled server error.
         let bad_value = internal_driver_error("Failed to insert", command_error(2, "BadValue"));
-        assert!(transient_entry_abort(&bad_value).is_none());
+        assert!(transient_abort(&bad_value, FailedAt::Entry(0)).is_none());
         // A flattened error.
-        assert!(transient_entry_abort(&internal_error("boom".to_string())).is_none());
+        assert!(transient_abort(&internal_error("boom".to_string()), FailedAt::Entry(0)).is_none());
         // A timeout is the server stopping work at its deadline, not a drop.
         let timeout = StorageError::Backend(BackendError::Timeout {
             backend_name: "mongodb".to_string(),
             message: "deadline".to_string(),
         });
-        assert!(transient_entry_abort(&timeout).is_none());
+        assert!(transient_abort(&timeout, FailedAt::Entry(0)).is_none());
         // Not a backend error at all.
         let exists = StorageError::Resource(ResourceError::AlreadyExists {
             resource_type: "Patient".to_string(),
             id: "1".to_string(),
         });
-        assert!(transient_entry_abort(&exists).is_none());
+        assert!(transient_abort(&exists, FailedAt::Entry(0)).is_none());
     }
 
     #[test]
@@ -13329,7 +13410,7 @@ mod transient_abort_tests {
             super::super::bundle_creates::resource_insert_failure(&entries, &identities, duplicate);
         assert_eq!(at, 21, "the entry of the refused create, not of the chunk");
         assert!(
-            transient_entry_abort(&err).is_none(),
+            transient_abort(&err, FailedAt::Entry(0)).is_none(),
             "a reused id is not transient"
         );
         match entry_attempt_error(at, 30, &err) {
@@ -13379,12 +13460,12 @@ mod transient_abort_tests {
         assert_eq!(at, 20);
         match entry_attempt_error(at, 30, &err) {
             BundleAttemptError::TransientAbort {
-                entry,
+                at: failed_at,
                 code,
                 eviction,
                 ..
             } => {
-                assert_eq!(entry, Some(20));
+                assert_eq!(failed_at, FailedAt::Entry(20));
                 assert_eq!(code, Some(WRITE_CONFLICT_CODE));
                 assert!(eviction);
             }
@@ -13545,7 +13626,7 @@ mod transient_abort_tests {
             let err = internal_driver_error("Failed to insert search index entries", driver);
             match entry_attempt_error(3, 10, &err) {
                 BundleAttemptError::TransientAbort {
-                    entry: Some(3),
+                    at: FailedAt::Entry(3),
                     code,
                     eviction,
                     ..
@@ -13597,7 +13678,7 @@ mod transient_abort_tests {
             "Entry processing failed: internal error in mongodb: Failed to insert search \
              index entries: Kind: Command failed: Error code 112 (WriteConflict): {EVICTION_112}"
         );
-        match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
+        match lone_eviction_failure(true, true, 7412, FailedAt::Entry(6959), &reason) {
             Some(TransactionError::TooLargeForCache {
                 entries,
                 cause,
@@ -13616,7 +13697,7 @@ mod transient_abort_tests {
             other => panic!("expected TooLargeForCache, got {other:?}"),
         }
         // At commit there is no failing entry to name.
-        match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
+        match lone_eviction_failure(true, true, 7412, FailedAt::Commit, "Commit failed: boom") {
             Some(TransactionError::TooLargeForCache {
                 entries,
                 cause,
@@ -13632,18 +13713,58 @@ mod transient_abort_tests {
             }
             other => panic!("expected TooLargeForCache, got {other:?}"),
         }
+        // At the ledger write, which comes before the commit: neither an entry
+        // nor the commit is blamed (#2037).
+        let ledger_reason = "Deferred search index ledger write failed: boom";
+        match lone_eviction_failure(true, true, 7412, FailedAt::Ledger, ledger_reason) {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
+                assert_eq!(entries, 7412);
+                assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
+                assert_eq!(
+                    reason,
+                    "Deferred search index ledger write rolled back for eviction while the \
+                     Bundle ran alone; not replayed: Deferred search index ledger write \
+                     failed: boom"
+                );
+                assert!(!reason.starts_with("Commit"), "{reason}");
+                assert!(!reason.contains("Entry "), "{reason}");
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+    }
+
+    /// #2037: one typed place, so a log field says the ledger for a ledger
+    /// failure and an entry's number only for an entry.
+    #[test]
+    fn a_failed_at_says_where_in_the_attempt_it_was() {
+        assert_eq!(FailedAt::Entry(7).entry(), Some(7));
+        assert_eq!(FailedAt::Ledger.entry(), None);
+        assert_eq!(FailedAt::Commit.entry(), None);
+        assert_eq!(FailedAt::Entry(7).place(), "entry");
+        assert_eq!(FailedAt::Ledger.place(), "ledger");
+        assert_eq!(FailedAt::Commit.place(), "commit");
+        assert_eq!(FailedAt::Entry(7).failed(), "Entry 7 processing failed");
+        assert_eq!(
+            FailedAt::Ledger.failed(),
+            "Deferred search index ledger write failed"
+        );
+        assert_eq!(FailedAt::Commit.failed(), "Commit failed");
     }
 
     #[test]
     fn a_bundle_that_shared_the_room_is_replayed_after_an_eviction() {
-        assert!(lone_eviction_failure(false, true, 7412, Some(6959), "boom").is_none());
-        assert!(lone_eviction_failure(false, true, 2, None, "boom").is_none());
+        assert!(lone_eviction_failure(false, true, 7412, FailedAt::Entry(6959), "boom").is_none());
+        assert!(lone_eviction_failure(false, true, 2, FailedAt::Commit, "boom").is_none());
     }
 
     #[test]
     fn a_lone_bundle_that_lost_a_plain_write_conflict_is_replayed() {
-        assert!(lone_eviction_failure(true, false, 7412, Some(6959), "boom").is_none());
-        assert!(lone_eviction_failure(true, false, 7412, None, "boom").is_none());
+        assert!(lone_eviction_failure(true, false, 7412, FailedAt::Entry(6959), "boom").is_none());
+        assert!(lone_eviction_failure(true, false, 7412, FailedAt::Ledger, "boom").is_none());
     }
 
     #[test]
@@ -13656,7 +13777,7 @@ mod transient_abort_tests {
         assert!(matches!(
             entry_attempt_error(3, 10, &err),
             BundleAttemptError::TransientAbort {
-                entry: Some(3),
+                at: FailedAt::Entry(3),
                 code: Some(WRITE_CONFLICT_CODE),
                 ..
             }
@@ -13730,7 +13851,7 @@ mod transient_abort_tests {
         );
         match ledger_attempt_error(7412, &eviction) {
             BundleAttemptError::TransientAbort {
-                entry: None,
+                at: FailedAt::Ledger,
                 code: Some(WRITE_CONFLICT_CODE),
                 eviction: true,
                 ..
@@ -13744,7 +13865,7 @@ mod transient_abort_tests {
         assert!(matches!(
             ledger_attempt_error(7412, &plain),
             BundleAttemptError::TransientAbort {
-                entry: None,
+                at: FailedAt::Ledger,
                 eviction: false,
                 ..
             }
@@ -13752,7 +13873,10 @@ mod transient_abort_tests {
         // A dropped connection reaches the loop as `Unavailable`.
         assert!(matches!(
             ledger_attempt_error(7412, &classified_io_error()),
-            BundleAttemptError::TransientAbort { entry: None, .. }
+            BundleAttemptError::TransientAbort {
+                at: FailedAt::Ledger,
+                ..
+            }
         ));
     }
 
@@ -13773,6 +13897,73 @@ mod transient_abort_tests {
                 }
                 other => panic!("expected RolledBack, got {other:?}"),
             }
+        }
+    }
+
+    /// The error a failed ledger `insert_many` hands `ledger_attempt_error`.
+    fn ledger_write_error(driver: MongoError) -> StorageError {
+        internal_driver_error(
+            "Failed to write the deferred search index ledger in transaction",
+            driver,
+        )
+    }
+
+    /// What every log-only reason of a failed ledger write starts with (#2037).
+    const LEDGER_REASON_PREFIX: &str = "Deferred search index ledger write failed: ";
+
+    /// #2037: the reason of a ledger failure names the ledger write. The ledger
+    /// is no entry, so it never reads `Entry N` (the Bundle's entry count used to
+    /// be passed as the entry index, naming an entry that does not exist), and it
+    /// is not the commit either.
+    #[test]
+    fn a_ledger_388_reason_names_the_ledger_and_no_entry() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            insert_many_write_error(388),
+        ] {
+            match ledger_attempt_error(7412, &ledger_write_error(driver)) {
+                BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                    reason, ..
+                }) => {
+                    assert!(reason.starts_with(LEDGER_REASON_PREFIX), "{reason}");
+                    assert!(!reason.contains("Entry "), "{reason}");
+                    assert!(!reason.starts_with("Commit"), "{reason}");
+                }
+                other => panic!("expected TooLargeForCache, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_ledger_transient_abort_reason_names_the_ledger_and_no_entry() {
+        let eviction = ledger_write_error(command_error_with_message(
+            WRITE_CONFLICT_CODE,
+            "WriteConflict",
+            EVICTION_112,
+        ));
+        let plain = ledger_write_error(command_error(WRITE_CONFLICT_CODE, "WriteConflict"));
+        // A dropped connection reaches the loop as `Unavailable`, whose reason
+        // takes the message alone.
+        for err in [eviction, plain, classified_io_error()] {
+            match ledger_attempt_error(7412, &err) {
+                BundleAttemptError::TransientAbort { reason, .. } => {
+                    assert!(reason.starts_with(LEDGER_REASON_PREFIX), "{reason}");
+                    assert!(!reason.contains("Entry "), "{reason}");
+                }
+                other => panic!("expected a transient abort, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_ledger_write_reason_names_the_ledger_and_no_entry() {
+        let err = ledger_write_error(command_error(20, "IllegalOperation"));
+        match ledger_attempt_error(7412, &err) {
+            BundleAttemptError::TransactionsRefused { reason, .. } => {
+                assert!(reason.starts_with(LEDGER_REASON_PREFIX), "{reason}");
+                assert!(!reason.contains("Entry "), "{reason}");
+            }
+            other => panic!("expected a refused transaction, got {other:?}"),
         }
     }
 
@@ -13941,7 +14132,7 @@ mod transient_abort_tests {
         assert_eq!(steps.len(), 1);
         match stopped_with(&steps[0]) {
             BundleAttemptError::TransientAbort {
-                entry: None,
+                at: FailedAt::Commit,
                 code: Some(365),
                 eviction: true,
                 reason,
@@ -15261,15 +15452,24 @@ mod single_write_topology_tests {
 
         assert!(matches!(
             entry_attempt_error(3, 10, &refused()),
-            BundleAttemptError::TransactionsRefused { entry: Some(3), .. }
+            BundleAttemptError::TransactionsRefused {
+                at: FailedAt::Entry(3),
+                ..
+            }
         ));
         assert!(matches!(
             ledger_attempt_error(10, &refused()),
-            BundleAttemptError::TransactionsRefused { entry: None, .. }
+            BundleAttemptError::TransactionsRefused {
+                at: FailedAt::Ledger,
+                ..
+            }
         ));
         assert!(matches!(
             CommitAttempts::new(10).after_failure(&command_error(20, "IllegalOperation")),
-            CommitStep::Stop(BundleAttemptError::TransactionsRefused { entry: None, .. })
+            CommitStep::Stop(BundleAttemptError::TransactionsRefused {
+                at: FailedAt::Commit,
+                ..
+            })
         ));
 
         // A refusal after a commit with an unknown result stays unknown: the
@@ -15449,12 +15649,25 @@ mod single_write_topology_tests {
 
         assert!(matches!(
             entry_attempt_error(2, 5, &internal_driver_error("x", selection.clone())),
-            BundleAttemptError::NoUsableServer { entry: Some(2), .. }
+            BundleAttemptError::NoUsableServer {
+                at: FailedAt::Entry(2),
+                ..
+            }
         ));
-        assert!(matches!(
-            ledger_attempt_error(5, &internal_driver_error("x", selection)),
-            BundleAttemptError::NoUsableServer { entry: None, .. }
-        ));
+        match ledger_attempt_error(5, &internal_driver_error("x", selection)) {
+            BundleAttemptError::NoUsableServer {
+                at: FailedAt::Ledger,
+                reason,
+            } => {
+                // #2037: the ledger is no entry.
+                assert!(
+                    reason.starts_with("Deferred search index ledger write failed: "),
+                    "{reason}"
+                );
+                assert!(!reason.contains("Entry "), "{reason}");
+            }
+            other => panic!("expected NoUsableServer, got {other:?}"),
+        }
     }
 
     /// A failed single-resource write attempt has its open transaction aborted

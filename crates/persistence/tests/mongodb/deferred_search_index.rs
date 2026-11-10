@@ -5402,6 +5402,660 @@ async fn the_step_and_the_repair_publish_the_deferred_index_metrics() {
 }
 
 // ---------------------------------------------------------------------------
+// A real Bundle across more than one ledger document (#2032)
+// ---------------------------------------------------------------------------
+
+/// Resources one ledger document names (`LEDGER_CHUNK_REFS` in
+/// `deferred_index.rs`, which the test crate cannot read).
+const LEDGER_CHUNK: usize = 5_000;
+
+/// Resources of one post-commit batch (`DEFERRED_INDEX_BATCH_RESOURCES`): a
+/// chunk of 5,000 minimal Patients is `ceil(5000 / 256)` = 20 batches, 19 of 256
+/// and one of 136. Each batch sends one `update` command, which is what the
+/// failpoints below count. [`a_two_chunk_bundle_writes_two_ledger_documents_and_clears_both`]
+/// checks the batch sizes against the oplog, so a change of either constant
+/// fails there first.
+const BATCH_RESOURCES: usize = 256;
+
+/// Post-commit batches of the first ledger document of a [`two_chunk_bundle`].
+const FIRST_CHUNK_BATCHES: usize = LEDGER_CHUNK.div_ceil(BATCH_RESOURCES);
+
+/// The Observations a [`two_chunk_bundle`] adds after its Patients: the second
+/// ledger document.
+const SECOND_CHUNK: usize = 40;
+
+/// The code every Observation of a [`two_chunk_bundle`] carries.
+const TWO_CHUNK_CODE: &str = "two-chunk-code";
+
+/// The tests of a [`two_chunk_bundle`] take turns. Each Bundle is 5,040 entries,
+/// a transaction of some tens of MB on a test mongod whose WiredTiger cache is
+/// 0.25 GB, and each test has a backend of its own, so nothing else keeps them
+/// from running together: four at once roll each other back for cache pressure
+/// ("rolled back for eviction") and a Bundle that holds the whole admission room
+/// is not replayed for it (#1895), so it fails as a lone eviction. Alone, a
+/// Bundle commits (measured: about 14-24 s in a debug build).
+static TWO_CHUNK_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The MRN of Patient `k` of a [`two_chunk_bundle`].
+fn two_chunk_mrn(k: usize) -> String {
+    format!("TWO-{k}")
+}
+
+/// A Bundle of `LEDGER_CHUNK + SECOND_CHUNK` POST entries: `LEDGER_CHUNK`
+/// Patients, then `SECOND_CHUNK` Observations. A deferred Bundle's ledger lists
+/// its resources in the order the Bundle created them, so the first ledger
+/// document names exactly the Patients and the second exactly the Observations:
+/// the type tells the chunks apart. The resources are as small as a resource
+/// with an ordinary search parameter gets (an `identifier`, a `code`).
+fn two_chunk_bundle() -> Vec<BundleEntry> {
+    let patients = (0..LEDGER_CHUNK).map(|k| {
+        post(
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": MRN_SYSTEM, "value": two_chunk_mrn(k)}],
+            }),
+            &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        )
+    });
+    let observations = (0..SECOND_CHUNK).map(|_| {
+        post(
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": TWO_CHUNK_CODE}]},
+            }),
+            &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        )
+    });
+    patients.chain(observations).collect()
+}
+
+/// The ledger's documents, by `chunk`.
+async fn ledger_documents_by_chunk(backend: &MongoBackend) -> Vec<Document> {
+    let mut documents: Vec<Document> = raw_db(backend)
+        .await
+        .collection::<Document>("search_index_pending")
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    documents.sort_by_key(|document| document.get_i32("chunk").unwrap());
+    documents
+}
+
+/// The `Type` of every ref of a ledger document, each type once (`Patient/<id>`
+/// is `Patient`).
+fn ledger_ref_types(document: &Document) -> Vec<String> {
+    let mut types: Vec<String> = document
+        .get_array("refs")
+        .unwrap()
+        .iter()
+        .map(|stored| {
+            let stored = stored.as_str().expect("a ref is a string");
+            stored.split('/').next().unwrap().to_string()
+        })
+        .collect();
+    types.sort();
+    types.dedup();
+    types
+}
+
+/// The resources of `resource_type` in the tenant with at least one
+/// `search_index` row.
+async fn indexed_count(backend: &MongoBackend, tenant_id: &str, resource_type: &str) -> usize {
+    raw_db(backend)
+        .await
+        .collection::<Document>("search_index")
+        .distinct(
+            "resource_id",
+            doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+        )
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Rows of the tenant in `search_index` and `search_index_contained`.
+async fn tenant_row_count(backend: &MongoBackend, tenant_id: &str) -> u64 {
+    count_docs(backend, "search_index", doc! { "tenant_id": tenant_id }).await
+        + count_docs(
+            backend,
+            "search_index_contained",
+            doc! { "tenant_id": tenant_id },
+        )
+        .await
+}
+
+/// What a search by an ordinary parameter finds of a [`two_chunk_bundle`]: how
+/// many of three Patients (the first, one from the middle and the last, by
+/// `identifier`) it finds, and whether the `code` finds an Observation.
+async fn two_chunk_search_hits(backend: &MongoBackend, tenant: &TenantContext) -> (usize, bool) {
+    let mut patients = 0;
+    for k in [0, LEDGER_CHUNK / 2, LEDGER_CHUNK - 1] {
+        patients += patients_by_mrn(backend, tenant, &two_chunk_mrn(k))
+            .await
+            .len();
+    }
+    let observations = search_ids(
+        backend,
+        tenant,
+        SearchQuery::new("Observation").with_parameter(token_param(
+            "code",
+            &format!("http://loinc.org|{TWO_CHUNK_CODE}"),
+        )),
+    )
+    .await;
+    (patients, !observations.is_empty())
+}
+
+/// Every Patient and Observation of a [`two_chunk_bundle`] has search rows, no
+/// resource carries a marker, and the ordinary searches find them.
+async fn assert_two_chunk_bundle_indexed(backend: &MongoBackend, tenant: &TenantContext) {
+    let tenant_id = tenant.tenant_id().as_str();
+    assert_eq!(marker_count(backend, tenant_id).await, 0, "no marker");
+    assert_eq!(
+        indexed_count(backend, tenant_id, "Patient").await,
+        LEDGER_CHUNK,
+        "every Patient has rows"
+    );
+    assert_eq!(
+        indexed_count(backend, tenant_id, "Observation").await,
+        SECOND_CHUNK,
+        "every Observation has rows"
+    );
+    assert_eq!(
+        two_chunk_search_hits(backend, tenant).await,
+        (3, true),
+        "the ordinary parameters find the Bundle's resources"
+    );
+}
+
+/// The operations of every transaction committed in the oplog window, in one
+/// list. A transaction that outgrows one `applyOps` entry is several entries of
+/// the oplog, so a Bundle of this size is not read one entry at a time.
+async fn all_committed_ops(oplog: &Oplog, backend: &MongoBackend) -> Vec<Document> {
+    oplog
+        .committed(backend)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The documents the oplog's operations inserted into `collection`.
+fn inserted_into<'a>(ops: &'a [Document], db: &str, collection: &str) -> Vec<&'a Document> {
+    let ns = format!("{db}.{collection}");
+    ops.iter()
+        .filter(|op| {
+            op.get_str("ns").is_ok_and(|v| v == ns) && op.get_str("op").is_ok_and(|v| v == "i")
+        })
+        .filter_map(|op| op.get_document("o").ok())
+        .collect()
+}
+
+/// The resources cleared by each committed post-commit batch, in commit order,
+/// from the oplog. A batch commits as one transaction that updates `resources`
+/// and inserts rows; the Bundle's own transaction inserts resources and the
+/// ledger and is not one.
+async fn cleared_per_committed_batch(oplog: &Oplog, backend: &MongoBackend) -> Vec<usize> {
+    batch_txns(oplog, backend)
+        .await
+        .into_iter()
+        .map(|(cleared, _)| cleared)
+        .filter(|cleared| *cleared > 0)
+        .collect()
+}
+
+/// The batch sizes a complete step of a [`two_chunk_bundle`] commits: the
+/// first ledger document's Patients, in `BATCH_RESOURCES` and a remainder, then
+/// the Observations.
+fn two_chunk_batches() -> Vec<usize> {
+    let mut batches = vec![BATCH_RESOURCES; LEDGER_CHUNK / BATCH_RESOURCES];
+    batches.push(LEDGER_CHUNK % BATCH_RESOURCES);
+    batches.push(SECOND_CHUNK);
+    batches
+}
+
+/// Makes `tracing` weigh every dispatcher, not only the calling thread's, when
+/// it decides whether a callsite is enabled.
+///
+/// While exactly one dispatcher exists, `tracing` registers a new callsite
+/// against the default dispatcher of whichever thread hits it first. The scoped
+/// subscriber of a log-capturing test is that one dispatcher until a second one
+/// exists, so a callsite that another test's thread (which has no subscriber)
+/// hits first is cached as disabled, and the capturing test then sees none of
+/// that callsite's events. It did: the first capturing test of a run missed the
+/// post-commit step's whole log, whenever the tests ran together. Two
+/// dispatchers, created and kept once per process, keep that shortcut off; each
+/// dispatcher created after them rebuilds every callsite's interest.
+pub(super) fn keep_two_dispatchers_registered() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for _ in 0..2 {
+            std::mem::forget(tracing::Dispatch::new(
+                tracing::subscriber::NoSubscriber::default(),
+            ));
+        }
+    });
+}
+
+/// A scoped subscriber for one test that records what the post-commit step logs
+/// (its INFO line and its WARN) into a fresh buffer. `set_default` is
+/// thread-local and the runtime of a `#[tokio::test]` is current-thread, so the
+/// step's events land here and no other test's do (see
+/// [`keep_two_dispatchers_registered`] for what it takes). Keep the guard until
+/// the log assertions are done.
+fn capture_step_logs() -> (
+    &'static std::sync::Mutex<Vec<u8>>,
+    tracing::dispatcher::DefaultGuard,
+) {
+    keep_two_dispatchers_registered();
+    let buf: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let writer = tracing_test::internal::MockWriter::new(buf);
+    let dispatch = tracing_test::internal::get_subscriber(
+        writer,
+        "helios_persistence::backends::mongodb::deferred_index=info",
+    );
+    let guard = tracing::dispatcher::set_default(&dispatch);
+    (buf, guard)
+}
+
+/// The captured lines that contain `needle`.
+fn captured_step_lines(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> Vec<String> {
+    let buf = buf.lock().unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The step's WARN for a step that left work to the repair.
+const STEP_LEFT_WORK: &str = "search rows not all written after commit";
+
+/// The step's INFO line.
+const STEP_DONE: &str = "search rows written after commit";
+
+/// A real Bundle of more than 5,000 resources writes one ledger document per
+/// 5,000, and its post-commit step finishes both: the first document is deleted
+/// after its Patients' batches, the second after the Observations'. The oplog
+/// is the proof of what the transaction wrote (two ledger documents, `chunk` 0
+/// and 1 of `chunks` 2, with 5,000 and 40 refs) and of what the step then
+/// committed (the batches, in the order of the chunks); the search by an
+/// ordinary parameter is the proof of the result.
+#[tokio::test]
+async fn a_two_chunk_bundle_writes_two_ledger_documents_and_clears_both() {
+    const NAME: &str = "a_two_chunk_bundle_writes_two_ledger_documents_and_clears_both";
+    let _turn = TWO_CHUNK_TURN.lock().await;
+    let Some(backend) =
+        deferred_backend("def_two_chunks", "def-two-chunks", Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-two-chunks");
+    let tenant_id = tenant.tenant_id().as_str();
+    let oplog = Oplog::begin(&backend).await;
+    let (logs, _guard) = capture_step_logs();
+    let before = backend.deferred_index_step_totals();
+
+    let started = Instant::now();
+    let Some(result) =
+        process_transaction_or_skip(&backend, &tenant, two_chunk_bundle(), NAME).await
+    else {
+        return;
+    };
+    eprintln!(
+        "{NAME}: {} entries took {:?}",
+        result.entries.len(),
+        started.elapsed()
+    );
+    assert_eq!(result.entries.len(), LEDGER_CHUNK + SECOND_CHUNK);
+
+    // The transaction wrote two ledger documents.
+    if let Some(oplog) = &oplog {
+        let db = backend.config().database_name.clone();
+        let ops = all_committed_ops(oplog, &backend).await;
+        let mut ledger = inserted_into(&ops, &db, "search_index_pending");
+        ledger.sort_by_key(|document| document.get_i32("chunk").unwrap());
+        assert_eq!(ledger.len(), 2, "one ledger document per 5,000 resources");
+        for (n, document) in ledger.iter().enumerate() {
+            assert_eq!(document.get_i32("chunk").unwrap(), n as i32);
+            assert_eq!(document.get_i32("chunks").unwrap(), 2);
+            assert_eq!(
+                document.get_i64("entries").unwrap(),
+                (LEDGER_CHUNK + SECOND_CHUNK) as i64
+            );
+        }
+        assert_eq!(ledger[0].get_array("refs").unwrap().len(), LEDGER_CHUNK);
+        assert_eq!(ledger[1].get_array("refs").unwrap().len(), SECOND_CHUNK);
+        assert_eq!(ledger_ref_types(ledger[0]), vec!["Patient"]);
+        assert_eq!(ledger_ref_types(ledger[1]), vec!["Observation"]);
+        assert_eq!(
+            cleared_per_committed_batch(oplog, &backend).await,
+            two_chunk_batches(),
+            "the step committed the first document's batches, then the second's"
+        );
+    }
+
+    // The step finished both documents: nothing is left and everything is found.
+    assert_eq!(
+        ledger_count(&backend).await,
+        0,
+        "both documents are deleted"
+    );
+    assert_two_chunk_bundle_indexed(&backend, &tenant).await;
+    let step = backend.deferred_index_step_totals().since(&before);
+    assert_eq!(
+        (step.steps, step.incomplete),
+        (1, 0),
+        "one step, and a complete one: {step:?}"
+    );
+    assert_eq!(
+        step.rows,
+        tenant_row_count(&backend, tenant_id).await,
+        "the step wrote every row the store holds"
+    );
+    assert!(
+        captured_step_lines(logs, STEP_LEFT_WORK).is_empty(),
+        "a complete step logs no left-work WARN: {:?}",
+        captured_step_lines(logs, STEP_LEFT_WORK)
+    );
+    let done = captured_step_lines(logs, STEP_DONE);
+    assert_eq!(done.len(), 1, "one step line: {done:?}");
+    assert!(
+        done[0].contains(&format!("resources={}", LEDGER_CHUNK + SECOND_CHUNK)),
+        "{}",
+        done[0]
+    );
+}
+
+/// The state of a [`two_chunk_bundle`] whose step finished none of its batches:
+/// both ledger documents are still there (chunk 0 of the Patients and chunk 1 of
+/// the Observations, as the transaction wrote them), every resource still
+/// carries its marker and nothing is found by an ordinary parameter yet.
+async fn assert_both_chunks_left(backend: &MongoBackend, tenant: &TenantContext) {
+    let tenant_id = tenant.tenant_id().as_str();
+    let ledger = ledger_documents_by_chunk(backend).await;
+    assert_eq!(
+        ledger
+            .iter()
+            .map(|document| document.get_i32("chunk").unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "both ledger documents are left"
+    );
+    assert_eq!(ledger_ref_types(&ledger[0]), vec!["Patient"]);
+    assert_eq!(ledger_ref_types(&ledger[1]), vec!["Observation"]);
+    assert_eq!(
+        marker_count(backend, tenant_id).await,
+        (LEDGER_CHUNK + SECOND_CHUNK) as u64,
+        "every resource still carries its marker"
+    );
+    assert_eq!(indexed_count(backend, tenant_id, "Patient").await, 0);
+    assert_eq!(indexed_count(backend, tenant_id, "Observation").await, 0);
+    assert_eq!(
+        two_chunk_search_hits(backend, tenant).await,
+        (0, false),
+        "nothing is found by an ordinary parameter yet"
+    );
+}
+
+/// One repair pass with no minimum age, from a second backend on the same
+/// database (a restarted server), which must take `documents` ledger documents
+/// and clear them all, leaving the whole Bundle indexed.
+async fn repair_finishes_the_bundle(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    app: &str,
+    documents: usize,
+    resources: usize,
+) {
+    let repair = same_db_backend(backend, app).await.unwrap();
+    let report = repair
+        .repair_deferred_search_index(Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.examined,
+            report.reindexed,
+            report.cleared,
+            report.failed,
+            report.remaining
+        ),
+        (documents, resources, documents, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(ledger_count(backend).await, 0);
+    assert_two_chunk_bundle_indexed(backend, tenant).await;
+}
+
+/// The step's left-work WARN of the test, which must be the only one.
+fn left_work_warn(logs: &std::sync::Mutex<Vec<u8>>) -> String {
+    let mut lines = captured_step_lines(logs, STEP_LEFT_WORK);
+    assert_eq!(lines.len(), 1, "one left-work WARN: {lines:?}");
+    lines.remove(0)
+}
+
+/// A step cut by the Bundle deadline before its first batch: the transaction
+/// has committed both ledger documents, and the loop leaves the chunk in hand
+/// and the later one to the repair (`left_chunks` 2). Nothing is searchable by
+/// an ordinary parameter yet, the step is an incomplete step, and one repair
+/// pass finishes both documents.
+#[tokio::test]
+async fn a_two_chunk_bundle_cut_before_its_first_batch_leaves_both_documents_to_the_repair() {
+    const NAME: &str =
+        "a_two_chunk_bundle_cut_before_its_first_batch_leaves_both_documents_to_the_repair";
+    let _turn = TWO_CHUNK_TURN.lock().await;
+    let Some(backend) = cut_by_the_deadline("def_two_cut", "def-two-cut").await else {
+        return;
+    };
+    let tenant = create_tenant("def-two-cut");
+    let (logs, _guard) = capture_step_logs();
+    let before = backend.deferred_index_step_totals();
+
+    let Some(result) =
+        process_transaction_or_skip(&backend, &tenant, two_chunk_bundle(), NAME).await
+    else {
+        return;
+    };
+    assert_eq!(result.entries.len(), LEDGER_CHUNK + SECOND_CHUNK);
+
+    assert_both_chunks_left(&backend, &tenant).await;
+    let step = backend.deferred_index_step_totals().since(&before);
+    assert_eq!(
+        (step.steps, step.rows, step.incomplete),
+        (1, 0, 1),
+        "cut before its first batch: {step:?}"
+    );
+    let warn = left_work_warn(logs);
+    for field in ["left_chunks=2", "stopped_at_deadline=true"] {
+        assert!(warn.contains(field), "missing {field}: {warn}");
+    }
+
+    repair_finishes_the_bundle(
+        &backend,
+        &tenant,
+        "def-two-cut-repair",
+        2,
+        LEDGER_CHUNK + SECOND_CHUNK,
+    )
+    .await;
+}
+
+/// The first ledger document's batches commit and the second document's first
+/// batch fails for good (its `update` fails on each of five attempts): the
+/// first document is deleted and the Patients are searchable and unmarked, the
+/// second document (`chunk` 1) is kept with its Observations still marked, and
+/// the step is an incomplete step with one document left. The failpoint lets the
+/// first document's `FIRST_CHUNK_BATCHES` `update` commands through (`skip`),
+/// and fails every later one, so the cut falls between the documents without a
+/// timer.
+#[tokio::test]
+async fn a_two_chunk_bundle_whose_second_chunk_fails_keeps_only_the_second_document() {
+    const NAME: &str = "a_two_chunk_bundle_whose_second_chunk_fails_keeps_only_the_second_document";
+    let _turn = TWO_CHUNK_TURN.lock().await;
+    let app = "fp-def-two-second";
+    let Some(backend) = deferred_backend("def_two_second", app, Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-two-second");
+    let tenant_id = tenant.tenant_id().as_str();
+    // A catalog `update` of a type's first write would count against `skip`.
+    record_missing_fingerprints(&backend).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! { "failCommands": ["update"], "errorCode": 2 },
+        doc! { "skip": FIRST_CHUNK_BATCHES as i64 },
+    )
+    .await
+    else {
+        return;
+    };
+    let (logs, _guard) = capture_step_logs();
+    let before = backend.deferred_index_step_totals();
+
+    let result = backend
+        .process_transaction(&tenant, two_chunk_bundle(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if lacks_transactions(&result) {
+        return;
+    }
+    let result = result.expect("a committed Bundle is not failed by its post-commit step");
+    assert_eq!(result.entries.len(), LEDGER_CHUNK + SECOND_CHUNK);
+    // The `skip`ped commands are not counted: what fired is the second
+    // document's first batch, on each of its five attempts.
+    assert_eq!(
+        entered, 5,
+        "the second document's first batch is tried five times and no other batch starts"
+    );
+
+    // The first document is gone, the second is as the transaction wrote it.
+    let ledger = ledger_documents_by_chunk(&backend).await;
+    assert_eq!(ledger.len(), 1, "only the second document is left");
+    assert_eq!(ledger[0].get_i32("chunk").unwrap(), 1);
+    assert_eq!(ledger[0].get_i32("chunks").unwrap(), 2);
+    assert_eq!(ledger_ref_types(&ledger[0]), vec!["Observation"]);
+    assert_eq!(ledger[0].get_array("refs").unwrap().len(), SECOND_CHUNK);
+
+    // The Patients are indexed and unmarked; the Observations are not.
+    assert_eq!(
+        indexed_count(&backend, tenant_id, "Patient").await,
+        LEDGER_CHUNK
+    );
+    assert!(marked_ids(&backend, tenant_id, "Patient").await.is_empty());
+    assert_eq!(
+        patients_by_mrn(&backend, &tenant, &two_chunk_mrn(LEDGER_CHUNK - 1))
+            .await
+            .len(),
+        1,
+        "the last Patient of the first document is found"
+    );
+    assert_eq!(indexed_count(&backend, tenant_id, "Observation").await, 0);
+    assert_eq!(
+        marked_ids(&backend, tenant_id, "Observation").await.len(),
+        SECOND_CHUNK,
+        "the second document's resources are still marked"
+    );
+    assert!(
+        !two_chunk_search_hits(&backend, &tenant).await.1,
+        "no Observation is found by its code yet"
+    );
+
+    let step = backend.deferred_index_step_totals().since(&before);
+    assert_eq!(
+        (step.steps, step.incomplete),
+        (1, 1),
+        "an incomplete step: {step:?}"
+    );
+    assert!(step.rows > 0, "the first document's rows were written");
+    let warn = left_work_warn(logs);
+    for field in ["left_chunks=1", "stopped_at_deadline=false"] {
+        assert!(warn.contains(field), "missing {field}: {warn}");
+    }
+
+    repair_finishes_the_bundle(&backend, &tenant, "def-two-second-repair", 1, SECOND_CHUNK).await;
+}
+
+/// A batch of the first ledger document fails for good (its `update` fails on
+/// each of five attempts): the chunk in hand and the later chunk are both left,
+/// so both documents stay, nothing is written, the step is an incomplete step
+/// (`left_chunks` 2, not a deadline) and one repair pass finishes both.
+#[tokio::test]
+async fn a_two_chunk_bundle_whose_first_batch_fails_leaves_both_documents_to_the_repair() {
+    const NAME: &str =
+        "a_two_chunk_bundle_whose_first_batch_fails_leaves_both_documents_to_the_repair";
+    let _turn = TWO_CHUNK_TURN.lock().await;
+    let app = "fp-def-two-first";
+    let Some(backend) = deferred_backend("def_two_first", app, Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-two-first");
+    record_missing_fingerprints(&backend).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! { "failCommands": ["update"], "errorCode": 2 },
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+    let (logs, _guard) = capture_step_logs();
+    let before = backend.deferred_index_step_totals();
+
+    let result = backend
+        .process_transaction(&tenant, two_chunk_bundle(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if lacks_transactions(&result) {
+        return;
+    }
+    let result = result.expect("a committed Bundle is not failed by its post-commit step");
+    assert_eq!(result.entries.len(), LEDGER_CHUNK + SECOND_CHUNK);
+    assert_eq!(
+        entered, 5,
+        "the first batch is tried five times and no other batch starts"
+    );
+
+    assert_both_chunks_left(&backend, &tenant).await;
+    let step = backend.deferred_index_step_totals().since(&before);
+    assert_eq!(
+        (step.steps, step.rows, step.incomplete),
+        (1, 0, 1),
+        "an incomplete step that wrote nothing: {step:?}"
+    );
+    let warn = left_work_warn(logs);
+    for field in ["left_chunks=2", "stopped_at_deadline=false"] {
+        assert!(warn.contains(field), "missing {field}: {warn}");
+    }
+    assert!(
+        warn.contains("Failed to clear the deferred search rows marker"),
+        "the WARN carries the last batch error: {warn}"
+    );
+
+    repair_finishes_the_bundle(
+        &backend,
+        &tenant,
+        "def-two-first-repair",
+        2,
+        LEDGER_CHUNK + SECOND_CHUNK,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // The ceiling
 // ---------------------------------------------------------------------------
 
@@ -5425,10 +6079,15 @@ fn env_flag(name: &str, default: bool) -> bool {
 
 /// Where a `TooLargeForCache` reason says the Bundle ended: the digits after
 /// `Entry ` (`Entry 19766 processing failed: ...`, `Entry 21100 rolled back
-/// for eviction ...`), `commit` for a reason that starts with `Commit`, and `na`
+/// for eviction ...`), `ledger` for a reason that starts with `Deferred search
+/// index ledger write`, `commit` for one that starts with `Commit`, and `na`
 /// for anything else. The prefixes are written by `entry_attempt_error`,
-/// `ledger_attempt_error` and `lone_eviction_failure` in `storage.rs`.
+/// `ledger_attempt_error` and `lone_eviction_failure` in `storage.rs`; the
+/// harness reads them because they are all a `TooLargeForCache` carries (#2037).
 fn abort_entry(reason: &str) -> String {
+    if reason.starts_with("Deferred search index ledger write") {
+        return "ledger".to_string();
+    }
     if reason.starts_with("Commit") {
         return "commit".to_string();
     }
@@ -5454,6 +6113,18 @@ fn abort_entry_is_read_from_the_reason() {
     assert_eq!(
         abort_entry("Commit rolled back for eviction while the Bundle ran alone; x"),
         "commit"
+    );
+    // The ledger is written before the commit, and is no entry (#2037).
+    assert_eq!(
+        abort_entry("Deferred search index ledger write failed: x"),
+        "ledger"
+    );
+    assert_eq!(
+        abort_entry(
+            "Deferred search index ledger write rolled back for eviction while the Bundle ran \
+             alone; not replayed: Deferred search index ledger write failed: x"
+        ),
+        "ledger"
     );
     assert_eq!(abort_entry("x"), "na");
 }
@@ -5773,7 +6444,8 @@ async fn run_ceiling_probe(url: &str, fixture: &Value) {
 ///   abort_entry=.. secs=.. entries_per_s=.. resources=.. rows=.. ledger=..
 ///   markers=.. wt_rollbacks=.. step_s=..`. `outcome` is `ok`, `too_large`,
 ///   `transient` or `other:..`; `abort_entry` is the entry the transaction ended
-///   at (or `commit`, or `na` for a committed Bundle); `entries_per_s` is the
+///   at (or `ledger`, or `commit`, or `na` for a committed Bundle);
+///   `entries_per_s` is the
 ///   entries written, up to the abort, per second; `step_s` is the post-commit
 ///   step's own time (the part of `secs` that is not the transaction), or `na`
 ///   when no step ran (#2036).
@@ -5795,10 +6467,11 @@ async fn run_ceiling_probe(url: &str, fixture: &Value) {
 /// `abort_entry` is accurate to about one create chunk
 /// (`BUNDLE_CREATE_CHUNK_ENTRIES`, 100 entries): a failed chunk is charged to the
 /// entry the server names, or else to its first entry, so it can read up to 99
-/// entries low (`bundle_creates.rs`, Attribution). A refusal while the ledger is
-/// written reads as `abort_entry=<entries>`, because `ledger_attempt_error`
-/// reuses `entry_attempt_error(entries, entries, ..)` in `storage.rs`; a lone
-/// eviction rollback there names no entry and reads as `abort_entry=commit`.
+/// entries low (`bundle_creates.rs`, Attribution). A failure while the ledger is
+/// written reads as `abort_entry=ledger` (#2037); it read as
+/// `abort_entry=<entries>` for a 388 (`ledger_attempt_error` passed the entry
+/// count as an entry index) and as `abort_entry=commit` for an eviction
+/// rollback, before. A ledger abort counts all the entries as written.
 /// A `transient` outcome also prints a `DEFERRED_CEILING_TRANSIENT` line with
 /// the last attempt's reason.
 ///
@@ -5939,12 +6612,13 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
             ),
         };
         // The entries written up to the end, for the rate: all of them for a
-        // committed Bundle, the abort entry for one that aborted at an entry,
-        // and none (`na`) for a commit or an outcome with no abort entry.
+        // committed Bundle or one that aborted at the ledger (written after the
+        // last entry), the abort entry for one that aborted at an entry, and
+        // none (`na`) for a commit or an outcome with no abort entry.
         let written = abort
             .parse::<usize>()
             .ok()
-            .or((outcome == "ok").then_some(entry_count));
+            .or((outcome == "ok" || abort == "ledger").then_some(entry_count));
         let entries_per_s = written.map_or_else(
             || "na".to_string(),
             |written| format!("{:.1}", written as f64 / secs),
