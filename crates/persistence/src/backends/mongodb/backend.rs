@@ -684,6 +684,32 @@ pub struct MongoBackendConfig {
     /// since a loaded CI host can take more than a second to move the majority.
     #[serde(default = "default_settle_read_max_time_ms")]
     pub settle_read_max_time_ms: u64,
+
+    /// The most `resource_history` documents (versions) a `$purge` removes in one
+    /// transaction (#2146). A purge of one resource whose history is longer, and
+    /// a `purge_all` batch whose resources have more versions in all, does not
+    /// use a transaction: the resource is purged one command at a time, as before
+    /// #2146, and a batch is halved.
+    ///
+    /// The REST layer drops a request that outlives `HFS_REQUEST_TIMEOUT`, and
+    /// dropping the request aborts its transaction. A transaction that needs
+    /// longer than that is rolled back on every call and its resource can never
+    /// be purged, unless the cache is too small to hold it (code 388, which is
+    /// also run without a transaction). Counting the versions first is how a long
+    /// history is kept out of one. Only versions are counted: the search rows of
+    /// the resources are not, and neither is the size of anything.
+    ///
+    /// The limit bounds the time a purge transaction takes, not the cache it
+    /// holds. On a small cache a purge under the limit can still be rolled back
+    /// under cache pressure; the purge then runs the transaction once more after
+    /// 100 ms and, if that is rolled back too, runs without a transaction, so it
+    /// does not answer `503` for it.
+    ///
+    /// Default [`DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS`](super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS),
+    /// with the measurement behind it. Must be at least 1: [`MongoBackend::new`]
+    /// rejects `0`. No `HFS_*` variable sets it, like `settle_read_max_time_ms`.
+    #[serde(default = "default_purge_transaction_max_versions")]
+    pub purge_transaction_max_versions: u64,
 }
 
 /// Environment variable that sets
@@ -1020,6 +1046,10 @@ fn default_settle_read_max_time_ms() -> u64 {
     super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
 }
 
+fn default_purge_transaction_max_versions() -> u64 {
+    super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+}
+
 impl Debug for MongoBackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Destructured without `..` so a new field fails to compile until it
@@ -1056,6 +1086,7 @@ impl Debug for MongoBackendConfig {
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
             settle_read_max_time_ms,
+            purge_transaction_max_versions,
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
@@ -1104,6 +1135,10 @@ impl Debug for MongoBackendConfig {
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
             .field("settle_read_max_time_ms", settle_read_max_time_ms)
+            .field(
+                "purge_transaction_max_versions",
+                purge_transaction_max_versions,
+            )
             .finish()
     }
 }
@@ -1162,6 +1197,7 @@ impl Default for MongoBackendConfig {
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
             settle_read_max_time_ms: default_settle_read_max_time_ms(),
+            purge_transaction_max_versions: default_purge_transaction_max_versions(),
         }
     }
 }
@@ -1244,6 +1280,13 @@ impl MongoBackend {
                 backend_name: "mongodb".to_owned(),
                 message: "settle_read_max_time_ms must be an integer from 1 to 2147483647"
                     .to_owned(),
+                source: None,
+            }));
+        }
+        if config.purge_transaction_max_versions == 0 {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "purge_transaction_max_versions must be at least 1".to_owned(),
                 source: None,
             }));
         }
@@ -3186,6 +3229,56 @@ mod tests {
             assert!(
                 MongoBackend::new(MongoBackendConfig {
                     settle_read_max_time_ms: valid,
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_transaction_max_versions_defaults_survives_serde_and_rejects_zero() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(
+            default.purge_transaction_max_versions,
+            super::super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+        );
+        assert!(default.purge_transaction_max_versions >= 1);
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(
+            from_empty.purge_transaction_max_versions,
+            super::super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+        );
+
+        let config = MongoBackendConfig {
+            purge_transaction_max_versions: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.purge_transaction_max_versions, 3);
+        assert!(
+            format!("{config:?}").contains("purge_transaction_max_versions: 3"),
+            "{config:?}"
+        );
+
+        let err = MongoBackend::new(MongoBackendConfig {
+            purge_transaction_max_versions: 0,
+            ..Default::default()
+        })
+        .expect_err("0 is refused");
+        assert!(
+            err.to_string().contains("purge_transaction_max_versions"),
+            "{err}"
+        );
+        for valid in [1, u64::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    purge_transaction_max_versions: valid,
                     ..Default::default()
                 })
                 .is_ok(),
