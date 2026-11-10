@@ -30,6 +30,7 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 | `HFS_BASE_URL` | Base URL used in notification links |
 | `HFS_SUBSCRIPTION_PERSIST_STATUS` | Write server-driven status transitions back into the stored `Subscription` (default `true`) |
 | `HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS` | Per-write timeout for that write-back (default `5000`) |
+| `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | Events remembered per subscription for `$events` (default `100`, `0` disables; in memory only, empty after a restart) |
 | `HFS_SUBSCRIPTION_REHYDRATE` | Replay stored topics/subscriptions into the engine at startup (default `true`) |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | Re-run activation for stored `requested`/`error` subscriptions (default `true`) |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY` | Cap on concurrent startup handshakes (default `8`) |
@@ -64,6 +65,9 @@ Things to know when working here:
   `error` → `active`.
 - `$status` / `$events` fall back to the stored resource when the engine does
   not hold the subscription, instead of `404`.
+- `$events` returns a `query-event` status (R4 `Parameters`, R4B+ `SubscriptionStatus`) with
+  an absolute subscription reference plus id-only entries for the requested
+  `eventsSinceNumber`/`eventsUntilNumber` range; an invalid range is `400` + `OperationOutcome`.
 
 ## Key API
 

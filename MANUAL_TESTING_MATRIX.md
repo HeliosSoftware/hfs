@@ -1329,11 +1329,37 @@ Save this batch Bundle as `$WORK/fixtures/encounters.json`:
    2, 6, 14, 30 and 62 s after the upload and then every minute, so a receiver
    restarted within the roughly five-minute retry window is reached on the next one),
    and the two queued behind it follow within milliseconds.
+4. `$status` and `$events` (run after step 1, before step 3, so the counter is exactly 3;
+   `$HFS` is the server base, `$BASE` = `$HFS/fhir` or your configured base URL):
+   - `curl -s $BASE/Subscription/manual-sub/\$status` → `200`, a `Parameters` resource
+     (R4) with `subscription` (an **absolute** URL ending `/Subscription/manual-sub`),
+     `topic`, `status` = `active`, `type` = `query-status` and
+     `events-since-subscription-start` = `3`.
+   - `curl -s "$BASE/Subscription/manual-sub/\$events?eventsSinceNumber=1&eventsUntilNumber=3"`
+     → `200`, a `history` Bundle (R4/R4B; `subscription-notification` on R5/R6).
+     `entry[0].resource` is the status: on **R4** a `Parameters` (never a
+     `SubscriptionStatus`) with `type` = `query-event`, the same absolute `subscription`
+     reference as `$status`, `events-since-subscription-start` = `3` and **3**
+     `notification-event` parts (`event-number` 1, 2, 3, a `timestamp`, and a `focus`
+     reference `Encounter/<id>`); on **R4B and later** a `SubscriptionStatus` with
+     `type` = `query-event` and 3 `notificationEvent` entries. `entry[0].request` is
+     `GET Subscription/manual-sub/$status`. Entries 1-3 are id-only (`fullUrl` and
+     `request GET Encounter/<id>`, no `resource`).
+   - `...$events?eventsSinceNumber=2&eventsUntilNumber=2` → the same shape with exactly
+     **1** event (number 2): the range parameters change the result.
+   - `...$events?eventsSinceNumber=5` (above the counter), `...eventsSinceNumber=3&eventsUntilNumber=1`
+     and `...eventsSinceNumber=abc` → `400` with an `OperationOutcome` (issue code `invalid`).
+   - The event history is in memory (size `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE`, default
+     100) and is empty after a server restart; a range entirely older than the retained
+     events is also `400`.
 
 Pass criteria: the handshake arrives; the stored Subscription flips
 `requested → active` with a new version; each created Encounter yields exactly one
 notification carrying the configured `Authorization` header; a non-matching resource
-does not notify; retries deliver after the receiver returns.
+does not notify; retries deliver after the receiver returns; `$events` returns the
+status in the server's FHIR-version shape (R4: `Parameters`, not `SubscriptionStatus`)
+with `type` `query-event`, an absolute subscription reference, exactly the requested
+events, and `400` + `OperationOutcome` for an invalid range.
 
 ---
 

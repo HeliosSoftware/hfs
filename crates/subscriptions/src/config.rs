@@ -97,6 +97,12 @@ pub struct SubscriptionConfig {
     /// same instant; without a bound those transitions would each check out a
     /// backend connection and could starve ordinary reads.
     pub status_write_concurrency: usize,
+
+    /// Number of most recent notification events remembered per subscription
+    /// so `$events` can replay them (event number, timestamp and focus
+    /// reference only, never the resource body). The history is in memory, like
+    /// the event counter, and is empty after a restart. `0` disables it.
+    pub event_history_size: usize,
 }
 
 /// FHIR Messaging channel configuration.
@@ -138,6 +144,7 @@ impl Default for SubscriptionConfig {
             persist_status: true,
             status_write_timeout: Duration::from_secs(5),
             status_write_concurrency: 4,
+            event_history_size: 100,
         }
     }
 }

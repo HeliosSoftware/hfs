@@ -29,6 +29,8 @@ pub enum NotificationType {
     Heartbeat,
     /// A resource event matched the subscription.
     EventNotification,
+    /// Response to an `$events` query.
+    QueryEvent,
 }
 
 impl NotificationType {
@@ -37,6 +39,7 @@ impl NotificationType {
             Self::Handshake => "handshake",
             Self::Heartbeat => "heartbeat",
             Self::EventNotification => "event-notification",
+            Self::QueryEvent => "query-event",
         }
     }
 
@@ -47,6 +50,7 @@ impl NotificationType {
             "handshake" => Some(Self::Handshake),
             "heartbeat" => Some(Self::Heartbeat),
             "event-notification" => Some(Self::EventNotification),
+            "query-event" => Some(Self::QueryEvent),
             _ => None,
         }
     }
@@ -132,6 +136,22 @@ pub fn build_notification(
     }
 }
 
+/// Builds the `$events` response bundle for an [`EventQuery`].
+///
+/// R4 yields a `history` Bundle whose first entry is the backport status as a
+/// `Parameters`; R4B and later yield a native `SubscriptionStatus`. Both carry
+/// `type = query-event`, the absolute `subscription_url`, and the events as
+/// id-only entries (no resource bodies are retained). Counters in the native
+/// status are strings so R4B (`string`) and R5/R6 (`integer64`) both parse.
+pub fn build_query_events_bundle(
+    query: &crate::manager::EventQuery,
+    subscription_id: &str,
+    subscription_url: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, SubscriptionError> {
+    builder::build_query_events_bundle(query, subscription_id, subscription_url, base_url)
+}
+
 /// Builds a handshake notification for a newly activated subscription.
 pub fn build_handshake(
     subscription: &ActiveSubscription,
@@ -210,6 +230,117 @@ mod tests {
             consecutive_failures: 0,
             tenant_id: "test-tenant".to_string(),
         }
+    }
+
+    fn query(version: FhirVersion) -> crate::manager::EventQuery {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        crate::manager::EventQuery {
+            status: SubscriptionStatusCode::Active,
+            topic_url: "http://example.org/topic/encounter-start".to_string(),
+            fhir_version: version,
+            events_since_start: 3,
+            oldest_retained: Some(2),
+            events: (2..=3)
+                .map(|n| NotificationEventData {
+                    event_number: n,
+                    timestamp: ts,
+                    focus_reference: format!("Encounter/{n}"),
+                })
+                .collect(),
+        }
+    }
+
+    const SUB_URL: &str = "https://public.example/fhir/Subscription/sub-1";
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_query_events_r4_uses_parameters() {
+        let bundle = build_query_events_bundle(
+            &query(FhirVersion::R4),
+            "sub-1",
+            SUB_URL,
+            "https://public.example/fhir",
+        )
+        .unwrap();
+        assert_eq!(bundle["type"], "history");
+        let entries = bundle["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "status + 2 id-only entries");
+        let status = &entries[0]["resource"];
+        assert_eq!(status["resourceType"], "Parameters");
+        let params = status["parameter"].as_array().unwrap();
+        let get = |name: &str| params.iter().find(|p| p["name"] == name).unwrap();
+        assert_eq!(get("type")["valueCode"], "query-event");
+        assert_eq!(get("subscription")["valueReference"]["reference"], SUB_URL);
+        assert_eq!(get("events-since-subscription-start")["valueString"], "3");
+        let events: Vec<_> = params
+            .iter()
+            .filter(|p| p["name"] == "notification-event")
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["part"][0]["valueString"], "2");
+        assert_eq!(
+            events[0]["part"][2]["valueReference"]["reference"],
+            "Encounter/2"
+        );
+        assert_eq!(entries[0]["request"]["url"], "Subscription/sub-1/$status");
+        assert_eq!(
+            entries[1]["fullUrl"],
+            "https://public.example/fhir/Encounter/2"
+        );
+        assert_eq!(entries[1]["request"]["url"], "Encounter/2");
+        assert!(entries[1].get("resource").is_none());
+    }
+
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn test_query_events_r4b_native_status_parses_into_model() {
+        let bundle = build_query_events_bundle(
+            &query(FhirVersion::R4B),
+            "sub-1",
+            SUB_URL,
+            "https://public.example/fhir",
+        )
+        .unwrap();
+        assert_eq!(bundle["type"], "history");
+        let status = bundle["entry"][0]["resource"].clone();
+        assert_eq!(status["resourceType"], "SubscriptionStatus");
+        assert_eq!(status["type"], "query-event");
+        assert_eq!(status["subscription"]["reference"], SUB_URL);
+        assert_eq!(status["eventsSinceSubscriptionStart"], "3");
+        assert_eq!(status["notificationEvent"][0]["eventNumber"], "2");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 3);
+        let parsed: helios_fhir::r4b::SubscriptionStatus =
+            serde_json::from_value(status).expect("R4B SubscriptionStatus");
+        assert_eq!(parsed.notification_event.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[cfg(feature = "R5")]
+    #[test]
+    fn test_query_events_r5_native_status_parses_into_model() {
+        let bundle = build_query_events_bundle(
+            &query(FhirVersion::R5),
+            "sub-1",
+            SUB_URL,
+            "https://public.example/fhir",
+        )
+        .unwrap();
+        assert_eq!(bundle["type"], "subscription-notification");
+        let status = bundle["entry"][0]["resource"].clone();
+        assert_eq!(status["type"], "query-event");
+        let parsed: helios_fhir::r5::SubscriptionStatus =
+            serde_json::from_value(status).expect("R5 SubscriptionStatus");
+        assert_eq!(parsed.notification_event.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn test_query_event_type_round_trips() {
+        assert_eq!(NotificationType::QueryEvent.as_fhir_str(), "query-event");
+        assert_eq!(
+            NotificationType::from_fhir_str("query-event"),
+            Some(NotificationType::QueryEvent)
+        );
     }
 
     #[test]

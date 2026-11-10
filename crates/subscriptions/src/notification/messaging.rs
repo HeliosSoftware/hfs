@@ -130,6 +130,7 @@ fn notification_type_display(notification_type: NotificationType) -> &'static st
         NotificationType::Handshake => "Handshake notification",
         NotificationType::Heartbeat => "Heartbeat notification",
         NotificationType::EventNotification => "Event notification",
+        NotificationType::QueryEvent => "Query event",
     }
 }
 
