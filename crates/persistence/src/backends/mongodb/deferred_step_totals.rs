@@ -63,6 +63,9 @@ impl DeferredStepCounters {
         self.rows.fetch_add(rows, Ordering::Relaxed);
         // A u64 of nanoseconds holds 584 years; saturate rather than wrap.
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        // `fetch_update` is deprecated on newer toolchains in favour of
+        // `try_update`, which is unstable on the 1.90 MSRV.
+        #[allow(deprecated)]
         let _ = self
             .nanos
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
