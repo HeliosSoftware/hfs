@@ -1,0 +1,11 @@
+[T8 12.1] pass receiver listening on 127.0.0.1:9999 pid=2081555 log=/home/edson/tmp/939/work/webhook.log (expected: listening, empty log); fixture /home/edson/tmp/939/work/fixtures/encounters.json
+[T8 12.2.1] pass Unsaved pill before save=1 cleared=true; editor status=""; GET Basic/manual-topic -> 200 (expected 200, code SubscriptionTopic)
+[T8 12.2.2] pass Unsaved pill cleared=true; editor status=""; GET Subscription/manual-sub -> 200, endpoint=http://127.0.0.1:9999/webhook (expected http://127.0.0.1:9999/webhook)
+[T8 12.2.3] pass after 2899 ms: 1 log line(s), handshake lines=1, auth="Bearer manual-token" (expected 1 line, handshake, "Bearer manual-token")
+[T8 12.2.4] pass UI result row="manual-sub active 02:11 PM" (expected status column active); API ?_elements=status -> "active"; _history entries=2 (expected 2), statuses v1->v2=requested->active; UI History tab version rows=2 (expected 2); diff mentions status requested -> active=true text="v1 → v2 2 metadata changes hidden REPLACE /status requested → active Show full text diff 4 4 "profile": [ 5 5 "http://hl7.org/fhir/uv/subscriptions-backport/Str" 
+[T8 12.3.1] pass request line="POST [base] · Bundle · batch · 3 entries"; created badge="3 created"; overall="200"; log lines=4 (expected 4); last auth="Bearer manual-token"; events-since-subscription-start on last line=3 (expected 3); id-only payload
+[T8 12.3.1-status] pass GET Subscription/manual-sub/$status -> 200, status active=true, eventsSinceSubscriptionStart=3 (expected 3)
+[T8 12.3.1-events] pass GET $events?eventsSinceNumber=1&eventsUntilNumber=3 -> 200, Bundle.type=history, entries=1 [SubscriptionStatus]; the matrix does not state an expected count, expected status 200 with a history Bundle whose first entry is the SubscriptionStatus
+[T8 12.3.2] pass Condition saved (pill cleared=true, status=""); log lines before=4 after=4 (expected 4 and unchanged)
+[T8 12.3.3] pass receiver stopped=true; batch created="3 created"; log lines before=4, after 30000 ms with receiver down=4 (expected unchanged), after receiver restart +31624 ms=7 (expected 7); added events-since counters=[4,5,6] auth all Bearer manual-token=true
+[T8 12.console] pass no browser console errors during T8 (ignoring 2 editor id-probe 404/410 lines)

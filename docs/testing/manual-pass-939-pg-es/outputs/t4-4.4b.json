@@ -1,0 +1,2 @@
+# GET /RiskAssessment?probability=lt0.5&_total=accurate -> 200
+{"resourceType":"Bundle","type":"searchset","total":0,"link":[{"relation":"self","url":"http://localhost:18080/RiskAssessment?probability=lt0.5&_total=accurate"}],"entry":[]}

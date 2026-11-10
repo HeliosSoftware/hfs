@@ -1,0 +1,2 @@
+# GET http://localhost:18080/export-status/bf14a84a-3c53-4afe-8eee-dcb3f1ee6f13 -> 200
+{"transactionTime":"2026-11-10T13:52:00.486767Z","request":"http://localhost:18080/$export?_type=Organization","requiresAccessToken":false,"output":[{"type":"Organization","url":"http://localhost:18080/export-file/bf14a84a-3c53-4afe-8eee-dcb3f1ee6f13/Organization-0","count":1000},{"type":"Organization","url":"http://localhost:18080/export-file/bf14a84a-3c53-4afe-8eee-dcb3f1ee6f13/Organization-1","count":140}],"error":[],"deleted":[],"link":[]}

@@ -1,0 +1,5 @@
+PUT where=code.coding.first().code = '8302-2'
+HTTP 200
+narrowed dependency rows (COUNT over obs through $sql-run)=175355
+Observation?code=8302-2 total=175355
+Observations on server=7699987

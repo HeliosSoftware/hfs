@@ -1,0 +1,2 @@
+# GET /health -> 200
+{"status":"ok","service":"hfs","version":"0.2.8","uptime_seconds":54.180939756,"started_at":"2026-11-09T13:57:46.965532914+00:00","timestamp":"2026-11-09T13:58:41.146472369+00:00"}

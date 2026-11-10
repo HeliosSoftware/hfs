@@ -1,0 +1,2 @@
+# GET http://localhost:18080/export-status/01add7cf-c274-4def-ae78-a2d6d766c2f4 -> 200
+{"transactionTime":"2026-11-10T14:16:12.638344Z","request":"http://localhost:18080/Group/manual-group/$export?_type=Patient,Condition","requiresAccessToken":false,"output":[{"type":"Condition","url":"http://localhost:18080/export-file/01add7cf-c274-4def-ae78-a2d6d766c2f4/Condition-0","count":16},{"type":"Patient","url":"http://localhost:18080/export-file/01add7cf-c274-4def-ae78-a2d6d766c2f4/Patient-0","count":1}],"error":[],"deleted":[],"link":[]}

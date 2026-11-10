@@ -1,0 +1,2 @@
+# GET /Encounter?_summary=count -> 200
+{"resourceType":"Bundle","type":"searchset","total":827980}

@@ -1,0 +1,1 @@
+Contract for step scripts (steps/tN.mjs): import from ../lib.mjs; read HFS_BASE (default http://127.0.0.1:18080) and OUT; one script per matrix step; every matrix row -> record(); on any unexpected result record 'fail' with the exact on-screen text, keep going, never stop the run.

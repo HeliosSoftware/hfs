@@ -1,0 +1,2 @@
+# GET /Subscription/manual-sub/$status -> 200
+{"resourceType":"Parameters","parameter":[{"name":"subscription","valueReference":{"reference":"http://localhost:18080/Subscription/manual-sub"}},{"name":"topic","valueCanonical":"http://example.org/topics/encounter-start"},{"name":"status","valueCode":"active"},{"name":"type","valueCode":"query-status"},{"name":"events-since-subscription-start","valueString":"3"}]}

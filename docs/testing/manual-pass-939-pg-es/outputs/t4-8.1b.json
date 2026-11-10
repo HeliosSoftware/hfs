@@ -1,0 +1,2 @@
+# GET /ValueSet/manual-test-vs -> 200
+{"id":"manual-test-vs","url":"http://example.org/fhir/ValueSet/manual-test","name":"ManualTest","status":"active","resourceType":"ValueSet","meta":{"versionId":"1","lastUpdated":"2026-11-09T15:52:13.725Z"}}

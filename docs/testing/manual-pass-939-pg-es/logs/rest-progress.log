@@ -1,0 +1,16 @@
+13:50:22 start t5
+13:53:02 end t5 exit=0
+13:53:02 start t6
+13:53:55 end t6 exit=0
+13:53:55 start t7
+14:11:47 end t7 exit=0
+14:11:47 start t8
+14:12:02 reruns waiting for T9 13.4a
+14:13:14 end t8 exit=0
+14:13:14 start t9
+14:13:52 reruns start (T9 13.4a seen)
+14:16:25 end t5 rerun exit=0
+14:30:09 end t7n exit=0
+14:30:09 reruns DONE
+14:30:14 end t9 exit=0
+14:30:14 ALL DONE

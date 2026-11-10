@@ -1,0 +1,2 @@
+# GET /Subscription/manual-sub/$events?eventsSinceNumber=1&eventsUntilNumber=3 -> 200
+{"resourceType":"Bundle","type":"history","entry":[{"resource":{"resourceType":"SubscriptionStatus","status":"active","type":"query-status","eventsSinceSubscriptionStart":3,"subscription":{"reference":"Subscription/manual-sub"},"topic":"http://example.org/topics/encounter-start"}}]}

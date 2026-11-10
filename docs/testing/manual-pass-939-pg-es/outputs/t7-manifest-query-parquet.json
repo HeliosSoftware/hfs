@@ -1,0 +1,2 @@
+# GET /export/18a5b7e7-b8cb-40c6-90dd-fe82baf5d362/status -> 422
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job '18a5b7e7-b8cb-40c6-90dd-fe82baf5d362' failed: query 'tall_female_patients': dependency 'obs' (ViewDefinition observation_flat) exceeds 1000000-row limit: SQL queries materialize each dependency in full before the query's WHERE runs. Narrow the dependency with a ViewDefinition 'where', or raise HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD.","expression":["tall_female_patients"]}]}

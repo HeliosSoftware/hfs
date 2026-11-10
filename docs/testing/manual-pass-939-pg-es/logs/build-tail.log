@@ -1,0 +1,5 @@
+   Compiling helios-subscriptions v0.2.8 (/home/edson/src/hfs-wt/docs-939-manual-pass-screenshots/crates/subscriptions)
+   Compiling helios-rest v0.2.8 (/home/edson/src/hfs-wt/docs-939-manual-pass-screenshots/crates/rest)
+   Compiling helios-ui v0.2.8 (/home/edson/src/hfs-wt/docs-939-manual-pass-screenshots/crates/ui)
+   Compiling helios-hfs v0.2.8 (/home/edson/src/hfs-wt/docs-939-manual-pass-screenshots/crates/hfs)
+    Finished `release` profile [optimized] target(s) in 10m 31s

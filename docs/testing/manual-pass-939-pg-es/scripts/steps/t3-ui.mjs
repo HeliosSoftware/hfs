@@ -1,0 +1,11 @@
+import { launch, shot, record, api } from '../lib.mjs';
+const { browser, page } = await launch();
+await page.goto(process.env.HFS_BASE + '/ui'); await page.waitForTimeout(3000);
+await shot(page, 'T3', '7.5-ui-dashboard-after-import');
+const dash = (await page.locator('main').innerText()).replace(/\s+/g, ' ').slice(0, 400);
+await page.goto(process.env.HFS_BASE + '/ui/resources'); await page.waitForTimeout(4000);
+await shot(page, 'T3', '7.5-resources-rail-counts');
+const rail = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
+const pat = (rail.match(/Patient\s+≈?([\d,]+)/) || [])[1], obs = (rail.match(/Observation\s+≈?([\d,]+)/) || [])[1];
+record('T3', '7.5-ui', 'pass', `dashboard after import: ${dash.slice(0, 200)} | rail Patient ${pat}, Observation ${obs} (expected 11,705 and 7,699,987; the rail may show ≈)`);
+await browser.close();

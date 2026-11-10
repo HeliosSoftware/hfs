@@ -1,0 +1,24 @@
+// T3 7.2: create the submission from the Import page and record the start instant.
+import fs from 'fs';
+import { launch, shot, record, OUT, BASE } from '../lib.mjs';
+const MANIFEST = process.env.MANIFEST || 'http://localhost:18801/manifest.json';
+const NAME = process.env.SUB_NAME || 'synthea-pg-es';
+const { browser, page } = await launch();
+await page.goto(BASE + '/ui/bulk-import');
+const empty = (await page.locator('main').innerText()).includes('No submissions yet. Create one to get started.');
+await shot(page, 'T3', '7.2-import-empty');
+await page.getByText('New Submission', { exact: true }).first().click();
+await page.locator('input[name=name]').fill(NAME);
+await page.locator('input[name=manifest_url]').fill(MANIFEST);
+const authNone = await page.locator('input[name=auth][value=none]').isChecked();
+await shot(page, 'T3', '7.2-create-dialog-filled');
+const start = new Date().toISOString();
+await Promise.all([page.waitForURL(/\/ui\/bulk-import\/[^/]+$/), page.locator('dialog form button[type=submit].btn, [role=dialog] form button[type=submit]').filter({ hasText: /^\s*Submit\s*$/ }).first().click()]);
+const id = page.url().split('/').pop();
+fs.writeFileSync(`${OUT}/t3-start.txt`, `${start}\n${id}\n`);
+await page.waitForTimeout(4000);
+await shot(page, 'T3', '7.3-submission-just-created');
+const text = await page.locator('main').innerText();
+record('T3', '7.2', empty && authNone ? 'pass' : 'fail', `empty list="${empty}", auth none=${authNone}, created id ${id} at ${start} UTC (T3 start)`);
+record('T3', '7.3a', /Manifest URL/.test(text) && text.includes(MANIFEST) && text.includes('http://localhost:18080') ? 'pass' : 'fail', `summary: ${text.replace(/\s+/g, ' ').slice(0, 400)}`);
+await browser.close();
