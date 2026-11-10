@@ -2900,6 +2900,12 @@ impl SubmitWorkerStorage for SqliteBackend {
                     })?),
                     None => None,
                 };
+                let line_count = i64::try_from(file.line_count).map_err(|_| {
+                    internal_error(format!("line_count {} exceeds i64", file.line_count))
+                })?;
+                let byte_count = i64::try_from(file.byte_count).map_err(|_| {
+                    internal_error(format!("byte_count {} exceeds i64", file.byte_count))
+                })?;
                 tx.execute(
                     "INSERT INTO bulk_submit_files
                      (tenant_id, submitter, submission_id, manifest_id, manifest_url, file_type,
@@ -2917,8 +2923,8 @@ impl SubmitWorkerStorage for SqliteBackend {
                         file.part_index,
                         lease_token,
                         file.file_path,
-                        file.line_count,
-                        file.byte_count,
+                        line_count,
+                        byte_count,
                         count_severity,
                         Utc::now().to_rfc3339(),
                     ],
@@ -3874,6 +3880,10 @@ fn publish_manifest_artifacts_in_tx(
             ),
             None => None,
         };
+        let line_count = i64::try_from(file.line_count)
+            .map_err(|_| internal_error(format!("line_count {} exceeds i64", file.line_count)))?;
+        let byte_count = i64::try_from(file.byte_count)
+            .map_err(|_| internal_error(format!("byte_count {} exceeds i64", file.byte_count)))?;
         tx.execute(
             "INSERT INTO bulk_submit_files
              (tenant_id, submitter, submission_id, manifest_id, manifest_url, file_type,
@@ -3891,8 +3901,8 @@ fn publish_manifest_artifacts_in_tx(
                 file.part_index,
                 lease_token,
                 file.file_path,
-                file.line_count,
-                file.byte_count,
+                line_count,
+                byte_count,
                 count_severity,
                 Utc::now().to_rfc3339(),
             ],

@@ -172,8 +172,7 @@ impl IdentityApp {
                 let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
                 let names = statement
                     .column_names()
-                    .iter()
-                    .map(|name| (*name).to_owned())
+                    .map(|name| name.to_owned())
                     .collect::<Vec<_>>();
                 statement
                     .query_map([], |row| {
