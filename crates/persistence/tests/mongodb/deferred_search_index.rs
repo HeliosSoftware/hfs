@@ -6039,8 +6039,8 @@ async fn wt_cache_gb(url: &str) -> String {
 /// entry are comparable with `DEFERRED_CEILING`. The backend is built as the
 /// ceiling's `deferred` variant is: the default threshold (4,000 entries), 32
 /// connections and no Bundle deadline, so the step runs to its end. Ignored: a
-/// 6,000-entry Bundle takes minutes, and it fills the test mongod's cache, so
-/// run it by itself:
+/// 30,000-entry Bundle takes over a minute, and it needs more cache than the
+/// usual test mongod has, so run it by itself:
 ///
 /// ```bash
 /// HFS_TEST_MONGODB_URL='mongodb://localhost:27018/?directConnection=true' \
@@ -6061,6 +6061,9 @@ async fn wt_cache_gb(url: &str) -> String {
 /// Bundle's transaction rolls it back with a transient error instead. The
 /// default of 6,000 is the size of the Bundle the README's lag figure is
 /// about, which needs a larger cache than the 0.25 GB of the usual test mongod.
+/// On a mongod with `--wiredTigerCacheSizeGB 2` and `--oplogSize 128`, 4,005,
+/// 6,141 and 30,171 entries all committed, three runs each, with steps of 6.8 s,
+/// 10.4-16.8 s and 57.3-64.1 s (the README has the lines).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "#2036 measurement; run alone with --ignored --nocapture"]
 async fn the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own() {

@@ -2013,10 +2013,11 @@ that document serializes them: a loser starts again from the state the winner co
   only `_id` and `_lastUpdated` finds them at once, since those are resolved on the resource
   documents. A search on any other parameter can miss them until their rows are written. For an
   updated or deleted resource the old rows stay until its batch runs, so such a search can briefly
-  match its previous content. The lag is the post-commit step's own time, which is measured on one
-  host and inferred for the rest (see **Lag of the post-commit step** below). After a crash or a
-  deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
-  Bundle deadline) plus up to one repair interval plus the time to write the rows.
+  match its previous content. The lag is the post-commit step's own time. It was measured on one
+  laptop, for Bundles of 4,005 to 30,171 entries, and not on any other host (see **Lag of the
+  post-commit step** below). After a crash or a deadline cut it is the repair's lag: in `hfs`, its
+  minimum age (the larger of 60 s and the Bundle deadline) plus up to one repair interval plus the
+  time to write the rows.
 - A supported `:missing=true` search resolves on the resource document's `missing_params`. A
   resource of a deferred type that the Bundle created, updated or restored has none until its
   batch commits (the `ifNoneExist` target types keep theirs). It still carries the
@@ -2048,56 +2049,85 @@ that document serializes them: a loser starts again from the state the winner co
 
 **Lag of the post-commit step (#2036).** The window above is the time the step takes after the
 commit: `mongodb_deferred_search_index_step_seconds` on a server, the `step_s` of the test line
-below in a harness. The two figures here come from different environments and are not
-interchangeable:
+below in a harness. The step times here were measured on one laptop, with the step timed on its own.
+An earlier version of this section gave about 2 s for a 6,000-entry Bundle and about 10 s for a
+30,000-entry one, inferred from the 57,346 rows/s the `$reindex` writer reached in a benchmark run
+and 18.6 rows per entry. The measurements below replace both figures: the measured steps are 5 to
+8 times (6,141 entries) and about 6 times (30,171 entries) as long. The benchmark host was not
+used for this section.
 
-- *Inferred, benchmark host, not measured with this code:* about 2 s for a 6,000-entry Bundle and
-  about 10 s for a 30,000-entry one, from the 57,346 rows/s the `$reindex` writer reached in a
-  benchmark run and 18.6 rows per entry.
-- *Measured, laptop, with the step timed on its own:* the ignored test
-  `the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` sends one deferred Bundle (copies
-  of the 267-entry US Core fixture, 16.0 rows per entry) and prints
-  `DEFERRED_STEP entries=.. rows=.. bundle_s=.. step_s=.. txn_s=.. rows_per_s=..`: `step_s` is the
-  step's own time from `MongoBackend::deferred_index_step_totals()`, `txn_s` is the rest of the call.
-  The raw lines (the `wt_cache_gb=0.25` field of each is left out):
+The ignored test `the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` sends one
+deferred Bundle (copies of the 267-entry US Core fixture, 16.0 rows per entry) and prints
+`DEFERRED_STEP entries=.. rows=.. bundle_s=.. step_s=.. txn_s=.. rows_per_s=.. wt_cache_gb=..`:
+`step_s` is the step's own time from `MongoBackend::deferred_index_step_totals()`, `txn_s` is the
+rest of the call. `entries` is the requested size rounded up to whole fixture copies, so a request
+for 6,000 entries sends 6,141 and one for 30,000 sends 30,171. The raw lines, in the order they
+were taken, with the `wt_cache_gb` field shown as `cache_gb`:
 
-  ```text
-  build    entries  rows    bundle_s  step_s  txn_s  rows_per_s
-  release   4005    64035        9.7     7.9    1.8        8144
-  release   4005    64035       17.0    13.8    3.2        4627
-  release   4005    64035        8.9     6.9    2.1        9342
-  release   4272    68304        9.2     7.3    1.9        9329
-  release   4539    72573       10.0     7.8    2.3        9354
-  debug     4005    64035       34.4    31.3    3.2        2047
-  debug     4005    64035       15.5    12.5    2.9        5111
-  debug     4005    64035       17.6    14.2    3.3        4500
-  ```
+```text
+build    cache_gb  entries    rows  bundle_s  step_s  txn_s  rows_per_s
+release      0.25     4005   64035       9.7     7.9    1.8        8144
+release      0.25     4005   64035      17.0    13.8    3.2        4627
+release      0.25     4005   64035       8.9     6.9    2.1        9342
+release      0.25     4272   68304       9.2     7.3    1.9        9329
+release      0.25     4539   72573      10.0     7.8    2.3        9354
+debug        0.25     4005   64035      34.4    31.3    3.2        2047
+debug        0.25     4005   64035      15.5    12.5    2.9        5111
+debug        0.25     4005   64035      17.6    14.2    3.3        4500
+release      2.00     4005   64035       8.7     6.8    1.9        9427
+release      2.00     4005   64035       8.4     6.8    1.6        9412
+release      2.00     4005   64035       8.7     6.8    1.9        9388
+release      2.00     6141   98187      14.3    10.9    3.4        9026
+release      2.00     6141   98187      13.3    10.4    2.9        9398
+release      2.00     6141   98187      20.6    16.8    3.8        5833
+release      2.00    30171  482397      72.2    57.3   14.9        8423
+release      2.00    30171  482397      79.9    64.1   15.8        7531
+release      2.00    30171  482397      72.0    58.4   13.6        8266
+```
 
-  Conditions: an AMD Ryzen 7 7730U laptop (8 cores, 16 threads, 31 GB), Windows 11, the test
-  process and a Docker Desktop `mongo:7.0` single-member replica set on the same machine, started
-  with `--wiredTigerCacheSizeGB 0.25 --oplogSize 128`; the default 4,000-entry threshold, 32
-  connections, no Bundle deadline, no other build or test running from the session that took the
-  measurements. Release is `--release`.
+Conditions: an AMD Ryzen 7 7730U laptop (8 cores, 16 threads, 31 GB), Windows 11, the test process
+and a Docker Desktop `mongo:7.0` single-member replica set on the same machine, started with
+`--oplogSize 128` and `--wiredTigerCacheSizeGB 0.25` (the first eight lines) or
+`--wiredTigerCacheSizeGB 2` (the last nine); the default 4,000-entry threshold, 32 connections, no
+Bundle deadline. One run at a time, no other build or test running from the session that took the
+measurements, and no `cargo` or `rustc` process on the machine when the 2 GB runs started. Release
+is `--release`; the 2 GB lines are all release builds, three runs of each size.
 
-What the measured lines show, for that host and cache: the step, not the transaction, is most of
-the call (1.8-3.3 s of 8.9-34.4 s); the step ran at 4,600-9,400 rows/s in a release build, a
-sixth to a twelfth of the `$reindex` figure above. The runs of one build differ by a factor of two
-or more (6.9-13.8 s for release, 12.5-31.3 s for debug, and the ranges overlap); the cause of the
-spread was not investigated. At those rates a 6,000-entry Bundle (about 96,000 rows) would take
-about 10-21 s; that is scaling the measured rate, not a measurement.
+What the measured lines show, for this laptop:
+
+- At 0.25 GB the step, not the transaction, is most of the call (1.8-3.3 s of 8.9-34.4 s). In a
+  release build it ran at 4,600-9,400 rows/s, a sixth to a twelfth of the `$reindex` figure above.
+  The runs of one build differ by a factor of two or more (6.9-13.8 s for release, 12.5-31.3 s for
+  debug, and the ranges overlap).
+- At 2 GB all nine runs committed, and the test's own checks of the store passed (the step wrote
+  every row in the store, and no ledger document or marker was left). The step took 6.8 s for
+  4,005 entries (all three runs), 10.4-16.8 s for 6,141 entries and 57.3-64.1 s for 30,171 entries.
+  It was 76-82% of the call in each run. The rest of the call (`txn_s`) took 1.6-1.9 s, 2.9-3.8 s
+  and 13.6-15.8 s for the three sizes.
+- Rows per second at 2 GB: 9,388-9,427 for 4,005 entries, 5,833-9,398 for 6,141 and 7,531-8,423
+  for 30,171. The 30,171-entry rate is below the 4,005-entry one and inside the spread of the
+  6,141-entry runs. The slowest of the nine runs (5,833 rows/s) is the third 6,141-entry run.
+- The same 4,005-entry Bundle took 6.9-13.8 s at 0.25 GB and 6.8 s at 2 GB; the fastest runs of the
+  two caches are 0.1 s apart. Three runs per cell do not show whether the cache changes the spread
+  between runs. The cause of the spread at either cache was not investigated.
+- Lag after the commit on this laptop with a 2 GB cache, for a client other than the one that sent
+  the Bundle: 10.4-16.8 s for 6,141 entries and 57.3-64.1 s for 30,171 entries. The client that
+  sent the Bundle gets its response after the step: 13.3-20.6 s and 72.0-79.9 s (`bundle_s`).
 
 Not measured:
 
-- A 6,000-entry Bundle did not commit on this cache, so the test did not reach its step. Of the
-  sizes tried, 4,005 to 4,539 entries committed; 5,073 and 6,141 entries were rolled back by the
+- A Bundle of exactly 6,000 or 30,000 entries (the test rounds up to 6,141 and 30,171), a size
+  between 4,005 and 30,171 other than 6,141, a size above 30,171 (nothing was tried above it, so
+  the cache's limit at 2 GB is not known), a cache between 0.25 GB and 2 GB (the smallest cache
+  that commits 6,141 entries was not found) or above 2 GB, and a debug build at 2 GB.
+- At 0.25 GB, 4,005 to 4,539 entries committed. 5,073 and 6,141 entries were rolled back by the
   server as `TooLargeForCache` (`Commit rolled back for eviction while the Bundle ran alone` while
   the ledger was written: MongoDB error 112, `WriteConflict`, reason `transaction rolled back
   because of cache overflow`), and 30,171 entries failed at entry 12,729 with the write set refused
-  (code 388).
-  The 30,000-entry figure therefore has no measurement either.
-- The benchmark host, a larger cache, a server under other load, and a replica set of more than
-  one member (a single member has no replication to wait for). The 6,000-entry measurement needs a
-  cache larger than 0.25 GB.
+  (code 388). Those sizes did not commit at 0.25 GB, so no step was timed for them there.
+- The benchmark host, a server under other load, and a replica set of more than one member (a
+  single member has no replication to wait for). What the benchmark host would measure for this
+  step is not known.
 
 **Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
 transaction through the search rows, so it must see an earlier entry of the same Bundle. A
