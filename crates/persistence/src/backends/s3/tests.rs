@@ -6821,6 +6821,57 @@ fn bucket_per_tenant_instance_declares_database_per_tenant_only() {
     assert!(!declared.contains(&BackendCapability::SharedSchema));
 }
 
+/// S3 does not search: `supports_search()` is `false`, is its declared
+/// `BasicSearch` (absent) in both tenancy modes, and agrees with what `search`
+/// and `search_count` do for a type S3 does not list by scan. `/metadata`
+/// advertises `search-type` from that answer (#514).
+#[tokio::test]
+async fn supports_search_is_false_and_search_refuses() {
+    use crate::core::SearchProvider;
+    use crate::types::SearchQuery;
+
+    let prefix = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let bucket = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ])));
+
+    for (label, backend) in [("prefix", &prefix), ("bucket", &bucket)] {
+        assert!(!backend.supports_search(), "{label}");
+        assert_eq!(
+            backend.supports_search(),
+            backend.supports(BackendCapability::BasicSearch),
+            "{label}"
+        );
+
+        let query = SearchQuery::new("Patient");
+        let refused =
+            |capability: &str, result: Result<(), crate::error::StorageError>| match result {
+                Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::UnsupportedCapability { capability: c, .. },
+                )) => assert_eq!(c, capability, "{label}"),
+                other => {
+                    panic!("{label} {capability}: expected UnsupportedCapability, got {other:?}")
+                }
+            };
+        refused(
+            "search",
+            backend
+                .search(&tenant("tenant-a"), &query)
+                .await
+                .map(|_| ()),
+        );
+        refused(
+            "search_count",
+            backend
+                .search_count(&tenant("tenant-a"), &query)
+                .await
+                .map(|_| ()),
+        );
+    }
+}
+
 /// The behavioural warrant for the two declarations above: bucket-per-tenant
 /// really does resolve distinct buckets, and prefix-per-tenant really does
 /// share one bucket while separating tenants by key prefix.

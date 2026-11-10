@@ -91,7 +91,13 @@ pub enum BackendCapability {
     TypeHistory,
     /// System-level history.
     SystemHistory,
-    /// Basic search with token/string parameters.
+    /// Basic search with token/string parameters: `search` is really
+    /// implemented, not answering `UnsupportedCapability`.
+    ///
+    /// [`SearchProvider::supports_search`](crate::core::SearchProvider::supports_search)
+    /// is read from this on a backend that does not search (S3 declares it
+    /// absent), and `/metadata` advertises `search-type` from that answer
+    /// (#514).
     BasicSearch,
     /// Date range search.
     DateSearch,
@@ -201,7 +207,8 @@ pub enum BackendCapability {
     /// layer's `501` both read, through
     /// [`ConditionalStorage::supports_conditional`](crate::core::ConditionalStorage::supports_conditional)
     /// (#1384). A backend declares one only when the matching trait method is
-    /// really implemented; S3 declares none.
+    /// really implemented; S3 declares only `ConditionalCreate`
+    /// (identifier-scoped, #1435).
     ConditionalCreate,
     /// Conditional update (`PUT [type]?criteria`).
     ConditionalUpdate,

@@ -1505,8 +1505,9 @@ pub trait ConditionalStorage: ResourceStorage {
     /// `conditional_update` and `conditional_delete` are required methods,
     /// while `conditional_patch` works only once
     /// [`resolve_conditional_matches`](Self::resolve_conditional_matches) is
-    /// provided. A backend whose methods differ from that — S3 refuses all
-    /// four; SQLite, PostgreSQL and MongoDB serve patch — overrides it from its
+    /// provided. A backend whose methods differ from that — S3 serves only an
+    /// identifier-scoped create (#1435) and refuses the other three; SQLite,
+    /// PostgreSQL and MongoDB serve patch — overrides it from its
     /// declared [`BackendCapability`](crate::core::BackendCapability) list, the
     /// same list `tests/backend_capability_contract.rs` pins.
     fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {

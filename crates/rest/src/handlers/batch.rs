@@ -5119,8 +5119,9 @@ mod tests {
         MultipleMatches(usize),
         Unsupported,
         /// The storage declares no conditional interaction at all
-        /// (`supports_conditional` is `false`), as S3 does. Its methods are
-        /// unscripted: reaching one panics.
+        /// (`supports_conditional` is `false`), as S3 does for update, delete
+        /// and patch (it declares only an identifier-scoped create, #1435).
+        /// Its methods are unscripted: reaching one panics.
         Undeclared,
     }
 

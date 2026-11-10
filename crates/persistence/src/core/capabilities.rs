@@ -1,7 +1,9 @@
-//! Storage capabilities and capability statement generation.
+//! Storage capability summaries and CapabilityStatement fragments.
 //!
-//! This module defines traits for runtime capability discovery and
-//! generation of FHIR CapabilityStatement fragments.
+//! [`CapabilityProvider`] and [`StorageCapabilities`] summarize what a storage
+//! offers and can render a FHIR `rest` fragment. They are not what
+//! `GET /metadata` is built from: `helios-rest` reads the per-capability
+//! methods on the storage traits instead (see [`CapabilityProvider`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -372,7 +374,30 @@ impl StorageCapabilities {
     }
 }
 
-/// Trait for storage backends to declare their capabilities.
+/// Trait for storage backends to summarize their capabilities.
+///
+/// The CapabilityStatement HFS serves at `GET /metadata` is **not** generated
+/// from this trait. `helios-rest` builds it from the per-capability methods on
+/// the storage traits, each answered by the storage that serves the request:
+///
+/// - [`SearchProvider::supports_search`](crate::core::SearchProvider::supports_search):
+///   `search-type` and the `searchParam` / `searchInclude` / `searchRevInclude`
+///   lists;
+/// - [`SearchProvider::supports_contained_search`](crate::core::SearchProvider::supports_contained_search):
+///   `_contained` / `_containedType`;
+/// - [`SearchProvider::modifiers_for_param_type`](crate::core::SearchProvider::modifiers_for_param_type):
+///   the per-parameter modifier extensions;
+/// - [`ConditionalStorage::supports_conditional`](crate::core::ConditionalStorage::supports_conditional):
+///   `conditionalCreate` / `conditionalUpdate` / `conditionalDelete` /
+///   `conditionalPatch`;
+/// - [`BundleProvider::supports_atomic_transactions`](crate::core::BundleProvider::supports_atomic_transactions):
+///   the `transaction` system interaction.
+///
+/// The only implementation is [`CompositeStorage`](crate::composite::CompositeStorage),
+/// which fills in the system-level interactions and leaves
+/// [`StorageCapabilities::resources`] empty. No implementation populates
+/// per-resource capabilities and nothing in HFS reads them, so a type that
+/// implements this trait does not change what `/metadata` says (#514).
 pub trait CapabilityProvider {
     /// Returns the capabilities of this storage backend.
     fn capabilities(&self) -> StorageCapabilities;

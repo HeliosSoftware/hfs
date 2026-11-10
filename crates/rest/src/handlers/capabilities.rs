@@ -145,6 +145,13 @@ where
     // evaluate contained search (others reject them with 501).
     let supports_contained = state.storage().supports_contained_search();
 
+    // `search-type` and the `searchParam` / `searchInclude` / `searchRevInclude`
+    // lists are the storage's to declare, not literals. They were listed for
+    // every resource type on every backend, while a standalone S3 deployment
+    // answers every search `501` (its `search` returns `UnsupportedCapability`),
+    // so the statement promised an interaction no request could use (#514).
+    let supports_search = state.storage().supports_search();
+
     // Per-parameter-type modifier sets the backend actually honors. Used to
     // advertise supported modifiers (as `valueCode` extensions) on each
     // resource-specific search param.
@@ -171,8 +178,8 @@ where
     let revinclude_by_target = build_revinclude_index(&registry);
 
     // The conditional interactions are the storage's to declare, not literals:
-    // S3 serves none on its own, and a composite's answer depends on how it
-    // is composed (#1384). The conditional handlers
+    // S3 serves only an identifier-scoped create on its own, and a composite's
+    // answer depends on how it is composed (#1384). The conditional handlers
     // refuse with `501` from this same source.
     let conditionals = super::conditional_support::advertised(state.storage(), version);
 
@@ -183,6 +190,7 @@ where
                 rt,
                 &conditionals,
                 &registry,
+                supports_search,
                 supports_contained,
                 &modifier_map,
                 &revinclude_by_target,
@@ -404,22 +412,28 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 }
 
 /// Builds the capability entry for a resource type.
+///
+/// `supports_search` is the storage's [`SearchProvider::supports_search`].
+/// When it is `false` the entry carries no `search-type` interaction and no
+/// `searchParam`, `searchInclude` or `searchRevInclude`, for every type
+/// (#514); everything else is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn build_resource_capability(
     resource_type: &str,
     conditionals: &serde_json::Map<String, serde_json::Value>,
     registry: &SearchParameterRegistry,
+    supports_search: bool,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     version: FhirVersion,
 ) -> serde_json::Value {
-    let interactions = if resource_type == "AuditEvent" {
+    let mut interactions = if resource_type == "AuditEvent" {
         serde_json::json!([
             { "code": "read" },
             { "code": "vread" },
             { "code": "history-instance" },
-            { "code": "history-type" },
-            { "code": "search-type" }
+            { "code": "history-type" }
         ])
     } else {
         serde_json::json!([
@@ -430,10 +444,12 @@ fn build_resource_capability(
             { "code": "delete" },
             { "code": "history-instance" },
             { "code": "history-type" },
-            { "code": "create" },
-            { "code": "search-type" }
+            { "code": "create" }
         ])
     };
+    if supports_search && let Some(list) = interactions.as_array_mut() {
+        list.push(serde_json::json!({ "code": "search-type" }));
+    }
 
     let mut entry = serde_json::json!({
         "type": resource_type,
@@ -441,9 +457,18 @@ fn build_resource_capability(
         "interaction": interactions,
         "versioning": "versioned",
         "readHistory": true,
-        "conditionalRead": "full-support",
-        "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map, version)
+        "conditionalRead": "full-support"
     });
+
+    if supports_search {
+        entry["searchParam"] = serde_json::Value::Array(build_search_params(
+            resource_type,
+            registry,
+            supports_contained,
+            modifier_map,
+            version,
+        ));
+    }
 
     if resource_type != "AuditEvent" {
         entry["updateCreate"] = serde_json::Value::Bool(true);
@@ -453,15 +478,19 @@ fn build_resource_capability(
     }
 
     // Advertise real `_include` targets: one "Type:code" per reference param on
-    // this type. Omitted entirely when the type has no reference params.
-    let search_include = build_search_includes(resource_type, registry);
-    if !search_include.is_empty() {
-        entry["searchInclude"] = serde_json::Value::Array(search_include);
+    // this type. Omitted entirely when the type has no reference params, and
+    // when the storage does not search (#514).
+    if supports_search {
+        let search_include = build_search_includes(resource_type, registry);
+        if !search_include.is_empty() {
+            entry["searchInclude"] = serde_json::Value::Array(search_include);
+        }
     }
 
     // Advertise real `_revinclude` targets: "Source:code" tokens from other
-    // types' reference params that point at this type.
-    if let Some(rev) = revinclude_by_target.get(resource_type) {
+    // types' reference params that point at this type. Omitted when the
+    // storage does not search (#514).
+    if supports_search && let Some(rev) = revinclude_by_target.get(resource_type) {
         if !rev.is_empty() {
             entry["searchRevInclude"] = serde_json::Value::Array(
                 rev.iter().cloned().map(serde_json::Value::String).collect(),
@@ -929,5 +958,202 @@ mod tests {
         // Common control params (e.g. _id) do not carry the modifier extension.
         let id = params.iter().find(|p| p["name"] == "_id").unwrap();
         assert!(id.get("extension").is_none());
+    }
+
+    /// The `rest.resource` entry of `resource_type`, built over a registry that
+    /// gives `Patient` a search parameter (`name`), an `_include` target
+    /// (`Patient:general-practitioner`) and a `_revinclude` source
+    /// (`Observation:subject`).
+    fn resource_entry(resource_type: &str, supports_search: bool) -> serde_json::Value {
+        use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
+
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(
+            SearchParameterDefinition::new(
+                "http://example.org/Patient-name",
+                "name",
+                SearchParamType::String,
+                "Patient.name",
+            )
+            .with_base(["Patient"]),
+        )
+        .unwrap();
+        reg.register(ref_param(
+            "http://example.org/Patient-general-practitioner",
+            "general-practitioner",
+            "Patient",
+            &["Practitioner"],
+        ))
+        .unwrap();
+        reg.register(ref_param(
+            "http://example.org/Observation-subject",
+            "subject",
+            "Observation",
+            &["Patient"],
+        ))
+        .unwrap();
+
+        let mut conditionals = serde_json::Map::new();
+        conditionals.insert("conditionalCreate".to_string(), serde_json::json!(true));
+
+        build_resource_capability(
+            resource_type,
+            &conditionals,
+            &reg,
+            supports_search,
+            false,
+            &std::collections::HashMap::new(),
+            &build_revinclude_index(&reg),
+            FhirVersion::default_enabled(),
+        )
+    }
+
+    fn interaction_codes(entry: &serde_json::Value) -> Vec<&str> {
+        entry["interaction"]
+            .as_array()
+            .expect("interaction array")
+            .iter()
+            .filter_map(|i| i["code"].as_str())
+            .collect()
+    }
+
+    /// With a storage that searches, the entry is what it always was:
+    /// `search-type` last in the interaction list, and the three search
+    /// blocks.
+    #[test]
+    fn search_is_advertised_when_the_storage_searches() {
+        let patient = resource_entry("Patient", true);
+        assert_eq!(
+            interaction_codes(&patient),
+            [
+                "read",
+                "vread",
+                "update",
+                "patch",
+                "delete",
+                "history-instance",
+                "history-type",
+                "create",
+                "search-type"
+            ]
+        );
+        assert!(
+            param_names(patient["searchParam"].as_array().expect("searchParam"))
+                .contains(&"name".to_string())
+        );
+        assert_eq!(
+            patient["searchInclude"],
+            serde_json::json!(["Patient:general-practitioner"])
+        );
+        assert_eq!(
+            patient["searchRevInclude"],
+            serde_json::json!(["Observation:subject"])
+        );
+
+        let audit = resource_entry("AuditEvent", true);
+        assert_eq!(
+            interaction_codes(&audit),
+            [
+                "read",
+                "vread",
+                "history-instance",
+                "history-type",
+                "search-type"
+            ]
+        );
+        assert!(audit["searchParam"].is_array());
+    }
+
+    /// With a storage that does not search (standalone S3), no resource type
+    /// — the `AuditEvent` branch included — lists `search-type` or any of the
+    /// three search blocks. Every other element is untouched (#514).
+    #[test]
+    fn no_search_is_advertised_when_the_storage_does_not_search() {
+        for resource_type in ["Patient", "Observation", "Practitioner", "AuditEvent"] {
+            let entry = resource_entry(resource_type, false);
+            assert!(
+                !interaction_codes(&entry).contains(&"search-type"),
+                "{resource_type}: {entry}"
+            );
+            for key in ["searchParam", "searchInclude", "searchRevInclude"] {
+                assert!(
+                    entry.get(key).is_none(),
+                    "{resource_type}: {key} in {entry}"
+                );
+            }
+            assert_eq!(entry["type"], resource_type);
+            assert_eq!(entry["versioning"], "versioned");
+            assert_eq!(entry["readHistory"], true);
+            assert_eq!(entry["conditionalRead"], "full-support");
+        }
+
+        let patient = resource_entry("Patient", false);
+        assert_eq!(
+            interaction_codes(&patient),
+            [
+                "read",
+                "vread",
+                "update",
+                "patch",
+                "delete",
+                "history-instance",
+                "history-type",
+                "create"
+            ]
+        );
+        assert_eq!(patient["updateCreate"], true);
+        assert_eq!(patient["conditionalCreate"], true);
+        assert!(patient["operation"].is_array(), "Patient keeps `$export`");
+
+        assert_eq!(
+            interaction_codes(&resource_entry("AuditEvent", false)),
+            ["read", "vread", "history-instance", "history-type"]
+        );
+    }
+
+    /// A storage that searches yields the same statement for the whole server:
+    /// every resource entry lists `search-type` and a non-empty `searchParam`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn statement_over_a_searching_storage_lists_search_on_every_type() {
+        use crate::config::ServerConfig;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+        assert!(backend.supports_search());
+        let state = AppState::new(backend, ServerConfig::default());
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        let statement = build_capability_statement(
+            &state,
+            &tenant,
+            FhirVersion::default_enabled(),
+            "http://localhost:8080",
+        );
+        let resources = statement["rest"][0]["resource"]
+            .as_array()
+            .expect("resources");
+        assert!(!resources.is_empty());
+        for resource in resources {
+            assert!(
+                interaction_codes(resource).contains(&"search-type"),
+                "{}",
+                resource["type"]
+            );
+            assert!(
+                !resource["searchParam"]
+                    .as_array()
+                    .expect("searchParam")
+                    .is_empty(),
+                "{}",
+                resource["type"]
+            );
+        }
     }
 }
