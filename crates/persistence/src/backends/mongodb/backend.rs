@@ -223,6 +223,9 @@ pub struct MongoBackend {
     /// commit; `None` never defers (#1975). Read through
     /// [`MongoBackend::deferred_search_index_min_entries`].
     deferred_index_min_entries: Option<usize>,
+    /// What this instance's post-commit search-row steps have done so far,
+    /// read through [`MongoBackend::deferred_index_step_totals`] (#2036).
+    pub(super) deferred_step_counters: super::deferred_step_totals::DeferredStepCounters,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -1350,6 +1353,7 @@ impl MongoBackend {
             prepare_gate: tokio::sync::Semaphore::new(1),
             transaction_bundle_gate,
             deferred_index_min_entries,
+            deferred_step_counters: Default::default(),
             broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             write_topology: Default::default(),
@@ -2071,6 +2075,18 @@ impl MongoBackend {
             return None;
         }
         self.deferred_index_min_entries
+    }
+
+    /// What the post-commit search-row steps of deferred transaction Bundles
+    /// (#1975) have done on this instance since it was created: how many ran,
+    /// the rows they wrote, their own wall time, and how many left work to the
+    /// repair (#2036). The same numbers feed the
+    /// `mongodb_deferred_search_index_*` metrics, but these are per instance
+    /// and can be read back: take a snapshot before a Bundle and one after,
+    /// and subtract with
+    /// [`DeferredIndexStepTotals::since`](super::DeferredIndexStepTotals::since).
+    pub fn deferred_index_step_totals(&self) -> super::DeferredIndexStepTotals {
+        self.deferred_step_counters.snapshot()
     }
 }
 

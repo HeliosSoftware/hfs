@@ -1990,7 +1990,10 @@ Bundle changed SearchParameters, and then rewrites the rows:
   batches before it have committed.
 - It logs one `INFO` line per Bundle, "transaction bundle search rows written after commit", with
   `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches` (the batch
-  transactions that wrote resources), `retries`, `shrinks` and `ms`.
+  transactions that wrote resources), `retries`, `shrinks` and `ms`. It also records its duration,
+  its rows and whether it left work behind as metrics (see **Metrics** below), and in
+  `MongoBackend::deferred_index_step_totals()`, so a test or a harness can read them without parsing
+  the line (#2036).
   If anything is left it also logs a `WARN`, "transaction bundle search rows not all written after
   commit; the deferred index repair will finish them", with `left_chunks`, `stopped_at_deadline`
   and `last_error`.
@@ -2010,9 +2013,8 @@ that document serializes them: a loser starts again from the state the winner co
   only `_id` and `_lastUpdated` finds them at once, since those are resolved on the resource
   documents. A search on any other parameter can miss them until their rows are written. For an
   updated or deleted resource the old rows stay until its batch runs, so such a search can briefly
-  match its previous content. The lag is inferred, not measured with this change: about 2 s for
-  a 6,000-entry Bundle and about 10 s for a 30,000-entry one, from the 57,346 rows/s the
-  `$reindex` writer reached in a benchmark run and 18.6 rows per entry. After a crash or a
+  match its previous content. The lag is the post-commit step's own time, which is measured on one
+  host and inferred for the rest (see **Lag of the post-commit step** below). After a crash or a
   deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
   Bundle deadline) plus up to one repair interval plus the time to write the rows.
 - A supported `:missing=true` search resolves on the resource document's `missing_params`. A
@@ -2043,6 +2045,59 @@ that document serializes them: a loser starts again from the state the winner co
   step. Rows and `missing_params` written inside a transaction are built before that reload: those
   of an inline Bundle and of the `ifNoneExist` types of a deferred Bundle. A deferred create,
   update or restore has none to rewrite: its transaction writes none (#2035).
+
+**Lag of the post-commit step (#2036).** The window above is the time the step takes after the
+commit: `mongodb_deferred_search_index_step_seconds` on a server, the `step_s` of the test line
+below in a harness. The two figures here come from different environments and are not
+interchangeable:
+
+- *Inferred, benchmark host, not measured with this code:* about 2 s for a 6,000-entry Bundle and
+  about 10 s for a 30,000-entry one, from the 57,346 rows/s the `$reindex` writer reached in a
+  benchmark run and 18.6 rows per entry.
+- *Measured, laptop, with the step timed on its own:* the ignored test
+  `the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` sends one deferred Bundle (copies
+  of the 267-entry US Core fixture, 16.0 rows per entry) and prints
+  `DEFERRED_STEP entries=.. rows=.. bundle_s=.. step_s=.. txn_s=.. rows_per_s=..`: `step_s` is the
+  step's own time from `MongoBackend::deferred_index_step_totals()`, `txn_s` is the rest of the call.
+  The raw lines (the `wt_cache_gb=0.25` field of each is left out):
+
+  ```text
+  build    entries  rows    bundle_s  step_s  txn_s  rows_per_s
+  release   4005    64035        9.7     7.9    1.8        8144
+  release   4005    64035       17.0    13.8    3.2        4627
+  release   4005    64035        8.9     6.9    2.1        9342
+  release   4272    68304        9.2     7.3    1.9        9329
+  release   4539    72573       10.0     7.8    2.3        9354
+  debug     4005    64035       34.4    31.3    3.2        2047
+  debug     4005    64035       15.5    12.5    2.9        5111
+  debug     4005    64035       17.6    14.2    3.3        4500
+  ```
+
+  Conditions: an AMD Ryzen 7 7730U laptop (8 cores, 16 threads, 31 GB), Windows 11, the test
+  process and a Docker Desktop `mongo:7.0` single-member replica set on the same machine, started
+  with `--wiredTigerCacheSizeGB 0.25 --oplogSize 128`; the default 4,000-entry threshold, 32
+  connections, no Bundle deadline, no other build or test running from the session that took the
+  measurements. Release is `--release`.
+
+What the measured lines show, for that host and cache: the step, not the transaction, is most of
+the call (1.8-3.3 s of 8.9-34.4 s); the step ran at 4,600-9,400 rows/s in a release build, a
+sixth to a twelfth of the `$reindex` figure above. The runs of one build differ by a factor of two
+or more (6.9-13.8 s for release, 12.5-31.3 s for debug, and the ranges overlap); the cause of the
+spread was not investigated. At those rates a 6,000-entry Bundle (about 96,000 rows) would take
+about 10-21 s; that is scaling the measured rate, not a measurement.
+
+Not measured:
+
+- A 6,000-entry Bundle did not commit on this cache, so the test did not reach its step. Of the
+  sizes tried, 4,005 to 4,539 entries committed; 5,073 and 6,141 entries were rolled back by the
+  server as `TooLargeForCache` (`Commit rolled back for eviction while the Bundle ran alone` while
+  the ledger was written: MongoDB error 112, `WriteConflict`, reason `transaction rolled back
+  because of cache overflow`), and 30,171 entries failed at entry 12,729 with the write set refused
+  (code 388).
+  The 30,000-entry figure therefore has no measurement either.
+- The benchmark host, a larger cache, a server under other load, and a replica set of more than
+  one member (a single member has no replication to wait for). The 6,000-entry measurement needs a
+  cache larger than 0.25 GB.
 
 **Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
 transaction through the search rows, so it must see an earlier entry of the same Bundle. A
@@ -2095,15 +2150,64 @@ unwritten are never written.
 
 - A pass that found work logs "Deferred search index repair pass finished" at `INFO` (at `WARN` if
   any document failed) with `examined`, `skipped`, `resources`, `reindexed`, `rows`, `cleared`,
-  `failed`, `remaining` and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
+  `failed`, `remaining`, `oldest_pending_secs` (the age of the oldest ledger document left, `0` for
+  an empty ledger) and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
   repair could not finish a ledger chunk", with `tenant`, `bundle_id`, `chunk`, `attempts` and
   `error`. A pass that could not run at all logs "Repair of deferred MongoDB search rows could not
   run".
+- A pass that took no document although some were due (every one was skipped: claimed or finished
+  by another repair, or its claim failed, which logs its own `WARN`, "could not claim a deferred
+  search index ledger chunk") logs one `INFO`, "Deferred search index repair pass took no chunk:
+  every due chunk was skipped (claimed or finished by another repair, or its claim failed)", with
+  `skipped` and `remaining`.
 - At startup, if nothing was due but the ledger is not empty, it logs "Deferred search index
   ledger holds chunks younger than the repair's minimum age; the next pass takes them".
+- Any other pass (nothing examined, nothing skipped) logs nothing, so a quiet log does not say the
+  ledger is empty: use the metrics below.
 - To see what is owed, run `db.search_index_pending.countDocuments()` (or call
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
   fully indexed.
+
+**Metrics (#2034, #2036).** `/metrics` carries six process-level series for the backlog and the
+post-commit step. None has a tenant, resource-type or Bundle label (`/metrics` is public); the only
+label is `reason` on the last one.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `mongodb_deferred_search_index_pending_chunks` | gauge | Ledger documents after the latest repair pass, due or not |
+| `mongodb_deferred_search_index_oldest_pending_seconds` | gauge | Age of the oldest ledger document, by its `created_at`; `0` when the ledger is empty. This is the one to alert on: a Bundle has been committed and not fully searchable for this long |
+| `mongodb_deferred_search_index_repair_failed_chunks_total` | counter | Ledger documents a repair pass worked on and had to leave in place (the pass line's `failed`). A document that keeps failing counts once per pass |
+| `mongodb_deferred_search_index_step_seconds` | histogram | Duration of each post-commit step, buckets from 0.05 s to 600 s |
+| `mongodb_deferred_search_index_step_rows_total` | counter | Search rows written by post-commit steps. The step's rows per second is `rate(..._step_rows_total) / rate(..._step_seconds_sum)` |
+| `mongodb_deferred_search_index_steps_incomplete_total{reason}` | counter | Steps that left work to the repair. `reason` is `deadline` (cut at the Bundle deadline) or `failure` (a batch failed for good, the cache refused a resource in a transaction of its own, or a finished ledger document could not be deleted) |
+
+- The two gauges describe the ledger as the latest repair pass left it, so they are as fresh as that
+  pass (every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds, `60` by default). They are not
+  exported before the first pass, nor at all when the repair is off
+  (`HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL=0`) or the server has no native MongoDB backend. A
+  pass that cannot run publishes nothing, so while passes keep failing ("Repair of deferred MongoDB
+  search rows could not run") both gauges keep the last successful pass's values and the age does
+  not grow. A Bundle whose step finishes it between two passes is never seen by them; the step
+  series cover that. The ledger is in the shared database, so every instance reports the same
+  documents: combine the gauges across instances with `max`, not `sum`.
+- The step series are recorded when a step ends. A step whose request was dropped before that
+  records nothing; what it left is in the ledger, which the next pass reports. A Bundle that
+  deferred nothing runs no step.
+- An alert for a Bundle left unsearchable beyond the repair's own lag, which is `min_age` (the larger
+  of 60 s and the Bundle deadline) plus up to one repair interval plus the time to write the rows.
+  With the default `HFS_REQUEST_TIMEOUT` of 30 s that is about two minutes, so five minutes is a
+  stuck ledger; with a 900 s timeout use more than 1,200:
+
+  ```
+  max(mongodb_deferred_search_index_oldest_pending_seconds) > 300
+  ```
+
+  and, for a repair that keeps leaving documents behind (the `WARN` and the document's
+  `last_error` say why):
+
+  ```
+  increase(mongodb_deferred_search_index_repair_failed_chunks_total[30m]) > 0
+  ```
 
 **Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its Bulk
 Data Submit manifests, then its `resources`, then its `search_index`, `search_index_contained` and
@@ -2212,7 +2316,11 @@ mongod's `transactionLifetimeLimitSeconds`), `HFS_TEST_DEFERRED_CEILING_MONGODB_
 replica set; no container is started), `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT` (`true`;
 `false` accepts any inline outcome) and `HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT` (`true`; `false`
 accepts any outcome of the other variants, to find where they abort). An aborted Bundle must leave
-no resource, ledger or marker whatever the knobs. Speed depends on the load of the host. On a shared
+no resource, ledger or marker whatever the knobs. The line ends with `step_s`, the post-commit
+step's own time (`na` when no step ran), so `secs` can be split into the transaction and the step;
+`the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` times one deferred Bundle on its
+own (see **Lag of the post-commit step** above) and takes `HFS_TEST_DEFERRED_STEP_ENTRIES` (`6000`,
+rounded up to whole fixture copies) and `HFS_TEST_MONGODB_URL`. Speed depends on the load of the host. On a shared
 12-core host with a debug build, a committing 4,005-entry Bundle ran at 48-54 entries per second
 (74.1 s, 79.9 s and 83.7 s), and the variants that aborted ran at 51-401 entries per second up to
 the abort, so an aborting variant took about 90-245 s at 2 GB. A 28,035-entry Bundle that committed

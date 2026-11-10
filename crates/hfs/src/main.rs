@@ -554,14 +554,22 @@ impl helios_persistence::composite::SecondarySyncObserver for CompositeSyncMetri
 }
 
 /// Reads a non-negative integer setting, falling back on anything else.
-#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
+#[cfg(feature = "elasticsearch")]
 fn env_u64(var: &str, default_value: u64) -> u64 {
-    match std::env::var(var) {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+    u64_setting(var, std::env::var(var).ok().as_deref(), default_value)
+}
+
+/// [`env_u64`] on the value already read from the environment (`None`: unset),
+/// so a test can drive the parsing without changing the process environment.
+/// `var` only names the setting in the warning.
+#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
+fn u64_setting(var: &str, raw: Option<&str>, default_value: u64) -> u64 {
+    match raw {
+        Some(v) => v.trim().parse().unwrap_or_else(|_| {
             tracing::warn!(variable = var, value = %v, default_value, "Not a number; using the default");
             default_value
         }),
-        Err(_) => default_value,
+        None => default_value,
     }
 }
 
@@ -2489,72 +2497,149 @@ const DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS: usize = 20;
 /// (startup) and then every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`
 /// seconds (default 60; `0` disables the task, the ledger is still written).
 ///
+/// Each pass also publishes the ledger's size and the age of its oldest
+/// document as `/metrics` gauges (`mongodb_deferred_search_index_*`), so with
+/// the task off those two gauges are not exported.
+///
 /// Only spawned for the native MongoDB backend: with Elasticsearch serving
 /// search nothing is deferred, so there is nothing to repair.
+///
+/// This reads the variable, logs whether the task is on, and spawns
+/// [`run_deferred_index_repair`] with the backend's pass; the loop and the
+/// per-pass logging are separate so tests can drive them without MongoDB.
 #[cfg(feature = "mongodb")]
 fn spawn_mongodb_deferred_index_repair(backend: Arc<MongoBackend>, min_age: std::time::Duration) {
-    let interval = env_u64("HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL", 60);
-    if interval == 0 {
+    let raw = std::env::var(DEFERRED_INDEX_REPAIR_INTERVAL_VAR).ok();
+    let Some(interval) = deferred_index_repair_interval(raw.as_deref()) else {
         info!(
             "HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL=0: repair of deferred MongoDB search rows is off; large transaction Bundles still write their ledger"
         );
         return;
-    }
+    };
     info!(
         min_age_secs = min_age.as_secs(),
-        interval_secs = interval,
+        interval_secs = interval.as_secs(),
         "Repair of deferred MongoDB search rows is on"
     );
-    let interval = std::time::Duration::from_secs(interval);
-    tokio::spawn(async move {
-        let mut first_pass = true;
-        loop {
-            let started = std::time::Instant::now();
-            match backend
+    tokio::spawn(run_deferred_index_repair(interval, move || {
+        let backend = backend.clone();
+        async move {
+            backend
                 .repair_deferred_search_index(min_age, DEFERRED_INDEX_REPAIR_CHUNKS_PER_PASS)
                 .await
-            {
-                Ok(report) if report.examined > 0 => {
-                    let pass_ms = started.elapsed().as_millis() as u64;
-                    if report.failed > 0 {
-                        warn!(
-                            examined = report.examined,
-                            skipped = report.skipped,
-                            resources = report.resources,
-                            reindexed = report.reindexed,
-                            rows = report.rows,
-                            cleared = report.cleared,
-                            failed = report.failed,
-                            remaining = report.remaining,
-                            pass_ms,
-                            "Deferred search index repair pass finished"
-                        );
-                    } else {
-                        info!(
-                            examined = report.examined,
-                            skipped = report.skipped,
-                            resources = report.resources,
-                            reindexed = report.reindexed,
-                            rows = report.rows,
-                            cleared = report.cleared,
-                            failed = report.failed,
-                            remaining = report.remaining,
-                            pass_ms,
-                            "Deferred search index repair pass finished"
-                        );
-                    }
-                }
-                Ok(report) if first_pass && report.remaining > 0 => info!(
-                    remaining = report.remaining,
-                    "Deferred search index ledger holds chunks younger than the repair's minimum age; the next pass takes them"
-                ),
-                Ok(_) => {}
-                Err(e) => warn!("Repair of deferred MongoDB search rows could not run: {e}"),
-            }
-            first_pass = false;
-            tokio::time::sleep(interval).await;
         }
-    });
+    }));
+}
+
+/// The variable that sets the deferred-index repair interval, in seconds.
+#[cfg(feature = "mongodb")]
+const DEFERRED_INDEX_REPAIR_INTERVAL_VAR: &str = "HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL";
+
+/// The repair interval for the raw value of
+/// [`DEFERRED_INDEX_REPAIR_INTERVAL_VAR`] (`None`: unset): 60 s when unset or
+/// not a number, and `None`, meaning the task is off, for `0`.
+#[cfg(feature = "mongodb")]
+fn deferred_index_repair_interval(raw: Option<&str>) -> Option<std::time::Duration> {
+    let seconds = u64_setting(DEFERRED_INDEX_REPAIR_INTERVAL_VAR, raw, 60);
+    (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
+}
+
+/// Runs `pass` right away and then once per `interval`, for ever: each wait
+/// starts when the previous pass ends, and a pass that fails is logged and
+/// does not end the loop. The first pass is the one that may say the ledger
+/// holds only young chunks ([`log_deferred_index_repair_pass`]).
+#[cfg(feature = "mongodb")]
+async fn run_deferred_index_repair<F, Fut>(
+    interval: std::time::Duration,
+    mut pass: F,
+) -> std::convert::Infallible
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = helios_persistence::StorageResult<
+                helios_persistence::backends::mongodb::DeferredIndexRepairReport,
+            >,
+        >,
+{
+    let mut first_pass = true;
+    loop {
+        let started = std::time::Instant::now();
+        let outcome = pass().await;
+        log_deferred_index_repair_pass(&outcome, first_pass, started.elapsed().as_millis() as u64);
+        first_pass = false;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// What one repair pass logs; every pass goes through here.
+///
+/// - A pass that worked on a ledger document: `INFO`, or `WARN` when a document
+///   failed, "Deferred search index repair pass finished", with the report's
+///   counts, `oldest_pending_secs` (the age of the oldest document left, `0`
+///   for an empty ledger) and `pass_ms`.
+/// - A pass that worked on none but skipped some (they were due, and every one
+///   was claimed or finished by another repair, or its claim failed, which
+///   has its own `WARN`): one `INFO` with `skipped` and `remaining`. It comes
+///   before the young-chunks line below, which would be wrong for a pass that
+///   had due chunks.
+/// - The first pass, when it found nothing due but the ledger is not empty:
+///   one `INFO`, "holds chunks younger than the repair's minimum age".
+/// - A pass that could not run: a `WARN` with the error.
+/// - An idle pass (nothing examined, nothing skipped, and not the first pass
+///   with a non-empty ledger) logs nothing.
+#[cfg(feature = "mongodb")]
+fn log_deferred_index_repair_pass(
+    outcome: &helios_persistence::StorageResult<
+        helios_persistence::backends::mongodb::DeferredIndexRepairReport,
+    >,
+    first_pass: bool,
+    pass_ms: u64,
+) {
+    match outcome {
+        Ok(report) if report.examined > 0 => {
+            let oldest_pending_secs = report.oldest_pending.map_or(0, |age| age.as_secs());
+            if report.failed > 0 {
+                warn!(
+                    examined = report.examined,
+                    skipped = report.skipped,
+                    resources = report.resources,
+                    reindexed = report.reindexed,
+                    rows = report.rows,
+                    cleared = report.cleared,
+                    failed = report.failed,
+                    remaining = report.remaining,
+                    oldest_pending_secs,
+                    pass_ms,
+                    "Deferred search index repair pass finished"
+                );
+            } else {
+                info!(
+                    examined = report.examined,
+                    skipped = report.skipped,
+                    resources = report.resources,
+                    reindexed = report.reindexed,
+                    rows = report.rows,
+                    cleared = report.cleared,
+                    failed = report.failed,
+                    remaining = report.remaining,
+                    oldest_pending_secs,
+                    pass_ms,
+                    "Deferred search index repair pass finished"
+                );
+            }
+        }
+        Ok(report) if report.skipped > 0 => info!(
+            skipped = report.skipped,
+            remaining = report.remaining,
+            "Deferred search index repair pass took no chunk: every due chunk was skipped (claimed or finished by another repair, or its claim failed)"
+        ),
+        Ok(report) if first_pass && report.remaining > 0 => info!(
+            remaining = report.remaining,
+            "Deferred search index ledger holds chunks younger than the repair's minimum age; the next pass takes them"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("Repair of deferred MongoDB search rows could not run: {e}"),
+    }
 }
 
 /// S3 flavor of the periodic registry refresh (#235, #787). Before #787, S3
@@ -5871,6 +5956,364 @@ mod tests {
         // A long one is the Bundle deadline, `HFS_REQUEST_TIMEOUT` - 2 s.
         assert_eq!(deferred_index_repair_min_age(600), Duration::from_secs(598));
         assert_eq!(deferred_index_repair_min_age(900), Duration::from_secs(898));
+    }
+
+    /// The deferred-index repair task (#2034): the interval setting, the loop
+    /// and what each pass logs. None of it needs MongoDB: the loop takes a
+    /// closure for one pass, and the log decision takes the pass's outcome.
+    #[cfg(feature = "mongodb")]
+    mod deferred_index_repair {
+        use super::*;
+        use helios_persistence::StorageError;
+        use helios_persistence::backends::mongodb::DeferredIndexRepairReport;
+        use helios_persistence::error::BackendError;
+        use std::collections::VecDeque;
+        use std::io::Write;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        /// A `MakeWriter` collecting everything a scoped subscriber writes, as
+        /// in the request-span test of `helios_observability::middleware`.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// One captured log line: its level, and the rest (the message, then
+        /// `key=value` fields).
+        #[derive(Debug)]
+        struct Line {
+            level: String,
+            text: String,
+        }
+
+        impl Line {
+            /// The value of field `name`, if the line has it.
+            fn field(&self, name: &str) -> Option<&str> {
+                self.text
+                    .split_whitespace()
+                    .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
+            }
+        }
+
+        /// A scoped (not global) subscriber that records every event of the
+        /// test's thread; keep the guard alive until the assertions are done.
+        fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (captured, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn lines(captured: &Captured) -> Vec<Line> {
+            let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            text.lines()
+                .map(|line| {
+                    let (level, text) = line.trim_start().split_once(' ').unwrap();
+                    Line {
+                        level: level.to_string(),
+                        text: text.to_string(),
+                    }
+                })
+                .collect()
+        }
+
+        /// What the pass logs, in order.
+        fn logged(
+            outcome: &helios_persistence::StorageResult<DeferredIndexRepairReport>,
+            first_pass: bool,
+        ) -> Vec<Line> {
+            let (captured, _guard) = capture();
+            log_deferred_index_repair_pass(outcome, first_pass, 42);
+            lines(&captured)
+        }
+
+        fn report(
+            examined: usize,
+            skipped: usize,
+            failed: usize,
+            remaining: u64,
+        ) -> DeferredIndexRepairReport {
+            DeferredIndexRepairReport {
+                examined,
+                skipped,
+                resources: 9,
+                reindexed: 8,
+                rows: 120,
+                cleared: examined.saturating_sub(failed),
+                failed,
+                remaining,
+                oldest_pending: (remaining > 0).then_some(Duration::from_millis(95_900)),
+            }
+        }
+
+        fn unavailable() -> StorageError {
+            BackendError::Unavailable {
+                backend_name: "mongodb".to_string(),
+                message: "no server".to_string(),
+            }
+            .into()
+        }
+
+        const PASS: &str = "Deferred search index repair pass finished";
+        const SKIPPED_ONLY: &str = "Deferred search index repair pass took no chunk";
+        const YOUNG: &str =
+            "Deferred search index ledger holds chunks younger than the repair's minimum age";
+        const COULD_NOT_RUN: &str = "Repair of deferred MongoDB search rows could not run";
+
+        #[test]
+        fn interval_zero_turns_the_repair_off_and_the_rest_is_seconds() {
+            assert_eq!(deferred_index_repair_interval(Some("0")), None);
+            assert_eq!(deferred_index_repair_interval(Some(" 0 ")), None);
+            assert_eq!(
+                deferred_index_repair_interval(Some("15")),
+                Some(Duration::from_secs(15))
+            );
+            assert_eq!(
+                deferred_index_repair_interval(Some(" 15 ")),
+                Some(Duration::from_secs(15))
+            );
+            // Unset, or not a number: the default of a minute.
+            assert_eq!(
+                deferred_index_repair_interval(None),
+                Some(Duration::from_secs(60))
+            );
+            for junk in ["", "soon", "-1", "1.5"] {
+                assert_eq!(
+                    deferred_index_repair_interval(Some(junk)),
+                    Some(Duration::from_secs(60)),
+                    "{junk:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_pass_that_examined_chunks_logs_info_with_its_counts() {
+            let logged = logged(&Ok(report(2, 1, 0, 3)), false);
+            let [line] = logged.as_slice() else {
+                panic!("one line expected: {logged:?}");
+            };
+            assert_eq!(line.level, "INFO", "{line:?}");
+            assert!(line.text.starts_with(PASS), "{line:?}");
+            for (field, value) in [
+                ("examined", "2"),
+                ("skipped", "1"),
+                ("resources", "9"),
+                ("reindexed", "8"),
+                ("rows", "120"),
+                ("cleared", "2"),
+                ("failed", "0"),
+                ("remaining", "3"),
+                ("oldest_pending_secs", "95"),
+                ("pass_ms", "42"),
+            ] {
+                assert_eq!(line.field(field), Some(value), "{field} in {line:?}");
+            }
+        }
+
+        #[test]
+        fn a_pass_with_a_failed_chunk_logs_warn() {
+            let logged = logged(&Ok(report(2, 0, 1, 2)), false);
+            let [line] = logged.as_slice() else {
+                panic!("one line expected: {logged:?}");
+            };
+            assert_eq!(line.level, "WARN", "{line:?}");
+            assert!(line.text.starts_with(PASS), "{line:?}");
+            assert_eq!(line.field("failed"), Some("1"), "{line:?}");
+            assert_eq!(line.field("remaining"), Some("2"), "{line:?}");
+            assert_eq!(line.field("oldest_pending_secs"), Some("95"), "{line:?}");
+        }
+
+        #[test]
+        fn a_pass_that_emptied_the_ledger_reports_no_oldest_age() {
+            let logged = logged(&Ok(report(1, 0, 0, 0)), false);
+            let [line] = logged.as_slice() else {
+                panic!("one line expected: {logged:?}");
+            };
+            assert_eq!(line.level, "INFO", "{line:?}");
+            assert_eq!(line.field("remaining"), Some("0"), "{line:?}");
+            assert_eq!(line.field("oldest_pending_secs"), Some("0"), "{line:?}");
+        }
+
+        #[test]
+        fn the_first_pass_says_when_only_young_chunks_remain() {
+            let logged = logged(&Ok(report(0, 0, 0, 2)), true);
+            let [line] = logged.as_slice() else {
+                panic!("one line expected: {logged:?}");
+            };
+            assert_eq!(line.level, "INFO", "{line:?}");
+            assert!(line.text.starts_with(YOUNG), "{line:?}");
+            assert_eq!(line.field("remaining"), Some("2"), "{line:?}");
+
+            // Later passes find the same and say nothing.
+            assert!(logged_is_empty(&Ok(report(0, 0, 0, 2)), false));
+        }
+
+        #[test]
+        fn a_pass_whose_due_chunks_were_all_taken_elsewhere_logs_one_info() {
+            for first_pass in [false, true] {
+                let logged = logged(&Ok(report(0, 3, 0, 4)), first_pass);
+                let [line] = logged.as_slice() else {
+                    panic!("one line expected (first_pass={first_pass}): {logged:?}");
+                };
+                assert_eq!(line.level, "INFO", "{line:?}");
+                assert!(line.text.starts_with(SKIPPED_ONLY), "{line:?}");
+                assert_eq!(line.field("skipped"), Some("3"), "{line:?}");
+                assert_eq!(line.field("remaining"), Some("4"), "{line:?}");
+                // It is not the young-chunks line, even on the first pass:
+                // these chunks were due.
+                assert!(!line.text.contains("younger"), "{line:?}");
+            }
+        }
+
+        fn logged_is_empty(
+            outcome: &helios_persistence::StorageResult<DeferredIndexRepairReport>,
+            first_pass: bool,
+        ) -> bool {
+            logged(outcome, first_pass).is_empty()
+        }
+
+        #[test]
+        fn an_idle_pass_logs_nothing() {
+            // Nothing due, nothing skipped, an empty ledger: on any pass.
+            assert!(logged_is_empty(&Ok(report(0, 0, 0, 0)), true));
+            assert!(logged_is_empty(&Ok(report(0, 0, 0, 0)), false));
+            // A non-empty ledger of young chunks after the first pass.
+            assert!(logged_is_empty(&Ok(report(0, 0, 0, 5)), false));
+        }
+
+        #[test]
+        fn a_pass_that_could_not_run_logs_warn_with_the_error() {
+            for first_pass in [true, false] {
+                let logged = logged(&Err(unavailable()), first_pass);
+                let [line] = logged.as_slice() else {
+                    panic!("one line expected: {logged:?}");
+                };
+                assert_eq!(line.level, "WARN", "{line:?}");
+                assert!(line.text.starts_with(COULD_NOT_RUN), "{line:?}");
+                assert!(line.text.contains("no server"), "{line:?}");
+            }
+        }
+
+        /// Lets the spawned loop run until it waits on its timer again.
+        async fn settle() {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// A loop task whose passes take their outcomes from `script` (an
+        /// empty script answers with an idle pass) and note the time each began,
+        /// as time since the clock was paused.
+        fn spawn_loop(
+            interval: Duration,
+            script: Vec<helios_persistence::StorageResult<DeferredIndexRepairReport>>,
+        ) -> (
+            tokio::task::JoinHandle<std::convert::Infallible>,
+            Arc<Mutex<Vec<Duration>>>,
+        ) {
+            let began = Arc::new(Mutex::new(Vec::new()));
+            let script = Arc::new(Mutex::new(VecDeque::from(script)));
+            let clock = tokio::time::Instant::now();
+            let task = tokio::spawn(run_deferred_index_repair(interval, {
+                let began = began.clone();
+                move || {
+                    let (began, script) = (began.clone(), script.clone());
+                    async move {
+                        began.lock().unwrap().push(clock.elapsed());
+                        script
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| Ok(DeferredIndexRepairReport::default()))
+                    }
+                }
+            }));
+            (task, began)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_first_pass_runs_at_once_and_the_next_ones_one_interval_apart() {
+            let interval = Duration::from_secs(60);
+            let (task, began) = spawn_loop(interval, Vec::new());
+
+            settle().await;
+            assert_eq!(*began.lock().unwrap(), [Duration::ZERO], "the first pass");
+
+            tokio::time::advance(interval - Duration::from_millis(1)).await;
+            settle().await;
+            assert_eq!(began.lock().unwrap().len(), 1, "not before the interval");
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            settle().await;
+            assert_eq!(*began.lock().unwrap(), [Duration::ZERO, interval]);
+
+            tokio::time::advance(interval).await;
+            settle().await;
+            assert_eq!(
+                *began.lock().unwrap(),
+                [Duration::ZERO, interval, interval * 2]
+            );
+            task.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_pass_that_fails_is_logged_and_does_not_end_the_loop() {
+            let (captured, _guard) = capture();
+            let interval = Duration::from_secs(30);
+            let (task, began) = spawn_loop(
+                interval,
+                vec![
+                    Ok(report(0, 0, 0, 2)),
+                    Err(unavailable()),
+                    Ok(report(0, 0, 0, 2)),
+                    Ok(report(1, 0, 0, 0)),
+                ],
+            );
+
+            for _ in 0..4 {
+                settle().await;
+                tokio::time::advance(interval).await;
+            }
+            settle().await;
+            assert!(!task.is_finished(), "the loop outlives a failed pass");
+            assert_eq!(began.lock().unwrap().len(), 5, "a pass after the failure");
+            task.abort();
+
+            // Pass 1 is the first and finds only young chunks; pass 2 fails;
+            // pass 3 finds the same chunks and is not the first, so it is
+            // silent; pass 4 works on one; pass 5 is idle.
+            let logged = lines(&captured);
+            let summary: Vec<(&str, &str)> = logged
+                .iter()
+                .map(|line| {
+                    let message = [YOUNG, COULD_NOT_RUN, PASS]
+                        .into_iter()
+                        .find(|message| line.text.starts_with(message))
+                        .unwrap_or("?");
+                    (line.level.as_str(), message)
+                })
+                .collect();
+            assert_eq!(
+                summary,
+                [("INFO", YOUNG), ("WARN", COULD_NOT_RUN), ("INFO", PASS)],
+                "{logged:?}"
+            );
+        }
     }
 
     #[cfg(feature = "mongodb")]

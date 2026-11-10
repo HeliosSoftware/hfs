@@ -24,6 +24,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
+use helios_persistence::backends::mongodb::DeferredIndexStepTotals;
 use mongodb::bson::Timestamp;
 use mongodb::bson::oid::ObjectId;
 use serde_json::Value;
@@ -2254,6 +2255,10 @@ async fn a_lone_resource_rolled_back_once_for_cache_pressure_is_retried_at_the_s
             "the Patient is a batch of one, committed by the retry: {batches:?}"
         );
     }
+    // A step that needed a retry still completed: it left nothing to the repair.
+    let step = run.backend.deferred_index_step_totals();
+    assert_eq!((step.steps, step.incomplete), (1, 0), "{step:?}");
+    assert!(step.rows > run.per as u64, "{step:?}");
 }
 
 /// The same lone resource rolled back for cache pressure on every attempt: it
@@ -2274,6 +2279,13 @@ async fn a_lone_resource_rolled_back_for_cache_pressure_every_time_is_left_after
         "five attempts at the same size, then the step stops at the chunk"
     );
     assert_lone_patient_left_to_the_repair(&run).await;
+    // The step ended by a failure, not the deadline, and wrote no row.
+    let step = run.backend.deferred_index_step_totals();
+    assert_eq!(
+        (step.steps, step.rows, step.incomplete),
+        (1, 0, 1),
+        "{step:?}"
+    );
 
     let Some((repair, report, entered)) = repair_with_failing_batch(&run, 365, 5).await else {
         return;
@@ -4987,6 +4999,409 @@ async fn migrating_from_v12_creates_the_ledger_collection_and_index() {
 }
 
 // ---------------------------------------------------------------------------
+// The backlog and the post-commit step as numbers (#2034, #2036)
+// ---------------------------------------------------------------------------
+
+/// Plants a ledger document created `age` ago and due now, naming a resource
+/// that does not exist (a repair that takes it finds nothing marked and clears
+/// it).
+async fn plant_aged_chunk(db: &mongodb::Database, tenant_id: &str, bundle_id: &str, age: Duration) {
+    let now = mongodb::bson::DateTime::now();
+    let created = mongodb::bson::DateTime::from_millis(
+        now.timestamp_millis() - i64::try_from(age.as_millis()).unwrap(),
+    );
+    db.collection::<Document>("search_index_pending")
+        .insert_one(doc! {
+            "_id": ObjectId::new(),
+            "tenant_id": tenant_id,
+            "bundle_id": bundle_id,
+            "chunk": 0_i32,
+            "chunks": 1_i32,
+            "entries": 1_i64,
+            "created_at": created,
+            "not_before": now,
+            "attempts": 0_i32,
+            "refs": ["Patient/planted-aged"],
+        })
+        .await
+        .unwrap();
+}
+
+/// A backend whose Bundle deadline is 1 ms, so the post-commit step of every
+/// Bundle is cut before its first batch and the ledger is left to the repair.
+async fn cut_by_the_deadline(test: &str, app: &str) -> Option<MongoBackend> {
+    let backend = deferred_backend(test, app, Some(THRESHOLD), |c| {
+        c.bundle_transaction_deadline = Some(Duration::from_millis(1));
+    })
+    .await;
+    if backend.is_none() {
+        eprintln!("Skipping {test} (requires Docker or HFS_TEST_MONGODB_URL)");
+    }
+    backend
+}
+
+/// #2034: a repair pass reports the ledger it leaves: how many documents it
+/// holds, due or not, and the age of the oldest by `created_at`. With a long
+/// minimum age a pass takes nothing and still reports both; a pass that clears
+/// the ledger reports no oldest age.
+#[tokio::test]
+async fn a_repair_pass_reports_the_backlog_and_the_age_of_its_oldest_document() {
+    const NAME: &str = "a_repair_pass_reports_the_backlog_and_the_age_of_its_oldest_document";
+    let Some(backend) = cut_by_the_deadline("def_backlog", "def-backlog").await else {
+        return;
+    };
+    let tenant = create_tenant("def-backlog");
+    let tenant_id = tenant.tenant_id().as_str();
+    let one_hour = Duration::from_secs(3600);
+
+    // An empty ledger has no oldest document.
+    let report = backend
+        .repair_deferred_search_index(one_hour, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.examined, report.skipped, report.remaining),
+        (0, 0, 0)
+    );
+    assert_eq!(report.oldest_pending, None, "{report:?}");
+
+    // One Bundle's ledger document, left by the deadline. A pass whose minimum
+    // age is an hour does not take it, and reports it.
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        patient_bundle(4, "Backlog", "MRN-BACKLOG"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    let resources = located(&result);
+    assert_eq!(ledger_count(&backend).await, 1);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let report = backend
+        .repair_deferred_search_index(one_hour, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.examined, report.skipped, report.remaining),
+        (0, 0, 1),
+        "{report:?}"
+    );
+    let age = report.oldest_pending.expect("one document is owed");
+    assert!(
+        age >= Duration::from_millis(200) && age < Duration::from_secs(60),
+        "a document left a moment ago: {age:?}"
+    );
+
+    // An older document makes the oldest the planted one, by `created_at`:
+    // its `not_before` is now, so the order of the repair's own query (by
+    // `not_before`) would have put it last.
+    let db = raw_db(&backend).await;
+    plant_aged_chunk(&db, tenant_id, "backlog-old", one_hour).await;
+    let report = backend
+        .repair_deferred_search_index(one_hour, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.examined, report.skipped, report.remaining),
+        (0, 0, 2),
+        "{report:?}"
+    );
+    let age = report.oldest_pending.expect("two documents are owed");
+    assert!(
+        age >= one_hour && age < one_hour + Duration::from_secs(60),
+        "the planted document is the oldest: {age:?}"
+    );
+
+    // A pass with no minimum age (a restarted server's repair) finishes both.
+    let repair = same_db_backend(&backend, "def-backlog-repair")
+        .await
+        .unwrap();
+    let report = repair
+        .repair_deferred_search_index(Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.examined,
+            report.reindexed,
+            report.cleared,
+            report.failed,
+            report.remaining
+        ),
+        (2, 6, 2, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(report.oldest_pending, None, "{report:?}");
+    assert_bundle_searchable(&backend, &tenant, &resources, "Backlog", "MRN-BACKLOG", 4).await;
+}
+
+/// #2036: a deferred Bundle whose step completes adds one step, the rows it
+/// wrote and a time to the backend's totals, so a caller can read them without
+/// parsing the step's log line.
+#[tokio::test]
+async fn a_completed_deferred_step_adds_to_the_backends_step_totals() {
+    const NAME: &str = "a_completed_deferred_step_adds_to_the_backends_step_totals";
+    let Some(backend) = deferred_backend(
+        "def_step_totals",
+        "def-step-totals",
+        Some(THRESHOLD),
+        |_| {},
+    )
+    .await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-step-totals");
+    let tenant_id = tenant.tenant_id().as_str();
+    assert_eq!(
+        backend.deferred_index_step_totals(),
+        DeferredIndexStepTotals::default(),
+        "a new backend has run no step"
+    );
+
+    let before = backend.deferred_index_step_totals();
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        patient_bundle(4, "Totals", "MRN-TOTALS-1"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    let rows_in_store = count_docs(&backend, "search_index", doc! { "tenant_id": tenant_id }).await
+        + count_docs(
+            &backend,
+            "search_index_contained",
+            doc! { "tenant_id": tenant_id },
+        )
+        .await;
+    let first = backend.deferred_index_step_totals().since(&before);
+    assert!(rows_in_store > 0);
+    assert_eq!(first.steps, 1, "{first:?}");
+    assert_eq!(first.incomplete, 0, "{first:?}");
+    assert_eq!(
+        first.rows, rows_in_store,
+        "the step wrote every row the store holds"
+    );
+    assert!(first.elapsed > Duration::ZERO, "{first:?}");
+    assert_eq!(ledger_count(&backend).await, 0);
+
+    // A second Bundle adds to them.
+    let before_second = backend.deferred_index_step_totals();
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        patient_bundle(4, "Totals", "MRN-TOTALS-2"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    let second = backend.deferred_index_step_totals().since(&before_second);
+    assert_eq!((second.steps, second.incomplete), (1, 0), "{second:?}");
+    assert_eq!(
+        backend.deferred_index_step_totals(),
+        DeferredIndexStepTotals {
+            steps: 2,
+            rows: first.rows + second.rows,
+            elapsed: first.elapsed + second.elapsed,
+            incomplete: 0,
+        }
+    );
+    assert_eq!(second.rows, first.rows, "the same Bundle again");
+}
+
+/// #2036: a Bundle that does not defer (below the threshold, or with the
+/// deferral off) runs no post-commit step, so the totals do not move.
+#[tokio::test]
+async fn a_bundle_that_defers_nothing_adds_no_step() {
+    const NAME: &str = "a_bundle_that_defers_nothing_adds_no_step";
+    for (label, min_entries, n_obs) in [
+        // Four entries, under the threshold of 5.
+        ("below", Some(THRESHOLD), 2),
+        // Six entries with the deferral off.
+        ("off", Some(0), 4),
+    ] {
+        let test = format!("def_step_none_{label}");
+        let Some(backend) = deferred_backend(&test, &test, min_entries, |_| {}).await else {
+            eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let tenant = create_tenant("def-step-none");
+        let Some(_) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            patient_bundle(n_obs, "NoStep", "MRN-NOSTEP"),
+            NAME,
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            backend.deferred_index_step_totals(),
+            DeferredIndexStepTotals::default(),
+            "{label}: no step ran"
+        );
+        assert_eq!(ledger_count(&backend).await, 0, "{label}: no ledger");
+    }
+}
+
+/// #2036: a step the Bundle's deadline cuts is a step that left work to the
+/// repair; the repair is not a step.
+#[tokio::test]
+async fn a_step_cut_by_the_deadline_counts_as_incomplete() {
+    const NAME: &str = "a_step_cut_by_the_deadline_counts_as_incomplete";
+    let Some(backend) = cut_by_the_deadline("def_step_cut", "def-step-cut").await else {
+        return;
+    };
+    let tenant = create_tenant("def-step-cut");
+    let before = backend.deferred_index_step_totals();
+    let Some(_) =
+        process_transaction_or_skip(&backend, &tenant, patient_bundle(4, "Cut", "MRN-CUT"), NAME)
+            .await
+    else {
+        return;
+    };
+    let step = backend.deferred_index_step_totals().since(&before);
+    assert_eq!(
+        (step.steps, step.rows, step.incomplete),
+        (1, 0, 1),
+        "cut before its first batch: {step:?}"
+    );
+    assert_eq!(ledger_count(&backend).await, 1);
+
+    // The same backend's own repair writes the rows and is not counted as a step.
+    let report = repair_until_clear(&backend).await;
+    assert_eq!(report.cleared, 1, "{report:?}");
+    assert_eq!(
+        backend.deferred_index_step_totals().since(&before),
+        step,
+        "the repair does not move the step totals"
+    );
+}
+
+/// The value of the series `series` (its name with its labels, as rendered)
+/// in a Prometheus exposition text.
+fn series_value(text: &str, series: &str) -> Option<f64> {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let (name, value) = line.rsplit_once(' ')?;
+            (name == series).then(|| value.parse().ok()).flatten()
+        })
+}
+
+/// #2034, #2036 end to end: what a Bundle's step and a repair pass publish
+/// reaches the metrics recorder. The recorder is installed for this thread
+/// only, so tests running beside this one do not mix in; the runtime of a
+/// `#[tokio::test]` is current-thread, so everything below records on it.
+#[tokio::test]
+async fn the_step_and_the_repair_publish_the_deferred_index_metrics() {
+    const NAME: &str = "the_step_and_the_repair_publish_the_deferred_index_metrics";
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _installed = metrics::set_default_local_recorder(&recorder);
+
+    let Some(backend) = cut_by_the_deadline("def_metrics", "def-metrics").await else {
+        return;
+    };
+    let tenant = create_tenant("def-metrics");
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        patient_bundle(4, "Metrics", "MRN-METRICS"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // The step was cut at the deadline and wrote nothing.
+    let text = handle.render();
+    let value = |series: &str| series_value(&text, series);
+    assert_eq!(
+        value("mongodb_deferred_search_index_steps_incomplete_total{reason=\"deadline\"}"),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("mongodb_deferred_search_index_steps_incomplete_total{reason=\"failure\"}"),
+        Some(0.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("mongodb_deferred_search_index_step_seconds_count"),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        value("mongodb_deferred_search_index_step_rows_total"),
+        Some(0.0),
+        "{text}"
+    );
+    // No repair pass has run yet, so the ledger gauges are not published.
+    assert_eq!(
+        value("mongodb_deferred_search_index_pending_chunks"),
+        None,
+        "{text}"
+    );
+
+    // A pass that takes nothing publishes the backlog.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let report = backend
+        .repair_deferred_search_index(Duration::from_secs(3600), 10)
+        .await
+        .unwrap();
+    assert_eq!(report.remaining, 1, "{report:?}");
+    let text = handle.render();
+    assert_eq!(
+        series_value(&text, "mongodb_deferred_search_index_pending_chunks"),
+        Some(1.0),
+        "{text}"
+    );
+    let oldest = series_value(
+        &text,
+        "mongodb_deferred_search_index_oldest_pending_seconds",
+    )
+    .expect("the oldest age is published");
+    assert!((0.2..60.0).contains(&oldest), "{oldest}\n{text}");
+
+    // A pass that finishes it empties both gauges and counts no failure.
+    let repair = same_db_backend(&backend, "def-metrics-repair")
+        .await
+        .unwrap();
+    let report = repair
+        .repair_deferred_search_index(Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert_eq!((report.cleared, report.remaining), (1, 0), "{report:?}");
+    let text = handle.render();
+    for (series, expected) in [
+        ("mongodb_deferred_search_index_pending_chunks", 0.0),
+        ("mongodb_deferred_search_index_oldest_pending_seconds", 0.0),
+        (
+            "mongodb_deferred_search_index_repair_failed_chunks_total",
+            0.0,
+        ),
+    ] {
+        assert_eq!(
+            series_value(&text, series),
+            Some(expected),
+            "{series}\n{text}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The ceiling
 // ---------------------------------------------------------------------------
 
@@ -5356,10 +5771,12 @@ async fn run_ceiling_probe(url: &str, fixture: &Value) {
 ///   `DEFERRED_CEILING_PROBE_INDEXES` line with the raw keys per index.
 /// - `DEFERRED_CEILING variant=.. wt_cache_gb=.. entries=.. outcome=.. cause=..
 ///   abort_entry=.. secs=.. entries_per_s=.. resources=.. rows=.. ledger=..
-///   markers=.. wt_rollbacks=..`. `outcome` is `ok`, `too_large`, `transient`
-///   or `other:..`; `abort_entry` is the entry the transaction ended at (or
-///   `commit`, or `na` for a committed Bundle); `entries_per_s` is the entries
-///   written, up to the abort, per second.
+///   markers=.. wt_rollbacks=.. step_s=..`. `outcome` is `ok`, `too_large`,
+///   `transient` or `other:..`; `abort_entry` is the entry the transaction ended
+///   at (or `commit`, or `na` for a committed Bundle); `entries_per_s` is the
+///   entries written, up to the abort, per second; `step_s` is the post-commit
+///   step's own time (the part of `secs` that is not the transaction), or `na`
+///   when no step ran (#2036).
 ///
 /// Run with:
 /// `cargo test -p helios-persistence --features mongodb --test mongodb_tests
@@ -5481,11 +5898,21 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
         );
 
         let before = super::transaction_bundle_load::eviction_rollbacks(&url).await;
+        let step_before = backend.deferred_index_step_totals();
         let started = Instant::now();
         let result = backend
             .process_transaction(&tenant, entries, FhirVersion::default())
             .await;
         let secs = started.elapsed().as_secs_f64();
+        // The post-commit step's own time (#2036), from the backend's totals:
+        // `na` when no step ran (a variant that does not defer, or a Bundle
+        // that aborted before it).
+        let step = backend.deferred_index_step_totals().since(&step_before);
+        let step_s = if step.steps > 0 {
+            format!("{:.1}", step.elapsed.as_secs_f64())
+        } else {
+            "na".to_string()
+        };
 
         // Words only, so the line stays `key=value` separated by spaces.
         let words = |text: String| text.split_whitespace().collect::<Vec<_>>().join("_");
@@ -5533,7 +5960,7 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
             "DEFERRED_CEILING variant={label} wt_cache_gb={cache_label} entries={entry_count} \
              outcome={outcome} cause={cause} abort_entry={abort} secs={secs:.1} \
              entries_per_s={entries_per_s} resources={resources} rows={rows} ledger={ledger} \
-             markers={markers} wt_rollbacks={rollbacks}"
+             markers={markers} wt_rollbacks={rollbacks} step_s={step_s}"
         );
 
         if outcome != "ok" && (resources != 0 || ledger != 0 || markers != 0) {
@@ -5573,6 +6000,151 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The WiredTiger cache the server at `url` runs with, in GB, for the report
+/// lines.
+async fn wt_cache_gb(url: &str) -> String {
+    let client = raw_test_client(url).await.expect("raw client");
+    let status = client
+        .database("admin")
+        .run_command(doc! {"serverStatus": 1})
+        .await
+        .expect("serverStatus");
+    let bytes = status
+        .get_document("wiredTiger")
+        .and_then(|w| w.get_document("cache"))
+        .map(|cache| bson_f64(cache.get("maximum bytes configured")))
+        .unwrap_or(f64::NAN);
+    format!("{:.2}", bytes / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// #2036: the post-commit step of ONE deferred Bundle, timed on its own. The
+/// ceiling harness above times the whole `process_transaction` call, which is
+/// the transaction and the step together and cannot be split. This reads the
+/// step's own time from `MongoBackend::deferred_index_step_totals` and prints
+/// one line:
+///
+/// `DEFERRED_STEP entries=.. rows=.. bundle_s=.. step_s=.. txn_s=.. rows_per_s=..
+/// wt_cache_gb=..`
+///
+/// `bundle_s` is the whole call, `step_s` the step's own time (the rows written
+/// after the commit, before the call returns), `txn_s` is `bundle_s - step_s`
+/// (the transaction and everything else the call does), `rows` the rows the
+/// step wrote and `rows_per_s` is `rows / step_s`. `wt_cache_gb` is what the
+/// server reports for its WiredTiger cache.
+///
+/// The Bundle is copies of the ceiling harness's fixture (the US Core Patient
+/// 85 Bundle, 267 entries and about 16 rows per entry each), so its rows per
+/// entry are comparable with `DEFERRED_CEILING`. The backend is built as the
+/// ceiling's `deferred` variant is: the default threshold (4,000 entries), 32
+/// connections and no Bundle deadline, so the step runs to its end. Ignored: a
+/// 6,000-entry Bundle takes minutes, and it fills the test mongod's cache, so
+/// run it by itself:
+///
+/// ```bash
+/// HFS_TEST_MONGODB_URL='mongodb://localhost:27018/?directConnection=true' \
+///   cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+///   the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own \
+///   -- --ignored --nocapture
+/// ```
+///
+/// `HFS_TEST_DEFERRED_STEP_ENTRIES` (default 6,000) is the Bundle's size,
+/// rounded up to whole fixture copies; the line prints the real count. It must
+/// reach the 4,000-entry threshold. A Bundle the server cannot commit fails the
+/// test with the server's error instead of printing a line: on a mongod with
+/// `--wiredTigerCacheSizeGB 0.25`, 4,005 to 4,539 entries commit, from 5,073
+/// the Bundle is rolled back as `TooLargeForCache` (for cache overflow while the
+/// ledger is written; 6,141 entries too), and at 30,171 the write set is
+/// refused while the entries are written (entry 12,729). A server whose
+/// `transactionLifetimeLimitSeconds` (60 by default) is shorter than the
+/// Bundle's transaction rolls it back with a transient error instead. The
+/// default of 6,000 is the size of the Bundle the README's lag figure is
+/// about, which needs a larger cache than the 0.25 GB of the usual test mongod.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "#2036 measurement; run alone with --ignored --nocapture"]
+async fn the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own() {
+    const NAME: &str = "the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own";
+    let Some(url) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let wanted = env_usize("HFS_TEST_DEFERRED_STEP_ENTRIES", 6_000);
+
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../hfs/tests/inferno/uscore_bundle_patient_85.json");
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture_path).expect("read fixture"))
+            .expect("parse fixture");
+    let per_copy = fixture["entry"].as_array().expect("entry array").len();
+    let copies = wanted.div_ceil(per_copy).max(1);
+
+    let backend = MongoBackend::new(ceiling_config(&url, "step", |config| {
+        CeilingVariant::Deferred.configure(config)
+    }))
+    .unwrap();
+    backend.initialize().await.unwrap();
+    let threshold = backend
+        .deferred_search_index_min_entries()
+        .expect("the deferral is on");
+    let entries = super::transaction_bundle_load::bundle_entries(&fixture, copies);
+    let entry_count = entries.len();
+    assert!(
+        entry_count >= threshold,
+        "{wanted} entries ({copies} copies, {entry_count} entries) are below the threshold of \
+         {threshold}: raise HFS_TEST_DEFERRED_STEP_ENTRIES"
+    );
+
+    let tenant = create_tenant("def-step");
+    let tenant_id = tenant.tenant_id().as_str();
+    let before = backend.deferred_index_step_totals();
+    let started = Instant::now();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
+    let bundle_s = started.elapsed().as_secs_f64();
+    if lacks_transactions(&result) {
+        return;
+    }
+    result.unwrap_or_else(|e| {
+        panic!(
+            "the {entry_count}-entry Bundle did not commit: {e:?}\n\
+             (`TooLargeForCache` means this server's WiredTiger cache is too small for a \
+             Bundle of this size even with its search rows deferred: lower \
+             HFS_TEST_DEFERRED_STEP_ENTRIES)"
+        )
+    });
+    let step = backend.deferred_index_step_totals().since(&before);
+
+    let step_s = step.elapsed.as_secs_f64();
+    let rows_per_s = step.rows as f64 / step_s;
+    println!(
+        "DEFERRED_STEP entries={entry_count} rows={} bundle_s={bundle_s:.1} step_s={step_s:.1} \
+         txn_s={:.1} rows_per_s={rows_per_s:.0} wt_cache_gb={}",
+        step.rows,
+        bundle_s - step_s,
+        wt_cache_gb(&url).await
+    );
+
+    let in_store = count_docs(&backend, "search_index", doc! { "tenant_id": tenant_id }).await
+        + count_docs(
+            &backend,
+            "search_index_contained",
+            doc! { "tenant_id": tenant_id },
+        )
+        .await;
+    let (ledger, markers) = (
+        ledger_count(&backend).await,
+        marker_count(&backend, tenant_id).await,
+    );
+    raw_db(&backend)
+        .await
+        .drop()
+        .await
+        .expect("drop the test database");
+    assert_eq!((step.steps, step.incomplete), (1, 0), "{step:?}");
+    assert_eq!(step.rows, in_store, "the step wrote every row of the store");
+    assert_eq!((ledger, markers), (0, 0), "nothing is left to the repair");
 }
 
 /// #2031 on a real cache: one Patient whose rows alone overflow the test

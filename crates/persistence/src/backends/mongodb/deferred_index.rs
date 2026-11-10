@@ -38,6 +38,18 @@
 //!   or a failed batch are finished by `repair_deferred_search_index`, which
 //!   the server runs at startup and periodically. It claims a document before
 //!   working on it and goes on past a failed chunk.
+//! - **Metrics (#2034, #2036).** Both are measured. Each post-commit step
+//!   records its own duration, the rows it wrote and, when it left work to the
+//!   repair, why (a deadline or a failure), as the
+//!   `mongodb_deferred_search_index_step_*` series of
+//!   `helios_observability::deferred_index_metrics`, and adds them to the
+//!   per-instance totals that [`MongoBackend::deferred_index_step_totals`](super::MongoBackend::deferred_index_step_totals)
+//!   reads back. Each repair pass publishes the ledger as it left it: its
+//!   document count and the age of its oldest document (by `created_at`), the
+//!   signal for "committed but not searchable for this long", and counts the
+//!   documents it had to leave in place. A step whose request is dropped before
+//!   it finishes records nothing; what it left is in the ledger, which the next
+//!   pass reports. A Bundle that deferred nothing never runs a step.
 //!
 //! **Batches by rows, and a cache overflow (#2031).** A chunk of up to 256 ids
 //! of one type is written by one or more batch transactions, each its own
@@ -92,6 +104,8 @@ use mongodb::{ClientSession, Database};
 
 use crate::core::{BundleEntry, BundleMethod};
 use crate::error::{StorageError, StorageResult};
+
+use helios_observability::deferred_index_metrics::IncompleteReason;
 
 use super::MongoBackend;
 use super::retry::retry_transient;
@@ -665,6 +679,13 @@ pub struct DeferredIndexRepairReport {
     pub failed: usize,
     /// Ledger documents in the collection after the pass, due or not.
     pub remaining: u64,
+    /// The age of the oldest ledger document after the pass, by its
+    /// `created_at` (its `not_before` when it has none): how long the Bundle
+    /// that left it has been committed and not fully searchable. `None` when
+    /// the ledger was empty when it was read. It is read right after
+    /// `remaining` and is not one atomic snapshot with it: a document another
+    /// writer finishes in between can leave the two a document apart.
+    pub oldest_pending: Option<Duration>,
 }
 
 impl MongoBackend {
@@ -1274,6 +1295,11 @@ impl MongoBackend {
     /// still open, is aborted by the drop. Dropping the future aborts only the
     /// batch in flight; the batches before it have committed and the ledger
     /// covers the rest.
+    ///
+    /// When it ends it records its own wall time, the rows it wrote and whether
+    /// it left work to the repair ([`Self::record_deferred_step`], #2036). A
+    /// step that is dropped before it ends records nothing. A Bundle that
+    /// deferred nothing never calls this, so it records nothing either.
     pub(super) async fn write_deferred_search_rows(
         &self,
         db: &Database,
@@ -1337,7 +1363,8 @@ impl MongoBackend {
             }
         }
 
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
         tracing::info!(
             tenant = %tenant_id,
             bundle_id = %deferred.bundle_id,
@@ -1363,7 +1390,22 @@ impl MongoBackend {
                  the deferred index repair will finish them"
             );
         }
+        self.record_deferred_step(elapsed, &stats);
         stats
+    }
+
+    /// Records a finished post-commit step (#2036) in the per-instance totals
+    /// and as the `mongodb_deferred_search_index_step_*` metrics: its own wall
+    /// time, the rows it wrote and, if it left work to the repair, why.
+    fn record_deferred_step(&self, elapsed: Duration, stats: &DeferredIndexStats) {
+        let incomplete = incomplete_reason(stats);
+        self.deferred_step_counters
+            .record(elapsed, stats.rows, incomplete.is_some());
+        helios_observability::deferred_index_metrics::record_step(
+            elapsed.as_secs_f64(),
+            stats.rows,
+            incomplete,
+        );
     }
 
     /// The number of documents in the `search_index_pending` ledger: Bundles'
@@ -1413,7 +1455,29 @@ impl MongoBackend {
     ///
     /// With search offloaded to a secondary no deferred ledger is written; this
     /// only reports the count.
+    ///
+    /// **Metrics (#2034).** A pass that returns a report publishes it before
+    /// returning: the `mongodb_deferred_search_index_pending_chunks` and
+    /// `..._oldest_pending_seconds` gauges from `remaining` and
+    /// `oldest_pending`, and `..._repair_failed_chunks_total` from `failed`
+    /// (see `helios_observability::deferred_index_metrics`). A pass that
+    /// returns an error publishes nothing, so the gauges keep what the last
+    /// successful pass left. Whoever calls this periodically therefore also
+    /// keeps those series current; a process that never calls it exports no
+    /// ledger gauges.
     pub async fn repair_deferred_search_index(
+        &self,
+        min_age: Duration,
+        max_chunks: usize,
+    ) -> StorageResult<DeferredIndexRepairReport> {
+        let report = self.repair_pass(min_age, max_chunks).await?;
+        publish_repair_report(&report);
+        Ok(report)
+    }
+
+    /// One repair pass, as [`Self::repair_deferred_search_index`] describes it,
+    /// without publishing its report.
+    async fn repair_pass(
         &self,
         min_age: Duration,
         max_chunks: usize,
@@ -1421,7 +1485,7 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let mut report = DeferredIndexRepairReport::default();
         if self.is_search_offloaded() || max_chunks == 0 {
-            report.remaining = count_ledger_documents(&db).await?;
+            (report.remaining, report.oldest_pending) = read_ledger_backlog(&db).await?;
             return Ok(report);
         }
 
@@ -1516,9 +1580,35 @@ impl MongoBackend {
         }
         report.reindexed = stats.indexed;
         report.rows = stats.rows;
-        report.remaining = count_ledger_documents(&db).await?;
+        (report.remaining, report.oldest_pending) = read_ledger_backlog(&db).await?;
         Ok(report)
     }
+}
+
+/// Why a finished post-commit step left work to the repair, or `None` when it
+/// left none: the Bundle's deadline cut it, or something else did (a batch that
+/// ran out of attempts, a resource the cache refuses in a transaction of its
+/// own, a finished ledger document that could not be deleted). The deadline
+/// wins when both happened.
+fn incomplete_reason(stats: &DeferredIndexStats) -> Option<IncompleteReason> {
+    (stats.left_chunks > 0).then_some(if stats.stopped_at_deadline {
+        IncompleteReason::Deadline
+    } else {
+        IncompleteReason::Failure
+    })
+}
+
+/// Publishes what a repair pass found: the ledger's size and the age of its
+/// oldest document (`0` for an empty ledger), and the documents it had to
+/// leave in place.
+fn publish_repair_report(report: &DeferredIndexRepairReport) {
+    helios_observability::deferred_index_metrics::set_backlog(
+        report.remaining,
+        report.oldest_pending.map_or(0.0, |age| age.as_secs_f64()),
+    );
+    helios_observability::deferred_index_metrics::record_repair_failed_chunks(
+        u64::try_from(report.failed).unwrap_or(u64::MAX),
+    );
 }
 
 /// Records that the repair could not finish a ledger document: due again
@@ -1570,6 +1660,57 @@ async fn count_ledger_documents(db: &Database) -> StorageResult<u64> {
     retry_transient(|| async { ledger.count_documents(doc! {}).await })
         .await
         .map_err(|e| internal_driver_error("Failed to count the deferred search index ledger", e))
+}
+
+/// The ledger as a repair pass leaves it: how many documents it holds, and the
+/// age of the oldest (`None` for an empty ledger).
+///
+/// The oldest is one `find_one` sorted by `created_at`, with only the two
+/// timestamps projected. The ledger is small (one document per 5,000 deferred
+/// resources, deleted as soon as they are indexed, so a long ledger is a long
+/// outage) and its only index is `not_before`, so this reads the ledger's
+/// documents once, once per pass.
+async fn read_ledger_backlog(db: &Database) -> StorageResult<(u64, Option<Duration>)> {
+    let remaining = count_ledger_documents(db).await?;
+    if remaining == 0 {
+        return Ok((0, None));
+    }
+    let ledger = db.collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION);
+    let oldest = retry_transient(|| async {
+        ledger
+            .find_one(doc! {})
+            .sort(doc! { "created_at": 1_i32, "_id": 1_i32 })
+            .projection(doc! { "created_at": 1_i32, "not_before": 1_i32 })
+            .await
+    })
+    .await
+    .map_err(|e| {
+        internal_driver_error(
+            "Failed to read the oldest deferred search index ledger document",
+            e,
+        )
+    })?;
+    Ok((
+        remaining,
+        oldest.map(|d| ledger_document_age(&d, Utc::now())),
+    ))
+}
+
+/// How old a ledger document is at `now`: from its `created_at`, or from its
+/// `not_before` when it has none (a document the post-commit step did not
+/// write). A document with neither, or one stamped in the future (a clock that
+/// differs between instances), is `Duration::ZERO` old.
+fn ledger_document_age(document: &Document, now: DateTime<Utc>) -> Duration {
+    let stamp = document
+        .get_datetime("created_at")
+        .or_else(|_| document.get_datetime("not_before"));
+    let Ok(stamp) = stamp else {
+        return Duration::ZERO;
+    };
+    let age_ms = now
+        .timestamp_millis()
+        .saturating_sub(stamp.timestamp_millis());
+    Duration::from_millis(u64::try_from(age_ms).unwrap_or(0))
 }
 
 /// The `not_before` time at or before which a ledger document is due for the
@@ -2119,5 +2260,62 @@ mod tests {
                 "{chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_step_is_incomplete_when_it_left_chunks_and_the_deadline_wins() {
+        // Everything written: nothing left to the repair.
+        assert_eq!(incomplete_reason(&DeferredIndexStats::default()), None);
+        // A batch that failed for good: chunks left and an error.
+        let failed = DeferredIndexStats {
+            left_chunks: 2,
+            last_error: Some("boom".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(incomplete_reason(&failed), Some(IncompleteReason::Failure));
+        // Written, but the finished ledger document could not be deleted: a
+        // chunk left with no batch error is still a failure, not a deadline.
+        let undeleted = DeferredIndexStats {
+            left_chunks: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            incomplete_reason(&undeleted),
+            Some(IncompleteReason::Failure)
+        );
+        // Cut at the Bundle's deadline.
+        let cut = DeferredIndexStats {
+            left_chunks: 3,
+            stopped_at_deadline: true,
+            ..Default::default()
+        };
+        assert_eq!(incomplete_reason(&cut), Some(IncompleteReason::Deadline));
+        // Both: the deadline is the reason.
+        let both = DeferredIndexStats {
+            last_error: Some("boom".to_string()),
+            ..cut
+        };
+        assert_eq!(incomplete_reason(&both), Some(IncompleteReason::Deadline));
+    }
+
+    #[test]
+    fn a_ledger_documents_age_comes_from_created_at_then_not_before() {
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let ago = |seconds: i64| chrono_to_bson(now - chrono::Duration::seconds(seconds));
+        // `created_at` is the age of the Bundle's commit; a later `not_before`
+        // (a claim or a recorded failure moves it) does not make it younger.
+        let both = doc! { "created_at": ago(100), "not_before": ago(10) };
+        assert_eq!(ledger_document_age(&both, now), Duration::from_secs(100));
+        // A document without `created_at` falls back to its `not_before`.
+        let only_not_before = doc! { "not_before": ago(30) };
+        assert_eq!(
+            ledger_document_age(&only_not_before, now),
+            Duration::from_secs(30)
+        );
+        // Neither stamp, or a stamp in the future (clocks differ between
+        // instances): zero, never a wrapped number.
+        assert_eq!(ledger_document_age(&doc! {}, now), Duration::ZERO);
+        let future = doc! { "created_at": ago(-5) };
+        assert_eq!(ledger_document_age(&future, now), Duration::ZERO);
     }
 }

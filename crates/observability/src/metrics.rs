@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-use crate::{dashboard_metrics, pool_metrics, uptime};
+use crate::{dashboard_metrics, deferred_index_metrics, pool_metrics, uptime};
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -48,7 +48,7 @@ pub fn init(service_name: &str) {
 /// explicit histogram buckets. Split out so tests can build an identical,
 /// thread-local recorder without installing a global one.
 pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
-    let histograms: [(&str, &[f64]); 5] = [
+    let histograms: [(&str, &[f64]); 6] = [
         ("http_request_duration_seconds", LATENCY_BUCKETS),
         (
             dashboard_metrics::RECONCILE_PASS_DURATION,
@@ -63,6 +63,10 @@ pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
             dashboard_metrics::CORRECTION_BUCKETS,
         ),
         (pool_metrics::MONGODB_CHECKOUT_WAIT_SECONDS, LATENCY_BUCKETS),
+        (
+            deferred_index_metrics::STEP_SECONDS,
+            deferred_index_metrics::STEP_SECONDS_BUCKETS,
+        ),
     ];
     histograms.into_iter().fold(
         PrometheusBuilder::new().add_global_label("service", service_name),
@@ -95,6 +99,10 @@ pub fn router() -> Router {
 // The PostgreSQL pool gauges in `crate::pool_metrics` (`postgres_pool_*`)
 // follow it too: their only label is `pool`, whose values are a fixed set the
 // server chooses at startup (`primary`, `audit`). No tenant or database name.
+//
+// So do the deferred search-index series in `crate::deferred_index_metrics`
+// (`mongodb_deferred_search_index_*`): the only label is `reason`, over a fixed
+// two-value set. No tenant, resource type or Bundle id.
 
 /// Render the Prometheus exposition text. The `uptime_seconds` gauge and the
 /// registered PostgreSQL pool gauges are set immediately before rendering
