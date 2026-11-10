@@ -89,8 +89,8 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact URL lifetime in seconds |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max entries per status-manifest page; `0` disables pagination |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | none | OAuth client_id for fetching protected provider files |
-| `HFS_BULK_SUBMIT_PRIVATE_KEY` | none | PEM key for `private_key_jwt` client assertion |
-| `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384` |
+| `HFS_BULK_SUBMIT_PRIVATE_KEY` | none | PEM key for `private_key_jwt` client assertion; with `ES384` its public half is served, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` |
+| `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384`; with `RS384` no key is published and assertions carry no `kid` |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens; never `system/bulk-submit` |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` seconds advertised on an in-progress status poll once ingestion has started |
 | `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` seconds advertised while pre-ingest (queued / reading manifest / sizing / downloading); clamped to `RETRY_AFTER` and to `POLL_RATE_WINDOW / POLL_RATE_LIMIT` |
@@ -112,6 +112,7 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - `BulkSubmitProvider::get_submission_status` is a point read of the submission row/document on every backend (PostgreSQL since #1154, MongoDB and SQLite since #998); `get_submission` is the one that aggregates receipts, so never call it on a status poll, a status-only kick-off, or the lease keeper's abort watch. `complete_submission` returns `()` for the same reason — it no longer re-reads the summary. Measured at 11M receipts on MongoDB, the aggregation was ~26s per call.
 - The Import page (`crates/ui/src/bulk_import.rs`) keeps a status change the recipient never *answered* (timeout, refused connection) as `pendingStatus` on the submission and re-sends it from the status card's refresh every 15s, up to 10 attempts, while the page is open; a refusal (any non-2xx answer) is never retried. Operator writes go through a compare-and-swap that re-loads and re-applies on a version conflict, so a *Mark completed* pressed during a live ingest no longer loses the race to the 5s status poll.
 - For `requiresAccessToken` files, HFS acquires a read-scoped token via SMART Backend Services using `client_credentials` and `private_key_jwt` when `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+- HFS publishes the public half of that signing key at `GET /.well-known/bulk-submit-jwks.json` (no authentication), so a recipient's authorization server can register the URL as the client's `jwks_uri`. Assertions, from the bulk-submit consumer and from the Import page, carry a `kid` header that is the key's RFC 7638 thumbprint. With `RS384` the key set is empty and assertions carry no `kid` (RSA key derivation is not offered: RUSTSEC-2023-0071), so an RS384 deployment registers its public key with the recipient out of band. One key is published, so there is no rotation overlap window.
 - If credentials are absent for `requiresAccessToken` files, fetches record a manifest-level error.
 - `deleted` files, either transaction Bundles or resource refs, are applied as deletes.
 - Partial success remains `200` with a populated `error[]` array of OperationOutcome NDJSON. Per-entry errors leave the manifest `completed`; a file that could not be read to its end makes it `failed` (see below).

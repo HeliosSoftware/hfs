@@ -483,8 +483,8 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. Each pass drains every expired submission in batches. |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | *(none)* | OAuth `client_id` for fetching protected provider files. |
-| `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
-| `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |
+| `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
+| `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
@@ -519,6 +519,21 @@ Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` code default (the benchma
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
 `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+
+HFS publishes the public half of that key at
+`GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
+recipient's authorization server can register that URL as the client's
+`jwks_uri`. Every assertion HFS signs, whether the bulk-submit consumer's or
+the web UI Import page's, carries a `kid` header that is the key's
+[RFC 7638](https://www.rfc-editor.org/rfc/rfc7638) thumbprint, so the server
+can pick the matching key from the set. Two limits:
+
+- With `HFS_BULK_SUBMIT_SIGNING_ALG=RS384` the key set is empty and assertions
+  carry no `kid`: HFS does not derive an RSA public key (RUSTSEC-2023-0071). An
+  RS384 deployment still registers its public key with the recipient out of
+  band.
+- One key is published, so there is no overlap window in which an old and a
+  new key are both served.
 
 #### Encrypted submissions (`fileEncryptionKey`)
 
