@@ -24,8 +24,15 @@ const TENANT: &str = "default";
 const BASE_URL: &str = "https://public.example/fhir";
 const TOPIC_URL: &str = "http://example.org/topics/encounter-start";
 
+#[cfg(feature = "R4")]
 fn backport(version: FhirVersion) -> bool {
     version == FhirVersion::R4
+}
+
+/// Without the R4 feature no server in this build speaks the backport shape.
+#[cfg(not(feature = "R4"))]
+fn backport(_version: FhirVersion) -> bool {
+    false
 }
 
 fn topic(version: FhirVersion) -> Value {
@@ -289,4 +296,22 @@ async fn r4b_events_returns_subscription_status_with_notification_events() {
         .get("/Subscription/manual-sub/$events?eventsSinceNumber=9")
         .await
         .assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "R5")]
+#[tokio::test]
+async fn r5_events_returns_subscription_notification_bundle() {
+    let (server, _hook) = server(FhirVersion::R5, 3, 100).await;
+
+    let response = server
+        .get("/Subscription/manual-sub/$events?eventsSinceNumber=1&eventsUntilNumber=2")
+        .await;
+    response.assert_status_ok();
+    let bundle: Value = response.json();
+    assert_eq!(bundle["type"], "subscription-notification");
+    let status = &bundle["entry"][0]["resource"];
+    assert_eq!(status["resourceType"], "SubscriptionStatus");
+    assert_eq!(status["type"], "query-event");
+    assert_eq!(status["notificationEvent"].as_array().unwrap().len(), 2);
+    assert_eq!(focus_ids(&bundle), ["Encounter/enc-1", "Encounter/enc-2"]);
 }
