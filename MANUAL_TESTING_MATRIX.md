@@ -1516,18 +1516,7 @@ API count was exactly 4. The rail marks this with `≈`. "Either form passes" sh
 that values may differ by one until the next reconcile, and that the exact check is the
 API/search count.
 
-### 3. §7.3 / §14 — "Processing finished at" is stamped by the first poll, not by the worker
-
-The submission page's *Processing finished at* is set when the first status poll after
-completion arrives (`crates/ui/src/bulk_import.rs`: the `completed_at` match falls back to
-`now_stamp()`), not when the worker finishes. With nobody polling, the page keeps showing
-*Queued - starting shortly* / In Progress. In this pass the UI said 15:51:02Z (1 h 50 min
-16 s after the 14:00:46Z start), while the server log shows ingest done at 15:13:38Z
-(1 h 12 min 52 s) and the deferred reindex done at 15:16:36Z (1 h 15 min 50 s). Record
-the ingest time from the server log, or keep the status card polling. This is the one
-application defect found in the pass.
-
-### 4. §7.4 / §7.5 — indexing during ingest with settings outside the recipe
+### 3. §7.4 / §7.5 — indexing during ingest with settings outside the recipe
 
 This pass used `HFS_BULK_SUBMIT_INDEX_QUEUE=64` and `HFS_BULK_SUBMIT_INDEX_CONCURRENCY=8`
 (the previous campaign's settings) on a 23 GB host. The recipe in `crates/rest/README.md`
@@ -1540,26 +1529,26 @@ repaired all of them (processed 4049 of 4049, failed=0, finished in 38 s). Final
 counts matched PostgreSQL and Elasticsearch for all 24 types. Use the README recipe
 settings.
 
-### 5. §8.3 row 4.22 — "`LPID` is among the rows" cannot be asserted
+### 4. §8.3 row 4.22 — "`LPID` is among the rows" cannot be asserted
 
 The `_has` query matches 5,294 patients (5,293 from the corpus plus the T2 patient) and
 `_count=50` returns the first page only. Use
 `/Patient?_id=<LPID>&_has:Condition:patient:code=http://snomed.info/sct|706893006`
 (expect 1), or assert the total of 5,294.
 
-### 6. §9.2 row 5.1 — expected counts must include the T2 fixtures
+### 5. §9.2 row 5.1 — expected counts must include the T2 fixtures
 
 Organization is 1,140, Practitioner 1,140 and Location 1,142. "`Location-0002.ndjson`
 with 137" becomes 142 (`Location-0001.ndjson` has 1,000).
 
-### 7. §9.2 row 5.2 — the Patients picker lists three patients; T8 changes the anchor's Conditions
+### 6. §9.2 row 5.2 — the Patients picker lists three patients; T8 changes the anchor's Conditions
 
 Typing `Cari853` lists three patients. The anchor Cari853 Esperanza675 Parker433 is the
 third; the first is Tanna708 Cari853 Hegmann834 (35 Condition, 242 Observation). Pick it
 by id. Also, T8 step 12.2.2 (the non-matching Condition created from the editor) adds one
 Condition to the anchor patient, so a T5 run after T8 sees 16 Conditions instead of 15.
 
-### 8. §11 rows 7.b, 7.d, 7.o, 7.p, 11.5 "all three subjects" and "Export as files" (7.exp-as-files) — the query needs a narrowed dependency at full scale
+### 7. §11 rows 7.b, 7.d, 7.o, 7.p, 11.5 "all three subjects" and "Export as files" (7.exp-as-files) — the query needs a narrowed dependency at full scale
 
 With the full corpus (7,699,987 Observations) the SQL Query `tall_female_patients` stops
 with *dependency 'obs' (ViewDefinition observation_flat) exceeds 1000000-row limit*
@@ -1571,7 +1560,7 @@ dependency materializes 175,355 rows and the ground truth is 4,945 rows for
 `min_height=150`, 11,705 for `patient_demographics` and 5,814 for `female_patients`. Run
 these rows that way at full scale.
 
-### 9. §11.5 rows 7.l and 7.f — one filter error per submit
+### 8. §11.5 rows 7.l and 7.f — one filter error per submit
 
 Row 7.l: the server reports one filter error per submit, the Patients one first (*Could
 not start the export. Enter only valid logical Patient IDs, separated by commas or new
@@ -1579,18 +1568,18 @@ lines.*). The since and tracking-id messages exist in the markup but are hidden 
 three fields are bad; each shows alone when only that field is bad. Row 7.f: the full
 on-screen text is *Could not start the export. Select at least one subject.*
 
-### 10. §8.1 — re-saving an existing fixture shows an extra dialog
+### 9. §8.1 — re-saving an existing fixture shows an extra dialog
 
 Rerunning the raw-editor save of a resource that already exists shows an extra *already
 exists. Saving will add a new version of it.* dialog (button **Save new version**).
 
-### 11. §13 (T9) — failure-path timings with the receiver down
+### 10. §13 (T9) — failure-path timings with the receiver down
 
 Fail streak 1 at 5 min 16 s, streak 2 at 10 min 17 s and the Error chip at 15 min 19 s
 after the upload, which matches the matrix's 15-17 minutes. Restart rehydration and the
 engine-disabled notice passed.
 
-### 12. §5 (T0 / T1) — R4-only build and startup line wording
+### 11. §5 (T0 / T1) — R4-only build and startup line wording
 
 This pass built with `cargo build --release -p helios-hfs --features
 postgres,elasticsearch,subscriptions,xml` instead of `--workspace --all-features`, so the
@@ -1598,5 +1587,19 @@ R5 version switch in T1 was not run. The startup line names the backend as
 `storage_backend=postgres-elasticsearch` and the prefix as `index_prefix=<prefix>`, not
 `pg-es`.
 
-**Result:** T0-T9 completed. One application defect (finding 3); everything else is
+### 12. §12 row 12.3.1 — `$events` on R4 returns a non-R4 resource and no events
+
+On R4 the response to `GET /Subscription/<id>/$events?eventsSinceNumber=1&eventsUntilNumber=3` was a
+`history` Bundle with one `SubscriptionStatus` entry (not an R4 resource; `$status` on the same
+subscription returns `Parameters`), no event, and the range parameters had no effect
+(`crates/rest/src/handlers/subscriptions.rs`, lines 149-197). The matrix gives no expected shape,
+which let this pass; §12 should state it. Filed as #2547.
+
+### 13. §6.3 / T6 — the primary is logged as unhealthy after reading a deleted resource
+
+Reading ViewDefinitions that the pass had just deleted (410 Gone) logged `Backend marked unhealthy
+backend_id="postgres" failures=3` twice on `pg-es`. A client-caused `Gone` is counted as a backend
+failure; this is the tracked issue #2532 (evidence added there). The warning is harmless for the pass.
+
+**Result:** T0-T9 completed. One new application issue (finding 12, #2547) and one known one (finding 13, #2532); everything else is
 documented behavior, script/matrix corrections, or settings outside the recipe.
