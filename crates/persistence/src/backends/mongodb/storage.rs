@@ -512,7 +512,10 @@ impl WriteAttemptError {
 /// writer, but it does not say that writer won the resource. A create or a
 /// `PUT` to a new id meets one on its resource insert while another write of
 /// the same id is uncommitted, and runs out of attempts when that write stays
-/// uncommitted through all of them (#2300).
+/// uncommitted through all of them (#2300). A purge marks every command of its
+/// transaction ([`ReplayedStep::Purge`], #2146): it wins nothing a conflict
+/// could name, and a rerun that finds the resource already purged answers
+/// `NotFound`.
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
     let marked_step = replayed_step(err).is_some();
     kept_driver_error(err).filter(|driver| {
@@ -576,6 +579,13 @@ enum ReplayedStep {
     /// A create's, a restore's, an update's or a delete's commit that applied
     /// nothing (#2300, #2342).
     Commit,
+    /// Any command of a purge's transaction, its reads and its deletes
+    /// (#2146). A purge carries no version a conflict could say was lost and
+    /// means the same after the other writer commits, so a conflict on any
+    /// document it touches is run again and the rerun's own writes decide:
+    /// `NotFound` when they find nothing left to change because the other
+    /// writer already purged it.
+    Purge,
 }
 
 impl ReplayedStep {
@@ -586,6 +596,7 @@ impl ReplayedStep {
             Self::ResourceInsert => "resource_insert",
             Self::HistoryInsert => "history_insert",
             Self::Commit => "commit",
+            Self::Purge => "purge",
         }
     }
 }
@@ -733,9 +744,7 @@ where
                     error_code = rolled_back_for_eviction(&err).and_then(driver_error_code),
                     "mongodb rolled the {what} transaction back for eviction under cache pressure; not running it again: {err}"
                 );
-                return Err(write_unavailable(format!(
-                    "The {what} was rolled back by the database under cache pressure; retry the request"
-                )));
+                return Err(eviction_unavailable(what));
             }
             outcome => return outcome,
         };
@@ -779,6 +788,17 @@ fn write_unavailable(message: String) -> StorageError {
         backend_name: "mongodb".to_string(),
         message,
     })
+}
+
+/// The answer of a write (`what`) whose transaction the database rolled back
+/// under cache pressure: [`replay_aborted_writes`] gives it without a second
+/// attempt. A purge never answers it: the purge's own attempt hands such a
+/// rollback back before the replay sees it, and the purge goes on without a
+/// transaction (#2146).
+fn eviction_unavailable(what: &str) -> StorageError {
+    write_unavailable(format!(
+        "The {what} was rolled back by the database under cache pressure; retry the request"
+    ))
 }
 
 /// Whether the failed single-resource write attempt that raised `err` has its
@@ -9217,150 +9237,1329 @@ impl crate::core::transaction::BundleMatchSource for MongoBundleMatches<'_> {
 // MongoDB stores resources across four collections — `resources`,
 // `resource_history`, `search_index`, and `search_index_contained` — the same
 // shape SQLite uses (plus the #1160 contained-rows split), so purge is the
-// same four deletes keyed by (tenant_id, resource_type, id). Note that the
-// ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
-// tombstone. Purge is the only path that removes the bytes.
+// same four deletes keyed by (tenant_id, resource_type, id), then a blanking of
+// the resource's prior bodies in the bulk-submit change log and a delete of its
+// sync failures (#2279). Note that the ordinary `delete` is a *soft* delete: it
+// flips `is_deleted` and writes a tombstone. Purge is the only path that removes
+// the bytes.
+//
+// What is atomic (#2146). `purge` of one resource is one transaction where the
+// deployment has them: the count of its versions, the six writes and the commit
+// run in a session, with the replay, the lost-race and the unknown-commit
+// handling of every single-resource write (`purge_in_transaction`). A failure
+// leaves every collection as it was. What is not:
+//
+// - A standalone `mongod` has no transactions, so the same commands run one at
+//   a time (`purge_without_transaction`). A crash or a failed command between
+//   two of them leaves what the later ones would have removed. A repeated
+//   purge finishes it: `NotFound` is answered only when the six writes changed
+//   nothing, so a resource of which anything is left (history, search rows, a
+//   prior body in the change log, a sync failure) is purged again. That also
+//   finishes a purge that an earlier version of this code left half-done.
+// - A resource whose purge outgrows what one transaction may write
+//   (`TransactionTooLargeForCache`, 388, a very long history) is purged the same
+//   way, without a transaction, with a WARN. So is one whose transaction the
+//   database rolls back under cache pressure (365, or a 112 that names the
+//   eviction) twice in a row, 100 ms apart: the first rollback gets one more
+//   transactional try, because it may have been the cache's load at that moment,
+//   and a second one is read as the purge's own size. These succeeded before
+//   #2146, so they still do, and a purge never answers the "rolled back under
+//   cache pressure" `503`. A resource with more versions than
+//   `purge_transaction_max_versions` never starts a transaction: the REST layer
+//   drops a request after `HFS_REQUEST_TIMEOUT`, which aborts its transaction,
+//   so a transaction that needs longer would be rolled back on every call. That
+//   limit bounds the time the transaction takes, not the cache it holds: on a
+//   small cache a purge under the limit can still be rolled back under cache
+//   pressure, and the second try and the fallback above are what handle it.
+// - `purge_all` is one transaction per batch of ids, not one for the type. A
+//   batch that fails returns its error; the batches before it stay purged and
+//   the rest is untouched, so a repeated call continues. The type-wide deletes
+//   that follow the batches, which include `resources` and the sync failures,
+//   are sessionless: a resource created after the last id was read is purged
+//   by them, whole, unless it is created while they run.
+// - The search rows of a `purge` are removed once more, sessionless, after the
+//   commit (`sweep_purged_rows`); if that fails the purge has still committed
+//   and a repeat removes what is left.
+//
+// `resources` goes first in every spelling, in the transaction and out of it,
+// because of the one writer that this order protects: a `$reindex` page. It
+// inserts its rows without a transaction and then reads `resources`; one that no
+// longer finds the resource removes what it wrote, and one that still finds it
+// ran before the delete of the resource, so everything it wrote is there for the
+// deletes of the rows that follow (the protocol of `purge_tenant_data`, #2259,
+// #2310). A transaction reads one snapshot, though, and does not see a row such
+// a page inserts after it, which is why `purge` sweeps the rows again after its
+// commit.
+//
+// A bulk-submit batch is not protected. Its check is of its manifest
+// (`manifest_exists`, `bulk_ingest.rs`), which only a tenant purge removes, not of
+// the resources it wrote. A batch that writes the same id while it is purged can
+// leave a history row, search rows and a `previous_content` body behind after a
+// purge that answered `Ok`. That hole is older than #2146, and this change does
+// not close it.
 // ============================================================================
 
 #[async_trait]
 impl PurgableStorage for MongoBackend {
+    /// Removes one resource, with all its versions, rows, prior bodies and sync
+    /// failures, and answers `NotFound` when the purge changed nothing: no
+    /// document of the resource was left in any of the collections it removes
+    /// from. One transaction on a replica set or a mongos, one command at a time
+    /// on a standalone server, and the same way when the transaction is too large
+    /// (388), is rolled back under cache pressure twice in a row, or the resource
+    /// has more versions than `purge_transaction_max_versions`; see the notes
+    /// above for what each does and does not guarantee. A purge the server keeps
+    /// aborting for another reason (a write conflict that does not go away)
+    /// answers [`BackendError::Unavailable`] (`503`) and changed nothing. A purge
+    /// never answers `503` for cache pressure: it goes on without a transaction.
     async fn purge(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let db = self.get_database().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-
-        let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type, "id": id };
-
-        // A resource that exists only in history (already purged from the
-        // current collection) is still purgeable; only a resource with no trace
-        // at all is NotFound. Mirrors the SQLite backend.
-        let in_resources = resources
-            .count_documents(key.clone())
-            .await
-            .map_err(|e| read_driver_error("Failed to check resource", e))?;
-        let in_history = history
-            .count_documents(key.clone())
-            .await
-            .or_query_error("Failed to check resource history")?;
-        if in_resources == 0 && in_history == 0 {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
+        let scope = PurgeScope::one(tenant.tenant_id().as_str(), resource_type, id);
+        match self.purge_in_transaction(&scope).await? {
+            PurgeAttempt::Committed { .. } => {
+                self.sweep_purged_rows(&scope).await;
+                Ok(())
+            }
+            // A standalone server: the same commands, one at a time.
+            PurgeAttempt::NoTransactions => {
+                self.purge_without_transaction(&scope).await.map(|_| ())
+            }
+            // A purge of one resource has nothing smaller to try: it runs
+            // without a transaction, as it did before #2146.
+            PurgeAttempt::Refused(refusal) => {
+                warn_purging_without_a_transaction(&scope, &refusal);
+                self.purge_without_transaction(&scope).await.map(|_| ())
+            }
         }
+    }
 
-        resources
-            .delete_many(key.clone())
-            .await
-            .or_query_error("Failed to purge resource")?;
-        history
-            .delete_many(key)
-            .await
-            .or_query_error("Failed to purge resource history")?;
+    /// Removes every resource of a type from `tenant`, and returns how many
+    /// `resources` documents were removed.
+    ///
+    /// With transactions the type goes in batches of at most
+    /// [`PURGE_ALL_BATCH_IDS`] ids, one transaction per batch ([`PurgeScope`]).
+    /// A batch is not "a `purge` of each id": it answers no `NotFound`, does not
+    /// sweep the rows again after its commit, and does not delete the sync
+    /// failures, because that delete matches no index and would scan the whole
+    /// ledger once per batch. Each batch removes its ids from the four
+    /// collections and blanks their prior bodies. The ids are read from the
+    /// primary, in `id` order, so a batch that committed is never read again. A
+    /// type-wide delete in one transaction would outgrow the cache on a large
+    /// type, and one without a transaction outlives the REST request timeout,
+    /// which then never sends the commands that follow it (#2146).
+    ///
+    /// A batch of more than one id that cannot run in a transaction is halved:
+    /// one that is too large for the cache (388), one rolled back for cache
+    /// pressure, one whose resources have more versions in all than
+    /// `purge_transaction_max_versions`. After a refusal for the cache the call
+    /// pauses 25 ms before it reads the next ids, as `deferred_index.rs` does. The
+    /// halving is logged at WARN each time, except that of the version limit,
+    /// which is logged at WARN the first time in a call and at DEBUG after that.
+    /// The size doubles only after [`PURGE_ALL_GROW_AFTER`] batches in a row were
+    /// purged at the current size, up to [`PURGE_ALL_BATCH_IDS`], and any refusal
+    /// starts that count again: a type whose batches overflow the cache by their
+    /// total size would otherwise commit one batch and have the next rolled back
+    /// for ever, every second transaction a write set the server throws away.
+    ///
+    /// A batch of one id that cannot run in a transaction is purged as `purge`
+    /// purges one resource: a rollback for cache pressure gets one more
+    /// transactional try after 100 ms, and the second refusal, a 388 or a version
+    /// count over the limit goes through the sessionless commands, with the WARN.
+    /// A call never answers `503` for cache pressure.
+    ///
+    /// After the last batch one sessionless type-wide sweep removes what no batch
+    /// named: the `resources` documents, the history, the rows and the prior
+    /// bodies of an id the batches did not read, and the sync failures of the
+    /// whole type. Its count is added to the call's. A resource created after
+    /// the last id was read is therefore purged whole, with its history and
+    /// rows, as the type-wide deletes of the code before #2146 did; one created
+    /// while the sweep itself runs can still be left half-purged (its
+    /// `resources` document removed and its rows kept, or the reverse). The
+    /// sweep removes the history, the rows and the prior bodies of an id that is
+    /// no longer in `resources` too (a purge of an earlier version of this code
+    /// that stopped part-way). Its failure is an error, unlike the sweep after
+    /// one `purge`, because nothing else removes those leftovers.
+    ///
+    /// Not atomic across batches: the call is a sequence of transactions. A batch
+    /// that fails for good returns its error, after one WARN that says how many
+    /// resources this call had purged; the batches before it stay purged and every
+    /// other id is untouched in all collections, so a repeated call continues. A
+    /// call that is dropped before it finishes, as the REST layer drops a handler
+    /// that outlives `HFS_REQUEST_TIMEOUT`, logs one WARN with the same count
+    /// (when it purged any) and the words "dropped before it finished"; its
+    /// transaction in flight is aborted and the batches before it stay purged. The
+    /// count of a failed or dropped call is lost, and a repeat returns only what
+    /// it purged itself. A resource of the type created while the call runs may
+    /// be purged or not. The sync failures of every resource of the type are
+    /// removed, whatever its age.
+    ///
+    /// A standalone server has no transactions. The first batch's ids are read
+    /// and then the attempt's `hello` finds out there are none; the ids are
+    /// dropped and the type-wide deletes of the code before #2146 run:
+    /// `resources` counted and deleted first, then history, rows, prior bodies and
+    /// sync failures, one command at a time. A repeated call finishes a stopped
+    /// one.
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let mut run = PurgeAllRun::new(tenant.tenant_id().as_str(), resource_type);
+        match self.purge_all_batches(&db, &mut run).await {
+            Ok(()) => Ok(run.finished()),
+            Err(err) => {
+                run.failed(&err);
+                Err(err)
+            }
+        }
+    }
+}
 
-        // The search_index collection keys the resource as `resource_id`.
-        search_index
-            .delete_many(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": id,
-            })
-            .await
-            .or_query_error("Failed to purge search index")?;
+/// What one `purge_all` call has done so far, and what it logs if it ends without
+/// saying how many resources it purged (#2146): it owns the tenant, the type and
+/// the running count.
+///
+/// The REST layer drops the handler of a request after `HFS_REQUEST_TIMEOUT`, and
+/// for a large type that is how every call but the last one ends, by design. Then
+/// neither the error path of [`PurgableStorage::purge_all`] nor the handler's audit
+/// event runs, and nothing would say how many resources that call erased. So the
+/// guard is armed from the start and disarmed by [`Self::finished`] and
+/// [`Self::failed`]; dropped while armed with a count above 0 it logs one WARN.
+struct PurgeAllRun {
+    tenant_id: String,
+    resource_type: String,
+    /// The `resources` documents this call has removed so far.
+    purged: u64,
+    armed: bool,
+}
 
-        // Contained rows share the container's (tenant_id, resource_type,
-        // resource_id), so they key the same way.
-        let search_index_contained =
-            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
-        search_index_contained
-            .delete_many(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": id,
-            })
-            .await
-            .or_query_error("Failed to purge contained search index")?;
+impl PurgeAllRun {
+    fn new(tenant_id: &str, resource_type: &str) -> Self {
+        Self {
+            tenant_id: tenant_id.to_string(),
+            resource_type: resource_type.to_string(),
+            purged: 0,
+            armed: true,
+        }
+    }
 
-        // The bulk-submit rollback log keeps the prior body of every updated
-        // resource; blank it so no content survives the purge (#2279). The
-        // change row itself stays so submission counters remain coherent.
-        db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
-            .update_many(
-                doc! { "tenant_id": tenant_id, "resource_type": resource_type, "resource_id": id },
-                doc! { "$set": { "previous_content": Bson::Null } },
-            )
-            .await
-            .or_query_error("Failed to clear bulk submission previous content")?;
-        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
-            .delete_many(doc! {
-                "_id.tenant_id": tenant_id,
-                "_id.resource_type": resource_type,
-                "_id.resource_id": id,
-            })
-            .await
-            .or_query_error("Failed to purge sync failures")?;
+    /// The call ended with `Ok`: disarms the guard and returns the count.
+    fn finished(&mut self) -> u64 {
+        self.armed = false;
+        self.purged
+    }
 
+    /// The call ended with `err`: disarms the guard, and logs one WARN with the
+    /// count when this call had purged something.
+    fn failed(&mut self, err: &StorageError) {
+        self.armed = false;
+        if self.purged > 0 {
+            tracing::warn!(
+                tenant = %self.tenant_id,
+                resource_type = %self.resource_type,
+                purged = self.purged,
+                "mongodb purge_all stopped with an error after purging some resources; \
+                 they stay purged and a repeated call continues: {err}"
+            );
+        }
+    }
+}
+
+impl Drop for PurgeAllRun {
+    fn drop(&mut self) {
+        if self.armed && self.purged > 0 {
+            tracing::warn!(
+                tenant = %self.tenant_id,
+                resource_type = %self.resource_type,
+                purged = self.purged,
+                "mongodb purge_all was dropped before it finished (a request timeout or a \
+                 cancelled request) after purging some resources; they stay purged and a \
+                 repeated call continues"
+            );
+        }
+    }
+}
+
+/// The most ids one `purge_all` transaction removes (#2146): small enough that a
+/// batch of resources with rows and a few versions each stays well under what one
+/// transaction may write, large enough that a type of a million resources is two
+/// thousand transactions and not a million. A batch the cache cannot hold, or
+/// whose versions are over `purge_transaction_max_versions`, is halved
+/// ([`smaller_purge_batch`]) and grows back ([`PurgeBatchSize`]).
+const PURGE_ALL_BATCH_IDS: usize = 500;
+
+/// How many batches in a row `purge_all` must purge at its current size before it
+/// doubles the size (#2146). Doubling after every commit would settle a type whose
+/// batches overflow the cache by their total size into "commit 62 ids, have 124
+/// rolled back, commit 62, have 124 rolled back": every second transaction a full
+/// write set that the server throws away, adding cache pressure for everyone else.
+const PURGE_ALL_GROW_AFTER: u32 = 4;
+
+/// How long `purge_all` pauses after a batch the cache refused (388 or a rollback
+/// under cache pressure) before it reads the next ids (#2146). It is the pause
+/// `deferred_index.rs` takes after a cache refusal (an inline `25` there, no
+/// constant to reuse), so the two writers that halve a batch back off alike. No
+/// pause follows a refusal for the version limit: that one wrote nothing.
+const PURGE_CACHE_REFUSAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How long a purge of one resource (or a `purge_all` batch of one id) waits after
+/// its transaction was rolled back under cache pressure before it runs the
+/// transaction once more (#2146). The rollback may have been the cache's load at
+/// that moment, which another writer's work changes; the pause gives it a moment.
+const PURGE_CACHE_PRESSURE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Default of `MongoBackendConfig::purge_transaction_max_versions` (#2146): the
+/// most `resource_history` documents one purge transaction removes.
+///
+/// The limit exists because a request is dropped after `HFS_REQUEST_TIMEOUT`
+/// (30 s by default) and dropping it aborts the transaction. It bounds the time
+/// the transaction takes, not the cache it holds. It counts versions only: the
+/// search rows are not counted, and neither is the size of anything. On a small
+/// cache a purge under the limit can still be rolled back under cache pressure
+/// (the table below shows it for a long history of small documents); the second
+/// transactional try after 100 ms and the purge without a transaction that
+/// follows it (`purge_in_transaction`, `purge`) are what handle that.
+///
+/// Measured with `the_transactional_purge_of_a_long_history_is_timed` (ignored; it
+/// plants N `resource_history` documents of one small Patient, about 0.3 KB each,
+/// with `insert_many` and times the transactional purge of that one resource, the
+/// guard raised out of the way). A debug build against `mongo:7.0` in Docker, a
+/// one-member replica set with `--wiredTigerCacheSizeGB 0.25`, on a Windows laptop,
+/// each size twice:
+///
+/// ```text
+/// n=5000    0.09 s  0.09 s  0.09 s  0.09 s   54,868 to 58,614 docs/s   purged
+/// n=20000   0.34 s  0.33 s  0.33 s  0.30 s   59,378 to 65,645 docs/s   purged
+/// n=50000   0.87 s  0.74 s  0.77 s  0.80 s   57,694 to 67,509 docs/s   purged
+/// n=100000  2.07 s  2.13 s                   46,848 to 48,362 docs/s   rolled back under cache pressure
+/// n=200000  3.56 s  2.30 s                   56,223 to 86,820 docs/s   rolled back under cache pressure
+/// ```
+///
+/// (Two sessions of two runs each for the three smaller sizes; one session of two
+/// runs for the two larger, which were measured once to see where the cache gives
+/// out. The seconds of the two larger sizes are the time to the rollback; the purge
+/// answered `503` then. Since the second try and the fallback, the same two sizes
+/// are purged, whole, after two rolled-back transactions and a purge without one:
+/// 6.36 s and 4.93 s for 100,000, 10.26 s and 6.21 s for 200,000, `fell_back` in
+/// every run.)
+///
+/// No 388 came up to 200,000, and the first rollback under cache pressure is
+/// somewhere above 50,000 versions on this cache. The choice: the slowest rate of the three sizes asked
+/// for, 54,868 docs/s, halved is 27,434 docs/s, which takes about 5 s for 137,000
+/// versions, a round 100,000; the cap of 10,000 is lower, so 10,000 it is: about
+/// 0.2 s at the measured rate, 0.4 s at half of it. The documents are small, and
+/// the count sees neither their size nor the search rows deleted in the same
+/// transaction. A resource has rows only for its current version, so for the single
+/// long history this limit is about they are few; a batch of many resources can
+/// have more rows than versions. A real purge of this many versions can take longer
+/// than the table says: the limit is a ceiling on the work counted, not a promise of
+/// a time or of a cache footprint.
+pub(super) const DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS: u64 = 10_000;
+
+/// The batch size to try after a batch of `len` ids could not run in a
+/// transaction: half of it, or `None` for a lone id, which `purge_all` removes
+/// without a transaction (#2146).
+fn smaller_purge_batch(len: usize) -> Option<usize> {
+    (len > 1).then_some(len / 2)
+}
+
+/// The batch size to read once the batches at `len` ids have proved it fits:
+/// double, up to [`PURGE_ALL_BATCH_IDS`], so one heavy resource does not leave the
+/// rest of the type to be purged one id at a time (#2146).
+fn grown_purge_batch(len: usize) -> usize {
+    len.saturating_mul(2).min(PURGE_ALL_BATCH_IDS)
+}
+
+/// The size of `purge_all`'s batches (#2146): [`PURGE_ALL_BATCH_IDS`] to start,
+/// halved by a refusal ([`smaller_purge_batch`]), doubled again
+/// ([`grown_purge_batch`]) only after [`PURGE_ALL_GROW_AFTER`] batches in a row
+/// were purged at the current size. A refusal starts that count again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PurgeBatchSize {
+    len: usize,
+    purged_in_a_row: u32,
+}
+
+impl PurgeBatchSize {
+    fn new() -> Self {
+        Self {
+            len: PURGE_ALL_BATCH_IDS,
+            purged_in_a_row: 0,
+        }
+    }
+
+    /// How many ids the next read asks for.
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// A batch of `ids` ids was refused: the run of purged batches is over, and
+    /// the next read asks for half as many ids. `None` for a lone id, which
+    /// cannot be halved (the size is left as it is).
+    fn refused(&mut self, ids: usize) -> Option<usize> {
+        self.purged_in_a_row = 0;
+        let smaller = smaller_purge_batch(ids)?;
+        self.len = smaller;
+        Some(smaller)
+    }
+
+    /// A batch was purged, in a transaction or, for a lone id, without one.
+    fn purged(&mut self) {
+        self.purged_in_a_row += 1;
+        if self.purged_in_a_row >= PURGE_ALL_GROW_AFTER {
+            self.len = grown_purge_batch(self.len);
+            self.purged_in_a_row = 0;
+        }
+    }
+}
+
+/// Whether `purge_all` is going round in circles (#2146): its last batch
+/// committed and removed no `resources` document (`stalled_on` is that batch's
+/// first id), and the next read starts at the same id again. It then stops with an
+/// error rather than commit the same empty batch for ever.
+fn purge_all_is_stalled(stalled_on: Option<&str>, next_first: &str) -> bool {
+    stalled_on == Some(next_first)
+}
+
+/// The ids one purge transaction removes (#2146): one resource (`purge`), or a
+/// batch of the ids of one type that `purge_all` read from `resources`.
+#[derive(Clone, Copy)]
+enum PurgeIds<'a> {
+    One(&'a str),
+    Batch(&'a [String]),
+}
+
+/// What one purge transaction removes: `ids` of `resource_type` in `tenant_id`.
+///
+/// Every filter it builds carries `tenant_id` and `resource_type`, and `id` or
+/// `resource_id` as one id or an `$in` of the batch. A purge that touched another
+/// tenant or another type would be the worst bug here, so nothing else builds a
+/// purge filter.
+#[derive(Clone, Copy)]
+struct PurgeScope<'a> {
+    tenant_id: &'a str,
+    resource_type: &'a str,
+    ids: PurgeIds<'a>,
+}
+
+impl<'a> PurgeScope<'a> {
+    fn one(tenant_id: &'a str, resource_type: &'a str, id: &'a str) -> Self {
+        Self {
+            tenant_id,
+            resource_type,
+            ids: PurgeIds::One(id),
+        }
+    }
+
+    fn batch(tenant_id: &'a str, resource_type: &'a str, ids: &'a [String]) -> Self {
+        Self {
+            tenant_id,
+            resource_type,
+            ids: PurgeIds::Batch(ids),
+        }
+    }
+
+    /// The id of a purge of one resource, which answers `NotFound` when its
+    /// writes change nothing. `None` for a batch.
+    fn single_id(&self) -> Option<&'a str> {
+        match self.ids {
+            PurgeIds::One(id) => Some(id),
+            PurgeIds::Batch(_) => None,
+        }
+    }
+
+    /// The id to name in a log line: the one resource's, or the only id of a
+    /// batch of one.
+    fn lone_id(&self) -> Option<&'a str> {
+        match self.ids {
+            PurgeIds::One(id) => Some(id),
+            PurgeIds::Batch([id]) => Some(id),
+            PurgeIds::Batch(_) => None,
+        }
+    }
+
+    /// Whether this is a batch of more than one id, which can be halved.
+    fn is_batch_of_many(&self) -> bool {
+        matches!(self.ids, PurgeIds::Batch(ids) if ids.len() > 1)
+    }
+
+    /// Whether its transaction deletes the sync failures: a purge of one resource
+    /// does, in one scan of the ledger, as before #2146. A batch leaves them to
+    /// the sweep that follows the batches, since the delete matches no index and
+    /// would scan the whole ledger once per batch.
+    fn removes_sync_failures(&self) -> bool {
+        matches!(self.ids, PurgeIds::One(_))
+    }
+
+    /// `id` for one resource, `{ "$in": [...] }` for a batch.
+    fn id_match(&self) -> Bson {
+        match self.ids {
+            PurgeIds::One(id) => Bson::String(id.to_string()),
+            PurgeIds::Batch(ids) => Bson::Document(doc! { "$in": ids.to_vec() }),
+        }
+    }
+
+    /// The filter of `resources` and `resource_history`: the deletes, the count of
+    /// versions, and the read of whether the resource exists again.
+    fn resources_filter(&self) -> Document {
+        doc! {
+            "tenant_id": self.tenant_id,
+            "resource_type": self.resource_type,
+            "id": self.id_match(),
+        }
+    }
+
+    /// The filter of the rows of `search_index` and `search_index_contained`, and
+    /// of the bulk-submit change log: they key the resource as `resource_id`, and
+    /// contained rows share their container's.
+    fn rows_filter(&self) -> Document {
+        doc! {
+            "tenant_id": self.tenant_id,
+            "resource_type": self.resource_type,
+            "resource_id": self.id_match(),
+        }
+    }
+
+    /// [`Self::rows_filter`] for the change rows that still hold a prior body,
+    /// which is what the settling read of a purge looks for. Served by
+    /// `idx_bulk_changes_resource`, with the body test applied to the fetched row.
+    fn changes_with_body_filter(&self) -> Document {
+        let mut filter = self.rows_filter();
+        filter.insert("previous_content", doc! { "$ne": Bson::Null });
+        filter
+    }
+
+    /// The filter of the sync-failure ledger, which keys the resource inside its
+    /// compound `_id`. No index serves it: it is a scan of the ledger.
+    fn sync_failures_filter(&self) -> Document {
+        doc! {
+            "_id.tenant_id": self.tenant_id,
+            "_id.resource_type": self.resource_type,
+            "_id.resource_id": self.id_match(),
+        }
+    }
+
+    /// What a settling read looks for: the four collections a purge removes
+    /// documents from, and the change rows that still hold a prior body, each with
+    /// its filter. The sync-failure ledger is not here: a probe of it would scan
+    /// the ledger, so a purge that had only a sync failure to remove cannot be
+    /// confirmed by a read.
+    fn settled_documents(&self) -> [(&'static str, Document); 5] {
+        [
+            (MongoBackend::RESOURCES_COLLECTION, self.resources_filter()),
+            (
+                MongoBackend::RESOURCE_HISTORY_COLLECTION,
+                self.resources_filter(),
+            ),
+            (MongoBackend::SEARCH_INDEX_COLLECTION, self.rows_filter()),
+            (
+                MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                self.rows_filter(),
+            ),
+            (
+                super::bulk_submit::CHANGES_COLLECTION,
+                self.changes_with_body_filter(),
+            ),
+        ]
+    }
+}
+
+/// What the six writes of a purge changed (#2146).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PurgeChanges {
+    /// The `resources` documents removed: what `purge_all` counts.
+    resources: u64,
+    /// Everything changed: the four deletes, the change rows whose prior body was
+    /// blanked, and the sync failures removed. `0` means the purge found nothing
+    /// of the resource, which is what `NotFound` is answered from.
+    total: u64,
+}
+
+impl PurgeChanges {
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn add(&mut self, changed: u64) {
+        self.total = self.total.saturating_add(changed);
+    }
+}
+
+/// What an attempt at a purge transaction did (#2146).
+enum PurgeAttempt {
+    /// The transaction committed, or its outcome was settled as committed by a
+    /// read; `resources` is how many `resources` documents it removed.
+    Committed { resources: u64 },
+    /// The deployment has no transactions (a standalone `mongod`). Nothing ran.
+    NoTransactions,
+    /// The purge cannot run in a transaction, and was aborted or rolled back
+    /// with nothing applied. The caller picks what it does instead.
+    Refused(PurgeRefusal),
+}
+
+/// Why a purge did not run in a transaction although the deployment has them
+/// (#2146).
+enum PurgeRefusal {
+    /// The server rolled the transaction back because its write set will not fit
+    /// in the cache (`TransactionTooLargeForCache`, 388). Recognised before the
+    /// replay looks at labels: the same writes meet the same cache.
+    TooLargeForCache(StorageError),
+    /// The server rolled the transaction back under cache pressure (365, or a 112
+    /// that names the eviction), for any scope. Nothing was applied. A batch of
+    /// more than one id is halved: a smaller one may fit. A lone scope (a
+    /// purge of one resource, or a batch of one id) is run in a transaction once
+    /// more after a pause, and when that is refused too it is purged without a
+    /// transaction ([`MongoBackend::purge_in_transaction`]). A purge never
+    /// answers `503` for it.
+    CachePressure(StorageError),
+    /// The resources have more versions in all than
+    /// `purge_transaction_max_versions`, counted first in the transaction, which
+    /// was aborted before it wrote anything.
+    TooManyVersions { versions: u64, limit: u64 },
+}
+
+impl PurgeRefusal {
+    /// The version count, for the refusal that is about it.
+    fn versions(&self) -> Option<u64> {
+        match self {
+            Self::TooManyVersions { versions, .. } => Some(*versions),
+            Self::TooLargeForCache(_) | Self::CachePressure(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PurgeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLargeForCache(cause) => {
+                write!(f, "the transaction is too large for the cache: {cause}")
+            }
+            Self::CachePressure(cause) => {
+                write!(
+                    f,
+                    "the transaction was rolled back under cache pressure: {cause}"
+                )
+            }
+            Self::TooManyVersions { versions, limit } => write!(
+                f,
+                "{versions} versions are more than purge_transaction_max_versions ({limit})"
+            ),
+        }
+    }
+}
+
+/// A failed command of a purge. Inside a transaction the driver error is kept
+/// and marked ([`ReplayedStep::Purge`]), so [`replay_aborted_writes`] can read
+/// its code and labels; without one it is classified like every sessionless
+/// command ([`classify_mongodb_error`]).
+fn purge_error(in_session: bool, context: &str, err: MongoError) -> StorageError {
+    if in_session {
+        in_replayed_step(ReplayedStep::Purge, internal_driver_error(context, err))
+    } else {
+        StorageError::Backend(classify_mongodb_error(context, err))
+    }
+}
+
+/// `count_documents(filter)` through `session`, when there is one.
+async fn purge_count(
+    collection: &Collection<Document>,
+    filter: Document,
+    session: &mut Option<ClientSession>,
+) -> Result<u64, MongoError> {
+    match session.as_mut() {
+        Some(session) => collection.count_documents(filter).session(session).await,
+        None => collection.count_documents(filter).await,
+    }
+}
+
+/// `delete_many(filter)` through `session`, when there is one; returns how many
+/// documents it removed.
+async fn purge_delete_many(
+    collection: &Collection<Document>,
+    filter: Document,
+    session: &mut Option<ClientSession>,
+) -> Result<u64, MongoError> {
+    let deleted = match session.as_mut() {
+        Some(session) => collection.delete_many(filter).session(session).await?,
+        None => collection.delete_many(filter).await?,
+    };
+    Ok(deleted.deleted_count)
+}
+
+/// Logs that a purge is about to run without a transaction although the
+/// deployment has them, once, naming the tenant, the type, the id and, when that
+/// is the reason, the version count (#2146). A purge that fails like this on a
+/// resource with a very long history, or one whose transaction the cache cannot
+/// hold, succeeded before the transaction, so it still does.
+fn warn_purging_without_a_transaction(scope: &PurgeScope<'_>, refusal: &PurgeRefusal) {
+    tracing::warn!(
+        tenant = %scope.tenant_id,
+        resource_type = %scope.resource_type,
+        id = scope.lone_id(),
+        versions = refusal.versions(),
+        "mongodb purge cannot run in a transaction ({refusal}); purging without a transaction"
+    );
+}
+
+impl MongoBackend {
+    /// The batches of `purge_all` and the sweep that follows them (#2146); `run`
+    /// receives the `resources` documents removed so far, so the caller can say
+    /// how many a failed or dropped call had purged.
+    ///
+    /// The size of the batches is [`PurgeBatchSize`]'s: halved by every refusal
+    /// of a batch of more than one id, doubled after [`PURGE_ALL_GROW_AFTER`]
+    /// batches in a row. A refusal for the cache (388, or a rollback under cache
+    /// pressure) is followed by a pause of [`PURGE_CACHE_REFUSAL_PAUSE`], one for
+    /// the version limit is not. The halving is logged at WARN, except that of the
+    /// version limit after the first one of the call, which goes to DEBUG: with
+    /// the default limit a type whose resources average more than 20 versions
+    /// would otherwise log a WARN every fifth transaction.
+    async fn purge_all_batches(
+        &self,
+        db: &mongodb::Database,
+        run: &mut PurgeAllRun,
+    ) -> StorageResult<()> {
+        let tenant_id = run.tenant_id.clone();
+        let resource_type = run.resource_type.clone();
+        let (tenant_id, resource_type) = (tenant_id.as_str(), resource_type.as_str());
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut batch = PurgeBatchSize::new();
+        let mut warned_versions = false;
+        // The first id of the last batch when it committed and removed no
+        // `resources` document.
+        let mut stalled_on: Option<String> = None;
+        loop {
+            let ids = self
+                .next_purge_ids(&resources, tenant_id, resource_type, batch.len())
+                .await?;
+            let Some(first) = ids.first() else {
+                break;
+            };
+            if purge_all_is_stalled(stalled_on.as_deref(), first) {
+                return Err(internal_error(format!(
+                    "purge_all of {resource_type} made no progress: a batch starting at {first} \
+                     committed and removed no resource, and the next read starts at it again"
+                )));
+            }
+            let scope = PurgeScope::batch(tenant_id, resource_type, &ids);
+            let (removed, in_transaction) = match self.purge_in_transaction(&scope).await? {
+                PurgeAttempt::Committed { resources } => (resources, true),
+                PurgeAttempt::NoTransactions => {
+                    run.purged += self.purge_type_wide(db, tenant_id, resource_type).await?;
+                    return Ok(());
+                }
+                PurgeAttempt::Refused(refusal) => {
+                    let refused_by_the_cache =
+                        !matches!(refusal, PurgeRefusal::TooManyVersions { .. });
+                    match batch.refused(ids.len()) {
+                        Some(smaller) => {
+                            if refused_by_the_cache || !warned_versions {
+                                warned_versions |= !refused_by_the_cache;
+                                tracing::warn!(
+                                    tenant = %tenant_id,
+                                    resource_type,
+                                    batch_ids = ids.len(),
+                                    next_batch_ids = smaller,
+                                    versions = refusal.versions(),
+                                    "mongodb purge_all batch cannot run in a transaction \
+                                     ({refusal}); halving it"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    tenant = %tenant_id,
+                                    resource_type,
+                                    batch_ids = ids.len(),
+                                    next_batch_ids = smaller,
+                                    versions = refusal.versions(),
+                                    "mongodb purge_all batch cannot run in a transaction \
+                                     ({refusal}); halving it"
+                                );
+                            }
+                            if refused_by_the_cache {
+                                tokio::time::sleep(PURGE_CACHE_REFUSAL_PAUSE).await;
+                            }
+                            continue;
+                        }
+                        // A lone id: `purge_in_transaction` already gave a
+                        // rollback under cache pressure its second try.
+                        None => {
+                            warn_purging_without_a_transaction(&scope, &refusal);
+                            if refused_by_the_cache {
+                                tokio::time::sleep(PURGE_CACHE_REFUSAL_PAUSE).await;
+                            }
+                            (
+                                self.purge_without_transaction(&scope).await?.resources,
+                                false,
+                            )
+                        }
+                    }
+                }
+            };
+            run.purged += removed;
+            tracing::debug!(
+                tenant = %tenant_id,
+                resource_type,
+                batch_ids = ids.len(),
+                removed,
+                in_transaction,
+                "mongodb purge_all batch purged"
+            );
+            batch.purged();
+            stalled_on = (removed == 0).then(|| first.clone());
+        }
+        // The sweep after the batches takes `resources` too: a resource created
+        // after the last read above would otherwise lose its history, rows and
+        // prior bodies and keep its `resources` document.
+        run.purged += self.purge_type_wide(db, tenant_id, resource_type).await?;
         Ok(())
     }
 
-    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+    /// Runs the purge of `scope` in a transaction (#2146): once, or, for a lone
+    /// scope whose transaction was rolled back under cache pressure, a second time
+    /// after a pause.
+    ///
+    /// [`Self::run_purge_transaction`] is one run, with everything the next
+    /// paragraphs describe. This adds the second try that only a lone scope has
+    /// (a purge of one resource, or a `purge_all` batch of one id). A rollback
+    /// under cache pressure (365, or a 112 that names the eviction) may have been
+    /// the cache's load at that moment, which another writer's work changes, so a
+    /// lone scope waits [`PURGE_CACHE_PRESSURE_RETRY_PAUSE`] (100 ms) and runs
+    /// the transaction once more. Whatever that second run gives is the answer:
+    /// committed, or refused again (cache pressure, a 388, the version limit),
+    /// which the caller turns into a purge without a transaction. A batch of more
+    /// than one id gets no second try, its caller halves it; a 388 and the
+    /// version limit are refused at once, with no second try: the same writes meet
+    /// the same cache, and the same history the same limit. So a purge never
+    /// answers the "rolled back under cache pressure" `503`
+    /// ([`eviction_unavailable`] stays for the other writes).
+    async fn purge_in_transaction(&self, scope: &PurgeScope<'_>) -> StorageResult<PurgeAttempt> {
+        let attempt = self.run_purge_transaction(scope).await?;
+        let PurgeAttempt::Refused(PurgeRefusal::CachePressure(cause)) = &attempt else {
+            return Ok(attempt);
+        };
+        if scope.is_batch_of_many() {
+            return Ok(attempt);
+        }
+        tracing::info!(
+            tenant = %scope.tenant_id,
+            resource_type = %scope.resource_type,
+            id = scope.lone_id(),
+            pause_ms = PURGE_CACHE_PRESSURE_RETRY_PAUSE.as_millis() as u64,
+            "mongodb purge transaction was rolled back under cache pressure; running it once \
+             more: {cause}"
+        );
+        tokio::time::sleep(PURGE_CACHE_PRESSURE_RETRY_PAUSE).await;
+        self.run_purge_transaction(scope).await
+    }
+
+    /// One run of the purge of `scope` in one transaction, with what every
+    /// single-resource write has (#2146):
+    ///
+    /// - [`replay_aborted_writes`] runs it again, up to
+    ///   [`WRITE_ABORT_RETRY`](super::retry::WRITE_ABORT_RETRY) attempts (four,
+    ///   after 100, 200 and 400 ms), while the server aborts the transaction.
+    ///   That includes a lost write conflict: every command of the purge is
+    ///   marked [`ReplayedStep::Purge`], so a plain `WriteConflict` is replayed,
+    ///   not read as a lost race, because a purge means the same after the other
+    ///   writer commits and the rerun decides (`NotFound` when the other writer
+    ///   already purged it). A purge that is aborted until the attempts are used
+    ///   up answers [`BackendError::Unavailable`] (`503`, retryable).
+    /// - A failed attempt's transaction is aborted before the next starts
+    ///   ([`abort_failed_write`], #2307), except after a commit was sent.
+    /// - A refused transaction and a missing server answer `Unavailable`
+    ///   ([`Self::unavailable_write_error`]).
+    ///
+    /// Two failures are not left to the replay. They are recognised on the
+    /// attempt's own error, after its transaction was aborted, and returned as
+    /// [`PurgeAttempt::Refused`], so the caller can purge without a transaction or
+    /// with a smaller one. A 388 ([`is_too_large_for_cache_failure`]) comes first,
+    /// even when the server labelled it a transient abort: the same writes meet the
+    /// same cache, as the Bundle path decides too. A rollback under cache pressure
+    /// ([`rolled_back_for_eviction`]) is handed back for every scope, not only a
+    /// batch of many: the replay would turn it into `503` without a second
+    /// attempt, and this write's callers have something else to try (a smaller
+    /// batch, a second run, a purge without a transaction). Such an error raised
+    /// by the commit itself means the server has rolled the transaction back, so
+    /// the session kept for the next attempt ([`RefusedCommitSession`]) is dropped
+    /// with the write, without another abort.
+    async fn run_purge_transaction(&self, scope: &PurgeScope<'_>) -> StorageResult<PurgeAttempt> {
+        let refused_commit = RefusedCommitSession::default();
+        let replayed = replay_aborted_writes("purge", || async {
+            let mut session = refused_commit.take();
+            let attempt = self.purge_attempt(scope, &mut session).await;
+            let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
+            refused_commit.keep_after(&attempt, &mut session);
+            match attempt {
+                Err(cause) if is_too_large_for_cache_failure(&cause) => {
+                    Ok(PurgeAttempt::Refused(PurgeRefusal::TooLargeForCache(cause)))
+                }
+                Err(cause) if rolled_back_for_eviction(&cause).is_some() => {
+                    Ok(PurgeAttempt::Refused(PurgeRefusal::CachePressure(cause)))
+                }
+                attempt => attempt,
+            }
+        });
+        commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
+            .await
+            .map_err(|err| self.unavailable_write_error("purge", err))
+    }
+
+    /// One attempt at [`Self::run_purge_transaction`]: the transaction, the count
+    /// of the scope's versions, the six writes and the commit.
+    ///
+    /// The count is the transaction's first command. Over
+    /// `purge_transaction_max_versions` the transaction is aborted here, before it
+    /// writes anything, and the attempt answers [`PurgeRefusal::TooManyVersions`]:
+    /// the REST layer drops a request after `HFS_REQUEST_TIMEOUT`, and dropping it
+    /// aborts the transaction, so a purge that needs longer than that would be
+    /// rolled back on every call. The count serves `idx_history_identity` and
+    /// reads no documents. A purge of one resource whose six writes changed
+    /// nothing answers `NotFound`, and its transaction is aborted like any failed
+    /// attempt's.
+    ///
+    /// `session` receives the attempt's session, so its caller can abort a failed
+    /// attempt's transaction before anything runs next ([`abort_failed_write`]).
+    /// On a standalone server nothing runs and the answer is
+    /// [`PurgeAttempt::NoTransactions`].
+    async fn purge_attempt(
+        &self,
+        scope: &PurgeScope<'_>,
+        session: &mut Option<ClientSession>,
+    ) -> StorageResult<PurgeAttempt> {
         let db = self.get_database().await?;
-        let tenant_id = tenant.tenant_id().as_str();
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "purge", session.take())
+            .await?;
+        *session = begun;
+        if !transaction_active {
+            return Ok(PurgeAttempt::NoTransactions);
+        }
+
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let versions = purge_count(&history, scope.resources_filter(), session)
+            .await
+            .map_err(|e| purge_error(true, "Failed to count resource history", e))?;
+        let limit = self.config().purge_transaction_max_versions;
+        if versions > limit {
+            abort_attempt_transaction(session).await;
+            return Ok(PurgeAttempt::Refused(PurgeRefusal::TooManyVersions {
+                versions,
+                limit,
+            }));
+        }
+
+        let changes = self.purge_writes(&db, scope, session).await?;
+        if let Some(id) = scope.single_id()
+            && changes.is_empty()
+        {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: scope.resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+        self.commit_purge(&db, scope, session).await?;
+        Ok(PurgeAttempt::Committed {
+            resources: changes.resources,
+        })
+    }
+
+    /// Commits a purge, and settles a commit whose outcome stayed unknown with
+    /// reads of what the purge removed (#2146).
+    ///
+    /// The commit is the helper every single-resource write uses
+    /// ([`try_commit_best_effort_multi_write_session`], with its re-sends of an
+    /// unknown commit and its deadline window), and a commit that applied
+    /// nothing is mapped like theirs ([`replayed_commit_error`]). What differs is
+    /// the settling read: [`Self::commit_single_write`] looks for the history row a
+    /// write stamped, and a purge writes none, so [`Self::purge_is_settled`]
+    /// looks for the documents it removed. If none is left the purge committed
+    /// (`Ok`); otherwise the answer is the same
+    /// [`TransactionError::CommitOutcomeUnknown`] the other writes return.
+    async fn commit_purge(
+        &self,
+        db: &mongodb::Database,
+        scope: &PurgeScope<'_>,
+        session: &mut Option<ClientSession>,
+    ) -> StorageResult<()> {
+        let window = ResendWindow::until(
+            commit_deadline::single_write_deadline_at(),
+            settle_read_max_time(self.config().settle_read_max_time_ms),
+        );
+        let committed =
+            try_commit_best_effort_multi_write_session(session, true, "purge", window).await;
+        if let Err(SingleWriteCommitError::OutcomeUnknown(_)) = &committed
+            && self.purge_is_settled(db, scope, session.as_ref()).await
+        {
+            return Ok(());
+        }
+        committed.map_err(|err| replayed_commit_error("purge", err))
+    }
+
+    /// Whether nothing of `scope` is left to remove, read with
+    /// `readConcern: majority` that waits for the majority to reach the failed
+    /// commit, as [`Self::written_version_is_stored`] does for a version (#2146).
+    /// That is the proof a purge committed: before it the documents were there, and
+    /// a read that is causally after the commit finds them again only if the commit
+    /// applied nothing. It looks at the four collections the purge deletes from and
+    /// at the change rows that still hold a prior body
+    /// ([`PurgeScope::settled_documents`], each served by an index).
+    ///
+    /// It does not look at the sync-failure ledger: no index serves a probe of it,
+    /// so that would be a scan of the whole ledger. A purge that had only a sync
+    /// failure to remove therefore settles as committed even if its commit never
+    /// applied; a repeated purge removes it.
+    ///
+    /// `false` means unknown, not "not committed": a read that finds a document,
+    /// one that waited out its bound (code 50) and one that failed prove nothing
+    /// about the commit. A purge whose commit applied while an `$reindex` page
+    /// wrote rows for it after the transaction's snapshot also reads `false`, which
+    /// only costs a retryable answer: a repeated purge removes them.
+    async fn purge_is_settled(
+        &self,
+        db: &mongodb::Database,
+        scope: &PurgeScope<'_>,
+        failed: Option<&ClientSession>,
+    ) -> bool {
+        let max_time = settle_read_max_time(self.config().settle_read_max_time_ms);
+        let left = async {
+            let mut settling = settling_session(db.client(), failed).await?;
+            for (collection, filter) in scope.settled_documents() {
+                let found = db
+                    .collection::<Document>(collection)
+                    .find_one(filter)
+                    .projection(doc! { "_id": 1_i32 })
+                    .read_concern(mongodb::options::ReadConcern::majority())
+                    .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                        mongodb::options::ReadPreference::PrimaryPreferred { options: None },
+                    ))
+                    .max_time(max_time)
+                    .session(&mut settling)
+                    .await?;
+                if found.is_some() {
+                    return Ok::<_, MongoError>(Some(collection));
+                }
+            }
+            Ok(None)
+        }
+        .await;
+        match left {
+            Ok(None) => {
+                tracing::info!(
+                    tenant = %scope.tenant_id,
+                    resource_type = %scope.resource_type,
+                    id = scope.lone_id(),
+                    "mongodb purge commit outcome resolved by a read: nothing is left; \
+                     answering as committed"
+                );
+                true
+            }
+            Ok(Some(collection)) => {
+                tracing::warn!(
+                    tenant = %scope.tenant_id,
+                    resource_type = %scope.resource_type,
+                    id = scope.lone_id(),
+                    collection,
+                    "mongodb purge commit outcome still unknown: the collection still holds a \
+                     document of the purge"
+                );
+                false
+            }
+            Err(e) if driver_error_code(&e) == Some(MAX_TIME_MS_EXPIRED_CODE) => {
+                tracing::warn!(
+                    tenant = %scope.tenant_id,
+                    resource_type = %scope.resource_type,
+                    id = scope.lone_id(),
+                    "mongodb purge commit outcome still unknown: the majority did not reach the \
+                     commit within {max_time:?}"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %scope.tenant_id,
+                    resource_type = %scope.resource_type,
+                    id = scope.lone_id(),
+                    error = %e,
+                    "mongodb purge commit outcome still unknown: the settling read failed"
+                );
+                false
+            }
+        }
+    }
+
+    /// The six writes of a purge, in this order, through `session` when there is
+    /// one; returns what they changed ([`PurgeChanges`]).
+    ///
+    /// `resources` goes first, in a transaction and in a sessionless run alike, for
+    /// the `$reindex` page's protocol described above `impl PurgableStorage`. Then
+    /// the history, the rows of both row collections, the prior bodies of the
+    /// bulk-submit change log (blanked, so no content survives the purge, #2279;
+    /// the change row stays so submission counters remain coherent), and, for a
+    /// purge of one resource, the sync failures ([`PurgeScope::removes_sync_failures`]).
+    ///
+    /// The protocol does not cover a bulk-submit batch. It checks its manifest, not
+    /// the resources it wrote, so a batch that writes the same id while it is
+    /// purged can leave rows behind a purge that answered `Ok`.
+    async fn purge_writes(
+        &self,
+        db: &mongodb::Database,
+        scope: &PurgeScope<'_>,
+        session: &mut Option<ClientSession>,
+    ) -> StorageResult<PurgeChanges> {
+        let in_session = session.is_some();
+        let mut changes = PurgeChanges::default();
 
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        changes.resources = purge_delete_many(&resources, scope.resources_filter(), session)
+            .await
+            .map_err(|e| purge_error(in_session, "Failed to purge resource", e))?;
+        changes.add(changes.resources);
+
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        changes.add(
+            purge_delete_many(&history, scope.resources_filter(), session)
+                .await
+                .map_err(|e| purge_error(in_session, "Failed to purge resource history", e))?,
+        );
+
+        // The search_index collection keys the resource as `resource_id`.
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let search_index_contained =
-            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        changes.add(
+            purge_delete_many(&search_index, scope.rows_filter(), session)
+                .await
+                .map_err(|e| purge_error(in_session, "Failed to purge search index", e))?,
+        );
 
+        // Contained rows share the container's (tenant_id, resource_type,
+        // resource_id), so they key the same way.
+        let contained = db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
+        changes.add(
+            purge_delete_many(&contained, scope.rows_filter(), session)
+                .await
+                .map_err(|e| {
+                    purge_error(in_session, "Failed to purge contained search index", e)
+                })?,
+        );
+
+        let change_log = db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION);
+        let blank = doc! { "$set": { "previous_content": Bson::Null } };
+        let blanked = match session.as_mut() {
+            Some(session) => {
+                change_log
+                    .update_many(scope.rows_filter(), blank)
+                    .session(session)
+                    .await
+            }
+            None => change_log.update_many(scope.rows_filter(), blank).await,
+        }
+        .map_err(|e| {
+            purge_error(
+                in_session,
+                "Failed to clear bulk submission previous content",
+                e,
+            )
+        })?;
+        changes.add(blanked.modified_count);
+
+        if scope.removes_sync_failures() {
+            let failures =
+                db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION);
+            changes.add(
+                purge_delete_many(&failures, scope.sync_failures_filter(), session)
+                    .await
+                    .map_err(|e| purge_error(in_session, "Failed to purge sync failures", e))?,
+            );
+        }
+
+        Ok(changes)
+    }
+
+    /// A purge of `scope` without a transaction: the six writes, one command at a
+    /// time, in the order of [`Self::purge_writes`], and for a purge of one
+    /// resource `NotFound` when they changed nothing. It is not atomic: a crash or a
+    /// failed command between two of them leaves what the later ones would have
+    /// removed, and a repeated purge finishes it, because it is only `NotFound` when
+    /// nothing at all was left. It is the whole of a purge on a standalone server,
+    /// and the fallback of one whose transaction is too large (388), was rolled
+    /// back under cache pressure twice, or whose resource has too many versions.
+    /// Nothing is counted first: it needs no guard, since a command that outlives
+    /// the request timeout still made progress.
+    async fn purge_without_transaction(
+        &self,
+        scope: &PurgeScope<'_>,
+    ) -> StorageResult<PurgeChanges> {
+        let db = self.get_database().await?;
+        let mut no_session = None;
+        let changes = self.purge_writes(&db, scope, &mut no_session).await?;
+        if let Some(id) = scope.single_id()
+            && changes.is_empty()
+        {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: scope.resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+        Ok(changes)
+    }
+
+    /// Removes the rows of a purged resource once more, sessionless, after the
+    /// purge committed (#2146).
+    ///
+    /// The transaction read one snapshot, so its deletes of the rows did not see
+    /// a row a `$reindex` page inserted after that snapshot. Such a page ends
+    /// with a read of `resources` (`resource_states`, `reindex_pipeline.rs`); if
+    /// that read ran before the commit it found the resource and kept its rows,
+    /// and the rows were inserted before the read, so they are there when this
+    /// runs after the commit. A page whose read ran after the commit finds the
+    /// resource gone and removes its own rows. The sessionless purge got the same
+    /// result from its order: its row deletes ran after its `resources` delete.
+    /// This does not cover a bulk-submit batch, which does not read the resource.
+    ///
+    /// Between the commit and this, a client can create the same id again, and the
+    /// delete would take the new resource's rows. So the primary is asked first
+    /// (`primary_selection`, read concern `local`, as the other "is it gone" reads
+    /// are), and the sweep is skipped when the resource exists. That narrows the
+    /// window to the time between that read and the delete; it does not close it.
+    ///
+    /// The purge has committed, so a failure here is not the purge's: it logs one
+    /// WARN naming the tenant, the type and the id, and the purge answers `Ok`. That
+    /// includes a failed read, which skips the sweep. A repeated purge finds any row
+    /// left and removes it.
+    async fn sweep_purged_rows(&self, scope: &PurgeScope<'_>) {
+        let swept = async {
+            let db = self.get_database().await?;
+            let exists_again = db
+                .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+                .find_one(scope.resources_filter())
+                .projection(doc! { "_id": 1_i32 })
+                .selection_criteria(super::bulk_submit::primary_selection())
+                .read_concern(mongodb::options::ReadConcern::local())
+                .await
+                .map_err(|e| {
+                    purge_error(false, "Failed to check that the purged resource is gone", e)
+                })?;
+            if exists_again.is_some() {
+                tracing::debug!(
+                    tenant = %scope.tenant_id,
+                    resource_type = %scope.resource_type,
+                    id = scope.lone_id(),
+                    "mongodb purge: the resource exists again; not removing its rows"
+                );
+                return Ok(());
+            }
+            for collection in [
+                MongoBackend::SEARCH_INDEX_COLLECTION,
+                MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+            ] {
+                purge_delete_many(
+                    &db.collection::<Document>(collection),
+                    scope.rows_filter(),
+                    &mut None,
+                )
+                .await
+                .map_err(|e| purge_error(false, "Failed to sweep the purged search rows", e))?;
+            }
+            Ok::<(), StorageError>(())
+        }
+        .await;
+        if let Err(err) = swept {
+            tracing::warn!(
+                tenant = %scope.tenant_id,
+                resource_type = %scope.resource_type,
+                id = scope.lone_id(),
+                "mongodb purge committed, but removing its search rows once more failed; a \
+                 repeated purge removes any row left: {err}"
+            );
+        }
+    }
+
+    /// Reads up to `limit` ids of the resources of `resource_type` in `tenant_id`
+    /// from `resources`, in `id` order, for a `purge_all` batch (#2146). The read
+    /// is hinted to the identity index, which serves the filter and the order with
+    /// no sort, as `purge_tenant_data`'s delete is. It reads the primary with read
+    /// concern `local`: with a URI-level `readConcernLevel=majority` it could
+    /// otherwise return the ids of the batch that just committed, and trip the
+    /// no-progress guard. Sessionless: the batch's transaction takes its own
+    /// snapshot, and an id removed in between is simply not removed again.
+    async fn next_purge_ids(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let cursor = resources
+            .find(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .projection(doc! { "_id": 0_i32, "id": 1_i32 })
+            .sort(doc! { "id": 1_i32 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+            .selection_criteria(super::bulk_submit::primary_selection())
+            .read_concern(mongodb::options::ReadConcern::local())
+            .await
+            .map_err(|e| read_driver_error("Failed to read the resources to purge", e))?;
+        collect_documents(cursor)
+            .await?
+            .iter()
+            .map(|document| {
+                document
+                    .get_str("id")
+                    .map(str::to_string)
+                    .map_err(|e| internal_error(format!("A resource to purge has no id: {e}")))
+            })
+            .collect()
+    }
+
+    /// The type-wide deletes of `purge_all`, sessionless, in the order of
+    /// [`Self::purge_writes`] (#2146): `resources` first, then `resource_history`,
+    /// `search_index`, `search_index_contained`, the bulk-submit prior bodies and
+    /// the sync failures. They are the whole of a `purge_all` on a standalone
+    /// server, and the sweep after the batches otherwise. The sweep removes what no
+    /// batch named: a `resources` document of an id the batches did not read (one
+    /// created after the last read, which is then purged whole), the history, the
+    /// rows and the prior bodies of an id that is no longer in `resources`, and the
+    /// sync failures of the whole type, which no batch deletes. Returns how many
+    /// `resources` documents it counted before removing them: the figure is
+    /// "resources purged", not "versions purged".
+    async fn purge_type_wide(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
         let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
-
-        // Counted before the delete, and counted over `resources` rather than
-        // `resource_history`, so the returned figure is "resources purged", not
-        // "versions purged".
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let count = resources
             .count_documents(key.clone())
             .await
             .or_query_error("Failed to count resources")?;
-
         resources
             .delete_many(key.clone())
             .await
             .or_query_error("Failed to purge resources")?;
-        history
-            .delete_many(key)
+        db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
+            .delete_many(key.clone())
             .await
             .or_query_error("Failed to purge resource history")?;
-        search_index
-            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+        db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
+            .delete_many(key.clone())
             .await
             .or_query_error("Failed to purge search index")?;
         // Contained rows share the container's (tenant_id, resource_type),
         // so a type-level purge keys the same way (#1160 Task 4).
-        search_index_contained
-            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+        db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(key.clone())
             .await
             .or_query_error("Failed to purge contained search index")?;
         db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
-            .update_many(
-                doc! { "tenant_id": tenant_id, "resource_type": resource_type },
-                doc! { "$set": { "previous_content": Bson::Null } },
-            )
+            .update_many(key, doc! { "$set": { "previous_content": Bson::Null } })
             .await
             .or_query_error("Failed to clear bulk submission previous content")?;
         db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
             .delete_many(doc! { "_id.tenant_id": tenant_id, "_id.resource_type": resource_type })
             .await
             .or_query_error("Failed to purge sync failures")?;
-
         Ok(count)
     }
 }
@@ -13370,6 +14569,362 @@ mod transient_abort_tests {
         assert_eq!(ReplayedStep::ResourceInsert.name(), "resource_insert");
         assert_eq!(ReplayedStep::HistoryInsert.name(), "history_insert");
         assert_eq!(ReplayedStep::Commit.name(), "commit");
+        assert_eq!(ReplayedStep::Purge.name(), "purge");
+    }
+
+    /// #2146: a failed command of a purge keeps its message in both spellings.
+    /// Inside a transaction it keeps the driver error and the
+    /// [`ReplayedStep::Purge`] mark, so [`replay_aborted_writes`] can run the
+    /// purge again after a `WriteConflict` (a constructed driver error has no
+    /// label, so the replay decision itself is the pure table above) and an
+    /// eviction rollback is still told apart. Without one it is classified like
+    /// every sessionless command and carries no mark.
+    #[test]
+    fn a_failed_purge_command_is_marked_in_a_transaction_and_classified_without_one() {
+        let conflict = || command_error(WRITE_CONFLICT_CODE, "WriteConflict");
+        let in_transaction = purge_error(true, "Failed to purge search index", conflict());
+        assert_eq!(replayed_step(&in_transaction), Some(ReplayedStep::Purge));
+        assert_eq!(
+            kept_driver_error(&in_transaction).and_then(driver_error_code),
+            Some(WRITE_CONFLICT_CODE)
+        );
+        assert_eq!(
+            in_transaction.to_string(),
+            internal_driver_error("Failed to purge search index", conflict()).to_string()
+        );
+        // Marked, the abort is still aborted: only a commit that was sent is not.
+        assert!(aborts_failed_write(&in_transaction));
+        // So is a `NotFound` that a purge's changeless writes ended with: the
+        // transaction is aborted before the next attempt or the answer.
+        assert!(aborts_failed_write(&StorageError::Resource(
+            ResourceError::NotFound {
+                resource_type: "Patient".to_string(),
+                id: "1".to_string(),
+            }
+        )));
+
+        let eviction = purge_error(
+            true,
+            "Failed to purge resource",
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        );
+        assert!(rolled_back_for_eviction(&eviction).is_some());
+
+        let too_large = purge_error(
+            true,
+            "Failed to purge resource",
+            command_error(
+                TRANSACTION_TOO_LARGE_FOR_CACHE_CODE,
+                "TransactionTooLargeForCache",
+            ),
+        );
+        assert!(
+            is_too_large_for_cache_failure(&too_large),
+            "the fallback finds the 388 through the mark"
+        );
+
+        let sessionless = purge_error(false, "Failed to purge search index", conflict());
+        assert_eq!(replayed_step(&sessionless), None);
+        let StorageError::Backend(BackendError::Internal { message, .. }) = &sessionless else {
+            panic!("expected Internal, got {sessionless:?}");
+        };
+        assert!(
+            message.starts_with("Failed to purge search index: "),
+            "{message}"
+        );
+    }
+
+    /// #2146: a purge of one resource matches its id exactly and one of a batch
+    /// matches them with `$in`, in the filters of every collection, and only the
+    /// purge of one resource answers `NotFound` when its writes change nothing.
+    #[test]
+    fn a_purge_scope_matches_one_id_or_a_batch_of_them() {
+        let one = PurgeScope::one("t", "Patient", "p1");
+        assert_eq!(
+            one.resources_filter(),
+            doc! { "tenant_id": "t", "resource_type": "Patient", "id": "p1" }
+        );
+        assert_eq!(
+            one.rows_filter(),
+            doc! { "tenant_id": "t", "resource_type": "Patient", "resource_id": "p1" }
+        );
+        assert_eq!(
+            one.sync_failures_filter(),
+            doc! {
+                "_id.tenant_id": "t",
+                "_id.resource_type": "Patient",
+                "_id.resource_id": "p1",
+            }
+        );
+        assert_eq!(one.single_id(), Some("p1"));
+        assert_eq!(one.lone_id(), Some("p1"));
+
+        let ids = vec!["p1".to_string(), "p2".to_string()];
+        let batch = PurgeScope::batch("t", "Patient", &ids);
+        assert_eq!(
+            batch.resources_filter(),
+            doc! {
+                "tenant_id": "t",
+                "resource_type": "Patient",
+                "id": { "$in": ["p1", "p2"] },
+            }
+        );
+        assert_eq!(
+            batch.rows_filter(),
+            doc! {
+                "tenant_id": "t",
+                "resource_type": "Patient",
+                "resource_id": { "$in": ["p1", "p2"] },
+            }
+        );
+        assert_eq!(
+            batch.sync_failures_filter(),
+            doc! {
+                "_id.tenant_id": "t",
+                "_id.resource_type": "Patient",
+                "_id.resource_id": { "$in": ["p1", "p2"] },
+            }
+        );
+        assert_eq!(batch.single_id(), None, "a batch answers no NotFound");
+        assert_eq!(batch.lone_id(), None);
+        assert!(batch.is_batch_of_many());
+        let lone = vec!["p9".to_string()];
+        let lone = PurgeScope::batch("t", "Patient", &lone);
+        assert_eq!(lone.single_id(), None);
+        assert_eq!(lone.lone_id(), Some("p9"));
+        assert!(!lone.is_batch_of_many(), "a lone id cannot be halved");
+        assert!(!one.is_batch_of_many());
+
+        // Only a purge of one resource deletes the sync failures in its
+        // transaction: the delete scans the ledger, so a batch leaves it to the
+        // sweep that follows the batches.
+        assert!(one.removes_sync_failures());
+        assert!(!batch.removes_sync_failures());
+        assert!(!lone.removes_sync_failures());
+
+        // The settling read's change-row probe asks for a prior body.
+        assert_eq!(
+            one.changes_with_body_filter(),
+            doc! {
+                "tenant_id": "t",
+                "resource_type": "Patient",
+                "resource_id": "p1",
+                "previous_content": { "$ne": Bson::Null },
+            }
+        );
+    }
+
+    /// #2146: no filter of a purge, of one id or of a batch, can match another
+    /// tenant or another type: every one carries `tenant_id` and `resource_type`
+    /// (as `_id.tenant_id` and `_id.resource_type` in the sync-failure ledger),
+    /// as plain strings, and each collection a settling read looks at is paired
+    /// with the field that keys it. That covers every filter the purge builds: the
+    /// deletes, the version count, the read of whether the resource exists again,
+    /// the blanking of prior bodies, the sync-failure delete and the settling
+    /// read's probes, the change-row probe included.
+    #[test]
+    fn every_purge_filter_names_the_tenant_and_the_type() {
+        let ids = vec!["p1".to_string(), "p2".to_string()];
+        for scope in [
+            PurgeScope::one("tenant-a", "Patient", "p1"),
+            PurgeScope::batch("tenant-a", "Patient", &ids),
+        ] {
+            let mut filters = vec![scope.sync_failures_filter()];
+            for (collection, filter) in scope.settled_documents() {
+                filters.push(filter.clone());
+                let id_field = if collection == MongoBackend::RESOURCES_COLLECTION
+                    || collection == MongoBackend::RESOURCE_HISTORY_COLLECTION
+                {
+                    "id"
+                } else {
+                    "resource_id"
+                };
+                assert!(filter.contains_key(id_field), "{collection}: {filter:?}");
+            }
+            filters.push(scope.resources_filter());
+            filters.push(scope.rows_filter());
+            filters.push(scope.changes_with_body_filter());
+            for filter in filters {
+                let (tenant_field, type_field) = if filter.contains_key("_id.tenant_id") {
+                    ("_id.tenant_id", "_id.resource_type")
+                } else {
+                    ("tenant_id", "resource_type")
+                };
+                assert_eq!(filter.get_str(tenant_field), Ok("tenant-a"), "{filter:?}");
+                assert_eq!(filter.get_str(type_field), Ok("Patient"), "{filter:?}");
+            }
+        }
+        let collections: Vec<&str> = PurgeScope::one("t", "Patient", "p1")
+            .settled_documents()
+            .iter()
+            .map(|(collection, _)| *collection)
+            .collect();
+        assert_eq!(
+            collections,
+            [
+                "resources",
+                "resource_history",
+                "search_index",
+                "search_index_contained",
+                "bulk_submission_changes"
+            ],
+            "the sync-failure ledger is not probed: no index serves it"
+        );
+    }
+
+    /// #2146: a `purge_all` batch size doubles, up to the most one transaction
+    /// takes, so one heavy resource does not leave the rest of the type to be
+    /// purged one id at a time.
+    #[test]
+    fn a_purge_all_batch_grows_back_after_a_halving() {
+        assert_eq!(grown_purge_batch(1), 2);
+        assert_eq!(grown_purge_batch(125), 250);
+        assert_eq!(grown_purge_batch(250), PURGE_ALL_BATCH_IDS);
+        assert_eq!(grown_purge_batch(PURGE_ALL_BATCH_IDS), PURGE_ALL_BATCH_IDS);
+        assert_eq!(grown_purge_batch(usize::MAX), PURGE_ALL_BATCH_IDS);
+
+        let mut len = 1;
+        let mut doublings = 0;
+        while len < PURGE_ALL_BATCH_IDS {
+            len = grown_purge_batch(len);
+            doublings += 1;
+        }
+        assert_eq!(doublings, 9, "1, 2, 4, 8, 16, 32, 64, 128, 256, 500");
+    }
+
+    /// #2146: the size doubles only after [`PURGE_ALL_GROW_AFTER`] batches in a
+    /// row were purged at the current size, and any refusal starts the count
+    /// again, so a type whose batches overflow the cache by their total size does
+    /// not alternate between a batch that commits and one that is rolled back.
+    #[test]
+    fn a_purge_all_batch_grows_only_after_four_good_batches_in_a_row() {
+        assert_eq!(PURGE_ALL_GROW_AFTER, 4);
+        let mut size = PurgeBatchSize::new();
+        assert_eq!(size.len(), PURGE_ALL_BATCH_IDS);
+        assert_eq!(size.refused(PURGE_ALL_BATCH_IDS), Some(250));
+        assert_eq!(size.refused(250), Some(125));
+        assert_eq!(size.len(), 125);
+
+        for _ in 0..3 {
+            size.purged();
+            assert_eq!(size.len(), 125, "three in a row are not enough");
+        }
+        size.purged();
+        assert_eq!(size.len(), 250, "the fourth doubles it");
+        for _ in 0..4 {
+            size.purged();
+        }
+        assert_eq!(size.len(), PURGE_ALL_BATCH_IDS, "up to the cap");
+        for _ in 0..8 {
+            size.purged();
+        }
+        assert_eq!(size.len(), PURGE_ALL_BATCH_IDS, "and no further");
+
+        // A refusal in the middle of a run starts it again: three good batches,
+        // a refusal, and three more are still not four in a row.
+        let mut size = PurgeBatchSize::new();
+        assert_eq!(size.refused(PURGE_ALL_BATCH_IDS), Some(250));
+        for _ in 0..3 {
+            size.purged();
+        }
+        assert_eq!(size.refused(250), Some(125));
+        for _ in 0..3 {
+            size.purged();
+        }
+        assert_eq!(size.len(), 125);
+        size.purged();
+        assert_eq!(size.len(), 250);
+
+        // A lone id cannot be halved, and its refusal still ends the run.
+        let mut size = PurgeBatchSize::new();
+        assert_eq!(size.refused(2), Some(1));
+        for _ in 0..3 {
+            size.purged();
+        }
+        assert_eq!(size.refused(1), None);
+        assert_eq!(size.len(), 1, "the size is left as it is");
+        for _ in 0..3 {
+            size.purged();
+        }
+        assert_eq!(size.len(), 1);
+        size.purged();
+        assert_eq!(size.len(), 2);
+    }
+
+    /// #2146: a purge of one resource answers `NotFound` when its writes changed
+    /// nothing, and counts every kind of change: the four deletes, a blanked prior
+    /// body and a removed sync failure. A resource that only has a sync failure,
+    /// or only a prior body, left is therefore still purged.
+    #[test]
+    fn a_purge_that_changed_nothing_is_empty_and_any_change_counts() {
+        let mut changes = PurgeChanges::default();
+        assert!(changes.is_empty());
+        // Any one write's change alone, a blanked body or a sync failure included,
+        // is enough to keep the answer from being `NotFound`.
+        let mut one = PurgeChanges::default();
+        one.add(1);
+        assert!(!one.is_empty());
+        changes.add(0);
+        assert!(changes.is_empty());
+        changes.add(2);
+        changes.add(3);
+        assert_eq!(changes.total, 5);
+        assert_eq!(changes.resources, 0, "the resources count is its own");
+        changes.add(u64::MAX);
+        assert_eq!(changes.total, u64::MAX, "the sum saturates");
+    }
+
+    /// #2146: what a refusal says in the log: the version count only for the
+    /// refusal that is about it.
+    #[test]
+    fn a_purge_refusal_names_its_cause_and_the_version_count_only_for_the_limit() {
+        let versions = PurgeRefusal::TooManyVersions {
+            versions: 12,
+            limit: 10,
+        };
+        assert_eq!(versions.versions(), Some(12));
+        assert_eq!(
+            versions.to_string(),
+            "12 versions are more than purge_transaction_max_versions (10)"
+        );
+        let too_large = PurgeRefusal::TooLargeForCache(internal_error("388".to_string()));
+        assert_eq!(too_large.versions(), None);
+        assert!(too_large.to_string().contains("too large for the cache"));
+        let pressure = PurgeRefusal::CachePressure(internal_error("365".to_string()));
+        assert_eq!(pressure.versions(), None);
+        assert!(pressure.to_string().contains("cache pressure"));
+    }
+
+    /// #2146: a `purge_all` batch that does not fit a transaction is halved until
+    /// it is one id, and a lone id is left to the purge without a transaction.
+    #[test]
+    fn a_purge_all_batch_that_is_too_large_is_halved_down_to_one_id() {
+        assert_eq!(smaller_purge_batch(PURGE_ALL_BATCH_IDS), Some(250));
+        assert_eq!(smaller_purge_batch(3), Some(1));
+        assert_eq!(smaller_purge_batch(2), Some(1));
+        assert_eq!(smaller_purge_batch(1), None);
+        assert_eq!(smaller_purge_batch(0), None);
+
+        let mut len = PURGE_ALL_BATCH_IDS;
+        let mut halvings = 0;
+        while let Some(next) = smaller_purge_batch(len) {
+            assert!(next < len && next >= 1);
+            len = next;
+            halvings += 1;
+        }
+        assert_eq!(len, 1);
+        assert_eq!(halvings, 8, "500, 250, 125, 62, 31, 15, 7, 3, 1");
+    }
+
+    /// #2146: `purge_all` stops with an error only when the last batch committed
+    /// and removed no `resources` document and the next read starts at the same
+    /// id; a batch that removed something, or a read that starts elsewhere, goes
+    /// on.
+    #[test]
+    fn purge_all_stops_only_when_an_empty_batch_is_read_again() {
+        assert!(purge_all_is_stalled(Some("p-0001"), "p-0001"));
+        assert!(!purge_all_is_stalled(Some("p-0001"), "p-0002"));
+        assert!(!purge_all_is_stalled(None, "p-0001"));
     }
 
     /// #2401: a create, a restore, an update and a delete map a commit that did

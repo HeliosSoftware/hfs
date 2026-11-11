@@ -1517,6 +1517,12 @@ mod write_abort_retry;
 #[path = "mongodb/read_errors.rs"]
 mod read_errors;
 
+/// #2146: `purge` is one transaction where the deployment has them, a repeated
+/// `purge` finishes a half-done one, and `purge_all` removes a type in batches of
+/// ids, one transaction per batch.
+#[path = "mongodb/purge.rs"]
+mod purge;
+
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
 /// their turn. #1806: the gate's room is counted in entries, so small Bundles
 /// share a slot and large ones take more than one.

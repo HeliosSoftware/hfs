@@ -1053,6 +1053,77 @@ set or a sharded cluster. These are the answers for its failures:
   as before and reports none of its entries' write events, but a Bundle with a SearchParameter
   entry reloads the SearchParameter cache. Its commit re-sends stop at the Bundle's deadline
   (`bundle_transaction_deadline`, see the caveats below).
+- **A `$purge` of one resource** (`DELETE /{type}/{id}/$purge`, #2146) is one transaction on a
+  replica set or a sharded cluster. It counts the resource's versions, deletes from `resources`,
+  `resource_history`, `search_index` and `search_index_contained`, blanks the resource's prior
+  bodies in the bulk-submit change log and deletes its sync failures. These commit together, or
+  none of them applies. It gets the answers above, except that a `WriteConflict` on any of its
+  documents is run again too, because a purge means the same after the other writer commits: 4
+  attempts with pauses of 100, 200 and 400 ms, then `503` with `Retry-After`. A rollback for
+  eviction under cache pressure never answers `503`: it gets one more transactional try after
+  100 ms, and a second one runs the purge without a transaction (below). A commit that stays
+  unknown is settled by a read of what the
+  purge removed, with the same causal `majority` read. When nothing of the resource is left in
+  the four collections and no change row of it still holds a prior body, it is answered as
+  committed. Otherwise the answer is the `500` that says to check before retrying. The read does
+  not look at the sync-failure ledger, because no index serves a probe of it, so a purge that
+  had only a sync failure to remove settles as committed.
+
+  The purge answers `404` only when its writes changed nothing: no document of the resource in
+  any of the four collections, no prior body to blank and no sync failure. A repeated purge
+  therefore finishes a half-done one, also one that an earlier version left, and a resource
+  whose history is all that is left no longer blocks creating its id again after such a purge.
+
+  The transaction reads one snapshot, so after the commit the purge removes the resource's
+  search rows once more, in case a `$reindex` page wrote some after that snapshot. It skips
+  that when the primary shows the resource again, because another client created the id in the
+  meantime. That narrows the window to the time between the read and the delete; it does not
+  close it. A failure of the sweep is logged at `warn` and does not fail the purge. A bulk-submit
+  batch that writes the same id while it is purged is not covered: it checks its manifest, not
+  the resources it wrote, and can leave a history row, search rows and a prior body behind a
+  purge that answered `200`. That is older than #2146 and not closed by it.
+
+  Three cases run without a transaction, one command at a time in the same order (`resources`
+  first), as before #2146, and a `warn` line says so. The first is a resource with more versions
+  than `purge_transaction_max_versions` (default 10,000; a `MongoBackendConfig`
+  field that no `HFS_*` variable sets). The REST layer drops a request after
+  `HFS_REQUEST_TIMEOUT`, and dropping it aborts the transaction, so a long history would be
+  rolled back on every call and could never be purged. The versions are counted first, in the
+  transaction, which is aborted before it writes; the search rows are not counted. That limit
+  bounds the time of the transaction, not the cache it holds. The second is a transaction too
+  large for the cache (`TransactionTooLargeForCache`, 388), which is recognised before the
+  server's labels, so it is never replayed. The third is a transaction that the database rolls
+  back under cache pressure twice in a row, 100 ms apart: on a small cache a purge under the
+  version limit can still be too much for the cache, and the second try and this fallback are
+  what handle that. A standalone server has no transactions: the same commands run one at a
+  time, and a repeat finishes a stopped one.
+- **A `$purge` of a type** (`POST /{type}/$purge`, #2146) removes the type in batches of at most
+  500 ids, one transaction per batch. A batch is not a purge of each id: it answers no `404`,
+  does not sweep the rows again after its commit, and does not delete sync failures, because
+  that delete matches no index and would scan the whole ledger once per batch. The ids are read
+  from the primary, in `id` order. A batch of more than one id that cannot run in a transaction
+  is halved: one too large for the cache (388), one rolled back under cache pressure, and one
+  whose resources have more versions in all than `purge_transaction_max_versions`. After a
+  refusal for the cache the call pauses 25 ms before it reads again. The halving is logged at
+  `warn`, except that of the version limit, which is logged at `warn` once per call and at
+  `debug` after that. A single id that cannot goes the way a `$purge` of one resource does: a
+  rollback under cache pressure gets one more try after 100 ms, then it, a 388 and a history over
+  the limit run without a transaction. The batch size doubles only after 4 batches in a row were
+  purged at the current size, and a refusal starts that count again. After the last batch,
+  type-wide deletes remove what no batch named: the `resources` documents of an id the batches
+  did not read (a resource created after the last read, which is then purged whole), the
+  history, rows and prior bodies of an id that is no longer in `resources`, and the sync
+  failures of the whole type. A resource created while those deletes run can still be left
+  half-purged.
+
+  The call is not atomic across batches. When a batch fails, the call logs one `warn` line with
+  the number of resources it had purged and answers the batch's error. A call that is dropped
+  before it finishes, as the REST layer drops one after `HFS_REQUEST_TIMEOUT`, logs a `warn`
+  line with that number and the words "dropped before it finished". The batches before it
+  stay purged, every other resource is untouched in all collections, and the count of the failed
+  or dropped call is lost. Calling it again continues, and answers only what that call purged
+  itself. On a standalone server the call reads the first batch's ids, then finds out there are
+  no transactions, drops the ids, and runs the type-wide deletes one at a time as before #2146.
 - **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
   `Retry-After` when its connection dropped, its connection pool was cleared or it found no
   usable server. It also answers `503` when the server refused it with a code that means the node
@@ -1068,8 +1139,11 @@ set or a sharded cluster. These are the answers for its failures:
   50, ExceededTimeLimit 262) answers `504`; any other driver error answers `500`, with the driver
   error kept as its source. Since #2301 the same rules cover the other single-document reads: the
   reads a single-resource write makes outside its transaction (on a standalone server, and the
-  re-reads after a lost race), the tenant registry lookup, `delete_with_match`'s load, `$purge`'s
-  existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
+  re-reads after a lost race), the tenant registry lookup, `delete_with_match`'s load and the
+  `$reindex` walk's resource-type list and newest-resource probe. (`$purge` used to be on this
+  list with an existence check. Since #2146 it counts the resource's versions inside its
+  transaction on a replica set. A failure there that the server labels a transient abort is run
+  again like any aborted write, and any other error ends the purge at once.) The read
   is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
   that outlasts that retry reaches the client as this `503`.
 - **A failed query or purge** (searches, counts, history queries, `$purge`, the tenant purge and
@@ -1082,9 +1156,13 @@ set or a sharded cluster. These are the answers for its failures:
   retry does not always finish the job. A retried tenant purge
   (`DELETE /admin/tenants/{id}?purge=true`) finishes it only with the #2309 fix (PR #2358);
   without it the retry answers `404` once the tenant is deregistered and has no live resources.
-  An instance `$purge` that stopped after its `resources` and `resource_history` deletes answers
-  `404` to a retry, because it finds no trace of the resource, and leaves its search rows,
-  contained search rows, bulk-submit previous content and sync-failure rows behind (#2146). A
+  An instance `$purge` is one transaction on a replica set or a sharded cluster and does not stop
+  partway (see the `$purge` entries above). One that runs without a transaction, on a standalone
+  server or because its transaction was too large for the cache, was rolled back under cache
+  pressure twice, or its history too long, can still stop
+  partway, and since #2146 a retry finishes it: the purge answers `404` only when its writes
+  changed nothing, so a resource of which a row, a prior body or a sync failure is left is no
+  longer `404`. A
   transaction Bundle entry that meets one of these codes aborts the attempt, and the Bundle runs
   again as after any transient abort. A failed commit is still decided by the commit's own labels,
   so a commit whose outcome is unknown is re-sent, never replayed.
