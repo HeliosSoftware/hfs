@@ -1606,6 +1606,11 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SEED_CONFORMANCE", default_value = "true")]
     pub seed_conformance: bool,
 
+    /// Most large Bundle requests (bodies of 8 MiB or more) admitted at
+    /// once; further ones wait. 0 disables the gate.
+    #[arg(long, env = "HFS_LARGE_BUNDLE_CONCURRENCY", default_value = "2")]
+    pub large_bundle_concurrency: usize,
+
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
     pub export_sink: String,
@@ -1763,6 +1768,7 @@ impl fmt::Debug for ServerConfig {
             max_body_size,
             request_timeout,
             batch_max_concurrency,
+            large_bundle_concurrency,
             enable_cors,
             cors_origins,
             cors_methods,
@@ -1843,6 +1849,7 @@ impl fmt::Debug for ServerConfig {
             .field("max_body_size", max_body_size)
             .field("request_timeout", request_timeout)
             .field("batch_max_concurrency", batch_max_concurrency)
+            .field("large_bundle_concurrency", large_bundle_concurrency)
             .field("enable_cors", enable_cors)
             .field("cors_origins", cors_origins)
             .field("cors_methods", cors_methods)
@@ -2102,6 +2109,7 @@ impl Default for ServerConfig {
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
             seed_conformance: true,
+            large_bundle_concurrency: 2,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -2457,6 +2465,7 @@ impl ServerConfig {
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
             seed_conformance: true,
+            large_bundle_concurrency: 2,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
