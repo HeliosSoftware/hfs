@@ -146,11 +146,29 @@ pub enum Phase {
     ReindexDbWait,
     /// Time the reindex driver waited for a prefetched page (#1403).
     ReindexFetchWait,
+    /// The advisory-lock plan of a PostgreSQL reindex group (gate + keys).
+    ReindexLocks,
+    /// Resolving the current row of each resource in a PostgreSQL reindex
+    /// group: the metadata read, and the body re-read for the resources
+    /// whose fetched copy is no longer the stored one.
+    ReindexCurrent,
+    /// The tenant's authoritative search-parameter registry for a PostgreSQL
+    /// reindex group: the stored-SearchParameter fingerprint, and the overlay
+    /// read on a cache miss.
+    ReindexRegistry,
+    /// Time a bulk-submit batch waited for its turn to charge the file
+    /// watermark behind the batches before it (the stream driver's ordered
+    /// charge step, `crate::core::bulk_submit_stream`).
+    IngestChargeWait,
+    /// Time the stream driver held a parsed batch waiting for a free writer,
+    /// an id in flight, or the previous batch's locks — the parse side is
+    /// ahead of the write side.
+    IngestSlotWait,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 38] = [
+    pub const ALL: [Phase; 43] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -189,6 +207,11 @@ impl Phase {
         Phase::SubmitHeartbeatRpc,
         Phase::ReindexDbWait,
         Phase::ReindexFetchWait,
+        Phase::ReindexLocks,
+        Phase::ReindexCurrent,
+        Phase::ReindexRegistry,
+        Phase::IngestChargeWait,
+        Phase::IngestSlotWait,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -221,7 +244,10 @@ impl Phase {
             | Phase::ReindexFts
             | Phase::ReindexCommit
             | Phase::ReindexFallback
-            | Phase::ReindexDbWait => Some(Phase::ReindexPage),
+            | Phase::ReindexDbWait
+            | Phase::ReindexLocks
+            | Phase::ReindexCurrent
+            | Phase::ReindexRegistry => Some(Phase::ReindexPage),
             _ => None,
         }
     }
@@ -267,11 +293,16 @@ impl Phase {
             Phase::SubmitHeartbeatRpc => "submit_heartbeat_rpc",
             Phase::ReindexDbWait => "reindex_db_wait",
             Phase::ReindexFetchWait => "reindex_fetch_wait",
+            Phase::ReindexLocks => "reindex_locks",
+            Phase::ReindexCurrent => "reindex_current",
+            Phase::ReindexRegistry => "reindex_registry",
+            Phase::IngestChargeWait => "ingest_charge_wait",
+            Phase::IngestSlotWait => "ingest_slot_wait",
         }
     }
 }
 
-const PHASE_COUNT: usize = 38;
+const PHASE_COUNT: usize = 43;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -882,10 +913,14 @@ mod tests {
     fn reindex_db_wait_and_fetch_wait_are_wired_correctly() {
         assert_eq!(
             Phase::ALL.len(),
-            38,
-            "PHASE_COUNT and ALL must both grow to 38 (#1403)"
+            43,
+            "PHASE_COUNT and ALL must both grow to 43 (#1403, pg reindex group phases, ingest pipeline)"
         );
-        assert_eq!(PHASE_COUNT, 38);
+        assert_eq!(PHASE_COUNT, 43);
+        assert_eq!(Phase::IngestChargeWait.label(), "ingest_charge_wait");
+        assert_eq!(Phase::IngestChargeWait.nested_in(), None);
+        assert_eq!(Phase::IngestSlotWait.label(), "ingest_slot_wait");
+        assert_eq!(Phase::IngestSlotWait.nested_in(), None);
         assert_eq!(Phase::ReindexDbWait.label(), "reindex_db_wait");
         assert_eq!(Phase::ReindexDbWait.nested_in(), Some(Phase::ReindexPage));
         assert_eq!(Phase::ReindexFetchWait.label(), "reindex_fetch_wait");
@@ -896,6 +931,17 @@ mod tests {
             "appended after SubmitHeartbeatRpc, before ReindexFetchWait"
         );
         assert_eq!(Phase::ALL[37], Phase::ReindexFetchWait);
+        for (index, phase) in [
+            (38, Phase::ReindexLocks),
+            (39, Phase::ReindexCurrent),
+            (40, Phase::ReindexRegistry),
+        ] {
+            assert_eq!(Phase::ALL[index], phase);
+            assert_eq!(phase.nested_in(), Some(Phase::ReindexPage));
+        }
+        assert_eq!(Phase::ReindexLocks.label(), "reindex_locks");
+        assert_eq!(Phase::ReindexCurrent.label(), "reindex_current");
+        assert_eq!(Phase::ReindexRegistry.label(), "reindex_registry");
     }
 
     #[cfg(perf_phases)]

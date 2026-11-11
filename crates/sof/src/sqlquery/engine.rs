@@ -550,19 +550,15 @@ impl InMemorySqlEngine {
                 Authorization::Deny
             }
         };
+        // Fail closed: if the authorizer cannot be installed, run nothing.
         self.conn.authorizer(Some(read_only))?;
         let result = self.run_select(sql, bindings, max_rows);
-        // Always clear the authorizer, even if the query failed, so the
-        // engine's own setup statements are never run under it.
-        let cleared = self
+        let removed = self
             .conn
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         match refused.get() {
             Some(keyword) => Err(not_select(keyword)),
-            None => {
-                cleared?;
-                result
-            }
+            None => result.and_then(|r| removed.map(|()| r).map_err(Into::into)),
         }
     }
 

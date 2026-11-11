@@ -2723,23 +2723,24 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
             "stale until the repair"
         );
         assert!(row_counts(&backend, tenant_id, "Patient", p2.id()).await.0 > 0);
-        // The Bundle's transaction rewrote `missing_params` of both Patients
-        // (the update through `resource_update`, the delete with `[]`). The
-        // first Patient's rows are still the old ones, with no gender row, so
-        // a rows route would list it as missing a gender; only its
-        // `missing_params` excludes it, and the second Patient is deleted.
-        let p1_missing = missing_params_of(&backend, tenant_id, "Patient", p1.id()).await;
-        assert!(
-            p1_missing
-                .as_ref()
-                .is_some_and(|names| !names.iter().any(|name| name == "gender")),
-            "the update's transaction removed gender from missing_params: {p1_missing:?}"
+        // The delete's transaction wrote `missing_params: []` (a delete
+        // extracts nothing). The update's transaction extracted nothing either
+        // (#2035): it removed the old array, so the first Patient carries the
+        // marker and no `missing_params` until its batch, like a created one.
+        assert_eq!(
+            missing_params_of(&backend, tenant_id, "Patient", p1.id()).await,
+            None,
+            "the update's transaction wrote no missing_params"
         );
         assert_eq!(
             missing_params_of(&backend, tenant_id, "Patient", p2.id()).await,
             Some(Vec::<String>::new()),
             "the delete's transaction emptied missing_params"
         );
+        // The first Patient's rows are still the old ones, with no gender row,
+        // so a rows route would list it as missing a gender. It is marked and
+        // has no `missing_params`, so the metadata route leaves it out until
+        // its batch (the documented lag), and the second Patient is deleted.
         assert!(
             ids_missing(
                 &backend,
@@ -2751,7 +2752,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
             )
             .await
             .is_empty(),
-            "gender:missing=true is already right before the repair"
+            "gender:missing=true leaves the marked Patient out before the repair"
         );
         let repair = same_db_backend(&backend, "def-upd-del-repair")
             .await
@@ -2825,6 +2826,598 @@ async fn deferred_updates_and_deletes_leave_no_stale_rows() {
 #[tokio::test]
 async fn deferred_updates_and_deletes_cut_before_indexing_leave_no_stale_rows_after_the_repair() {
     updates_and_deletes_leave_no_stale_rows("def_upd_del_cut", true).await;
+}
+
+// ---------------------------------------------------------------------------
+// One extraction for a deferred update (#2035)
+// ---------------------------------------------------------------------------
+//
+// A deferred create already writes neither its rows nor its `missing_params`
+// in the transaction (#2256). An update or a restore of a deferred type does
+// the same now: its transaction skips the extraction and removes the metadata
+// the previous version carried, and the batch writes rows and metadata from one
+// extraction. What the transaction left is read by cutting the post-commit step
+// with a 1 ms deadline, as `a_deferred_bundle_leaves_its_creates_out_of_missing`
+// does for creates, and reading the `resources` document.
+//
+// There is no test of one Bundle that creates an id and then updates or deletes
+// it: the Bundle's state refuses a second write to a `Type/id` ("Transaction
+// entries overlap on resource ...", `BundleTransactionState::record`), so one
+// resource is written once per Bundle and the batch never sees two versions of
+// it from the same Bundle.
+
+/// A backend whose post-commit step the 1 ms deadline cuts, so the state a
+/// deferred Bundle commits can be read before its batch runs. The metadata
+/// route of `:missing=true` is built.
+async fn cut_backend(test: &str) -> Option<MongoBackend> {
+    let backend = deferred_backend(test, test, Some(THRESHOLD), |config| {
+        config.bundle_transaction_deadline = Some(Duration::from_millis(1));
+    })
+    .await?;
+    assert!(
+        matches!(
+            backend.wait_for_missing_index_build().await,
+            Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
+        ),
+        "idx_resources_missing_params is built"
+    );
+    Some(backend)
+}
+
+/// A Patient with a gender and a family, and no identifier.
+fn old_patient() -> Value {
+    json!({
+        "resourceType": "Patient",
+        "name": [{"family": "Old"}],
+        "gender": "female",
+    })
+}
+
+/// A Patient no Bundle touches: it has a gender, an identifier and a family.
+fn control_patient() -> Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": MRN_SYSTEM, "value": "MRN-CONTROL"}],
+        "name": [{"family": "Control"}],
+        "gender": "male",
+    })
+}
+
+/// What an update gives [`old_patient`]: an identifier is present that was
+/// missing, a gender is missing that was present, and the family changes.
+fn updated_patient(id: Option<&str>) -> Value {
+    let mut patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": MRN_SYSTEM, "value": "MRN-ONCE"}],
+        "name": [{"family": "New"}],
+    });
+    if let Some(id) = id {
+        patient["id"] = json!(id);
+    }
+    patient
+}
+
+fn put_patient(id: &str, content: Value) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Put,
+        url: format!("Patient/{id}"),
+        resource: Some(content),
+        ..Default::default()
+    }
+}
+
+/// `n` POST Observations about `Patient/<id>`: padding that brings a short
+/// Bundle up to [`THRESHOLD`], and rows the Bundle defers.
+fn observations_about(id: &str, n: usize) -> Vec<BundleEntry> {
+    (0..n)
+        .map(|k| {
+            post(
+                "Observation",
+                observation_json(&format!("Patient/{id}"), k),
+                &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            )
+        })
+        .collect()
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+fn lists(names: &[String], name: &str) -> bool {
+    names.iter().any(|listed| listed == name)
+}
+
+/// The raw `resources` document of one resource, deleted or not.
+async fn resource_document(
+    backend: &MongoBackend,
+    tenant_id: &str,
+    resource_type: &str,
+    id: &str,
+) -> Document {
+    raw_db(backend)
+        .await
+        .collection::<Document>("resources")
+        .find_one(doc! { "tenant_id": tenant_id, "resource_type": resource_type, "id": id })
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{resource_type}/{id} is stored"))
+}
+
+/// Every ref the ledger names, sorted.
+async fn ledger_refs(backend: &MongoBackend) -> Vec<String> {
+    let documents: Vec<Document> = raw_db(backend)
+        .await
+        .collection::<Document>("search_index_pending")
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut refs: Vec<String> = documents
+        .iter()
+        .flat_map(|document| {
+            document
+                .get_array("refs")
+                .expect("a ledger document has refs")
+                .iter()
+                .map(|entry| entry.as_str().expect("a ref is text").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    refs.sort();
+    refs
+}
+
+/// What a deferred Bundle's transaction leaves of a resource it wrote: the
+/// marker, and neither `missing_params` nor its fingerprint stamp. Returns the
+/// stored document for further checks.
+async fn assert_marked_without_metadata(
+    backend: &MongoBackend,
+    tenant_id: &str,
+    resource_type: &str,
+    id: &str,
+    what: &str,
+) -> Document {
+    let stored = resource_document(backend, tenant_id, resource_type, id).await;
+    assert!(
+        stored.contains_key("search_rows_pending"),
+        "{what}: {resource_type}/{id} carries the marker until its batch"
+    );
+    assert!(
+        !stored.contains_key("missing_params"),
+        "{what}: the transaction wrote no missing_params for {resource_type}/{id}"
+    );
+    assert!(
+        !stored.contains_key("missing_params_fp"),
+        "{what}: the transaction wrote no missing_params_fp for {resource_type}/{id}"
+    );
+    stored
+}
+
+/// What a batch (or the repair) leaves of a Patient with [`updated_patient`]'s
+/// content: no marker, `missing_params` of that content (no gender; an
+/// identifier and a family) and the fingerprint stamp, which is returned.
+async fn assert_updated_patient_metadata(
+    backend: &MongoBackend,
+    tenant_id: &str,
+    id: &str,
+    what: &str,
+) -> String {
+    let stored = resource_document(backend, tenant_id, "Patient", id).await;
+    assert!(
+        !stored.contains_key("search_rows_pending"),
+        "{what}: the batch cleared the marker of Patient/{id}"
+    );
+    let names = missing_params_of(backend, tenant_id, "Patient", id)
+        .await
+        .unwrap_or_else(|| panic!("{what}: the batch wrote missing_params for Patient/{id}"));
+    assert!(lists(&names, "gender"), "{what}: {names:?}");
+    assert!(!lists(&names, "identifier"), "{what}: {names:?}");
+    assert!(!lists(&names, "family"), "{what}: {names:?}");
+    missing_params_fp_of(backend, tenant_id, "Patient", id)
+        .await
+        .unwrap_or_else(|| panic!("{what}: the batch stamped Patient/{id}"))
+}
+
+/// The batch's result for `id` is what a Patient created with
+/// [`updated_patient`]'s content outside any Bundle has: the same
+/// `missing_params`, the same stamp and the same rows (a duplicate row set, or
+/// a row of other content, would differ). The twin goes to a tenant of its own.
+async fn assert_matches_an_inline_twin(
+    backend: &MongoBackend,
+    tenant_id: &str,
+    id: &str,
+    what: &str,
+) {
+    let twin_tenant = create_tenant("def-once-twin");
+    let twin_tenant_id = twin_tenant.tenant_id().as_str();
+    let twin = backend
+        .seed_create(
+            &twin_tenant,
+            "Patient",
+            updated_patient(None),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_params_of(backend, tenant_id, "Patient", id).await,
+        missing_params_of(backend, twin_tenant_id, "Patient", twin.id()).await,
+        "{what}: missing_params of the inline twin"
+    );
+    assert_eq!(
+        missing_params_fp_of(backend, tenant_id, "Patient", id).await,
+        missing_params_fp_of(backend, twin_tenant_id, "Patient", twin.id()).await,
+        "{what}: missing_params_fp of the inline twin"
+    );
+    let rows = normalized_fingerprints(
+        backend,
+        tenant_id,
+        &[("Patient".to_string(), id.to_string())],
+    )
+    .await;
+    assert!(!rows[0].is_empty(), "{what}: Patient/{id} has rows");
+    assert_eq!(
+        rows,
+        normalized_fingerprints(
+            backend,
+            twin_tenant_id,
+            &[("Patient".to_string(), twin.id().to_string())],
+        )
+        .await,
+        "{what}: the rows of the inline twin"
+    );
+}
+
+/// A deferred Bundle that updates an existing resource: its transaction writes
+/// no `missing_params` and no stamp, only the marker (red before #2035: it
+/// extracted and wrote both there, and the batch extracted again). The old rows
+/// stay until the batch, which writes rows and metadata for the new content from
+/// one extraction: a parameter that was present and is missing now, one that was
+/// missing and is present now, and a value that changed.
+#[tokio::test]
+async fn a_deferred_update_leaves_its_search_metadata_to_its_batch() {
+    const NAME: &str = "a_deferred_update_leaves_its_search_metadata_to_its_batch";
+    let Some(backend) = cut_backend("def_once_update").await else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-once-update");
+    let tenant_id = tenant.tenant_id().as_str();
+    let seed =
+        |content: Value| backend.seed_create(&tenant, "Patient", content, FhirVersion::default());
+    let p1 = seed(old_patient()).await.unwrap().id().to_string();
+    let p2 = seed(control_patient()).await.unwrap().id().to_string();
+
+    // Before the Bundle: the first Patient has a gender and no identifier.
+    let found = |name: &'static str, missing: bool| {
+        ids_missing(
+            &backend,
+            &tenant,
+            "Patient",
+            name,
+            SearchParamType::Token,
+            missing,
+        )
+    };
+    assert!(found("gender", true).await.is_empty());
+    assert_eq!(found("identifier", true).await, vec![p1.clone()]);
+    let rows_before = row_fingerprints(&backend, tenant_id, "Patient", &p1).await;
+    assert!(!rows_before.is_empty());
+    let control_rows = row_fingerprints(&backend, tenant_id, "Patient", &p2).await;
+    let control_missing = missing_params_of(&backend, tenant_id, "Patient", &p2).await;
+    let control_fp = missing_params_fp_of(&backend, tenant_id, "Patient", &p2)
+        .await
+        .expect("the control Patient is stamped");
+
+    let mut entries = vec![put_patient(&p1, updated_patient(Some(&p1)))];
+    entries.extend(observations_about(&p1, THRESHOLD - 1));
+    assert_eq!(entries.len(), THRESHOLD);
+    let Some(result) = process_transaction_or_skip(&backend, &tenant, entries, NAME).await else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200, "the PUT updates");
+
+    // The step was cut: this is what the transaction wrote.
+    assert_eq!(ledger_count(&backend).await, 1);
+    assert_eq!(marker_count(&backend, tenant_id).await, THRESHOLD as u64);
+    let stored = assert_marked_without_metadata(&backend, tenant_id, "Patient", &p1, NAME).await;
+    assert_eq!(stored.get_str("version_id").unwrap(), "2", "the update");
+    assert_eq!(
+        row_fingerprints(&backend, tenant_id, "Patient", &p1).await,
+        rows_before,
+        "the old rows stay until the batch"
+    );
+    assert!(
+        found("gender", true).await.is_empty(),
+        "the marked Patient is left out of :missing=true until its batch"
+    );
+    let control = resource_document(&backend, tenant_id, "Patient", &p2).await;
+    assert!(!control.contains_key("search_rows_pending"));
+    assert_eq!(
+        missing_params_of(&backend, tenant_id, "Patient", &p2).await,
+        control_missing,
+        "the control Patient keeps its metadata"
+    );
+
+    let repair = same_db_backend(&backend, "def-once-update-repair")
+        .await
+        .unwrap();
+    let report = repair_until_clear(&repair).await;
+    assert_eq!((report.cleared, report.failed), (1, 0));
+
+    assert_eq!(marker_count(&backend, tenant_id).await, 0);
+    assert_eq!(ledger_count(&backend).await, 0);
+    let fp = assert_updated_patient_metadata(&backend, tenant_id, &p1, NAME).await;
+    assert_eq!(fp, control_fp, "the batch stamps the current definitions");
+    assert_eq!(
+        found("gender", true).await,
+        vec![p1.clone()],
+        "gender was present and is missing now"
+    );
+    assert_eq!(found("gender", false).await, vec![p2.clone()]);
+    assert!(
+        found("identifier", true).await.is_empty(),
+        "identifier was missing and is present now"
+    );
+    assert_eq!(
+        found("identifier", false).await,
+        sorted(vec![p1.clone(), p2.clone()])
+    );
+    assert!(
+        patients_by_family(&backend, &tenant, "Old")
+            .await
+            .is_empty(),
+        "no row of the old content"
+    );
+    assert_eq!(
+        patients_by_family(&backend, &tenant, "New").await,
+        vec![p1.clone()]
+    );
+    assert_eq!(
+        patients_by_mrn(&backend, &tenant, "MRN-ONCE").await,
+        vec![p1.clone()]
+    );
+    assert_matches_an_inline_twin(&backend, tenant_id, &p1, NAME).await;
+    // Nothing happened to the Patient the Bundle did not name.
+    assert_eq!(
+        row_fingerprints(&backend, tenant_id, "Patient", &p2).await,
+        control_rows
+    );
+    assert_eq!(
+        missing_params_of(&backend, tenant_id, "Patient", &p2).await,
+        control_missing
+    );
+}
+
+/// A deferred Bundle's `PUT` over a deleted id restores it
+/// (`restore_resource_in_bundle_transaction`, #2145), through the same writer as
+/// an update: the restored document carries the marker and no `missing_params`
+/// (the tombstone's `[]` is removed), and the batch writes rows, metadata and
+/// the stamp for the restored content.
+#[tokio::test]
+async fn a_deferred_put_over_a_deleted_id_leaves_its_search_metadata_to_its_batch() {
+    const NAME: &str = "a_deferred_put_over_a_deleted_id_leaves_its_search_metadata_to_its_batch";
+    let Some(backend) = cut_backend("def_once_restore").await else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-once-restore");
+    let tenant_id = tenant.tenant_id().as_str();
+    let seeded = backend
+        .seed_create(&tenant, "Patient", old_patient(), FhirVersion::default())
+        .await
+        .unwrap();
+    let id = seeded.id().to_string();
+    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    assert_eq!(
+        missing_params_of(&backend, tenant_id, "Patient", &id).await,
+        Some(Vec::<String>::new()),
+        "the tombstone lists nothing as missing"
+    );
+    assert_eq!(
+        row_counts(&backend, tenant_id, "Patient", &id).await,
+        (0, 0)
+    );
+
+    let mut entries = vec![put_patient(&id, updated_patient(Some(&id)))];
+    entries.extend(observations_about(&id, THRESHOLD - 1));
+    assert_eq!(entries.len(), THRESHOLD);
+    let Some(result) = process_transaction_or_skip(&backend, &tenant, entries, NAME).await else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201, "the PUT restores");
+
+    assert_eq!(ledger_count(&backend).await, 1);
+    let stored = assert_marked_without_metadata(&backend, tenant_id, "Patient", &id, NAME).await;
+    assert!(!stored.get_bool("is_deleted").unwrap(), "restored");
+    assert_eq!(
+        stored.get_str("version_id").unwrap(),
+        "3",
+        "create 1, delete 2, restore 3"
+    );
+    assert_eq!(
+        row_counts(&backend, tenant_id, "Patient", &id).await,
+        (0, 0),
+        "no rows until the batch"
+    );
+
+    let repair = same_db_backend(&backend, "def-once-restore-repair")
+        .await
+        .unwrap();
+    let report = repair_until_clear(&repair).await;
+    assert_eq!((report.cleared, report.failed), (1, 0));
+
+    assert_eq!(marker_count(&backend, tenant_id).await, 0);
+    assert_updated_patient_metadata(&backend, tenant_id, &id, NAME).await;
+    assert!(
+        patients_by_family(&backend, &tenant, "Old")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        patients_by_family(&backend, &tenant, "New").await,
+        vec![id.clone()]
+    );
+    assert_eq!(
+        ids_missing(
+            &backend,
+            &tenant,
+            "Patient",
+            "gender",
+            SearchParamType::Token,
+            true
+        )
+        .await,
+        vec![id.clone()]
+    );
+    assert_matches_an_inline_twin(&backend, tenant_id, &id, NAME).await;
+}
+
+/// Unchanged: a Bundle below the threshold extracts in its transaction, so an
+/// update writes `missing_params`, the stamp and the new rows there; it commits
+/// alone (no batch, no ledger, no marker).
+#[tokio::test]
+async fn an_update_in_a_bundle_below_the_threshold_writes_its_metadata_in_the_transaction() {
+    const NAME: &str =
+        "an_update_in_a_bundle_below_the_threshold_writes_its_metadata_in_the_transaction";
+    let Some(backend) =
+        deferred_backend("def_once_below", "def-once-below", Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-once-below");
+    let tenant_id = tenant.tenant_id().as_str();
+    let p1 = backend
+        .seed_create(&tenant, "Patient", old_patient(), FhirVersion::default())
+        .await
+        .unwrap()
+        .id()
+        .to_string();
+    let oplog = Oplog::begin(&backend).await;
+
+    let mut entries = vec![put_patient(&p1, updated_patient(Some(&p1)))];
+    entries.extend(observations_about(&p1, THRESHOLD - 2));
+    assert_eq!(entries.len(), THRESHOLD - 1, "below the threshold");
+    let Some(_) = process_transaction_or_skip(&backend, &tenant, entries, NAME).await else {
+        return;
+    };
+
+    assert_eq!(ledger_count(&backend).await, 0, "no ledger");
+    assert_eq!(marker_count(&backend, tenant_id).await, 0, "no marker");
+    // No batch ran, so everything below was written by the Bundle's transaction.
+    assert_updated_patient_metadata(&backend, tenant_id, &p1, NAME).await;
+    assert!(
+        patients_by_family(&backend, &tenant, "Old")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        patients_by_family(&backend, &tenant, "New").await,
+        vec![p1.clone()]
+    );
+    if let Some(oplog) = &oplog {
+        let db = backend.config().database_name.clone();
+        let txns = oplog.committed(&backend).await;
+        assert_eq!(txns.len(), 1, "one transaction: the Bundle's, no batches");
+        let ops = bundle_txn_updating_resources(&txns, &db);
+        assert!(count_ops(ops, &db, "search_index", "i") > 0);
+        assert_eq!(count_ops(ops, &db, "search_index_pending", "i"), 0);
+    }
+}
+
+/// The transaction that updated `resources`: the Bundle's own, when it has no
+/// insert into `resources` (an update-only Bundle's creates are Observations).
+fn bundle_txn_updating_resources<'a>(txns: &'a [Vec<Document>], db: &str) -> &'a [Document] {
+    txns.iter()
+        .find(|ops| count_ops(ops, db, "resources", "u") > 0)
+        .expect("the oplog holds the Bundle's transaction")
+}
+
+/// Unchanged for a type the deferred Bundle keeps inline (the target of a POST
+/// with `ifNoneExist`, which is matched in the transaction through the rows):
+/// an update of such a resource extracts in the transaction, so it has
+/// `missing_params`, the stamp and its new rows, and no marker, right after the
+/// commit, while the Observations of the same Bundle are marked and have none.
+#[tokio::test]
+async fn an_update_of_an_inline_type_in_a_deferred_bundle_writes_its_metadata_in_the_transaction() {
+    const NAME: &str =
+        "an_update_of_an_inline_type_in_a_deferred_bundle_writes_its_metadata_in_the_transaction";
+    let Some(backend) = cut_backend("def_once_inline").await else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("def-once-inline");
+    let tenant_id = tenant.tenant_id().as_str();
+    let p1 = backend
+        .seed_create(&tenant, "Patient", old_patient(), FhirVersion::default())
+        .await
+        .unwrap()
+        .id()
+        .to_string();
+
+    // Patient is an `ifNoneExist` target, so the Bundle keeps it inline; the
+    // Observations are deferred.
+    let new_mrn = "MRN-INLINE-NEW";
+    let mut entries = vec![
+        put_patient(&p1, updated_patient(Some(&p1))),
+        post_if_none_exist(
+            "Patient",
+            patient_json("Inline", new_mrn),
+            &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            &format!("identifier={MRN_SYSTEM}|{new_mrn}"),
+        ),
+    ];
+    entries.extend(observations_about(&p1, THRESHOLD - 2));
+    assert_eq!(entries.len(), THRESHOLD);
+    let Some(result) = process_transaction_or_skip(&backend, &tenant, entries, NAME).await else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200, "the PUT updates");
+    assert_eq!(
+        result.entries[1].status, 201,
+        "nothing matches the criteria"
+    );
+
+    // Only the Observations were deferred.
+    let refs = ledger_refs(&backend).await;
+    assert_eq!(refs.len(), THRESHOLD - 2, "{refs:?}");
+    assert!(
+        refs.iter().all(|listed| listed.starts_with("Observation/")),
+        "{refs:?}"
+    );
+    assert_eq!(
+        marker_count(&backend, tenant_id).await,
+        (THRESHOLD - 2) as u64
+    );
+    for (resource_type, id) in refs.iter().filter_map(|listed| listed.split_once('/')) {
+        assert_marked_without_metadata(&backend, tenant_id, resource_type, id, NAME).await;
+    }
+
+    // The updated Patient was written in full by the transaction, cut or not.
+    assert_updated_patient_metadata(&backend, tenant_id, &p1, NAME).await;
+    assert!(
+        patients_by_family(&backend, &tenant, "Old")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        patients_by_family(&backend, &tenant, "New").await,
+        vec![p1.clone()],
+        "the new rows are there before any batch"
+    );
+    let created = patients_by_mrn(&backend, &tenant, new_mrn).await;
+    assert_eq!(created.len(), 1);
+    assert!(
+        missing_params_of(&backend, tenant_id, "Patient", &created[0])
+            .await
+            .is_some(),
+        "the inline create has its missing_params"
+    );
 }
 
 // ---------------------------------------------------------------------------

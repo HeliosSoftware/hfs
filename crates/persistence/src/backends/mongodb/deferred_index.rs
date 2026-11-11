@@ -13,13 +13,16 @@
 //!   transaction that writes the rows, so running it twice, or racing a client
 //!   write or a repair, ends with one correct set of rows. The same update
 //!   rewrites the document's `missing_params` (#1984) from the extraction that
-//!   built the rows. A deferred create carries no `missing_params` until then:
-//!   they, like its rows, are written by its batch (or the repair), which keeps
-//!   the Bundle's write set to what an offloaded one writes (#1975). Its
-//!   metadata is unknown during the lag, and a `:missing=true` on the metadata
-//!   route leaves it out while it carries the marker (`missing_resource_condition`). A
-//!   deferred update or delete still writes `missing_params` in the transaction,
-//!   and the batch rewrites them after the SearchParameter reload.
+//!   built the rows. A deferred create, update or restore carries no
+//!   `missing_params` until then: they, like its rows, are written by its batch
+//!   (or the repair) from one extraction, which keeps the Bundle's write set to
+//!   what an offloaded one writes (#1975, #2035). An update or restore removes
+//!   the metadata the previous version carried, so it is in the state a create
+//!   is. Its metadata is unknown during the lag, and a `:missing=true` on the
+//!   metadata route leaves it out while it carries the marker
+//!   (`missing_resource_condition`). A deferred delete extracts nothing and
+//!   still writes `missing_params: []` in the transaction, the smallest value
+//!   of the index key; the batch writes the same `[]` with the fingerprint.
 //! - **Ledger.** The same transaction inserts the `search_index_pending`
 //!   collection's documents: one per [`LEDGER_CHUNK_REFS`] resources, naming
 //!   them as `Type/id`. They commit or abort with the Bundle and add a bounded
@@ -417,10 +420,10 @@ impl MongoBackend {
     /// `$reindex` use; a deleted resource gets none) and clears the marker. The
     /// update that clears it also rewrites each resource's `missing_params` from
     /// the same extraction: the names, nothing when the extraction failed, and
-    /// `[]` for a deleted resource. A created resource has none until this
-    /// write (#1975). An updated one has those its Bundle's transaction wrote
-    /// with the registry as it was before its SearchParameters were reloaded;
-    /// the rows are built after that reload.
+    /// `[]` for a deleted resource. A created, updated or restored resource
+    /// has none until this write (#1975, #2035): its Bundle's transaction
+    /// extracted nothing, so the metadata is built, like the rows, with the
+    /// registry as it is after its SearchParameters were reloaded.
     ///
     /// **Why this is safe next to other writers.** The marker is cleared, and
     /// `missing_params` written, in the same transaction that rewrites the
