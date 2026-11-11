@@ -198,6 +198,32 @@ fn assert_shared_schema_instance_is_consistent<B: helios_persistence::core::Back
     );
 }
 
+/// Asserts a live instance answers `SearchProvider::supports_search` from its
+/// declared `BasicSearch`, which is what `/metadata` advertises `search-type`
+/// from (#514).
+///
+/// A backend that really searches keeps the trait's default (`true`) and
+/// declares `BasicSearch`; one whose `search` is a stub (S3) declares nothing
+/// and overrides it. A backend that dropped `BasicSearch` without overriding
+/// would keep advertising search, which is what this catches.
+#[cfg(any(feature = "sqlite", feature = "mongodb", feature = "elasticsearch"))]
+fn assert_supports_search_matches_declaration<
+    B: helios_persistence::core::Backend + helios_persistence::core::SearchProvider,
+>(
+    name: &str,
+    backend: &B,
+) {
+    assert_eq!(
+        backend.supports_search(),
+        backend.supports(BackendCapability::BasicSearch),
+        "{name}: supports_search() must equal its BasicSearch declaration"
+    );
+    assert!(
+        backend.supports_search(),
+        "{name} implements search and must say so"
+    );
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -382,6 +408,14 @@ mod sqlite {
             );
         }
     }
+
+    /// SQLite searches: `supports_search()` is `true` and is its declared
+    /// `BasicSearch` (#514).
+    #[test]
+    fn sqlite_instance_supports_search_matches_its_declaration() {
+        let backend = SqliteBackend::in_memory().expect("in-memory SQLite backend");
+        assert_supports_search_matches_declaration("sqlite", &backend);
+    }
 }
 
 #[cfg(feature = "mongodb")]
@@ -443,6 +477,14 @@ mod mongodb {
         let backend =
             MongoBackend::new(MongoBackendConfig::default()).expect("MongoBackend from defaults");
         assert_shared_schema_instance_is_consistent("mongodb", &backend);
+    }
+
+    /// MongoDB searches (#514); same construction as above, no server needed.
+    #[test]
+    fn mongodb_instance_supports_search_matches_its_declaration() {
+        let backend =
+            MongoBackend::new(MongoBackendConfig::default()).expect("MongoBackend from defaults");
+        assert_supports_search_matches_declaration("mongodb", &backend);
     }
 
     /// All four: `conditional_patch` is the trait's provided implementation
@@ -514,6 +556,15 @@ mod elasticsearch {
         let backend =
             ElasticsearchBackend::new(ElasticsearchConfig::default()).expect("ES backend");
         assert_shared_schema_instance_is_consistent("elasticsearch", &backend);
+    }
+
+    /// Elasticsearch searches (#514); same construction as above, no cluster
+    /// needed.
+    #[test]
+    fn elasticsearch_instance_supports_search_matches_its_declaration() {
+        let backend =
+            ElasticsearchBackend::new(ElasticsearchConfig::default()).expect("ES backend");
+        assert_supports_search_matches_declaration("elasticsearch", &backend);
     }
 
     /// None: Elasticsearch is a search secondary and does not implement
@@ -722,6 +773,26 @@ mod s3 {
                 "s3",
                 &S3Backend::declared_capabilities_for(&mode),
                 &[BackendCapability::ConditionalCreate],
+            );
+        }
+    }
+
+    /// S3 does not declare `BasicSearch` in any tenancy mode: its `search`
+    /// answers `UnsupportedCapability`. `SearchProvider::supports_search` is
+    /// read from this list, so `/metadata` advertises no `search-type` for it
+    /// (#514). The instance-level counterpart, with a mock client, is
+    /// `src/backends/s3/tests.rs`.
+    #[test]
+    fn s3_declares_no_search() {
+        for mode in [
+            prefix_mode(),
+            bucket_mode(None),
+            bucket_mode(Some("system")),
+        ] {
+            assert!(
+                !S3Backend::declared_capabilities_for(&mode)
+                    .contains(&BackendCapability::BasicSearch),
+                "s3 does not search and must not declare BasicSearch"
             );
         }
     }

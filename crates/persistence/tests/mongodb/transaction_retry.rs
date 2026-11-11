@@ -20,7 +20,11 @@
 //! the default gate. The lone-Bundle tests at the end of the file (#1895) use a
 //! 1 x 2 gate, where the same Bundle holds the whole room. The commit-time 388
 //! tests (#1991) run on both gates: the default one, and the 1 x 2 gate, where
-//! the Bundle runs alone and defers its search rows.
+//! the Bundle runs alone and defers its search rows. Since #1975 the 1 x 2 gate's
+//! default threshold makes that 2-entry Bundle defer, so each lone-Bundle test
+//! also has an `inline` twin with the deferral off (#2037), which is the path a
+//! Bundle below the threshold takes. The ledger-write wording tests at the end
+//! fail the ledger's own insert (#2037).
 
 use super::*;
 
@@ -156,10 +160,11 @@ async fn stored_counts(backend: &MongoBackend, tenant_id: &str) -> (u64, u64) {
 
 /// The lone-Bundle tests below run on a 1 x 2 gate, where the default
 /// threshold for deferring a Bundle's search rows (#1975) is the gate's room of
-/// two entries, so their 2-entry Bundle takes the deferred path. Whatever the
-/// outcome, nothing deferred may be left behind: an aborted attempt takes its
-/// ledger document and its `search_rows_pending` markers with it, and a
-/// committed Bundle clears both after writing its rows.
+/// two entries, so their 2-entry Bundle takes the deferred path, and again with
+/// the deferral off, where it stays inline (`LonePath`). Whatever the outcome,
+/// nothing deferred may be left behind: an aborted attempt takes its ledger
+/// document and its `search_rows_pending` markers with it, a committed Bundle
+/// clears both after writing its rows, and an inline Bundle never has either.
 async fn assert_nothing_deferred_left(backend: &MongoBackend, tenant_id: &str) {
     assert_eq!(
         super::deferred_search_index::ledger_count(backend).await,
@@ -1168,6 +1173,9 @@ fn capture_bundle_warnings() -> (
     &'static std::sync::Mutex<Vec<u8>>,
     tracing::dispatcher::DefaultGuard,
 ) {
+    // So the first capturing test of a run does not lose events to a callsite
+    // that another test's thread hit first (#2037).
+    super::deferred_search_index::keep_two_dispatchers_registered();
     let buf: &'static std::sync::Mutex<Vec<u8>> =
         Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
     let writer = tracing_test::internal::MockWriter::new(buf);
@@ -1195,22 +1203,107 @@ const LONE_NOT_RETRYING: &str = "while running alone; not retrying:";
 /// The WARN the replay loop logs before it replays a Bundle.
 const TRANSIENT_RETRYING: &str = "aborted by a transient mongodb error; retrying:";
 
+/// The path a lone-Bundle test sends its Bundle down (#2037).
+///
+/// The lone-Bundle tests run on a 1 x 2 gate, where the 2-entry Bundle holds the
+/// whole admission room. The default threshold for deferring a Bundle's search
+/// rows (#1975) is the room in entries, so on that gate the Bundle takes the
+/// deferred path: a ledger inside the transaction and the rows after the commit.
+/// Since #1975 that was the only path these tests ran. The inline path (no
+/// ledger, the rows inside the transaction) is what runs below the threshold and
+/// when search is offloaded, and it gets the same tests with the deferral off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LonePath {
+    /// The default threshold: the Bundle defers its rows.
+    Deferred,
+    /// `transaction_bundle_deferred_index_entries = Some(0)`: it never does.
+    Inline,
+}
+
+impl LonePath {
+    /// Names the database, tenant and failpoint scope of a test on this path.
+    fn label(self) -> &'static str {
+        match self {
+            LonePath::Deferred => "deferred",
+            LonePath::Inline => "inline",
+        }
+    }
+}
+
+/// A backend on the 1 x 2 gate for a lone-Bundle test, on `path`. It checks
+/// that the backend takes that path, so a change of the default threshold cannot
+/// flip a test to the other path unnoticed: the deferred threshold is the room's
+/// two entries, the inline path has none.
+async fn lone_backend(
+    test: &str,
+    app: &str,
+    path: LonePath,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<MongoBackend> {
+    let backend = create_backend_with_app_name_and_gate(test, app, 1, 2, |config| {
+        if path == LonePath::Inline {
+            config.transaction_bundle_deferred_index_entries = Some(0);
+        }
+        configure(config);
+    })
+    .await?;
+    assert_eq!(
+        backend.deferred_search_index_min_entries(),
+        match path {
+            LonePath::Deferred => Some(2),
+            LonePath::Inline => None,
+        },
+        "the {} lone-Bundle test must take the {} path",
+        path.label(),
+        path.label()
+    );
+    Some(backend)
+}
+
+/// No post-commit step ran on `backend`: a lone Bundle that aborted never
+/// reached one, and an inline Bundle never has one.
+fn assert_no_step_ran(backend: &MongoBackend) {
+    assert_eq!(
+        backend.deferred_index_step_totals(),
+        helios_persistence::backends::mongodb::DeferredIndexStepTotals::default(),
+        "no post-commit step ran"
+    );
+}
+
+/// The `search_index` and `search_index_contained` rows of the tenant: none
+/// where a lone Bundle aborted, whatever path it took.
+async fn assert_no_search_rows_left(backend: &MongoBackend, tenant_id: &str) {
+    let filter = doc! { "tenant_id": tenant_id };
+    assert_eq!(
+        count_docs(backend, "search_index", filter.clone()).await
+            + count_docs(backend, "search_index_contained", filter).await,
+        0,
+        "a rolled-back transaction leaves no search row"
+    );
+}
+
 /// #1895: a Bundle that holds the whole admission room ran alone, so a
 /// cache-pressure rollback at commit (code 365) is its own write set meeting the
 /// cache and a replay would meet it again. It ends after one attempt as
 /// `TooLargeForCache`, the outcome error 388 already has, with the lone-eviction
 /// cause (#1993), and frees the room.
-#[tokio::test]
-async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
-    let app = "fp-txn-lone-evict-commit";
-    let Some(backend) =
-        create_backend_with_app_name_and_gate("txn_lone_evict_commit", app, 1, 2, |_| {}).await
+async fn lone_eviction_at_commit_is_not_replayed(path: LonePath) {
+    let label = path.label();
+    let app = format!("fp-txn-lone-evict-commit-{label}");
+    let tenant_id = format!("txn-lone-evict-commit-{label}");
+    let Some(backend) = lone_backend(
+        &format!("txn_lone_evict_commit_{label}"),
+        &app,
+        path,
+        |_| {},
+    )
+    .await
     else {
         return;
     };
-    let tenant = create_tenant("txn-lone-evict-commit");
+    let tenant = create_tenant(&tenant_id);
     let Some(fail_point) = FailPoint::enable(
-        app,
+        &app,
         temporarily_unavailable_on("commitTransaction"),
         doc! { "times": 100 },
     )
@@ -1256,7 +1349,13 @@ async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
     assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
     let lone = captured_lines(logs, LONE_NOT_RETRYING);
     assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
-    for field in ["lone=true", "attempt=1", "entries=2", "error_code=365"] {
+    for field in [
+        "lone=true",
+        "attempt=1",
+        "entries=2",
+        "error_code=365",
+        "failed_at=\"commit\"",
+    ] {
         assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
     }
     assert!(
@@ -1267,25 +1366,44 @@ async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
     let retries = captured_lines(logs, TRANSIENT_RETRYING);
     assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
     assert_eq!(
-        stored_counts(&backend, "txn-lone-evict-commit").await,
+        stored_counts(&backend, &tenant_id).await,
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
-    assert_nothing_deferred_left(&backend, "txn-lone-evict-commit").await;
+    assert_nothing_deferred_left(&backend, &tenant_id).await;
+    assert_no_search_rows_left(&backend, &tenant_id).await;
+    assert_no_step_ran(&backend);
+}
+
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
+    lone_eviction_at_commit_is_not_replayed(LonePath::Deferred).await;
+}
+
+/// #2037: the same on the inline path.
+#[tokio::test]
+async fn an_inline_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
+    lone_eviction_at_commit_is_not_replayed(LonePath::Inline).await;
 }
 
 /// #1895, entry side: the same, with the rollback arriving on an entry's write.
-#[tokio::test]
-async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replayed() {
-    let app = "fp-txn-lone-evict-insert";
-    let Some(backend) =
-        create_backend_with_app_name_and_gate("txn_lone_evict_insert", app, 1, 2, |_| {}).await
+async fn lone_eviction_on_an_entry_write_is_not_replayed(path: LonePath) {
+    let label = path.label();
+    let app = format!("fp-txn-lone-evict-insert-{label}");
+    let tenant_id = format!("txn-lone-evict-insert-{label}");
+    let Some(backend) = lone_backend(
+        &format!("txn_lone_evict_insert_{label}"),
+        &app,
+        path,
+        |_| {},
+    )
+    .await
     else {
         return;
     };
-    let tenant = create_tenant("txn-lone-evict-insert");
+    let tenant = create_tenant(&tenant_id);
     let Some(fail_point) = FailPoint::enable(
-        app,
+        &app,
         temporarily_unavailable_on("insert"),
         doc! { "times": 100 },
     )
@@ -1341,34 +1459,49 @@ async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replaye
         "entries=2",
         "error_code=365",
         "failed_entry=",
+        "failed_at=\"entry\"",
     ] {
         assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
     }
     let retries = captured_lines(logs, TRANSIENT_RETRYING);
     assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
     assert_eq!(
-        stored_counts(&backend, "txn-lone-evict-insert").await,
+        stored_counts(&backend, &tenant_id).await,
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
-    assert_nothing_deferred_left(&backend, "txn-lone-evict-insert").await;
+    assert_nothing_deferred_left(&backend, &tenant_id).await;
+    assert_no_search_rows_left(&backend, &tenant_id).await;
+    assert_no_step_ran(&backend);
+}
+
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replayed() {
+    lone_eviction_on_an_entry_write_is_not_replayed(LonePath::Deferred).await;
+}
+
+/// #2037: the same on the inline path.
+#[tokio::test]
+async fn an_inline_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replayed() {
+    lone_eviction_on_an_entry_write_is_not_replayed(LonePath::Inline).await;
 }
 
 /// #1895: only the eviction rollback is not replayed. A lone Bundle that keeps
 /// losing a plain `WriteConflict` (the failpoint's message names no eviction)
 /// is a lost race, which a replay can win, so it is still replayed up to the
 /// policy's three attempts.
-#[tokio::test]
-async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed() {
-    let app = "fp-txn-lone-conflict";
+async fn lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed(path: LonePath) {
+    let label = path.label();
+    let app = format!("fp-txn-lone-conflict-{label}");
+    let tenant_id = format!("txn-lone-conflict-{label}");
     let Some(backend) =
-        create_backend_with_app_name_and_gate("txn_lone_conflict", app, 1, 2, |_| {}).await
+        lone_backend(&format!("txn_lone_conflict_{label}"), &app, path, |_| {}).await
     else {
         return;
     };
-    let tenant = create_tenant("txn-lone-conflict");
+    let tenant = create_tenant(&tenant_id);
     let Some(fail_point) =
-        FailPoint::enable(app, write_conflict_on("insert"), doc! { "times": 100 }).await
+        FailPoint::enable(&app, write_conflict_on("insert"), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -1399,33 +1532,153 @@ async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed
     );
     for line in &retries {
         assert!(line.contains("error_code=112"), "{line}");
+        assert!(line.contains("failed_at=\"entry\""), "{line}");
     }
     assert_eq!(
-        stored_counts(&backend, "txn-lone-conflict").await,
+        stored_counts(&backend, &tenant_id).await,
         (0, 0),
         "an exhausted transaction leaves nothing behind"
     );
-    assert_nothing_deferred_left(&backend, "txn-lone-conflict").await;
+    assert_nothing_deferred_left(&backend, &tenant_id).await;
+    assert_no_search_rows_left(&backend, &tenant_id).await;
+    assert_no_step_ran(&backend);
+}
+
+#[tokio::test]
+async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed() {
+    lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed(LonePath::Deferred).await;
+}
+
+/// #2037: the same on the inline path.
+#[tokio::test]
+async fn an_inline_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed() {
+    lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed(LonePath::Inline).await;
+}
+
+/// #1895, #2037: a lone Bundle that loses one plain `WriteConflict` is replayed
+/// and the replay commits, so its resources are stored once. This is the
+/// replayed lone Bundle that finally commits: on the inline path its rows were
+/// written inside the transaction (no ledger, no marker, no post-commit step) and
+/// an ordinary search finds it at once; on the deferred path the step wrote them
+/// before the call returned, and it counts as one complete step.
+async fn lone_bundle_that_loses_one_plain_write_conflict_commits_on_the_replay(path: LonePath) {
+    let label = path.label();
+    let app = format!("fp-txn-lone-replayed-{label}");
+    let tenant_id = format!("txn-lone-replayed-{label}");
+    let Some(backend) =
+        lone_backend(&format!("txn_lone_replayed_{label}"), &app, path, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant(&tenant_id);
+    let Some(fail_point) =
+        FailPoint::enable(&app, write_conflict_on("insert"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let bundle = result.expect("a lone Bundle that lost one plain conflict commits on the replay");
+    assert_eq!(bundle.entries.len(), 2);
+    assert!(bundle.entries.iter().all(|entry| entry.status == 201));
+    assert_eq!(entered, 1, "the failpoint fires once; the replay is clean");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert!(lone.is_empty(), "no not-retrying WARN: {lone:?}");
+    assert_eq!(
+        captured_lines(logs, TRANSIENT_RETRYING).len(),
+        1,
+        "one replay"
+    );
+    assert_eq!(
+        stored_counts(&backend, &tenant_id).await,
+        (2, 2),
+        "one Patient and one Observation, each with one history row"
+    );
+    assert_nothing_deferred_left(&backend, &tenant_id).await;
+
+    // An ordinary parameter finds the Patient as soon as the call returns.
+    let found = backend
+        .search(
+            &tenant,
+            &SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "family".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq("TxnRetry")],
+                chain: vec![],
+                components: vec![],
+            }),
+        )
+        .await
+        .expect("search")
+        .resources
+        .items
+        .len();
+    assert_eq!(found, 1, "the Patient is searchable at once");
+    let rows = count_docs(&backend, "search_index", doc! { "tenant_id": &tenant_id }).await
+        + count_docs(
+            &backend,
+            "search_index_contained",
+            doc! { "tenant_id": &tenant_id },
+        )
+        .await;
+    assert!(rows > 0, "the committed Bundle has search rows");
+
+    let step = backend.deferred_index_step_totals();
+    match path {
+        LonePath::Inline => assert_no_step_ran(&backend),
+        LonePath::Deferred => assert_eq!(
+            (step.steps, step.incomplete, step.rows),
+            (1, 0, rows),
+            "one complete step wrote every row: {step:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_lone_bundle_that_loses_one_plain_write_conflict_commits_on_the_replay() {
+    lone_bundle_that_loses_one_plain_write_conflict_commits_on_the_replay(LonePath::Deferred).await;
+}
+
+/// #2037: the same on the inline path.
+#[tokio::test]
+async fn an_inline_lone_bundle_that_loses_one_plain_write_conflict_commits_on_the_replay() {
+    lone_bundle_that_loses_one_plain_write_conflict_commits_on_the_replay(LonePath::Inline).await;
 }
 
 /// #1895: the lone check runs before `next_attempt_delay`, so a lone eviction
 /// rollback ends as `TooLargeForCache` even when the replay budget is already
 /// spent. With the check after the delay, a zero budget would end the Bundle as
 /// `Transient { attempts: 1 }`.
-#[tokio::test]
-async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache() {
-    let app = "fp-txn-lone-evict-nobudget";
-    let Some(backend) =
-        create_backend_with_app_name_and_gate("txn_lone_evict_nobudget", app, 1, 2, |c| {
+async fn lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache(
+    path: LonePath,
+) {
+    let label = path.label();
+    let app = format!("fp-txn-lone-evict-nobudget-{label}");
+    let tenant_id = format!("txn-lone-evict-nobudget-{label}");
+    let Some(backend) = lone_backend(
+        &format!("txn_lone_evict_nobudget_{label}"),
+        &app,
+        path,
+        |c| {
             c.bundle_transaction_budget = std::time::Duration::ZERO;
-        })
-        .await
+        },
+    )
+    .await
     else {
         return;
     };
-    let tenant = create_tenant("txn-lone-evict-nobudget");
+    let tenant = create_tenant(&tenant_id);
     let Some(fail_point) = FailPoint::enable(
-        app,
+        &app,
         temporarily_unavailable_on("commitTransaction"),
         doc! { "times": 100 },
     )
@@ -1451,11 +1704,26 @@ async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_
     }
     assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
     assert_eq!(
-        stored_counts(&backend, "txn-lone-evict-nobudget").await,
+        stored_counts(&backend, &tenant_id).await,
         (0, 0),
         "a rolled-back transaction leaves nothing behind"
     );
-    assert_nothing_deferred_left(&backend, "txn-lone-evict-nobudget").await;
+    assert_nothing_deferred_left(&backend, &tenant_id).await;
+    assert_no_search_rows_left(&backend, &tenant_id).await;
+    assert_no_step_ran(&backend);
+}
+
+#[tokio::test]
+async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache() {
+    lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache(LonePath::Deferred)
+        .await;
+}
+
+/// #2037: the same on the inline path.
+#[tokio::test]
+async fn an_inline_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache() {
+    lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache(LonePath::Inline)
+        .await;
 }
 
 /// #1991 on the 1 x 2 gate, where the 2-entry Bundle holds the whole admission
@@ -1549,4 +1817,183 @@ async fn a_lone_deferred_bundle_whose_commit_is_too_large_for_cache_ends_at_once
         (2, 2)
     );
     assert_nothing_deferred_left(&backend, "txn-lone-commit-too-large").await;
+}
+
+/// A `failCommand` that fails every `insert` into the deferred-index ledger of
+/// `backend`'s database with `error_code`, and no other insert (#2037): the
+/// server's `namespace` field limits it to that collection, so the Bundle's own
+/// entries and their history rows go in as usual and the failure falls on the
+/// ledger's `insert_many`, the last write before the commit.
+fn ledger_insert_fails_with(backend: &MongoBackend, error_code: i32) -> Document {
+    doc! {
+        "failCommands": ["insert"],
+        "namespace": format!("{}.search_index_pending", backend.config().database_name),
+        "errorCode": error_code,
+    }
+}
+
+/// #2037: a lone deferred Bundle whose ledger `insert_many` is rolled back for
+/// cache pressure (code 365) is a lone eviction like any other, and ends the
+/// same way (`TooLargeForCache`, `LoneEviction`, not replayed). Its log-only
+/// reason names the ledger write: the failure fell after the last entry and
+/// before the commit, so it is neither `Commit ...` nor an `Entry N ...` (the
+/// Bundle's entry count used to be passed as an entry index).
+#[tokio::test]
+async fn a_lone_deferred_bundle_rolled_back_for_eviction_at_its_ledger_write_names_the_ledger() {
+    let app = "fp-txn-lone-ledger-evict";
+    let tenant_id = "txn-lone-ledger-evict";
+    let Some(backend) =
+        lone_backend("txn_lone_ledger_evict", app, LonePath::Deferred, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant(tenant_id);
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        ledger_insert_fails_with(&backend, 365),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::LoneEviction,
+                "a lone eviction rollback is not the write-set cause"
+            );
+            assert!(
+                reason.starts_with(
+                    "Deferred search index ledger write rolled back for eviction while the \
+                     Bundle ran alone; not replayed: Deferred search index ledger write failed: "
+                ),
+                "the reason names the ledger write and says the Bundle ran alone: {reason}"
+            );
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            for blamed in ["Commit", "Entry "] {
+                assert!(
+                    !reason.contains(blamed),
+                    "a ledger failure does not blame {blamed:?}: {reason}"
+                );
+            }
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(
+        entered, 1,
+        "only the ledger insert met the failpoint, once: a lone eviction is not replayed"
+    );
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
+    for field in [
+        "lone=true",
+        "attempt=1",
+        "entries=2",
+        "error_code=365",
+        "failed_at=\"ledger\"",
+    ] {
+        assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
+    }
+    assert!(
+        !lone[0].contains("failed_entry="),
+        "a ledger failure has no failed entry: {}",
+        lone[0]
+    );
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, tenant_id).await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, tenant_id).await;
+    assert_no_search_rows_left(&backend, tenant_id).await;
+    assert_no_step_ran(&backend);
+}
+
+/// #2037: the same Bundle with a 388 at its ledger write is the write-set cause,
+/// not a lone eviction, and its reason says the ledger write too.
+#[tokio::test]
+async fn a_lone_deferred_bundle_whose_ledger_write_is_too_large_for_cache_names_the_ledger() {
+    let app = "fp-txn-lone-ledger-388";
+    let tenant_id = "txn-lone-ledger-388";
+    let Some(backend) = lone_backend("txn_lone_ledger_388", app, LonePath::Deferred, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant(tenant_id);
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        ledger_insert_fails_with(&backend, 388),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(cause, TooLargeForCacheCause::WriteSetTooLarge);
+            assert!(
+                reason.starts_with("Deferred search index ledger write failed: "),
+                "the reason names the ledger write: {reason}"
+            );
+            assert!(
+                reason.contains("388"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            for blamed in ["Commit", "Entry "] {
+                assert!(
+                    !reason.contains(blamed),
+                    "a ledger failure does not blame {blamed:?}: {reason}"
+                );
+            }
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a 388 is not replayed");
+    assert!(
+        captured_lines(logs, LONE_NOT_RETRYING).is_empty(),
+        "a 388 is not a lone eviction rollback"
+    );
+    assert!(captured_lines(logs, TRANSIENT_RETRYING).is_empty());
+    assert_eq!(stored_counts(&backend, tenant_id).await, (0, 0));
+    assert_nothing_deferred_left(&backend, tenant_id).await;
+    assert_no_search_rows_left(&backend, tenant_id).await;
+    assert_no_step_ran(&backend);
 }

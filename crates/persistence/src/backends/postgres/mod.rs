@@ -74,6 +74,7 @@
 
 mod backend;
 mod bulk_export;
+mod bulk_index_rebuild;
 mod bulk_provider;
 mod bulk_submit;
 mod bundle_lock_plan;

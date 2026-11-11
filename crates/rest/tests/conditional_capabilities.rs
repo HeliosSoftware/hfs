@@ -13,8 +13,9 @@
 //! shared at the persistence level, the composite serves conditional patch,
 //! and declares it — so the statement and the behaviour below changed
 //! together, from that one declaration. The `501` half is held by the unit
-//! tests of `handlers::conditional_support` and by S3, the storage that still
-//! declines. Plain SQLite is the no-regression half; its `/metadata` is also
+//! tests of `handlers::conditional_support` and by S3, which declares only
+//! conditional create (identifier-scoped, #1435) and declines update, delete
+//! and patch. Plain SQLite is the no-regression half; its `/metadata` is also
 //! asserted in `conditional_patch.rs`.
 //!
 //! `conditionalPatch` exists from FHIR R5 on, so the statement only shows it
