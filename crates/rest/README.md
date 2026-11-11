@@ -874,8 +874,15 @@ and an unusable value does not apply.
   the client never saw, or bring a deleted resource back (`201`). Entries without
   `ifMatch` are unchanged: last writer wins, and a `PUT` on a deleted resource
   brings it back.
-- `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
-  `BundleEntry.if_none_match`; no handler or backend reads it.
+- `ifNoneMatch` — **supported on `GET [type]/[id]` entries,** in both `batch` and
+  `transaction` bundles: the conditional read, answered as `GET [type]/[id]`
+  answers `If-None-Match`. A tag naming the current version (weak or strong form,
+  any member of a comma-separated list, or `*`) answers `304 Not Modified` with no
+  resource; any other tag, or a value that is not a list of entity-tags, answers
+  the full `200`. A read of a missing resource is the same `404` it is without the
+  tag. Search, vread and history `GET` entries ignore it, as their direct
+  endpoints do, and it has no meaning on a write entry (conditional creates use
+  `ifNoneExist`).
 - `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
   `transaction` bundles, on every backend that implements `ConditionalStorage`
   (SQLite, PostgreSQL, MongoDB; on S3 only `_id` and `identifier` criteria, by

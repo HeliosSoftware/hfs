@@ -24,7 +24,7 @@ use helios_persistence::core::{
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
     EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
     RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
-    apply_patch_for_version, bundle_if_match_gate, conditional_update_entry,
+    apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
     decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
 use helios_persistence::error::{
@@ -966,6 +966,7 @@ where
                     &deferred.compartment,
                     deferred.target,
                     prefer.is_strict(),
+                    entry.if_none_match.as_deref(),
                 )
                 .await;
                 deferred_results.push((index, entry, result));
@@ -1304,6 +1305,7 @@ where
         return entry_failure(missing_url(index));
     };
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
+    let if_none_match = request.get("ifNoneMatch").and_then(|v| v.as_str());
     let if_none_exist = request.get("ifNoneExist").and_then(|v| v.as_str());
 
     // A URL that names an operation is refused before anything reads it as a
@@ -1454,6 +1456,7 @@ where
                 &compartment,
                 get_target.expect("GET entries are classified above"),
                 strict,
+                if_none_match,
             )
             .await
         }
@@ -3177,12 +3180,19 @@ impl GetEntryTarget {
 /// URL is answered one way whichever Bundle it arrives in. A vread and a
 /// history read go through [`execute_vread`] and [`execute_history_bundle`], the
 /// code the direct handlers call (#2380).
+///
+/// `if_none_match` is the entry's `ifNoneMatch`, honoured on an instance read
+/// only (#869): `GET [type]/[id]` answers `If-None-Match` and the other three
+/// targets do not, so neither does their entry. The transaction arm runs an
+/// instance read inside the storage transaction, not here; the backends reach
+/// the same answer through [`bundle_read_result`].
 async fn execute_get_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
     target: GetEntryTarget,
     strict: bool,
+    if_none_match: Option<&str>,
 ) -> BundleEntryResult
 where
     S: ResourceStorage
@@ -3233,7 +3243,7 @@ where
                     stored.content(),
                     "read",
                 ) {
-                    Ok(()) => BundleEntryResult::ok(stored),
+                    Ok(()) => bundle_read_result(stored, if_none_match),
                     Err(e) => entry_failure(e),
                 },
                 // The one expression this PR changes on the arm #478/#481 is
@@ -3409,6 +3419,7 @@ fn status_text(code: &str) -> &'static str {
         "200" => "OK",
         "201" => "Created",
         "204" => "No Content",
+        "304" => "Not Modified",
         "400" => "Bad Request",
         "401" => "Unauthorized",
         "403" => "Forbidden",
