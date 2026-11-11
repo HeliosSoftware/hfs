@@ -979,6 +979,12 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
 backend really serves (`ConditionalStorage::supports_conditional`, #1384). A
 conditional `batch` entry for an interaction the backend does not serve is `501`.
 
+Likewise `search-type` and the `searchParam`, `searchInclude` and
+`searchRevInclude` lists are advertised only where the storage searches
+(`SearchProvider::supports_search`, #514): a standalone S3 deployment answers
+every search `501`, and its `/metadata` lists none of them. A composite answers
+for the provider its search reaches, so `s3-elasticsearch` advertises search.
+
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:

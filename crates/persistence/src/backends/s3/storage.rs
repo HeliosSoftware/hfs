@@ -2733,6 +2733,15 @@ impl S3Backend {
 
 #[async_trait]
 impl SearchProvider for S3Backend {
+    /// S3 does not declare `BasicSearch`: `search` serves only the filterless
+    /// listing of [`SCAN_LISTED_TYPES`] and answers `UnsupportedCapability` for
+    /// everything else, which is not a search engine to advertise (#514). One
+    /// declaration, the list the contract test pins, as for
+    /// [`ConditionalStorage::supports_conditional`] (#1384).
+    fn supports_search(&self) -> bool {
+        crate::core::Backend::supports(self, crate::core::BackendCapability::BasicSearch)
+    }
+
     async fn search(
         &self,
         tenant: &TenantContext,

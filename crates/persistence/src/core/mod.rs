@@ -8,7 +8,8 @@
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
 //! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
-//! - [`CapabilityProvider`] - Runtime capability discovery
+//! - [`CapabilityProvider`] - Summary of a storage's capabilities (not the
+//!   source of `GET /metadata`; see below)
 //!
 //! # Trait Hierarchy
 //!
@@ -37,23 +38,31 @@
 //!
 //! # Backend Capabilities
 //!
-//! Not all backends support all features. Use [`CapabilityProvider`] to
-//! discover what a backend supports at runtime:
+//! Not all backends support all features. A storage answers what it really
+//! implements through per-capability methods on the storage traits, and the
+//! REST layer builds `GET /metadata` from those answers:
 //!
-//! ```ignore
-//! use helios_persistence::core::{CapabilityProvider, Interaction};
+//! - [`SearchProvider::supports_search`], [`SearchProvider::supports_contained_search`]
+//!   and [`SearchProvider::modifiers_for_param_type`]
+//! - [`ConditionalStorage::supports_conditional`]
+//! - [`BundleProvider::supports_atomic_transactions`]
+//! - [`Backend::supports`] for the declared [`BackendCapability`] list
 //!
-//! fn check_capabilities<S: CapabilityProvider>(storage: &S) {
-//!     if storage.supports_interaction("Patient", Interaction::HistoryType) {
-//!         // Use type-level history
+//! ```
+//! use helios_persistence::core::{ConditionalInteraction, ConditionalStorage, SearchProvider};
+//!
+//! fn describe<S: SearchProvider + ConditionalStorage>(storage: &S) {
+//!     if storage.supports_search() {
+//!         // `search` is implemented; a search request is served.
 //!     }
-//!
-//!     let caps = storage.capabilities();
-//!     println!("Backend: {}", caps.backend_name);
-//!     println!("Supports transactions: {}",
-//!         caps.system_interactions.contains(&SystemInteraction::Transaction));
+//!     if storage.supports_conditional(ConditionalInteraction::Update) {
+//!         // `PUT [type]?criteria` is served.
+//!     }
 //! }
 //! ```
+//!
+//! [`CapabilityProvider`] is a separate summary type. The REST layer does not
+//! read it, so it does not change what `/metadata` says.
 //!
 //! # Example: Implementing a Storage Backend
 //!
