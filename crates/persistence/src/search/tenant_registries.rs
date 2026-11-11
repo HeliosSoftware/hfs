@@ -40,6 +40,13 @@ use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
 pub type StoredParamLoader =
     Arc<dyn Fn(&str) -> Option<Vec<SearchParameterDefinition>> + Send + Sync>;
 
+/// One [`TenantSearchRegistries::cache_authoritative`] entry.
+struct AuthoritativeEntry {
+    /// Fingerprint of the stored `SearchParameter` rows `registry` was built from.
+    fingerprint: String,
+    registry: Arc<RwLock<SearchParameterRegistry>>,
+}
+
 /// A shared base registry plus lazily-built, cached per-tenant registries.
 ///
 /// Backends hold `Arc<TenantSearchRegistries>` in place of the former single
@@ -53,6 +60,13 @@ pub struct TenantSearchRegistries {
     /// Per-tenant registries (`base` clone + tenant stored overlay), keyed by
     /// tenant id. Built on first access, dropped on invalidation.
     per_tenant: RwLock<HashMap<String, Arc<RwLock<SearchParameterRegistry>>>>,
+    /// Per-tenant registries a guarded write built from the *persisted*
+    /// overlay (PostgreSQL's `authoritative_extractor`), each tagged with the
+    /// fingerprint of the stored `SearchParameter` rows it was built from.
+    /// Read through [`authoritative_cached`](Self::authoritative_cached),
+    /// which hands an entry back only for the fingerprint it was built under;
+    /// dropped with `per_tenant` on invalidation.
+    authoritative: RwLock<HashMap<String, AuthoritativeEntry>>,
     /// Reads a tenant's stored active params from storage.
     loader: StoredParamLoader,
 }
@@ -64,6 +78,7 @@ impl TenantSearchRegistries {
         Self {
             base: Arc::new(RwLock::new(SearchParameterRegistry::new())),
             per_tenant: RwLock::new(HashMap::new()),
+            authoritative: RwLock::new(HashMap::new()),
             loader,
         }
     }
@@ -152,16 +167,54 @@ impl TenantSearchRegistries {
         }
     }
 
-    /// Drops a tenant's cached registry so the next access rebuilds it from
-    /// storage. Called when that tenant writes a `SearchParameter`.
+    /// The registry a guarded write last built for `tenant_id` from the
+    /// persisted overlay, if the stored `SearchParameter` rows still carry
+    /// `fingerprint` — the caller computes that from storage under the same
+    /// lock it would read the overlay under, so a hit is exactly as fresh as
+    /// the full read it replaces. `None` means read the overlay and
+    /// [`cache_authoritative`](Self::cache_authoritative) the result.
+    pub fn authoritative_cached(
+        &self,
+        tenant_id: &str,
+        fingerprint: &str,
+    ) -> Option<Arc<RwLock<SearchParameterRegistry>>> {
+        self.authoritative
+            .read()
+            .get(tenant_id)
+            .filter(|entry| entry.fingerprint == fingerprint)
+            .map(|entry| entry.registry.clone())
+    }
+
+    /// Remembers the registry a guarded write built for `tenant_id` from the
+    /// persisted overlay whose rows carried `fingerprint`; replaces the
+    /// tenant's previous entry, so the map holds one registry per tenant.
+    pub fn cache_authoritative(
+        &self,
+        tenant_id: &str,
+        fingerprint: String,
+        registry: Arc<RwLock<SearchParameterRegistry>>,
+    ) {
+        self.authoritative.write().insert(
+            tenant_id.to_string(),
+            AuthoritativeEntry {
+                fingerprint,
+                registry,
+            },
+        );
+    }
+
+    /// Drops a tenant's cached registries so the next access rebuilds them
+    /// from storage. Called when that tenant writes a `SearchParameter`.
     pub fn invalidate(&self, tenant_id: &str) {
         self.per_tenant.write().remove(tenant_id);
+        self.authoritative.write().remove(tenant_id);
     }
 
     /// Drops every cached per-tenant registry (the TTL refresh: storage is the
     /// source of truth, so each tenant's overlay is re-read on next access).
     pub fn invalidate_all(&self) {
         self.per_tenant.write().clear();
+        self.authoritative.write().clear();
     }
 
     /// Number of currently-cached tenant registries (for diagnostics/tests).

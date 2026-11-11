@@ -38,7 +38,7 @@ Each run produces, in this order:
 - **Job summary text.** The comparison tables (unchanged), then a collapsed `### Charts` section: one for the compare job (`md_charts.py compare --in comparison.md`) and one per leg (`md_charts.py leg --box ... --leg ... --run-dir ...`). Both are display only and never fail the job.
 - **Run history block** (`history.py`): the last 10 runs of the branch plus the latest `main` run, as tables and one Mermaid chart per leg and row. Old and new row labels are joined (see `LABEL_ALIASES`); the old (deferred-indexing) Elasticsearch ingest and index cells are shown with the marker `ᵈ`, and their change is only computed against runs with the same indexing mode. See [Run history](#run-history).
 - **Standalone HTML report**, artifact `fhir-bench-report-<run id>`: one dark file (`report_html.py`, template `report_template.html`), uploaded with `archive: false` so it is not zipped. It opens in the browser through the `Full report (HTML)` link on the last line of the summary; that link works for signed-in viewers of the repository only.
-  Sections: run summary, 1 Is this run valid?, 2 Results, 3 Detail (timeline and host load, Bulk Import and Batch/Transaction Import by phase, import comparison, `$sql-run` by view, trend), 4 Full data. CI passes `--no-shapes`, so there is no "Search by query shape" section.
+  Sections: run summary, 1 Is this run valid?, 2 Results, 3 Detail (timeline and host load, Bulk Import and Batch/Transaction Import by phase, import comparison, `$sql-run` by view, trend; on a release tag also the version trend), 4 Full data. CI passes `--no-shapes`, so there is no "Search by query shape" section.
 - **Report data**, artifact `fhir-bench-report-data-<run id>` (`report-data.json`). Later runs read it (`history.py --data-dir`) for the trend in the HTML report.
 
 All four artifacts and the summary are best effort (`continue-on-error`); a failure here never fails the benchmark.
@@ -76,6 +76,12 @@ Safe once report-data artifacts cover the window, about `history_runs` runs afte
 The row aliases in `history.py` (`LABEL_ALIASES`) are for the Markdown history and can stay.
 
 Caveats of the legacy points: for runs 37986575337, 38501925223 and 38564965562 the HTML (Bulk import table) and the Markdown history may differ for the non-ES ingest and index values. The oldest points also predate #2248 and may carry `$reindex` skew. Runs in the current format are never read by `legacy_points.py`.
+
+### Version trend (release runs)
+
+Every `v*` tag gets one benchmark run: `ci.yml`'s `benchmark-release` job dispatches this workflow on the tag (default inputs) once the release jobs are done. Releases are tagged on Sunday afternoon, and no nightly workflow is scheduled on Monday (UTC), so that run has the runners and the Docker host as much to itself as possible (slot list in `ci-extended.yml`).
+
+On a run whose ref is a release tag (`vMAJOR.MINOR.PATCH[-pre]`), `history.py --version-dir` also downloads the `report-data.json` of the newest run (with an artifact left) of each OLDER tag, at most `--max-versions` minus one (10 with this run), from the last 300 completed runs of the workflow; `report_html.py --version-dir` then adds a second chart set under the branch trend, "Trend of <leg> across versions", one point per version in version order (`v0.2.10` after `v0.2.9`), with a table of the run, commit and runner behind each. A run of the same tag or of a newer one is never a point. On a branch run nothing is fetched and the block stays hidden; the branch trend (`--trend-dir`) is the same on both. Report data is kept 90 days, so weekly releases cover about 12 versions.
 
 ## Run time
 
