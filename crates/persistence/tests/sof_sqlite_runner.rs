@@ -1649,7 +1649,7 @@ mod sqlite_runner_tests {
             .unwrap();
         let tenant = test_tenant();
         {
-            let conn = pool.get().unwrap();
+            let mut conn = pool.get().unwrap();
             conn.execute_batch(
                 "CREATE TABLE resources (
                 tenant_id TEXT NOT NULL, resource_type TEXT NOT NULL, id TEXT NOT NULL,
@@ -1674,7 +1674,8 @@ mod sqlite_runner_tests {
             conn.trace_v2(
                 rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
                 Some(capture_preview_sql),
-            );
+            )
+            .unwrap();
         }
         let runner = helios_persistence::sof::sqlite::SqliteInDbRunner::new(pool);
         let alias = format!("sof_sqlite_sql_limit_{}", uuid::Uuid::new_v4().simple());
