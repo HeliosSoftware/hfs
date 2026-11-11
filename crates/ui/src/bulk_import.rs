@@ -931,7 +931,8 @@ fn url_origin(url: &str) -> String {
 }
 
 /// Computes the RFC 7638 thumbprint of a private key as the `kid`.
-/// Supports ES384 (P-384) and RS384. Returns `None` when the PEM cannot be parsed.
+/// ES384 (P-384) only. Returns `None` for `RS384`, whose assertions go out
+/// without a `kid`, and when the PEM cannot be parsed as a P-384 key.
 fn signing_kid(pem: &str, alg: &str) -> Option<String> {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

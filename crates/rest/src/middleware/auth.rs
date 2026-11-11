@@ -691,6 +691,7 @@ mod tests {
         assert!(is_exempt_path("/_liveness"));
         assert!(is_exempt_path("/_readiness"));
         assert!(is_exempt_path("/.well-known/smart-configuration"));
+        assert!(is_exempt_path("/.well-known/bulk-submit-jwks.json"));
         assert!(is_exempt_path("/$versions"));
 
         assert!(!is_exempt_path("/Patient"));
@@ -703,6 +704,9 @@ mod tests {
         assert!(!is_exempt_path("/Device/_liveness"));
         assert!(!is_exempt_path("/Patient/_readiness"));
         assert!(!is_exempt_path("/Patient/.well-known/smart-configuration"));
+        assert!(!is_exempt_path(
+            "/Patient/.well-known/bulk-submit-jwks.json"
+        ));
         assert!(!is_exempt_path("/tenant/metadata"));
         assert!(!is_exempt_path("/tenant/$versions"));
     }

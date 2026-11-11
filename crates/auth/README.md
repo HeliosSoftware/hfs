@@ -132,6 +132,8 @@ These populate the `GET /.well-known/smart-configuration` response:
 | `HFS_SMART_REVOCATION_ENDPOINT` | Token revocation endpoint |
 | `HFS_SMART_END_SESSION_ENDPOINT` | OIDC end-session (RP-initiated logout) endpoint; used by the web UI's Sign out. Discovered from the issuer when unset |
 
+**Two different key sets.** The `jwks_uri` in `/.well-known/smart-configuration` (`HFS_SMART_JWKS_URL`, else `HFS_AUTH_JWKS_URL`) is the identity provider's key set: HFS uses it to validate the bearer tokens coming *in*. `/.well-known/bulk-submit-jwks.json` is HFS's own key set, served by `helios-rest` and used by other servers to verify the client assertions HFS signs and sends *out* for bulk submit (see the Bulk Submit section of the `helios-rest` README).
+
 ### Web UI Interactive Login
 
 The web UI (`crates/ui`) signs users in with **Authorization Code + PKCE**
