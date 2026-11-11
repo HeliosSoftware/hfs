@@ -152,8 +152,8 @@ fn build_code_text_clause(name: &str, value: &str) -> Option<Value> {
 /// Format: type-system|type-code|value
 ///
 /// A value of fewer than three parts names nothing: the shared `:of-type`
-/// expectation (`modifier_parity_suite`) and MongoDB both match nothing for
-/// one. It is [`match_none`](super::date::match_none) and never `None`, which
+/// expectation (`modifier_parity_suite`), and SQLite, PostgreSQL and MongoDB
+/// alike, match nothing for one. It is [`match_none`](super::date::match_none) and never `None`, which
 /// the query builder refuses a parameter over (#2510) — and which, before it
 /// did, dropped the value and returned every resource.
 fn build_of_type_clause(name: &str, value: &str) -> Option<Value> {

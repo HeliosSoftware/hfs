@@ -34926,15 +34926,6 @@ mod postgres_integration {
             &backend,
             &unique_base("modifier_parity"),
             &[
-                // A short `:of-type` value adds no condition at all: every Patient.
-                Divergence {
-                    label: "Patient?identifier:ofType=MR|12345",
-                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
-                },
-                Divergence {
-                    label: "Patient?identifier:ofType=12345",
-                    expect: Expect::Ids(&["p1", "p2", "p3", "p4"]),
-                },
                 // Terminology-backed token modifiers are not refused but degraded:
                 // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
                 // itself. Unreachable over REST, which expands them or answers 501 first.
