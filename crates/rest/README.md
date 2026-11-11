@@ -835,6 +835,7 @@ search entry and the same search at `GET [base]/[type]?…`.
 | `request.method` not an `http-verb` code | 400 | `value` |
 | `request.url` absent | 400 | `required` |
 | `request.url` names nothing | 400 | `value` |
+| `request.url` has a `$` path segment before its last one | 400 | `value` |
 | `resource` absent on `POST`/`PUT` | 400 | `invalid` |
 | `PUT`/`PATCH`/`DELETE` URL names no instance | 400 | `value` |
 | criteria in a `POST` entry's URL | 400 | `value` |
@@ -846,6 +847,7 @@ search entry and the same search at `GET [base]/[type]?…`.
 | `HEAD` | 405 | `not-supported` |
 | `ifMatch` precondition failed | 412 | `conflict` |
 | write validation failed | 422 | the validator's own issues |
+| `request.url` names an operation (`$lookup`, `[type]/$expand`, `[type]/[id]/$everything`, …), on any method | 501 | `not-supported` |
 | `Binary` JSON Patch in an R4/R4B bundle | 501 | `not-supported` |
 | storage error | per class | `deleted`, `conflict`, `multiple-matches`, `transient`, `timeout`, `exception`, … |
 
@@ -960,6 +962,7 @@ conditional `batch` entry for an interaction the backend does not serve is `501`
 The following FHIR transaction features are not yet implemented:
 - **Conditional reference resolution in batches** - a `transaction` resolves references like `Patient?identifier=12345` in its resources (#459): one match rewrites the reference to `Type/id`, and zero or several fail the bundle. A `batch` leaves them as written
 - **HEAD entries** - refused with `405 not-supported`. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
+- **Operation entries** - an entry whose `request.url` ends in an operation (`POST ValueSet/$lookup`, `GET Patient/123/$everything`, `GET ValueSet/$expand?…`, `POST $diff`) is not dispatched. It is refused with `501 not-supported`, naming the operation and the entry's index and saying to invoke it directly against the REST API: as that entry's own outcome in a `batch` (its siblings still run), and as the whole bundle's error in a `transaction` (nothing is applied). This holds for every method, for absolute URLs and for a percent-encoded `%24`; a `$` in the query string is not an operation, and a `$` in a segment before the last is a `400 value`. Dispatching the operations the server implements (`$validate`, `$everything`, the terminology operations) from entries is tracked in #868. Before #868, a `GET` entry of this shape answered `200` with the first two path segments read as a resource (`GET Patient/123/$everything` returned `Patient/123`), and a `POST` entry was refused as an unknown resource type
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
 - **Transaction entry failures after dispatch** - a transaction entry that fails once the backend is executing it is still collapsed to `400 processing`, with the real status stringified into the message (`Entry failed with status 404`). The backends discard the entry result at their `status >= 400` guard and return `TransactionError::BundleError`, which carries neither. Tracked separately; the per-entry codes above are the `batch` arm and the transaction refusals raised *before* dispatch
