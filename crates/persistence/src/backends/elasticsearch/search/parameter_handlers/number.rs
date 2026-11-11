@@ -7,9 +7,9 @@ use crate::types::SearchPrefix;
 
 /// Builds an ES query clause for a number search parameter.
 ///
-/// Never returns `None` for a value it cannot read. The query builder collects
-/// these clauses with `filter_map`, so `None` does not mean "matches nothing",
-/// it means "no constraint": `probability=abc` used to return every
+/// Never returns `None` for a value it cannot read. `None` does not mean
+/// "matches nothing": the query builder refuses a parameter over it (#2510),
+/// and used to read it as "no constraint", so `probability=abc` returned every
 /// RiskAssessment (#1319). The search gate (`validate_numeric_values`) rejects
 /// such a value before a query is built; as defence in depth it is
 /// [`match_none`](super::date::match_none) here, under every prefix.
@@ -176,8 +176,8 @@ mod tests {
         assert_eq!(plain, trailing_zero);
     }
 
-    /// The `filter_map` trap (#1319): `None` from here does not mean "matches
-    /// nothing", it means "no constraint". A value that is not a number — by
+    /// The silent-drop trap (#1319): `None` from here does not mean "matches
+    /// nothing"; the builder refuses it (#2510). A value that is not a number — by
     /// the shared grammar, so `inf` and `nan` included (#1340) — must be a
     /// clause, and one that matches nothing, under every prefix.
     #[test]
