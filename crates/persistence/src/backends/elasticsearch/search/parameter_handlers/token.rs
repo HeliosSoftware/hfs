@@ -150,10 +150,16 @@ fn build_code_text_clause(name: &str, value: &str) -> Option<Value> {
 
 /// Builds a :of-type modifier clause for Identifier types.
 /// Format: type-system|type-code|value
+///
+/// A value of fewer than three parts names nothing: the shared `:of-type`
+/// expectation (`modifier_parity_suite`) and MongoDB both match nothing for
+/// one. It is [`match_none`](super::date::match_none) and never `None`, which
+/// the query builder refuses a parameter over (#2510) — and which, before it
+/// did, dropped the value and returned every resource.
 fn build_of_type_clause(name: &str, value: &str) -> Option<Value> {
     let parts: Vec<&str> = value.splitn(3, '|').collect();
     if parts.len() < 3 {
-        return None;
+        return Some(super::date::match_none());
     }
 
     let type_system = parts[0];
@@ -258,6 +264,28 @@ mod tests {
         assert!(!s.contains("must_not"));
         assert!(s.contains("search_params.token.code"));
         assert!(s.contains("male"));
+    }
+
+    /// #2510: a value with fewer than three parts names nothing; it is a
+    /// clause that matches nothing, never `None`, which the query builder
+    /// refuses a parameter over.
+    #[test]
+    fn test_of_type_with_fewer_than_three_parts_matches_nothing() {
+        let param = make_param("identifier", Some(SearchModifier::OfType));
+        for short in ["MR|12345", "12345", ""] {
+            assert_eq!(
+                build_clause(&param, short),
+                Some(json!({ "match_none": {} })),
+                "{short:?}"
+            );
+        }
+
+        let full = build_clause(
+            &param,
+            "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
+        )
+        .unwrap();
+        assert!(full["nested"]["query"]["bool"]["must"].is_array());
     }
 
     #[test]

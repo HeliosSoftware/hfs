@@ -845,7 +845,7 @@ impl SearchProvider for ElasticsearchBackend {
         let mut es_query = EsQueryBuilder::new(tenant_id, &query.resource_type, index.clone())
             .with_max_result_window(self.config().max_result_window)
             .with_max_terms_count(self.config().max_terms_count)
-            .build(query);
+            .build(query)?;
         let base_query = es_query.body["query"].take();
 
         // How many distinct values: sizes the partitions below.
@@ -911,7 +911,7 @@ impl SearchProvider for ElasticsearchBackend {
         let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
             .with_max_result_window(self.config().max_result_window)
             .with_max_terms_count(self.config().max_terms_count);
-        let es_query = builder.build(query);
+        let es_query = builder.build(query)?;
         let over_fetched = es_query.over_fetched;
 
         // Execute search (with retry on transient shard-availability errors)
@@ -1112,7 +1112,7 @@ impl SearchProvider for ElasticsearchBackend {
         let es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
             .with_max_result_window(self.config().max_result_window)
             .with_max_terms_count(self.config().max_terms_count)
-            .build(query);
+            .build(query)?;
         let over_fetched = es_query.over_fetched;
 
         let body = match send_search_with_retry(self, &index, ids_only_body(es_query.body)).await? {
@@ -1188,7 +1188,7 @@ impl SearchProvider for ElasticsearchBackend {
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
 
-        let count_body = build_count_query(tenant_id, resource_type, query);
+        let count_body = build_count_query(tenant_id, resource_type, query)?;
 
         // A count of 0 is a factual claim about the data. Only make it when the
         // cluster actually told us so (success), or when the index genuinely
@@ -1369,7 +1369,7 @@ impl ElasticsearchBackend {
 
         let mut es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
             .with_max_terms_count(self.config().max_terms_count)
-            .build(&standard_query);
+            .build(&standard_query)?;
         for param in &id_params {
             let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
             let matches_id = json!({ "bool": { "should": [
@@ -2235,6 +2235,7 @@ mod tests {
         let query = SearchQuery::new("Patient").with_count(5);
         let built = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string())
             .build(&query)
+            .unwrap()
             .body;
         let body = ids_only_body(built.clone());
 
@@ -2275,7 +2276,7 @@ mod tests {
             .with_count(1000)
             .with_cursor(cursor);
         let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
-        let body = builder.build(&query).body;
+        let body = builder.build(&query).unwrap().body;
 
         assert_eq!(body["search_after"], json!(hit_sort));
         assert_eq!(body["size"], json!(1001));
