@@ -230,7 +230,6 @@ async fn r4_events_invalid_ranges_are_operation_outcomes() {
         "eventsUntilNumber=-1",
         "eventsSinceNumber=0",
         "eventsSinceNumber=3&eventsUntilNumber=1",
-        "eventsSinceNumber=5",
     ] {
         let response = server
             .get(&format!("/Subscription/manual-sub/$events?{query}"))
@@ -239,6 +238,39 @@ async fn r4_events_invalid_ranges_are_operation_outcomes() {
         let outcome: Value = response.json();
         assert_eq!(outcome["resourceType"], "OperationOutcome", "{query}");
         assert_eq!(outcome["issue"][0]["code"], "invalid", "{query}");
+    }
+}
+
+/// A client that remembers the last event number and polls for the next one
+/// gets the status and no events while nothing new has happened, also on a
+/// subscription that has had no events yet.
+#[cfg(feature = "R4")]
+#[tokio::test]
+async fn r4_events_polling_past_the_latest_event_is_empty() {
+    for (events, query) in [
+        (3, "eventsSinceNumber=4"),
+        (3, "eventsSinceNumber=4&eventsUntilNumber=10"),
+        (0, "eventsSinceNumber=1"),
+    ] {
+        let (server, _hook) = server(FhirVersion::R4, events, 100).await;
+        let response = server
+            .get(&format!("/Subscription/manual-sub/$events?{query}"))
+            .await;
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        let params = bundle["entry"][0]["resource"]["parameter"]
+            .as_array()
+            .unwrap();
+        let count = params
+            .iter()
+            .find(|p| p["name"] == "events-since-subscription-start")
+            .unwrap();
+        assert_eq!(count["valueString"], events.to_string(), "{query}");
+        assert!(
+            !params.iter().any(|p| p["name"] == "notification-event"),
+            "{query}"
+        );
+        assert!(focus_ids(&bundle).is_empty(), "{query}");
     }
 }
 
@@ -292,10 +324,16 @@ async fn r4b_events_returns_subscription_status_with_notification_events() {
     assert_eq!(status["notificationEvent"].as_array().unwrap().len(), 2);
     assert_eq!(focus_ids(&bundle), ["Encounter/enc-2", "Encounter/enc-3"]);
 
-    server
+    // Polling past the latest event: the status, no events.
+    let response = server
         .get("/Subscription/manual-sub/$events?eventsSinceNumber=9")
-        .await
-        .assert_status(StatusCode::BAD_REQUEST);
+        .await;
+    response.assert_status_ok();
+    let bundle: Value = response.json();
+    let status = &bundle["entry"][0]["resource"];
+    assert_eq!(status["eventsSinceSubscriptionStart"], "3");
+    assert!(status.get("notificationEvent").is_none());
+    assert!(focus_ids(&bundle).is_empty());
 }
 
 #[cfg(feature = "R5")]

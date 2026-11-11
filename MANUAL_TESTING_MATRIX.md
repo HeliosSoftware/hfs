@@ -1347,8 +1347,10 @@ Save this batch Bundle as `$WORK/fixtures/encounters.json`:
      `request GET Encounter/<id>`, no `resource`).
    - `...$events?eventsSinceNumber=2&eventsUntilNumber=2` → the same shape with exactly
      **1** event (number 2): the range parameters change the result.
-   - `...$events?eventsSinceNumber=5` (above the counter), `...eventsSinceNumber=3&eventsUntilNumber=1`
-     and `...eventsSinceNumber=abc` → `400` with an `OperationOutcome` (issue code `invalid`).
+   - `...$events?eventsSinceNumber=4` (the next number, nothing new yet) → `200` with the
+     status and **0** events (`events-since-subscription-start` still `3`).
+   - `...eventsSinceNumber=3&eventsUntilNumber=1` and `...eventsSinceNumber=abc` → `400`
+     with an `OperationOutcome` (issue code `invalid`).
    - The event history is in memory (size `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE`, default
      100) and is empty after a server restart; a range entirely older than the retained
      events is also `400`.
