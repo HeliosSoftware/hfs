@@ -399,10 +399,12 @@ mod mongodb_backend {
         );
     }
 
-    /// #2301: the tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and the
-    /// `$reindex` resource-type list and newest-resource probe used to stringify the driver error
-    /// into a 500. Against no server they answer `Unavailable` (a retryable 503) with a message
-    /// that names the read and leaves the driver text to the log.
+    /// #2301: the tenant lookup, `delete_with_match`'s load and the `$reindex` resource-type list
+    /// and newest-resource probe used to stringify the driver error into a 500. Against no server
+    /// they answer `Unavailable` (a retryable 503) with a message that names the read and leaves
+    /// the driver text to the log. Since #2146 `$purge` has no existence check; against no server
+    /// its first step is the topology check its transaction makes, and that is what this test
+    /// covers for `$purge`.
     #[tokio::test]
     async fn unreachable_server_lookups_are_unavailable_without_driver_text() {
         let backend = MongoBackend::new(MongoBackendConfig {
@@ -432,7 +434,11 @@ mod mongodb_backend {
             delete,
             "Failed to load resource for delete_with_match: ",
         );
-        assert_unavailable_without_driver_text("purge", purge, "Failed to check resource: ");
+        assert_unavailable_without_driver_text(
+            "purge",
+            purge,
+            "Failed to check the MongoDB topology before the purge: ",
+        );
         assert_unavailable_without_driver_text(
             "list_resource_types",
             types,

@@ -77,9 +77,9 @@ tempfile = "3"
 form_urlencoded = "1"
 
 # SQLite backend
-rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled", "serde_json", "functions", "fallible_uint"], optional = true }
 r2d2 = { version = "0.8", optional = true }
-r2d2_sqlite = { version = "0.26", optional = true }
+r2d2_sqlite = { version = "0.36", default-features = false, optional = true }
 
 # PostgreSQL backend
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"], optional = true }
@@ -143,7 +143,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 # Observe the SQL executed by the SQLite preview regression test.
-rusqlite = { version = "0.33", features = ["trace"] }
+rusqlite = { version = "0.41", features = ["trace"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -155,6 +155,11 @@ ctor = "0.2"
 # Asserts that lease loss, heartbeat timeouts, and broken input streams are
 # logged at `warn` (#1127).
 tracing-test = "0.2"
+# A thread-local recorder that reads back what a deferred-index repair pass and
+# a post-commit step publish (#2034, #2036); the same versions and features as
+# `helios-observability`, so nothing new is built.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
 # timeouts) that a real cluster cannot be made to produce on demand (#1125).
 wiremock = "0.6"
@@ -182,6 +187,11 @@ required-features = ["sqlite"]
 [[example]]
 name = "bulk_submit_mongo_bench"
 required-features = ["mongodb"]
+
+# Search-parameter extraction timing and canonical value dump (SQLite marshal).
+[[example]]
+name = "extract_probe"
+required-features = ["sqlite"]
 
 # Chained and `_has` search as REST runs it: resolve, then the first page.
 [[example]]

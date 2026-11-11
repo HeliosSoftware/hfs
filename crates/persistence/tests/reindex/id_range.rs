@@ -419,8 +419,9 @@ pub async fn assert_ranges_cover_a_type_once<B: RangedBackend>(
 }
 
 /// Resources created while a ranged job runs: one in range ahead of the
-/// cursor is read by the job, one in range behind the cursor and one outside
-/// the range are not, and all three are searchable through their own writes.
+/// cursor may be read by the job (unless its page was prefetched first), one
+/// in range behind the cursor and one outside the range are not, and all
+/// three are searchable through their own writes.
 pub async fn assert_ranged_run_with_a_write_during_it<B: RangedBackend>(
     backend: Arc<B>,
     registries: Arc<TenantSearchRegistries>,
@@ -455,11 +456,16 @@ pub async fn assert_ranged_run_with_a_write_during_it<B: RangedBackend>(
         "{:?}",
         progress.error_message
     );
-    // `total` was counted before the writes; the walk reads one of them.
+    // `total` was counted before the writes. The one ahead of the cursor is
+    // read when the walk fetches its next page after the write; a source that
+    // prefetches that page while the first one is written (SQLite and
+    // PostgreSQL do) may already have read past it. Either way at most once,
+    // and it is searchable through its own write.
     assert_eq!(progress.total_resources, 4);
-    assert_eq!(progress.processed_resources, 5);
     let written = writer.written_counts();
-    assert_eq!(written.get("6-during"), Some(&1));
+    let ahead = written.get("6-during").copied().unwrap_or(0);
+    assert!(ahead <= 1, "{written:?}");
+    assert_eq!(progress.processed_resources, 4 + ahead as u64);
     assert_eq!(written.get("4-during"), None, "behind the cursor");
     assert_eq!(written.get("c-during"), None, "outside the range");
     assert_eq!(patients_found(backend.as_ref(), &tenant).await, 19);

@@ -546,6 +546,24 @@ pub trait SearchProvider: ResourceStorage {
     fn search_param_registry(&self, tenant: &TenantContext)
     -> Arc<RwLock<SearchParameterRegistry>>;
 
+    /// Whether [`search`](Self::search) is really implemented, as opposed to
+    /// answering `UnsupportedCapability`.
+    ///
+    /// Defaults to `true`: a type that implements the required `search` serves
+    /// it. A storage whose `search` is a stub overrides this from its declared
+    /// [`BackendCapability::BasicSearch`](crate::core::BackendCapability::BasicSearch)
+    /// (standalone S3 does), and a wrapper that forwards `search` to an inner
+    /// storage forwards this too; `CompositeStorage` answers for whichever
+    /// provider its `search` reaches.
+    ///
+    /// The REST layer builds `GET /metadata` from this: `search-type` and the
+    /// `searchParam` / `searchInclude` / `searchRevInclude` lists are advertised
+    /// only where it is `true`, so the statement and the `501` a search request
+    /// gets from a stub `search` cannot disagree (#514).
+    fn supports_search(&self) -> bool {
+        true
+    }
+
     /// Whether this backend can evaluate `_contained=true|both` searches (which
     /// require contained-resource indexing). Defaults to `false`; backends that
     /// index `contained[]` entries override this. The REST layer uses it to

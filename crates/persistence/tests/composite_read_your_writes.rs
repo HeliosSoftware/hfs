@@ -137,6 +137,10 @@ impl ResourceStorage for LaggingIndex {
 
 #[async_trait]
 impl SearchProvider for LaggingIndex {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
+
     async fn search(
         &self,
         tenant: &TenantContext,

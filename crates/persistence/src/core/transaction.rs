@@ -482,7 +482,8 @@ pub struct BundleEntry {
     /// If-Match header value for conditional operations.
     #[serde(default)]
     pub if_match: Option<String>,
-    /// If-None-Match header value for conditional creates.
+    /// If-None-Match header value: the conditional-read validator of a `GET`
+    /// entry (#869), answered `304` when it names the current version.
     #[serde(default)]
     pub if_none_match: Option<String>,
     /// If-None-Exist header for conditional creates.
@@ -749,6 +750,24 @@ impl BundleEntryResult {
             etag: Some(resource.etag().to_string()),
             last_modified: Some(resource.last_modified().to_rfc3339()),
             resource: Some(resource.content_with_meta()),
+            outcome: None,
+            effect: BundleEntryEffect::Read,
+        }
+    }
+
+    /// Creates the result for a read whose `ifNoneMatch` named the resource's
+    /// current version (#869): `304`, no resource and no outcome.
+    ///
+    /// Bare, as the direct read handler's `304` is: a client that sent the tag
+    /// has the representation, so nothing about the resource is repeated. The
+    /// entry only read, so its effect is [`BundleEntryEffect::Read`].
+    pub fn not_modified() -> Self {
+        Self {
+            status: 304,
+            location: None,
+            etag: None,
+            last_modified: None,
+            resource: None,
             outcome: None,
             effect: BundleEntryEffect::Read,
         }

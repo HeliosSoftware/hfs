@@ -4851,6 +4851,10 @@ mod contained_search {
 
     #[async_trait]
     impl SearchProvider for CountingSearch {
+        fn supports_search(&self) -> bool {
+            self.inner.supports_search()
+        }
+
         async fn search(
             &self,
             tenant: &TenantContext,

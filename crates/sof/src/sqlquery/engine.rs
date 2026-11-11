@@ -533,7 +533,7 @@ impl InMemorySqlEngine {
     /// the engine's own `create_table` / `insert_rows` / `create_view`
     /// statements are unaffected.
     pub fn execute_select(
-        &self,
+        &mut self,
         sql: &str,
         bindings: &[BoundParam],
         max_rows: usize,
@@ -550,13 +550,15 @@ impl InMemorySqlEngine {
                 Authorization::Deny
             }
         };
-        self.conn.authorizer(Some(read_only));
+        // Fail closed: if the authorizer cannot be installed, run nothing.
+        self.conn.authorizer(Some(read_only))?;
         let result = self.run_select(sql, bindings, max_rows);
-        self.conn
+        let removed = self
+            .conn
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         match refused.get() {
             Some(keyword) => Err(not_select(keyword)),
-            None => result,
+            None => result.and_then(|r| removed.map(|()| r).map_err(Into::into)),
         }
     }
 
@@ -587,7 +589,7 @@ impl InMemorySqlEngine {
             }
         }
 
-        let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let columns: Vec<String> = stmt.column_names().map(String::from).collect();
         // Pre-seed with String to be overwritten per row.
         let mut column_types: Vec<ColumnFhirType> = columns
             .iter()
@@ -809,7 +811,7 @@ mod tests {
             Ok(json!({"score": 1, "id": "p1"})),
             Ok(json!({"score": 2, "id": "p2"})),
         ]);
-        let (engine, inserted) = engine
+        let (mut engine, inserted) = engine
             .insert_rows("union_rows", &schema, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -841,7 +843,7 @@ mod tests {
             Ok(json!({"id": "a", "n": 1})),
             Ok(json!({"id": "b", "n": 2})),
         ]);
-        let (engine, inserted) = engine
+        let (mut engine, inserted) = engine
             .insert_rows("patients", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -864,7 +866,7 @@ mod tests {
         ]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter(vec![Ok(json!({"id": "a"}))]); // age missing
-        let (engine, _inserted) = engine
+        let (mut engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -928,7 +930,7 @@ mod tests {
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((1..=10).map(|i| Ok(json!({"n": i}))));
-        let (engine, _inserted) = engine
+        let (mut engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();
@@ -954,7 +956,7 @@ mod tests {
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((1..=5).map(|i| Ok(json!({"n": i}))));
-        let (engine, _inserted) = engine
+        let (mut engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();
@@ -1005,7 +1007,7 @@ mod tests {
             ]);
             engine.create_table("t", &s).unwrap();
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            let (engine, inserted) = engine
+            let (mut engine, inserted) = engine
                 .insert_rows("t", &s, Box::pin(stream), 10_000)
                 .await
                 .unwrap();
@@ -1193,7 +1195,7 @@ mod tests {
             Ok(json!({"id": "b", "n": 2})),
             Ok(json!({"id": "c", "n": 3})),
         ]);
-        let (engine, inserted) = engine
+        let (mut engine, inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -1227,7 +1229,7 @@ mod tests {
             Ok(json!({"id": "b", "n": 2})),
             Ok(json!({"id": "c", "n": 3})),
         ]);
-        let (engine, _inserted) = engine
+        let (mut engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -1244,7 +1246,7 @@ mod tests {
 
     #[test]
     fn create_view_over_empty_schema_table_works() {
-        let engine = InMemorySqlEngine::open().unwrap();
+        let mut engine = InMemorySqlEngine::open().unwrap();
         let s = TableSchema { columns: vec![] };
         engine.create_table("e", &s).unwrap();
         engine.create_view("ve", "e").unwrap();
@@ -1279,7 +1281,7 @@ mod tests {
     /// prefix) cannot modify the database.
     #[test]
     fn execute_select_refuses_writes_ddl_pragma_and_attach() {
-        let engine = InMemorySqlEngine::open().unwrap();
+        let mut engine = InMemorySqlEngine::open().unwrap();
         engine
             .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
             .unwrap();
@@ -1318,7 +1320,7 @@ mod tests {
 
         // Nothing took effect: t still exists, is empty and kept its one column
         // (the ALTER did not run), and no u, v, i or tt was created.
-        let count = |sql: &str| {
+        let mut count = |sql: &str| {
             let result = engine.execute_select(sql, &[], 10).unwrap();
             result.rows[0][0].clone()
         };
@@ -1348,7 +1350,7 @@ mod tests {
     /// server; the `sqlite3_stmt_readonly` check must refuse it.
     #[test]
     fn execute_select_refuses_vacuum_into() {
-        let engine = InMemorySqlEngine::open().unwrap();
+        let mut engine = InMemorySqlEngine::open().unwrap();
         engine
             .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
             .unwrap();
@@ -1371,7 +1373,7 @@ mod tests {
     /// Pins that a trailing write never runs (rusqlite drops the tail).
     #[test]
     fn execute_select_never_runs_a_trailing_statement() {
-        let engine = InMemorySqlEngine::open().unwrap();
+        let mut engine = InMemorySqlEngine::open().unwrap();
         engine
             .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
             .unwrap();
@@ -1392,7 +1394,7 @@ mod tests {
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((1..=3).map(|i| Ok(json!({"n": i}))));
-        let (engine, _) = engine
+        let (mut engine, _) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();
@@ -1436,7 +1438,7 @@ mod tests {
     /// statements keep working after a refused query.
     #[tokio::test]
     async fn engine_setup_still_runs_after_a_refused_query() {
-        let engine = InMemorySqlEngine::open().unwrap();
+        let mut engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
 
@@ -1445,7 +1447,7 @@ mod tests {
 
         engine.create_table("u", &s).unwrap();
         let rows = stream::iter((1..=2).map(|i| Ok(json!({"n": i}))));
-        let (engine, inserted) = engine
+        let (mut engine, inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();

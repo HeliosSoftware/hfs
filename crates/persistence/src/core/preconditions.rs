@@ -575,6 +575,38 @@ pub fn bundle_if_none_exist_gate(matches: Vec<StoredResource>) -> Option<BundleE
     }
 }
 
+/// Answers a bundle `GET [type]/[id]` entry that found `resource`, honouring its
+/// `ifNoneMatch` (#869) as the direct read handler honours `If-None-Match`, so
+/// the REST batch arm and every backend's transaction executor agree by
+/// construction (the same discipline as [`bundle_if_match_gate`]).
+///
+/// - No `ifNoneMatch`, or one that does not name the current version: `200` with
+///   the resource, as an unconditional read answers.
+/// - An `ifNoneMatch` that does (a listed tag equal to the version id, weakly
+///   compared, or `*`): `304` and no resource ([`BundleEntryResult::not_modified`]).
+/// - A value that is not a list of entity-tags cannot be satisfied, and is
+///   treated as "does not match": the direct read handler does the same, and for
+///   a safe method that means the full representation, never an error.
+///
+/// A read that finds nothing never reaches this: its `404` does not depend on
+/// `ifNoneMatch`.
+pub fn bundle_read_result(
+    resource: StoredResource,
+    raw_if_none_match: Option<&str>,
+) -> BundleEntryResult {
+    let not_modified = raw_if_none_match
+        .and_then(|raw| EntityTagPrecondition::parse([raw]).ok())
+        .is_some_and(|precondition| {
+            !precondition.if_none_match_satisfied(Some(resource.version_id()))
+        });
+
+    if not_modified {
+        BundleEntryResult::not_modified()
+    } else {
+        BundleEntryResult::ok(resource)
+    }
+}
+
 /// Builds the `412 multiple-matches` bundle entry result for a conditional
 /// `operation` (`create`, `update`, `delete`) whose criteria resolved to
 /// `count` resources.
@@ -974,6 +1006,60 @@ mod tests {
             outcome["issue"][0]["diagnostics"],
             "Conditional create matched 2 resources"
         );
+    }
+
+    // ── ifNoneMatch on a read entry ──────────────────────────────────────────
+
+    /// `stored("p1")` is at version `1`.
+    #[test]
+    fn read_result_answers_304_when_a_tag_names_the_current_version() {
+        for tag in [
+            "W/\"1\"",
+            "\"1\"",
+            "*",
+            "W/\"7\", W/\"1\", W/\"9\"",
+            " W/\"1\" ",
+        ] {
+            let result = bundle_read_result(stored("p1"), Some(tag));
+            assert_eq!(result.status, 304, "{tag}");
+            assert!(result.resource.is_none(), "{tag}: no body on 304");
+            assert!(result.outcome.is_none(), "{tag}: not a failure");
+            assert_eq!(
+                result.effect,
+                crate::core::transaction::BundleEntryEffect::Read,
+                "{tag}: the entry only read"
+            );
+        }
+    }
+
+    #[test]
+    fn read_result_answers_200_when_no_tag_names_the_current_version() {
+        for tag in [None, Some("W/\"2\""), Some("\"9\", W/\"8\"")] {
+            let result = bundle_read_result(stored("p1"), tag);
+            assert_eq!(result.status, 200, "{tag:?}");
+            assert_eq!(result.etag.as_deref(), Some("W/\"1\""), "{tag:?}");
+            assert_eq!(
+                result
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.get("id"))
+                    .and_then(|v| v.as_str()),
+                Some("p1"),
+                "{tag:?}"
+            );
+        }
+    }
+
+    /// The direct read handler treats a header it cannot parse as "does not
+    /// match" (the full representation for a safe method), and so does the
+    /// entry: it must never turn into a `304`, nor into an error.
+    #[test]
+    fn read_result_treats_an_unparseable_tag_as_not_matching() {
+        for tag in ["", "  ", "1", "not-a-tag", "*, W/\"1\"", ","] {
+            let result = bundle_read_result(stored("p1"), Some(tag));
+            assert_eq!(result.status, 200, "{tag:?}");
+            assert!(result.resource.is_some(), "{tag:?}");
+        }
     }
 
     #[test]

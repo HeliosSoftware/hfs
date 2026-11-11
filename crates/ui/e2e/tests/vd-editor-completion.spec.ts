@@ -182,7 +182,11 @@ test("FHIRPath completion after a dot offers the resolved type's own elements", 
   // Right before the closing quote of "Patient.name" — typing "." makes it
   // "Patient.name.", a member position off HumanName.
   await ed.setCursorAfter(doc, "Patient.name");
+  const completed = page.waitForResponse(
+    r => r.url().endsWith("/ui/sql/view-definitions/complete") && r.ok(),
+  );
   await page.keyboard.type(".");
+  const { items } = (await (await completed).json()) as { items: unknown[] };
   await expect(ed.completionPopup).toBeVisible();
 
   await expect(ed.optionByLabel("given")).toBeVisible();
@@ -190,10 +194,14 @@ test("FHIRPath completion after a dot offers the resolved type's own elements", 
   // #821 (validator-caught during 02): the library's own default
   // `maxRenderedOptions` (100) silently truncated exactly this response —
   // HumanName's own elements plus the entire function catalog. Asserting
-  // the full, known count (not just "some" elements) is what actually
-  // guards `code-editor.js`'s `maxRenderedOptions: 300` against a future
-  // regression back to the default.
-  await expect(ed.completionOptions).toHaveCount(114);
+  // that every item the server sent is rendered (not just "some" elements)
+  // is what actually guards `code-editor.js`'s `maxRenderedOptions: 300`
+  // against a future regression back to the default. The count is read
+  // from the response, not hard-coded, so a new FHIRPath function (#2245
+  // added seven) does not break this test; the floor keeps the response
+  // above the old default, or the check would no longer catch a cap.
+  expect(items.length).toBeGreaterThan(100);
+  await expect(ed.completionOptions).toHaveCount(items.length);
 });
 
 test("FHIRPath completion resolves the ancestor select's own forEach context", async ({
