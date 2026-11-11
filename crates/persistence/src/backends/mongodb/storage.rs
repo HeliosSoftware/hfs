@@ -7881,7 +7881,22 @@ impl MongoBackend {
         let new_version = next_version(expected_version)?;
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
-        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
+        // A Bundle that defers this type extracts nothing here, as for a create
+        // (#2256): the post-commit batch (or the repair) writes the rows and
+        // `missing_params` / `missing_params_fp` from one extraction of the
+        // stored document, and clears the marker in the same update. With no
+        // extraction, `resource_update` below removes the metadata the
+        // previous version carried (unknown, not "known absent"), so the
+        // updated or restored resource is in the state a deferred create is
+        // until its batch: marked, with no `missing_params` (#2035). Extracting
+        // here would pay for the same extraction twice and have the
+        // transaction pin the `missing_params` index keys until it commits.
+        let marker = writes.pending_marker(resource_type);
+        let search_documents = if marker.is_some() {
+            SearchIndexDocuments::default()
+        } else {
+            self.search_index_documents(tenant_id, resource_type, id, &resource)
+        };
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -7896,7 +7911,7 @@ impl MongoBackend {
             "deleted_at": Bson::Null,
             "fhir_version": &fhir_version_str,
         };
-        if let Some(marker) = writes.pending_marker(resource_type) {
+        if let Some(marker) = marker {
             set.insert(SEARCH_ROWS_PENDING_FIELD, marker);
         }
 
@@ -8944,11 +8959,13 @@ impl MongoBackend {
     /// resource is only noted for the post-commit step.
     ///
     /// The rows come from `docs`, which the caller built from the same
-    /// extraction as the resource's `missing_params`. A deferred type drops
-    /// `docs`: its rows are rebuilt after commit, and so are its
-    /// `missing_params`. An update's `docs` carry the `missing_params` the
-    /// caller already wrote on the document; a deferred create builds none
-    /// (#1975).
+    /// extraction as the resource's `missing_params`. A deferred type's `docs`
+    /// are empty: a create and an update both skip the extraction for a type
+    /// the Bundle defers (`BundleWrites::pending_marker`), because its rows are
+    /// built after commit and so are its `missing_params` and
+    /// `missing_params_fp`, from one extraction of the stored document
+    /// (#1975, #2035). An update that defers leaves the document with the
+    /// marker and no `missing_params`, as a deferred create does.
     fn search_rows_in_transaction(
         &self,
         writes: &mut BundleWrites,
@@ -8975,8 +8992,11 @@ impl MongoBackend {
     /// Writes a resource's search rows inside the Bundle's transaction, or, when
     /// the Bundle defers them for this type (#1975), only notes the resource for
     /// the post-commit step: neither the two deletes nor the inserts run. See
-    /// [`Self::search_rows_in_transaction`]. A create stages its rows with its
-    /// document instead (#1977).
+    /// [`Self::search_rows_in_transaction`]. A deferred type's `missing_params`
+    /// are not "already on the resource document" either: the caller skipped
+    /// the extraction, so the update removed them and the post-commit step
+    /// writes them (#2035). A create stages its rows with its document instead
+    /// (#1977).
     #[allow(clippy::too_many_arguments)]
     async fn index_resource_in_bundle_transaction(
         &self,
