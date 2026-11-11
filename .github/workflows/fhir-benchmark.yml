@@ -206,7 +206,7 @@ on:
         required: false
         default: "1g"
       es_sync_mode:
-        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
+        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 50ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
         type: choice
         required: false
         default: synchronous
@@ -747,7 +747,10 @@ jobs:
               # synchronous = this benchmark's default (see the es_sync_mode
               # input): the conformance workflows' read-your-writes setting
               # (inferno-us-core.yml — wait_for makes the refresh interval
-              # the price of every write, hence 200ms). Async import cannot
+              # the price of every write, hence a short interval: 50ms,
+              # measured against 200ms on the full corpus in #2180, E-33 and
+              # E-34: insert x2.5, CRUD +71 %, import +34 %, setup 3.7x
+              # shorter, search unchanged). Async import cannot
               # finish the 1000-bundle corpus inside k6's 60-minute cap
               # (run 36412022609: 313/1000 bundles, drain gate
               # status=incomplete, 194,664 resources never reached the
@@ -759,7 +762,7 @@ jobs:
               # backlog before measuring — this is what run 36412022609
               # measured.
               case "${IN_ES_SYNC_MODE:-synchronous}" in
-                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
+                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=50ms ;;
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
               esac

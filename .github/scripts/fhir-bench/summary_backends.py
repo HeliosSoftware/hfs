@@ -235,7 +235,7 @@ if backend.endswith("-elasticsearch"):
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "
-              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **Batch/Transaction Import/crud/insert latency "
+              "with `refresh=wait_for` against a 50ms `refresh_interval`, so **Batch/Transaction Import/crud/insert latency "
               "on this leg includes Elasticsearch indexing plus that refresh wait**, not just the "
               "primary. Every update and delete also runs a `_delete_by_query` with a forced refresh "
               "across all of the tenant's indices. Cluster health `yellow` is expected (1 replica per "
