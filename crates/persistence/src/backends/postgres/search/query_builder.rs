@@ -738,12 +738,36 @@ fn is_relative_type_id(value: &str) -> bool {
     !value.starts_with("http://") && !value.starts_with("https://")
 }
 
+/// The refusal for a parameter the builders have values for but no condition to
+/// build from (#2508): a `special`-typed parameter no arm of
+/// `build_parameter_condition` evaluates (`near`, and from R5 `_type`,
+/// `_filter`, `contains`, `section-text`), or a composite without its
+/// components. Skipped, it would leave the query with fewer conditions than were
+/// asked for — with none at all, every resource of the type.
+fn unevaluable_parameter(param: &SearchParameter, resource_type: &str) -> SearchError {
+    SearchError::QueryParseError {
+        message: format!(
+            "search parameter '{}' cannot be evaluated by the PostgreSQL backend: no condition \
+             can be built for it, and ignoring it would widen the search to every {resource_type}",
+            param.name
+        ),
+    }
+}
+
 impl PostgresQueryBuilder {
     /// Builds a search query for finding matching resource IDs.
     ///
     /// Returns a SQL fragment that selects DISTINCT resource_ids from search_index
-    /// matching the given search parameters.
-    pub fn build_search_query(query: &SearchQuery, param_offset: usize) -> Option<SqlFragment> {
+    /// matching the given search parameters, or `None` when the query asks for
+    /// no condition at all.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::build_search_query_for`].
+    pub fn build_search_query(
+        query: &SearchQuery,
+        param_offset: usize,
+    ) -> Result<Option<SqlFragment>, SearchError> {
         Self::build_search_query_for(query, param_offset, IndexLayout::Denormalized)
     }
 
@@ -755,11 +779,19 @@ impl PostgresQueryBuilder {
     /// conjunction. A database that predates v18 still stores one row per
     /// component, where that conjunction matches nothing at all — the search
     /// silently returns an empty bundle rather than failing.
+    ///
+    /// # Errors
+    ///
+    /// A parameter that carries values but for which no condition can be built
+    /// is an error, never skipped (#2508): a query with no conditions matches
+    /// every resource of the type, so skipping `Location?near=…`, or `_type` on
+    /// R5/R6, answered with the whole type. A parameter with no values asks for
+    /// nothing and constrains nothing.
     pub fn build_search_query_for(
         query: &SearchQuery,
         param_offset: usize,
         layout: IndexLayout,
-    ) -> Option<SqlFragment> {
+    ) -> Result<Option<SqlFragment>, SearchError> {
         // Repeated occurrences of one parameter name are independent candidate
         // sets ANDed together (`?date=ge2020&date=le2021`). Built as one
         // `id IN (…)` per occurrence the conjunction is two semi-joins, and
@@ -902,6 +934,11 @@ impl PostgresQueryBuilder {
                 }
                 current_offset += condition.params.len();
                 conditions.push(condition);
+            } else if !param.values.is_empty() {
+                // Something was asked for and cannot be answered. Answering
+                // anyway, without it, would be a wider question than the one
+                // asked (#2508). A parameter with no values asks for nothing.
+                return Err(unevaluable_parameter(param, &query.resource_type));
             }
         }
 
@@ -915,7 +952,7 @@ impl PostgresQueryBuilder {
         }
 
         if conditions.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // AND all conditions together
@@ -924,7 +961,7 @@ impl PostgresQueryBuilder {
             combined = combined.and(cond);
         }
 
-        Some(combined)
+        Ok(Some(combined))
     }
 
     /// Only the measured patient + top-level token/quantity composite shape uses
@@ -1213,8 +1250,18 @@ impl PostgresQueryBuilder {
     /// `_tag`, `_profile`, `_security`, `_source` and `_language` are indexed
     /// from the contained resource's own `meta` like any other parameter. What
     /// the contained rows cannot answer is refused by
-    /// [`Self::reject_unsupported_contained`], which every caller runs first;
-    /// this function skips those parameters.
+    /// [`Self::reject_unsupported_contained`], which every caller runs first.
+    ///
+    /// # Errors
+    ///
+    /// A parameter that carries values but that no branch below can build is an
+    /// error, never skipped (#2508). That includes everything
+    /// `reject_unsupported_contained` refuses (chains, `_lastUpdated`, `_text`
+    /// and the other `_` names the contained rows cannot answer, `:missing` and
+    /// the other modifiers that are not a predicate on one index row, `special`
+    /// parameters, a composite with a modifier or without components): a caller
+    /// that skipped the gate gets the refusal from here instead of a query
+    /// without the criterion. A parameter with no values asks for nothing.
     ///
     /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
     ///
@@ -1222,7 +1269,7 @@ impl PostgresQueryBuilder {
     /// own references. With no criterion at all the result is every contained
     /// resource of the type (#1383), so this always returns `Some`. The rows
     /// are unordered; the caller sorts them before paging.
-    pub fn build_contained(query: &SearchQuery) -> Option<SqlFragment> {
+    pub fn build_contained(query: &SearchQuery) -> Result<Option<SqlFragment>, SearchError> {
         // (branch, negated)
         let mut branches: Vec<(String, bool)> = Vec::new();
         let mut entity_filters: Vec<String> = Vec::new();
@@ -1233,8 +1280,14 @@ impl PostgresQueryBuilder {
         let mut offset = 2;
 
         for param in &query.parameters {
-            if Self::contained_unsupported_reason(param).is_some() || param.values.is_empty() {
+            if param.values.is_empty() {
                 continue;
+            }
+            // Refused by `reject_unsupported_contained` before any caller gets
+            // here, so this is a backstop: a parameter the contained rows
+            // cannot answer is an error, not a criterion left out (#2508).
+            if Self::contained_unsupported_reason(param).is_some() {
+                return Err(unevaluable_parameter(param, &query.resource_type));
             }
 
             if param.name == "_id" {
@@ -1393,14 +1446,19 @@ impl PostgresQueryBuilder {
                     ))),
                     (SearchParamType::Composite | SearchParamType::Special, _) => None,
                 };
-                if let Some((sql, ps)) = predicate {
-                    offset += ps.len();
-                    or_parts.push(sql);
-                    params.extend(ps);
-                }
-            }
-            if or_parts.is_empty() {
-                continue;
+                // A value with no predicate is an error, not a dropped
+                // alternative: `or_parts` is built one-per-value, so it is
+                // never empty here (an empty `values` was skipped above) and no
+                // branch is ever left out. Only the `Composite | Special` arm
+                // yields `None`: a composite is paired in the branch before
+                // this loop, and `contained_unsupported_reason` refuses a
+                // `special` parameter above.
+                let Some((sql, ps)) = predicate else {
+                    return Err(unevaluable_parameter(param, &query.resource_type));
+                };
+                offset += ps.len();
+                or_parts.push(sql);
+                params.extend(ps);
             }
             branches.push((
                 format!(
@@ -1477,7 +1535,7 @@ impl PostgresQueryBuilder {
                 };
             sql.push_str(&format!(" HAVING {having}"));
         }
-        Some(SqlFragment::with_params(sql, params))
+        Ok(Some(SqlFragment::with_params(sql, params)))
     }
 
     /// Why `_contained` matching cannot apply `param`, if it cannot.
@@ -1799,6 +1857,12 @@ impl PostgresQueryBuilder {
     }
 
     /// Builds a condition for a single search parameter.
+    ///
+    /// `None` means "no condition for this parameter", which is only the right
+    /// answer for a parameter with no values. For one that has values the caller
+    /// must refuse the query ([`unevaluable_parameter`]) rather than leave the
+    /// parameter out: a value no builder can interpret is built as
+    /// [`match_nothing`], never as `None` (#1289, #1319, #2508).
     fn build_parameter_condition(
         param: &SearchParameter,
         param_offset: usize,
@@ -1857,6 +1921,11 @@ impl PostgresQueryBuilder {
                 IndexLayout::Denormalized => Self::build_composite_condition(param, param_offset),
                 IndexLayout::Legacy => Self::build_composite_condition_legacy(param, param_offset),
             },
+            // Nothing indexes a `special` parameter, and the ones with a
+            // condition (`_id`, `_lastUpdated`, `_text`, `_content`) were
+            // dispatched by name above. The rest — `Location.near`, and from R5
+            // `_type`, `_filter`, `contains`, `section-text` — have none, which
+            // the caller turns into an error (#2508).
             SearchParamType::Special => None,
         }
     }
@@ -3013,8 +3082,8 @@ impl PostgresQueryBuilder {
                 // value, so `eq2024-01-15` meant midnight rather than the day.
                 // Not a date: a bare `FALSE` predicate with no params, rather
                 // than `None`. Composite callers treat `None` as match-nothing,
-                // but `build_contained` skips it, which would drop the
-                // constraint and over-match (#1289).
+                // but `build_contained` used to skip it, which dropped the
+                // constraint and over-matched (#1289); it refuses it now.
                 let mut next = offset;
                 let (sql, params) =
                     date_predicate("value_date", value.prefix, &value.value, &mut next);
@@ -3503,6 +3572,27 @@ mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
 
+    // The builders refuse a parameter they have no condition for (#2508). The
+    // tests that pin the SQL of a query the builder accepts go through these, so
+    // a refusal fails them with its message; the refusals themselves are
+    // asserted against `PostgresQueryBuilder` directly.
+    fn accepted(query: &SearchQuery, offset: usize) -> Option<SqlFragment> {
+        PostgresQueryBuilder::build_search_query(query, offset).expect("the query builds")
+    }
+
+    fn accepted_for(
+        query: &SearchQuery,
+        offset: usize,
+        layout: IndexLayout,
+    ) -> Option<SqlFragment> {
+        PostgresQueryBuilder::build_search_query_for(query, offset, layout)
+            .expect("the query builds")
+    }
+
+    fn accepted_contained(query: &SearchQuery) -> Option<SqlFragment> {
+        PostgresQueryBuilder::build_contained(query).expect("the query builds")
+    }
+
     fn query_1579() -> SearchQuery {
         SearchQuery::new("Observation")
             .with_parameter(SearchParameter {
@@ -3567,7 +3657,7 @@ mod tests {
             ] {
                 let mut query = base.clone();
                 query.parameters = order.map(|index| base.parameters[index].clone()).to_vec();
-                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                let fragment = accepted(&query, offset).unwrap();
                 assert!(
                     fragment
                         .sql
@@ -3631,15 +3721,14 @@ mod tests {
         q.contained = ContainedMode::Both;
         cases.push(q);
         for query in cases {
-            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            let fragment = accepted(&query, 2).unwrap();
             assert!(
                 !fragment.sql.contains("scoped_quantity"),
                 "{}",
                 fragment.sql
             );
         }
-        let legacy =
-            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        let legacy = accepted_for(&base, 2, IndexLayout::Legacy).unwrap();
         assert!(!legacy.sql.contains("scoped_quantity"));
     }
 
@@ -3651,7 +3740,7 @@ mod tests {
                 if reversed {
                     query.parameters.reverse();
                 }
-                let frag = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                let frag = accepted(&query, offset).unwrap();
                 assert!(
                     frag.sql.contains("WITH scoped_composite AS MATERIALIZED"),
                     "{}",
@@ -3729,11 +3818,10 @@ mod tests {
         q.resource_type = "DiagnosticReport".into();
         cases.push(q);
         for query in cases {
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            let frag = accepted(&query, 2).unwrap();
             assert!(!frag.sql.contains("MATERIALIZED"), "{}", frag.sql);
         }
-        let frag =
-            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        let frag = accepted_for(&base, 2, IndexLayout::Legacy).unwrap();
         let patient = PostgresQueryBuilder::build_parameter_condition(
             &base.parameters[0],
             2,
@@ -3767,7 +3855,7 @@ mod tests {
             SearchPrefix::Gt,
             "2010-01-01",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -3784,7 +3872,7 @@ mod tests {
         let query = SearchQuery::new("Encounter")
             .with_parameter(date_param("date", SearchPrefix::Gt, "2010-01-01"))
             .with_parameter(date_param("date", SearchPrefix::Lt, "2020-01-01"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
     }
@@ -3851,7 +3939,7 @@ mod tests {
                 query.parameters.reverse();
             }
             for offset in [2, 4] {
-                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                let fragment = accepted(&query, offset).unwrap();
                 assert_eq!(fragment.sql.matches("id IN (").count(), 3);
                 assert_eq!(fragment.sql.matches(" INTERSECT ").count(), 1);
                 assert_eq!(fragment.sql.matches(" UNION ALL ").count(), 1);
@@ -3907,7 +3995,7 @@ mod tests {
             bare.parameters[1].values = vec![SearchValue::new(prefix, "75")];
             bare.parameters.reverse();
             for offset in [2, 4] {
-                let fragment = PostgresQueryBuilder::build_search_query(&bare, offset).unwrap();
+                let fragment = accepted(&bare, offset).unwrap();
                 assert!(fragment.sql.contains(" AND EXISTS("));
                 assert_eq!(
                     bind_numbers(&fragment.sql, offset),
@@ -3940,8 +4028,7 @@ mod tests {
                         query.parameters.reverse();
                     }
                     for offset in [2, 4] {
-                        let fragment =
-                            PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                        let fragment = accepted(&query, offset).unwrap();
                         assert_eq!(fragment.params.len(), param_count, "{prefix:?} {value}");
                         assert_eq!(
                             bind_numbers(&fragment.sql, offset),
@@ -4112,7 +4199,7 @@ mod tests {
         // candidate arm. A repeat keeps its pre-existing repeated-name fold.
         let mut invalid = base.clone();
         invalid.parameters[1].values[0].value = "bogus".into();
-        let fragment = PostgresQueryBuilder::build_search_query(&invalid, 2).unwrap();
+        let fragment = accepted(&invalid, 2).unwrap();
         assert!(fragment.sql.contains("FALSE"));
         assert!(!fragment.sql.contains(" INTERSECT "));
         let mut repeated = base;
@@ -4139,7 +4226,7 @@ mod tests {
                 SearchValue::new(SearchPrefix::Eq, "2020-06-01"),
             ],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert_eq!(
             frag.sql,
@@ -4185,7 +4272,7 @@ mod tests {
                 SearchValue::new(SearchPrefix::Gt, "2020-01-01"),
             ],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(
             frag.sql
@@ -4207,7 +4294,7 @@ mod tests {
                 SearchValue::new(SearchPrefix::Eq, "2020-06-01"),
             ],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert_eq!(
             frag.sql,
@@ -4240,7 +4327,7 @@ mod tests {
                     SearchValue::new(SearchPrefix::Eq, b),
                 ],
             ));
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
 
             assert!(!frag.sql.contains(") AND (id IN"), "{name}: {}", frag.sql);
             assert_eq!(
@@ -4277,7 +4364,7 @@ mod tests {
             SearchPrefix::Eq,
             "2013-04-05",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
         assert_eq!(
             frag.sql,
             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND value_date >= $3 AND value_date < $4 AND value_date_end <= $4)"
@@ -4306,7 +4393,7 @@ mod tests {
                 ],
             ))
             .with_parameter(date_param("date", SearchPrefix::Gt, "2019-01-01"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert_eq!(
             frag.sql,
@@ -4356,7 +4443,7 @@ mod tests {
             .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"));
 
         for offset in [2, 4] {
-            let frag = PostgresQueryBuilder::build_search_query(&query, offset).expect("condition");
+            let frag = accepted(&query, offset).expect("condition");
 
             // The intersection is written where the group's first occurrence is,
             // and the parameter that sat in between follows it.
@@ -4424,7 +4511,7 @@ mod tests {
             for value in values {
                 query = query.with_parameter(date_param("date", SearchPrefix::Eq, value));
             }
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
 
             assert_eq!(
                 frag.sql.matches("id IN (").count(),
@@ -4469,7 +4556,7 @@ mod tests {
             .with_parameter(token_param("status", None, "finished"))
             .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"))
             .with_parameter(token_param("status", None, "in-progress"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert_eq!(frag.sql.matches(" INTERSECT ").count(), 2, "{}", frag.sql);
         assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
@@ -4524,7 +4611,7 @@ mod tests {
             SearchPrefix::Ge,
             "2020-01-01",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
         assert_eq!(
@@ -4593,7 +4680,7 @@ mod tests {
                 for param in pair {
                     query = query.with_parameter(param);
                 }
-                let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+                let frag = accepted(&query, 2).expect("condition");
                 let at = if ineligible_first { "first" } else { "last" };
                 assert!(
                     !frag.sql.contains("INTERSECT"),
@@ -4617,7 +4704,7 @@ mod tests {
         let query = SearchQuery::new("Encounter")
             .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
             .with_parameter(date_param("birthdate", SearchPrefix::Le, "2000-01-01"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
         assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
@@ -4643,12 +4730,7 @@ mod tests {
                 .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"))
                 .with_parameter(composite_param("combo-code-value-quantity", "8867-4$lt200"))
         };
-        let flat = PostgresQueryBuilder::build_search_query_for(
-            &composite(),
-            2,
-            IndexLayout::Denormalized,
-        )
-        .expect("condition");
+        let flat = accepted_for(&composite(), 2, IndexLayout::Denormalized).expect("condition");
         assert_eq!(flat.sql.matches(" INTERSECT ").count(), 1, "{}", flat.sql);
         assert_eq!(
             flat.sql.matches("FROM search_index").count(),
@@ -4658,9 +4740,7 @@ mod tests {
         );
         assert!(!flat.sql.contains("GROUP BY"), "{}", flat.sql);
 
-        let legacy =
-            PostgresQueryBuilder::build_search_query_for(&composite(), 2, IndexLayout::Legacy)
-                .expect("condition");
+        let legacy = accepted_for(&composite(), 2, IndexLayout::Legacy).expect("condition");
         assert!(!legacy.sql.contains("INTERSECT"), "{}", legacy.sql);
         assert_eq!(
             legacy
@@ -4678,8 +4758,7 @@ mod tests {
                 .with_parameter(date_param("date", SearchPrefix::Le, "2021-01-01"))
         };
         for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
-            let frag = PostgresQueryBuilder::build_search_query_for(&dated(), 2, layout)
-                .expect("condition");
+            let frag = accepted_for(&dated(), 2, layout).expect("condition");
             assert_eq!(
                 frag.sql.matches(" INTERSECT ").count(),
                 1,
@@ -4765,7 +4844,7 @@ mod tests {
                 special_param(name, values)
             };
             let query = SearchQuery::new("Procedure").with_parameter(param);
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
             assert_eq!(frag.sql, "(FALSE) OR (FALSE)", "{name}");
             assert!(frag.params.is_empty(), "{name}");
         }
@@ -4778,7 +4857,7 @@ mod tests {
         let mut param = date_param("date", SearchPrefix::Eq, "true");
         param.modifier = Some(SearchModifier::Missing);
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
     }
@@ -4807,8 +4886,7 @@ mod tests {
             ],
         });
 
-        let frag = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
-            .expect("fragment");
+        let frag = accepted_for(&query, 2, IndexLayout::Legacy).expect("fragment");
 
         assert!(
             frag.sql.contains("value_token_code_2 = $6"),
@@ -4864,9 +4942,7 @@ mod tests {
         };
         let query = SearchQuery::new("Observation").with_parameter(parameter.clone());
         for offset in [2, 4] {
-            let fragment =
-                PostgresQueryBuilder::build_search_query_for(&query, offset, IndexLayout::Legacy)
-                    .unwrap();
+            let fragment = accepted_for(&query, offset, IndexLayout::Legacy).unwrap();
             assert!(
                 fragment.sql.contains("composite_slot = 1")
                     && fragment.sql.contains("composite_slot = 2"),
@@ -4893,8 +4969,7 @@ mod tests {
                 (offset + 1..=offset + fragment.params.len()).collect::<Vec<_>>()
             );
         }
-        let fragment =
-            PostgresQueryBuilder::build_contained(&contained_query(vec![parameter])).unwrap();
+        let fragment = accepted_contained(&contained_query(vec![parameter])).unwrap();
         assert!(
             fragment.sql.contains("composite_slot = 1")
                 && fragment.sql.contains("composite_slot = 2"),
@@ -4931,8 +5006,7 @@ mod tests {
             ],
         });
 
-        let frag = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
-            .expect("fragment");
+        let frag = accepted_for(&query, 2, IndexLayout::Legacy).expect("fragment");
 
         assert!(
             !frag.sql.contains("_2"),
@@ -4969,8 +5043,8 @@ mod tests {
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
 
-        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
-            .expect("legacy composite condition");
+        let legacy =
+            accepted_for(&query, 2, IndexLayout::Legacy).expect("legacy composite condition");
         assert!(
             legacy
                 .sql
@@ -4987,9 +5061,8 @@ mod tests {
         // two same-type components into one denormalized row.
         assert!(!legacy.sql.contains("value_token_code_2"), "{}", legacy.sql);
 
-        let flat =
-            PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Denormalized)
-                .expect("denormalized composite condition");
+        let flat = accepted_for(&query, 2, IndexLayout::Denormalized)
+            .expect("denormalized composite condition");
         assert!(!flat.sql.contains("GROUP BY"), "{}", flat.sql);
         assert!(
             flat.sql.contains("composite_group IS NOT NULL"),
@@ -5027,8 +5100,7 @@ mod tests {
             ],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let legacy = PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy)
-            .expect("condition");
+        let legacy = accepted_for(&query, 2, IndexLayout::Legacy).expect("condition");
         assert!(PostgresQueryBuilder::single_index_predicate(&legacy.sql).is_none());
     }
 
@@ -5067,7 +5139,7 @@ mod tests {
             (SearchPrefix::Eb, "<"),
         ] {
             let query = SearchQuery::new("Observation").with_parameter(number_param(prefix, "60"));
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
 
             assert!(
                 frag.sql.contains(&format!("value_number {op} $3")),
@@ -5089,11 +5161,11 @@ mod tests {
         // implicit precision.
         let query60 =
             SearchQuery::new("Observation").with_parameter(quantity_param(SearchPrefix::Gt, "60"));
-        let frag60 = PostgresQueryBuilder::build_search_query(&query60, 2).expect("condition");
+        let frag60 = accepted(&query60, 2).expect("condition");
 
         let query60_0 = SearchQuery::new("Observation")
             .with_parameter(quantity_param(SearchPrefix::Gt, "60.0"));
-        let frag60_0 = PostgresQueryBuilder::build_search_query(&query60_0, 2).expect("condition");
+        let frag60_0 = accepted(&query60_0, 2).expect("condition");
 
         assert_eq!(frag60.sql, frag60_0.sql);
         assert_eq!(frag60.params.len(), frag60_0.params.len());
@@ -5111,7 +5183,7 @@ mod tests {
             SearchPrefix::Gt,
             "60|http://unitsofmeasure.org|kg",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(
             frag.sql.contains("value_quantity_canonical_value > $"),
@@ -5141,7 +5213,7 @@ mod tests {
             SearchPrefix::Ne,
             "60|http://unitsofmeasure.org|kg",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(
             frag.sql.contains(
@@ -5184,7 +5256,7 @@ mod tests {
         // implicit-precision window derived from the value as written.
         let query = SearchQuery::new("Observation")
             .with_parameter(quantity_param(SearchPrefix::Eq, "60.0"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(
             frag.sql
@@ -5225,8 +5297,7 @@ mod tests {
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
         // Non-cursor search binds $1=tenant, $2=type, so params start at $3.
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("composite should produce a condition");
+        let frag = accepted(&query, 2).expect("composite should produce a condition");
 
         assert!(frag.sql.contains("param_name = 'code-value-quantity'"));
         assert!(frag.sql.contains("value_token_system IN ($3, "));
@@ -5300,7 +5371,7 @@ mod tests {
             ],
         };
         let query = SearchQuery::new("MolecularSequence").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
         assert!(
             frag.sql.contains("(value_number BETWEEN $4 AND $5)"),
             "{}",
@@ -5331,7 +5402,7 @@ mod tests {
         // values in `k6/searchConfig.js` are this spelling.
         let query = SearchQuery::new("Observation")
             .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert_eq!(
             frag.sql,
@@ -5354,7 +5425,7 @@ mod tests {
             "combo-code-value-quantity",
             "http://loinc.org|8480-6$gt140",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         // The named system, or the marker of a `code` component (#1379).
         assert_eq!(
@@ -5439,7 +5510,7 @@ mod tests {
                 "combo-code-value-quantity",
                 &format!("8867-4${spelling}"),
             ));
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
             assert!(
                 frag.sql.contains(&predicate),
                 "{spelling} must emit a strict predicate: {}",
@@ -5466,7 +5537,7 @@ mod tests {
         // ASC` is what the index has to serve.
         let query = SearchQuery::new("Observation")
             .with_parameter(composite_param("combo-code-value-quantity", "8867-4$gt100"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone composite test is extractable");
 
@@ -5500,8 +5571,8 @@ mod tests {
             "_text",
             vec![SearchValue::eq("Zebracrossingdiagnosis")],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_text must produce a condition, not an empty filter");
+        let frag =
+            accepted(&query, 2).expect("_text must produce a condition, not an empty filter");
 
         assert!(
             frag.sql.contains("FROM resource_fts"),
@@ -5527,8 +5598,7 @@ mod tests {
             "_content",
             vec![SearchValue::eq("Quokkaflavoured")],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_content must produce a condition");
+        let frag = accepted(&query, 2).expect("_content must produce a condition");
 
         assert!(
             frag.sql
@@ -5539,6 +5609,263 @@ mod tests {
         assert_eq!(frag.params.len(), 1);
     }
 
+    /// The message of the refusal the builder must give for `query`.
+    fn refusal(query: &SearchQuery) -> String {
+        match PostgresQueryBuilder::build_search_query(query, 2) {
+            Err(SearchError::QueryParseError { message }) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// #2508: `Location.near` is `special` on every FHIR version and no arm of
+    /// `build_parameter_condition` evaluates it. It used to build no condition,
+    /// and a query with no condition at all is every Location.
+    #[test]
+    fn a_special_near_parameter_is_refused_not_skipped() {
+        let query = SearchQuery::new("Location")
+            .with_parameter(special_param("near", vec![SearchValue::eq("2|1|10|km")]));
+
+        // The old answer was `Ok(None)`: no filter, every Location.
+        assert!(
+            PostgresQueryBuilder::build_search_query(&query, 2).is_err(),
+            "near has no condition to build, so the query must not build"
+        );
+        let message = refusal(&query);
+        assert!(message.contains("'near'"), "{message}");
+        assert!(message.contains("every Location"), "{message}");
+        assert!(message.contains("PostgreSQL"), "{message}");
+
+        // The legacy layout shares the loop, so it refuses too.
+        assert!(matches!(
+            PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy),
+            Err(SearchError::QueryParseError { .. })
+        ));
+    }
+
+    /// #2508: from R5 the spec types `_type` as `special`, and REST lets it
+    /// through (`_type` is a global search parameter). `GET /Patient?_type=Observation`
+    /// answered with every Patient.
+    #[test]
+    fn a_special_type_parameter_is_refused_not_skipped() {
+        let query = SearchQuery::new("Patient")
+            .with_parameter(special_param("_type", vec![SearchValue::eq("Observation")]));
+
+        let message = refusal(&query);
+        assert!(message.contains("'_type'"), "{message}");
+        assert!(message.contains("every Patient"), "{message}");
+    }
+
+    /// The other `special`-typed spec parameters no arm evaluates (R5/R6 type
+    /// `_filter`, `Location.contains` and `Composition.section-text` as
+    /// `special`) are refused the same way.
+    #[test]
+    fn every_special_parameter_without_an_arm_is_refused() {
+        for (resource_type, name) in [
+            ("Patient", "_filter"),
+            ("Location", "contains"),
+            ("Composition", "section-text"),
+        ] {
+            let query = SearchQuery::new(resource_type)
+                .with_parameter(special_param(name, vec![SearchValue::eq("x")]));
+            let message = refusal(&query);
+            assert!(message.contains(&format!("'{name}'")), "{message}");
+            assert!(
+                message.contains(&format!("every {resource_type}")),
+                "{message}"
+            );
+        }
+    }
+
+    /// #2508: beside a parameter that does filter, the unevaluable one still
+    /// refuses the query. Building only the valid condition is a wider search
+    /// than the one asked, which is the same defect as building none.
+    #[test]
+    fn a_special_parameter_beside_a_valid_one_refuses_the_whole_query() {
+        let special = special_param("near", vec![SearchValue::eq("2|1|10|km")]);
+        let valid = token_param("status", None, "active");
+
+        for parameters in [
+            vec![valid.clone(), special.clone()],
+            vec![special.clone(), valid.clone()],
+            // A repeated name takes the grouped path first; one occurrence that
+            // builds no condition disqualifies the group, not the refusal.
+            vec![special.clone(), valid.clone(), special.clone()],
+        ] {
+            let mut query = SearchQuery::new("Location");
+            query.parameters = parameters;
+            let message = refusal(&query);
+            assert!(message.contains("'near'"), "{message}");
+            assert!(
+                matches!(
+                    PostgresQueryBuilder::build_search_query_for(&query, 2, IndexLayout::Legacy),
+                    Err(SearchError::QueryParseError { .. })
+                ),
+                "the legacy layout refuses too"
+            );
+        }
+
+        // The valid parameter alone is unaffected.
+        let alone = SearchQuery::new("Location").with_parameter(valid);
+        let frag = accepted(&alone, 2).expect("status builds");
+        assert!(frag.sql.contains("param_name = 'status'"), "{}", frag.sql);
+    }
+
+    /// A parameter with no values asks for nothing and constrains nothing: it is
+    /// skipped whatever its type, as the SQLite builder skips it.
+    #[test]
+    fn a_parameter_without_values_is_skipped_not_refused() {
+        let mut empty = special_param("near", vec![]);
+        let alone = SearchQuery::new("Location").with_parameter(empty.clone());
+        assert!(
+            matches!(
+                PostgresQueryBuilder::build_search_query(&alone, 2),
+                Ok(None)
+            ),
+            "no values and no other parameter: no condition"
+        );
+
+        // Beside a valid parameter only that parameter's condition is built.
+        let valid = token_param("status", None, "active");
+        let mut query = SearchQuery::new("Location");
+        query.parameters = vec![empty.clone(), valid.clone()];
+        let both = accepted(&query, 2).expect("status builds");
+        let only = accepted(&SearchQuery::new("Location").with_parameter(valid), 2)
+            .expect("status builds");
+        assert_eq!(both.sql, only.sql);
+        assert_eq!(both.params.len(), only.params.len());
+        assert!(!both.sql.contains("near"), "{}", both.sql);
+
+        // The same for a type the builders do evaluate.
+        empty.name = "_text".to_string();
+        let alone = SearchQuery::new("Location").with_parameter(empty);
+        assert!(matches!(
+            PostgresQueryBuilder::build_search_query(&alone, 2),
+            Ok(None)
+        ));
+    }
+
+    /// The two `special` names the builder does evaluate are not refused, alone
+    /// or beside a parameter that filters (the arms the #2508 refusal must not
+    /// reach).
+    #[test]
+    fn text_and_content_still_build_a_condition() {
+        for (name, column) in [
+            ("_text", "narrative_tsvector"),
+            ("_content", "content_tsvector"),
+        ] {
+            let text = special_param(name, vec![SearchValue::eq("fracture")]);
+            let query = SearchQuery::new("Patient").with_parameter(text.clone());
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                .unwrap_or_else(|e| panic!("{name} must not be refused: {e}"))
+                .unwrap_or_else(|| panic!("{name} must build a condition"));
+            assert!(frag.sql.contains(column), "{name}: {}", frag.sql);
+
+            let mut query = SearchQuery::new("Patient");
+            query.parameters = vec![token_param("gender", None, "female"), text];
+            let frag = accepted(&query, 2).expect("both build");
+            assert!(frag.sql.contains(column), "{name}: {}", frag.sql);
+            assert!(frag.sql.contains("param_name = 'gender'"), "{}", frag.sql);
+        }
+    }
+
+    /// A composite whose components the REST layer could not resolve has nothing
+    /// to pair: `build_composite_condition*` returned `None` for it and the
+    /// parameter was skipped, under either layout.
+    #[test]
+    fn a_composite_without_components_is_refused_under_both_layouts() {
+        let mut composite = composite_param("code-value-quantity", "8480-6$lt60");
+        composite.components.clear();
+        let query = SearchQuery::new("Observation").with_parameter(composite);
+
+        for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+            match PostgresQueryBuilder::build_search_query_for(&query, 2, layout) {
+                Err(SearchError::QueryParseError { message }) => {
+                    assert!(message.contains("'code-value-quantity'"), "{message}");
+                    assert!(message.contains("every Observation"), "{message}");
+                }
+                other => panic!("{layout:?}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2508: `_contained` search refuses, in `reject_unsupported_contained`,
+    /// everything its rows cannot answer. `build_contained` used to skip those
+    /// parameters, so a caller that skipped the gate got a query without the
+    /// criterion; it now refuses them itself, naming the parameter.
+    #[test]
+    fn contained_refuses_a_parameter_it_cannot_build_instead_of_skipping_it() {
+        use crate::types::ChainedParameter;
+
+        let mut chained = token_param("code", None, "X");
+        chained.chain = vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: None,
+            target_param: "name".to_string(),
+            has: None,
+        }];
+        let mut no_components = composite_param("code-value-quantity", "8480-6$lt60");
+        no_components.components.clear();
+        let date = date_param("_lastUpdated", SearchPrefix::Gt, "2020-01-01");
+
+        let cases = [
+            (
+                "near",
+                special_param("near", vec![SearchValue::eq("2|1|10|km")]),
+            ),
+            (
+                "_type",
+                special_param("_type", vec![SearchValue::eq("Patient")]),
+            ),
+            (
+                "_text",
+                special_param("_text", vec![SearchValue::eq("fracture")]),
+            ),
+            ("_lastUpdated", date),
+            ("code", chained),
+            (
+                "code",
+                token_param("code", Some(SearchModifier::Missing), "true"),
+            ),
+            ("code-value-quantity", no_components),
+        ];
+        for (name, unsupported) in cases {
+            // Beside one the contained rows can answer.
+            let query = contained_query(vec![token_param("category", None, "vital"), unsupported]);
+
+            // Refused by the gate every caller runs first ...
+            assert!(
+                PostgresQueryBuilder::reject_unsupported_contained(&query).is_err(),
+                "{name}: the gate refuses it"
+            );
+            // ... and again by the builder itself, which no longer skips it.
+            match PostgresQueryBuilder::build_contained(&query) {
+                Err(SearchError::QueryParseError { message }) => {
+                    assert!(message.contains(&format!("'{name}'")), "{message}");
+                    assert!(message.contains("every Observation"), "{message}");
+                }
+                other => panic!("{name}: expected a refusal, got {other:?}"),
+            }
+        }
+
+        // A parameter with no values asks for nothing, so it is still skipped.
+        let mut no_values = special_param("near", vec![]);
+        no_values.values.clear();
+        let frag = accepted_contained(&contained_query(vec![
+            token_param("category", None, "vital"),
+            no_values,
+        ]))
+        .expect("contained builds");
+        assert!(!frag.sql.contains("near"), "{}", frag.sql);
+
+        // And what the contained rows can answer still builds.
+        let supported = contained_query(vec![
+            token_param("category", None, "vital"),
+            token_param("_tag", None, "t"),
+        ]);
+        assert!(PostgresQueryBuilder::reject_unsupported_contained(&supported).is_ok());
+        assert!(accepted_contained(&supported).is_some());
+    }
+
     #[test]
     fn last_updated_binds_timestamps_with_precision_ranges() {
         // #871: a text param bound against the TIMESTAMPTZ column fails
@@ -5547,8 +5874,7 @@ mod tests {
             "_lastUpdated",
             vec![SearchValue::eq("2026-09-01")],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_lastUpdated must produce a condition");
+        let frag = accepted(&query, 2).expect("_lastUpdated must produce a condition");
 
         assert!(
             frag.sql
@@ -5575,8 +5901,7 @@ mod tests {
                 value: "2026-09-01".to_string(),
             }],
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_lastUpdated gt must produce a condition");
+        let frag = accepted(&query, 2).expect("_lastUpdated gt must produce a condition");
 
         assert!(frag.sql.contains("last_updated >= $3"), "{}", frag.sql);
         assert_eq!(frag.params.len(), 1);
@@ -5602,7 +5927,7 @@ mod tests {
             SearchPrefix::Eq,
             "2013-04-05T09:20:00-04:00",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         // The whole second it names, not a scalar `=` on its first instant:
         // a stored `…T09:20:00.123-04:00` is inside it (#1297).
@@ -5943,8 +6268,8 @@ mod tests {
                 let context = format!("{prefix:?} {input}");
                 let query =
                     SearchQuery::new("Procedure").with_parameter(date_param("date", prefix, input));
-                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-                    .expect("an invalid date must still constrain the query");
+                let frag =
+                    accepted(&query, 2).expect("an invalid date must still constrain the query");
 
                 assert_eq!(frag.sql, "FALSE", "{context}");
                 assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
@@ -5962,7 +6287,7 @@ mod tests {
                     "_lastUpdated",
                     vec![SearchValue::new(prefix, input)],
                 ));
-                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                let frag = accepted(&query, 2)
                     .expect("an invalid _lastUpdated must still constrain the query");
 
                 assert_eq!(frag.sql, "FALSE", "{context}");
@@ -5992,7 +6317,7 @@ mod tests {
             .values
             .push(SearchValue::new(SearchPrefix::Eq, "2024-01-15"));
         let query = SearchQuery::new("Procedure").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(frag.sql.starts_with("(FALSE) OR ("), "{}", frag.sql);
         assert!(
@@ -6040,7 +6365,7 @@ mod tests {
                     ],
                 };
                 let query = SearchQuery::new("Observation").with_parameter(param);
-                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                let frag = accepted(&query, 2)
                     .expect("an invalid composite date must still constrain the query");
 
                 assert!(
@@ -6065,7 +6390,7 @@ mod tests {
             SearchPrefix::Lt,
             "not-a-date",
         ));
-        let frag = PostgresQueryBuilder::build_contained(&query)
+        let frag = accepted_contained(&query)
             .expect("an invalid date must still constrain the contained match");
 
         assert!(
@@ -6083,7 +6408,7 @@ mod tests {
         let query = SearchQuery::new("Observation")
             .with_parameter(token_param("code", None, "X"))
             .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"));
-        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        let frag = accepted_contained(&query).unwrap();
 
         assert!(
             frag.sql.ends_with("HAVING COUNT(DISTINCT param_name) >= 2"),
@@ -6107,7 +6432,7 @@ mod tests {
             .with_parameter(token_param("code", None, "X"))
             .with_parameter(date_param("date", SearchPrefix::Sa, "2019-12-31"))
             .with_parameter(upper);
-        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        let frag = accepted_contained(&query).unwrap();
 
         let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
         assert!(!having.contains("COUNT("), "{having}");
@@ -6149,7 +6474,7 @@ mod tests {
             token_param("category", Some(SearchModifier::Not), "cat1"),
         ]);
         assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
-        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        let frag = accepted_contained(&query).unwrap();
 
         let (filter, having) = frag.sql.split_once(" HAVING ").expect("a HAVING clause");
         assert!(!filter.contains("param_name"), "{filter}");
@@ -6165,8 +6490,7 @@ mod tests {
     fn contained_id_is_the_local_id_and_needs_no_other_criterion() {
         let mut id = token_param("_id", None, "a");
         id.values.push(SearchValue::new(SearchPrefix::Eq, "b"));
-        let frag =
-            PostgresQueryBuilder::build_contained(&contained_query(vec![id.clone()])).unwrap();
+        let frag = accepted_contained(&contained_query(vec![id.clone()])).unwrap();
         assert!(
             frag.sql.ends_with(
                 "contained_type = $2 AND contained_local_id IN ($3, $4) \
@@ -6177,11 +6501,8 @@ mod tests {
         );
 
         // Beside a value parameter the numbering carries on after the ids.
-        let frag = PostgresQueryBuilder::build_contained(&contained_query(vec![
-            id,
-            token_param("_tag", None, "foo"),
-        ]))
-        .unwrap();
+        let frag = accepted_contained(&contained_query(vec![id, token_param("_tag", None, "foo")]))
+            .unwrap();
         assert_eq!(placeholders(&frag.sql), vec![1, 2, 3, 4, 5]);
         assert_eq!(frag.params.len(), 3);
         assert!(
@@ -6197,7 +6518,7 @@ mod tests {
     /// compartment membership is one explicit branch over several names.
     #[test]
     fn contained_without_criteria_and_with_a_compartment() {
-        let frag = PostgresQueryBuilder::build_contained(&contained_query(vec![])).unwrap();
+        let frag = accepted_contained(&contained_query(vec![])).unwrap();
         assert!(
             frag.sql.ends_with(
                 "contained_type = $2 GROUP BY resource_type, resource_id, contained_local_id"
@@ -6212,7 +6533,7 @@ mod tests {
             params: vec!["subject".to_string(), "performer".to_string()],
             reference: "Patient/p1/_history/2".to_string(),
         });
-        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        let frag = accepted_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
         assert_eq!(placeholders(filter), vec![1, 2, 3, 4, 4]);
@@ -6372,7 +6693,7 @@ mod tests {
         let branch = |param: SearchParameter| {
             let query = contained_query(vec![param]);
             assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
-            let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+            let frag = accepted_contained(&query).unwrap();
             let sql = frag
                 .sql
                 .split_once("contained_type = $2 AND (")
@@ -6512,7 +6833,7 @@ mod tests {
             token_param("category", None, "lab"),
         ]);
         assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
-        let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
+        let frag = accepted_contained(&query).unwrap();
         assert!(
             frag.sql.contains(
                 "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
@@ -6613,8 +6934,8 @@ mod tests {
                 let context = format!("{prefix:?} {input:?}");
                 let query =
                     SearchQuery::new("RiskAssessment").with_parameter(number_param(prefix, input));
-                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-                    .expect("an invalid number must still constrain the query");
+                let frag =
+                    accepted(&query, 2).expect("an invalid number must still constrain the query");
 
                 assert_eq!(frag.sql, "FALSE", "{context}");
                 assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
@@ -6631,7 +6952,7 @@ mod tests {
                     let context = format!("{prefix:?} {value:?}");
                     let query = SearchQuery::new("Observation")
                         .with_parameter(quantity_param(prefix, &value));
-                    let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    let frag = accepted(&query, 2)
                         .expect("an invalid quantity must still constrain the query");
 
                     assert_eq!(frag.sql, "FALSE", "{context}");
@@ -6656,7 +6977,7 @@ mod tests {
         ] {
             let query = SearchQuery::new("Observation")
                 .with_parameter(quantity_param(SearchPrefix::Eq, value));
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            let frag = accepted(&query, 2).expect("condition");
             assert!(frag.sql.contains("value_quantity_value >= $3"), "{value}");
             assert_eq!(frag.params.len(), binds, "{value}: {:?}", frag.params);
         }
@@ -6664,7 +6985,7 @@ mod tests {
         // The escaped pipe reaches the bind unescaped.
         let query = SearchQuery::new("Observation")
             .with_parameter(quantity_param(SearchPrefix::Eq, "5.4||a\\|b"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
         assert!(
             matches!(frag.params.get(2), Some(SqlParam::Text(unit)) if unit == "a|b"),
             "{:?}",
@@ -6687,7 +7008,7 @@ mod tests {
         let mut param = number_param(SearchPrefix::Lt, "abc");
         param.values.push(SearchValue::new(SearchPrefix::Gt, "0.5"));
         let query = SearchQuery::new("RiskAssessment").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(frag.sql.starts_with("(FALSE) OR ("), "{}", frag.sql);
         assert!(frag.sql.contains("value_number > $3"), "{}", frag.sql);
@@ -6701,7 +7022,7 @@ mod tests {
         let mut param = quantity_param(SearchPrefix::Ne, "abc||mg");
         param.values.push(SearchValue::new(SearchPrefix::Gt, "6"));
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let frag = accepted(&query, 2).expect("condition");
 
         assert!(frag.sql.starts_with("(FALSE) OR ("), "{}", frag.sql);
         assert!(
@@ -6743,7 +7064,7 @@ mod tests {
                         ],
                     };
                     let query = SearchQuery::new("Observation").with_parameter(param);
-                    let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    let frag = accepted(&query, 2)
                         .expect("an invalid composite number must still constrain the query");
 
                     // A component with nothing in it (`8480-6$`) is an empty
@@ -6790,7 +7111,7 @@ mod tests {
             let query = SearchQuery::new("Observation")
                 .with_parameter(token_param("code", None, "8480-6"))
                 .with_parameter(numeric);
-            let frag = PostgresQueryBuilder::build_contained(&query)
+            let frag = accepted_contained(&query)
                 .expect("an invalid number must still constrain the contained match");
 
             assert!(
@@ -6841,8 +7162,7 @@ mod tests {
         // the exact failure mode being fixed.
         let query = SearchQuery::new("Patient")
             .with_parameter(special_param("_text", vec![SearchValue::eq("")]));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("a blank _text must still constrain the query");
+        let frag = accepted(&query, 2).expect("a blank _text must still constrain the query");
 
         assert_eq!(frag.sql, "FALSE");
         assert!(frag.params.is_empty());
@@ -6867,8 +7187,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("token OR-list should produce a condition");
+        let frag = accepted(&query, 2).expect("token OR-list should produce a condition");
 
         assert_eq!(frag.params.len(), 2, "two code-only values bind two params");
         assert!(frag.sql.contains("value_token_code = $3"));
@@ -6896,8 +7215,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("mixed token OR-list should produce a condition");
+        let frag = accepted(&query, 2).expect("mixed token OR-list should produce a condition");
 
         assert_eq!(frag.params.len(), 3);
         assert!(frag.sql.contains("value_token_code = $3"));
@@ -6906,8 +7224,11 @@ mod tests {
         assert!(!frag.sql.contains("$6"));
     }
 
+    /// A composite whose components were not resolved has no condition to build.
+    /// This used to pin `None`, i.e. the parameter silently skipped and the
+    /// search answered with every Observation; it is a refusal now (#2508).
     #[test]
-    fn composite_returns_none_without_components() {
+    fn composite_without_components_is_refused_not_skipped() {
         let param = SearchParameter {
             name: "code-value-quantity".to_string(),
             param_type: SearchParamType::Composite,
@@ -6917,7 +7238,8 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        assert!(PostgresQueryBuilder::build_search_query(&query, 2).is_none());
+        let message = refusal(&query);
+        assert!(message.contains("'code-value-quantity'"), "{message}");
     }
 
     #[test]
@@ -6959,8 +7281,7 @@ mod tests {
             ],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag =
-            PostgresQueryBuilder::build_search_query(&query, 2).expect("composite condition");
+        let frag = accepted(&query, 2).expect("composite condition");
 
         // One row per composite instance: the predicate is scoped to composite
         // rows and every component is ANDed within that single row.
@@ -7015,8 +7336,7 @@ mod tests {
             ],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("unparseable composite still yields a condition");
+        let frag = accepted(&query, 2).expect("unparseable composite still yields a condition");
 
         assert_eq!(
             frag.params.len(),
@@ -7046,7 +7366,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token OR-list");
+        let frag = accepted(&query, 2).expect("token OR-list");
 
         assert_eq!(
             frag.sql.matches("id IN (SELECT").count(),
@@ -7076,7 +7396,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Organization").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        let frag = accepted(&query, 2).expect("string condition");
 
         assert!(
             frag.sql.contains(
@@ -7198,8 +7518,7 @@ mod tests {
         for term in terms {
             let query =
                 SearchQuery::new("Patient").with_parameter(string_param("name", None, term));
-            let frag =
-                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            let frag = accepted(&query, 2).expect("string condition");
             assert!(
                 frag.sql.contains("~>=~ $3 AND") && frag.sql.contains("~<~ $4)"),
                 "{:?} fell back to the LIKE form: {}",
@@ -7226,7 +7545,7 @@ mod tests {
         // such a parameter with `FALSE` (#1380).
         let param = string_param("name", None, "");
         let query = SearchQuery::new("Patient").with_parameter(param.clone());
-        let guarded = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        let guarded = accepted(&query, 2).expect("condition");
         assert_eq!(guarded.sql, "FALSE");
 
         let frag =
@@ -7263,7 +7582,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Patient").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        let frag = accepted(&query, 2).expect("string condition");
 
         assert!(frag.sql.contains("~>=~ $3 AND"), "{}", frag.sql);
         assert!(frag.sql.contains("~<~ $4)"), "{}", frag.sql);
@@ -7297,7 +7616,7 @@ mod tests {
         // starts-with plan. See `migrate_v32_to_v33`.
         let query =
             SearchQuery::new("Patient").with_parameter(string_param("name", None, "Emilia"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        let frag = accepted(&query, 2).expect("string condition");
         assert!(
             frag.sql
                 .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3"),
@@ -7323,8 +7642,7 @@ mod tests {
                 modifier.clone(),
                 "Emilia",
             ));
-            let frag =
-                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            let frag = accepted(&query, 2).expect("string condition");
             assert!(
                 frag.sql
                     .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
@@ -7351,7 +7669,7 @@ mod tests {
             Some(SearchModifier::Exact),
             "Emilia",
         ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+        let frag = accepted(&query, 2).expect("string condition");
 
         assert!(frag.sql.contains("value_string = $3"), "{}", frag.sql);
         assert!(!frag.sql.contains("IS NOT NULL"), "{}", frag.sql);
@@ -7407,8 +7725,7 @@ mod tests {
                 modifier.clone(),
                 "Emilia",
             ));
-            let frag =
-                PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+            let frag = accepted(&query, 2).expect("string condition");
             assert_eq!(
                 frag.sql.matches("value_string_folded").count(),
                 frag.sql.matches(FOLDED_STRING_EXPR).count(),
@@ -7472,7 +7789,7 @@ mod tests {
         ];
 
         for (query, column) in cases {
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("display shape");
+            let frag = accepted(&query, 2).expect("display shape");
             let mentions = frag.sql.matches(column).count();
             assert!(mentions > 0, "expected a {column} predicate: {}", frag.sql);
             assert_eq!(
@@ -7513,8 +7830,7 @@ mod tests {
         ];
 
         for query in queries {
-            let frag =
-                PostgresQueryBuilder::build_search_query(&query, 2).expect("reference shape");
+            let frag = accepted(&query, 2).expect("reference shape");
             for op in [" < ", " > ", " <= ", " >= ", "ORDER BY value_reference"] {
                 assert!(
                     !frag.sql.contains(op),
@@ -7545,7 +7861,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+        let frag = accepted(&query, 2).expect("token condition");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -7581,7 +7897,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+        let frag = accepted(&query, 2).expect("token condition");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -7596,7 +7912,7 @@ mod tests {
     fn empty_system_token_requires_no_system() {
         let query =
             SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+        let frag = accepted(&query, 2).expect("token condition");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -7618,12 +7934,12 @@ mod tests {
     /// `:not` stays the exact negation of the positive `|code` predicate.
     #[test]
     fn not_empty_system_token_negates_the_no_system_predicate() {
-        let positive = PostgresQueryBuilder::build_search_query(
+        let positive = accepted(
             &SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5")),
             2,
         )
         .expect("token condition");
-        let negated = PostgresQueryBuilder::build_search_query(
+        let negated = accepted(
             &SearchQuery::new("Observation").with_parameter(token_param(
                 "code",
                 Some(SearchModifier::Not),
@@ -7689,7 +8005,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+        let frag = accepted(&query, 2).expect("token condition");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -7727,7 +8043,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Encounter").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token OR-list");
+        let frag = accepted(&query, 2).expect("token OR-list");
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
@@ -7754,11 +8070,8 @@ mod tests {
                 chain: vec![],
                 components: vec![],
             };
-            PostgresQueryBuilder::build_search_query(
-                &SearchQuery::new("Observation").with_parameter(param),
-                2,
-            )
-            .expect("reference condition")
+            accepted(&SearchQuery::new("Observation").with_parameter(param), 2)
+                .expect("reference condition")
         };
         (build(None).sql, build(Some(SearchModifier::Not)))
     }
@@ -7805,7 +8118,7 @@ mod tests {
         let query = SearchQuery::new("Observation")
             .with_parameter(not("Patient/p1"))
             .with_parameter(not("Patient/p2"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("two :not");
+        let frag = accepted(&query, 2).expect("two :not");
         assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
         assert_eq!(
             frag.sql.matches("NOT (id IN (SELECT").count(),
@@ -7824,7 +8137,7 @@ mod tests {
                 Some(SearchModifier::Not),
                 "Patient/p2",
             ));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("mixed");
+        let frag = accepted(&query, 2).expect("mixed");
         assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
         assert!(frag.sql.contains("NOT (id IN (SELECT"), "{}", frag.sql);
         assert_eq!(frag.sql.matches("id IN (SELECT").count(), 2, "{}", frag.sql);
@@ -7844,7 +8157,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("reference OR-list");
+        let frag = accepted(&query, 2).expect("reference OR-list");
 
         assert_eq!(
             frag.sql.matches("id IN (SELECT").count(),
@@ -7876,7 +8189,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("reference OR-list");
+        let frag = accepted(&query, 2).expect("reference OR-list");
 
         assert_eq!(
             frag.sql.matches("id IN (SELECT").count(),
@@ -7917,7 +8230,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("bare-id reference");
+        let frag = accepted(&query, 2).expect("bare-id reference");
 
         let params: Vec<&str> = frag
             .params
@@ -7966,7 +8279,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect(":Type reference");
+        let frag = accepted(&query, 2).expect(":Type reference");
 
         let params: Vec<&str> = frag
             .params
@@ -8000,7 +8313,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("Type/id reference");
+        let frag = accepted(&query, 2).expect("Type/id reference");
 
         assert!(
             frag.sql
@@ -8033,7 +8346,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("versioned Type/id");
+        let frag = accepted(&query, 2).expect("versioned Type/id");
         match &frag.params[0] {
             SqlParam::Text(t) => assert_eq!(t, "Patient/patient-1"),
             other => panic!("expected a text param, got {:?}", other),
@@ -8053,7 +8366,7 @@ mod tests {
             reference: "Patient/patient-1/_history/3".to_string(),
             params: vec!["subject".to_string(), "performer".to_string()],
         });
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("compartment");
+        let frag = accepted(&query, 2).expect("compartment");
         assert!(
             !frag.sql.contains("LIKE"),
             "no pattern arm survives: {}",
@@ -8082,7 +8395,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect(":identifier");
+        let frag = accepted(&query, 2).expect(":identifier");
 
         assert!(
             !frag.sql.contains("SUBSTRING") && !frag.sql.contains("EXISTS"),
@@ -8121,8 +8434,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("versioned bare-id reference");
+        let frag = accepted(&query, 2).expect("versioned bare-id reference");
 
         match &frag.params[0] {
             SqlParam::Text(t) => assert_eq!(t, "patient-1"),
@@ -8149,8 +8461,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
-        let frag =
-            PostgresQueryBuilder::build_search_query(&query, 2).expect("metacharacter references");
+        let frag = accepted(&query, 2).expect("metacharacter references");
 
         let params: Vec<&str> = frag
             .params
@@ -8181,8 +8492,7 @@ mod tests {
         let query = SearchQuery::new("Observation")
             .with_parameter(reference_param("subject", None, "patient-1"))
             .with_parameter(token_param("status", None, "final"));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("reference followed by token");
+        let frag = accepted(&query, 2).expect("reference followed by token");
 
         assert!(
             frag.sql
@@ -8218,8 +8528,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Patient").with_parameter(param);
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect(":of-type should produce a condition");
+        let frag = accepted(&query, 2).expect(":of-type should produce a condition");
 
         assert!(frag.sql.contains("param_name = 'identifier'"));
         assert!(frag.sql.contains("value_token_code = $3"));
@@ -8245,10 +8554,11 @@ mod tests {
             components: vec![],
         };
 
-        for short in ["MR|12345", "12345"] {
+        // Two parts, one part, and three empty parts name nothing.
+        for short in ["MR|12345", "12345", "||"] {
             let query = SearchQuery::new("Patient").with_parameter(of_type(&[short]));
-            let frag = PostgresQueryBuilder::build_search_query(&query, 2)
-                .expect("a short :of-type value must still be a condition");
+            let frag =
+                accepted(&query, 2).expect("a short :of-type value must still be a condition");
             assert_eq!(frag.sql, "FALSE", "{short:?}");
             assert!(frag.params.is_empty(), "{short:?}");
         }
@@ -8257,10 +8567,20 @@ mod tests {
             "MR|12345",
             "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
         ]));
-        let frag = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+        let frag = accepted(&query, 2).unwrap();
         assert!(frag.sql.starts_with("FALSE OR "), "{}", frag.sql);
         assert!(frag.sql.contains("value_token_code = $3"), "{}", frag.sql);
         assert_eq!(frag.params.len(), 3);
+        // The short value costs no placeholder: the full value's binds stay
+        // gap-free from `$3`, in either order (#2508).
+        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4, 5], "{}", frag.sql);
+        let reversed = SearchQuery::new("Patient").with_parameter(of_type(&[
+            "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
+            "MR|12345",
+        ]));
+        let frag = accepted(&reversed, 2).unwrap();
+        assert!(frag.sql.ends_with(" OR FALSE"), "{}", frag.sql);
+        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4, 5], "{}", frag.sql);
     }
 
     fn id_param_text(value: &SqlParam) -> &str {
@@ -8286,8 +8606,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_id must produce a condition");
+        let fragment = accepted(&query, 2).expect("_id must produce a condition");
 
         assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
@@ -8310,7 +8629,7 @@ mod tests {
                 values: values.clone(),
                 ..Default::default()
             });
-            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            let fragment = accepted(&query, 2).unwrap();
             assert_eq!(fragment.sql, expected_sql);
             assert!(
                 matches!(fragment.params.as_slice(), [SqlParam::TextArray(ids)] if ids.len() == 65_536 && ids[65_535] == "id-65535")
@@ -8329,8 +8648,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_id:not must produce a condition");
+        let fragment = accepted(&query, 2).expect("_id:not must produce a condition");
 
         assert_eq!(fragment.sql, "id <> $3");
         assert_eq!(fragment.params.len(), 1);
@@ -8348,8 +8666,7 @@ mod tests {
             components: vec![],
         });
 
-        let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect("_id:not must produce a condition");
+        let fragment = accepted(&query, 2).expect("_id:not must produce a condition");
 
         assert_eq!(fragment.sql, "id NOT IN ($3, $4)");
         assert_eq!(fragment.params.len(), 2);
@@ -8368,8 +8685,7 @@ mod tests {
             components: vec![],
         };
         let query = SearchQuery::new("Patient").with_parameter(param);
-        let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
-            .expect(":missing must produce a condition");
+        let fragment = accepted(&query, 2).expect(":missing must produce a condition");
 
         assert!(
             fragment.sql.contains("is_contained = FALSE"),
@@ -8392,8 +8708,7 @@ mod tests {
                 chain: vec![],
                 components: vec![],
             });
-            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
-                .expect(":missing must produce a condition");
+            let fragment = accepted(&query, 2).expect(":missing must produce a condition");
 
             assert!(fragment.sql.contains("FROM resources"));
             assert!(fragment.sql.contains(&format!("{column} IS NOT NULL")));
@@ -8435,7 +8750,7 @@ mod tests {
                 chain: vec![],
                 components: vec![],
             });
-            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+            let fragment = accepted(&query, 2)
                 .unwrap_or_else(|| panic!("{context}: a dropped condition matches everything"));
             assert_eq!(fragment.sql, "FALSE", "{context}");
             assert!(fragment.params.is_empty(), "{context}");
