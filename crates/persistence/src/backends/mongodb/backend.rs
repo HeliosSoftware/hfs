@@ -243,8 +243,7 @@ pub struct MongoBackend {
     deferred_index_min_entries: Option<usize>,
     /// What this instance's post-commit search-row steps have done so far,
     /// read through [`MongoBackend::deferred_index_step_totals`] (#2036).
-    /// Shared (`Arc`) so the clones the bulk-submit stream driver hands its
-    /// batch writers count into the same totals.
+    /// Shared (`Arc`) so a clone's steps count toward the same totals.
     pub(super) deferred_step_counters: Arc<super::deferred_step_totals::DeferredStepCounters>,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
