@@ -609,6 +609,45 @@ A sustained-saturation alert, for example:
 min_over_time(mongodb_pool_waiting_callers{pool="primary"}[5m]) > 0
 ```
 
+With the native MongoDB backend (`HFS_STORAGE_BACKEND=mongodb`), a transaction
+Bundle of at least `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES`
+entries commits without its search rows and writes them right after the commit
+(#1975); what that step does not finish waits in the `search_index_pending`
+ledger for the repair task. Six series report the step and the ledger. Besides
+`service` their only label is `reason`, on the last one. Nothing in them names a
+tenant, a resource type or a Bundle.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `mongodb_deferred_search_index_pending_chunks` | gauge | ledger documents | Documents in the ledger after the latest repair pass, due or not |
+| `mongodb_deferred_search_index_oldest_pending_seconds` | gauge | seconds | Age of the oldest ledger document, `0` when the ledger is empty: a Bundle committed and not fully searchable for this long |
+| `mongodb_deferred_search_index_repair_failed_chunks_total` | counter | ledger documents | Documents a repair pass worked on and had to leave in place |
+| `mongodb_deferred_search_index_step_seconds` | histogram | seconds | Duration of each post-commit step |
+| `mongodb_deferred_search_index_step_rows_total` | counter | search rows | Rows written by post-commit steps |
+| `mongodb_deferred_search_index_steps_incomplete_total{reason}` | counter | steps | Steps that left work to the repair; `reason` is `deadline` or `failure` |
+
+Caveats:
+
+- The two gauges are set by the repair task, so they are as fresh as its last
+  pass (`HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL`, 60 s by default), are
+  not exported while it is off (`0`), and keep the last successful pass's
+  values (the age does not grow) while passes fail. The ledger is shared by
+  every instance, so aggregate the gauges across instances with `max`.
+- The step series are per process and recorded when a step ends. The step's rows
+  per second is `rate(mongodb_deferred_search_index_step_rows_total[5m]) /
+  rate(mongodb_deferred_search_index_step_seconds_sum[5m])`.
+
+A Bundle left unsearchable beyond the repair's own lag (its minimum age, at
+least 60 s and the Bundle deadline, plus one interval), for example with the
+default 30 s request timeout:
+
+```
+max(mongodb_deferred_search_index_oldest_pending_seconds) > 300
+```
+
+See "Deferred search indexing for large MongoDB transaction Bundles" in
+`crates/persistence/README.md` for the meaning of each series and the log lines.
+
 Per-tenant stored-resource counts are **deliberately NOT exported to
 `/metrics`**. Tenant is never a metric label (see the rule in
 `crates/observability/src/metrics.rs` and `crates/observability/src/middleware.rs`): because `/metrics` is

@@ -1570,14 +1570,15 @@ commit, since every attempt meets the same cache, and answers `500` with a `too-
 OperationOutcome that names the WiredTiger cache and the Bundle's entry count and says that
 resubmitting it unchanged will fail the same way. It also names the ways out: smaller transaction
 Bundles with client-assigned ids (PUT), `$bulk-submit` if the server enables it, or a larger cache.
-The driver's text stays in the server log (#1837); a commit-time 388 is logged with the prefix
-`Commit failed:`. Size `--wiredTigerCacheSizeGB` with the rule above, or use one of the
-alternatives listed there. In the HFS benchmark at `--wiredTigerCacheSizeGB 2` (runs 40728433458
-and 40772360813), the four Bundles above 30,000 entries end with `TooLargeForCache` on both
-MongoDB legs, at entries 28,627-31,983, and on the `mongodb` leg the 49,027-entry Bundle ends as a
-lone eviction rollback (described below). The first benchmark with the search rows deferred (run
-39657850695) had the `mongodb` leg abort lower, at 19,200-21,100 entries. The ignored ceiling test
-of the
+The driver's text stays in the server log (#1837); the log reason's prefix says where it happened:
+`Entry N processing failed:` for an entry's write, `Deferred search index ledger write failed:` for
+the ledger of a deferred Bundle (below), and `Commit failed:` for a commit-time 388 (#2037). Size
+`--wiredTigerCacheSizeGB` with the rule above, or use one of the alternatives listed there. In the
+HFS benchmark at `--wiredTigerCacheSizeGB 2` (runs 40728433458 and 40772360813), the four Bundles
+above 30,000 entries end with `TooLargeForCache` on both MongoDB legs, at entries 28,627-31,983, and
+on the `mongodb` leg the 49,027-entry Bundle ends as a lone eviction rollback (described below). The
+first benchmark with the search rows deferred (run 39657850695) had the `mongodb` leg abort lower,
+at 19,200-21,100 entries. The ignored ceiling test of the
 [deferred-indexing section](#deferred-search-indexing-for-large-mongodb-transaction-bundles) shows
 that a deferred create's transaction then wrote each resource's `missing_params` and its
 `idx_resources_missing_params` keys (15.19 per resource on its fixture), which an offloaded backend
@@ -1628,15 +1629,21 @@ that an unchanged resubmit will fail: the room bounds only this instance's trans
 while single-resource writes, batch Bundles, other HFS instances and other clients share the same
 cache, so a resubmit is unlikely to succeed but can (#1993). It logs one `WARN`, "transaction bundle
 rolled back for eviction while running alone; not retrying", with `lone=true`, `entries`,
-`failed_entry` (absent at commit), `error_code` and `attempt` (#1895). With chunked creates
-(#1977), `failed_entry`, and the "Entry N" of the log-only reasons, is the entry whose document the
-server refused when the error names one, and otherwise the first entry of the chunk being sent, so
-an abort position reads up to 99 entries before the entry the server was writing. The
-`Transaction failed` `ERROR` line names the cause: `write set too large` for 388,
-`lone eviction rollback` here. Bundles that shared the room, and plain write conflicts, are still
-replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
-weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
-per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+`failed_entry` (set only when an entry was being written), `failed_at` (`entry`, `ledger` or
+`commit`: a deferred Bundle's ledger is written after the last entry and before the commit, and a
+rollback there is neither), `error_code` and `attempt` (#1895, #2037). The log-only reason of the
+`TooLargeForCache` it returns starts `Entry N rolled back for eviction while the Bundle ran alone;
+not replayed: `, `Deferred search index ledger write rolled back for eviction while the Bundle ran
+alone; not replayed: ` or `Commit rolled back for eviction while the Bundle ran alone; not
+replayed: `, by where it arrived. With chunked creates (#1977), `failed_entry`, and the "Entry N" of
+the log-only reasons, is the entry whose document the server refused when the error names one, and
+otherwise the first entry of the chunk being sent, so an abort position reads up to 99 entries
+before the entry the server was writing. The `Transaction failed` `ERROR` line names the cause:
+`write set too large` for 388, `lone eviction rollback` here. Bundles that shared the room, and
+plain write conflicts, are still replayed. With a weight of `0` or no limit no Bundle counts as
+alone. Raising the limit x the weight above the largest Bundle restores the replays, at the cost of
+sharing the cache. The room is per backend instance: Bundles sent to another HFS instance on the
+same MongoDB are not seen.
 
 **Refusing an oversized Bundle before it runs (#2351).** With
 `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
@@ -1895,8 +1902,10 @@ chunk of creates (#1977) and before the commit, and it commits or aborts with th
 aborted or replayed attempt leaves neither a ledger nor markers. A failure to write the ledger is a
 server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
 ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
-it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
-the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update).
+it, and the log reason of a cache failure or a transient abort there starts `Deferred search index
+ledger write ...`, never `Entry N` or `Commit` (#2037). The transaction does not insert
+`search_index` or `search_index_contained` rows, and it skips the deletes of old rows that an inline
+Bundle sends once per chunk of creates (or per update).
 
 A resource of a deferred type that the Bundle creates, updates or restores (a `PUT` to the id of a
 deleted resource) also carries no `missing_params` and no `missing_params_fp`
@@ -1932,17 +1941,61 @@ Bundle changed SearchParameters, and then rewrites the rows:
   at or after the Bundle's commit, so a marker cannot be missed because the commit is not yet
   visible to it (for example under `readConcernLevel=majority` with `w:1`). A batch that finds no
   marker was finished by another rewriter.
-- Resources are taken in batches of up to 256 of one type. Each batch is its own small
-  transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
-  their old rows and inserts the new ones. It then makes one update per resource that removes the
+- Resources are taken in batches of up to 256 of one type, and a batch is cut by rows as well
+  (#2031): it takes resources until the rows built so far reach 5,000, and the resource that
+  reaches it is the last one it takes, so the budget is a soft cut, not a ceiling (a resource with
+  20,000 rows ends its batch, with whatever came before it). The 5,000 is the rows of one `insert_many` and a
+  little over the 4,762 rows of 256 resources at the benchmark's 18.6 rows each, so a batch of
+  ordinary resources is still 256 and only rows-heavy resources (a ValueSet expansion, a
+  CodeSystem) are split. The resources a batch leaves are the next batch's, in order. Each batch is
+  its own small transaction that selects the resources still carrying the marker, deletes their old
+  rows and inserts the new ones. It then makes one update per resource that removes the
   marker and writes `missing_params` and its fingerprint from the same extraction as the rows
   (a created, updated or restored resource has none until then): `[]` for a deleted
   resource, and removed when the extraction failed, as on every other write path. A batch that
   fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
   a ledger document are done, the document is deleted.
-- A batch that runs out of its five attempts stops the step: the rest of that ledger document and
-  every later one are left to the repair, so a stalled MongoDB costs one batch's attempts, not
-  one per document.
+- A batch of more than one resource whose transaction the server refuses because of the cache is
+  not tried again as it was (#2031): `TransactionTooLargeForCache` (388) and a rollback for cache
+  pressure (365, or a `WriteConflict` that names the eviction or the cache overflow) are not
+  replayed at that size, because the same writes meet the same cache. The retry takes half of the
+  resources the failed one held, again and again down to one resource, and the smaller size is kept
+  for the rest of that chunk of up to 256. The `shrinks` field of the log line counts these
+  retries. A failure that is not the cache's, and a failure before the batch has read its resources
+  (starting the transaction, the `find`: there is nothing to shrink), is tried again as before, at
+  the same size, up to five times.
+- One resource whose own transaction the cache refuses cannot be split: its old rows' delete, its
+  rows' insert and its marker's removal are one transaction (see below). What happens depends on
+  the refusal. With 388 the transaction's own write set is the cause, so a replay would fail the
+  same way: it fails after one attempt. With a cache-pressure rollback (365, or the labelled
+  `WriteConflict`) the cause is the cache's load at that moment, which another writer's work
+  changes, so it is tried again at the same size, five times in all, like any other failure, and
+  fails only when they run out. Either way the resource fails alone: every other resource of its
+  chunk is written, the resource stays marked, and its ledger document is kept. The `WARN` of the
+  step and the document's `last_error` name it. For 388 they say `Patient/<id> with N rows is too
+  large for one transaction and cannot be split`; for the rollback they say `Patient/<id> with N
+  rows was rolled back for cache pressure in a transaction of its own, 5 times, and cannot be
+  split`, which does not claim the resource is too large. The server's error follows. Finishing it
+  needs a larger cache, less competing load (or a smaller resource); the repair tries it again every
+  pass (one attempt for 388, five for a rollback), and the ledger's `attempts` counts those passes.
+  There is no terminal state: the document stays until the resource is written or deleted.
+  Measured on the test harness's mongod (`--wiredTigerCacheSizeGB 0.25`, the ignored test
+  `a_resource_whose_rows_overflow_the_real_cache_fails_alone`): a Patient of 20,004 rows committed
+  in one transaction, and one of 80,004 rows was refused with code 388 (`transaction is too large
+  and will not fit in the storage engine cache`; the whole live step took 6.2 s, one Bundle and
+  one refused transaction) and was left alone as described.
+- A batch that runs out of its five attempts, and a chunk with a resource the cache refuses in a
+  transaction of its own, both stop the step: the rest of that ledger document and every later one
+  are left to the repair, so a stalled MongoDB costs one batch's attempts, not one per document.
+  (The chunk with a refused resource is first finished: its other resources are written.) Three
+  such resources in a row, with no batch between them that committed, end the chunk too: the cache,
+  not one resource, is the problem. A Bundle of more than 5,000 resources leaves more than one
+  ledger document, and the step goes through them in order, deleting each when its batches are
+  done. Tests send a real Bundle of 5,040 resources (5,000 Patients and 40 Observations: two
+  documents) through each way the step can end (#2032): both documents finished; cut by the
+  deadline before the first batch (both left, `left_chunks` 2); a failed batch in the second
+  document (the first deleted, the second left, `left_chunks` 1); and a failed batch in the first
+  (both left, `left_chunks` 2). In each, one repair pass finishes what is left.
 - The step starts no new attempt after the Bundle's own deadline (`bundle_transaction_deadline`:
   `HFS_REQUEST_TIMEOUT` less 2 s, counted from the call), and an attempt still running at the
   deadline is cut, so a committed Bundle is answered instead of timing out with `408` and being
@@ -1951,7 +2004,11 @@ Bundle changed SearchParameters, and then rewrites the rows:
   for the repair, and cancelling the request mid-step aborts only the batch in flight, since the
   batches before it have committed.
 - It logs one `INFO` line per Bundle, "transaction bundle search rows written after commit", with
-  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches`, `retries` and `ms`.
+  `tenant`, `bundle_id`, `entries`, `resources`, `indexed`, `rows`, `batches` (the batch
+  transactions that wrote resources), `retries`, `shrinks` and `ms`. It also records its duration,
+  its rows and whether it left work behind as metrics (see **Metrics** below), and in
+  `MongoBackend::deferred_index_step_totals()`, so a test or a harness can read them without parsing
+  the line (#2036).
   If anything is left it also logs a `WARN`, "transaction bundle search rows not all written after
   commit; the deferred index repair will finish them", with `left_chunks`, `stopped_at_deadline`
   and `last_error`.
@@ -1971,11 +2028,11 @@ that document serializes them: a loser starts again from the state the winner co
   only `_id` and `_lastUpdated` finds them at once, since those are resolved on the resource
   documents. A search on any other parameter can miss them until their rows are written. For an
   updated or deleted resource the old rows stay until its batch runs, so such a search can briefly
-  match its previous content. The lag is inferred, not measured with this change: about 2 s for
-  a 6,000-entry Bundle and about 10 s for a 30,000-entry one, from the 57,346 rows/s the
-  `$reindex` writer reached in a benchmark run and 18.6 rows per entry. After a crash or a
-  deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
-  Bundle deadline) plus up to one repair interval plus the time to write the rows.
+  match its previous content. The lag is the post-commit step's own time. It was measured on one
+  laptop, for Bundles of 4,005 to 30,171 entries, and not on any other host (see **Lag of the
+  post-commit step** below). After a crash or a deadline cut it is the repair's lag: in `hfs`, its
+  minimum age (the larger of 60 s and the Bundle deadline) plus up to one repair interval plus the
+  time to write the rows.
 - A supported `:missing=true` search resolves on the resource document's `missing_params`. A
   resource of a deferred type that the Bundle created, updated or restored has none until its
   batch commits (the `ifNoneExist` target types keep theirs). It still carries the
@@ -2005,6 +2062,90 @@ that document serializes them: a loser starts again from the state the winner co
   of an inline Bundle and of the `ifNoneExist` types of a deferred Bundle. A deferred create,
   update or restore has none to rewrite: its transaction writes none (#2035).
 
+**Lag of the post-commit step (#2036).** The window above is the time the step takes after the
+commit: `mongodb_deferred_search_index_step_seconds` on a server, the `step_s` of the test line
+below in a harness. The step times here were measured on one laptop, with the step timed on its own.
+An earlier version of this section gave about 2 s for a 6,000-entry Bundle and about 10 s for a
+30,000-entry one, inferred from the 57,346 rows/s the `$reindex` writer reached in a benchmark run
+and 18.6 rows per entry. The measurements below replace both figures: the measured steps are 5 to
+8 times (6,141 entries) and about 6 times (30,171 entries) as long. The benchmark host was not
+used for this section.
+
+The ignored test `the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` sends one
+deferred Bundle (copies of the 267-entry US Core fixture, 16.0 rows per entry) and prints
+`DEFERRED_STEP entries=.. rows=.. bundle_s=.. step_s=.. txn_s=.. rows_per_s=.. wt_cache_gb=..`:
+`step_s` is the step's own time from `MongoBackend::deferred_index_step_totals()`, `txn_s` is the
+rest of the call. `entries` is the requested size rounded up to whole fixture copies, so a request
+for 6,000 entries sends 6,141 and one for 30,000 sends 30,171. The raw lines, in the order they
+were taken, with the `wt_cache_gb` field shown as `cache_gb`:
+
+```text
+build    cache_gb  entries    rows  bundle_s  step_s  txn_s  rows_per_s
+release      0.25     4005   64035       9.7     7.9    1.8        8144
+release      0.25     4005   64035      17.0    13.8    3.2        4627
+release      0.25     4005   64035       8.9     6.9    2.1        9342
+release      0.25     4272   68304       9.2     7.3    1.9        9329
+release      0.25     4539   72573      10.0     7.8    2.3        9354
+debug        0.25     4005   64035      34.4    31.3    3.2        2047
+debug        0.25     4005   64035      15.5    12.5    2.9        5111
+debug        0.25     4005   64035      17.6    14.2    3.3        4500
+release      2.00     4005   64035       8.7     6.8    1.9        9427
+release      2.00     4005   64035       8.4     6.8    1.6        9412
+release      2.00     4005   64035       8.7     6.8    1.9        9388
+release      2.00     6141   98187      14.3    10.9    3.4        9026
+release      2.00     6141   98187      13.3    10.4    2.9        9398
+release      2.00     6141   98187      20.6    16.8    3.8        5833
+release      2.00    30171  482397      72.2    57.3   14.9        8423
+release      2.00    30171  482397      79.9    64.1   15.8        7531
+release      2.00    30171  482397      72.0    58.4   13.6        8266
+```
+
+Conditions: an AMD Ryzen 7 7730U laptop (8 cores, 16 threads, 31 GB), Windows 11, the test process
+and a Docker Desktop `mongo:7.0` single-member replica set on the same machine, started with
+`--oplogSize 128` and `--wiredTigerCacheSizeGB 0.25` (the first eight lines) or
+`--wiredTigerCacheSizeGB 2` (the last nine); the default 4,000-entry threshold, 32 connections, no
+Bundle deadline. One run at a time, no other build or test running from the session that took the
+measurements, and no `cargo` or `rustc` process on the machine when the 2 GB runs started. Release
+is `--release`; the 2 GB lines are all release builds, three runs of each size.
+
+What the measured lines show, for this laptop:
+
+- At 0.25 GB the step, not the transaction, is most of the call (1.8-3.3 s of 8.9-34.4 s). In a
+  release build it ran at 4,600-9,400 rows/s, a sixth to a twelfth of the `$reindex` figure above.
+  The runs of one build differ by a factor of two or more (6.9-13.8 s for release, 12.5-31.3 s for
+  debug, and the ranges overlap).
+- At 2 GB all nine runs committed, and the test's own checks of the store passed (the step wrote
+  every row in the store, and no ledger document or marker was left). The step took 6.8 s for
+  4,005 entries (all three runs), 10.4-16.8 s for 6,141 entries and 57.3-64.1 s for 30,171 entries.
+  It was 76-82% of the call in each run. The rest of the call (`txn_s`) took 1.6-1.9 s, 2.9-3.8 s
+  and 13.6-15.8 s for the three sizes.
+- Rows per second at 2 GB: 9,388-9,427 for 4,005 entries, 5,833-9,398 for 6,141 and 7,531-8,423
+  for 30,171. The 30,171-entry rate is below the 4,005-entry one and inside the spread of the
+  6,141-entry runs. The slowest of the nine runs (5,833 rows/s) is the third 6,141-entry run.
+- The same 4,005-entry Bundle took 6.9-13.8 s at 0.25 GB and 6.8 s at 2 GB; the fastest runs of the
+  two caches are 0.1 s apart. Three runs per cell do not show whether the cache changes the spread
+  between runs. The cause of the spread at either cache was not investigated.
+- Lag after the commit on this laptop with a 2 GB cache, for a client other than the one that sent
+  the Bundle: 10.4-16.8 s for 6,141 entries and 57.3-64.1 s for 30,171 entries. The client that
+  sent the Bundle gets its response after the step: 13.3-20.6 s and 72.0-79.9 s (`bundle_s`).
+
+Not measured:
+
+- A Bundle of exactly 6,000 or 30,000 entries (the test rounds up to 6,141 and 30,171), a size
+  between 4,005 and 30,171 other than 6,141, a size above 30,171 (nothing was tried above it, so
+  the cache's limit at 2 GB is not known), a cache between 0.25 GB and 2 GB (the smallest cache
+  that commits 6,141 entries was not found) or above 2 GB, and a debug build at 2 GB.
+- At 0.25 GB, 4,005 to 4,539 entries committed. 5,073 and 6,141 entries were rolled back by the
+  server as `TooLargeForCache` (while the ledger was written: MongoDB error 112, `WriteConflict`,
+  reason `transaction rolled back because of cache overflow`; the log reason of those runs read
+  `Commit rolled back for eviction while the Bundle ran alone`, which blamed the commit, and now
+  reads `Deferred search index ledger write rolled back for eviction while the Bundle ran alone`,
+  #2037), and 30,171 entries failed at entry 12,729 with the write set refused (code 388). Those
+  sizes did not commit at 0.25 GB, so no step was timed for them there.
+- The benchmark host, a server under other load, and a replica set of more than one member (a
+  single member has no replication to wait for). What the benchmark host would measure for this
+  step is not known.
+
 **Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
 transaction through the search rows, so it must see an earlier entry of the same Bundle. A
 deferred Bundle therefore still writes the rows of every resource whose type is the target of one
@@ -2030,11 +2171,18 @@ step that is still running.
   overlapping call) that read the same document finds the claim taken and skips it: that is the
   `skipped` field of `DeferredIndexRepairReport`, which is not counted in `examined`. A claimer
   that crashes leaves a document that is due again after `min_age`.
-- It runs the same marker-gated batches with no deadline. A batch that runs out of attempts does
-  not stop the document: the healthy batches are still written (up to three failed batches in a
-  row, so a MongoDB that is down does not cost every attempt of every batch), and the document is
-  kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
-  increased, and is retried after another `min_age`.
+- It runs the same marker-gated batches with no deadline, cut by rows and shrunk on a cache
+  overflow exactly as the step's are (one implementation, #2031). A batch that runs out of attempts
+  does not stop the document: the healthy batches are still written (up to three failed batches in
+  a row, so a MongoDB that is down does not cost every attempt of every batch), and the document
+  is kept, with `not_before` set to now, `last_error` (at most 1,024 characters) and `attempts`
+  increased, and is retried after another `min_age`. A resource the cache refuses in a
+  transaction of its own (too large for one transaction with 388, after one attempt; rolled back
+  for cache pressure on each of five attempts) does not stop the document either, and does not
+  count toward those three (it shows the server is answering): the other resources and the later
+  chunks are written, and the document is kept with `last_error` naming the first such resource.
+  The rebuilt batch of a repair reads only the resources still marked, so after a pass that wrote
+  the others it is that one resource alone, in one transaction.
 - A document with no `refs` array, or with refs that cannot be read, is kept the same way, after
   its readable refs are indexed. Documents are never dropped before all of their resources are
   indexed. Every instance may run the repair.
@@ -2049,15 +2197,64 @@ unwritten are never written.
 
 - A pass that found work logs "Deferred search index repair pass finished" at `INFO` (at `WARN` if
   any document failed) with `examined`, `skipped`, `resources`, `reindexed`, `rows`, `cleared`,
-  `failed`, `remaining` and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
+  `failed`, `remaining`, `oldest_pending_secs` (the age of the oldest ledger document left, `0` for
+  an empty ledger) and `pass_ms`. Each failing document logs a `WARN`, "deferred search index
   repair could not finish a ledger chunk", with `tenant`, `bundle_id`, `chunk`, `attempts` and
   `error`. A pass that could not run at all logs "Repair of deferred MongoDB search rows could not
   run".
+- A pass that took no document although some were due (every one was skipped: claimed or finished
+  by another repair, or its claim failed, which logs its own `WARN`, "could not claim a deferred
+  search index ledger chunk") logs one `INFO`, "Deferred search index repair pass took no chunk:
+  every due chunk was skipped (claimed or finished by another repair, or its claim failed)", with
+  `skipped` and `remaining`.
 - At startup, if nothing was due but the ledger is not empty, it logs "Deferred search index
   ledger holds chunks younger than the repair's minimum age; the next pass takes them".
+- Any other pass (nothing examined, nothing skipped) logs nothing, so a quiet log does not say the
+  ledger is empty: use the metrics below.
 - To see what is owed, run `db.search_index_pending.countDocuments()` (or call
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
   fully indexed.
+
+**Metrics (#2034, #2036).** `/metrics` carries six process-level series for the backlog and the
+post-commit step. None has a tenant, resource-type or Bundle label (`/metrics` is public); the only
+label is `reason` on the last one.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `mongodb_deferred_search_index_pending_chunks` | gauge | Ledger documents after the latest repair pass, due or not |
+| `mongodb_deferred_search_index_oldest_pending_seconds` | gauge | Age of the oldest ledger document, by its `created_at`; `0` when the ledger is empty. This is the one to alert on: a Bundle has been committed and not fully searchable for this long |
+| `mongodb_deferred_search_index_repair_failed_chunks_total` | counter | Ledger documents a repair pass worked on and had to leave in place (the pass line's `failed`). A document that keeps failing counts once per pass |
+| `mongodb_deferred_search_index_step_seconds` | histogram | Duration of each post-commit step, buckets from 0.05 s to 600 s |
+| `mongodb_deferred_search_index_step_rows_total` | counter | Search rows written by post-commit steps. The step's rows per second is `rate(..._step_rows_total) / rate(..._step_seconds_sum)` |
+| `mongodb_deferred_search_index_steps_incomplete_total{reason}` | counter | Steps that left work to the repair. `reason` is `deadline` (cut at the Bundle deadline) or `failure` (a batch failed for good, the cache refused a resource in a transaction of its own, or a finished ledger document could not be deleted) |
+
+- The two gauges describe the ledger as the latest repair pass left it, so they are as fresh as that
+  pass (every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds, `60` by default). They are not
+  exported before the first pass, nor at all when the repair is off
+  (`HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL=0`) or the server has no native MongoDB backend. A
+  pass that cannot run publishes nothing, so while passes keep failing ("Repair of deferred MongoDB
+  search rows could not run") both gauges keep the last successful pass's values and the age does
+  not grow. A Bundle whose step finishes it between two passes is never seen by them; the step
+  series cover that. The ledger is in the shared database, so every instance reports the same
+  documents: combine the gauges across instances with `max`, not `sum`.
+- The step series are recorded when a step ends. A step whose request was dropped before that
+  records nothing; what it left is in the ledger, which the next pass reports. A Bundle that
+  deferred nothing runs no step.
+- An alert for a Bundle left unsearchable beyond the repair's own lag, which is `min_age` (the larger
+  of 60 s and the Bundle deadline) plus up to one repair interval plus the time to write the rows.
+  With the default `HFS_REQUEST_TIMEOUT` of 30 s that is about two minutes, so five minutes is a
+  stuck ledger; with a 900 s timeout use more than 1,200:
+
+  ```
+  max(mongodb_deferred_search_index_oldest_pending_seconds) > 300
+  ```
+
+  and, for a repair that keeps leaving documents behind (the `WARN` and the document's
+  `last_error` say why):
+
+  ```
+  increase(mongodb_deferred_search_index_repair_failed_chunks_total[30m]) > 0
+  ```
 
 **Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its Bulk
 Data Submit manifests, then its `resources`, then its `search_index`, `search_index_contained` and
@@ -2150,14 +2347,16 @@ index keys per resource with `validate`. It prints one `DEFERRED_CEILING_PROBE` 
 (`missing_keys_per_resource` and `fp_keys_per_resource` are the keys of
 `idx_resources_missing_params` and `idx_resources_missing_params_fp`, `resource_keys_per_resource`
 all keys of `resources`), and then one `DEFERRED_CEILING` line per variant with `outcome`,
-`cause`, `abort_entry` (the entry the transaction ended at, `commit`, or `na` for a committed
-Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by), the resources,
-rows, ledger documents and markers left, and the server's eviction-rollback delta.
+`cause`, `abort_entry` (the entry the transaction ended at, `ledger`, `commit`, or `na` for a
+committed Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by; the
+entries written are all of them for `ledger`), the resources, rows, ledger documents and markers
+left, and the server's eviction-rollback delta.
 
 `abort_entry` is accurate to about one create chunk (100 entries): a failed chunk is charged to the
-entry the server names, or else to its first entry, so it can read up to 99 entries low. A 388
-while the ledger is written reads as `abort_entry=<entries>`, because `ledger_attempt_error` reuses
-`entry_attempt_error(entries, entries, ..)`.
+entry the server names, or else to its first entry, so it can read up to 99 entries low. A failure
+while the ledger is written reads as `abort_entry=ledger` (#2037). Before that it read as
+`abort_entry=<entries>` for a 388, because `ledger_attempt_error` passed the entry count as an
+entry index, and as `abort_entry=commit` for an eviction rollback.
 
 Knobs (defaults in parentheses): `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (`0.5`),
 `HFS_TEST_DEFERRED_CEILING_COPIES` (`15`), `HFS_TEST_DEFERRED_CEILING_VARIANTS` (`inline,deferred`),
@@ -2166,7 +2365,11 @@ mongod's `transactionLifetimeLimitSeconds`), `HFS_TEST_DEFERRED_CEILING_MONGODB_
 replica set; no container is started), `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT` (`true`;
 `false` accepts any inline outcome) and `HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT` (`true`; `false`
 accepts any outcome of the other variants, to find where they abort). An aborted Bundle must leave
-no resource, ledger or marker whatever the knobs. Speed depends on the load of the host. On a shared
+no resource, ledger or marker whatever the knobs. The line ends with `step_s`, the post-commit
+step's own time (`na` when no step ran), so `secs` can be split into the transaction and the step;
+`the_post_commit_step_of_one_deferred_bundle_is_timed_on_its_own` times one deferred Bundle on its
+own (see **Lag of the post-commit step** above) and takes `HFS_TEST_DEFERRED_STEP_ENTRIES` (`6000`,
+rounded up to whole fixture copies) and `HFS_TEST_MONGODB_URL`. Speed depends on the load of the host. On a shared
 12-core host with a debug build, a committing 4,005-entry Bundle ran at 48-54 entries per second
 (74.1 s, 79.9 s and 83.7 s), and the variants that aborted ran at 51-401 entries per second up to
 the abort, so an aborting variant took about 90-245 s at 2 GB. A 28,035-entry Bundle that committed

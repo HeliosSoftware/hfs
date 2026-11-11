@@ -3502,6 +3502,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3624,6 +3625,8 @@ dependencies = [
  "helios-sof",
  "humantime",
  "json-patch",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mongodb",
  "neo4rs",
  "parking_lot",

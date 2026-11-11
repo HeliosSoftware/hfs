@@ -106,6 +106,12 @@ serde_json = "1"
 # assert what the binary actually serves, not what a `cfg` says.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `tokio::time::pause()` / `start_paused` for the deferred-index repair loop's
+# tests (#2034): the loop's first pass and its interval run on a virtual clock.
+tokio = { version = "1", features = ["full", "test-util"] }
+# A scoped subscriber that captures what the repair loop logs (#2034), as in
+# `helios-observability`'s request-span test.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `tests/elasticsearch_startup.rs` talks HTTP to the `hfs` binary it starts
 # and to the Elasticsearch cluster under it.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

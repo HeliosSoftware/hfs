@@ -23,6 +23,11 @@
 //! - [`composite_metrics`] — process-level Prometheus metrics for composite
 //!   storage's secondary sync: final failures by backend and operation, and
 //!   the number of resources recorded as needing a reindex (#1334).
+//! - [`deferred_index_metrics`] — process-level Prometheus metrics for MongoDB's
+//!   deferred search indexing of large transaction Bundles: the ledger backlog
+//!   and the age of its oldest document (as the latest repair pass left them),
+//!   failed repair documents, and each post-commit step's duration, rows and
+//!   incomplete outcomes (#2034, #2036). Only a fixed `reason` label.
 //! - [`pool_metrics`] — process-level Prometheus gauges for the server's
 //!   PostgreSQL connection pools (ceiling, open, idle, waiting callers),
 //!   sampled at scrape time from sources the server registers (#1907). Only
@@ -63,6 +68,7 @@ pub mod composite_metrics;
 pub mod dashboard;
 pub mod dashboard_counters;
 pub mod dashboard_metrics;
+pub mod deferred_index_metrics;
 pub mod metrics;
 pub mod middleware;
 pub mod mode;

@@ -155,6 +155,11 @@ ctor = "0.2"
 # Asserts that lease loss, heartbeat timeouts, and broken input streams are
 # logged at `warn` (#1127).
 tracing-test = "0.2"
+# A thread-local recorder that reads back what a deferred-index repair pass and
+# a post-commit step publish (#2034, #2036); the same versions and features as
+# `helios-observability`, so nothing new is built.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
 # timeouts) that a real cluster cannot be made to produce on demand (#1125).
 wiremock = "0.6"
