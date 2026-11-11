@@ -6766,11 +6766,12 @@ mod tests {
             .await
             .unwrap();
         // FTS5 reports its own internal statements (`-- …`), some of them while
-        // the COMMIT runs; only the application's statements count here.
+        // the COMMIT runs, and r2d2_sqlite's checkout health check is a bare
+        // `SELECT 1;`; only the application's statements count here.
         let log: Vec<String> = STMTS
             .with(|s| s.borrow().clone())
             .into_iter()
-            .filter(|s| !s.starts_with("--"))
+            .filter(|s| !s.starts_with("--") && s != "SELECT 1;")
             .collect();
         let begins = log.iter().filter(|s| s.starts_with("BEGIN")).count();
         let commits = log.iter().filter(|s| s.starts_with("COMMIT")).count();
