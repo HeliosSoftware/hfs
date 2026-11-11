@@ -15,10 +15,12 @@ on:
   # Windows has its own nightly, windows-nightly.yml, at the same time and
   # without a Windows agent; nothing in this file runs on Windows.
   # 06:30 UTC sits in the quietest stretch of the week's runner demand
-  # (06:00-11:00 UTC).
+  # (06:00-11:00 UTC). Not on Mondays: that is when the Sunday release's tag
+  # run and then its benchmark (the benchmark-release job) use the runners;
+  # see the nightly slot list in ci-extended.yml.
   # Check the latest nightlies are green before cutting a `v*` tag.
   schedule:
-    - cron: "30 6 * * *"
+    - cron: "30 6 * * 0,2-6"
   # Manual run, e.g. to check a branch on macOS before merging a fix for a
   # nightly failure: Actions -> HFS Continuous Integration -> Run workflow,
   # pick the branch and the OS. `macOS` is the nightly. For Windows, run
@@ -2132,3 +2134,36 @@ jobs:
     with:
       server: ${{ matrix.server }}
     secrets: inherit
+
+  # ── Release benchmark ──────────────────────────────────────────
+  # Once every other release job is done, start the FHIR Server Benchmark on
+  # the tag, so each version gets one benchmark run and the run's HTML report
+  # can chart it against the previous versions (the version trend,
+  # .github/scripts/fhir-bench/README.md). Releases are tagged on Sunday
+  # afternoon and this run lands on Monday, the day no nightly is scheduled
+  # (see the slot list in ci-extended.yml), so it has the self-hosted runners
+  # and the Docker host as much to itself as possible.
+  #
+  # A dispatch, not `uses:`: a called workflow would run inside this CI run,
+  # hold it open for hours and never appear among fhir-benchmark.yml's runs,
+  # which is where history.py finds earlier runs and versions. A
+  # workflow_dispatch is one of the events GITHUB_TOKEN may start a run with.
+  # It runs only when the GitHub Release itself was created; a failed deploy
+  # or Docker push does not stop it (the benchmark builds HFS from the tag).
+  benchmark-release:
+    name: Start FHIR Server Benchmark on the release tag
+    needs: [release, publish-pypi, publish-report, docker-manifests, deploy-hts, deploy]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch fhir-benchmark.yml on ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh workflow run fhir-benchmark.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" \
+            -f backend=core -f tests=all
+          echo "Started the FHIR Server Benchmark on $TAG: https://github.com/$GITHUB_REPOSITORY/actions/workflows/fhir-benchmark.yml" >> "$GITHUB_STEP_SUMMARY"

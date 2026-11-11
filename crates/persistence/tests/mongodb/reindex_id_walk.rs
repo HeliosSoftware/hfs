@@ -2285,3 +2285,235 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     // Final-row correctness is not asserted: residual (a) is expected under
     // continuous writes that outpace the walk.
 }
+
+// ===========================================================================
+// #945: a time-scoped walk whose floor covers the whole type walks by id
+// ===========================================================================
+
+/// `snapshot`'s `search_index` and `search_index_contained` rows of
+/// `resource_type` whose `resource_id` `keep` accepts.
+fn rows_of(
+    rows: &(Vec<String>, Vec<String>),
+    resource_type: &str,
+    keep: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let pick = |lines: &Vec<String>| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["resource_type"] == resource_type
+                    && row["resource_id"].as_str().is_some_and(&keep)
+            })
+            .cloned()
+            .collect()
+    };
+    (pick(&rows.0), pick(&rows.1))
+}
+
+/// Drops every `search_index` and `search_index_contained` row of
+/// `resource_type` for `tenant_id`, so a following reindex shows exactly
+/// which resources it wrote.
+async fn wipe_type_index(db: &mongodb::Database, tenant_id: &str, resource_type: &str) {
+    for collection in ["search_index", "search_index_contained"] {
+        db.collection::<Document>(collection)
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .unwrap();
+    }
+}
+
+/// Every page of `source`'s walk of `resource_type`: the ids each page
+/// returned, and the cursor that page handed back.
+async fn walk_pages(
+    source: &std::sync::Arc<dyn ReindexSource>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    limit: u32,
+) -> Vec<(Vec<String>, Option<String>)> {
+    let mut pages = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..100 {
+        let page = source
+            .fetch_resources_page(tenant, resource_type, cursor.as_deref(), limit)
+            .await
+            .unwrap();
+        let ids = page.resources.iter().map(|r| r.id().to_string()).collect();
+        let next = page.next_cursor.clone();
+        pages.push((ids, next.clone()));
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return pages,
+        }
+    }
+    panic!("the walk did not end: {pages:?}");
+}
+
+/// Runs a reindex of Observation through the real driver, time-scoped when
+/// `since` is set, and waits for it.
+async fn reindex_observations(
+    backend: &std::sync::Arc<MongoBackend>,
+    tenant: &TenantContext,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> helios_persistence::search::ReindexProgress {
+    let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+    let job = op
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(["Observation"])
+                .with_updated_since(since)
+                .with_batch_size(7),
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = wait_for_terminal(&op, &job).await;
+    assert_eq!(
+        progress.status,
+        helios_persistence::search::ReindexStatus::Completed,
+        "{progress:?}"
+    );
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    progress
+}
+
+#[tokio::test]
+async fn mongodb_reindex_time_floor_before_every_row_walks_the_type_by_id() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_since_whole_type").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+    let tenant = create_tenant("since-whole");
+    let fixture = seed_walk_fixture(&backend, &tenant, 30, "only-here").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+    let live: Vec<String> = fixture.live["Observation"].iter().cloned().collect();
+    let db = backend.get_database().await.unwrap();
+
+    // The reference: an unscoped rebuild of the type.
+    wipe_type_index(&db, "since-whole", "Observation").await;
+    reindex_observations(&backend, &tenant, None).await;
+    let unscoped = rows_of(
+        &snapshot(&db, "since-whole", false).await,
+        "Observation",
+        |_| true,
+    );
+    assert!(!unscoped.0.is_empty());
+
+    // A floor before every live row: the window is the whole type.
+    let floor = ts("2019-12-31T00:00:00.000Z");
+    wipe_type_index(&db, "since-whole", "Observation").await;
+    let progress = reindex_observations(&backend, &tenant, Some(floor)).await;
+    assert_eq!(progress.total_resources, live.len() as u64);
+    assert_eq!(progress.processed_resources, live.len() as u64);
+    let scoped = rows_of(
+        &snapshot(&db, "since-whole", false).await,
+        "Observation",
+        |_| true,
+    );
+    assert_eq!(
+        scoped, unscoped,
+        "the scoped rebuild must match the unscoped one"
+    );
+
+    // The walk itself: id-phase cursors, in id order, every live row once,
+    // and the count the driver sizes it by is unchanged.
+    let view = backend.clone().with_updated_since(floor).unwrap();
+    assert_eq!(
+        view.count_resources(&tenant, "Observation").await.unwrap(),
+        live.len() as u64
+    );
+    let pages = walk_pages(&view, &tenant, "Observation", 7).await;
+    let first_cursor = pages[0].1.as_deref().expect("a first page cursor");
+    assert!(first_cursor.starts_with("v2|i|"), "{first_cursor}");
+    assert!(view.may_prefetch_page(first_cursor));
+    let walked: Vec<String> = pages.iter().flat_map(|(ids, _)| ids.clone()).collect();
+    assert_eq!(walked, live, "the whole type, once, in id order");
+
+    let chosen = walk_log_lines(&[
+        "tenant=since-whole",
+        "resource_type=Observation",
+        "mongodb reindex time floor covers the whole type; walking by id",
+    ]);
+    assert!(!chosen.is_empty());
+    assert!(
+        walk_log_lines(&[
+            "tenant=since-whole",
+            "mongodb reindex walk started at a time floor",
+        ])
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn mongodb_reindex_time_floor_inside_the_data_stays_time_ordered() {
+    use std::sync::Arc;
+
+    let Some(backend) = create_backend("reindex_since_mid_floor").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    capture_walk_logs();
+    let tenant = create_tenant("since-mid");
+    let fixture = seed_walk_fixture(&backend, &tenant, 30, "only-here").await;
+    backdate_fixture(&backend, &tenant, &fixture).await;
+    let db = backend.get_database().await.unwrap();
+
+    wipe_type_index(&db, "since-mid", "Observation").await;
+    reindex_observations(&backend, &tenant, None).await;
+    let unscoped = snapshot(&db, "since-mid", false).await;
+
+    // Observation `i` is stamped at second `i % 3`: a floor at second 1
+    // keeps groups 1 and 2 and leaves group 0 out.
+    let floor = ts("2020-01-01T00:00:01.000Z");
+    let group = |id: &str| -> usize { id.trim_start_matches("obs-").parse::<usize>().unwrap() % 3 };
+    let mut in_window: Vec<String> = fixture.live["Observation"]
+        .iter()
+        .filter(|id| group(id) > 0)
+        .cloned()
+        .collect();
+    in_window.sort_by_key(|id| (group(id), id.clone()));
+
+    wipe_type_index(&db, "since-mid", "Observation").await;
+    let progress = reindex_observations(&backend, &tenant, Some(floor)).await;
+    assert_eq!(progress.total_resources, in_window.len() as u64);
+    let scoped = rows_of(
+        &snapshot(&db, "since-mid", false).await,
+        "Observation",
+        |_| true,
+    );
+    let expected = rows_of(&unscoped, "Observation", |id| group(id) > 0);
+    assert!(!expected.0.is_empty());
+    assert_eq!(scoped, expected, "only the window's rows are rewritten");
+
+    let view = backend.clone().with_updated_since(floor).unwrap();
+    let pages = walk_pages(&view, &tenant, "Observation", 7).await;
+    let first_cursor = pages[0].1.as_deref().expect("a first page cursor");
+    assert!(first_cursor.starts_with("v2|c|"), "{first_cursor}");
+    assert!(!view.may_prefetch_page(first_cursor));
+    let walked: Vec<String> = pages.iter().flat_map(|(ids, _)| ids.clone()).collect();
+    assert_eq!(
+        walked, in_window,
+        "(last_updated, id) order over the window"
+    );
+
+    assert!(
+        !walk_log_lines(&[
+            "tenant=since-mid",
+            "resource_type=Observation",
+            "mongodb reindex walk started at a time floor",
+        ])
+        .is_empty()
+    );
+    assert!(
+        walk_log_lines(&[
+            "tenant=since-mid",
+            "mongodb reindex time floor covers the whole type; walking by id",
+        ])
+        .is_empty()
+    );
+}

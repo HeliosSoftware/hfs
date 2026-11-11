@@ -1129,10 +1129,41 @@ async fn a_tenant_purge_racing_a_held_ingest_change_log_insert_leaves_no_rows() 
     ingest_race("chgins", "insert", "bulk_submission_changes").await;
 }
 
-/// The receipts are one `update` command with upserts, the last write of a batch.
+/// The receipts of new entries are one unordered `insert` command, the last
+/// write of a batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_purge_racing_a_held_ingest_receipt_insert_leaves_no_rows() {
+    ingest_race("rcptins", "insert", "bulk_entry_results").await;
+}
+
+/// The same file ingested again: its receipts exist, the `insert` reports them
+/// as duplicates and they go in by an `update` with upserts, which is the write
+/// that is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_receipt_upsert_leaves_no_rows() {
-    ingest_race("rcptupd", "update", "bulk_entry_results").await;
+    let Some(race) = BulkRace::start("rcptupd").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    race.ingest(entries(5, "v1"), FILE_URL)
+        .await
+        .expect("create the receipts the held batch upserts");
+    let Some(result) = purge_while_held(
+        &race.app,
+        &race.db_name,
+        "update",
+        "bulk_entry_results",
+        &race.purger,
+        race.purged_id(),
+        race.ingest(entries(5, "v2"), FILE_URL),
+    )
+    .await
+    else {
+        return;
+    };
+    eprintln!("the batch ended: {}", describe(&result));
+    race.assert_only_kept_rows_remain().await;
+    assert_manifest_not_found(&result);
 }
 
 /// `record_submit_file` reads the manifest to check its fence and then upserts

@@ -74,9 +74,9 @@ octofhir-ucum = "0.5"
 unicode-normalization = "0.1"
 
 # SQLite (default)
-rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }
-r2d2_sqlite = { version = "0.26", optional = true }
+r2d2_sqlite = { version = "0.36", default-features = false, optional = true }
 
 # PostgreSQL
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"], optional = true }

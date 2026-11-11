@@ -1,7 +1,9 @@
 name: FHIR Server Benchmark
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Manual trigger only — runs the HealthSamurai FHIR Server Performance Benchmark
+# Manual trigger, plus one run per release: ci.yml's benchmark-release job
+# dispatches it on every `v*` tag once the release is out (default inputs, so
+# backend=core, tests=all). Runs the HealthSamurai FHIR Server Performance Benchmark
 # (https://github.com/HealthSamurai/fhir-server-performance-benchmark) against
 # HFS so we can measure ourselves against Aidbox / HAPI / Medplum and (later)
 # submit comparable numbers for the public report.
@@ -2347,6 +2349,9 @@ jobs:
       # history.md is NOT appended here any more: the last step does it, so the
       # report link lands after it. --data-dir receives the report-data.json of
       # earlier runs (artifact fhir-bench-report-data-<run id>) for the HTML trend.
+      # On a release tag (vX.Y.Z, the run ci.yml's benchmark-release job starts),
+      # --version-dir also receives that of the newest run of each of the
+      # earlier versions, for the HTML version trend; on a branch it stays empty.
       - name: Write run history
         if: always()
         continue-on-error: true
@@ -2365,7 +2370,7 @@ jobs:
           if [ "$N" -lt 1 ]; then N=1; fi
           if [ "$N" -gt 20 ]; then N=20; fi
           echo "HISTORY_RUNS_N=$N" >> "$GITHUB_ENV"
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend"
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend" --version-dir "$RUNNER_TEMP/versions" --max-versions 10
 
       # comparison.md exists only after the summary step, so it is staged here.
       - name: Stage comparison for the report
@@ -2398,6 +2403,8 @@ jobs:
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
             --trend-max $(( ${HISTORY_RUNS_N:-10} + 1 )) \
+            --version-dir "$RUNNER_TEMP/versions" \
+            --version-max 10 \
             --no-shapes
 
       # archive: false uploads the single .html as-is (not zipped), so it opens

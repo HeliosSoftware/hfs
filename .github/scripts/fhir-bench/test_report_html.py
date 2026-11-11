@@ -607,5 +607,96 @@ class LegacyTrend(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
 
 
+class VersionTrend(unittest.TestCase):
+    """The version trend: release-tag runs only, one point per version, the branch trend untouched."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import report_html
+        cls.R = report_html
+
+    def pt(self, rid, tag, date="2026-11-02T10:00:00Z"):
+        return {"run": rid, "date": date, "branch": tag, "sha": "abc" + rid,
+                "suites": {"crud": {"rps": int(rid), "p95": 1}}}
+
+    def doc(self, p):
+        return (p["run"], {"run": p["run"], "legs": {"sqlite": {"point": p}}})
+
+    def test_one_point_per_older_version_current_last(self):
+        hist = [self.doc(self.pt("50", "v0.2.5")), self.doc(self.pt("60", "v0.2.6")),
+                self.doc(self.pt("61", "v0.2.6")),  # newer run of v0.2.6 wins
+                self.doc(self.pt("75", "main")), self.doc(self.pt("80", "v0.2.8")),
+                self.doc(self.pt("95", "v0.2.10")),  # newer than this run's version
+                self.doc(self.pt("89", "v0.2.9"))]   # earlier run of this run's version
+        cur = self.pt("90", "v0.2.9")
+        tr = self.R.version_trend("sqlite", cur, hist, "90")
+        self.assertEqual([(t["branch"], t["run"]) for t in tr],
+                         [("v0.2.5", "50"), ("v0.2.6", "61"), ("v0.2.8", "80"), ("v0.2.9", "90")])
+        tr = self.R.version_trend("sqlite", cur, hist, "90", max_versions=2)
+        self.assertEqual([t["branch"] for t in tr], ["v0.2.8", "v0.2.9"])
+        self.assertEqual(self.R.version_trend("sqlite", cur, hist, "90", max_versions=1), [cur])
+
+    def test_semver_order_not_text_order(self):
+        hist = [self.doc(self.pt(str(10 + i), "v0.%d.0" % i)) for i in (2, 9, 10)]
+        tr = self.R.version_trend("sqlite", self.pt("99", "v0.11.0"), hist, "99")
+        self.assertEqual([t["branch"] for t in tr], ["v0.2.0", "v0.9.0", "v0.10.0", "v0.11.0"])
+
+    def test_nothing_on_a_branch(self):
+        hist = [self.doc(self.pt("50", "v0.2.5"))]
+        self.assertEqual(self.R.version_trend("sqlite", self.pt("90", "main"), hist, "90"), [])
+        self.assertEqual(self.R.version_trend("sqlite", None, hist, "90"), [])
+
+    def render(self, t, branch, vdir):
+        cur = os.path.join(t, "cur")
+        if not os.path.isdir(cur):
+            make_leg(cur, "sqlite", False)
+        out, dump = os.path.join(t, branch.replace("/", "_") + ".html"), os.path.join(t, "d.json")
+        args = ["--run-dir", cur, "--run-id", "777", "--branch", branch, "--out", out, "--dump-json", dump,
+                "--no-shapes", "--trend-dir", os.path.join(t, "none")]
+        if vdir:
+            args += ["--version-dir", vdir]
+        r = run(args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return open(out, encoding="utf-8").read(), json.load(open(dump))
+
+    def vdir(self, t, tags):
+        v = os.path.join(t, "versions")
+        for rid, tag in tags:
+            os.makedirs(os.path.join(v, rid))
+            with open(os.path.join(v, rid, "report-data.json"), "w", encoding="utf-8") as fh:
+                json.dump({"run": rid, "ref": tag, "legs": {"sqlite": {"point": self.pt(rid, tag)}}}, fh)
+        return v
+
+    def test_cli_release_tag_gets_version_trend(self):
+        with tempfile.TemporaryDirectory() as t:
+            v = self.vdir(t, [("600", "v0.2.6"), ("700", "v0.2.7"), ("800", "v0.3.0")])
+            html, d = self.render(t, "v0.2.8", v)
+            self.assertEqual(d["version"], "v0.2.8")
+            self.assertEqual(d["version_runs"], 3)
+            self.assertNotIn("vtrend", d["legs"]["sqlite"])  # the dump stays slim
+            data = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
+            self.assertEqual([x["branch"] for x in data["legs"]["sqlite"]["vtrend"]],
+                             ["v0.2.6", "v0.2.7", "v0.2.8"])
+            # the branch trend is unchanged: only this run, no history found
+            self.assertEqual([x["run"] for x in data["legs"]["sqlite"]["trend"]], ["777"])
+
+    def test_cli_branch_run_has_no_version_trend_even_with_a_version_dir(self):
+        with tempfile.TemporaryDirectory() as t:
+            v = self.vdir(t, [("600", "v0.2.6")])
+            html, d = self.render(t, "main", v)
+            self.assertIsNone(d["version"])
+            self.assertEqual(d["version_runs"], 0)
+            data = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
+            self.assertEqual(data["legs"]["sqlite"]["vtrend"], [])
+
+    def test_template_branch_trend_call_unchanged_and_version_block_hidden_by_default(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        self.assertIn('function trendPanel(el, key, title, unit, T = trendOf(), byVersion = false)', t)
+        self.assertIn('trendPanel($("tr-"+k), k, t, u.split(" ")[0]));', t)
+        self.assertIn('trendPanel($("vtr-"+k), k, t, u.split(" ")[0], VT, true)', t)
+        self.assertIn('<div id="vtrendBlock" style="display:none">', t)
+        self.assertIn('if(!D.version) return;', t)
+
+
 if __name__ == "__main__":
     unittest.main()
