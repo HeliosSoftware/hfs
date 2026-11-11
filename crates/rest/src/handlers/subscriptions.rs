@@ -183,9 +183,11 @@ fn parse_event_number(param: &str, raw: Option<&str>) -> RestResult<Option<u64>>
 ///
 /// `eventsSinceNumber` defaults to the oldest retained event and
 /// `eventsUntilNumber` to the latest one. Invalid ranges (non-numeric, below 1,
-/// since after until, since beyond the latest event, or entirely older than the
-/// retained history) answer `400` with an `OperationOutcome`. A range that only
-/// partly overlaps the retained history returns the retained subset.
+/// since after until, or entirely older than the retained history) answer `400`
+/// with an `OperationOutcome`. A `eventsSinceNumber` beyond the latest event
+/// (a client polling for the next one) returns the status with no events. A
+/// range that only partly overlaps the retained history returns the retained
+/// subset.
 ///
 /// The event history is bounded (`HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE`) and held
 /// in memory only, like the event counter: it is empty after a restart. A

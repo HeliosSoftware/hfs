@@ -67,7 +67,8 @@ Things to know when working here:
   not hold the subscription, instead of `404`.
 - `$events` returns a `query-event` status (R4 `Parameters`, R4B+ `SubscriptionStatus`) with
   an absolute subscription reference plus id-only entries for the requested
-  `eventsSinceNumber`/`eventsUntilNumber` range; an invalid range is `400` + `OperationOutcome`.
+  `eventsSinceNumber`/`eventsUntilNumber` range; an invalid range is `400` + `OperationOutcome`,
+  but `eventsSinceNumber` past the latest event (polling) is `200` with no events.
 
 ## Key API
 

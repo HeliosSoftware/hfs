@@ -351,8 +351,6 @@ pub enum RangeError {
     BelowMinimum { param: &'static str },
     /// `eventsSinceNumber` is greater than `eventsUntilNumber`.
     SinceAfterUntil { since: u64, until: u64 },
-    /// `eventsSinceNumber` is greater than the latest event number.
-    SinceBeyondLatest { since: u64, latest: u64 },
     /// The whole range is older than the retained history (or no history is kept).
     NoLongerRetained { oldest: Option<u64> },
 }
@@ -362,7 +360,7 @@ impl RangeError {
     pub fn param(&self) -> &'static str {
         match self {
             Self::BelowMinimum { param } => param,
-            Self::SinceAfterUntil { .. } | Self::SinceBeyondLatest { .. } => "eventsSinceNumber",
+            Self::SinceAfterUntil { .. } => "eventsSinceNumber",
             Self::NoLongerRetained { .. } => "eventsSinceNumber",
         }
     }
@@ -375,10 +373,6 @@ impl std::fmt::Display for RangeError {
             Self::SinceAfterUntil { since, until } => write!(
                 f,
                 "eventsSinceNumber ({since}) is greater than eventsUntilNumber ({until})"
-            ),
-            Self::SinceBeyondLatest { since, latest } => write!(
-                f,
-                "eventsSinceNumber ({since}) is greater than the latest event number ({latest})"
             ),
             Self::NoLongerRetained { oldest: Some(n) } => {
                 write!(f, "events before {n} are no longer retained")
@@ -833,9 +827,11 @@ impl SubscriptionManager {
     ///
     /// Returns `None` when the engine does not hold the subscription. Defaults:
     /// `since` is the oldest retained event, `until` the latest event number;
-    /// an `until` beyond the latest is clamped to it. A partial overlap with
-    /// the retained history yields the retained subset. The history is in
-    /// memory only and is empty after a restart.
+    /// an `until` beyond the latest is clamped to it. A `since` beyond the
+    /// latest event (the next number a polling client expects) yields no
+    /// events rather than an error. A partial overlap with the retained
+    /// history yields the retained subset. The history is in memory only and
+    /// is empty after a restart.
     pub fn events_in_range(
         &self,
         tenant_id: &str,
@@ -859,11 +855,10 @@ impl SubscriptionManager {
             {
                 return Err(RangeError::SinceAfterUntil { since: s, until: u });
             }
-            if let Some(s) = since
-                && s > latest
-            {
-                return Err(RangeError::SinceBeyondLatest { since: s, latest });
-            }
+            // A range starting after the latest event asks for events that have
+            // not happened yet: answer with none (polling with `last seen + 1`)
+            // instead of treating it as evicted history.
+            let ahead = since.is_some_and(|s| s > latest);
             let explicit = since.is_some() || until.is_some();
             let lower = since.or(oldest).unwrap_or(1);
             let upper = until.map_or(latest, |u| u.min(latest));
@@ -871,7 +866,7 @@ impl SubscriptionManager {
                 Some(o) => upper < o,
                 None => latest > 0,
             };
-            if explicit && evicted {
+            if explicit && evicted && !ahead {
                 return Err(RangeError::NoLongerRetained { oldest });
             }
             let events = entry
@@ -2209,13 +2204,24 @@ pub(crate) mod tests {
             err(Some(3), Some(1)),
             RangeError::SinceAfterUntil { since: 3, until: 1 }
         );
-        assert_eq!(
-            err(Some(5), None),
-            RangeError::SinceBeyondLatest {
-                since: 5,
-                latest: 3
+    }
+
+    /// Polling with `eventsSinceNumber = last seen + 1` when nothing new has
+    /// happened is an empty result, not an error, also on a fresh subscription
+    /// and with the history disabled.
+    #[test]
+    fn events_in_range_since_beyond_latest_is_empty() {
+        for (size, n) in [(10, 3), (10, 0), (0, 3)] {
+            let manager = manager_with_history(size, n);
+            for (since, until) in [(n + 1, None), (n + 5, None), (n + 1, Some(n + 9))] {
+                let q = manager
+                    .events_in_range("t1", "sub-1", Some(since), until)
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("size {size}, n {n}, since {since}: {e}"));
+                assert!(q.events.is_empty());
+                assert_eq!(q.events_since_start, n);
             }
-        );
+        }
     }
 
     #[test]
