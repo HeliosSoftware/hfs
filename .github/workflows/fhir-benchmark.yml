@@ -213,6 +213,10 @@ on:
         options:
           - synchronous
           - asynchronous
+      es_refresh_interval:
+        description: "*-elasticsearch legs: index refresh_interval, e.g. 50ms, 200ms, 1s. Empty = the es_sync_mode default (synchronous 50ms, asynchronous 1s). For a same-commit A/B of the interval, or to rerun one leg at the former 200ms"
+        required: false
+        default: ""
       mongo_wt_cache_gb:
         description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
         required: false
@@ -677,6 +681,7 @@ jobs:
       - name: Configure backend env
         env:
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_ES_REFRESH_INTERVAL: ${{ inputs.es_refresh_interval }}
         run: |
           set -euo pipefail
           BACKEND="${{ matrix.backend }}"
@@ -745,12 +750,16 @@ jobs:
               echo "ES volume:       $ES_VOLUME"
               echo "ES index prefix: $ES_PREFIX"
               # synchronous = this benchmark's default (see the es_sync_mode
-              # input): the conformance workflows' read-your-writes setting
-              # (inferno-us-core.yml — wait_for makes the refresh interval
-              # the price of every write, hence a short interval: 50ms,
-              # measured against 200ms on the full corpus in #2180, E-33 and
-              # E-34: insert x2.5, CRUD +71 %, import +34 %, setup 3.7x
-              # shorter, search unchanged). Async import cannot
+              # input): read-your-writes, as in the conformance workflows
+              # (inferno-us-core.yml), but with a shorter refresh interval
+              # than their 200ms. wait_for makes the interval the price of
+              # every write, and a 50-VU closed loop is capped at about
+              # VUs / interval; 50ms was measured against 200ms on the full
+              # corpus in #2180, E-33 and E-34: insert x2.5, CRUD +71 %,
+              # import +34 %, setup 3.7x shorter, search unchanged. Below
+              # 50ms nothing more is gained (E-23: a refresh itself costs
+              # 40-47 ms). The conformance and UI workflows keep 200ms: they
+              # are not throughput tests. Async import cannot
               # finish the 1000-bundle corpus inside k6's 60-minute cap
               # (run 36412022609: 313/1000 bundles, drain gate
               # status=incomplete, 194,664 resources never reached the
@@ -766,6 +775,16 @@ jobs:
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
               esac
+              # es_refresh_interval input: overrides the mode's interval for
+              # every Elasticsearch leg of this run (dispatch one leg alone
+              # to change only that leg). The value HFS ran with is recorded
+              # in runner-info.txt and printed in the leg summary.
+              if [ -n "${IN_ES_REFRESH_INTERVAL:-}" ]; then
+                if ! [[ "$IN_ES_REFRESH_INTERVAL" =~ ^[1-9][0-9]*(ms|s)$ ]]; then
+                  echo "::error::es_refresh_interval '$IN_ES_REFRESH_INTERVAL' must look like 50ms, 200ms or 1s"; exit 1
+                fi
+                REFRESH_INTERVAL="$IN_ES_REFRESH_INTERVAL"
+              fi
               {
                 echo "HFS_COMPOSITE_SYNC_MODE=$SYNC_MODE"
                 echo "HFS_ELASTICSEARCH_WRITE_REFRESH=$WRITE_REFRESH"

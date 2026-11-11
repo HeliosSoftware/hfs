@@ -119,6 +119,7 @@ if ri:
     if ri.get("es_heap", "n/a") != "n/a":
         print(f"| **ES heap** | `{ri.get('es_heap', '?')}` |")
         print(f"| **ES sync mode** | `{ri.get('es_sync_mode', '?')}` |")
+        print(f"| **ES refresh interval** | `{ri.get('es_refresh_interval', '?')}` |")
     if ri.get("mongo_wt_cache_gb", "n/a") != "n/a":
         print(f"| **Mongo WT cache** | `{ri.get('mongo_wt_cache_gb', '?')}` GB |")
         print(f"| **Mongo pool max** | `{ri.get('mongo_pool_max', '?')}` |")
@@ -232,10 +233,17 @@ if os.path.exists(contention_path):
 # sqlite/postgres leg.
 if backend.endswith("-elasticsearch"):
     if ri.get("es_sync_mode") == "synchronous":
+        # The interval this leg ran with, as recorded in runner-info.txt
+        # (the workflow's es_refresh_interval input can override the default).
+        es_interval = ri.get("es_refresh_interval", "unknown")
+        if es_interval in ("unknown", "n/a", ""):
+            es_interval_text = "the index `refresh_interval`"
+        else:
+            es_interval_text = f"a {es_interval} `refresh_interval`"
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "
-              "with `refresh=wait_for` against a 50ms `refresh_interval`, so **Batch/Transaction Import/crud/insert latency "
+              f"with `refresh=wait_for` against {es_interval_text}, so **Batch/Transaction Import/crud/insert latency "
               "on this leg includes Elasticsearch indexing plus that refresh wait**, not just the "
               "primary. Every update and delete also runs a `_delete_by_query` with a forced refresh "
               "across all of the tenant's indices. Cluster health `yellow` is expected (1 replica per "
