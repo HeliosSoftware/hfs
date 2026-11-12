@@ -357,7 +357,7 @@ async fn send_search_once(
     backend: &ElasticsearchBackend,
     op: ReadOp<'_>,
     index: &str,
-    body: Value,
+    body: &Value,
 ) -> SearchAttempt {
     let response = match op {
         ReadOp::Search => {
@@ -562,7 +562,7 @@ pub(super) async fn send_read_with_retry(
 ) -> StorageResult<Option<Value>> {
     let mut attempt: u32 = 0;
     let (attempts, last_failure) = loop {
-        let failure = match send_search_once(backend, op, index, body.clone()).await {
+        let failure = match send_search_once(backend, op, index, &body).await {
             SearchAttempt::Body(v) => return Ok(Some(v)),
             SearchAttempt::EmptyIndex => return Ok(None),
             SearchAttempt::Permanent(e) => return Err(e),
@@ -915,18 +915,14 @@ impl SearchProvider for ElasticsearchBackend {
         let over_fetched = es_query.over_fetched;
 
         // Execute search (with retry on transient shard-availability errors)
-        let body = match send_search_with_retry(self, &index, es_query.body).await? {
+        let mut body = match send_search_with_retry(self, &index, es_query.body).await? {
             Some(v) => v,
             None => return Ok(empty_index_result(query.wants_total())),
         };
 
-        // Parse hits
-        let hits = body
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // Parse hits: moved out of the response, not copied — each hit carries
+        // the full resource `content`.
+        let hits = take_hits(&mut body);
 
         // `hits.total` is only tracked when `_total` asks for one.
         let total = if query.wants_total() {
@@ -943,8 +939,11 @@ impl SearchProvider for ElasticsearchBackend {
         let mut hits_with_sort: Vec<(StoredResource, Option<Vec<Value>>)> = Vec::new();
         let mut scores: HashMap<String, f64> = HashMap::new();
 
-        for hit in &hits {
-            let source = match hit.get("_source") {
+        for hit in hits {
+            let Value::Object(mut hit) = hit else {
+                continue;
+            };
+            let source = match hit.remove("_source") {
                 Some(s) => s,
                 None => continue,
             };
@@ -965,7 +964,10 @@ impl SearchProvider for ElasticsearchBackend {
                 if let Some(score) = hit.get("_score").and_then(|s| s.as_f64()) {
                     scores.insert(stored.url(), score);
                 }
-                let sort_values = hit.get("sort").and_then(Value::as_array).cloned();
+                let sort_values = match hit.remove("sort") {
+                    Some(Value::Array(values)) => Some(values),
+                    _ => None,
+                };
                 hits_with_sort.push((stored, sort_values));
             }
         }
@@ -1298,7 +1300,7 @@ impl ElasticsearchBackend {
                     let Some(source) = sources.get(doc_id) else {
                         continue;
                     };
-                    let Some(stored) = parse_hit_to_stored_resource(source, tenant)? else {
+                    let Some(stored) = parse_hit_to_stored_resource(source.clone(), tenant)? else {
                         continue;
                     };
                     match local_id {
@@ -1665,18 +1667,13 @@ async fn execute_text_search(
     body: Value,
     tenant: &TenantContext,
 ) -> StorageResult<SearchResult> {
-    let body = match send_search_with_retry(backend, index, body).await? {
+    let mut body = match send_search_with_retry(backend, index, body).await? {
         Some(v) => v,
         // Text search has no `_total` and always tracks hits.
         None => return Ok(empty_index_result(true)),
     };
 
-    let hits = body
-        .get("hits")
-        .and_then(|h| h.get("hits"))
-        .and_then(|h| h.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let hits = take_hits(&mut body);
 
     let total = body
         .get("hits")
@@ -1685,8 +1682,8 @@ async fn execute_text_search(
         .and_then(|v| v.as_u64());
 
     let mut resources = Vec::new();
-    for hit in &hits {
-        if let Some(source) = hit.get("_source") {
+    for mut hit in hits {
+        if let Some(source) = hit.get_mut("_source").map(Value::take) {
             if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
                 resources.push(stored);
             }
@@ -1763,11 +1760,31 @@ impl RevincludeProvider for ElasticsearchBackend {
     }
 }
 
-/// Parses an ES hit's `_source` into a `StoredResource`.
+/// Moves the `hits.hits` array out of an ES search response, leaving `null`
+/// in its place, so the hits (each carrying a full `_source.content`) are not
+/// deep-copied. A missing or non-array value yields no hits, as before.
+fn take_hits(body: &mut Value) -> Vec<Value> {
+    match body
+        .get_mut("hits")
+        .and_then(|h| h.get_mut("hits"))
+        .map(Value::take)
+    {
+        Some(Value::Array(hits)) => hits,
+        _ => Vec::new(),
+    }
+}
+
+/// Parses an ES hit's `_source` into a `StoredResource`, moving `content`
+/// out of the owned `_source` instead of copying it.
 fn parse_hit_to_stored_resource(
-    source: &Value,
+    mut source: Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
+    let content = source
+        .get_mut("content")
+        .map(Value::take)
+        .unwrap_or_else(|| json!({}));
+
     let resource_type = match source.get("resource_type").and_then(|v| v.as_str()) {
         Some(rt) => rt,
         None => return Ok(None),
@@ -1782,8 +1799,6 @@ fn parse_hit_to_stored_resource(
         .get("version_id")
         .and_then(|v| v.as_str())
         .unwrap_or("1");
-
-    let content = source.get("content").cloned().unwrap_or_else(|| json!({}));
 
     let fhir_version_str = source
         .get("fhir_version")
@@ -1867,10 +1882,10 @@ mod tests {
             )
         };
 
-        let a = parse_hit_to_stored_resource(&full, &tenant)
+        let a = parse_hit_to_stored_resource(full.clone(), &tenant)
             .unwrap()
             .unwrap();
-        let b = parse_hit_to_stored_resource(&trimmed, &tenant)
+        let b = parse_hit_to_stored_resource(trimmed.clone(), &tenant)
             .unwrap()
             .unwrap();
         assert_eq!(view(&a), view(&b));
@@ -1883,6 +1898,29 @@ mod tests {
             .unwrap();
         assert_eq!(view(&c), view(&d));
         assert_eq!(view(&a), view(&c));
+    }
+
+    /// `take_hits` moves the hit array out and leaves the rest of the
+    /// response (`hits.total`) readable; odd shapes yield no hits.
+    #[test]
+    fn take_hits_moves_the_array_and_keeps_the_total() {
+        let mut body = json!({
+            "hits": {
+                "total": { "value": 7 },
+                "hits": [{ "_id": "a", "sort": [1, "a"] }, { "_id": "b" }],
+            }
+        });
+        let hits = take_hits(&mut body);
+        assert_eq!(
+            hits,
+            vec![
+                json!({ "_id": "a", "sort": [1, "a"] }),
+                json!({ "_id": "b" })
+            ]
+        );
+        assert_eq!(body["hits"]["total"]["value"], json!(7));
+        assert!(take_hits(&mut json!({})).is_empty());
+        assert!(take_hits(&mut json!({ "hits": { "hits": {} } })).is_empty());
     }
 
     use crate::error::{SearchError, StorageError};
