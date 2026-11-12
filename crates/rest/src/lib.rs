@@ -1336,6 +1336,18 @@ fn subscription_dispatch_config(
     ] {
         *field = subscription_dispatch_limit(name, lookup(name).as_deref(), *field);
     }
+    // Unlike the limits above, 0 is valid here: it disables the `$events` history.
+    if let Some(raw) = lookup("HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE") {
+        match raw.trim().parse::<usize>() {
+            Ok(size) => config.event_history_size = size,
+            Err(_) => warn!(
+                setting = "HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE",
+                configured = raw.as_str(),
+                effective = config.event_history_size,
+                "Invalid subscription event history size; using default"
+            ),
+        }
+    }
     config
 }
 
@@ -1628,6 +1640,27 @@ mod subscription_dispatch_config_tests {
     }
 
     #[test]
+    fn event_history_size_env_accepts_zero_and_ignores_garbage() {
+        let size = |raw: Option<&str>| {
+            subscription_dispatch_config(
+                helios_subscriptions::SubscriptionConfig::default(),
+                |name| {
+                    (name == "HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE")
+                        .then(|| raw.map(str::to_string))
+                        .flatten()
+                },
+            )
+            .event_history_size
+        };
+        let default = helios_subscriptions::SubscriptionConfig::default().event_history_size;
+        assert_eq!(size(None), default);
+        assert_eq!(size(Some("0")), 0);
+        assert_eq!(size(Some(" 25 ")), 25);
+        assert_eq!(size(Some("many")), default);
+        assert_eq!(size(Some("-1")), default);
+    }
+
+    #[test]
     fn dispatch_env_wires_all_five_limits_and_engine_normalization() {
         let config = subscription_dispatch_config(
             helios_subscriptions::SubscriptionConfig::default(),
@@ -1639,6 +1672,7 @@ mod subscription_dispatch_config_tests {
                         "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY" => "9",
                         "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY" => "2",
                         "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY" => "1",
+                        "HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE" => "0",
                         _ => panic!("unknown dispatch setting: {name}"),
                     }
                     .to_string(),
