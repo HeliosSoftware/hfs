@@ -472,11 +472,25 @@ fn parse_search_parameter_in(
     // chain's terminal parameter — `parse_parameter_name` cuts at the first
     // colon and would misread either.
     let (base_name, chain, modifier) = if name.contains('.') {
-        parse_chain_in(name, types)?
+        parse_chain_in(name, value, types)?
     } else {
         let (base_name, modifier) = parse_parameter_name_in(name, types)?;
         (base_name, vec![], modifier)
     };
+
+    // A chain ending in `_has`: the value is the `_has` terminal's, held in
+    // the last hop, which the chain resolver types and checks.
+    if chain.last().is_some_and(|hop| hop.has.is_some()) {
+        let (param_type, _) = parse_typed_values(registry, resource_type, base_name, &[]);
+        return Ok(SearchParameter {
+            name: base_name.to_string(),
+            param_type,
+            modifier: None,
+            values: vec![],
+            chain,
+            components: vec![],
+        });
+    }
 
     // FHIR defines :missing as a single, case-sensitive boolean literal.
     // Validate it before splitting comma-separated OR values so malformed
@@ -621,31 +635,66 @@ type ParsedChain<'a> = (
 /// resolver applies to the terminal search. A suffix that is not a modifier is
 /// an error rather than something to drop silently.
 ///
+/// A chain may end in a reverse chain, as R5 defines
+/// (`Encounter?patient._has:Group:member:_id=102`): from the first part that
+/// is a `_has`, the rest of the name is a `_has` key, parsed as a top-level one
+/// is and set on the last hop's [`has`] with `_has` as its `target_param`. Its
+/// terminal modifier stays in the `_has`; the returned modifier is `None`.
+///
 /// Examples:
 /// - "name" -> ("name", [], None)
 /// - "patient.name" -> ("patient", [{patient, None, name}], None)
 /// - "subject:Patient.organization:Organization.name:exact" ->
 ///   ("subject", [{subject, Patient, organization}, {organization, Organization, name}], Exact)
+/// - "patient._has:Group:member:_id" ->
+///   ("patient", [{patient, None, _has, has: _has:Group:member:_id}], None)
+///
+/// [`has`]: helios_persistence::types::ChainedParameter::has
 #[cfg(test)]
 fn parse_chain(name: &str) -> Result<ParsedChain<'_>, RestError> {
-    parse_chain_in(name, TypeScope::any_enabled())
+    parse_chain_in(name, "x", TypeScope::any_enabled())
 }
 
-/// [`parse_chain`], a hop's `:Type` qualifier being one of `types`.
-fn parse_chain_in(name: &str, types: TypeScope) -> Result<ParsedChain<'_>, RestError> {
+/// [`parse_chain`], a hop's `:Type` qualifier being one of `types`. `value` is
+/// the search value, which only a chain ending in `_has` reads.
+fn parse_chain_in<'a>(
+    name: &'a str,
+    value: &str,
+    types: TypeScope,
+) -> Result<ParsedChain<'a>, RestError> {
     let mut parts = name.split('.');
     // `split` always yields at least one item.
     let (base_name, mut qualifier) = split_qualifier(parts.next().unwrap_or(name));
     let mut reference_param = base_name;
+    // Byte offset of the part being read, for a `_has` that takes the rest.
+    let mut offset = base_name.len() + qualifier.map_or(0, |q| q.len() + 1) + 1;
 
     let mut chain = Vec::new();
     let mut modifier = None;
     let mut parts = parts.peekable();
     while let Some(part) = parts.next() {
+        let part_offset = offset;
+        offset += part.len() + 1;
         // Every part but the last is itself a reference parameter, whose
         // qualifier belongs to the *next* hop.
         let (target_param, suffix) = split_qualifier(part);
-        let next_qualifier = if parts.peek().is_some() {
+        let has = if target_param == "_has" {
+            let rest = &name[part_offset..];
+            if suffix.is_none() {
+                return Err(RestError::InvalidParameter {
+                    param: name.to_string(),
+                    message: "a chain that ends in _has takes the form \
+                              [chain]._has:[type]:[reference-param]:[search-param]=value"
+                        .to_string(),
+                });
+            }
+            parse_has_level(name, rest, value, types)?.map(Box::new)
+        } else {
+            None
+        };
+        let next_qualifier = if has.is_some() {
+            None
+        } else if parts.peek().is_some() {
             suffix
         } else {
             modifier = suffix
@@ -667,11 +716,16 @@ fn parse_chain_in(name: &str, types: TypeScope) -> Result<ParsedChain<'_>, RestE
                 ),
             });
         }
+        let ends_in_has = has.is_some();
         chain.push(helios_persistence::types::ChainedParameter {
             reference_param: reference_param.to_string(),
             target_type: qualifier.map(str::to_string),
             target_param: target_param.to_string(),
+            has,
         });
+        if ends_in_has {
+            break;
+        }
         reference_param = target_param;
         qualifier = next_qualifier;
     }
@@ -794,6 +848,19 @@ fn parse_has_level(
                 "unknown resource type '{source_type}' in _has; it is not a resource type{}{}",
                 types.version_clause(),
                 types.case_hint(&source_type)
+            ),
+        });
+    }
+
+    // `_in` is resolved into an `_id` filter on the searched type only; as a
+    // `_has` terminal it would reach a backend unresolved. Judged on the parsed
+    // terminal, so neither a `:List` / `:Group` qualifier nor a chain or a
+    // nesting in front of it hides it.
+    if search_param == "_in" {
+        return Err(RestError::InvalidParameter {
+            param: key.to_string(),
+            message: format!(
+                "'_in' cannot be used in a chained or reverse-chained search ('{key}')"
             ),
         });
     }
@@ -1156,6 +1223,7 @@ mod tests {
             "subject:Patient",
             "subject:Patient.name",
             "_has:Observation:subject:code",
+            "subject._has:Observation:subject:code",
         ] {
             let resource_type = if key.starts_with("_has") {
                 "Patient"
@@ -1171,6 +1239,8 @@ mod tests {
             "subject:Patient.general-practitioner:ActorDefinition.name",
             "_has:ActorDefinition:subject:code",
             "_has:Observation:subject:_has:ActorDefinition:subject:code",
+            "subject._has:ActorDefinition:subject:code",
+            "subject._has:Observation:subject:_has:ActorDefinition:subject:code",
         ] {
             match build_for("Observation", key, r4) {
                 Err(RestError::InvalidParameter { message, .. }) => {
@@ -1541,6 +1611,159 @@ mod tests {
         assert!(
             parse_search_parameter("Observation", "subject.birthdate:missing", "true", &reg)
                 .is_ok()
+        );
+    }
+
+    /// #2556: a chain whose last step is `_has` (R5) keeps the `_has` on its
+    /// last hop, parsed as a top-level one is, and the value in it.
+    #[test]
+    fn test_parse_chain_ending_in_has() {
+        let reg = test_registry();
+        let build = |resource_type: &str, name: &str, value: &str| {
+            parse_search_parameter(resource_type, name, value, &reg).unwrap()
+        };
+
+        // R5's example.
+        let param = build("Encounter", "patient._has:Group:member:_id", "102");
+        assert_eq!(param.name, "patient");
+        assert_eq!(param.modifier, None);
+        assert!(param.values.is_empty(), "the value is the _has terminal's");
+        assert_eq!(hops(&param.chain), owned(&[("patient", None, "_has")]));
+        let has = param.chain[0].has.as_deref().unwrap();
+        assert_eq!(
+            (
+                has.source_type.as_str(),
+                has.reference_param.as_str(),
+                has.search_param.as_str()
+            ),
+            ("Group", "member", "_id")
+        );
+        assert_eq!(has.value.as_ref().unwrap().value, "102");
+        assert!(has.nested.is_none());
+
+        let param = build(
+            "Task",
+            "patient._has:CareTeam:patient:participant",
+            "Practitioner/123",
+        );
+        let has = param.chain[0].has.as_deref().unwrap();
+        assert_eq!(has.search_param, "participant");
+        assert_eq!(has.value.as_ref().unwrap().value, "Practitioner/123");
+
+        // Two hops, the first typed, then the `_has`.
+        let param = build(
+            "Observation",
+            "encounter:Encounter.patient._has:Group:member:_id",
+            "102",
+        );
+        assert_eq!(
+            hops(&param.chain),
+            owned(&[
+                ("encounter", Some("Encounter"), "patient"),
+                ("patient", None, "_has"),
+            ])
+        );
+        assert!(param.chain[0].has.is_none());
+        assert!(param.chain[1].has.is_some());
+
+        // A typed last hop.
+        let param = build("Encounter", "subject:Patient._has:Group:member:_id", "102");
+        assert_eq!(
+            hops(&param.chain),
+            owned(&[("subject", Some("Patient"), "_has")])
+        );
+
+        // A nested `_has` after the chain.
+        let param = build(
+            "Encounter",
+            "patient._has:Observation:subject:_has:Provenance:target:agent",
+            "Practitioner/1",
+        );
+        let has = param.chain[0].has.as_deref().unwrap();
+        assert_eq!(has.source_type, "Observation");
+        assert_eq!(has.depth(), 2);
+        let inner = has.nested.as_deref().unwrap();
+        assert_eq!(inner.source_type, "Provenance");
+        assert_eq!(inner.search_param, "agent");
+
+        // The terminal modifier stays in the `_has`.
+        let param = build(
+            "Task",
+            "patient._has:CareTeam:patient:participant:missing",
+            "true",
+        );
+        assert_eq!(param.modifier, None);
+        assert_eq!(
+            param.chain[0].has.as_deref().unwrap().modifier,
+            Some(SearchModifier::Missing)
+        );
+    }
+
+    /// #2556: what a chain that ends in `_has` refuses, with a 400 naming the
+    /// whole key.
+    #[test]
+    fn test_parse_chain_ending_in_has_errors() {
+        let reg = test_registry();
+        for (name, value) in [
+            // The `_has=Type:ref:param:value` form is not defined after a chain.
+            ("patient._has", "Group:member:_id:102"),
+            ("patient._has:Bogus:member:_id", "1"),
+            ("patient._has:Group:member", "1"),
+            ("patient._has:CareTeam:patient:participant:bogus", "1"),
+            ("patient._has:CareTeam:patient:participant:missing", "yes"),
+            ("subject:Bogus._has:Group:member:_id", "1"),
+        ] {
+            match parse_search_parameter("Encounter", name, value, &reg) {
+                Err(RestError::InvalidParameter { param, .. }) => {
+                    assert_eq!(param, name, "{name}")
+                }
+                other => panic!("{name}: expected a 400, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2556: an `_in` terminal of a `_has` is refused from the parsed
+    /// terminal, whatever qualifier, chain or nesting surrounds it; a
+    /// qualified reference terminal is still accepted.
+    #[test]
+    fn test_has_terminal_in_is_refused() {
+        let reg = test_registry();
+        let refused = |name: &str, value: &str| {
+            let params = SearchParams::from_pairs(vec![(name.to_string(), value.to_string())]);
+            match build_search_query("Encounter", &params, &reg) {
+                Err(RestError::InvalidParameter { param, message }) => {
+                    assert_eq!(param, name, "{name}");
+                    assert!(
+                        message.contains("'_in' cannot be used"),
+                        "{name}: {message}"
+                    );
+                }
+                other => panic!("{name}: expected a 400, got {other:?}"),
+            }
+        };
+        for name in [
+            "_has:Observation:encounter:_in",
+            "_has:Observation:encounter:_in:List",
+            "_has:Observation:encounter:_has:Group:member:_in:Group",
+            "patient._has:Group:member:_in",
+            "patient._has:Group:member:_in:List",
+            "patient._has:Group:member:_in:Group",
+            "patient._has:Observation:subject:_has:Group:member:_in:List",
+        ] {
+            refused(name, "List/l1");
+        }
+        refused("_has", "Observation:encounter:_in:List/l1");
+
+        let param = parse_search_parameter(
+            "Task",
+            "patient._has:CareTeam:patient:participant:Practitioner",
+            "p123",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(
+            param.chain[0].has.as_deref().unwrap().modifier,
+            Some(SearchModifier::Type("Practitioner".to_string()))
         );
     }
 

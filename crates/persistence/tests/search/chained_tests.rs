@@ -118,6 +118,7 @@ async fn test_chained_search_subject_name() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -154,6 +155,7 @@ async fn test_chained_search_with_type_hint() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -185,6 +187,7 @@ async fn test_chained_search_no_results() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -230,6 +233,63 @@ async fn test_reverse_chaining() {
 
     // Should find both patients (both have 8867-4 observations)
     assert!(!result.resources.is_empty());
+}
+
+/// #2556: a chain whose last step is `_has` (R5):
+/// Observation?subject:Patient._has:Observation:subject:code=8310-5 selects
+/// every Observation of a patient who has an 8310-5 Observation.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_chain_ending_in_has() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    seed_chained_data(&backend, &tenant).await;
+
+    let query = |code: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![],
+            chain: vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: Some("Patient".to_string()),
+                target_param: "_has".to_string(),
+                has: Some(Box::new(ReverseChainedParameter::terminal(
+                    "Observation",
+                    "subject",
+                    "code",
+                    SearchValue::token(Some("http://loinc.org"), code),
+                ))),
+            }],
+            components: vec![],
+        })
+    };
+
+    let rewritten = resolve_chains(&backend, &tenant, &query("8310-5"))
+        .await
+        .unwrap();
+    let result = backend
+        .search(&tenant, &rewritten.with_count(100))
+        .await
+        .unwrap();
+    let subjects: Vec<&str> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.content()["subject"]["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        subjects,
+        ["Patient/patient-smith", "Patient/patient-smith"],
+        "both of Smith's Observations, none of Jones's"
+    );
+
+    let rewritten = resolve_chains(&backend, &tenant, &query("0000-0"))
+        .await
+        .unwrap();
+    let result = backend.search(&tenant, &rewritten).await.unwrap();
+    assert!(result.resources.is_empty());
 }
 
 /// Test reverse chaining with no matches.
@@ -327,6 +387,7 @@ async fn test_fractional_date_forward_and_reverse_chains() {
             reference_param: "encounter".to_string(),
             target_type: Some("Encounter".to_string()),
             target_param: "date".to_string(),
+            has: None,
         }],
         ..Default::default()
     });
@@ -399,6 +460,7 @@ async fn test_chained_search_survives_hops_beyond_the_default_page() {
             reference_param: "patient".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "gender".to_string(),
+            has: None,
         }],
         components: vec![],
     });

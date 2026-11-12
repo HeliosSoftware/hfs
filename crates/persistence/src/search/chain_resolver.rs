@@ -16,8 +16,8 @@ use crate::core::SearchProvider;
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue,
+    ChainedParameter, ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter,
+    SearchPrefix, SearchQuery, SearchValue,
 };
 
 use super::{
@@ -166,6 +166,21 @@ where
                     message: format!(
                         "forward chain depth {} exceeds the maximum of {}",
                         depth, max_forward_depth
+                    ),
+                },
+            ));
+        }
+        // A chain that ends in `_has` is capped on both sides.
+        let max_reverse_depth = crate::types::ChainConfig::default().max_reverse_depth;
+        if let Some(has) = param.chain.last().and_then(|hop| hop.has.as_deref())
+            && has.depth() > max_reverse_depth
+        {
+            return Err(crate::error::StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "_has nesting depth {} exceeds the maximum of {}",
+                        has.depth(),
+                        max_reverse_depth
                     ),
                 },
             ));
@@ -420,6 +435,9 @@ where
     if hops.is_empty() {
         return Ok(Some(Vec::new()));
     }
+    if let Some(has) = hops.last().and_then(|hop| hop.has.as_deref()) {
+        return resolve_forward_chain_to_has(storage, tenant, base_type, param, has, options).await;
+    }
     let terminal_param = &hops[hops.len() - 1].target_param;
 
     // Candidate parent/target types per hop, and the terminal param's type
@@ -428,31 +446,7 @@ where
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
 
-        let mut parents: Vec<Vec<String>> = Vec::with_capacity(hops.len());
-        let mut current: Vec<String> = vec![base_type.to_string()];
-        for hop in hops {
-            parents.push(current.clone());
-            current = match &hop.target_type {
-                Some(t) => vec![t.clone()],
-                None => {
-                    let mut targets: Vec<String> = Vec::new();
-                    for parent in &current {
-                        if let Some(def) = registry.get_param(parent, &hop.reference_param) {
-                            for t in def.target.as_deref().unwrap_or_default() {
-                                if !targets.contains(t) {
-                                    targets.push(t.clone());
-                                }
-                            }
-                        }
-                    }
-                    if targets.is_empty() {
-                        vec![infer_target_type(&hop.reference_param)]
-                    } else {
-                        targets
-                    }
-                }
-            };
-        }
+        let (parents, current) = hop_target_types(&registry, base_type, hops);
 
         // Only search terminal types that define the terminal param — the
         // others cannot match. Keep the unfiltered set if that empties the
@@ -584,8 +578,148 @@ where
         return Ok(Some(Vec::new()));
     }
 
-    // Walk back out: for each reference hop, find parents pointing at the
-    // refs, across every candidate parent type.
+    walk_back_out(storage, tenant, hops, &parent_types_per_hop, current_refs)
+        .await
+        .map(Some)
+}
+
+/// Resolves a forward chain that ends in `_has` (`patient._has:Group:member:_id`,
+/// R5): the `_has` selects the resources of each candidate target type of the
+/// last hop, as a top-level `_has` on that type would, and the chain is then
+/// walked back out from them as from a terminal search's matches.
+///
+/// `None` when the `_has` terminal was dropped by the terminology expander.
+async fn resolve_forward_chain_to_has<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    base_type: &str,
+    param: &SearchParameter,
+    has: &ReverseChainedParameter,
+    options: ChainResolveOptions<'_>,
+) -> StorageResult<Option<Vec<String>>>
+where
+    S: SearchProvider + ?Sized,
+{
+    let hops = &param.chain;
+    let (parent_types_per_hop, terminal_types) = {
+        let reg = storage.search_param_registry(tenant);
+        let registry = reg.read();
+        hop_target_types(&registry, base_type, hops)
+    };
+    // The chain as written before its `_has`, so an error on the `_has`
+    // terminal names the whole key: `patient._has:Group:member:_id`.
+    let mut outer = String::new();
+    for hop in hops {
+        outer.push_str(&hop.reference_param);
+        if let Some(t) = &hop.target_type {
+            outer.push(':');
+            outer.push_str(t);
+        }
+        outer.push('.');
+    }
+
+    let mut current_refs: Vec<String> = Vec::new();
+    for target in &terminal_types {
+        let Some(ids) =
+            resolve_reverse_chain_level(storage, tenant, target, has, options, &outer).await?
+        else {
+            return Ok(None);
+        };
+        // The `_has` yields the ids its sources *refer to*. Only those of
+        // resources that exist are reached by the chain, as a terminal
+        // search's matches are and a top-level `_has`'s final search is.
+        let live = existing_ids(storage, tenant, target, ids).await?;
+        current_refs.extend(live.into_iter().map(|id| format!("{target}/{id}")));
+    }
+    if current_refs.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    walk_back_out(storage, tenant, hops, &parent_types_per_hop, current_refs)
+        .await
+        .map(Some)
+}
+
+/// The distinct ids among `ids` of `resource_type` resources that exist in the
+/// tenant, read without resource bodies, `CHAIN_VALUE_CHUNK` ids per search.
+async fn existing_ids<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    ids: Vec<String>,
+) -> StorageResult<Vec<String>>
+where
+    S: SearchProvider + ?Sized,
+{
+    let mut seen: HashSet<String> = HashSet::new();
+    let ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let mut live = Vec::new();
+    for chunk in ids.chunks(CHAIN_VALUE_CHUNK) {
+        let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: chunk.iter().map(SearchValue::eq).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+        live.extend(search_all_ids(storage, tenant, query).await?);
+    }
+    Ok(live)
+}
+
+/// The candidate types each hop of a forward chain starts from, and the
+/// candidate types its last hop reaches.
+fn hop_target_types(
+    registry: &SearchParameterRegistry,
+    base_type: &str,
+    hops: &[ChainedParameter],
+) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut parents: Vec<Vec<String>> = Vec::with_capacity(hops.len());
+    let mut current: Vec<String> = vec![base_type.to_string()];
+    for hop in hops {
+        parents.push(current.clone());
+        current = match &hop.target_type {
+            Some(t) => vec![t.clone()],
+            None => {
+                let mut targets: Vec<String> = Vec::new();
+                for parent in &current {
+                    if let Some(def) = registry.get_param(parent, &hop.reference_param) {
+                        for t in def.target.as_deref().unwrap_or_default() {
+                            if !targets.contains(t) {
+                                targets.push(t.clone());
+                            }
+                        }
+                    }
+                }
+                if targets.is_empty() {
+                    vec![infer_target_type(&hop.reference_param)]
+                } else {
+                    targets
+                }
+            }
+        };
+    }
+    (parents, current)
+}
+
+/// Walks a forward chain back out from `current_refs`, the `Type/id`
+/// references its last hop reached: for each reference hop, finds the parents
+/// pointing at the refs, across every candidate parent type. Returns the ids
+/// of the chain's base type.
+async fn walk_back_out<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    hops: &[ChainedParameter],
+    parent_types_per_hop: &[Vec<String>],
+    mut current_refs: Vec<String>,
+) -> StorageResult<Vec<String>>
+where
+    S: SearchProvider + ?Sized,
+{
     for i in (0..hops.len()).rev() {
         let ref_param = &hops[i].reference_param;
         // Search the refs in chunks. A backend renders a multi-value reference
@@ -623,11 +757,11 @@ where
         }
         current_refs = next_refs;
         if current_refs.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Vec::new());
         }
     }
 
-    Ok(Some(current_refs))
+    Ok(current_refs)
 }
 
 /// Resolves a reverse chain (`_has:Source:refParam:searchParam=value`) to a set
@@ -1354,6 +1488,7 @@ mod tests {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         });
@@ -1552,6 +1687,425 @@ mod tests {
         );
     }
 
+    /// #2556: the data a chain that ends in `_has` is resolved over. `smith`
+    /// is a member of Group `g102` and the subject of CareTeam `ct1`, whose
+    /// participant is Practitioner `p123`; `jones` is the subject of CareTeam
+    /// `ct2`, with no participant. Encounters `e-smith` / `e-jones` and Tasks
+    /// `t-smith` / `t-jones` are theirs; Observation `o-e` has encounter
+    /// `e-smith`, and Provenance `prov1` targets Observation `o1` (Smith's).
+    async fn seed_chain_to_has(b: &SqliteBackend, t: &TenantContext) {
+        seed(b, t).await;
+        for resource in [
+            json!({"resourceType": "Practitioner", "id": "p123"}),
+            json!({"resourceType": "Group", "id": "g102", "type": "person", "actual": true,
+                   "member": [{"entity": {"reference": "Patient/smith"}}]}),
+            json!({"resourceType": "CareTeam", "id": "ct1",
+                   "subject": {"reference": "Patient/smith"},
+                   "participant": [{"member": {"reference": "Practitioner/p123"}}]}),
+            json!({"resourceType": "CareTeam", "id": "ct2",
+                   "subject": {"reference": "Patient/jones"}}),
+            json!({"resourceType": "Encounter", "id": "e-smith", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/smith"}}),
+            json!({"resourceType": "Encounter", "id": "e-jones", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/jones"}}),
+            json!({"resourceType": "Task", "id": "t-smith", "status": "requested",
+                   "intent": "order", "for": {"reference": "Patient/smith"}}),
+            json!({"resourceType": "Task", "id": "t-jones", "status": "requested",
+                   "intent": "order", "for": {"reference": "Patient/jones"}}),
+            json!({"resourceType": "Observation", "id": "o-e", "status": "final",
+                   "subject": {"reference": "Patient/jones"},
+                   "encounter": {"reference": "Encounter/e-smith"}}),
+            json!({"resourceType": "Provenance", "id": "prov1",
+                   "recorded": "2024-01-01T00:00:00Z",
+                   "target": [{"reference": "Observation/o1"}],
+                   "agent": [{"who": {"reference": "Practitioner/p123"}}]}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            b.create(t, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// `base?hop.hop._has…`: one hop per `(reference_param, target_type)`,
+    /// the last carrying `has`.
+    fn chain_to_has(
+        base: &str,
+        hops: &[(&str, Option<&str>)],
+        has: ReverseChainedParameter,
+    ) -> SearchQuery {
+        let mut chain: Vec<ChainedParameter> = hops
+            .windows(2)
+            .map(|pair| ChainedParameter {
+                reference_param: pair[0].0.to_string(),
+                target_type: pair[0].1.map(str::to_string),
+                target_param: pair[1].0.to_string(),
+                has: None,
+            })
+            .collect();
+        let (last, last_type) = hops[hops.len() - 1];
+        chain.push(ChainedParameter {
+            reference_param: last.to_string(),
+            target_type: last_type.map(str::to_string),
+            target_param: "_has".to_string(),
+            has: Some(Box::new(has)),
+        });
+        SearchQuery::new(base).with_parameter(SearchParameter {
+            name: hops[0].0.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![],
+            chain,
+            components: vec![],
+        })
+    }
+
+    /// #2556: a chain whose last step is `_has` selects the resources whose
+    /// chain leads to a resource the `_has` selects.
+    #[tokio::test]
+    async fn forward_chain_ending_in_has() {
+        let b = backend();
+        let t = tenant();
+        seed_chain_to_has(&b, &t).await;
+        let in_g102 =
+            || ReverseChainedParameter::terminal("Group", "member", "_id", SearchValue::eq("g102"));
+
+        // R5's example: Encounter?patient._has:Group:member:_id=g102.
+        let query = chain_to_has("Encounter", &[("patient", None)], in_g102());
+        assert_eq!(run(&b, &t, &query).await, ["e-smith"]);
+        let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
+        assert_positive_id_rewrite(&rewritten, &["e-smith"]);
+
+        // Task?patient._has:CareTeam:patient:participant=Practitioner/p123.
+        let query = chain_to_has(
+            "Task",
+            &[("patient", None)],
+            ReverseChainedParameter::terminal(
+                "CareTeam",
+                "patient",
+                "participant",
+                SearchValue::eq("Practitioner/p123"),
+            ),
+        );
+        assert_eq!(run(&b, &t, &query).await, ["t-smith"]);
+
+        // Two hops: Observation?encounter.patient._has:Group:member:_id=g102.
+        let query = chain_to_has(
+            "Observation",
+            &[("encounter", None), ("patient", None)],
+            in_g102(),
+        );
+        assert_eq!(run(&b, &t, &query).await, ["o-e"]);
+
+        // A polymorphic, untyped last hop (Observation.subject targets many
+        // types) and a typed one agree.
+        let untyped = chain_to_has("Observation", &[("subject", None)], in_g102());
+        let typed = chain_to_has("Observation", &[("subject", Some("Patient"))], in_g102());
+        assert_eq!(run(&b, &t, &untyped).await, ["o1"]);
+        assert_eq!(run(&b, &t, &typed).await, ["o1"]);
+
+        // Nested: Encounter?patient._has:Observation:subject:_has:Provenance:
+        // target:agent=Practitioner/p123.
+        let query = chain_to_has(
+            "Encounter",
+            &[("patient", None)],
+            ReverseChainedParameter::nested(
+                "Observation",
+                "subject",
+                ReverseChainedParameter::terminal(
+                    "Provenance",
+                    "target",
+                    "agent",
+                    SearchValue::eq("Practitioner/p123"),
+                ),
+            ),
+        );
+        assert_eq!(run(&b, &t, &query).await, ["e-smith"]);
+
+        // A terminal modifier applies to the `_has` terminal.
+        let missing = |value: &str| {
+            chain_to_has(
+                "Task",
+                &[("patient", None)],
+                ReverseChainedParameter::terminal(
+                    "CareTeam",
+                    "patient",
+                    "participant",
+                    SearchValue::eq(value),
+                )
+                .with_modifier(SearchModifier::Missing),
+            )
+        };
+        assert_eq!(run(&b, &t, &missing("true")).await, ["t-jones"]);
+        assert_eq!(run(&b, &t, &missing("false")).await, ["t-smith"]);
+
+        // Nothing selected: the no-match sentinel, not every Encounter.
+        let query = chain_to_has(
+            "Encounter",
+            &[("patient", None)],
+            ReverseChainedParameter::terminal("Group", "member", "_id", SearchValue::eq("nope")),
+        );
+        assert!(run(&b, &t, &query).await.is_empty());
+    }
+
+    /// The SQLite backend with its `search_reference_values` hidden, so the
+    /// resolver takes its fallback: drain the `_has` sources and extract.
+    struct NoReferenceHook<'a>(&'a SqliteBackend);
+
+    #[async_trait::async_trait]
+    impl ResourceStorage for NoReferenceHook<'_> {
+        fn backend_name(&self) -> &'static str {
+            "sqlite-without-reference-hook"
+        }
+        async fn create(
+            &self,
+            t: &TenantContext,
+            r: &str,
+            v: serde_json::Value,
+            f: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            self.0.create(t, r, v, f).await
+        }
+        async fn create_or_update(
+            &self,
+            t: &TenantContext,
+            r: &str,
+            id: &str,
+            v: serde_json::Value,
+            f: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            self.0.create_or_update(t, r, id, v, f).await
+        }
+        async fn read(
+            &self,
+            t: &TenantContext,
+            r: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            self.0.read(t, r, id).await
+        }
+        async fn update(
+            &self,
+            t: &TenantContext,
+            c: &StoredResource,
+            v: serde_json::Value,
+        ) -> StorageResult<StoredResource> {
+            self.0.update(t, c, v).await
+        }
+        async fn delete(&self, t: &TenantContext, r: &str, id: &str) -> StorageResult<()> {
+            self.0.delete(t, r, id).await
+        }
+        async fn count(&self, t: &TenantContext, r: Option<&str>) -> StorageResult<u64> {
+            self.0.count(t, r).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SearchProvider for NoReferenceHook<'_> {
+        async fn search(
+            &self,
+            t: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            self.0.search(t, query).await
+        }
+        async fn search_ids(
+            &self,
+            t: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<Page<String>> {
+            self.0.search_ids(t, query).await
+        }
+        async fn search_count(&self, t: &TenantContext, query: &SearchQuery) -> StorageResult<u64> {
+            self.0.search_count(t, query).await
+        }
+        fn search_param_registry(
+            &self,
+            t: &TenantContext,
+        ) -> std::sync::Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+            self.0.search_param_registry(t)
+        }
+    }
+
+    /// #2556: the chain reaches only a target that exists. A Group can list a
+    /// Patient that was never created or has been deleted, and an Encounter
+    /// can still refer to it; such an Encounter does not match, through the
+    /// reference index and through the fallback alike.
+    #[tokio::test]
+    async fn forward_chain_ending_in_has_needs_a_live_target() {
+        let b = backend();
+        let t = tenant();
+        for id in ["live", "deleted"] {
+            b.create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let group = |id: &str, members: &[&str]| {
+            json!({"resourceType": "Group", "id": id, "type": "person", "actual": true,
+                   "member": members.iter()
+                       .map(|m| json!({"entity": {"reference": format!("Patient/{m}")}}))
+                       .collect::<Vec<_>>()})
+        };
+        for resource in [
+            group("g-live", &["live"]),
+            group("g-ghost", &["ghost"]),
+            group("g-deleted", &["deleted"]),
+            group("g-mixed", &["live", "ghost", "deleted"]),
+        ] {
+            b.create(&t, "Group", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for (id, patient) in [
+            ("e-live", "live"),
+            ("e-ghost", "ghost"),
+            ("e-deleted", "deleted"),
+        ] {
+            b.create(
+                &t,
+                "Encounter",
+                json!({"resourceType": "Encounter", "id": id, "status": "finished",
+                       "class": {"code": "AMB"},
+                       "subject": {"reference": format!("Patient/{patient}")}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        b.delete(&t, "Patient", "deleted").await.unwrap();
+        // The dangling references are indexed: only the target check can drop
+        // them.
+        for (patient, encounter) in [("ghost", "e-ghost"), ("deleted", "e-deleted")] {
+            let direct = SearchQuery::new("Encounter").with_parameter(SearchParameter {
+                name: "patient".to_string(),
+                param_type: SearchParamType::Reference,
+                values: vec![SearchValue::eq(format!("Patient/{patient}"))],
+                ..Default::default()
+            });
+            assert_eq!(run(&b, &t, &direct).await, [encounter]);
+        }
+
+        let in_group = |group: &str| {
+            chain_to_has(
+                "Encounter",
+                &[("patient", None)],
+                ReverseChainedParameter::terminal("Group", "member", "_id", SearchValue::eq(group)),
+            )
+        };
+        let without_hook = NoReferenceHook(&b);
+        for (group, expected) in [
+            ("g-live", &["e-live"][..]),
+            ("g-ghost", &[][..]),
+            ("g-deleted", &[][..]),
+            ("g-mixed", &["e-live"][..]),
+        ] {
+            let query = in_group(group);
+            // The reference index (SQLite's `search_reference_values`).
+            assert_eq!(run(&b, &t, &query).await, expected, "{group}");
+            // The fallback: the Groups drained and their references extracted.
+            let rewritten = resolve_chains(&without_hook, &t, &query).await.unwrap();
+            let mut ids: Vec<String> = b
+                .search(&t, &rewritten)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "{group} without the hook");
+        }
+        assert!(
+            without_hook
+                .search_reference_values(&t, &SearchQuery::new("Group"), "member")
+                .await
+                .unwrap()
+                .is_none(),
+            "the wrapper hides the hook"
+        );
+        assert!(
+            b.search_reference_values(&t, &SearchQuery::new("Group"), "member")
+                .await
+                .unwrap()
+                .is_some(),
+            "SQLite answers the hook"
+        );
+    }
+
+    /// #2556: the `_has` a chain ends in is capped like a top-level one, and
+    /// its terminal errors name the whole key.
+    #[tokio::test]
+    async fn forward_chain_ending_in_has_errors() {
+        let b = backend();
+        let t = tenant();
+        seed_chain_to_has(&b, &t).await;
+
+        let mut deep = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("x"),
+        );
+        for _ in 0..crate::types::ChainConfig::default().max_reverse_depth {
+            deep = ReverseChainedParameter::nested("Observation", "subject", deep);
+        }
+        let query = chain_to_has("Encounter", &[("patient", None)], deep);
+        let err = resolve_chains(&b, &t, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("_has nesting depth"), "{err}");
+
+        // `:exact` is not defined for a reference parameter.
+        let query = chain_to_has(
+            "Task",
+            &[("patient", None)],
+            ReverseChainedParameter::terminal(
+                "CareTeam",
+                "patient",
+                "participant",
+                SearchValue::eq("x"),
+            )
+            .with_modifier(SearchModifier::Exact),
+        );
+        let err = resolve_chains(&b, &t, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("patient._has:CareTeam:patient:participant:exact"),
+            "{err}"
+        );
+
+        // A terminology-backed modifier without a terminology server.
+        let query = chain_to_has(
+            "Encounter",
+            &[("subject", Some("Patient"))],
+            ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::eq("http://example.org/vs"),
+            )
+            .with_modifier(SearchModifier::In),
+        );
+        let err = resolve_chains(&b, &t, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StorageError::Search(SearchError::TerminologyRequired { param, .. })
+                    if param == "subject:Patient._has:Observation:subject:code"
+            ),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn no_match_chain_yields_empty() {
         let b = backend();
@@ -1567,6 +2121,7 @@ mod tests {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         });
@@ -1649,6 +2204,7 @@ mod tests {
                     reference_param: reference.to_string(),
                     target_type: Some(target_type.to_string()),
                     target_param: target_param.to_string(),
+                    has: None,
                 })
                 .collect(),
             components: vec![],
@@ -2231,6 +2787,7 @@ mod tests {
                     reference_param: "target".to_string(),
                     target_type: None,
                     target_param: "context".to_string(),
+                    has: None,
                 }],
                 components: vec![],
             })
@@ -2549,11 +3106,13 @@ mod tests {
                     reference_param: "encounter".to_string(),
                     target_type: Some("Encounter".to_string()),
                     target_param: "subject".to_string(),
+                    has: None,
                 },
                 ChainedParameter {
                     reference_param: "subject".to_string(),
                     target_type: Some("Patient".to_string()),
                     target_param: "gender".to_string(),
+                    has: None,
                 },
             ],
             components: vec![],

@@ -574,6 +574,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }];
         // Not a number parameter at all.
         let string = param("name", SearchParamType::String, "inf");

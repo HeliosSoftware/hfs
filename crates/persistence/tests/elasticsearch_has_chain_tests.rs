@@ -715,6 +715,58 @@ async fn has_resolution_issues_no_source_type_search() {
     assert_eq!(ids(&result), set(&["p1", "p3"]));
 }
 
+/// #2556: a chain whose last step is `_has` reads its `_has` hop through the
+/// aggregation, with no Observation paging:
+/// Observation?subject:Patient._has:Observation:subject:code=<height>.
+#[tokio::test]
+async fn chain_ending_in_has_issues_no_source_type_search() {
+    let es = Arc::new(create_backend().await);
+    let t = tenant("chain-to-has");
+    for id in ["p1", "p2", "p3"] {
+        put(&*es, &t, "Patient", patient(id)).await;
+    }
+    for (id, code, subject) in [
+        ("o1", HEIGHT, "Patient/p1"),
+        ("o2", OTHER_CODE, "Patient/p1"),
+        ("o3", OTHER_CODE, "Patient/p2"),
+        ("o4", HEIGHT, "Patient/p3"),
+        // A Patient that was never created: its own reference makes it a
+        // `_has` match, but the chain cannot reach it.
+        ("o5", HEIGHT, "Patient/ghost"),
+    ] {
+        put(&*es, &t, "Observation", observation(id, code, subject)).await;
+    }
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        chain: vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "_has".to_string(),
+            has: Some(Box::new(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::token(Some(LOINC), HEIGHT),
+            ))),
+        }],
+        ..Default::default()
+    });
+    let counting = Counting::new(es);
+    let resolved = resolve_chains(&counting, &t, &query)
+        .await
+        .expect("resolve the chain ending in _has");
+
+    assert_eq!(counting.searches_of("Observation"), 0, "no source paging");
+    assert_eq!(*counting.reference_calls.lock().unwrap(), 1);
+    let result = counting
+        .search(&t, &resolved)
+        .await
+        .expect("Observation search");
+    assert_eq!(ids(&result), set(&["o1", "o2", "o4"]));
+}
+
 // ============================================================================
 // search_ids on Elasticsearch (#2295): ids only, same pages as `search`
 // ============================================================================
@@ -898,6 +950,7 @@ async fn forward_chain_resolves_the_same_through_search_ids() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -955,6 +1008,7 @@ async fn resolver_hops_use_search_ids_for_forward_chains_only() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });

@@ -113,13 +113,18 @@ pub fn parse_typed_values(
 /// never a query.
 ///
 /// Covers direct parameters, the components of a composite value, the raw
-/// values of a chained parameter and the (unsplit) value of a `_has`. Under
+/// values of a chained parameter and the (unsplit) value of a `_has`, the one
+/// a chain ends in included. Under
 /// `:missing` the value is the boolean literal, checked where it is parsed.
 /// An escaped comma (`family=a\,`) is data, not a separator.
 pub fn validate_value_presence(query: &SearchQuery) -> StorageResult<()> {
     for param in &query.parameters {
         if has_empty_value(param) {
             return Err(empty_value(display_name(param)));
+        }
+        // A chain that ends in `_has` carries its value in the `_has`.
+        if let Some(has) = param.chain.last().and_then(|hop| hop.has.as_deref()) {
+            validate_has_value_presence(has)?;
         }
     }
     for reverse_chain in &query.reverse_chains {
@@ -479,6 +484,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "family".to_string(),
+            has: None,
         }];
         assert_eq!(
             refused(&SearchQuery::new("Observation").with_parameter(chained)).as_deref(),
@@ -598,6 +604,31 @@ mod tests {
             refused(&nested).as_deref(),
             Some("_has:Provenance:target:agent")
         );
+
+        // #2556: so does the `_has` a chain ends in, whose own values are empty.
+        let chained = |value: &str| {
+            SearchQuery::new("Encounter").with_parameter(SearchParameter {
+                name: "patient".to_string(),
+                param_type: SearchParamType::Reference,
+                chain: vec![crate::types::ChainedParameter {
+                    reference_param: "patient".to_string(),
+                    target_type: None,
+                    target_param: "_has".to_string(),
+                    has: Some(Box::new(ReverseChainedParameter::terminal(
+                        "Group",
+                        "member",
+                        "_id",
+                        SearchValue::eq(value),
+                    ))),
+                }],
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            refused(&chained("g1,")).as_deref(),
+            Some("_has:Group:member:_id")
+        );
+        assert_eq!(refused(&chained("g1")), None);
     }
 
     #[test]

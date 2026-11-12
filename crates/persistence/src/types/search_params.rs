@@ -463,8 +463,15 @@ pub struct ChainedParameter {
     /// Optional type modifier on the reference.
     pub target_type: Option<String>,
 
-    /// The target parameter on the referenced resource.
+    /// The target parameter on the referenced resource; `_has` when
+    /// [`has`](Self::has) is set.
     pub target_param: String,
+
+    /// The reverse chain a chain ends in: `_has:Group:member:_id` of
+    /// `Encounter?patient._has:Group:member:_id=102`, which the resource this
+    /// hop reaches must satisfy. Set on the last hop only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has: Option<Box<ReverseChainedParameter>>,
 }
 
 /// A reverse chained parameter (_has).

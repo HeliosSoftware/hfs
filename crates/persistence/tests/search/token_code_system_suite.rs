@@ -452,6 +452,7 @@ where
                     reference_param: "subject".to_string(),
                     target_type: Some("Patient".to_string()),
                     target_param: "gender".to_string(),
+                    has: None,
                 }],
                 ..Default::default()
             })
