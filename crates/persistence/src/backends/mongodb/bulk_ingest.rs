@@ -723,7 +723,7 @@ impl MongoBackend {
                     };
                     let new_version = next_version(&previous_version)?;
                     let mut content =
-                        options.content_for_update(&previous_content, &entry.resource);
+                        options.content_to_write(Some(&previous_content), &entry.resource);
                     ensure_resource_identity(&resource_type, &id, &mut content);
 
                     let change = SubmissionChange::update(
@@ -745,7 +745,7 @@ impl MongoBackend {
                     let (resource_type, id) = key.clone().expect("an existing row has an id");
                     let row = &existing[&(resource_type.clone(), id.clone())];
                     let new_version = next_version(&row.version_id)?;
-                    let mut content = options.content_for_update(&row.content, &entry.resource);
+                    let mut content = options.content_to_write(Some(&row.content), &entry.resource);
                     ensure_resource_identity(&resource_type, &id, &mut content);
 
                     let change = SubmissionChange::update(
@@ -777,7 +777,7 @@ impl MongoBackend {
                         .resource_id
                         .clone()
                         .unwrap_or_else(crate::types::new_resource_id);
-                    let mut content = entry.resource.clone();
+                    let mut content = options.content_to_write(None, &entry.resource);
                     ensure_resource_identity(&resource_type, &id, &mut content);
 
                     let change = SubmissionChange::create(manifest_id, &resource_type, &id, "1");

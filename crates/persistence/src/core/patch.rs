@@ -152,6 +152,10 @@ fn apply_patch_inner(
         }
     }
 
+    // Deleting the last item of an array leaves `[]` behind, and an `add` or
+    // merge can bring in `{}` or `null`: FHIR JSON has no empty values (#2554).
+    super::drop_empty_elements(&mut patched);
+
     Ok(patched)
 }
 
@@ -961,6 +965,26 @@ mod tests {
         assert_eq!(current, patient());
     }
 
+    /// #2554: removing the last item of an array, or adding an empty value,
+    /// leaves no empty element in the result.
+    #[test]
+    fn json_patch_result_carries_no_empty_elements() {
+        let patched = apply_patch(
+            &patient(),
+            &PatchFormat::JsonPatch(json!([
+                {"op": "remove", "path": "/name/0"},
+                {"op": "add", "path": "/telecom", "value": [{}]},
+                {"op": "add", "path": "/gender", "value": null}
+            ])),
+        )
+        .unwrap();
+
+        assert_eq!(
+            patched,
+            json!({"resourceType": "Patient", "id": "p1", "active": false})
+        );
+    }
+
     #[test]
     fn merge_patch_sets_and_removes() {
         let patched = apply_patch(
@@ -1149,6 +1173,24 @@ mod tests {
             ])
         );
         assert_eq!(result["birthDate"], "2000-01-01");
+    }
+
+    /// #2554: a FHIRPath `delete` of the only `name` removes the element, not
+    /// just its item.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn fhirpath_delete_of_the_last_item_removes_the_array() {
+        let patch = operations(vec![operation("delete", "Patient.name[0]", vec![])]);
+        let result = apply_patch_for_version(
+            &patient(),
+            &PatchFormat::FhirPathPatch(patch),
+            FhirVersion::R4,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({"resourceType": "Patient", "id": "p1", "active": false})
+        );
     }
 
     #[cfg(feature = "R4")]

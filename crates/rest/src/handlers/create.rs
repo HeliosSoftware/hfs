@@ -8,7 +8,9 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
+use helios_persistence::core::{
+    ConditionalStorage, ResourceStorage, SearchProvider, WriteKind, drop_empty_elements,
+};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -64,7 +66,7 @@ pub async fn create_handler<S>(
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
-    FhirResource(resource): FhirResource,
+    FhirResource(mut resource): FhirResource,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
@@ -73,6 +75,8 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+    // FHIR JSON has no empty objects, empty arrays or null members (#2554).
+    drop_empty_elements(&mut resource);
 
     // A `patient/` scope creates inside the launch patient's compartment only
     // (#1618): the submitted payload must reference the launch patient through
@@ -119,7 +123,6 @@ where
     // resources (#647). Internal callers that rely on caller-supplied ids
     // for idempotency (spec seeding) go straight to storage, not through
     // this handler.
-    let mut resource = resource;
     if let Some(obj) = resource.as_object_mut() {
         obj.remove("id");
     }

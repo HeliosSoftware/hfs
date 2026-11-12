@@ -1238,13 +1238,20 @@ impl BulkProcessingOptions {
         self
     }
 
-    /// Resolves the content to write when a submitted resource lands on an existing
-    /// one, applying [`Self::import_mode`].
-    pub fn content_for_update(&self, stored: &Value, submitted: &Value) -> Value {
-        match self.import_mode {
-            ImportMode::Replace => submitted.clone(),
-            ImportMode::Merge => merge_resource(stored, submitted),
-        }
+    /// Resolves the content to write for a submitted resource: [`Self::import_mode`]
+    /// applied onto `stored` when the resource already exists, then empty objects,
+    /// empty arrays and `null` members removed (#2554).
+    ///
+    /// The submission is not cleaned before the mode is applied: under
+    /// [`ImportMode::Merge`] a `null` member removes the stored element and an empty
+    /// array replaces the stored one, and cleaning first would drop both requests.
+    pub fn content_to_write(&self, stored: Option<&Value>, submitted: &Value) -> Value {
+        let mut content = match (stored, self.import_mode) {
+            (Some(stored), ImportMode::Merge) => merge_resource(stored, submitted),
+            _ => submitted.clone(),
+        };
+        super::drop_empty_elements(&mut content);
+        content
     }
 
     /// Creates options for strict processing (no errors allowed).
@@ -2256,17 +2263,59 @@ mod tests {
     }
 
     #[test]
-    fn test_content_for_update_follows_import_mode() {
+    fn test_content_to_write_follows_import_mode() {
         let stored = serde_json::json!({
             "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
         });
         let submitted = serde_json::json!({"resourceType": "Patient", "id": "p1"});
 
         let replace = BulkProcessingOptions::new();
-        assert_eq!(replace.content_for_update(&stored, &submitted), submitted);
+        assert_eq!(
+            replace.content_to_write(Some(&stored), &submitted),
+            submitted
+        );
 
         let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
-        let merged = merge.content_for_update(&stored, &submitted);
+        let merged = merge.content_to_write(Some(&stored), &submitted);
         assert_eq!(merged["gender"], serde_json::json!("female"));
+    }
+
+    /// #2554: under merge a `null` member removes the stored element and an empty
+    /// array clears the stored one; the merged result, not the submission, is what
+    /// is cleaned.
+    #[test]
+    fn test_content_to_write_merges_before_dropping_empty_elements() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "gender": "female",
+            "telecom": [{"system": "phone", "value": "1"}],
+            "name": [{"family": "Stale"}]
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient", "id": "p1",
+            "telecom": null, "name": [], "address": [{}], "active": true
+        });
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        assert_eq!(
+            merge.content_to_write(Some(&stored), &submitted),
+            serde_json::json!({
+                "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
+            })
+        );
+    }
+
+    /// #2554: replace mode and new resources (either mode) are cleaned too.
+    #[test]
+    fn test_content_to_write_drops_empty_elements_for_replace_and_new_resources() {
+        let stored = serde_json::json!({"resourceType": "Patient", "id": "p1", "gender": "female"});
+        let submitted = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "active": true,
+            "name": [{}], "telecom": [], "gender": null
+        });
+        let clean = serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true});
+        let replace = BulkProcessingOptions::new();
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        assert_eq!(replace.content_to_write(Some(&stored), &submitted), clean);
+        assert_eq!(replace.content_to_write(None, &submitted), clean);
+        assert_eq!(merge.content_to_write(None, &submitted), clean);
     }
 }

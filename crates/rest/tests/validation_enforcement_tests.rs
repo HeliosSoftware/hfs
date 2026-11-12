@@ -394,3 +394,33 @@ async fn enforce_mode_honors_meta_profile_claims() {
         .await;
     assert_eq!(response.status_code(), 201, "{}", response.text());
 }
+
+/// #2554: empty elements are dropped before validation in every mode, so
+/// `enforce` judges, and every mode stores, the same clean body.
+#[tokio::test]
+async fn every_mode_stores_the_body_without_empty_elements() {
+    for mode in ["off", "log", "enforce"] {
+        let server = create_test_server(mode).await;
+        let response = server
+            .post("/Patient")
+            .add_header("prefer", "return=representation")
+            .json(&json!({
+                "resourceType": "Patient",
+                "active": true,
+                "name": [{}],
+                "telecom": [],
+                "gender": null
+            }))
+            .await;
+        assert_eq!(response.status_code(), 201, "{mode}: {}", response.text());
+        let mut stored: Value = response.json();
+        let stored = stored.as_object_mut().unwrap();
+        stored.remove("id");
+        stored.remove("meta");
+        assert_eq!(
+            Value::Object(stored.clone()),
+            json!({"resourceType": "Patient", "active": true}),
+            "{mode}"
+        );
+    }
+}
