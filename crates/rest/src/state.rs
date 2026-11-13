@@ -89,6 +89,10 @@ pub struct AppState<S> {
     /// Server configuration.
     config: Arc<ServerConfig>,
 
+    /// Admission gate for large Bundle requests (#2020); `None` when
+    /// `HFS_LARGE_BUNDLE_CONCURRENCY` is 0 (unlimited).
+    large_bundle_gate: Option<Arc<tokio::sync::Semaphore>>,
+
     /// Validated public URL used by response builders.
     public_url: PublicUrl,
 
@@ -175,6 +179,7 @@ impl<S> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             config: Arc::clone(&self.config),
+            large_bundle_gate: self.large_bundle_gate.clone(),
             public_url: self.public_url.clone(),
             auth_config: Arc::clone(&self.auth_config),
             auth: self.auth.clone(),
@@ -202,6 +207,11 @@ impl<S> Clone for AppState<S> {
     }
 }
 
+fn large_bundle_gate(config: &ServerConfig) -> Option<Arc<tokio::sync::Semaphore>> {
+    (config.large_bundle_concurrency > 0)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(config.large_bundle_concurrency)))
+}
+
 impl<S: ResourceStorage> AppState<S> {
     /// Creates a new AppState with the given storage and configuration.
     ///
@@ -220,6 +230,7 @@ impl<S: ResourceStorage> AppState<S> {
             config.terminology_server.as_deref(),
             config.default_fhir_version,
         ));
+        let gate = large_bundle_gate(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -245,6 +256,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_file_auth: None,
             bulk_submit_config,
             validation,
+            large_bundle_gate: gate,
             write_observability: WriteObservability::new(),
         }
     }
@@ -278,6 +290,7 @@ impl<S: ResourceStorage> AppState<S> {
             config.terminology_server.as_deref(),
             config.default_fhir_version,
         ));
+        let gate = large_bundle_gate(&config);
         Self {
             storage,
             config: Arc::new(config),
@@ -303,6 +316,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_file_auth: None,
             bulk_submit_config,
             validation,
+            large_bundle_gate: gate,
             write_observability: WriteObservability::new(),
         }
     }
@@ -497,6 +511,11 @@ impl<S: ResourceStorage> AppState<S> {
     }
 
     /// Returns a reference to the server configuration.
+    pub(crate) fn large_bundle_gate(&self) -> Option<&Arc<tokio::sync::Semaphore>> {
+        self.large_bundle_gate.as_ref()
+    }
+
+    /// Returns the server configuration.
     pub fn config(&self) -> &ServerConfig {
         &self.config
     }
