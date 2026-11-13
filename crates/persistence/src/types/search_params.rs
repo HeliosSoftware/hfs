@@ -823,15 +823,20 @@ impl CompartmentMembership {
     /// Whether this membership can match no resource at all: it names no
     /// membership parameter, or no compartment reference.
     ///
+    /// The reference is judged the way every backend matches on it, after
+    /// [`strip_reference_version`]: `/_history/1` strips to the empty string, so
+    /// it names no compartment, however non-empty it looks.
+    ///
     /// No resource can be a member of a compartment through no parameter, or of
     /// a compartment that has no reference, so such a membership matches
     /// nothing. It must never be read as "no compartment restriction": a
     /// compartment search is also how a request is confined to one patient, and
     /// skipping the restriction would return every resource of the type. Every
-    /// backend therefore answers an empty membership with zero rows and a
-    /// count of 0, and no error.
+    /// backend that can search therefore answers an empty membership with zero
+    /// rows and a count of 0, and no error. (Standalone S3 refuses every search
+    /// that has no index to answer it, this one included.)
     pub fn matches_nothing(&self) -> bool {
-        self.params.is_empty() || self.reference.is_empty()
+        self.params.is_empty() || strip_reference_version(&self.reference).is_empty()
     }
 }
 
@@ -1493,5 +1498,35 @@ mod tests {
         assert!(CompartmentMembership::default().matches_nothing());
         assert!(!membership(&["patient"], "Patient/p1").matches_nothing());
         assert!(!membership(&["subject", "performer"], "Patient/p1").matches_nothing());
+    }
+
+    /// #2509: the reference is judged after its version is stripped, because
+    /// that is what every backend matches on. A bare `/_history/<vid>` strips to
+    /// the empty string and names no compartment; a versioned reference to a
+    /// real one is still a real restriction.
+    #[test]
+    fn a_reference_that_strips_to_nothing_matches_nothing() {
+        assert_eq!(strip_reference_version("/_history/1"), "");
+        assert_eq!(
+            strip_reference_version("Patient/p1/_history/2"),
+            "Patient/p1"
+        );
+        assert_eq!(strip_reference_version(""), "");
+
+        let membership = |reference: &str| CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: reference.to_string(),
+        };
+        assert!(membership("/_history/1").matches_nothing());
+        assert!(membership("/_history/").matches_nothing());
+        assert!(!membership("Patient/p1/_history/2").matches_nothing());
+        assert!(!membership("Patient/p1").matches_nothing());
+        assert!(
+            CompartmentMembership {
+                params: vec![],
+                reference: "Patient/p1/_history/2".to_string(),
+            }
+            .matches_nothing()
+        );
     }
 }

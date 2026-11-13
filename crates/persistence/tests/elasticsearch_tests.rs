@@ -6032,8 +6032,8 @@ mod es_integration {
     async fn es_integration_empty_compartment_membership_matches_nothing() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
-            CompartmentMembership, SearchParamType, SearchParameter, SearchQuery, SearchValue,
-            TotalMode,
+            CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue, TotalMode,
         };
 
         let backend = create_backend().await;
@@ -6094,19 +6094,83 @@ mod es_integration {
         assert_eq!(seen, ["obs-p1".to_string()], "the control must find p1's");
         assert_eq!(backend.search_count(&tenant, &control).await.unwrap(), 1);
 
+        // `_id` and `:missing=true` beside a membership: the id of a member is
+        // found, the id of a non-member is not, and p1's observation is not
+        // missing a status.
+        let id = |id: &str| SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(id)],
+            ..Default::default()
+        };
+        let missing = |name: &str, param_type: SearchParamType| SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            ..Default::default()
+        };
+        for (label, parameter, expected) in [
+            ("_id=obs-p1", id("obs-p1"), vec!["obs-p1".to_string()]),
+            ("_id=obs-p2", id("obs-p2"), vec![]),
+            (
+                "status:missing=true",
+                missing("status", SearchParamType::Token),
+                vec![],
+            ),
+            (
+                "performer:missing=true",
+                missing("performer", SearchParamType::Reference),
+                vec!["obs-p1".to_string()],
+            ),
+        ] {
+            let mut query = SearchQuery::new("Observation").with_parameter(parameter);
+            query.compartment = membership(&["subject", "performer"], "Patient/p1");
+            let found: Vec<String> = backend
+                .search(&tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            assert_eq!(found, expected, "control + {label}");
+            assert_eq!(
+                backend.search_count(&tenant, &query).await.unwrap(),
+                expected.len() as u64,
+                "control + {label}: search_count"
+            );
+        }
+
         for (label, empty) in [
             ("no params", membership(&[], "Patient/p1")),
             ("empty reference", membership(&["subject"], "")),
+            // Matched on with its version stripped, which leaves nothing.
+            (
+                "version-only reference",
+                membership(&["subject"], "/_history/1"),
+            ),
             ("neither", membership(&[], "")),
         ] {
-            for with_parameter in [false, true] {
+            for (criteria, parameters) in [
+                ("alone", vec![]),
+                ("status=final", vec![status_final.clone()]),
+                ("_id=obs-p1", vec![id("obs-p1")]),
+                (
+                    "status:missing=true",
+                    vec![missing("status", SearchParamType::Token)],
+                ),
+                (
+                    "performer:missing=true",
+                    vec![missing("performer", SearchParamType::Reference)],
+                ),
+            ] {
                 let mut query = SearchQuery::new("Observation");
                 query.compartment = empty.clone();
                 query.total = Some(TotalMode::Accurate);
-                if with_parameter {
-                    query.parameters.push(status_final.clone());
-                }
-                let context = format!("{label}, parameter: {with_parameter}");
+                query.parameters = parameters;
+                let context = format!("{label} + {criteria}");
 
                 let found = backend.search(&tenant, &query).await.unwrap();
                 assert!(
@@ -6124,6 +6188,15 @@ mod es_integration {
                     backend.search_count(&tenant, &query).await.unwrap(),
                     0,
                     "{context}: search_count"
+                );
+                assert!(
+                    backend
+                        .search_ids(&tenant, &query)
+                        .await
+                        .unwrap()
+                        .items
+                        .is_empty(),
+                    "{context}: search_ids"
                 );
             }
         }

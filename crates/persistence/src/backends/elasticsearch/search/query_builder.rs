@@ -776,6 +776,15 @@ mod tests {
                     reference: String::new(),
                 },
             ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be a `term` on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["patient".to_string()],
+                    reference: "/_history/1".to_string(),
+                },
+            ),
             ("neither", CompartmentMembership::default()),
         ] {
             assert_eq!(
@@ -826,6 +835,10 @@ mod tests {
             CompartmentMembership {
                 params: vec!["subject".to_string()],
                 reference: String::new(),
+            },
+            CompartmentMembership {
+                params: vec!["subject".to_string()],
+                reference: "/_history/1".to_string(),
             },
             CompartmentMembership::default(),
         ] {

@@ -12,18 +12,22 @@
 //! parameter, or of one with no reference.
 //!
 //! This suite drives each backend's *real* [`SearchProvider`] paths — `search`,
-//! `search_count`, `search_ids` and `_contained=true|both` — with the three
-//! shapes of an empty membership, alone and beside the criteria that route a
+//! `search_count`, `search_ids` and `_contained=true|both` — with the four
+//! shapes of an empty membership (no params, an empty reference, a reference
+//! that strips to nothing, neither), alone and beside the criteria that route a
 //! search down a different path of its own (an ordinary parameter, `:not`,
-//! `:missing`, `_sort`, `_total=accurate`, paging). A control with a real
-//! membership runs the same shapes and must still return its members: without
-//! it, "returns nothing" would pass on a backend that returns nothing for
-//! everything.
+//! `:missing=false` and `:missing=true`, a positive `_id` — which is what
+//! chains, `_has` and `_list` resolve into — `_sort`, `_total=accurate` and
+//! `estimate`, `_count` and `_offset`). A control with a real membership runs
+//! the same shapes and must still return its members: without it, "returns
+//! nothing" would pass on a backend that returns nothing for everything.
 //!
-//! Included by `#[path]` into each backend's test binary, like
-//! `empty_value_suite.rs`. The backend must be built with the spec search
-//! parameters loaded: the controls refuse to go on until the fixture is
-//! searchable by `subject`, `performer`, `code` and `status`.
+//! Included by `#[path]` into the SQLite (`tests/search/mod.rs`), MongoDB and
+//! PostgreSQL test binaries, like `empty_value_suite.rs`. Elasticsearch does not
+//! run it: it has its own, narrower integration test in `elasticsearch_tests.rs`.
+//! The backend must be built with the spec search parameters loaded: the
+//! controls refuse to go on until the fixture is searchable by `subject`,
+//! `performer`, `code` and `status`.
 
 #![allow(dead_code)]
 
@@ -80,7 +84,29 @@ fn real_membership() -> CompartmentMembership {
     }
 }
 
-/// The three shapes of a membership that matches nothing.
+/// `_id=<ids>`: a positive `_id` names a finite candidate set, which is what
+/// chains, `_has` and `_list` resolve into before a backend searches.
+fn id_param(ids: &[&str]) -> SearchParameter {
+    SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        values: ids.iter().map(|id| SearchValue::eq(*id)).collect(),
+        ..Default::default()
+    }
+}
+
+/// `<name>:missing=<value>` on a parameter of type `param_type`.
+fn missing(name: &str, param_type: SearchParamType, value: &str) -> SearchParameter {
+    SearchParameter {
+        name: name.to_string(),
+        param_type,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq(value)],
+        ..Default::default()
+    }
+}
+
+/// The four shapes of a membership that matches nothing.
 fn empty_memberships() -> Vec<(&'static str, CompartmentMembership)> {
     vec![
         (
@@ -95,6 +121,15 @@ fn empty_memberships() -> Vec<(&'static str, CompartmentMembership)> {
             CompartmentMembership {
                 params: vec!["subject".to_string(), "performer".to_string()],
                 reference: String::new(),
+            },
+        ),
+        // Every backend matches on the reference with its version stripped,
+        // and `/_history/1` strips to the empty string.
+        (
+            "version-only reference",
+            CompartmentMembership {
+                params: vec!["subject".to_string(), "performer".to_string()],
+                reference: "/_history/1".to_string(),
             },
         ),
         ("neither", CompartmentMembership::default()),
@@ -120,6 +155,11 @@ fn top_level_variants() -> Vec<(&'static str, SearchQuery)> {
         .with_parameter(token("status", "amended", Some(SearchModifier::Not)));
     everything.sort.push(SortDirective::parse("date"));
     everything.total = Some(TotalMode::Accurate);
+    let mut estimate = base();
+    estimate.total = Some(TotalMode::Estimate);
+    let mut offset = base();
+    offset.count = Some(2);
+    offset.offset = Some(1);
     vec![
         ("alone", base()),
         ("code=X", base().with_parameter(token("code", "X", None))),
@@ -129,12 +169,51 @@ fn top_level_variants() -> Vec<(&'static str, SearchQuery)> {
         ),
         (
             "status:missing=false",
-            base().with_parameter(token("status", "false", Some(SearchModifier::Missing))),
+            base().with_parameter(missing("status", SearchParamType::Token, "false")),
+        ),
+        // Every Observation has a status, so this one is empty either way; the
+        // `performer` one is not: three of the four have none.
+        (
+            "status:missing=true",
+            base().with_parameter(missing("status", SearchParamType::Token, "true")),
+        ),
+        (
+            "performer:missing=true",
+            base().with_parameter(missing("performer", SearchParamType::Reference, "true")),
+        ),
+        // A positive `_id`: a finite candidate set to confine, beside nothing,
+        // beside an ordinary parameter, beside a complement, naming a member
+        // and a non-member together, and naming a non-member.
+        (
+            "_id=ec-p1-final",
+            base().with_parameter(id_param(&["ec-p1-final"])),
+        ),
+        (
+            "_id=ec-p1-final&code=X",
+            base()
+                .with_parameter(id_param(&["ec-p1-final"]))
+                .with_parameter(token("code", "X", None)),
+        ),
+        (
+            "_id=ec-p1-final&status:not=amended",
+            base()
+                .with_parameter(id_param(&["ec-p1-final"]))
+                .with_parameter(token("status", "amended", Some(SearchModifier::Not))),
+        ),
+        (
+            "_id=ec-p1-final,ec-p2-final",
+            base().with_parameter(id_param(&["ec-p1-final", "ec-p2-final"])),
+        ),
+        (
+            "_id=ec-p2-final",
+            base().with_parameter(id_param(&["ec-p2-final"])),
         ),
         ("_sort=date", by_date),
         ("_sort=-_lastUpdated", newest_first),
         ("_total=accurate", accurate),
+        ("_total=estimate", estimate),
         ("_count=2", paged),
+        ("_count=2&_offset=1", offset),
         (
             "code=X&status:not=amended&_sort=date&_total=accurate",
             everything,
@@ -229,7 +308,7 @@ fn expected_seen(query: &SearchQuery, expected: &[&str]) -> Seen {
     Seen {
         id_page: ids.clone(),
         ids,
-        total: (query.total == Some(TotalMode::Accurate)).then_some(n),
+        total: query.wants_total().then_some(n),
         has_next: false,
         counted: n,
     }
@@ -413,22 +492,35 @@ where
             // Not amended: the two final ones.
             "status:not=amended" => vec!["ec-p1-final", "ec-perf-p1"],
             "code=X&status:not=amended&_sort=date&_total=accurate" => vec!["ec-p1-final"],
+            // Every member has a status, so none is missing one; only
+            // `ec-perf-p1` has a performer.
+            "status:missing=true" => vec![],
+            "performer:missing=true" => vec!["ec-p1-amended", "ec-p1-final"],
+            // A member's id is found, a non-member's is not, and a list of both
+            // finds the member only.
+            "_id=ec-p1-final"
+            | "_id=ec-p1-final&code=X"
+            | "_id=ec-p1-final&status:not=amended"
+            | "_id=ec-p1-final,ec-p2-final" => vec!["ec-p1-final"],
+            "_id=ec-p2-final" => vec![],
             // Every member has a status.
             _ => members.to_vec(),
         };
         let mut query = variant.clone();
         query.compartment = Some(real_membership());
-        // A page of two reports the first two members, and that more follow.
-        if name == "_count=2" {
+        // A page of two reports two of the three members; whether more follow
+        // depends on where it starts.
+        if name == "_count=2" || name == "_count=2&_offset=1" {
+            let more = name == "_count=2";
             let actual = observe(backend, &tenant, &query).await;
-            let ok = actual
-                .as_ref()
-                .is_ok_and(|seen| seen.ids.len() == 2 && seen.has_next && seen.counted == 3);
+            let ok = actual.as_ref().is_ok_and(|seen| {
+                seen.ids.len() == 2 && seen.has_next == more && seen.counted == 3
+            });
             if !ok {
                 report.failures += 1;
             }
             report.lines.push(format!(
-                "{} | control + {name} | expected 2 of 3 members and a next page | actual {actual:?}",
+                "{} | control + {name} | expected 2 of 3 members, next page: {more} | actual {actual:?}",
                 if ok { "ok  " } else { "FAIL" }
             ));
             continue;

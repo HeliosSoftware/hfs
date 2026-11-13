@@ -2347,6 +2347,14 @@ async fn an_empty_compartment_membership_matches_nothing_in_the_planner_and_the_
                 reference: String::new(),
             },
         ),
+        (
+            // Judged after the version is stripped, as every backend matches.
+            "version-only reference",
+            CompartmentMembership {
+                params: vec!["subject".into(), "performer".into()],
+                reference: "/_history/1".into(),
+            },
+        ),
         ("neither", CompartmentMembership::default()),
     ];
     for (label, membership) in shapes {

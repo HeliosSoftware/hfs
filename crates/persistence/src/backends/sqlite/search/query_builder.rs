@@ -3109,6 +3109,15 @@ mod tests {
                     reference: String::new(),
                 },
             ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be an exact match on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string()],
+                    reference: "/_history/1".to_string(),
+                },
+            ),
             ("neither", CompartmentMembership::default()),
         ]
     }

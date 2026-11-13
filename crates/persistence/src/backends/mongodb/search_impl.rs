@@ -3936,6 +3936,13 @@ impl MongoBackend {
             // trip to validate, which isn't worth paying for a query this
             // narrow (an unsatisfiable `_id` AND an unresolvable target is
             // "no results" either way).
+            //
+            // The same holds for a membership that matches nothing (#2509): what
+            // is validated later, past this return, is not reached — the
+            // composite checks of `composite_driver_probe` (an all-`ne`
+            // `InvalidComposite`), and the `:identifier` resolution. Such a
+            // query answers empty rather than 400, exactly as it does beside an
+            // empty `_id` seed.
             for param in &normal {
                 if param.param_type != SearchParamType::Composite
                     && !matches!(param.modifier, Some(SearchModifier::Identifier))
@@ -9821,6 +9828,15 @@ mod modifier_parity_filter_tests {
                 CompartmentMembership {
                     params: vec!["subject".to_string(), "performer".to_string()],
                     reference: String::new(),
+                },
+            ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be an exact match on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string(), "performer".to_string()],
+                    reference: "/_history/1".to_string(),
                 },
             ),
             ("neither", CompartmentMembership::default()),
