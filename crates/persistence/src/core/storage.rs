@@ -592,12 +592,46 @@ pub trait ResourceStorage: Send + Sync {
     /// * `StorageError::Resource(NotFound)` - If the resource doesn't exist
     /// * `StorageError::Concurrency(VersionConflict)` - If the resource was modified
     /// * `StorageError::Tenant` - If the tenant doesn't have update permission
+    ///
+    /// # Tags and security labels
+    ///
+    /// `meta.tag` and `meta.security` held by `current` are merged into
+    /// `resource` before it is stored (see
+    /// [`merge_update_meta`](crate::types::merge_update_meta), #2562), so an
+    /// update cannot remove one. [`update_verbatim`](Self::update_verbatim)
+    /// stores the body as given.
     async fn update(
         &self,
         tenant: &TenantContext,
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource>;
+
+    /// [`update`](Self::update) without the tag and security-label merge:
+    /// `resource` is stored exactly as given, so a label it leaves out is
+    /// removed.
+    ///
+    /// For writes that must remove labels or reproduce a body verbatim —
+    /// `$meta-delete`, restoring a rolled-back bulk-submit update — never for a
+    /// client's update, which merges.
+    ///
+    /// # Errors
+    ///
+    /// As [`update`](Self::update). The default answers
+    /// `BackendError::UnsupportedCapability`, for storage that cannot write a
+    /// resource verbatim.
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let _ = (tenant, current, resource);
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "update_verbatim".to_string(),
+        }))
+    }
 
     /// Deletes a resource (soft delete).
     ///

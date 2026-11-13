@@ -531,7 +531,14 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 /// forms already are, so kicking one off with `POST` needs the same read scope,
 /// not a write one (#1123). System-level `/$export` is `$`-first and so is
 /// already method-agnostic (handled by the system-path guard below).
-const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export", "$meta"];
+
+/// Operations that write the resource they are invoked on: `POST
+/// /{type}/{id}/$meta-add` and `$meta-delete` change its `meta` and store a new
+/// version, so they are authorized as `FhirOperation::Update` of the
+/// first-segment type, exactly as a `PUT` of that resource is — not as the
+/// `POST` → `Create` fallthrough would classify them.
+const UPDATE_SHAPED_OPERATIONS: &[&str] = &["$meta-add", "$meta-delete"];
 
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
@@ -601,6 +608,12 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
     {
         return Some((resource_type, FhirOperation::Read));
+    }
+    if segments
+        .last()
+        .is_some_and(|s| UPDATE_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Update));
     }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
@@ -878,6 +891,27 @@ mod tests {
             let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
             assert_eq!(rt, "Patient", "method={method}");
             assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn meta_is_read_and_meta_add_delete_are_updates() {
+        for path in ["/Task/t1/$meta", "/Task/t1/_history/2/$meta", "/Task/$meta"] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    extract_operation(path, method),
+                    Some(("Task".to_string(), FhirOperation::Read)),
+                    "{method} {path}"
+                );
+            }
+        }
+        // Writes of the named resource: an update scope, never a create one.
+        for path in ["/Task/t1/$meta-add", "/Task/t1/$meta-delete"] {
+            assert_eq!(
+                extract_operation(path, "POST"),
+                Some(("Task".to_string(), FhirOperation::Update)),
+                "{path}"
+            );
         }
     }
 

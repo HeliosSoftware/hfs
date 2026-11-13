@@ -496,6 +496,17 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.update(tenant, current, resource).await
     }
 
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.composite
+            .update_verbatim(tenant, current, resource)
+            .await
+    }
+
     async fn delete(
         &self,
         tenant: &TenantContext,

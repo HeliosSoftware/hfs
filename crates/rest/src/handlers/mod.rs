@@ -33,6 +33,7 @@ pub mod delete;
 pub mod everything;
 pub mod health;
 pub mod history;
+pub mod meta;
 pub mod nl_search;
 pub mod patch;
 pub mod purge;
@@ -87,6 +88,10 @@ pub use health::health_handler;
 pub use history::{
     delete_instance_history_handler, delete_version_handler, history_instance_handler,
     history_system_handler, history_type_handler,
+};
+pub use meta::{
+    meta_add_handler, meta_delete_handler, meta_instance_handler,
+    meta_summary_not_supported_handler, meta_version_handler,
 };
 pub use nl_search::nl_search_handler;
 pub use patch::{conditional_patch_handler, patch_handler};

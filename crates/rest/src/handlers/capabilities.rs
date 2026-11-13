@@ -374,6 +374,18 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
         }),
         serde_json::json!({
+            "name": "meta",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta"
+        }),
+        serde_json::json!({
+            "name": "meta-add",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-add"
+        }),
+        serde_json::json!({
+            "name": "meta-delete",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete"
+        }),
+        serde_json::json!({
             "name": "versions",
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),

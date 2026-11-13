@@ -254,6 +254,33 @@ impl Default for BackendHealth {
 }
 
 impl CompositeStorage {
+    /// Records the primary's health after an update and syncs the stored
+    /// version to the secondaries — what [`ResourceStorage::update`] and
+    /// [`ResourceStorage::update_verbatim`] share.
+    async fn finish_update(
+        &self,
+        result: StorageResult<StoredResource>,
+    ) -> StorageResult<StoredResource> {
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        self.update_health(
+            primary_id,
+            result.is_ok(),
+            result.as_ref().err().map(|e| e.to_string()),
+        );
+
+        let stored = result?;
+
+        // Sync to secondaries
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
+            .await
+        {
+            warn!(error = %e, "Failed to sync update to secondaries; recorded as needing a reindex");
+        }
+
+        Ok(stored)
+    }
+
     fn has_dedicated_search_backend(&self) -> bool {
         self.config
             .backends_with_role(super::config::BackendRole::Search)
@@ -1267,26 +1294,22 @@ impl ResourceStorage for CompositeStorage {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let result = self.primary.update(tenant, current, resource.clone()).await;
+        let result = self.primary.update(tenant, current, resource).await;
+        self.finish_update(result).await
+    }
 
-        let primary_id = self.config.primary_id().unwrap_or("primary");
-        self.update_health(
-            primary_id,
-            result.is_ok(),
-            result.as_ref().err().map(|e| e.to_string()),
-        );
-
-        let stored = result?;
-
-        // Sync to secondaries
-        if let Err(e) = self
-            .sync_to_secondaries(SyncEvent::updated(stored.clone()))
-            .await
-        {
-            warn!(error = %e, "Failed to sync update to secondaries; recorded as needing a reindex");
-        }
-
-        Ok(stored)
+    #[instrument(skip(self, tenant, resource), fields(resource_type = %current.resource_type(), id = %current.id()))]
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let result = self
+            .primary
+            .update_verbatim(tenant, current, resource)
+            .await;
+        self.finish_update(result).await
     }
 
     #[instrument(skip(self, tenant), fields(resource_type = %resource_type, id = %id))]

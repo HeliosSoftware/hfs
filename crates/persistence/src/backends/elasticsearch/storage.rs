@@ -1787,86 +1787,19 @@ impl ResourceStorage for ElasticsearchBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let resource_type = current.resource_type();
-        tenant.check_permission(Operation::Update, resource_type)?;
-
-        let tenant_id = tenant.tenant_id().as_str();
-        let id = current.id();
-        let new_version: u64 = current.version_id().parse::<u64>().unwrap_or(0) + 1;
-        let version_id = new_version.to_string();
-        let fhir_version = current.fhir_version();
-
-        let mut resource = resource;
         // Tags and security labels the update leaves out are kept (#2562).
+        let mut resource = resource;
         merge_update_meta(current.content(), &mut resource);
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
+        self.store_update(tenant, current, resource).await
+    }
 
-        let extracted_values = self
-            .tenant_extractor(tenant_id)
-            .extract(&resource, resource_type)
-            .unwrap_or_default();
-
-        // The resource's instant: indexed as `last_updated` and returned as
-        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
-        let now = Utc::now();
-        let doc = build_es_document(
-            tenant_id,
-            resource_type,
-            id,
-            &version_id,
-            now,
-            &resource,
-            fhir_version,
-            &extracted_values,
-        );
-
-        schema::ensure_index(self, tenant_id, resource_type).await?;
-
-        let index = self.index_name(tenant_id, resource_type);
-        let doc_id = Self::document_id(resource_type, id);
-
-        index_document(
-            self,
-            &index,
-            &doc_id,
-            &doc,
-            self.write_refresh_param(),
-            "update document",
-        )
-        .await?;
-
-        // Re-sync contained docs exactly as `create_or_update` does. This path
-        // used to skip it, so an update that changed `contained[]` left the old
-        // contained documents matching `_contained` searches (#1382).
-        self.index_contained_docs(
-            tenant_id,
-            resource_type,
-            id,
-            &resource,
-            fhir_version,
-            &version_id,
-            now,
-            true,
-        )
-        .await?;
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            &version_id,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            fhir_version,
-        ))
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.store_update(tenant, current, resource).await
     }
 
     async fn delete(
@@ -2114,6 +2047,99 @@ impl ResourceStorage for ElasticsearchBackend {
         // Deleted-doc count (includes contained/tombstone docs) — informational;
         // the composite reports the primary's count to the admin API.
         delete_by_query_scoped(self, &pattern, body, "purge tenant data").await
+    }
+}
+
+impl ElasticsearchBackend {
+    /// Stores `resource` as the next version of `current`, exactly as given.
+    ///
+    /// The body of both [`ResourceStorage::update`] (which merges `current`'s
+    /// tags and security labels in first, #2562) and
+    /// [`ResourceStorage::update_verbatim`].
+    async fn store_update(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let id = current.id();
+        let new_version: u64 = current.version_id().parse::<u64>().unwrap_or(0) + 1;
+        let version_id = new_version.to_string();
+        let fhir_version = current.fhir_version();
+
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let extracted_values = self
+            .tenant_extractor(tenant_id)
+            .extract(&resource, resource_type)
+            .unwrap_or_default();
+
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
+        let doc = build_es_document(
+            tenant_id,
+            resource_type,
+            id,
+            &version_id,
+            now,
+            &resource,
+            fhir_version,
+            &extracted_values,
+        );
+
+        schema::ensure_index(self, tenant_id, resource_type).await?;
+
+        let index = self.index_name(tenant_id, resource_type);
+        let doc_id = Self::document_id(resource_type, id);
+
+        index_document(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            "update document",
+        )
+        .await?;
+
+        // Re-sync contained docs exactly as `create_or_update` does. This path
+        // used to skip it, so an update that changed `contained[]` left the old
+        // contained documents matching `_contained` searches (#1382).
+        self.index_contained_docs(
+            tenant_id,
+            resource_type,
+            id,
+            &resource,
+            fhir_version,
+            &version_id,
+            now,
+            true,
+        )
+        .await?;
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            &version_id,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
     }
 }
 
