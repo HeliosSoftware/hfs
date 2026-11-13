@@ -33,7 +33,7 @@ use crate::search::reindex::{
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::SearchQuery;
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
+use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource, merge_update_meta};
 
 use super::SqliteBackend;
 use super::bulk_submit::retry_bookkeeping_on_busy_async;
@@ -884,144 +884,10 @@ impl ResourceStorage for SqliteBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let resource_type = current.resource_type();
-        tenant.check_permission(Operation::Update, resource_type)?;
-
-        let mut conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let id = current.id();
-
-        // The expected version is `current`'s, and the UPDATE below only matches
-        // a row that still carries it — so the new version follows from what the
-        // caller already read.
-        let expected_version = current.version_id();
-        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-
-        // Ensure the resource has correct type and id
+        // Tags and security labels the update leaves out are kept (#2562).
         let mut resource = resource;
-        if let Some(obj) = resource.as_object_mut() {
-            obj.insert(
-                "resourceType".to_string(),
-                Value::String(resource_type.to_string()),
-            );
-            obj.insert("id".to_string(), Value::String(id.to_string()));
-        }
-
-        // Serialize the resource data
-        let data = serde_json::to_vec(&resource)
-            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
-
-        // Extract the search values before taking the write lock: it is pure
-        // CPU, and SQLite has one writer.
-        let prepared = (!self.is_search_offloaded())
-            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
-
-        let now = Utc::now();
-        let last_updated = now.to_rfc3339();
-        let fhir_version_str = current.fhir_version().as_mime_param();
-
-        // Compare-and-swap, history row and search index in ONE transaction.
-        //
-        // This used to be a `SELECT version_id`, a comparison in Rust, and then
-        // an `UPDATE` with no version in its `WHERE`, each statement
-        // auto-committed on a pooled connection. Two writers holding the same
-        // version on two connections both passed the comparison; the second
-        // `UPDATE` then overwrote the first and committed, and only its history
-        // `INSERT` failed — on `PRIMARY KEY (…, version_id)` — so that writer got
-        // a 500 while its content was already the current row, under a version
-        // whose history entry holds the *winner's* content (#1404).
-        //
-        // The version now rides in the `UPDATE`'s predicate, so the comparison
-        // and the write are one statement; and everything that follows shares
-        // its transaction, so a writer that loses leaves nothing behind.
-        // IMMEDIATE takes the write lock up front, where the busy handler
-        // applies (see `purge_tenant_data`).
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| internal_error(format!("Failed to begin update: {}", e)))?;
-
-        let updated = tx
-            .execute(
-                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
-                 WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
-                   AND version_id = ?7 AND is_deleted = 0",
-                params![
-                    new_version_str,
-                    data,
-                    last_updated,
-                    tenant_id,
-                    resource_type,
-                    id,
-                    expected_version
-                ],
-            )
-            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
-
-        if updated == 0 {
-            // Matched nothing; which of the two reasons it was costs a query,
-            // but only on the path that is already failing.
-            let actual: Result<String, _> = tx.query_row(
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-                params![tenant_id, resource_type, id],
-                |row| row.get(0),
-            );
-            return match actual {
-                Ok(actual_version) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version: expected_version.to_string(),
-                        actual_version,
-                    },
-                )),
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    Err(StorageError::Resource(ResourceError::NotFound {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                    }))
-                }
-                Err(e) => Err(internal_error(format!(
-                    "Failed to get current version: {}",
-                    e
-                ))),
-            };
-        }
-
-        // Insert into history (preserve the original FHIR version)
-        tx.execute(
-            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
-
-        // Re-index the resource (delete old entries, add new)
-        if let Some(prepared) = prepared {
-            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
-            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
-        }
-
-        tx.commit()
-            .map_err(|e| internal_error(format!("Failed to commit update: {}", e)))?;
-
-        // A SearchParameter write invalidates this tenant's cached registry.
-        if resource_type == "SearchParameter" {
-            self.tenant_registries().invalidate(tenant_id);
-        }
-
-        Ok(StoredResource::from_storage(
-            resource_type,
-            id,
-            new_version_str,
-            tenant.tenant_id().clone(),
-            resource,
-            now,
-            now,
-            None,
-            current.fhir_version(),
-        ))
+        merge_update_meta(current.content(), &mut resource);
+        self.update_verbatim(tenant, current, resource).await
     }
 
     async fn delete(
@@ -1724,6 +1590,158 @@ impl ResourceStorage for SqliteBackend {
             },
         )
         .await
+    }
+}
+
+impl SqliteBackend {
+    /// [`ResourceStorage::update`] without the #2562 merge: `resource` is
+    /// stored exactly as given, so a tag or security label it leaves out is
+    /// removed. For writes that must reproduce a body verbatim — restoring a
+    /// rolled-back bulk-submit update — not for client updates.
+    pub(crate) async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let id = current.id();
+
+        // The expected version is `current`'s, and the UPDATE below only matches
+        // a row that still carries it — so the new version follows from what the
+        // caller already read.
+        let expected_version = current.version_id();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        // Serialize the resource data
+        let data = serde_json::to_vec(&resource)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+
+        // Extract the search values before taking the write lock: it is pure
+        // CPU, and SQLite has one writer.
+        let prepared = (!self.is_search_offloaded())
+            .then(|| self.prepare_index(tenant_id, resource_type, id, &resource));
+
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+        let fhir_version_str = current.fhir_version().as_mime_param();
+
+        // Compare-and-swap, history row and search index in ONE transaction.
+        //
+        // This used to be a `SELECT version_id`, a comparison in Rust, and then
+        // an `UPDATE` with no version in its `WHERE`, each statement
+        // auto-committed on a pooled connection. Two writers holding the same
+        // version on two connections both passed the comparison; the second
+        // `UPDATE` then overwrote the first and committed, and only its history
+        // `INSERT` failed — on `PRIMARY KEY (…, version_id)` — so that writer got
+        // a 500 while its content was already the current row, under a version
+        // whose history entry holds the *winner's* content (#1404).
+        //
+        // The version now rides in the `UPDATE`'s predicate, so the comparison
+        // and the write are one statement; and everything that follows shares
+        // its transaction, so a writer that loses leaves nothing behind.
+        // IMMEDIATE takes the write lock up front, where the busy handler
+        // applies (see `purge_tenant_data`).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin update: {}", e)))?;
+
+        let updated = tx
+            .execute(
+                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
+                 WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
+                   AND version_id = ?7 AND is_deleted = 0",
+                params![
+                    new_version_str,
+                    data,
+                    last_updated,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    expected_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+
+        if updated == 0 {
+            // Matched nothing; which of the two reasons it was costs a query,
+            // but only on the path that is already failing.
+            let actual: Result<String, _> = tx.query_row(
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
+                params![tenant_id, resource_type, id],
+                |row| row.get(0),
+            );
+            return match actual {
+                Ok(actual_version) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected_version.to_string(),
+                        actual_version,
+                    },
+                )),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Err(StorageError::Resource(ResourceError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    }))
+                }
+                Err(e) => Err(internal_error(format!(
+                    "Failed to get current version: {}",
+                    e
+                ))),
+            };
+        }
+
+        // Insert into history (preserve the original FHIR version)
+        tx.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
+        )
+        .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+
+        // Re-index the resource (delete old entries, add new)
+        if let Some(prepared) = prepared {
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &resource, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit update: {}", e)))?;
+
+        // A SearchParameter write invalidates this tenant's cached registry.
+        if resource_type == "SearchParameter" {
+            self.tenant_registries().invalidate(tenant_id);
+        }
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            current.fhir_version(),
+        ))
     }
 }
 

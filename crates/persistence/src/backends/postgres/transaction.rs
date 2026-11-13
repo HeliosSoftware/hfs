@@ -18,7 +18,7 @@ use crate::error::{
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{SearchParameter, StoredResource};
+use crate::types::{SearchParameter, StoredResource, merge_update_meta};
 
 use super::PostgresBackend;
 use super::backend::OverlayFreshness;
@@ -1373,8 +1373,10 @@ impl Transaction for PostgresTransaction {
     async fn update(
         &mut self,
         current: &StoredResource,
-        resource: Value,
+        mut resource: Value,
     ) -> StorageResult<StoredResource> {
+        // Tags and security labels the update leaves out are kept (#2562).
+        merge_update_meta(current.content(), &mut resource);
         self.write_revision(current, resource, false).await
     }
 

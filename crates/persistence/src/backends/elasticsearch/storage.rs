@@ -26,7 +26,7 @@ use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, Res
 use crate::search::reindex_prepare::{PrepareEnv, extract_range, tokio_multi_thread_runtime};
 use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{DatePrecision, StoredResource};
+use crate::types::{DatePrecision, StoredResource, merge_update_meta};
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
@@ -1797,6 +1797,8 @@ impl ResourceStorage for ElasticsearchBackend {
         let fhir_version = current.fhir_version();
 
         let mut resource = resource;
+        // Tags and security labels the update leaves out are kept (#2562).
+        merge_update_meta(current.content(), &mut resource);
         if let Some(obj) = resource.as_object_mut() {
             obj.insert(
                 "resourceType".to_string(),

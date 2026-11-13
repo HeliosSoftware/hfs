@@ -27,7 +27,7 @@ use crate::search::reindex::{ReindexSource, ResourcePage};
 use crate::tenant::{Operation, TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
-    StoredResource,
+    StoredResource, merge_update_meta,
 };
 
 use super::backend::{ResourceLocation, S3Backend};
@@ -1496,6 +1496,10 @@ impl ResourceStorage for S3Backend {
             ));
         }
 
+        // Tags and security labels the update leaves out are kept (#2562),
+        // merged from the version the precondition just matched.
+        let mut resource = resource;
+        merge_update_meta(actual.resource.content(), &mut resource);
         let new_content = self.ensure_resource_shape(resource_type, id, resource);
         let updated = actual
             .resource
