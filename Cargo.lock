@@ -3356,7 +3356,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -3374,7 +3373,6 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
- "time",
  "tracing",
  "zip",
 ]
@@ -3397,11 +3395,8 @@ name = "helios-fhir-macro"
 version = "0.2.8"
 dependencies = [
  "heck",
- "helios-fhirpath-support",
  "proc-macro2",
  "quote",
- "serde",
- "serde_json",
  "syn 2.0.117",
 ]
 
@@ -3425,7 +3420,6 @@ dependencies = [
 name = "helios-fhirpath"
 version = "0.2.8"
 dependencies = [
- "arc-swap",
  "axum",
  "axum-test",
  "base64 0.22.1",
@@ -3445,7 +3439,6 @@ dependencies = [
  "octofhir-ucum",
  "once_cell",
  "parking_lot",
- "rayon",
  "regex",
  "reqwest",
  "roxmltree",
@@ -3660,7 +3653,6 @@ dependencies = [
  "aes 0.8.4",
  "aes-gcm",
  "aes-kw",
- "anyhow",
  "arrow",
  "async-compression",
  "async-trait",
@@ -3752,8 +3744,6 @@ dependencies = [
 name = "helios-sof"
 version = "0.2.8"
 dependencies = [
- "anyhow",
- "arc-swap",
  "arrow",
  "async-trait",
  "axum",

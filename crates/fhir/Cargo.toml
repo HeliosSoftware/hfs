@@ -28,7 +28,6 @@ clap = { version = "4.0", features = ["derive"] }
 helios-fhir-macro = { path = "../fhir-macro", version = "0.2.8" }
 helios-serde-support = { path = "../serde-support", version = "0.2.8" }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.8" }
-time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros
 rust_decimal = { version = "1.0", features = ["serde-with-arbitrary-precision", "macros"] }

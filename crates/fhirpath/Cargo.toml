@@ -26,7 +26,6 @@ helios-fhir = { path = "../fhir", version = "0.2.8", default-features = false }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.8" }
 helios-observability = { path = "../observability", version = "0.2.8" }
 chumsky = "0.10"
-roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions
 rust_decimal = { version = "1.0", features = ["serde-with-float", "macros"] }
 rust_decimal_macros = "1.0"
@@ -40,8 +39,6 @@ hex = "0.4" # For hex encode/decode functions
 octofhir-ucum = { version = "0.5", features = ["fhir"] } # For UCUM unit handling and conversion
 reqwest = { version = "0.12", features = ["json"] } # For terminology server HTTP calls
 httpdate = "1" # Retry-After HTTP-date parsing for terminology rate limits (#1856)
-rayon = "1.8" # For data parallelism
-arc-swap = "1.6" # For lock-free atomic data structures
 parking_lot = "0.12" # For better mutexes than std
 
 # CLI and server dependencies
@@ -55,6 +52,7 @@ tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+roxmltree = "0.20" # XML test-suite parsing (tests/)
 axum-test = "18.0"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
