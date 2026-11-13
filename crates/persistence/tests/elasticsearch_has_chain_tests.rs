@@ -292,8 +292,6 @@ struct Counting<S> {
     reference_calls: Mutex<u64>,
     /// `search_ids` calls (a subset of `searches`).
     id_calls: Mutex<u64>,
-    /// The parameter names of every search, per resource type, in order.
-    searched_params: Mutex<HashMap<String, Vec<Vec<String>>>>,
     /// Answer `Ok(None)` to `search_reference_values`, as before #1753.
     hide_hook: bool,
 }
@@ -305,29 +303,8 @@ impl<S> Counting<S> {
             searches: Mutex::new(HashMap::new()),
             reference_calls: Mutex::new(0),
             id_calls: Mutex::new(0),
-            searched_params: Mutex::new(HashMap::new()),
             hide_hook: false,
         }
-    }
-
-    /// The parameter names of each search of `resource_type`, in order.
-    fn params_searched_on(&self, resource_type: &str) -> Vec<Vec<String>> {
-        self.searched_params
-            .lock()
-            .unwrap()
-            .get(resource_type)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn record(&self, query: &SearchQuery) {
-        self.count(&query.resource_type);
-        self.searched_params
-            .lock()
-            .unwrap()
-            .entry(query.resource_type.clone())
-            .or_default()
-            .push(query.parameters.iter().map(|p| p.name.clone()).collect());
     }
 
     fn without_hook(mut self) -> Self {
@@ -446,7 +423,7 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
-        self.record(query);
+        self.count(&query.resource_type);
         self.inner.search(tenant, query).await
     }
     async fn search_ids(
@@ -454,7 +431,7 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<Page<String>> {
-        self.record(query);
+        self.count(&query.resource_type);
         *self.id_calls.lock().unwrap() += 1;
         self.inner.search_ids(tenant, query).await
     }
@@ -741,6 +718,10 @@ async fn has_resolution_issues_no_source_type_search() {
 /// #2556: a chain whose last step is `_has` reads its `_has` hop through the
 /// aggregation, with no Observation paging:
 /// Observation?subject:Patient._has:Observation:subject:code=<height>.
+///
+/// The chain's base is Observation too, so walking back out from the matched
+/// Patients is one id-only Observation search; the `_has` sources themselves
+/// are never searched.
 #[tokio::test]
 async fn chain_ending_in_has_issues_no_source_type_search() {
     let es = Arc::new(create_backend().await);
@@ -781,17 +762,12 @@ async fn chain_ending_in_has_issues_no_source_type_search() {
         .await
         .expect("resolve the chain ending in _has");
 
-    // Observation is both the `_has` source and the chain's base type here.
-    // The `_has` sources are read through the aggregation, never paged: the
-    // one Observation search is the walk back out from the matched Patients
-    // (`subject=Patient/p1,Patient/p3`), which every forward chain makes for
-    // its first hop — not a `code` search of the sources.
-    assert_eq!(
-        counting.params_searched_on("Observation"),
-        vec![vec!["subject".to_string()]],
-        "no source paging; only the walk back out to the base type"
-    );
     assert_eq!(*counting.reference_calls.lock().unwrap(), 1);
+    // Only the walk back out to the base: no source paging.
+    assert_eq!(counting.searches_of("Observation"), 1, "no source paging");
+    // That walk and the Patient existence check, both id-only.
+    assert_eq!(counting.searches_of("Patient"), 1);
+    assert_eq!(*counting.id_calls.lock().unwrap(), 2);
     let result = counting
         .search(&t, &resolved)
         .await

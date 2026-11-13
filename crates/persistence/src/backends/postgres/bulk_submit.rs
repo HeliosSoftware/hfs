@@ -1626,7 +1626,7 @@ impl PostgresBackend {
                 position += 1;
             }
             let fresh = self
-                .create_fresh_run(txn, manifest_id, &entries[start..position], want_resources)
+                .create_fresh_run(txn, manifest_id, &entries[start..position], options)
                 .await?;
             results.extend(fresh.results);
             changes.extend(fresh.changes);
@@ -1647,7 +1647,7 @@ impl PostgresBackend {
     /// here invalidates the routing snapshot and replays the whole batch
     /// through the individual path.
     ///
-    /// `want_resources` keeps what `create` returns — the resource with the
+    /// `options.wants_committed_resources()` keeps what `create` returns — the resource with the
     /// version and timestamp the flush writes — so an observer that indexes
     /// committed batches (#1127) gets the grouped run's contents exactly as
     /// committed, in input order (#939).
@@ -1656,9 +1656,11 @@ impl PostgresBackend {
         txn: &mut super::transaction::PostgresTransaction,
         manifest_id: &str,
         entries: &[NdjsonEntry],
-        want_resources: bool,
+        options: &BulkProcessingOptions,
     ) -> Result<MixedEntryBatch, MixedAttemptError> {
         use crate::core::Transaction;
+
+        let want_resources = options.wants_committed_resources();
 
         let ranges =
             grouped_fresh_create_ranges(entries).map_err(MixedAttemptError::ReplayWholeBatch)?;
@@ -1668,7 +1670,10 @@ impl PostgresBackend {
         for range in ranges {
             for entry in &entries[range] {
                 let created = txn
-                    .create(&entry.resource_type, entry.resource.clone())
+                    .create(
+                        &entry.resource_type,
+                        options.content_to_write(None, &entry.resource),
+                    )
                     .await
                     .map_err(MixedAttemptError::ReplayWholeBatch)?;
                 results.push(BulkEntryResult::success(
@@ -1881,7 +1886,8 @@ impl PostgresBackend {
                     }
 
                     // Update the resource, honoring the submission's import mode.
-                    let content = options.content_for_update(current.content(), &entry.resource);
+                    let content =
+                        options.content_to_write(Some(current.content()), &entry.resource);
 
                     // Opt-in (#1127): a replayed manifest re-sends byte-identical
                     // resources; writing them again only adds a history version
@@ -1922,7 +1928,10 @@ impl PostgresBackend {
                 }
                 None => {
                     let created = txn
-                        .create(&entry.resource_type, entry.resource.clone())
+                        .create(
+                            &entry.resource_type,
+                            options.content_to_write(None, &entry.resource),
+                        )
                         .await?;
                     let change = SubmissionChange::create(
                         manifest_id,
@@ -1945,7 +1954,10 @@ impl PostgresBackend {
             }
         } else {
             let created = txn
-                .create(&entry.resource_type, entry.resource.clone())
+                .create(
+                    &entry.resource_type,
+                    options.content_to_write(None, &entry.resource),
+                )
                 .await?;
             let change = SubmissionChange::create(
                 manifest_id,

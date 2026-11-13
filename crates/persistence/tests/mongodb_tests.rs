@@ -15730,6 +15730,93 @@ mod bulk_submit {
         .await;
     }
 
+    mod empty_elements_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/empty_elements_contract.rs"
+        ));
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn test_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_merge").await else {
+            return;
+        };
+        empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+            &backend,
+            &create_tenant("submit-empty-merge"),
+        )
+        .await;
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn test_submit_replace_drops_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_replace").await else {
+            return;
+        };
+        empty_elements_contract::replace_import_drops_empty_elements(
+            &backend,
+            &create_tenant("submit-empty-replace"),
+        )
+        .await;
+    }
+
+    /// #2554: a second line for a resource staged earlier in the same batch
+    /// merges onto the staged, already clean content (the `Seen::Staged`
+    /// branch of the MongoDB bulk writer).
+    #[tokio::test]
+    async fn test_submit_merge_onto_a_staged_resource_drops_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_staged").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-empty-staged");
+        let (submission, manifest) = seed(&backend, &tenant).await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient", "id": "ee-staged",
+                            "gender": "male", "name": [{"family": "Doe"}], "telecom": []
+                        }),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient", "id": "ee-staged",
+                            "gender": null, "name": [], "photo": [{}], "active": true
+                        }),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_import_mode(helios_persistence::core::ImportMode::Merge),
+            )
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let mut content = backend
+            .read(&tenant, "Patient", "ee-staged")
+            .await
+            .unwrap()
+            .expect("Patient/ee-staged is stored")
+            .content()
+            .clone();
+        content.as_object_mut().unwrap().remove("meta");
+        assert_eq!(
+            content,
+            json!({"resourceType": "Patient", "id": "ee-staged", "active": true})
+        );
+    }
+
     mod index_pending_contract {
         use helios_persistence as persistence;
         include!(concat!(

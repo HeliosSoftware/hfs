@@ -17,7 +17,7 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    EntryResultCursor, EntryResultPage, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
     PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
     SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
     invalid_entry_result_page,
@@ -1246,13 +1246,30 @@ impl BulkSubmitProvider for SqliteBackend {
                     );
                 }
             }
+            // Extracted from the content a create writes, without its empty
+            // elements (#2554); an update re-extracts from its merged content
+            // anyway. Replace mode never reads the raw submission again, so
+            // it is cleaned in place, without a copy of the batch; merge keeps
+            // it raw for the update arm and extracts from cleaned copies.
+            let candidates: Vec<serde_json::Value> = if options.import_mode == ImportMode::Replace {
+                for e in &mut entries {
+                    crate::core::drop_empty_elements(&mut e.resource);
+                }
+                Vec::new()
+            } else {
+                entries
+                    .iter()
+                    .map(|e| options.content_to_write(None, &e.resource))
+                    .collect()
+            };
             let items: Vec<(&str, &str, &serde_json::Value)> = entries
                 .iter()
-                .map(|e| {
+                .enumerate()
+                .map(|(i, e)| {
                     (
                         e.resource_type.as_str(),
                         e.resource_id.as_deref().unwrap_or(""),
-                        &e.resource,
+                        candidates.get(i).unwrap_or(&e.resource),
                     )
                 })
                 .collect();
@@ -1879,7 +1896,8 @@ impl SqliteBackend {
                     }
 
                     // Update the resource, honoring the submission's import mode.
-                    let content = options.content_for_update(current.content(), &entry.resource);
+                    let content =
+                        options.content_to_write(Some(current.content()), &entry.resource);
 
                     // Opt-in (#1127): a replayed manifest used to rewrite every
                     // byte-identical resource as a new version, doubling the
@@ -1928,7 +1946,12 @@ impl SqliteBackend {
                 // create produced, recorded as this entry's error.
                 None => {
                     let created = txn
-                        .create_prepared(&entry.resource_type, entry.resource, prepared, false)
+                        .create_prepared(
+                            &entry.resource_type,
+                            options.content_to_write_owned(None, entry.resource),
+                            prepared,
+                            false,
+                        )
                         .await?;
                     let change = SubmissionChange::create(
                         manifest_id,
@@ -1951,7 +1974,12 @@ impl SqliteBackend {
             }
         } else {
             let created = txn
-                .create_prepared(&entry.resource_type, entry.resource, prepared, known_absent)
+                .create_prepared(
+                    &entry.resource_type,
+                    options.content_to_write_owned(None, entry.resource),
+                    prepared,
+                    known_absent,
+                )
                 .await?;
             let change = SubmissionChange::create(
                 manifest_id,
