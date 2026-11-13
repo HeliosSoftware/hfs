@@ -763,7 +763,11 @@ async fn chain_ending_in_has_issues_no_source_type_search() {
     // chain (`Observation?subject=Patient/p1,Patient/p3`); it and the Patient
     // existence check are both id-only reads, so no full `search` ran.
     assert_eq!(*counting.reference_calls.lock().unwrap(), 1);
-    assert_eq!(counting.searches_of("Observation"), 1, "only the walk back out");
+    assert_eq!(
+        counting.searches_of("Observation"),
+        1,
+        "only the walk back out"
+    );
     assert_eq!(
         counting.searches_of("Observation") + counting.searches_of("Patient"),
         *counting.id_calls.lock().unwrap(),
