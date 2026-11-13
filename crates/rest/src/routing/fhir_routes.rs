@@ -379,6 +379,35 @@ where
             get(handlers::validate_instance_get_handler::<S>)
                 .post(handlers::validate_instance_post_handler::<S>),
         )
+        // `$meta`, `$meta-add`, `$meta-delete` — before the catch-alls, like
+        // `$validate`. The system/type-level `$meta` summary is refused (4xx),
+        // as the operation definition allows.
+        .route(
+            "/$meta",
+            get(handlers::meta_summary_not_supported_handler)
+                .post(handlers::meta_summary_not_supported_handler),
+        )
+        .route(
+            "/{resource_type}/$meta",
+            get(handlers::meta_summary_not_supported_handler)
+                .post(handlers::meta_summary_not_supported_handler),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta",
+            get(handlers::meta_instance_handler::<S>).post(handlers::meta_instance_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta",
+            get(handlers::meta_version_handler::<S>).post(handlers::meta_version_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-add",
+            post(handlers::meta_add_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-delete",
+            post(handlers::meta_delete_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))

@@ -90,7 +90,7 @@ pub use search_params::{
     SortDirective, SummaryMode, TotalMode, absolute_reference_target, strip_reference_version,
 };
 
-pub use meta_update::merge_update_meta;
+pub use meta_update::{MetaOperation, apply_meta_operation, merge_update_meta};
 pub use stored_resource::{ResourceMeta, ResourceMethod, StoredResource, StoredResourceBuilder};
 
 pub use search_capabilities::{

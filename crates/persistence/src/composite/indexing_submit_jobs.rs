@@ -308,6 +308,15 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.update(tenant, current, resource).await
     }
 
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.inner.update_verbatim(tenant, current, resource).await
+    }
+
     async fn delete(
         &self,
         tenant: &TenantContext,

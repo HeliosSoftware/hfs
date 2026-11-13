@@ -12,6 +12,9 @@
 //! security label the current version holds survives an update whose body
 //! leaves it out. `meta.profile` is not touched: the update's profiles replace
 //! the current ones.
+//!
+//! [`apply_meta_operation`] implements `$meta-add` and `$meta-delete`, the
+//! operations that add and remove labels explicitly.
 
 use serde_json::{Map, Value};
 
@@ -112,6 +115,146 @@ fn coding_key(coding: &Value) -> CodingKey<'_> {
     }
 }
 
+/// Which `$meta` operation [`apply_meta_operation`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaOperation {
+    /// `$meta-add`: add the profiles, tags and security labels not already
+    /// present.
+    Add,
+    /// `$meta-delete`: remove the profiles, tags and security labels named.
+    Delete,
+}
+
+/// Applies a `$meta-add` or `$meta-delete` `meta` to `content`, returning
+/// whether anything changed.
+///
+/// FHIR's `Resource-meta-add` / `Resource-meta-delete` operations: profiles,
+/// tags and security labels are sets. A tag or security label is identified by
+/// `system` + `code`, with `version` and `display` ignored; a profile by its
+/// full canonical URL. Adding one already present and deleting one that is
+/// absent are not errors — they change nothing. A list that a delete empties is
+/// removed, and so is a `meta` left with no members.
+///
+/// # Errors
+///
+/// A description of the problem when `meta` is not a `Meta`-shaped object:
+/// `profile` must be a list of strings, `tag` and `security` lists of objects.
+pub fn apply_meta_operation(
+    content: &mut Value,
+    meta: &Value,
+    operation: MetaOperation,
+) -> Result<bool, String> {
+    let meta = meta
+        .as_object()
+        .ok_or_else(|| "'meta' must be a Meta object".to_string())?;
+    let profiles = list(meta, "profile")?;
+    if let Some(bad) = profiles.iter().find(|p| !p.is_string()) {
+        return Err(format!(
+            "meta.profile entries must be canonical URLs, got {bad}"
+        ));
+    }
+    let tags = list(meta, "tag")?;
+    let security = list(meta, "security")?;
+    for (member, codings) in [("tag", tags), ("security", security)] {
+        if let Some(bad) = codings.iter().find(|c| !c.is_object()) {
+            return Err(format!("meta.{member} entries must be Codings, got {bad}"));
+        }
+    }
+
+    let Some(resource) = content.as_object_mut() else {
+        return Err("the stored resource is not a JSON object".to_string());
+    };
+    let mut changed = false;
+    match operation {
+        MetaOperation::Add => {
+            let target = resource
+                .entry("meta")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(target) = target.as_object_mut() else {
+                return Err("the stored resource's meta is not an object".to_string());
+            };
+            changed |= add_items(target, "profile", profiles, |a, b| a == b);
+            changed |= add_items(target, "tag", tags, same_coding);
+            changed |= add_items(target, "security", security, same_coding);
+        }
+        MetaOperation::Delete => {
+            let Some(target) = resource.get_mut("meta").and_then(Value::as_object_mut) else {
+                return Ok(false);
+            };
+            changed |= delete_items(target, "profile", profiles, |a, b| a == b);
+            changed |= delete_items(target, "tag", tags, same_coding);
+            changed |= delete_items(target, "security", security, same_coding);
+            if target.is_empty() {
+                resource.remove("meta");
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// `meta.<member>` as a slice; absent is empty, anything but a list an error.
+fn list<'a>(meta: &'a Map<String, Value>, member: &str) -> Result<&'a [Value], String> {
+    match meta.get(member) {
+        None => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items),
+        Some(other) => Err(format!("meta.{member} must be a list, got {other}")),
+    }
+}
+
+fn same_coding(a: &Value, b: &Value) -> bool {
+    coding_key(a) == coding_key(b)
+}
+
+fn add_items(
+    meta: &mut Map<String, Value>,
+    member: &str,
+    items: &[Value],
+    same: impl Fn(&Value, &Value) -> bool,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let existing = meta
+        .entry(member)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !existing.is_array() {
+        // A malformed stored list is replaced by the items added.
+        *existing = Value::Array(Vec::new());
+    }
+    let Some(existing) = existing.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for item in items {
+        if !existing.iter().any(|present| same(present, item)) {
+            existing.push(item.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn delete_items(
+    meta: &mut Map<String, Value>,
+    member: &str,
+    items: &[Value],
+    same: impl Fn(&Value, &Value) -> bool,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let Some(existing) = meta.get_mut(member).and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = existing.len();
+    existing.retain(|present| !items.iter().any(|item| same(present, item)));
+    let changed = existing.len() != before;
+    if existing.is_empty() {
+        meta.remove(member);
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +344,106 @@ mod tests {
         let mut incoming = json!({"meta": {"tag": "nonsense"}});
         merge_update_meta(&current, &mut incoming);
         assert_eq!(incoming, json!({"meta": {"tag": "nonsense"}}));
+    }
+
+    #[test]
+    fn meta_add_adds_only_what_is_missing() {
+        let mut content = json!({"resourceType": "Task", "meta": {
+            "versionId": "2",
+            "tag": [tag("a")],
+            "profile": ["http://example.org/p1"]
+        }});
+        let add = json!({
+            "tag": [
+                {"system": "http://example.org/tags", "code": "a", "display": "ignored"},
+                tag("b")
+            ],
+            "security": [{"system": "urn:sec", "code": "R"}],
+            "profile": ["http://example.org/p1", "http://example.org/p2"]
+        });
+        assert_eq!(
+            apply_meta_operation(&mut content, &add, MetaOperation::Add),
+            Ok(true)
+        );
+        assert_eq!(content["meta"]["tag"], json!([tag("a"), tag("b")]));
+        assert_eq!(
+            content["meta"]["security"],
+            json!([{"system": "urn:sec", "code": "R"}])
+        );
+        assert_eq!(
+            content["meta"]["profile"],
+            json!(["http://example.org/p1", "http://example.org/p2"])
+        );
+        assert_eq!(
+            apply_meta_operation(&mut content, &add, MetaOperation::Add),
+            Ok(false),
+            "adding again changes nothing"
+        );
+    }
+
+    #[test]
+    fn meta_add_creates_meta_when_absent() {
+        let mut content = json!({"resourceType": "Task"});
+        let add = json!({"tag": [tag("a")]});
+        assert_eq!(
+            apply_meta_operation(&mut content, &add, MetaOperation::Add),
+            Ok(true)
+        );
+        assert_eq!(content["meta"], json!({"tag": [tag("a")]}));
+    }
+
+    #[test]
+    fn meta_delete_matches_system_and_code_and_drops_emptied_lists() {
+        let mut content = json!({"resourceType": "Task", "meta": {
+            "tag": [
+                {"system": "http://example.org/tags", "code": "a", "display": "Alpha", "version": "1"},
+                tag("b")
+            ],
+            "security": [{"system": "urn:sec", "code": "R"}],
+            "profile": ["http://example.org/p1"]
+        }});
+        let delete = json!({
+            "tag": [tag("a"), tag("missing")],
+            "security": [{"system": "urn:sec", "code": "R", "display": "ignored"}],
+            "profile": ["http://example.org/p1"]
+        });
+        assert_eq!(
+            apply_meta_operation(&mut content, &delete, MetaOperation::Delete),
+            Ok(true)
+        );
+        assert_eq!(content["meta"], json!({"tag": [tag("b")]}));
+
+        let delete = json!({"tag": [tag("b")]});
+        assert_eq!(
+            apply_meta_operation(&mut content, &delete, MetaOperation::Delete),
+            Ok(true)
+        );
+        assert!(content.get("meta").is_none(), "an emptied meta is removed");
+        assert_eq!(
+            apply_meta_operation(&mut content, &delete, MetaOperation::Delete),
+            Ok(false),
+            "deleting what is absent is not an error"
+        );
+    }
+
+    #[test]
+    fn meta_operation_rejects_a_malformed_meta() {
+        let mut content = json!({"resourceType": "Task"});
+        for bad in [
+            json!("x"),
+            json!({"tag": "x"}),
+            json!({"tag": ["x"]}),
+            json!({"profile": [1]}),
+        ] {
+            assert!(
+                apply_meta_operation(&mut content, &bad, MetaOperation::Add).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            content,
+            json!({"resourceType": "Task"}),
+            "nothing was applied"
+        );
     }
 }

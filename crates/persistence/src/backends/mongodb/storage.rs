@@ -3083,7 +3083,16 @@ impl ResourceStorage for MongoBackend {
         // Tags and security labels the update leaves out are kept (#2562).
         let mut resource = resource;
         merge_update_meta(current.content(), &mut resource);
-        self.update_verbatim(tenant, current, resource).await
+        self.store_update(tenant, current, resource).await
+    }
+
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.store_update(tenant, current, resource).await
     }
 
     async fn delete(
@@ -3842,11 +3851,12 @@ impl ResourceStorage for MongoBackend {
 }
 
 impl MongoBackend {
-    /// [`ResourceStorage::update`] without the #2562 merge: `resource` is
-    /// stored exactly as given, so a tag or security label it leaves out is
-    /// removed. For writes that must reproduce a body verbatim — restoring a
-    /// rolled-back bulk-submit update — not for client updates.
-    pub(crate) async fn update_verbatim(
+    /// Stores `resource` as the next version of `current`, exactly as given.
+    ///
+    /// The body of both [`ResourceStorage::update`] (which merges `current`'s
+    /// tags and security labels in first, #2562) and
+    /// [`ResourceStorage::update_verbatim`].
+    async fn store_update(
         &self,
         tenant: &TenantContext,
         current: &StoredResource,

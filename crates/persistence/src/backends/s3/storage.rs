@@ -1461,85 +1461,19 @@ impl ResourceStorage for S3Backend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let resource_type = current.resource_type();
-        tenant.check_permission(Operation::Update, resource_type)?;
-
-        let location = self.resource_location(tenant).await?;
-        let id = current.id();
-        let current_key = location.keyspace.current_resource_key(resource_type, id);
-
-        let Some(actual) = self
-            .load_current_with_meta(tenant, resource_type, id)
-            .await?
-        else {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        };
-
-        if actual.resource.is_deleted() {
-            return Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            }));
-        }
-
-        if actual.resource.version_id() != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: actual.resource.version_id().to_string(),
-                },
-            ));
-        }
-
-        // Tags and security labels the update leaves out are kept (#2562),
-        // merged from the version the precondition just matched.
+        // Tags and security labels the update leaves out are kept (#2562).
         let mut resource = resource;
-        merge_update_meta(actual.resource.content(), &mut resource);
-        let new_content = self.ensure_resource_shape(resource_type, id, resource);
-        let updated = actual
-            .resource
-            .new_version(new_content, ResourceMethod::Put);
+        merge_update_meta(current.content(), &mut resource);
+        self.store_update(tenant, current, resource).await
+    }
 
-        let payload = self.serialize_json(&updated)?;
-        match self
-            .put_json_object(
-                &location.bucket,
-                &current_key,
-                &payload,
-                actual.etag.as_deref(),
-                None,
-            )
-            .await
-        {
-            Ok(_) => {
-                self.put_history_and_indexes(&location, &updated, HistoryMethod::Put)
-                    .await?;
-                self.maybe_reload_search_param_cache(tenant, resource_type, None)
-                    .await;
-                Ok(updated)
-            }
-            Err(StorageError::Backend(BackendError::QueryError { .. })) => {
-                let latest = self
-                    .load_current_with_meta(tenant, resource_type, id)
-                    .await?
-                    .map(|v| v.resource.version_id().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version: current.version_id().to_string(),
-                        actual_version: latest,
-                    },
-                ))
-            }
-            Err(err) => Err(err),
-        }
+    async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.store_update(tenant, current, resource).await
     }
 
     async fn delete(
@@ -1972,6 +1906,96 @@ impl ResourceStorage for S3Backend {
             );
         }
         Ok(removed)
+    }
+}
+
+impl S3Backend {
+    /// Stores `resource` as the next version of `current`, exactly as given.
+    ///
+    /// The body of both [`ResourceStorage::update`] (which merges `current`'s
+    /// tags and security labels in first, #2562) and
+    /// [`ResourceStorage::update_verbatim`].
+    async fn store_update(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let location = self.resource_location(tenant).await?;
+        let id = current.id();
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+
+        let Some(actual) = self
+            .load_current_with_meta(tenant, resource_type, id)
+            .await?
+        else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        if actual.resource.is_deleted() {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        if actual.resource.version_id() != current.version_id() {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: current.version_id().to_string(),
+                    actual_version: actual.resource.version_id().to_string(),
+                },
+            ));
+        }
+
+        let new_content = self.ensure_resource_shape(resource_type, id, resource);
+        let updated = actual
+            .resource
+            .new_version(new_content, ResourceMethod::Put);
+
+        let payload = self.serialize_json(&updated)?;
+        match self
+            .put_json_object(
+                &location.bucket,
+                &current_key,
+                &payload,
+                actual.etag.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.put_history_and_indexes(&location, &updated, HistoryMethod::Put)
+                    .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, None)
+                    .await;
+                Ok(updated)
+            }
+            Err(StorageError::Backend(BackendError::QueryError { .. })) => {
+                let latest = self
+                    .load_current_with_meta(tenant, resource_type, id)
+                    .await?
+                    .map(|v| v.resource.version_id().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: current.version_id().to_string(),
+                        actual_version: latest,
+                    },
+                ))
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
