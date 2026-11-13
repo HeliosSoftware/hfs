@@ -2139,7 +2139,7 @@ impl BulkSubmitRollbackProvider for SqliteBackend {
                         .read(tenant, &change.resource_type, &change.resource_id)
                         .await?;
                     if let Some(current) = current {
-                        self.update(tenant, &current, previous_content.clone())
+                        self.update_verbatim(tenant, &current, previous_content.clone())
                             .await?;
                         Ok(true)
                     } else {

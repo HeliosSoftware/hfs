@@ -1873,7 +1873,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
                     .await?
                 {
                     Some(current) => {
-                        self.update(tenant, &current, previous_content.clone())
+                        self.update_verbatim(tenant, &current, previous_content.clone())
                             .await?;
                         Ok(true)
                     }
