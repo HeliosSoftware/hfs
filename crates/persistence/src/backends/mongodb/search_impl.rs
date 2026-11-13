@@ -848,6 +848,11 @@ fn positive_id_seed(query: &SearchQuery) -> Option<HashSet<String>> {
 /// With `normalized` (the reference backfill is complete, so stored values
 /// carry no `/_history/` suffix) the filter is one exact match and the
 /// `_history` regex arm is dropped.
+///
+/// A membership that [matches nothing](CompartmentMembership::matches_nothing)
+/// gets a filter that matches no row (an empty `param_name` `$in`), never one
+/// that is looser than the membership: callers decide the empty case before
+/// they get here, and this is the backstop (#2509).
 fn compartment_membership_filter(
     tenant_id: &str,
     resource_type: &str,
@@ -855,7 +860,11 @@ fn compartment_membership_filter(
     normalized: bool,
 ) -> Document {
     let base = strip_reference_version(&comp.reference);
-    let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
+    let params: Vec<Bson> = if comp.matches_nothing() {
+        Vec::new()
+    } else {
+        comp.params.iter().cloned().map(Bson::String).collect()
+    };
     let mut filter = doc! {
         "tenant_id": tenant_id,
         "resource_type": resource_type,
@@ -2848,27 +2857,36 @@ impl MongoBackend {
         // parameter names, so it is left out of `distinct_names` — which sends
         // the pipeline down the per-occurrence path below.
         if let Some(comp) = &query.compartment {
-            if !comp.params.is_empty() && !comp.reference.is_empty() {
-                let base = strip_reference_version(&comp.reference);
-                let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-                // `search_index_contained` has no reference index, so only the
-                // completion marker (not index readiness) gates the exact form.
-                if self.references_marker_set() {
-                    branches.push(doc! {
-                        "param_name": { "$in": Bson::Array(params) },
-                        "value_reference": base,
-                    });
-                } else {
-                    branches.push(doc! {
-                        "param_name": { "$in": Bson::Array(params) },
-                        "$or": [
-                            { "value_reference": base },
-                            { "value_reference": {
-                                "$regex": format!("^{}/_history/", regex_escape(base))
-                            }},
-                        ],
-                    });
-                }
+            if comp.matches_nothing() {
+                // No contained resource is a member of a compartment through no
+                // parameter, or of one with no reference. Answered here, after
+                // the criteria above had their say on what they refuse, rather
+                // than by adding no branch: with no criterion at all every
+                // contained resource of the type matches (#2509).
+                return Ok(ContainedPage {
+                    keys: Vec::new(),
+                    total: want_total.then_some(0),
+                });
+            }
+            let base = strip_reference_version(&comp.reference);
+            let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
+            // `search_index_contained` has no reference index, so only the
+            // completion marker (not index readiness) gates the exact form.
+            if self.references_marker_set() {
+                branches.push(doc! {
+                    "param_name": { "$in": Bson::Array(params) },
+                    "value_reference": base,
+                });
+            } else {
+                branches.push(doc! {
+                    "param_name": { "$in": Bson::Array(params) },
+                    "$or": [
+                        { "value_reference": base },
+                        { "value_reference": {
+                            "$regex": format!("^{}/_history/", regex_escape(base))
+                        }},
+                    ],
+                });
             }
         }
         // With no criterion at all, every contained resource of the type
@@ -3886,11 +3904,15 @@ impl MongoBackend {
             }
         }
 
-        let has_compartment = query
-            .compartment
-            .as_ref()
-            .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
-        let compartment = query.compartment.as_ref().filter(|_| has_compartment);
+        // A compartment that matches nothing makes the overall AND certainly
+        // match nothing, exactly like an empty `_id` seed below, and is answered
+        // the same way. It is never read as "no compartment", which would
+        // widen the search to every resource of the type (#2509). Past that
+        // early return, a `Some` compartment is a real membership.
+        let compartment = query.compartment.as_ref();
+        let has_compartment = compartment.is_some();
+        let membership_matches_nothing =
+            compartment.is_some_and(CompartmentMembership::matches_nothing);
 
         // #1528: a positive `_id` parameter names a finite candidate universe
         // — chains, `_has` and `_list` all resolve to one before `search()`
@@ -3900,7 +3922,7 @@ impl MongoBackend {
         // `_id`", and every branch below falls back to today's behavior
         // unchanged in that case.
         let id_seed = positive_id_seed(query);
-        if id_seed.as_ref().is_some_and(HashSet::is_empty) {
+        if membership_matches_nothing || id_seed.as_ref().is_some_and(HashSet::is_empty) {
             // #1528: an empty seed (e.g. disjoint
             // repeated `_id` params) does make the overall AND certainly
             // match nothing, but short-circuiting here — before any sibling
@@ -3980,8 +4002,7 @@ impl MongoBackend {
                     if count < seed.len() as u64 {
                         let members = self
                             .compartment_resource_ids(&search_index, tenant_id, resource_type, comp)
-                            .await?
-                            .unwrap_or_default();
+                            .await?;
                         let confirmed: HashSet<String> =
                             members.into_iter().filter(|id| seed.contains(id)).collect();
                         if confirmed.len() > result_id_cap() {
@@ -4521,10 +4542,14 @@ impl MongoBackend {
         missing_support: &MissingSupport,
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
-        let compartment = query
-            .compartment
-            .as_ref()
-            .filter(|c| !c.params.is_empty() && !c.reference.is_empty());
+        let compartment = query.compartment.as_ref();
+        // `matching_resource_ids` answers a membership that matches nothing
+        // before it gets here; this is the backstop for any other caller. The
+        // membership rows would be none, and the walk below would otherwise
+        // fall through to every live resource of the type (#2509).
+        if compartment.is_some_and(CompartmentMembership::matches_nothing) {
+            return Ok(Some(HashSet::new()));
+        }
         let presence_driver = missing.iter().find(|param| {
             !missing_support.is_resource_parameter(param)
                 && !param
@@ -4658,17 +4683,18 @@ impl MongoBackend {
     /// (mirrors the reference handler): the stored reference must equal the base
     /// reference or carry a `/_history/<vid>` suffix.
     ///
-    /// Returns `Ok(None)` when `comp` carries no params or no reference (no
-    /// restriction to apply), otherwise `Ok(Some(ids))` (possibly empty).
+    /// A `comp` that [matches nothing](CompartmentMembership::matches_nothing)
+    /// has no members, so the answer is the empty set: never "no restriction",
+    /// which a caller would apply by keeping every resource (#2509).
     async fn compartment_resource_ids(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
         comp: &CompartmentMembership,
-    ) -> StorageResult<Option<HashSet<String>>> {
-        if comp.params.is_empty() || comp.reference.is_empty() {
-            return Ok(None);
+    ) -> StorageResult<HashSet<String>> {
+        if comp.matches_nothing() {
+            return Ok(HashSet::new());
         }
 
         let filter = compartment_membership_filter(
@@ -4677,9 +4703,7 @@ impl MongoBackend {
             comp,
             self.references_normalized(),
         );
-        Ok(Some(
-            self.distinct_resource_ids(search_index, filter).await?,
-        ))
+        self.distinct_resource_ids(search_index, filter).await
     }
 
     pub(super) async fn metadata_missing_ids(
@@ -9775,6 +9799,41 @@ mod modifier_parity_filter_tests {
         assert!(
             compartment_membership_filter("t1", "Observation", &comp, false).contains_key("$or")
         );
+    }
+
+    /// #2509: the filter of a membership that matches nothing names no
+    /// parameter, so no row satisfies it — in both reference forms. An empty
+    /// reference with real parameters would otherwise be an exact match on
+    /// `""`, and no parameters would depend on `$in: []` being what the caller
+    /// built.
+    #[test]
+    fn compartment_filter_of_an_empty_membership_matches_no_row() {
+        for (label, comp) in [
+            (
+                "no params",
+                CompartmentMembership {
+                    params: vec![],
+                    reference: "Patient/p1".to_string(),
+                },
+            ),
+            (
+                "empty reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string(), "performer".to_string()],
+                    reference: String::new(),
+                },
+            ),
+            ("neither", CompartmentMembership::default()),
+        ] {
+            for normalized in [true, false] {
+                let filter = compartment_membership_filter("t1", "Observation", &comp, normalized);
+                assert_eq!(
+                    filter.get_document("param_name").unwrap(),
+                    &doc! { "$in": Bson::Array(Vec::new()) },
+                    "{label} (normalized: {normalized})"
+                );
+            }
+        }
     }
 
     /// Each resolved target is matched exactly or at any version — never as a

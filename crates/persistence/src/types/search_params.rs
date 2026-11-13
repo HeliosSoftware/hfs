@@ -778,6 +778,12 @@ pub struct SearchQuery {
     /// (`GET /{compartmentType}/{id}/{targetType}`). Restricts results to
     /// resources that reference the compartment via *any* of the membership
     /// params (OR), per the FHIR CompartmentDefinition.
+    ///
+    /// A `Some` always constrains the query, and it also carries patient-scope
+    /// confinement, so it is a security boundary: a membership with no
+    /// `params`, or with an empty `reference`, matches nothing (see
+    /// [`CompartmentMembership::matches_nothing`]). It is never skipped, which
+    /// would widen the search to every resource of the type.
     pub compartment: Option<CompartmentMembership>,
 
     /// Raw query parameters for debugging.
@@ -800,6 +806,10 @@ pub struct SearchQuery {
 /// A resource is in the compartment if it references `reference` through *any*
 /// of the `params` reference search parameters (logical OR). See
 /// https://hl7.org/fhir/compartmentdefinition.html.
+///
+/// A membership with no `params`, or with an empty `reference`, has no members:
+/// see [`CompartmentMembership::matches_nothing`]. It is a restriction that
+/// matches nothing, never the absence of a restriction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CompartmentMembership {
     /// The membership reference search parameters (e.g. `patient`, `recorder`,
@@ -807,6 +817,22 @@ pub struct CompartmentMembership {
     pub params: Vec<String>,
     /// The compartment reference value, e.g. `Patient/123`.
     pub reference: String,
+}
+
+impl CompartmentMembership {
+    /// Whether this membership can match no resource at all: it names no
+    /// membership parameter, or no compartment reference.
+    ///
+    /// No resource can be a member of a compartment through no parameter, or of
+    /// a compartment that has no reference, so such a membership matches
+    /// nothing. It must never be read as "no compartment restriction": a
+    /// compartment search is also how a request is confined to one patient, and
+    /// skipping the restriction would return every resource of the type. Every
+    /// backend therefore answers an empty membership with zero rows and a
+    /// count of 0, and no error.
+    pub fn matches_nothing(&self) -> bool {
+        self.params.is_empty() || self.reference.is_empty()
+    }
 }
 
 /// Mode for the `_contained` parameter — whether contained resources (nested in
@@ -1451,5 +1477,21 @@ mod tests {
         assert_eq!(t("http://h/patient/p1"), None, "type must be capitalised");
         assert_eq!(t("http://h/Pat_ient/p1"), None);
         assert_eq!(t(&format!("http://h/Patient/{}", "a".repeat(65))), None);
+    }
+
+    /// #2509: a membership with no parameter or no reference can match nothing;
+    /// only one with both is a real restriction.
+    #[test]
+    fn membership_without_params_or_reference_matches_nothing() {
+        let membership = |params: &[&str], reference: &str| CompartmentMembership {
+            params: params.iter().map(|p| p.to_string()).collect(),
+            reference: reference.to_string(),
+        };
+        assert!(membership(&[], "Patient/p1").matches_nothing());
+        assert!(membership(&["patient"], "").matches_nothing());
+        assert!(membership(&[], "").matches_nothing());
+        assert!(CompartmentMembership::default().matches_nothing());
+        assert!(!membership(&["patient"], "Patient/p1").matches_nothing());
+        assert!(!membership(&["subject", "performer"], "Patient/p1").matches_nothing());
     }
 }

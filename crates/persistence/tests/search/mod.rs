@@ -69,6 +69,9 @@ pub mod date_period_suite;
 pub mod date_precision_suite;
 pub mod date_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#2509).
+pub mod empty_compartment_suite;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1380).
 pub mod empty_value_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
@@ -120,6 +123,21 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// A compartment membership with no params or no reference matches nothing,
+/// on every search path, where it used to be read as "no compartment" and
+/// widened the search to every resource of the type (#2509). PostgreSQL,
+/// MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn empty_compartment_membership_matches_nothing() {
+    let backend = make_sqlite_backend();
+    empty_compartment_suite::empty_membership_matches_nothing_on_every_path(
+        &backend,
+        "empty-compartment",
+    )
+    .await;
 }
 
 /// A resource with no value for a sort key sorts after those with one, in

@@ -6025,6 +6025,110 @@ mod es_integration {
         );
     }
 
+    /// #2509: a compartment membership with no params or no reference matches
+    /// nothing. It used to be read as "no compartment", so `search` returned
+    /// every Observation of the type and `search_count` counted them all.
+    #[tokio::test]
+    async fn es_integration_empty_compartment_membership_matches_nothing() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompartmentMembership, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+            TotalMode,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("empty-compartment-2509");
+
+        for (id, patient) in [("obs-p1", "p1"), ("obs-p2", "p2")] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "hr"},
+                        "subject": {"reference": format!("Patient/{patient}")}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let membership = |params: &[&str], reference: &str| {
+            Some(CompartmentMembership {
+                params: params.iter().map(|p| p.to_string()).collect(),
+                reference: reference.to_string(),
+            })
+        };
+        let status_final = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("final")],
+            ..Default::default()
+        };
+
+        // The control first: the real membership holds its member, once the
+        // index has caught up. Without it "returns nothing" would pass on an
+        // index that has not.
+        let mut control = SearchQuery::new("Observation");
+        control.compartment = membership(&["subject", "performer"], "Patient/p1");
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            seen = backend
+                .search(&tenant, &control)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            if seen == ["obs-p1".to_string()] {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(seen, ["obs-p1".to_string()], "the control must find p1's");
+        assert_eq!(backend.search_count(&tenant, &control).await.unwrap(), 1);
+
+        for (label, empty) in [
+            ("no params", membership(&[], "Patient/p1")),
+            ("empty reference", membership(&["subject"], "")),
+            ("neither", membership(&[], "")),
+        ] {
+            for with_parameter in [false, true] {
+                let mut query = SearchQuery::new("Observation");
+                query.compartment = empty.clone();
+                query.total = Some(TotalMode::Accurate);
+                if with_parameter {
+                    query.parameters.push(status_final.clone());
+                }
+                let context = format!("{label}, parameter: {with_parameter}");
+
+                let found = backend.search(&tenant, &query).await.unwrap();
+                assert!(
+                    found.resources.items.is_empty(),
+                    "{context}: search returned {:?}",
+                    found
+                        .resources
+                        .items
+                        .iter()
+                        .map(|r| r.id().to_string())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(found.total, Some(0), "{context}: _total=accurate");
+                assert_eq!(
+                    backend.search_count(&tenant, &query).await.unwrap(),
+                    0,
+                    "{context}: search_count"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn es_integration_search_by_name_multiple() {
         use helios_persistence::core::SearchProvider;

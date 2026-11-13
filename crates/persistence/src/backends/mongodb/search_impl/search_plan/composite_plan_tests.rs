@@ -2317,6 +2317,130 @@ async fn composite_id_page_reads_the_arm_in_id_order() {
     fixture.close().await;
 }
 
+/// #2509: a compartment membership with no params or no reference matches
+/// nothing. It used to be read as "no compartment", so the planner planned from
+/// the remaining parameters alone and the collector returned every resource of
+/// the type (or no id restriction at all).
+#[tokio::test]
+async fn an_empty_compartment_membership_matches_nothing_in_the_planner_and_the_collector() {
+    let Some(fixture) = Fixture::with_probe_timeout("empty-compartment", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    seed_references(&fixture).await;
+    let search_index = fixture.db.collection::<Document>("search_index");
+    let mut excluded = status_final();
+    excluded.modifier = Some(SearchModifier::Not);
+
+    let shapes = [
+        (
+            "no params",
+            CompartmentMembership {
+                params: vec![],
+                reference: "Patient/p1".into(),
+            },
+        ),
+        (
+            "empty reference",
+            CompartmentMembership {
+                params: vec!["subject".into(), "performer".into()],
+                reference: String::new(),
+            },
+        ),
+        ("neither", CompartmentMembership::default()),
+    ];
+    for (label, membership) in shapes {
+        for (name, parameters) in [
+            ("alone", vec![]),
+            ("status=final", vec![status_final()]),
+            ("status:not=final", vec![excluded.clone()]),
+        ] {
+            let context = format!("{label} + {name}");
+            let mut query = SearchQuery::new("Observation");
+            query.parameters = parameters;
+            query.compartment = Some(membership.clone());
+
+            // The planner stays out, whatever the other parameters would have
+            // planned from, and the collector answers with the empty id set.
+            for purpose in [SearchFilterPurpose::Count, SearchFilterPurpose::Page] {
+                let plan = plan_for(&fixture, &query, purpose).await.unwrap();
+                assert_eq!(kind_of(&plan), "none", "{context}");
+            }
+            let collected = fixture
+                .backend
+                .matching_resource_ids(
+                    &fixture.db,
+                    PLAN_TENANT,
+                    "Observation",
+                    &query,
+                    &MissingSupport::none(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                collected.is_some_and(|ids| ids.is_empty()),
+                "{context}: the collector must restrict to no id, not to none at all"
+            );
+
+            // Every read of the real search answers nothing, counts 0.
+            let mut accurate = with_total(query.clone(), TotalMode::Accurate);
+            accurate.count = Some(500);
+            let got = page(&fixture, &accurate).await;
+            assert!(got.ids.is_empty(), "{context}: {:?}", got.ids);
+            assert_eq!(got.total, Some(0), "{context}");
+            assert_eq!(
+                fixture
+                    .backend
+                    .search_count(&fixture.tenant, &query)
+                    .await
+                    .unwrap(),
+                0,
+                "{context}"
+            );
+            for sort in [&["_id"][..], &["-_lastUpdated"][..]] {
+                let mut sorted = with_sort(query.clone(), sort);
+                sorted.count = Some(500);
+                let got = page(&fixture, &sorted).await;
+                assert!(got.ids.is_empty(), "{context} sort={sort:?}: {:?}", got.ids);
+            }
+        }
+
+        // The complement-only collector answers an empty membership with the
+        // empty set too, were it ever reached directly: its membership driver
+        // would otherwise be absent and it would walk every live resource.
+        let mut complement_only = SearchQuery::new("Observation");
+        complement_only.parameters = vec![excluded.clone()];
+        complement_only.compartment = Some(membership.clone());
+        let collected = fixture
+            .backend
+            .matching_resource_ids_complement_only(
+                &fixture.db,
+                &search_index,
+                PLAN_TENANT,
+                "Observation",
+                &[],
+                &[&excluded],
+                &MissingSupport::none(),
+                &complement_only,
+            )
+            .await
+            .unwrap();
+        assert!(
+            collected.is_some_and(|ids| ids.is_empty()),
+            "{label}: complement-only"
+        );
+    }
+
+    // The control: a real membership still returns its members.
+    let mut control = SearchQuery::new("Observation");
+    control.compartment = Some(compartment("Patient/p1"));
+    control.count = Some(500);
+    let mut found = page(&fixture, &control).await.ids;
+    found.sort();
+    assert_eq!(found, ids_where(|n| n.is_multiple_of(40) || n % 40 == 5));
+    fixture.close().await;
+}
+
 /// A composite whose discovery arm was counted within the candidate cap keeps
 /// the grouped page: an ordered read walks `idx_search_composite` over the
 /// whole type to fill one window of a small arm, then falls back anyway.
