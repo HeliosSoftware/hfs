@@ -213,11 +213,11 @@ impl<'a> EsQueryBuilder<'a> {
         // Compartment membership: a resource joins the compartment if it
         // references `comp.reference` via ANY of the membership params (OR),
         // per the FHIR CompartmentDefinition. Modeled as a single nested query
-        // over the stored reference search params.
+        // over the stored reference search params. A membership that matches
+        // nothing still adds its (`match_none`) clause: skipping it would widen
+        // the search to every resource of the type (#2509).
         if let Some(comp) = &query.compartment {
-            if let Some(clause) = Self::build_compartment_clause(comp) {
-                must_clauses.push(clause);
-            }
+            must_clauses.push(Self::build_compartment_clause(comp));
         }
 
         // Build the bool query
@@ -316,11 +316,15 @@ impl<'a> EsQueryBuilder<'a> {
     /// Reference matching is version-agnostic and mirrors the reference
     /// parameter handler: the stored reference must equal the base reference or
     /// carry a `/_history/<vid>` suffix. The membership params come from the
-    /// bundled FHIR `CompartmentDefinition`s. Returns `None` if there are no
-    /// membership params or no reference.
-    fn build_compartment_clause(comp: &CompartmentMembership) -> Option<Value> {
-        if comp.params.is_empty() || comp.reference.is_empty() {
-            return None;
+    /// bundled FHIR `CompartmentDefinition`s.
+    ///
+    /// A membership with no membership params or no reference matches nothing
+    /// ([`CompartmentMembership::matches_nothing`]), so it yields a `match_none`
+    /// clause, never an absent one: dropping the clause would match every
+    /// resource of the type (#2509).
+    fn build_compartment_clause(comp: &CompartmentMembership) -> Value {
+        if comp.matches_nothing() {
+            return date::match_none();
         }
 
         let base = strip_reference_version(&comp.reference);
@@ -333,7 +337,7 @@ impl<'a> EsQueryBuilder<'a> {
             { "term": { "search_params.reference.reference_target": base } }
         ]);
 
-        Some(json!({
+        json!({
             "nested": {
                 "path": "search_params.reference",
                 "query": {
@@ -350,7 +354,7 @@ impl<'a> EsQueryBuilder<'a> {
                     }
                 }
             }
-        }))
+        })
     }
 
     /// Builds a clause for a single search parameter.
@@ -746,11 +750,134 @@ mod tests {
             params: vec!["patient".to_string()],
             reference: "Patient/p1/_history/3".to_string(),
         };
-        let s = serde_json::to_string(&EsQueryBuilder::build_compartment_clause(&comp).unwrap())
-            .unwrap();
+        let s = serde_json::to_string(&EsQueryBuilder::build_compartment_clause(&comp)).unwrap();
         assert!(
             s.contains(r#"{"term":{"search_params.reference.reference_target":"Patient/p1"}}"#)
         );
+    }
+
+    /// #2509: a membership with no params, no reference or neither matches
+    /// nothing. The clause is `match_none`, never absent: an absent clause
+    /// matches every resource of the type.
+    #[test]
+    fn compartment_clause_of_an_empty_membership_matches_nothing() {
+        for (label, comp) in [
+            (
+                "no params",
+                CompartmentMembership {
+                    params: vec![],
+                    reference: "Patient/p1".to_string(),
+                },
+            ),
+            (
+                "empty reference",
+                CompartmentMembership {
+                    params: vec!["patient".to_string()],
+                    reference: String::new(),
+                },
+            ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be a `term` on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["patient".to_string()],
+                    reference: "/_history/1".to_string(),
+                },
+            ),
+            ("neither", CompartmentMembership::default()),
+        ] {
+            assert_eq!(
+                EsQueryBuilder::build_compartment_clause(&comp),
+                json!({ "match_none": {} }),
+                "{label}"
+            );
+        }
+    }
+
+    /// #2509: a real membership is a nested query on the reference parameters,
+    /// not `match_none`.
+    #[test]
+    fn compartment_clause_of_a_real_membership_is_a_nested_query() {
+        let comp = CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        };
+        let clause = EsQueryBuilder::build_compartment_clause(&comp);
+        assert_eq!(clause["nested"]["path"], "search_params.reference");
+        assert_eq!(
+            clause["nested"]["query"]["bool"]["must"][0],
+            json!({ "terms": { "search_params.reference.name": ["subject", "performer"] } })
+        );
+        assert!(clause.get("match_none").is_none());
+    }
+
+    /// #2509: the whole query, the one `search`, `search_ids`, `_contained`
+    /// and the `_count` body all start from, carries the `match_none` clause of
+    /// an empty membership — alone and beside an ordinary parameter, and in
+    /// every `_contained` mode — and a real membership does not.
+    #[test]
+    fn an_empty_compartment_membership_makes_the_whole_query_match_nothing() {
+        let builder =
+            EsQueryBuilder::new("acme", "Observation", "hfs_acme_observation".to_string());
+        let none = json!({ "match_none": {} });
+        let status = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("final")],
+            ..Default::default()
+        };
+        for membership in [
+            CompartmentMembership {
+                params: vec![],
+                reference: "Patient/p1".to_string(),
+            },
+            CompartmentMembership {
+                params: vec!["subject".to_string()],
+                reference: String::new(),
+            },
+            CompartmentMembership {
+                params: vec!["subject".to_string()],
+                reference: "/_history/1".to_string(),
+            },
+            CompartmentMembership::default(),
+        ] {
+            for parameters in [vec![], vec![status.clone()]] {
+                for contained in [
+                    crate::types::ContainedMode::Off,
+                    crate::types::ContainedMode::On,
+                    crate::types::ContainedMode::Both,
+                ] {
+                    let mut query = SearchQuery::new("Observation");
+                    query.parameters = parameters.clone();
+                    query.contained = contained;
+                    query.compartment = Some(membership.clone());
+
+                    let must = builder.build(&query).unwrap().body["query"]["bool"]["must"].clone();
+                    let must = must.as_array().expect("a must clause");
+                    assert!(
+                        must.contains(&none),
+                        "{membership:?} + {} parameter(s), {contained:?}: {must:?}",
+                        parameters.len()
+                    );
+                    let counted = build_count_query("acme", "Observation", &query).unwrap();
+                    assert!(
+                        counted["query"]["bool"]["must"]
+                            .as_array()
+                            .is_some_and(|must| must.contains(&none)),
+                        "{membership:?} count: {counted}"
+                    );
+                }
+            }
+        }
+
+        let mut real = SearchQuery::new("Observation");
+        real.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        let must = builder.build(&real).unwrap().body["query"]["bool"]["must"].clone();
+        assert!(!must.as_array().unwrap().contains(&none), "{must}");
     }
 
     /// Encodes a `Previous` cursor at the given resource ID, used to
