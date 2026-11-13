@@ -17,7 +17,7 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    EntryResultCursor, EntryResultPage, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
     PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
     SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
     invalid_entry_result_page,
@@ -1246,20 +1246,30 @@ impl BulkSubmitProvider for SqliteBackend {
                     );
                 }
             }
-            // Extracted from the content a create writes (#2554); an update
-            // re-extracts from its merged content anyway.
-            let candidates: Vec<serde_json::Value> = entries
-                .iter()
-                .map(|e| options.content_to_write(None, &e.resource))
-                .collect();
+            // Extracted from the content a create writes, without its empty
+            // elements (#2554); an update re-extracts from its merged content
+            // anyway. Replace mode never reads the raw submission again, so
+            // it is cleaned in place, without a copy of the batch; merge keeps
+            // it raw for the update arm and extracts from cleaned copies.
+            let candidates: Vec<serde_json::Value> = if options.import_mode == ImportMode::Replace {
+                for e in &mut entries {
+                    crate::core::drop_empty_elements(&mut e.resource);
+                }
+                Vec::new()
+            } else {
+                entries
+                    .iter()
+                    .map(|e| options.content_to_write(None, &e.resource))
+                    .collect()
+            };
             let items: Vec<(&str, &str, &serde_json::Value)> = entries
                 .iter()
-                .zip(&candidates)
-                .map(|(e, candidate)| {
+                .enumerate()
+                .map(|(i, e)| {
                     (
                         e.resource_type.as_str(),
                         e.resource_id.as_deref().unwrap_or(""),
-                        candidate,
+                        candidates.get(i).unwrap_or(&e.resource),
                     )
                 })
                 .collect();
@@ -1938,7 +1948,7 @@ impl SqliteBackend {
                     let created = txn
                         .create_prepared(
                             &entry.resource_type,
-                            options.content_to_write(None, &entry.resource),
+                            options.content_to_write_owned(None, entry.resource),
                             prepared,
                             false,
                         )
@@ -1966,7 +1976,7 @@ impl SqliteBackend {
             let created = txn
                 .create_prepared(
                     &entry.resource_type,
-                    options.content_to_write(None, &entry.resource),
+                    options.content_to_write_owned(None, entry.resource),
                     prepared,
                     known_absent,
                 )

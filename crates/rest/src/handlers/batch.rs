@@ -25,8 +25,7 @@ use helios_persistence::core::{
     EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
     RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
     apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
-    decode_bundle_patch_resource, delete_under_precondition, drop_empty_elements,
-    precondition_failed_entry,
+    decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
@@ -737,7 +736,7 @@ where
     // Admit every mutation before reference resolution, configurable
     // validation, or storage. A transaction with one invalid write is declined
     // whole, so none of its otherwise valid siblings can commit or delete.
-    for (index, entry, _, _) in &mut parsed_entries {
+    for (index, entry, _, _) in &parsed_entries {
         if !matches!(
             entry.method,
             BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
@@ -760,13 +759,6 @@ where
             },
             other => other,
         })?;
-        // FHIR JSON has no empty objects, empty arrays or null members
-        // (#2554); a PATCH entry's document is not stored, its result is.
-        if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
-            && let Some(resource) = entry.resource.as_mut()
-        {
-            drop_empty_elements(resource);
-        }
     }
 
     // GET entries other than an instance read (searches such as
@@ -843,13 +835,15 @@ where
     // above, and their query strings are searches, not conditional references.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
-    // Write-path validation: transactions are atomic, so any invalid write
-    // entry rejects the whole bundle before anything executes.
-    for (index, entry, _) in &indexed_entries {
+    // Empty-element cleanup (#2554) and write-path validation: transactions
+    // are atomic, so any invalid write entry rejects the whole bundle before
+    // anything executes. A PATCH entry's document is not stored; its result
+    // is cleaned by the patch engine.
+    for (index, entry, _) in &mut indexed_entries {
         if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
             continue;
         }
-        let Some(resource) = &entry.resource else {
+        let Some(resource) = entry.resource.as_mut() else {
             continue;
         };
         let (resource_type, _) =
@@ -858,7 +852,7 @@ where
             })?;
         state
             .validation()
-            .check_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
+            .prepare_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
             .await?;
     }
 
@@ -1500,8 +1494,6 @@ where
             {
                 return entry_failure(error);
             }
-            // FHIR JSON has no empty objects, empty arrays or null members (#2554).
-            drop_empty_elements(&mut resource);
 
             // Write-path validation (per-entry outcome in batch semantics).
             //
@@ -1512,7 +1504,12 @@ where
             // `processing`, which is the lossiest case in #504.
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);
@@ -1614,8 +1611,6 @@ where
             {
                 return entry_failure(error);
             }
-            // FHIR JSON has no empty objects, empty arrays or null members (#2554).
-            drop_empty_elements(&mut resource);
 
             // Conditional update, mirroring `conditional_update_handler`:
             // upsert, so no match creates (201) and one match updates (200).
@@ -1633,7 +1628,12 @@ where
 
                 if let Err(e) = state
                     .validation()
-                    .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                    .prepare_write(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        &resource_type,
+                        &mut resource,
+                    )
                     .await
                 {
                     // Same funnel as the unconditional PUT below: the
@@ -1734,7 +1734,12 @@ where
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);

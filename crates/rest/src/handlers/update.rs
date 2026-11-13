@@ -8,9 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{
-    ConditionalStorage, ResourceStorage, SearchProvider, WriteKind, drop_empty_elements,
-};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -77,8 +75,6 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
-    // FHIR JSON has no empty objects, empty arrays or null members (#2554).
-    drop_empty_elements(&mut resource);
 
     // A `patient/` scope updates inside the launch patient's compartment only
     // (#1618). Both ends are checked: the submitted payload must stay in the
@@ -149,10 +145,16 @@ where
         });
     }
 
-    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    // Empty-element cleanup (#2554) and write-path validation
+    // (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
-        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .prepare_write(
+            tenant.tenant_id(),
+            fhir_version,
+            &resource_type,
+            &mut resource,
+        )
         .await?;
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
@@ -408,8 +410,6 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
-    // FHIR JSON has no empty objects, empty arrays or null members (#2554).
-    drop_empty_elements(&mut resource);
 
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
@@ -437,10 +437,16 @@ where
         "Processing conditional update request"
     );
 
-    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    // Empty-element cleanup (#2554) and write-path validation
+    // (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
-        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .prepare_write(
+            tenant.tenant_id(),
+            fhir_version,
+            &resource_type,
+            &mut resource,
+        )
         .await?;
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.

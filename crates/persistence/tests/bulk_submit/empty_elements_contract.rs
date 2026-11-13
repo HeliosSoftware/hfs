@@ -73,8 +73,8 @@ async fn ingest<B: BulkSubmitProvider>(
 }
 
 /// Merge mode, in one batch that updates a stored resource and creates two:
-/// `null` removes the stored element, `[]` clears it, omitted elements remain,
-/// and the new resources (with and without an id) are written clean.
+/// `null` and `""` remove the stored element, `[]` clears it, omitted elements
+/// remain, and the new resources (with and without an id) are written clean.
 pub async fn merge_import_applies_the_mode_before_dropping_empty_elements<B>(
     backend: &B,
     tenant: &TenantContext,
@@ -99,7 +99,8 @@ pub async fn merge_import_applies_the_mode_before_dropping_empty_elements<B>(
         vec![
             json!({
                 "resourceType": "Patient", "id": "ee-merge",
-                "telecom": null, "name": [], "address": [{}], "active": true
+                "telecom": null, "name": [], "address": [{}], "active": true,
+                "birthDate": ""
             }),
             json!({
                 "resourceType": "Patient", "id": "ee-merge-new",
@@ -115,7 +116,7 @@ pub async fn merge_import_applies_the_mode_before_dropping_empty_elements<B>(
         stored(backend, tenant, "ee-merge").await,
         json!({
             "resourceType": "Patient", "id": "ee-merge", "gender": "female",
-            "birthDate": "1970-01-01", "active": true
+            "active": true
         })
     );
     assert_eq!(
@@ -152,7 +153,8 @@ where
             }),
             json!({
                 "resourceType": "Patient", "id": "ee-replace-new",
-                "active": true, "name": [{"family": "Doe", "given": ["Ann", null]}]
+                "active": true, "gender": "",
+                "name": [{"family": "Doe", "given": ["Ann", null, ""], "text": ""}]
             }),
         ],
         &BulkProcessingOptions::new(),

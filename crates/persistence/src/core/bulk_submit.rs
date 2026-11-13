@@ -1240,11 +1240,13 @@ impl BulkProcessingOptions {
 
     /// Resolves the content to write for a submitted resource: [`Self::import_mode`]
     /// applied onto `stored` when the resource already exists, then empty objects,
-    /// empty arrays and `null` members removed (#2554).
+    /// empty arrays, empty strings and `null` members removed (#2554).
     ///
     /// The submission is not cleaned before the mode is applied: under
     /// [`ImportMode::Merge`] a `null` member removes the stored element and an empty
     /// array replaces the stored one, and cleaning first would drop both requests.
+    /// An empty string is merged in the same way, so it also removes the stored
+    /// value.
     pub fn content_to_write(&self, stored: Option<&Value>, submitted: &Value) -> Value {
         let mut content = match (stored, self.import_mode) {
             (Some(stored), ImportMode::Merge) => merge_resource(stored, submitted),
@@ -1252,6 +1254,22 @@ impl BulkProcessingOptions {
         };
         super::drop_empty_elements(&mut content);
         content
+    }
+
+    /// [`Self::content_to_write`] for a resource the caller owns: a new
+    /// resource is cleaned in place, without a clone.
+    pub fn content_to_write_owned(&self, stored: Option<&Value>, mut submitted: Value) -> Value {
+        match (stored, self.import_mode) {
+            (Some(stored), ImportMode::Merge) => {
+                let mut content = merge_resource(stored, &submitted);
+                super::drop_empty_elements(&mut content);
+                content
+            }
+            _ => {
+                super::drop_empty_elements(&mut submitted);
+                submitted
+            }
+        }
     }
 
     /// Creates options for strict processing (no errors allowed).

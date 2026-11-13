@@ -2,7 +2,8 @@
 //! (#2554).
 //!
 //! FHIR's JSON format has no empty values: an object is never `{}`, an array
-//! is never `[]`, and a property is never `null`. The one `null` it allows is
+//! is never `[]`, a string is never `""`, and a property is never `null`. The
+//! one `null` it allows is
 //! a placeholder in a primitive array, lining a value up with its extensions
 //! in the `_name` array beside it:
 //!
@@ -14,20 +15,34 @@
 //! [`drop_empty_elements`] removes those empty representations bottom up, as
 //! HAPI's parser does, while keeping each primitive value with its
 //! extensions: `{"type": [{"coding": []}]}` loses `coding`, then the emptied
-//! item, then `type` itself. It does nothing else: empty strings, unknown
-//! elements, cardinality, profiles and invariants are left to validation.
+//! item, then `type` itself. An empty string is an empty value too: `"gender":
+//! ""` is removed, and `""` in a primitive array becomes a placeholder slot
+//! (kept only when its `_name` slot has an extension). It does nothing else:
+//! whitespace-only strings, unknown elements, cardinality, profiles and
+//! invariants are left to validation.
 //!
 //! It is applied on these write paths: the REST create, update and
 //! conditional update bodies, batch and transaction `POST`/`PUT` entry
 //! resources, every PATCH result (instance, conditional, batch and
 //! transaction), and each `$bulk-submit` resource as written, after its
 //! import mode is applied. Writes that call a storage backend directly are
-//! not covered.
+//! not covered. On the REST paths it runs through
+//! `helios_rest::validation::ValidationService::prepare_write`, which cleans
+//! before validation, except under `HFS_VALIDATION_MODE=enforce`, where the
+//! raw body is validated first, so a client that opted into strict checking
+//! still gets its `ele-1` errors, and is cleaned only once it passes.
+//!
+//! Resources stored before this normalisation existed are not migrated: a
+//! resource already holding an empty element keeps it until its next write.
+//! An update, a PATCH or a `$bulk-submit` of that resource stores the cleaned
+//! content (a PATCH cleans the whole result, not just what it touched), and
+//! a skip-unchanged bulk replay sees the cleaned candidate differ from the
+//! stored copy and writes a new version once.
 
 use serde_json::{Map, Value};
 
-/// Removes every empty object, empty array and `null` member from `value`,
-/// keeping primitive-array placeholders.
+/// Removes every empty object, empty array, empty string and `null` member
+/// from `value`, keeping primitive-array placeholders.
 ///
 /// A primitive array `name` and its `_name` array are one sequence of
 /// (value, extension) slots, the shorter array padded with implicit `null`s
@@ -128,6 +143,7 @@ fn is_empty(value: &Value) -> bool {
         Value::Null => true,
         Value::Object(object) => object.is_empty(),
         Value::Array(items) => items.is_empty(),
+        Value::String(text) => text.is_empty(),
         _ => false,
     }
 }
@@ -180,7 +196,7 @@ mod tests {
             "name": [{}, {"family": "Doe", "given": []}, null],
             "active": false,
             "multipleBirthInteger": 0,
-            "gender": ""
+            "gender": " "
         });
         assert_eq!(
             cleaned(resource),
@@ -189,7 +205,7 @@ mod tests {
                 "name": [{"family": "Doe"}],
                 "active": false,
                 "multipleBirthInteger": 0,
-                "gender": ""
+                "gender": " "
             })
         );
     }
@@ -403,6 +419,57 @@ mod tests {
                 "contained": [{"resourceType": "Patient", "id": "p"}],
                 "status": "final"
             })
+        );
+    }
+
+    #[test]
+    fn empty_strings_are_removed_bottom_up() {
+        let resource = json!({
+            "resourceType": "Patient",
+            "gender": "",
+            "active": true,
+            "name": [{"family": "", "text": "Ann"}, {"family": ""}],
+            "telecom": [{"system": "phone", "value": ""}],
+            "identifier": [{"system": "urn:x", "value": "1"}, ""]
+        });
+        assert_eq!(
+            cleaned(resource),
+            json!({
+                "resourceType": "Patient",
+                "active": true,
+                "name": [{"text": "Ann"}],
+                "telecom": [{"system": "phone"}],
+                "identifier": [{"system": "urn:x", "value": "1"}]
+            })
+        );
+    }
+
+    /// `""` in a primitive array is an empty slot: it stays as a `null`
+    /// placeholder when its `_name` slot has an extension, and goes otherwise.
+    #[test]
+    fn an_empty_string_in_a_primitive_array_is_an_empty_slot() {
+        let extension = json!({"extension": [{"url": "http://example.org/x", "valueString": "y"}]});
+        let resource = json!({
+            "resourceType": "Patient",
+            "name": [{"given": ["", "Ann", ""], "_given": [extension, null]}]
+        });
+        assert_eq!(
+            cleaned(resource),
+            json!({
+                "resourceType": "Patient",
+                "name": [{"given": [null, "Ann"], "_given": [extension, null]}]
+            })
+        );
+    }
+
+    /// An empty singular value with an extension keeps the extension only.
+    #[test]
+    fn an_empty_string_value_keeps_its_extension() {
+        let extension = json!({"extension": [{"url": "http://example.org/x", "valueString": "y"}]});
+        let resource = json!({"resourceType": "Patient", "gender": "", "_gender": extension});
+        assert_eq!(
+            cleaned(resource),
+            json!({"resourceType": "Patient", "_gender": extension})
         );
     }
 

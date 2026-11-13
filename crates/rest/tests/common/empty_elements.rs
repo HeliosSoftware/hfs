@@ -1,8 +1,8 @@
 //! Scenarios for #2554: the REST write paths (create, update, conditional
 //! create and update, instance and conditional PATCH, batch and transaction
 //! POST/PUT/PATCH entries) store a resource without its empty objects, empty
-//! arrays and null members, and keep the `null` placeholders of primitive
-//! arrays.
+//! arrays, empty strings and null members, and keep the `null` placeholders
+//! of primitive arrays.
 //!
 //! Shared by `empty_elements_on_write.rs` (SQLite) and its MongoDB and
 //! PostgreSQL twins. Each scenario takes a server whose tenant routing is
@@ -32,11 +32,12 @@ fn plan_with_empties(identifier: &str) -> Value {
         "resourceType": "InsurancePlan",
         "identifier": [{"system": "urn:test:2554", "value": identifier}],
         "status": "active",
+        "language": "",
         "type": [{}],
         "alias": [],
         "period": {},
         "name": null,
-        "contact": [{"name": {"given": []}, "telecom": [null]}],
+        "contact": [{"name": {"given": [], "family": ""}, "telecom": [null, {"value": ""}]}],
         "coverage": [{"type": {"coding": []}, "benefit": [{"type": {"text": "visit"}, "requirement": null}]}]
     })
 }
@@ -336,7 +337,7 @@ pub async fn primitive_placeholders_are_kept(server: &TestServer) {
         "id": "p-2554",
         "name": [{
             "family": "Doe",
-            "given": [null, "Ann", null],
+            "given": [null, "Ann", ""],
             "_given": [{}, null, extension]
         }]
     });
