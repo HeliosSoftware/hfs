@@ -368,6 +368,11 @@ impl QueryAnalyzer {
                 .entry(QueryFeature::ChainedSearch)
                 .or_default()
                 .push(param.clone());
+            // A chain that ends in `_has` needs reverse chaining too. The
+            // parameter is routed once, as the chained search it is.
+            if param.chain.last().is_some_and(|hop| hop.has.is_some()) {
+                analysis.features.insert(QueryFeature::ReverseChaining);
+            }
         }
 
         // Check for terminology modifiers
@@ -533,12 +538,52 @@ mod tests {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         });
 
         let features = detect_query_features(&query);
         assert!(features.contains(&QueryFeature::ChainedSearch));
+        assert!(!features.contains(&QueryFeature::ReverseChaining));
+    }
+
+    /// #2556: a chain that ends in `_has` needs both capabilities.
+    #[test]
+    fn test_detect_chain_ending_in_has() {
+        let query = SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "patient".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![],
+            chain: vec![ChainedParameter {
+                reference_param: "patient".to_string(),
+                target_type: None,
+                target_param: "_has".to_string(),
+                has: Some(Box::new(crate::types::ReverseChainedParameter::terminal(
+                    "Group",
+                    "member",
+                    "_id",
+                    SearchValue::eq("102"),
+                ))),
+            }],
+            components: vec![],
+        });
+
+        let analysis = QueryAnalyzer::new().analyze(&query);
+        assert!(analysis.features.contains(&QueryFeature::ChainedSearch));
+        assert!(analysis.features.contains(&QueryFeature::ReverseChaining));
+        assert!(
+            analysis
+                .required_capabilities
+                .contains(&BackendCapability::ReverseChaining)
+        );
+        // Routed once, as the chained search it is.
+        assert!(
+            !analysis
+                .specialized_features
+                .contains(&QueryFeature::ReverseChaining)
+        );
     }
 
     #[test]
@@ -649,6 +694,7 @@ mod tests {
                     reference_param: "subject".to_string(),
                     target_type: Some("Patient".to_string()),
                     target_param: "name".to_string(),
+                    has: None,
                 }],
                 components: vec![],
             })

@@ -4,10 +4,11 @@
 
 use serde_json::{Value, json};
 
+use crate::error::SearchError;
 use crate::types::{
     CompartmentMembership, CursorDirection, PageCursor, SearchModifier, SearchParamType,
-    SearchParameter, SearchPrefix, SearchQuery, SortDirection, SortDirective, TotalMode,
-    strip_reference_version,
+    SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirection, SortDirective,
+    TotalMode, strip_reference_version,
 };
 
 /// Upper bound on hits counted for `_total=estimate`; beyond it Elasticsearch
@@ -80,10 +81,40 @@ fn es_order(direction: SortDirection, paging: CursorDirection) -> &'static str {
     if ascending { "asc" } else { "desc" }
 }
 
+/// The refusal for a parameter [`EsQueryBuilder::build`] has values for but no
+/// clause to build from (#2510): a `special`-typed parameter (`Location.near`,
+/// `_type` on R5/R6, `_filter`), which no handler evaluates and nothing
+/// indexes. Skipped, it would leave the query with fewer clauses than were
+/// asked for — with none at all, a `bool` of filters only, which matches every
+/// document of the tenant and type.
+fn unevaluable_parameter(param: &SearchParameter, resource_type: &str) -> SearchError {
+    SearchError::QueryParseError {
+        message: format!(
+            "search parameter '{}' cannot be evaluated by the Elasticsearch backend: no clause \
+             can be built for it, and ignoring it would widen the search to every {resource_type}",
+            param.name
+        ),
+    }
+}
+
+/// The refusal for one value of a parameter that no clause can be built for
+/// while its siblings have one (#2510). Left out of the OR it would change the
+/// question: under `:not`, `NOT (a OR b)` would become `NOT a`, a wider answer;
+/// without it, `a OR b` would become `a`, a different one.
+fn unevaluable_value(param: &SearchParameter, value: &str) -> SearchError {
+    SearchError::QueryParseError {
+        message: format!(
+            "search parameter '{}' cannot be evaluated by the Elasticsearch backend: no clause \
+             can be built for the value '{value}', and leaving it out would answer a different \
+             search than the one asked",
+            param.name
+        ),
+    }
+}
+
 /// Builds Elasticsearch queries from FHIR search queries.
 pub struct EsQueryBuilder<'a> {
     tenant_id: &'a str,
-    #[allow(dead_code)]
     resource_type: &'a str,
     index: String,
     /// The index's `index.max_result_window` setting, used to clamp the
@@ -124,7 +155,17 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a complete ES query from a FHIR SearchQuery.
-    pub fn build(&self, query: &SearchQuery) -> EsQuery {
+    ///
+    /// A parameter that carries values but yields no clause is an error
+    /// naming it (#2510), never a skipped term: with no `must` clause left the
+    /// `bool` query matches every document of the tenant and type. That covers
+    /// a parameter nothing can evaluate (a `special`-typed one) and a value of
+    /// a parameter that no clause can be built for (see
+    /// [`Self::build_parameter_clause`]). A parameter with no values asks for
+    /// nothing and is skipped. Every caller must propagate the error: `search`,
+    /// `search_ids`, `search_reference_values`, the `_contained` keys and the
+    /// `_count` body all build through here.
+    pub fn build(&self, query: &SearchQuery) -> Result<EsQuery, SearchError> {
         let mut must_clauses: Vec<Value> = Vec::new();
         let mut filter_clauses: Vec<Value> = vec![
             json!({ "term": { "tenant_id": self.tenant_id } }),
@@ -158,8 +199,14 @@ impl<'a> EsQueryBuilder<'a> {
 
         // Process each search parameter
         for param in &query.parameters {
-            if let Some(clause) = self.build_parameter_clause(param) {
-                must_clauses.push(clause);
+            match self.build_parameter_clause(param)? {
+                Some(clause) => must_clauses.push(clause),
+                // Nothing was asked for, so nothing is constrained.
+                None if param.values.is_empty() => {}
+                // Something was asked for and cannot be answered. Answering
+                // anyway, without it, would be a wider question than the one
+                // asked (#2510).
+                None => return Err(unevaluable_parameter(param, self.resource_type)),
             }
         }
 
@@ -255,11 +302,11 @@ impl<'a> EsQueryBuilder<'a> {
         source_fields.push("is_deleted");
         body["_source"] = json!(source_fields);
 
-        EsQuery {
+        Ok(EsQuery {
             body,
             index: self.index.clone(),
             over_fetched,
-        }
+        })
     }
 
     /// Builds a nested clause matching resources that reference
@@ -307,41 +354,78 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a clause for a single search parameter.
-    fn build_parameter_clause(&self, param: &SearchParameter) -> Option<Value> {
+    ///
+    /// `Ok(None)` means the parameter yields no clause at all — it has no
+    /// values, or no value of it has a clause (a `special`-typed parameter);
+    /// [`Self::build`] tells the two apart. `Err` is a parameter some of whose
+    /// values have a clause and others do not: the ones without cannot be left
+    /// out of the OR (#2510), see [`Self::or_of_values`].
+    fn build_parameter_clause(
+        &self,
+        param: &SearchParameter,
+    ) -> Result<Option<Value>, SearchError> {
         // Presence is independent of the parameter's ordinary value syntax.
         // Resolve it before `_id` and `_lastUpdated`, which would otherwise
         // interpret the boolean literal as an ID or date value.
         if param.modifier == Some(SearchModifier::Missing) {
-            return modifier_handlers::build_missing_clause(param);
+            return Ok(modifier_handlers::build_missing_clause(param));
         }
 
         // Defence in depth behind `validate_value_presence` (#1380): an empty
         // value is a prefix of every string, so it matches nothing here rather
         // than whatever the handler below would make of it — the whole
         // parameter, since under `:not` "nothing" negates into "everything".
-        // `match_none`, never `None`: a `None` drops the constraint.
+        // `match_none`, never `None`: the builder refuses a value with no clause
+        // (#2510), and used to drop the constraint instead.
         if crate::search::has_empty_value(param) {
-            return Some(date::match_none());
+            return Ok(Some(date::match_none()));
         }
 
-        // Handle special parameters
+        // Handle special parameters. Each returns `None` only for a parameter
+        // with no values.
         match param.name.as_str() {
-            "_id" => return self.build_id_clause(param),
-            "_lastUpdated" => return self.build_last_updated_clause(param),
-            "_text" => return fts::build_text_clause(param),
-            "_content" => return fts::build_content_clause(param),
+            "_id" => return Ok(self.build_id_clause(param)),
+            "_lastUpdated" => return Ok(self.build_last_updated_clause(param)),
+            "_text" => return Ok(fts::build_text_clause(param)),
+            "_content" => return Ok(fts::build_content_clause(param)),
             _ => {}
         }
 
         // Dispatch based on parameter type
-        let clauses: Vec<Value> = param
-            .values
-            .iter()
-            .filter_map(|value| self.build_value_clause(param, &value.value, value.prefix))
-            .collect();
+        Self::or_of_values(param, |value| {
+            self.build_value_clause(param, &value.value, value.prefix)
+        })
+    }
+
+    /// ORs the clause `clause_for` builds for each value of `param`, negated
+    /// as a whole under `:not`.
+    ///
+    /// A value `clause_for` builds nothing for is never dropped from the OR
+    /// (#2510): left out, `:not=a,b` would be `NOT a` and the search would
+    /// widen, and `a,b` would be `a` and answer a different question. When
+    /// every value lacks a clause the result is `Ok(None)` — the parameter is
+    /// not evaluable, which [`Self::build`] refuses by name — and when only
+    /// some do it is an error naming the first of them.
+    fn or_of_values(
+        param: &SearchParameter,
+        clause_for: impl Fn(&SearchValue) -> Option<Value>,
+    ) -> Result<Option<Value>, SearchError> {
+        let mut clauses: Vec<Value> = Vec::with_capacity(param.values.len());
+        let mut first_without: Option<&SearchValue> = None;
+        for value in &param.values {
+            match clause_for(value) {
+                Some(clause) => clauses.push(clause),
+                None => {
+                    first_without.get_or_insert(value);
+                }
+            }
+        }
 
         if clauses.is_empty() {
-            return None;
+            return Ok(None);
+        }
+        if let Some(value) = first_without {
+            return Err(unevaluable_value(param, &value.value));
         }
 
         // Multiple values for the same parameter are ORed
@@ -364,13 +448,18 @@ impl<'a> EsQueryBuilder<'a> {
         // clause matches when *some* indexed value matches, so its negation
         // covers resources with no value for the parameter at all.
         if matches!(param.modifier, Some(SearchModifier::Not)) {
-            return Some(json!({ "bool": { "must_not": [combined] } }));
+            return Ok(Some(json!({ "bool": { "must_not": [combined] } })));
         }
 
-        Some(combined)
+        Ok(Some(combined))
     }
 
     /// Builds a clause for a single value of a parameter.
+    ///
+    /// `None` is "no clause can be built for this value", never "matches
+    /// nothing" or "no constraint": [`Self::or_of_values`] refuses a parameter
+    /// over it (#2510). A value that is to match nothing says so with
+    /// [`date::match_none`].
     fn build_value_clause(
         &self,
         param: &SearchParameter,
@@ -630,17 +719,24 @@ impl<'a> EsQueryBuilder<'a> {
 /// `with_max_terms_count`, so a very large resolved id set (for example a `_has`
 /// over a big reverse chain) is not chunked here and can exceed the cluster's
 /// `index.max_terms_count` on `_total=accurate`.
-pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQuery) -> Value {
+///
+/// Refuses what [`EsQueryBuilder::build`] refuses (#2510): a count over a
+/// dropped parameter would be the size of the whole type.
+pub fn build_count_query(
+    tenant_id: &str,
+    resource_type: &str,
+    query: &SearchQuery,
+) -> Result<Value, SearchError> {
     let builder = EsQueryBuilder::new(tenant_id, resource_type, String::new());
-    let mut es_query = builder.build(query);
+    let mut es_query = builder.build(query)?;
 
-    json!({ "query": es_query.body["query"].take() })
+    Ok(json!({ "query": es_query.body["query"].take() }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CursorValue, SearchValue, SortDirection};
+    use crate::types::{CursorValue, SortDirection};
 
     /// #2394: compartment membership also matches absolute references through
     /// the stored `Type/id`.
@@ -672,7 +768,7 @@ mod tests {
     #[test]
     fn build_requests_only_the_fields_the_parser_reads() {
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&SearchQuery::new("Patient"));
+        let es_query = builder.build(&SearchQuery::new("Patient")).unwrap();
 
         let mut expected: Vec<&str> = HIT_SOURCE_FIELDS.to_vec();
         expected.push("is_deleted");
@@ -684,7 +780,7 @@ mod tests {
 
     #[test]
     fn count_query_carries_only_the_query() {
-        let body = build_count_query("acme", "Patient", &SearchQuery::new("Patient"));
+        let body = build_count_query("acme", "Patient", &SearchQuery::new("Patient")).unwrap();
         let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
         assert_eq!(keys, vec!["query"]);
     }
@@ -693,7 +789,7 @@ mod tests {
     fn test_basic_query_build() {
         let query = SearchQuery::new("Patient");
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         // Should have tenant and is_deleted filters
         let filters = &es_query.body["query"]["bool"]["filter"];
@@ -716,14 +812,14 @@ mod tests {
         };
 
         let blind = SearchQuery::new("Patient");
-        assert!(version_terms(&builder.build(&blind).body).is_empty());
-        assert!(version_terms(&build_count_query("acme", "Patient", &blind)).is_empty());
+        assert!(version_terms(&builder.build(&blind).unwrap().body).is_empty());
+        assert!(version_terms(&build_count_query("acme", "Patient", &blind).unwrap()).is_empty());
 
         let r4 = SearchQuery::new("Patient").with_fhir_version(helios_fhir::FhirVersion::R4);
         let expected = vec![json!({ "term": { "fhir_version": "4.0" } })];
-        assert_eq!(version_terms(&builder.build(&r4).body), expected);
+        assert_eq!(version_terms(&builder.build(&r4).unwrap().body), expected);
         assert_eq!(
-            version_terms(&build_count_query("acme", "Patient", &r4)),
+            version_terms(&build_count_query("acme", "Patient", &r4).unwrap()),
             expected
         );
     }
@@ -740,7 +836,7 @@ mod tests {
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
     }
@@ -762,7 +858,7 @@ mod tests {
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let clause = &es_query.body["query"]["bool"]["must"][0];
 
         assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
@@ -786,7 +882,9 @@ mod tests {
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
             .with_max_terms_count(3);
 
-        let es_query = builder.build(&SearchQuery::new("Patient").with_parameter(param(None)));
+        let es_query = builder
+            .build(&SearchQuery::new("Patient").with_parameter(param(None)))
+            .unwrap();
         let clause = &es_query.body["query"]["bool"]["must"][0];
         let should = clause["bool"]["should"]
             .as_array()
@@ -801,11 +899,13 @@ mod tests {
 
         let within = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
             .with_max_terms_count(7)
-            .build(&SearchQuery::new("Patient").with_parameter(param(None)));
+            .build(&SearchQuery::new("Patient").with_parameter(param(None)))
+            .unwrap();
         assert!(within.body["query"]["bool"]["must"][0]["terms"].is_object());
 
         let negated = builder
-            .build(&SearchQuery::new("Patient").with_parameter(param(Some(SearchModifier::Not))));
+            .build(&SearchQuery::new("Patient").with_parameter(param(Some(SearchModifier::Not))))
+            .unwrap();
         let inner = &negated.body["query"]["bool"]["must"][0]["bool"]["must_not"][0];
         assert_eq!(inner["bool"]["should"].as_array().unwrap().len(), 3);
     }
@@ -841,7 +941,7 @@ mod tests {
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let clause = &es_query.body["query"]["bool"]["must"][0];
 
         assert_eq!(
@@ -862,7 +962,7 @@ mod tests {
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
         let clause = &es_query.body["query"]["bool"]["must"][0];
 
         assert_eq!(
@@ -887,7 +987,7 @@ mod tests {
                 chain: vec![],
                 components: vec![],
             });
-            let es_query = builder.build(&query);
+            let es_query = builder.build(&query).unwrap();
             let clause = &es_query.body["query"]["bool"]["must"][0];
 
             assert_eq!(clause["exists"]["field"], field);
@@ -904,7 +1004,7 @@ mod tests {
             components: vec![],
         });
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        builder.build(&query).body["query"]["bool"]["must"][0].clone()
+        builder.build(&query).unwrap().body["query"]["bool"]["must"][0].clone()
     }
 
     #[test]
@@ -969,7 +1069,7 @@ mod tests {
         assert_eq!(should[0], json!({ "match_none": {} }));
         assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
 
-        // An indexed date parameter: `filter_map` must not get a `None` to drop.
+        // An indexed date parameter: the handler must not return a `None` for it.
         let query = SearchQuery::new("Procedure").with_parameter(SearchParameter {
             name: "date".to_string(),
             param_type: SearchParamType::Date,
@@ -980,7 +1080,7 @@ mod tests {
         });
         let builder = EsQueryBuilder::new("acme", "Procedure", "hfs_acme_procedure".to_string());
         assert_eq!(
-            builder.build(&query).body["query"]["bool"]["must"][0],
+            builder.build(&query).unwrap().body["query"]["bool"]["must"][0],
             json!({ "match_none": {} })
         );
     }
@@ -1010,7 +1110,7 @@ mod tests {
     fn test_not_modifier_negates_once() {
         let query = not_param(vec![SearchValue::eq("en-US")]);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         let clause = &es_query.body["query"]["bool"]["must"][0];
         let negated = &clause["bool"]["must_not"][0];
@@ -1030,7 +1130,7 @@ mod tests {
     fn test_not_modifier_multi_value_negates_the_or() {
         let query = not_param(vec![SearchValue::eq("en-US"), SearchValue::eq("es")]);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         let clause = &es_query.body["query"]["bool"]["must"][0];
         let negated = &clause["bool"]["must_not"][0];
@@ -1049,7 +1149,7 @@ mod tests {
     fn test_default_sort() {
         let query = SearchQuery::new("Patient");
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         let sort = &es_query.body["sort"];
         assert!(sort.is_array());
@@ -1065,7 +1165,7 @@ mod tests {
         });
 
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         let sort = &es_query.body["sort"];
         assert!(sort[0]["resource_id"]["order"].as_str() == Some("asc"));
@@ -1082,7 +1182,7 @@ mod tests {
             param_type: Some(SearchParamType::Date),
         });
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let sort = &builder.build(&query).body["sort"][0];
+        let sort = &builder.build(&query).unwrap().body["sort"][0];
 
         let clause = &sort["search_params.date.value"];
         assert!(
@@ -1110,7 +1210,7 @@ mod tests {
         let builder = EsQueryBuilder::new("acme", "Encounter", "hfs_acme_encounter".to_string());
 
         let query = SearchQuery::new("Encounter").with_sort(directive.clone());
-        let sort = &builder.build(&query).body["sort"][0];
+        let sort = &builder.build(&query).unwrap().body["sort"][0];
         let clause = &sort["search_params.date.end"];
         assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
         assert_eq!(clause["order"], "desc");
@@ -1121,7 +1221,7 @@ mod tests {
         let query = SearchQuery::new("Encounter")
             .with_sort(directive)
             .with_cursor(previous_cursor("e-5"));
-        let sort = &builder.build(&query).body["sort"][0];
+        let sort = &builder.build(&query).unwrap().body["sort"][0];
         assert!(
             !sort["search_params.date.end"].is_null(),
             "a Previous cursor keeps the sort key, got {sort}"
@@ -1136,7 +1236,7 @@ mod tests {
             param_type: Some(SearchParamType::Token),
         });
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let sort = &builder.build(&query).body["sort"][0];
+        let sort = &builder.build(&query).unwrap().body["sort"][0];
 
         let clause = &sort["search_params.token.code"];
         assert!(!clause.is_null(), "token sorts on the code, got {sort}");
@@ -1153,7 +1253,7 @@ mod tests {
             param_type: None,
         });
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let sort = &builder.build(&query).body["sort"][0];
+        let sort = &builder.build(&query).unwrap().body["sort"][0];
         assert!(
             !sort["search_params.string.value.keyword"].is_null(),
             "untyped parameters keep the string-group sort, got {sort}"
@@ -1169,7 +1269,7 @@ mod tests {
             .with_count(5)
             .with_cursor(previous_cursor("p-5"));
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let body = builder.build(&query).body;
+        let body = builder.build(&query).unwrap().body;
 
         assert_eq!(
             body["sort"],
@@ -1196,7 +1296,7 @@ mod tests {
             })
             .with_cursor(previous_cursor("p-5"));
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let sort = builder.build(&query).body["sort"].clone();
+        let sort = builder.build(&query).unwrap().body["sort"].clone();
         let sort = sort.as_array().expect("sort is an array");
 
         let clause = &sort[0]["search_params.date.value"];
@@ -1219,7 +1319,7 @@ mod tests {
             })
             .with_cursor(previous_cursor("p-5"));
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let sort = builder.build(&query).body["sort"].clone();
+        let sort = builder.build(&query).unwrap().body["sort"].clone();
 
         assert_eq!(sort[0], json!({ "_score": { "order": "asc" } }));
     }
@@ -1232,7 +1332,7 @@ mod tests {
             .with_count(5)
             .with_cursor(next_cursor("p-5"));
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let body = builder.build(&query).body;
+        let body = builder.build(&query).unwrap().body;
 
         assert_eq!(
             body["sort"],
@@ -1251,7 +1351,7 @@ mod tests {
     fn test_first_page_overfetches_by_one() {
         let query = SearchQuery::new("Patient").with_count(5);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let body = builder.build(&query).body;
+        let body = builder.build(&query).unwrap().body;
 
         assert_eq!(body["size"], json!(6));
         assert!(body.get("from").is_none());
@@ -1265,7 +1365,7 @@ mod tests {
         let mut query = SearchQuery::new("Patient").with_count(5);
         query.offset = Some(10);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let body = builder.build(&query).body;
+        let body = builder.build(&query).unwrap().body;
 
         assert_eq!(body["size"], json!(6));
         assert_eq!(body["from"], json!(10));
@@ -1279,7 +1379,7 @@ mod tests {
     fn test_size_is_clamped_to_max_result_window() {
         let query = SearchQuery::new("Patient").with_count(10_000);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         assert_eq!(es_query.body["size"], json!(10_000));
         assert!(!es_query.over_fetched);
@@ -1291,7 +1391,7 @@ mod tests {
     fn test_size_keeps_extra_hit_when_it_fits_the_window() {
         let query = SearchQuery::new("Patient").with_count(9_999);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         assert_eq!(es_query.body["size"], json!(10_000));
         assert!(es_query.over_fetched);
@@ -1304,7 +1404,7 @@ mod tests {
         let mut query = SearchQuery::new("Patient").with_count(20);
         query.offset = Some(9_990);
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
-        let es_query = builder.build(&query);
+        let es_query = builder.build(&query).unwrap();
 
         assert_eq!(es_query.body["from"], json!(9_990));
         assert_eq!(es_query.body["size"], json!(10));
@@ -1318,11 +1418,15 @@ mod tests {
         let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
             .with_max_result_window(50);
 
-        let full = builder.build(&SearchQuery::new("Patient").with_count(50));
+        let full = builder
+            .build(&SearchQuery::new("Patient").with_count(50))
+            .unwrap();
         assert_eq!(full.body["size"], json!(50));
         assert!(!full.over_fetched);
 
-        let room = builder.build(&SearchQuery::new("Patient").with_count(10));
+        let room = builder
+            .build(&SearchQuery::new("Patient").with_count(10))
+            .unwrap();
         assert_eq!(room.body["size"], json!(11));
         assert!(room.over_fetched);
     }
@@ -1364,10 +1468,387 @@ mod tests {
                 components: vec![],
             };
             assert_eq!(
-                builder.build_parameter_clause(&param),
+                builder.build_parameter_clause(&param).unwrap(),
                 Some(json!({ "match_none": {} })),
                 "{context}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #2510: a parameter that carries values but yields no clause is an
+    // error, not a skipped term. Skipped, a query with no other clause is a
+    // `bool` with only filters, which matches every document of the tenant
+    // and type.
+    // ------------------------------------------------------------------
+
+    fn param_with(
+        name: &str,
+        param_type: SearchParamType,
+        modifier: Option<SearchModifier>,
+        values: &[&str],
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn es_builder(resource_type: &'static str) -> EsQueryBuilder<'static> {
+        EsQueryBuilder::new(
+            "acme",
+            resource_type,
+            format!("hfs_acme_{}", resource_type.to_lowercase()),
+        )
+    }
+
+    /// The message of the refusal `result` is, or a panic naming `context`.
+    fn refusal(result: Result<EsQuery, SearchError>, context: &str) -> String {
+        match result {
+            Err(SearchError::QueryParseError { message }) => message,
+            other => panic!("{context}: expected a QueryParseError, got {other:?}"),
+        }
+    }
+
+    /// The `must` clauses of a built query; empty when it has none.
+    fn must_of(es_query: &EsQuery) -> Vec<Value> {
+        es_query.body["query"]["bool"]["must"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `Location?near=...`: `near` is a `special` parameter and nothing
+    /// indexes it, so there is no clause to build. The query it used to
+    /// leave behind matched every Location.
+    #[test]
+    fn a_special_typed_parameter_alone_is_refused_not_dropped() {
+        let query = SearchQuery::new("Location").with_parameter(param_with(
+            "near",
+            SearchParamType::Special,
+            None,
+            &["42.0|-71.0|10|km"],
+        ));
+        let message = refusal(es_builder("Location").build(&query), "near");
+
+        assert_eq!(
+            message,
+            "search parameter 'near' cannot be evaluated by the Elasticsearch backend: no clause \
+             can be built for it, and ignoring it would widen the search to every Location"
+        );
+    }
+
+    /// `Patient?_type=Observation` on R5/R6, where `_type` is typed `special`.
+    #[test]
+    fn a_special_typed_type_parameter_is_refused_not_dropped() {
+        for modifier in [None, Some(SearchModifier::Not)] {
+            let query = SearchQuery::new("Patient").with_parameter(param_with(
+                "_type",
+                SearchParamType::Special,
+                modifier.clone(),
+                &["Observation"],
+            ));
+            let message = refusal(
+                es_builder("Patient").build(&query),
+                &format!("_type {modifier:?}"),
+            );
+            assert!(message.contains("'_type'"), "{message}");
+            assert!(message.contains("every Patient"), "{message}");
+        }
+    }
+
+    /// A parameter the backend can answer does not rescue one it cannot: a
+    /// query with only the answerable clause is a narrower question than the
+    /// one asked.
+    #[test]
+    fn a_special_typed_parameter_beside_a_valid_one_is_refused_too() {
+        let id = || param_with("_id", SearchParamType::Token, None, &["a"]);
+        let near = || param_with("near", SearchParamType::Special, None, &["x"]);
+        let builder = es_builder("Location");
+
+        for (label, query) in [
+            (
+                "valid first",
+                SearchQuery::new("Location")
+                    .with_parameter(id())
+                    .with_parameter(near()),
+            ),
+            (
+                "special first",
+                SearchQuery::new("Location")
+                    .with_parameter(near())
+                    .with_parameter(id()),
+            ),
+        ] {
+            let message = refusal(builder.build(&query), label);
+            assert!(message.contains("'near'"), "{label}: {message}");
+        }
+    }
+
+    /// The count body is built from the same parameters and refuses them the
+    /// same way: a count over the dropped parameter would be the size of the
+    /// whole type.
+    #[test]
+    fn the_count_body_refuses_what_the_search_body_refuses() {
+        let query = SearchQuery::new("Location").with_parameter(param_with(
+            "near",
+            SearchParamType::Special,
+            None,
+            &["x"],
+        ));
+        match build_count_query("acme", "Location", &query) {
+            Err(SearchError::QueryParseError { message }) => {
+                assert!(message.contains("'near'"), "{message}")
+            }
+            other => panic!("expected a QueryParseError, got {other:?}"),
+        }
+    }
+
+    /// A parameter with no values asks for nothing, so it constrains nothing:
+    /// it is skipped, and does not stand in the way of the one beside it.
+    #[test]
+    fn a_parameter_with_no_values_is_skipped() {
+        let builder = es_builder("Patient");
+        let empty = |name: &str, param_type, modifier| param_with(name, param_type, modifier, &[]);
+
+        for param in [
+            empty("near", SearchParamType::Special, None),
+            empty("family", SearchParamType::String, None),
+            empty("gender", SearchParamType::Token, Some(SearchModifier::Not)),
+            empty("_id", SearchParamType::Token, None),
+            empty("_lastUpdated", SearchParamType::Date, None),
+            empty("_text", SearchParamType::Special, None),
+            empty("_content", SearchParamType::Special, None),
+        ] {
+            let name = param.name.clone();
+            let alone = builder
+                .build(&SearchQuery::new("Patient").with_parameter(param.clone()))
+                .unwrap_or_else(|e| panic!("{name}: no values is not an error: {e:?}"));
+            assert!(must_of(&alone).is_empty(), "{name}: {alone:?}");
+
+            let beside = builder
+                .build(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(param)
+                        .with_parameter(param_with("_id", SearchParamType::Token, None, &["a"])),
+                )
+                .unwrap_or_else(|e| panic!("{name}: no values is not an error: {e:?}"));
+            assert_eq!(
+                must_of(&beside),
+                vec![json!({ "term": { "resource_id": "a" } })],
+                "{name}: only the parameter that asked for something is a clause"
+            );
+        }
+    }
+
+    /// What `_id`, `_lastUpdated`, `_text`, `_content` and `:missing` built
+    /// before they build still, and none is mistaken for a parameter that has
+    /// no clause (`_text` and `_content` are `special`-typed).
+    #[test]
+    fn the_name_dispatched_parameters_still_build() {
+        let builder = es_builder("Patient");
+        let must = |param: SearchParameter| {
+            let name = param.name.clone();
+            let built = builder
+                .build(&SearchQuery::new("Patient").with_parameter(param))
+                .unwrap_or_else(|e| panic!("{name} must build: {e:?}"));
+            let mut must = must_of(&built);
+            assert_eq!(must.len(), 1, "{name}: {built:?}");
+            must.remove(0)
+        };
+
+        assert_eq!(
+            must(param_with("_id", SearchParamType::Token, None, &["a"])),
+            json!({ "term": { "resource_id": "a" } })
+        );
+        assert_eq!(
+            must(param_with(
+                "_lastUpdated",
+                SearchParamType::Date,
+                None,
+                &["2026-09-01"]
+            ))["range"]["last_updated"],
+            json!({ "gte": "2026-09-01", "lt": "2026-09-02" })
+        );
+        assert_eq!(
+            must(param_with(
+                "_text",
+                SearchParamType::Special,
+                None,
+                &["headache"]
+            )),
+            json!({ "match": { "narrative_text": { "query": "headache", "operator": "and" } } })
+        );
+        assert_eq!(
+            must(param_with(
+                "_content",
+                SearchParamType::Special,
+                None,
+                &["aspirin"]
+            )),
+            json!({ "match": { "content_text": { "query": "aspirin", "operator": "and" } } })
+        );
+
+        // `:missing` is a presence test on the parameter's nested group.
+        let missing = must(param_with(
+            "email",
+            SearchParamType::String,
+            Some(SearchModifier::Missing),
+            &["true"],
+        ));
+        assert_eq!(
+            missing,
+            json!({ "bool": { "must_not": [ { "nested": {
+                "path": "search_params.string",
+                "query": { "term": { "search_params.string.name": "email" } }
+            } } ] } })
+        );
+        assert_eq!(
+            must(param_with(
+                "_id",
+                SearchParamType::Token,
+                Some(SearchModifier::Missing),
+                &["false"]
+            )),
+            json!({ "exists": { "field": "resource_id" } })
+        );
+    }
+
+    /// D3 characterization: `:missing` on a `special`-typed parameter is
+    /// resolved before the parameter has to have a clause, against the string
+    /// group (`modifier_handlers::nested_path_for_type`). Special parameters
+    /// write no index entries, so that group never holds one of this name:
+    /// `:missing=true` is every resource and `:missing=false` none. Left as it
+    /// is by #2510; this pins what it builds today.
+    #[test]
+    fn missing_on_a_special_typed_parameter_is_a_presence_test_on_the_string_group() {
+        let builder = es_builder("Location");
+        let built = |value: &str| {
+            let query = SearchQuery::new("Location").with_parameter(param_with(
+                "near",
+                SearchParamType::Special,
+                Some(SearchModifier::Missing),
+                &[value],
+            ));
+            must_of(&builder.build(&query).expect("`:missing` builds a clause"))
+        };
+
+        let nested = json!({ "nested": {
+            "path": "search_params.string",
+            "query": { "term": { "search_params.string.name": "near" } }
+        } });
+        assert_eq!(
+            built("true"),
+            vec![json!({ "bool": { "must_not": [nested.clone()] } })]
+        );
+        assert_eq!(built("false"), vec![nested]);
+    }
+
+    /// The shared `:of-type` expectation (`modifier_parity_suite`) is that a
+    /// value with fewer than three parts "names nothing". The handler used to
+    /// return no clause for one, so a lone short value left the query without
+    /// a constraint (every Patient) and, in an OR-list, the value vanished.
+    #[test]
+    fn a_short_of_type_value_matches_nothing_instead_of_vanishing() {
+        let builder = es_builder("Patient");
+        let of_type = |values: &[&str]| {
+            let query = SearchQuery::new("Patient").with_parameter(param_with(
+                "identifier",
+                SearchParamType::Token,
+                Some(SearchModifier::OfType),
+                values,
+            ));
+            must_of(&builder.build(&query).expect("`:of-type` builds a clause"))
+        };
+
+        for short in ["MR|12345", "12345", "a|b"] {
+            let clauses = of_type(&[short]);
+            assert_eq!(clauses, vec![json!({ "match_none": {} })], "{short}");
+        }
+
+        // Beside a full value the short one is a `match_none` alternative: the
+        // OR keeps both, it does not collapse to the first.
+        let clauses = of_type(&[
+            "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
+            "MR|12345",
+        ]);
+        let should = clauses[0]["bool"]["should"]
+            .as_array()
+            .expect("two values are an OR");
+        assert_eq!(should.len(), 2);
+        assert_eq!(should[1], json!({ "match_none": {} }));
+        assert!(should[0]["nested"].is_object());
+    }
+
+    /// A clause for every value but `bad`: no real handler leaves a value
+    /// without one any more, so this drives the per-value rule directly.
+    fn all_but_bad(value: &SearchValue) -> Option<Value> {
+        (value.value != "bad").then(|| json!({ "term": { "v": value.value } }))
+    }
+
+    /// A value `clause_for` builds nothing for is never dropped from the OR,
+    /// plain or under `:not`. Dropped under `:not`, `NOT (a OR b)` is `NOT a`
+    /// and the search widens; dropped without it, `a OR b` is `a`.
+    #[test]
+    fn a_value_without_a_clause_is_refused_not_dropped_from_the_or() {
+        for modifier in [None, Some(SearchModifier::Not)] {
+            let param = param_with(
+                "code",
+                SearchParamType::Token,
+                modifier.clone(),
+                &["a", "bad", "b"],
+            );
+            match EsQueryBuilder::or_of_values(&param, all_but_bad) {
+                Err(SearchError::QueryParseError { message }) => assert_eq!(
+                    message,
+                    "search parameter 'code' cannot be evaluated by the Elasticsearch backend: \
+                     no clause can be built for the value 'bad', and leaving it out would \
+                     answer a different search than the one asked",
+                    "{modifier:?}"
+                ),
+                other => panic!("{modifier:?}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// When no value has a clause the result is `Ok(None)`, which `build`
+    /// turns into the parameter-level refusal (or a skip, for no values), and
+    /// when every value has one the OR is built as before, `:not` around it.
+    #[test]
+    fn the_or_of_values_is_unchanged_when_every_value_has_a_clause() {
+        let build = |modifier: Option<SearchModifier>, values: &[&str]| {
+            let param = param_with("code", SearchParamType::Token, modifier, values);
+            EsQueryBuilder::or_of_values(&param, all_but_bad).unwrap()
+        };
+        let term = |v: &str| json!({ "term": { "v": v } });
+
+        for modifier in [None, Some(SearchModifier::Not)] {
+            assert_eq!(build(modifier.clone(), &["bad"]), None, "{modifier:?}");
+            assert_eq!(
+                build(modifier, &["bad", "bad"]),
+                None,
+                "every value without a clause leaves the refusal to `build`"
+            );
+        }
+        assert_eq!(build(None, &[]), None);
+
+        assert_eq!(build(None, &["a"]), Some(term("a")));
+        assert_eq!(
+            build(None, &["a", "b"]),
+            Some(json!({ "bool": {
+                "should": [term("a"), term("b")],
+                "minimum_should_match": 1
+            } }))
+        );
+        assert_eq!(
+            build(Some(SearchModifier::Not), &["a", "b"]),
+            Some(json!({ "bool": { "must_not": [ { "bool": {
+                "should": [term("a"), term("b")],
+                "minimum_should_match": 1
+            } } ] } }))
+        );
     }
 }

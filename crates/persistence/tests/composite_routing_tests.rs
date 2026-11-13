@@ -101,6 +101,7 @@ fn test_detect_chained_search_features() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -316,6 +317,7 @@ fn test_route_chained_search_to_graph() {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }],
         components: vec![],
     });
@@ -416,6 +418,7 @@ fn test_route_complex_query_to_multiple_backends() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })
@@ -620,6 +623,7 @@ fn test_complexity_increases_with_features() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })

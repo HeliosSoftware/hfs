@@ -15,6 +15,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
 #[path = "reindex/clear_interrupted.rs"]
 mod clear_interrupted;
 
@@ -5762,6 +5765,44 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
     .await;
 }
 
+mod empty_elements_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/empty_elements_contract.rs"
+    ));
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+    empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+        &create_backend(),
+        &create_tenant("submit-empty-merge"),
+    )
+    .await;
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_replace_drops_empty_elements() {
+    empty_elements_contract::replace_import_drops_empty_elements(
+        &create_backend(),
+        &create_tenant("submit-empty-replace"),
+    )
+    .await;
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn test_bulk_submit_skip_unchanged_compares_the_clean_candidate() {
+    empty_elements_contract::skip_unchanged_compares_the_clean_candidate(
+        &create_backend(),
+        &create_tenant("submit-empty-skip"),
+    )
+    .await;
+}
+
 mod index_pending_contract {
     use helios_persistence as persistence;
     include!(concat!(
@@ -5791,6 +5832,11 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_updated_since_view_bounds_counts_and_pages() {
+    updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(create_backend())).await;
 }
 
 #[tokio::test]

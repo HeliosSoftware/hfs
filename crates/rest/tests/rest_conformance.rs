@@ -3,7 +3,7 @@
 //! Tests standard FHIR REST behaviors:
 //! - HTTP status codes (200, 201, 400, 404, 409, 410, 412)
 //! - Response headers (ETag, Last-Modified, Location, Content-Type)
-//! - Conditional operations (If-Match, If-None-Match, If-None-Exist)
+//! - Conditional operations (If-Match, If-None-Match, If-Modified-Since, If-None-Exist)
 //! - HEAD requests
 //! - Content negotiation
 
@@ -27,6 +27,7 @@ const CONTENT_TYPE: HeaderName = HeaderName::from_static("content-type");
 const IF_MATCH: HeaderName = HeaderName::from_static("if-match");
 const IF_NONE_MATCH: HeaderName = HeaderName::from_static("if-none-match");
 const IF_NONE_EXIST: HeaderName = HeaderName::from_static("if-none-exist");
+const IF_MODIFIED_SINCE: HeaderName = HeaderName::from_static("if-modified-since");
 
 /// Creates a test server.
 async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
@@ -434,7 +435,7 @@ mod response_headers {
 }
 
 // =============================================================================
-// Conditional Read Tests (If-None-Match)
+// Conditional Read Tests (If-None-Match, If-Modified-Since)
 // =============================================================================
 
 mod conditional_read {
@@ -496,6 +497,84 @@ mod conditional_read {
             .await;
 
         response.assert_status_ok();
+    }
+
+    /// `If-Modified-Since` formatted as an HTTP-date, `offset` from the
+    /// resource's `Last-Modified`.
+    fn http_date_from(last_modified: &str, offset: chrono::Duration) -> HeaderValue {
+        let base = chrono::DateTime::parse_from_rfc2822(last_modified)
+            .expect("Last-Modified is an HTTP-date");
+        let when = (base + offset).with_timezone(&chrono::Utc);
+        HeaderValue::from_str(&when.format("%a, %d %b %Y %H:%M:%S GMT").to_string()).unwrap()
+    }
+
+    /// `conditionalRead: "full-support"` in `/metadata` includes the date
+    /// precondition: a read whose `If-Modified-Since` is later than the
+    /// resource's last update answers `304`.
+    #[tokio::test]
+    async fn test_if_modified_since_later_than_last_update_returns_304() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let first = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        first.assert_status_ok();
+        let last_modified = first
+            .headers()
+            .get("last-modified")
+            .expect("Last-Modified header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let response = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                IF_MODIFIED_SINCE,
+                http_date_from(&last_modified, chrono::Duration::hours(1)),
+            )
+            .await;
+
+        response.assert_status(StatusCode::NOT_MODIFIED);
+        assert!(response.text().is_empty(), "a 304 carries no body");
+    }
+
+    /// A read whose `If-Modified-Since` is earlier than the resource's last
+    /// update is a plain read: `200` with the body.
+    #[tokio::test]
+    async fn test_if_modified_since_earlier_than_last_update_returns_200() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let first = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        first.assert_status_ok();
+        let last_modified = first
+            .headers()
+            .get("last-modified")
+            .expect("Last-Modified header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let response = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                IF_MODIFIED_SINCE,
+                http_date_from(&last_modified, chrono::Duration::hours(-1)),
+            )
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "Patient");
+        assert_eq!(body["id"], "patient-1");
     }
 }
 

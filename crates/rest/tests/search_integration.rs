@@ -529,6 +529,107 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_unknown_param_inside_has_is_reported() {
+        // #2563: an unknown reference or search parameter inside a `_has` used
+        // to match nothing (a silent empty 200), even under strict handling.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        let strict_header = || {
+            (
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+        };
+
+        let all: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = get_bundle_entries(&all).len();
+        assert!(total > 0, "fixture should seed patients");
+
+        for (url, key) in [
+            (
+                "/Patient?_has:Group:bogusref:_id=g1",
+                "_has:Group:bogusref:_id",
+            ),
+            (
+                "/Patient?_has:Group:member:bogus=1",
+                "_has:Group:member:bogus",
+            ),
+            ("/Patient?_has=Group:bogusref:_id:g1", "_has"),
+            (
+                "/Patient?_has:Observation:subject:_has:Group:bogusref:_id=g1",
+                "_has:Observation:subject:_has:Group:bogusref:_id",
+            ),
+            (
+                "/Patient?_has:Observation:subject:_has:Group:member:bogus=1",
+                "_has:Observation:subject:_has:Group:member:bogus",
+            ),
+            (
+                "/Encounter?patient._has:Group:bogusref:_id=g1",
+                "patient._has:Group:bogusref:_id",
+            ),
+        ] {
+            let (name, value) = strict_header();
+            let strict = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(name, value)
+                .await;
+            assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST, "{url}");
+            let body: Value = strict.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
+            assert!(
+                body.to_string().contains(key),
+                "outcome must name '{key}': {body}"
+            );
+
+            // Lenient: ignored like any unknown parameter, and said so.
+            let lenient = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            lenient.assert_status_ok();
+            let body: Value = lenient.json();
+            assert!(
+                !self_link(&body).contains("bogus"),
+                "self link must not echo the ignored parameter ({url})"
+            );
+            let outcomes = outcome_entries(&body);
+            assert_eq!(outcomes.len(), 1, "ignored _has must be reported ({url})");
+            let text = outcomes[0]["resource"]["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(text.contains(key), "outcome must name '{key}': {text}");
+            if url.starts_with("/Patient") {
+                let matches = get_bundle_entries(&body)
+                    .into_iter()
+                    .filter(|e| e["search"]["mode"] == "match")
+                    .count();
+                assert_eq!(matches, total, "ignored _has must not filter ({url})");
+            }
+        }
+
+        // Known names at every level are still accepted under strict handling.
+        for url in [
+            "/Patient?_has:Group:member:_id=g1",
+            "/Patient?_has:Observation:subject:code=1234-5",
+            "/Patient?_has:Observation:subject:_has:Provenance:target:agent=x",
+            "/Encounter?patient._has:Group:member:_id=g1",
+        ] {
+            let (name, value) = strict_header();
+            server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(name, value)
+                .await
+                .assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
     async fn test_known_params_survive_lenient_handling() {
         // The self link still carries every parameter that was applied, and no
         // outcome entry is added when nothing was ignored.
@@ -3914,6 +4015,169 @@ mod chaining {
         }
     }
 
+    /// #2556: the data a chain that ends in `_has` is searched over.
+    ///
+    /// - `p1` is a member of Group `g102` and the subject of CareTeam `ct1`,
+    ///   whose participant is Practitioner `p123`; `p2` is the subject of
+    ///   CareTeam `ct2`, which has no participant;
+    /// - Encounter `e1` and Task `t1` are `p1`'s, `e2` and `t2` are `p2`'s;
+    /// - Observation `o1` (subject `p1`, encounter `e1`) has a Provenance
+    ///   `prov1` whose agent is `p123`; `o2` is `p2`'s, encounter `e2`.
+    async fn seed_chain_to_has_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Practitioner", "id": "p123"}),
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "Patient", "id": "p2"}),
+            json!({"resourceType": "Group", "id": "g102", "type": "person", "actual": true,
+                   "member": [{"entity": {"reference": "Patient/p1"}}]}),
+            json!({"resourceType": "CareTeam", "id": "ct1",
+                   "subject": {"reference": "Patient/p1"},
+                   "participant": [{"member": {"reference": "Practitioner/p123"}}]}),
+            json!({"resourceType": "CareTeam", "id": "ct2",
+                   "subject": {"reference": "Patient/p2"}}),
+            json!({"resourceType": "Encounter", "id": "e1", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Encounter", "id": "e2", "status": "finished",
+                   "class": {"code": "AMB"}, "subject": {"reference": "Patient/p2"}}),
+            json!({"resourceType": "Task", "id": "t1", "status": "requested",
+                   "intent": "order", "for": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Task", "id": "t2", "status": "requested",
+                   "intent": "order", "for": {"reference": "Patient/p2"}}),
+            json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/p1"},
+                   "encounter": {"reference": "Encounter/e1"}}),
+            json!({"resourceType": "Observation", "id": "o2", "status": "final",
+                   "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]},
+                   "subject": {"reference": "Patient/p2"},
+                   "encounter": {"reference": "Encounter/e2"}}),
+            json!({"resourceType": "Provenance", "id": "prov1",
+                   "recorded": "2024-01-01T00:00:00Z",
+                   "target": [{"reference": "Observation/o1"}],
+                   "agent": [{"who": {"reference": "Practitioner/p123"}}]}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #2556: a chain whose last step is `_has`, as R5 defines it, accepted on
+    /// an R4 server too.
+    #[tokio::test]
+    async fn test_chain_ending_in_has() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_to_has_data(&backend).await;
+
+        for (url, expected) in [
+            // R5's example.
+            ("/Encounter?patient._has:Group:member:_id=g102", vec!["e1"]),
+            (
+                "/Task?patient._has:CareTeam:patient:participant=Practitioner/p123",
+                vec!["t1"],
+            ),
+            // A reference terminal's type qualifier.
+            (
+                "/Task?patient._has:CareTeam:patient:participant:Practitioner=p123",
+                vec!["t1"],
+            ),
+            // A typed hop.
+            (
+                "/Encounter?subject:Patient._has:Group:member:_id=g102",
+                vec!["e1"],
+            ),
+            // Two hops, then the `_has`.
+            (
+                "/Observation?encounter.patient._has:Group:member:_id=g102",
+                vec!["o1"],
+            ),
+            // A nested `_has` after the chain.
+            (
+                "/Encounter?patient._has:Observation:subject:_has:Provenance:target:agent=Practitioner/p123",
+                vec!["e1"],
+            ),
+            // A terminal modifier, and an OR list.
+            (
+                "/Task?patient._has:CareTeam:patient:participant:missing=true",
+                vec!["t2"],
+            ),
+            (
+                "/Encounter?patient._has:Group:member:_id=g102,nope",
+                vec!["e1"],
+            ),
+            // ANDed with a plain parameter, and nothing matches.
+            (
+                "/Encounter?patient._has:Group:member:_id=g102&status=planned",
+                vec![],
+            ),
+            ("/Encounter?patient._has:Group:member:_id=nope", vec![]),
+        ] {
+            assert_eq!(ids(&server, url).await, expected, "{url}");
+        }
+    }
+
+    /// #2556: what a chain that ends in `_has` refuses, naming the whole key.
+    #[tokio::test]
+    async fn test_chain_ending_in_has_errors() {
+        let (server, backend) = create_test_server().await;
+        seed_chain_to_has_data(&backend).await;
+
+        for (url, expected, named) in [
+            // The `_has=Type:ref:param:value` value form is not defined there.
+            (
+                "/Encounter?patient._has=Group:member:_id:g102",
+                StatusCode::BAD_REQUEST,
+                "patient._has",
+            ),
+            (
+                "/Encounter?patient._has:Bogus:member:_id=g102",
+                StatusCode::BAD_REQUEST,
+                "patient._has:Bogus:member:_id",
+            ),
+            (
+                "/Encounter?patient._has:Group:member=g102",
+                StatusCode::BAD_REQUEST,
+                "patient._has:Group:member",
+            ),
+            (
+                "/Task?patient._has:CareTeam:patient:participant:bogus=x",
+                StatusCode::BAD_REQUEST,
+                "patient._has:CareTeam:patient:participant",
+            ),
+            (
+                "/Task?patient._has:CareTeam:patient:participant:missing=yes",
+                StatusCode::BAD_REQUEST,
+                "patient._has:CareTeam:patient:participant",
+            ),
+            // Not defined for a reference: checked by the resolver.
+            (
+                "/Task?patient._has:CareTeam:patient:participant:exact=x",
+                StatusCode::BAD_REQUEST,
+                "patient._has:CareTeam:patient:participant",
+            ),
+            // Needs a terminology server.
+            (
+                "/Encounter?patient._has:Observation:subject:code:in=http://example.org/vs",
+                StatusCode::NOT_IMPLEMENTED,
+                "patient._has:Observation:subject:code",
+            ),
+            // An empty OR alternative.
+            (
+                "/Encounter?patient._has:Group:member:_id=g102,",
+                StatusCode::BAD_REQUEST,
+                "patient._has:Group:member:_id",
+            ),
+        ] {
+            let (status, text) = outcome(&server, url).await;
+            assert_eq!(status, expected, "{url}: {text}");
+            assert!(text.contains(named), "{url}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;
@@ -4851,6 +5115,10 @@ mod contained_search {
 
     #[async_trait]
     impl SearchProvider for CountingSearch {
+        fn supports_search(&self) -> bool {
+            self.inner.supports_search()
+        }
+
         async fn search(
             &self,
             tenant: &TenantContext,
@@ -5284,6 +5552,12 @@ mod contained_search {
             ("_list=l1", "_list"),
             ("_has:Provenance:target:_id=prov1", "_has"),
             ("subject.family=Smith", "subject.family"),
+            ("subject:Patient.family=Smith", "'subject:Patient.family'"),
+            // #2556: a chain that ends in `_has`, named in full.
+            (
+                "subject._has:Provenance:target:_id=prov1",
+                "'subject._has:Provenance:target:_id'",
+            ),
         ] {
             for mode in ["true", "both"] {
                 for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {
@@ -5942,6 +6216,15 @@ mod compartment_out_of_band {
             )
             .await,
             ["e-done"]
+        );
+        // #2556: a chain that ends in `_has`.
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient/p1/Observation?encounter._has:Observation:encounter:code=X"
+            )
+            .await,
+            ["o-done"]
         );
     }
 }

@@ -3991,11 +3991,12 @@ mod tests {
             query
         };
 
-        let conn = backend.get_connection().unwrap();
+        let mut conn = backend.get_connection().unwrap();
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(record_traced_sql),
-        );
+        )
+        .unwrap();
         let mut first = Vec::new();
         for (count, read) in [
             (1, "USING INTEGER PRIMARY KEY"),
@@ -4044,7 +4045,11 @@ mod tests {
                 "{plan:#?}"
             );
         }
-        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::empty(),
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
         assert_eq!(first[0], first[1]);
     }
 
@@ -4175,6 +4180,7 @@ mod tests {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             ..Default::default()
         });
@@ -5115,11 +5121,12 @@ mod tests {
             probe_plan_of(&backend, &tenant, &query),
             FirstPagePlan::ExistsDriven
         );
-        let conn = backend.get_connection().unwrap();
+        let mut conn = backend.get_connection().unwrap();
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(record_traced_sql),
-        );
+        )
+        .unwrap();
         TRACED_SQL.with(|t| t.borrow_mut().clear());
         let probed = backend
             .search_with_connection_probe(&conn, &tenant, &query, None, true)
@@ -5190,11 +5197,12 @@ mod tests {
     #[tokio::test]
     async fn probe_picks_the_measured_plans_for_the_page_statement() {
         let (backend, tenant) = probe_fixture().await;
-        let conn = backend.get_connection().unwrap();
+        let mut conn = backend.get_connection().unwrap();
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(record_traced_sql),
-        );
+        )
+        .unwrap();
         for (value, needle) in [
             ("B2000", "resources NOT INDEXED"),
             (
@@ -5223,6 +5231,10 @@ mod tests {
                 .expect("the page statement");
             assert!(page.contains(needle), "{value}: {page}");
         }
-        conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::empty(),
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
     }
 }

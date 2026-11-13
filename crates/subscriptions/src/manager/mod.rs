@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, watch};
 use tracing::{debug, warn};
 
 use crate::error::SubscriptionError;
+use crate::notification::NotificationEventData;
 use crate::topics::InMemoryTopicRegistry;
 
 pub use filters::SubscriptionFilter;
@@ -323,10 +324,75 @@ fn normalize_source(resource: &serde_json::Value) -> serde_json::Value {
     normalized
 }
 
+/// Default number of events remembered per subscription.
+const DEFAULT_EVENT_HISTORY_SIZE: usize = 100;
+
+/// Result of an `$events` range query (see [`SubscriptionManager::events_in_range`]).
+#[derive(Debug, Clone)]
+pub struct EventQuery {
+    /// Current subscription status.
+    pub status: SubscriptionStatusCode,
+    /// Canonical URL of the subscription topic.
+    pub topic_url: String,
+    /// FHIR version of the subscription resource.
+    pub fhir_version: FhirVersion,
+    /// Number of the latest event assigned (`eventsSinceSubscriptionStart`).
+    pub events_since_start: u64,
+    /// Number of the oldest event still retained, if any.
+    pub oldest_retained: Option<u64>,
+    /// Retained events inside the requested range, oldest first.
+    pub events: Vec<NotificationEventData>,
+}
+
+/// Why an `$events` range could not be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeError {
+    /// `eventsSinceNumber` / `eventsUntilNumber` must be at least 1.
+    BelowMinimum { param: &'static str },
+    /// `eventsSinceNumber` is greater than `eventsUntilNumber`.
+    SinceAfterUntil { since: u64, until: u64 },
+    /// The whole range is older than the retained history (or no history is kept).
+    NoLongerRetained { oldest: Option<u64> },
+}
+
+impl RangeError {
+    /// The request parameter the error is about.
+    pub fn param(&self) -> &'static str {
+        match self {
+            Self::BelowMinimum { param } => param,
+            Self::SinceAfterUntil { .. } => "eventsSinceNumber",
+            Self::NoLongerRetained { .. } => "eventsSinceNumber",
+        }
+    }
+}
+
+impl std::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BelowMinimum { param } => write!(f, "{param} must be 1 or greater"),
+            Self::SinceAfterUntil { since, until } => write!(
+                f,
+                "eventsSinceNumber ({since}) is greater than eventsUntilNumber ({until})"
+            ),
+            Self::NoLongerRetained { oldest: Some(n) } => {
+                write!(f, "events before {n} are no longer retained")
+            }
+            Self::NoLongerRetained { oldest: None } => {
+                write!(f, "no event history is retained for this subscription")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RangeError {}
+
 struct RegisteredSubscription {
     subscription: ActiveSubscription,
     generation: GenerationToken,
     source_fence: StatusSourceFence,
+    /// Most recent events, oldest first. Numbered and trimmed under the same
+    /// map guard as `subscription.events_since_start`, so the two never drift.
+    history: std::collections::VecDeque<NotificationEventData>,
 }
 
 impl RegisteredSubscription {
@@ -377,6 +443,9 @@ pub struct SubscriptionManager {
 
     /// Supported channel types.
     supported_channels: Vec<String>,
+
+    /// Events remembered per subscription for `$events` (0 disables).
+    event_history_size: usize,
 }
 
 impl SubscriptionManager {
@@ -389,7 +458,14 @@ impl SubscriptionManager {
             subscriptions: DashMap::new(),
             topic_registry,
             supported_channels,
+            event_history_size: DEFAULT_EVENT_HISTORY_SIZE,
         }
+    }
+
+    /// Sets how many recent events are remembered per subscription (0 disables).
+    pub fn with_event_history_size(mut self, size: usize) -> Self {
+        self.event_history_size = size;
+        self
     }
 
     /// Registers a subscription from a FHIR Subscription resource JSON.
@@ -511,6 +587,7 @@ impl SubscriptionManager {
             },
             generation: GenerationToken::new(status),
             source_fence: StatusSourceFence::new(resource, source_version),
+            history: std::collections::VecDeque::new(),
         };
 
         // Counter preservation, invalidation, and replacement share one map
@@ -518,12 +595,14 @@ impl SubscriptionManager {
         // between the previous-counter read and the new registration's insert.
         let (snapshot, re_registered) = match self.subscriptions.entry(key) {
             Entry::Occupied(mut entry) => {
-                let previous = entry.get();
+                let previous = entry.get_mut();
                 if !is_rearm(previous.subscription.status, status) {
                     registered.subscription.events_since_start =
                         previous.subscription.events_since_start;
                     registered.subscription.consecutive_failures =
                         previous.subscription.consecutive_failures;
+                    // The history follows the counter: kept together, reset together.
+                    registered.history = std::mem::take(&mut previous.history);
                 }
                 previous.generation.invalidate();
                 let snapshot = registered.snapshot();
@@ -617,6 +696,9 @@ impl SubscriptionManager {
     }
 
     /// Increments the event counter and returns the new value.
+    ///
+    /// Does not record an history entry (there is no timestamp or focus here);
+    /// the engine uses `record_event_if_current`, which does.
     pub fn increment_event_count(&self, tenant_id: &str, subscription_id: &str) -> Option<u64> {
         let key = (tenant_id.to_string(), subscription_id.to_string());
         let mut entry = self.subscriptions.get_mut(&key)?;
@@ -710,10 +792,13 @@ impl SubscriptionManager {
             .is_some_and(|entry| entry.is_current(snapshot) && entry.subscription.status == status)
     }
 
-    /// Assign numbers only while the evaluated generation is still Active.
-    pub(crate) fn increment_event_count_if_current(
+    /// Assign numbers only while the evaluated generation is still Active, and
+    /// remember the event in the bounded history under the same guard.
+    pub(crate) fn record_event_if_current(
         &self,
         snapshot: &SubscriptionSnapshot,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        focus_reference: String,
     ) -> Option<u64> {
         let sub = &snapshot.subscription;
         let key = (sub.tenant_id.clone(), sub.id.clone());
@@ -724,7 +809,82 @@ impl SubscriptionManager {
             return None;
         }
         entry.subscription.events_since_start += 1;
-        Some(entry.subscription.events_since_start)
+        let event_number = entry.subscription.events_since_start;
+        if self.event_history_size > 0 {
+            while entry.history.len() >= self.event_history_size {
+                entry.history.pop_front();
+            }
+            entry.history.push_back(NotificationEventData {
+                event_number,
+                timestamp,
+                focus_reference,
+            });
+        }
+        Some(event_number)
+    }
+
+    /// Looks up the retained events of a subscription in an inclusive number range.
+    ///
+    /// Returns `None` when the engine does not hold the subscription. Defaults:
+    /// `since` is the oldest retained event, `until` the latest event number;
+    /// an `until` beyond the latest is clamped to it. A `since` beyond the
+    /// latest event (the next number a polling client expects) yields no
+    /// events rather than an error. A partial overlap with the retained
+    /// history yields the retained subset. The history is in memory only and
+    /// is empty after a restart.
+    pub fn events_in_range(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Option<Result<EventQuery, RangeError>> {
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        let entry = self.subscriptions.get(&key)?;
+        let latest = entry.subscription.events_since_start;
+        let oldest = entry.history.front().map(|e| e.event_number);
+
+        let result = (|| {
+            for (param, value) in [("eventsSinceNumber", since), ("eventsUntilNumber", until)] {
+                if value == Some(0) {
+                    return Err(RangeError::BelowMinimum { param });
+                }
+            }
+            if let (Some(s), Some(u)) = (since, until)
+                && s > u
+            {
+                return Err(RangeError::SinceAfterUntil { since: s, until: u });
+            }
+            // A range starting after the latest event asks for events that have
+            // not happened yet: answer with none (polling with `last seen + 1`)
+            // instead of treating it as evicted history.
+            let ahead = since.is_some_and(|s| s > latest);
+            let explicit = since.is_some() || until.is_some();
+            let lower = since.or(oldest).unwrap_or(1);
+            let upper = until.map_or(latest, |u| u.min(latest));
+            let evicted = match oldest {
+                Some(o) => upper < o,
+                None => latest > 0,
+            };
+            if explicit && evicted && !ahead {
+                return Err(RangeError::NoLongerRetained { oldest });
+            }
+            let events = entry
+                .history
+                .iter()
+                .filter(|e| e.event_number >= lower && e.event_number <= upper)
+                .cloned()
+                .collect();
+            Ok(EventQuery {
+                status: entry.subscription.status,
+                topic_url: entry.subscription.topic_url.clone(),
+                fhir_version: entry.subscription.fhir_version,
+                events_since_start: latest,
+                oldest_retained: oldest,
+                events,
+            })
+        })();
+        Some(result)
     }
 
     /// Accept one delivery outcome for the current serving generation. The
@@ -1939,6 +2099,267 @@ pub(crate) mod tests {
         manager
     }
 
+    /// Active subscription with `n` recorded events (`Encounter/<k>`), through
+    /// the same path the engine uses.
+    fn manager_with_history(size: usize, n: u64) -> SubscriptionManager {
+        let manager =
+            SubscriptionManager::new(create_test_registry("t1"), vec!["rest-hook".to_string()])
+                .with_event_history_size(size);
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("register");
+        manager
+            .update_status("t1", "sub-1", SubscriptionStatusCode::Active)
+            .expect("activate");
+        for k in 1..=n {
+            let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+            let number = manager
+                .record_event_if_current(&snapshot, chrono::Utc::now(), format!("Encounter/{k}"))
+                .expect("record");
+            assert_eq!(number, k);
+        }
+        manager
+    }
+
+    fn numbers(query: &EventQuery) -> Vec<u64> {
+        query.events.iter().map(|e| e.event_number).collect()
+    }
+
+    #[test]
+    fn history_is_bounded_and_drops_the_oldest() {
+        let manager = manager_with_history(3, 5);
+        let q = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.events_since_start, 5);
+        assert_eq!(q.oldest_retained, Some(3));
+        assert_eq!(numbers(&q), vec![3, 4, 5]);
+        assert_eq!(q.events[0].focus_reference, "Encounter/3");
+    }
+
+    #[test]
+    fn events_in_range_defaults_and_subranges() {
+        let manager = manager_with_history(10, 4);
+        let all = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&all), vec![1, 2, 3, 4]);
+        let sub = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&sub), vec![2, 3]);
+        let one = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&one), vec![2]);
+        let from = manager
+            .events_in_range("t1", "sub-1", Some(3), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&from), vec![3, 4]);
+        let upto = manager
+            .events_in_range("t1", "sub-1", None, Some(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&upto), vec![1, 2]);
+        // `until` beyond the latest is clamped.
+        let clamped = manager
+            .events_in_range("t1", "sub-1", Some(3), Some(99))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&clamped), vec![3, 4]);
+    }
+
+    #[test]
+    fn events_in_range_rejects_invalid_ranges() {
+        let manager = manager_with_history(10, 3);
+        let err = |s, u| {
+            manager
+                .events_in_range("t1", "sub-1", s, u)
+                .unwrap()
+                .unwrap_err()
+        };
+        assert_eq!(
+            err(Some(0), None),
+            RangeError::BelowMinimum {
+                param: "eventsSinceNumber"
+            }
+        );
+        assert_eq!(
+            err(None, Some(0)),
+            RangeError::BelowMinimum {
+                param: "eventsUntilNumber"
+            }
+        );
+        assert_eq!(
+            err(Some(3), Some(1)),
+            RangeError::SinceAfterUntil { since: 3, until: 1 }
+        );
+    }
+
+    /// Polling with `eventsSinceNumber = last seen + 1` when nothing new has
+    /// happened is an empty result, not an error, also on a fresh subscription
+    /// and with the history disabled.
+    #[test]
+    fn events_in_range_since_beyond_latest_is_empty() {
+        for (size, n) in [(10, 3), (10, 0), (0, 3)] {
+            let manager = manager_with_history(size, n);
+            for (since, until) in [(n + 1, None), (n + 5, None), (n + 1, Some(n + 9))] {
+                let q = manager
+                    .events_in_range("t1", "sub-1", Some(since), until)
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("size {size}, n {n}, since {since}: {e}"));
+                assert!(q.events.is_empty());
+                assert_eq!(q.events_since_start, n);
+            }
+        }
+    }
+
+    #[test]
+    fn events_in_range_evicted_and_partial_ranges() {
+        let manager = manager_with_history(3, 6); // retains 4..=6
+        let evicted = manager
+            .events_in_range("t1", "sub-1", Some(1), Some(2))
+            .unwrap();
+        assert_eq!(
+            evicted.unwrap_err(),
+            RangeError::NoLongerRetained { oldest: Some(4) }
+        );
+        let partial = manager
+            .events_in_range("t1", "sub-1", Some(2), Some(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&partial), vec![4, 5]);
+    }
+
+    #[test]
+    fn events_in_range_with_history_disabled() {
+        let manager = manager_with_history(0, 3);
+        let all = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.events_since_start, 3, "numbering still works");
+        assert!(all.events.is_empty());
+        let err = manager
+            .events_in_range("t1", "sub-1", Some(1), Some(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err, RangeError::NoLongerRetained { oldest: None });
+    }
+
+    #[test]
+    fn events_in_range_unknown_subscription_is_none() {
+        let manager = manager_with_history(3, 1);
+        assert!(manager.events_in_range("t1", "nope", None, None).is_none());
+    }
+
+    #[test]
+    fn history_is_kept_on_edit_and_reset_on_rearm() {
+        let manager = manager_with_history(10, 3);
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("edit");
+        let kept = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&kept), vec![1, 2, 3]);
+
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("rearm");
+        let reset = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.events_since_start, 0);
+        assert!(reset.events.is_empty());
+    }
+
+    #[test]
+    fn stale_snapshot_records_no_history() {
+        let manager = manager_with_history(10, 1);
+        let old = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager
+            .register_snapshot(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+                Some("2"),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.record_event_if_current(&old, chrono::Utc::now(), "Encounter/z".to_string()),
+            None
+        );
+        let q = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&q), vec![1]);
+    }
+
+    #[test]
+    fn history_is_tenant_scoped() {
+        let registry = create_test_registry("t1");
+        registry.add_topic(
+            "t2",
+            registry
+                .get_topic("t1", "http://example.org/topic/encounter-start")
+                .unwrap(),
+        );
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+        for t in ["t1", "t2"] {
+            manager
+                .register(
+                    t,
+                    "sub-1",
+                    &subscription_with_status("requested"),
+                    FhirVersion::default(),
+                )
+                .unwrap();
+            manager
+                .update_status(t, "sub-1", SubscriptionStatusCode::Active)
+                .unwrap();
+        }
+        let snapshot = manager.get_snapshot("t1", "sub-1").unwrap();
+        manager
+            .record_event_if_current(&snapshot, chrono::Utc::now(), "Encounter/a".to_string())
+            .unwrap();
+        let t1 = manager
+            .events_in_range("t1", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        let t2 = manager
+            .events_in_range("t2", "sub-1", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(numbers(&t1), vec![1]);
+        assert!(t2.events.is_empty());
+        assert_eq!(t2.events_since_start, 0);
+    }
+
     /// An edit that does not change the status must not reset the counters.
     /// This is the client-PUT circuit-breaker reset: before #357, adding a
     /// filter or rotating a header re-armed the server against an endpoint it
@@ -2219,7 +2640,10 @@ pub(crate) mod tests {
         assert!(!manager.is_current(&old));
         assert!(manager.is_current(&replacement));
         assert!(!old.generation.same_generation(&replacement.generation));
-        assert_eq!(manager.increment_event_count_if_current(&old), None);
+        assert_eq!(
+            manager.record_event_if_current(&old, chrono::Utc::now(), "Encounter/x".to_string()),
+            None
+        );
         assert_eq!(manager.record_failure_if_current(&old), None);
         assert!(!manager.reset_failures_if_current(&old));
         assert_eq!(
@@ -2234,7 +2658,11 @@ pub(crate) mod tests {
         assert_eq!(current.consecutive_failures, 2);
         assert_eq!(current.status, SubscriptionStatusCode::Active);
         assert_eq!(
-            manager.increment_event_count_if_current(&replacement),
+            manager.record_event_if_current(
+                &replacement,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
             Some(8)
         );
 
@@ -2250,7 +2678,14 @@ pub(crate) mod tests {
         assert!(replacement.generation.is_cancelled());
         assert_eq!(rearmed.subscription.events_since_start, 0);
         assert_eq!(rearmed.subscription.consecutive_failures, 0);
-        assert_eq!(manager.increment_event_count_if_current(&rearmed), None);
+        assert_eq!(
+            manager.record_event_if_current(
+                &rearmed,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2319,7 +2754,14 @@ pub(crate) mod tests {
             !snapshot.generation.is_cancelled(),
             "admitted jobs drain through error"
         );
-        assert_eq!(manager.increment_event_count_if_current(&snapshot), None);
+        assert_eq!(
+            manager.record_event_if_current(
+                &snapshot,
+                chrono::Utc::now(),
+                "Encounter/x".to_string()
+            ),
+            None
+        );
         assert_eq!(manager.record_failure_if_current(&snapshot), Some(2));
         assert!(manager.reset_failures_if_current(&snapshot));
         assert!(!manager.is_current_status(&snapshot, SubscriptionStatusCode::Active));

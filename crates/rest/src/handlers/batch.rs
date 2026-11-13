@@ -24,7 +24,7 @@ use helios_persistence::core::{
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
     EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
     RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
-    apply_patch_for_version, bundle_if_match_gate, conditional_update_entry,
+    apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
     decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
 };
 use helios_persistence::error::{
@@ -835,13 +835,15 @@ where
     // above, and their query strings are searches, not conditional references.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
-    // Write-path validation: transactions are atomic, so any invalid write
-    // entry rejects the whole bundle before anything executes.
-    for (index, entry, _) in &indexed_entries {
+    // Empty-element cleanup (#2554) and write-path validation: transactions
+    // are atomic, so any invalid write entry rejects the whole bundle before
+    // anything executes. A PATCH entry's document is not stored; its result
+    // is cleaned by the patch engine.
+    for (index, entry, _) in &mut indexed_entries {
         if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
             continue;
         }
-        let Some(resource) = &entry.resource else {
+        let Some(resource) = entry.resource.as_mut() else {
             continue;
         };
         let (resource_type, _) =
@@ -850,7 +852,7 @@ where
             })?;
         state
             .validation()
-            .check_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
+            .prepare_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
             .await?;
     }
 
@@ -966,6 +968,7 @@ where
                     &deferred.compartment,
                     deferred.target,
                     prefer.is_strict(),
+                    entry.if_none_match.as_deref(),
                 )
                 .await;
                 deferred_results.push((index, entry, result));
@@ -1304,7 +1307,17 @@ where
         return entry_failure(missing_url(index));
     };
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
+    let if_none_match = request.get("ifNoneMatch").and_then(|v| v.as_str());
     let if_none_exist = request.get("ifNoneExist").and_then(|v| v.as_str());
+
+    // A URL that names an operation is refused before anything reads it as a
+    // type, an id or a search: the URL parsers below keep only the first or the
+    // last two segments and would answer `GET Patient/p1/$everything` as a read
+    // of `Patient/p1` (#868). The transaction arm refuses the same URLs through
+    // `parse_bundle_entry`, with the same error.
+    if let Err(refusal) = refuse_operation_url(&method, url) {
+        return entry_failure(refusal.into_rest_error(index));
+    }
 
     // Parse the URL to extract resource type and ID
     let (resource_type, id) = match parse_bundle_request_url(&method, url) {
@@ -1445,6 +1458,7 @@ where
                 &compartment,
                 get_target.expect("GET entries are classified above"),
                 strict,
+                if_none_match,
             )
             .await
         }
@@ -1490,7 +1504,12 @@ where
             // `processing`, which is the lossiest case in #504.
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);
@@ -1576,7 +1595,7 @@ where
         }
         BundleMethod::Put => {
             // Update operation
-            let resource = match entry.get("resource") {
+            let mut resource = match entry.get("resource") {
                 Some(r) => r.clone(),
                 None => {
                     // See the POST arm: `invalid` rather than `required`,
@@ -1609,7 +1628,12 @@ where
 
                 if let Err(e) = state
                     .validation()
-                    .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                    .prepare_write(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        &resource_type,
+                        &mut resource,
+                    )
                     .await
                 {
                     // Same funnel as the unconditional PUT below: the
@@ -1710,7 +1734,12 @@ where
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
-                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .prepare_write(
+                    tenant.tenant_id(),
+                    fhir_version,
+                    &resource_type,
+                    &mut resource,
+                )
                 .await
             {
                 return entry_failure(e);
@@ -2791,6 +2820,144 @@ fn parse_entry_method(request: &Value) -> Result<BundleMethod, EntryMethodRefusa
     }
 }
 
+/// Why a bundle entry's `request.url` was refused for what it says about an
+/// operation (#868).
+///
+/// A URL whose **last** path segment begins with `$` names an operation
+/// (`$lookup`, `[type]/$expand`, `[type]/[id]/$everything`), which a Bundle
+/// entry does not dispatch. It is refused honestly rather than left to the
+/// entry parsers, which know only resources: the POST parser takes the last
+/// segment for a resource type, the GET parser keeps the first two segments of
+/// an address and so answered `GET Patient/p1/$everything` as a read of
+/// `Patient/p1`, and the backends' transaction parser takes the last two
+/// segments of any URL as `[type]/[id]`.
+///
+/// Like [`EntryMethodRefusal`], the refusal carries its own status and wording,
+/// so the batch arm (a per-entry outcome) and the transaction arm (the
+/// whole-bundle error) cannot disagree about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationUrlRefusal {
+    /// The last path segment names an operation. Carries the operation as
+    /// spelled (`$lookup`), the entry's HTTP method and its URL as sent.
+    Operation {
+        operation: String,
+        method: &'static str,
+        url: String,
+    },
+    /// A segment other than the last begins with `$`. No FHIR URL has an
+    /// operation name before its end, and an id cannot begin with `$`, so the
+    /// URL is malformed and is not guessed at.
+    MisplacedOperation { segment: String, url: String },
+}
+
+impl OperationUrlRefusal {
+    /// Renders the refusal as the error **both** arms report.
+    ///
+    /// An operation is `501` + `not-supported` ([`RestError::NotImplemented`]):
+    /// a spec-defined interaction the server does not dispatch from a Bundle
+    /// entry yet, which is that variant's documented meaning, and the status
+    /// the transaction arm already answers for an entry its backend cannot
+    /// honour (a conditional interaction on a backend that cannot resolve it
+    /// inside a transaction). A client reading it learns the operation exists
+    /// and is not available *here*; the guidance says where it is.
+    ///
+    /// A misplaced `$` segment is `400` + `value`, as every other malformed
+    /// entry URL is.
+    fn into_rest_error(self, index: usize) -> RestError {
+        match self {
+            // `NotImplemented` renders "Feature '{feature}' is not implemented.",
+            // so the text is a clause that reads inside it, as the conditional
+            // refusal's does. It names the client's entry index: both arms call
+            // this before entries are reordered.
+            Self::Operation {
+                operation,
+                method,
+                url,
+            } => RestError::NotImplemented {
+                feature: format!(
+                    "operation {operation} is not supported in Bundle entries \
+                     (entry {index}: {method} {url}); invoke it directly against the REST API"
+                ),
+            },
+            Self::MisplacedOperation { segment, url } => RestError::InvalidElementValue {
+                message: format!(
+                    "Entry {index}: request.url '{url}' has the segment '{segment}' before its \
+                     last path segment. A '$' segment names an operation and can only end a URL."
+                ),
+            },
+        }
+    }
+}
+
+/// Refuses a Bundle entry URL that names an operation, or that puts a `$`
+/// segment where none can be (#868).
+///
+/// This is the one place the URL's `$` segments are judged, and both bundle
+/// arms call it, for **every** method, before anything parses the URL as a
+/// resource type, an id or a search. The query string is not part of the path,
+/// so `Observation/$lastn?max=3` is an operation and `Patient?name=$x` is
+/// still a search. A leading `/`, an absolute `http(s)` URL with a base path,
+/// and a percent-encoded `%24` for the `$` are the same operation, because the
+/// direct route would decode them to it.
+///
+/// A `$` segment is an operation only as the last one. A `$` anywhere else is a
+/// malformed URL, not an operation: valid FHIR ids are `[A-Za-z0-9\-.]{1,64}`,
+/// so no id begins with `$` either.
+fn refuse_operation_url(method: &BundleMethod, url: &str) -> Result<(), OperationUrlRefusal> {
+    let path = entry_url_path(url);
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(last) = segments.pop() else {
+        return Ok(());
+    };
+
+    if let Some(segment) = segments.into_iter().find(|s| is_operation_segment(s)) {
+        return Err(OperationUrlRefusal::MisplacedOperation {
+            segment: operation_name(segment),
+            url: url.to_string(),
+        });
+    }
+    if is_operation_segment(last) {
+        return Err(OperationUrlRefusal::Operation {
+            operation: operation_name(last),
+            method: bundle_method_to_http_method(method),
+            url: url.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The path of an entry URL, without its query: the part `$` segments are read in.
+///
+/// An absolute `http(s)` URL contributes its path (the base path included);
+/// anything else is taken as written, as the entry URL parsers take it.
+fn entry_url_path(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed.path().to_string(),
+        _ => url
+            .split_once('?')
+            .map_or(url, |(path, _)| path)
+            .to_string(),
+    }
+}
+
+/// Whether a path segment is an operation name: it begins with `$`, written
+/// plainly or percent-encoded (`%24`, either case of the hex digits).
+fn is_operation_segment(segment: &str) -> bool {
+    segment.starts_with('$')
+        || segment
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%24"))
+}
+
+/// The operation name of a segment [`is_operation_segment`] accepted, with a
+/// percent-encoded `$` written plainly (`%24lookup` -> `$lookup`).
+fn operation_name(segment: &str) -> String {
+    match segment.get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("%24") => format!("${}", &segment[3..]),
+        _ => segment.to_string(),
+    }
+}
+
 /// Why a bundle entry could not be parsed at all.
 ///
 /// Split from a bare `String` so the method refusal keeps its status across the
@@ -2806,12 +2973,16 @@ enum EntryParseError {
     /// `Bundle.entry.request.url` is present but names nothing a mutation
     /// can address (from [`canonical_bundle_mutation_url`]).
     MalformedUrl(String),
+    /// `Bundle.entry.request.url` names an operation, or puts a `$` segment
+    /// where no operation can be (#868).
+    OperationUrl(OperationUrlRefusal),
 }
 
 impl EntryParseError {
     fn into_rest_error(self, index: usize) -> RestError {
         match self {
             Self::Method(refusal) => refusal.into_rest_error(index),
+            Self::OperationUrl(refusal) => refusal.into_rest_error(index),
             // Both arms now reach the same helper, so an absent element is
             // described once rather than by whichever arm noticed it first.
             Self::MissingRequest => missing_request(index),
@@ -3026,12 +3197,19 @@ impl GetEntryTarget {
 /// URL is answered one way whichever Bundle it arrives in. A vread and a
 /// history read go through [`execute_vread`] and [`execute_history_bundle`], the
 /// code the direct handlers call (#2380).
+///
+/// `if_none_match` is the entry's `ifNoneMatch`, honoured on an instance read
+/// only (#869): `GET [type]/[id]` answers `If-None-Match` and the other three
+/// targets do not, so neither does their entry. The transaction arm runs an
+/// instance read inside the storage transaction, not here; the backends reach
+/// the same answer through [`bundle_read_result`].
 async fn execute_get_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
     target: GetEntryTarget,
     strict: bool,
+    if_none_match: Option<&str>,
 ) -> BundleEntryResult
 where
     S: ResourceStorage
@@ -3082,7 +3260,7 @@ where
                     stored.content(),
                     "read",
                 ) {
-                    Ok(()) => BundleEntryResult::ok(stored),
+                    Ok(()) => bundle_read_result(stored, if_none_match),
                     Err(e) => entry_failure(e),
                 },
                 // The one expression this PR changes on the arm #478/#481 is
@@ -3258,6 +3436,7 @@ fn status_text(code: &str) -> &'static str {
         "200" => "OK",
         "201" => "Created",
         "204" => "No Content",
+        "304" => "Not Modified",
         "400" => "Bad Request",
         "401" => "Unauthorized",
         "403" => "Forbidden",
@@ -3484,6 +3663,12 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
         .and_then(|v| v.as_str())
         .ok_or(EntryParseError::MissingUrl)?
         .to_string();
+    // Before the URL is canonicalized, and for every method:
+    // `canonical_bundle_mutation_url` keeps the last one or two segments of a
+    // mutation URL, and a GET URL goes to the backend as written, so either
+    // would act on part of an operation URL (#868). The batch arm calls the
+    // same function.
+    refuse_operation_url(&method, &raw_url).map_err(EntryParseError::OperationUrl)?;
     let url = if matches!(
         method,
         BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
@@ -5119,8 +5304,9 @@ mod tests {
         MultipleMatches(usize),
         Unsupported,
         /// The storage declares no conditional interaction at all
-        /// (`supports_conditional` is `false`), as S3 does. Its methods are
-        /// unscripted: reaching one panics.
+        /// (`supports_conditional` is `false`), as S3 does for update, delete
+        /// and patch (it declares only an identifier-scoped create, #1435).
+        /// Its methods are unscripted: reaching one panics.
         Undeclared,
     }
 
@@ -5801,6 +5987,204 @@ mod tests {
         for url in ["", "/", "?identifier=x"] {
             assert!(parse_request_url(url).is_err(), "url: {url}");
         }
+    }
+
+    fn operation_refusal(method: BundleMethod, url: &str) -> Option<OperationUrlRefusal> {
+        refuse_operation_url(&method, url).err()
+    }
+
+    /// A URL whose last segment begins with `$` names an operation, in every
+    /// shape the spec gives one (`$op`, `[type]/$op`, `[type]/[id]/$op`), with
+    /// or without a query, on any method, relative or absolute, plain or with
+    /// the `$` percent-encoded (#868).
+    #[test]
+    fn refuse_operation_url_names_the_operation_at_the_end_of_any_shape() {
+        for (method, url, operation) in [
+            (BundleMethod::Post, "$diff", "$diff"),
+            (BundleMethod::Post, "/$export", "$export"),
+            (BundleMethod::Post, "ValueSet/$lookup", "$lookup"),
+            (
+                BundleMethod::Get,
+                "ValueSet/$expand?url=http://x/vs",
+                "$expand",
+            ),
+            (BundleMethod::Get, "Observation/$lastn?max=3", "$lastn"),
+            (BundleMethod::Get, "Patient/123/$everything", "$everything"),
+            (
+                BundleMethod::Post,
+                "Patient/123/$everything?_count=5",
+                "$everything",
+            ),
+            (BundleMethod::Put, "Patient/123/$purge", "$purge"),
+            (BundleMethod::Patch, "Patient/123/$purge", "$purge"),
+            (BundleMethod::Delete, "Patient/123/$expunge", "$expunge"),
+            (
+                BundleMethod::Get,
+                "Patient/123/%24everything",
+                "$everything",
+            ),
+            (
+                BundleMethod::Get,
+                "Patient/123/%24Everything",
+                "$Everything",
+            ),
+            (
+                BundleMethod::Get,
+                "http://example.test/fhir/Patient/123/$everything",
+                "$everything",
+            ),
+            (
+                BundleMethod::Post,
+                "https://example.test/fhir/ValueSet/$lookup?x=1",
+                "$lookup",
+            ),
+        ] {
+            match operation_refusal(method, url) {
+                Some(OperationUrlRefusal::Operation {
+                    operation: found,
+                    url: echoed,
+                    ..
+                }) => {
+                    assert_eq!(found, operation, "url: {url}");
+                    assert_eq!(echoed, url, "the URL is echoed as sent");
+                }
+                other => panic!("{method} {url}: expected an operation refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Nothing that is a resource URL is taken for an operation: a `$` in the
+    /// query is a search value, and the URL shapes the entry parsers accept
+    /// pass through untouched.
+    #[test]
+    fn refuse_operation_url_leaves_resource_urls_alone() {
+        for (method, url) in [
+            (BundleMethod::Post, "Patient"),
+            (BundleMethod::Get, "Patient"),
+            (BundleMethod::Get, "/Patient/123"),
+            (BundleMethod::Get, "Patient?name=$x&_sort=$y"),
+            (BundleMethod::Get, "Patient?name=%24x"),
+            (BundleMethod::Get, "Patient/123/_history/1"),
+            (BundleMethod::Get, "_history"),
+            (
+                BundleMethod::Put,
+                "Patient?identifier=http:/example.org/fhir/ids|456456",
+            ),
+            (BundleMethod::Delete, "Patient/123"),
+            (BundleMethod::Post, "http://example.test/fhir/Patient"),
+            (
+                BundleMethod::Get,
+                "urn:uuid:61ebe359-bfdc-4613-8bf2-c5e300945f0a",
+            ),
+            // Empty and whitespace-only paths are for the entry parsers to refuse.
+            (BundleMethod::Get, ""),
+            (BundleMethod::Get, "/"),
+            (BundleMethod::Get, "?name=x"),
+            // `%24` is only an escape for `$` at the start of a segment; it is
+            // the same character mid-segment and is no operation name.
+            (BundleMethod::Get, "Patient/12%243"),
+            (BundleMethod::Get, "Patient/a$b"),
+            // Short and multi-byte segments must not trip the prefix test.
+            (BundleMethod::Get, "Patient/%2"),
+            (BundleMethod::Get, "Patient/\u{e9}\u{e9}"),
+        ] {
+            assert_eq!(operation_refusal(method, url), None, "{method} {url}");
+        }
+    }
+
+    /// A `$` segment before the last is no operation: no FHIR URL has one, and an
+    /// id cannot begin with `$`. It is refused as malformed, naming the segment.
+    #[test]
+    fn refuse_operation_url_rejects_a_dollar_segment_before_the_last() {
+        for url in [
+            "$everything/Patient",
+            "Patient/$everything/123",
+            "Patient/$everything/_history",
+            "http://example.test/fhir/$export/Patient",
+            "Patient/%24everything/123",
+        ] {
+            match operation_refusal(BundleMethod::Get, url) {
+                Some(OperationUrlRefusal::MisplacedOperation {
+                    segment,
+                    url: echoed,
+                }) => {
+                    assert!(segment.starts_with('$'), "url: {url}: {segment}");
+                    assert_eq!(echoed, url);
+                }
+                other => panic!("{url}: expected a malformed-URL refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// An operation is `501` + `not-supported` naming the operation, the
+    /// client's entry index, the method and the URL; a misplaced `$` is the
+    /// `400` + `value` every other malformed entry URL is. Both are rendered by
+    /// the one `RestError` mapping the response body and the per-entry outcome
+    /// share, so the arms cannot differ.
+    #[test]
+    fn operation_url_refusal_renders_its_status_code_and_wording() {
+        let (status, outcome) = refuse_operation_url(&BundleMethod::Post, "ValueSet/$lookup")
+            .unwrap_err()
+            .into_rest_error(7)
+            .client_outcome();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        let issue = &outcome["issue"][0];
+        assert_eq!(issue["code"], "not-supported");
+        let text = issue["details"]["text"].as_str().unwrap();
+        for needle in [
+            "$lookup",
+            "not supported in Bundle entries",
+            "entry 7",
+            "POST ValueSet/$lookup",
+            "invoke it directly against the REST API",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}: {text}");
+        }
+        assert!(!text.to_lowercase().contains("resource type"), "{text}");
+
+        let (status, outcome) = refuse_operation_url(&BundleMethod::Get, "$everything/Patient")
+            .unwrap_err()
+            .into_rest_error(3)
+            .client_outcome();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(outcome["issue"][0]["code"], "value");
+        let text = outcome["issue"][0]["details"]["text"].as_str().unwrap();
+        assert!(text.starts_with("Entry 3:"), "{text}");
+        assert!(text.contains("'$everything'"), "{text}");
+    }
+
+    /// The transaction arm's parser is the choke point for every method: a
+    /// mutation URL is canonicalized to its last one or two segments and a GET
+    /// URL is passed on as written, so each would act on part of an operation
+    /// URL if it were not refused first.
+    #[test]
+    fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
+        for (method, url) in [
+            ("GET", "Patient/p1/$everything"),
+            ("GET", "ValueSet/$expand?url=x"),
+            ("POST", "ValueSet/$lookup"),
+            ("POST", "$diff"),
+            ("PUT", "Patient/p1/$purge"),
+            ("PATCH", "Patient/p1/$purge"),
+            ("DELETE", "Patient/p1/$expunge"),
+        ] {
+            let entry = serde_json::json!({
+                "request": { "method": method, "url": url },
+                "resource": { "resourceType": "Parameters" }
+            });
+            match parse_bundle_entry(&entry) {
+                Err(EntryParseError::OperationUrl(OperationUrlRefusal::Operation { .. })) => {}
+                other => panic!("{method} {url}: expected an operation refusal, got {other:?}"),
+            }
+        }
+
+        // A method that is refused wins over the URL, as in the batch arm.
+        let head =
+            serde_json::json!({ "request": { "method": "HEAD", "url": "Patient/p1/$everything" } });
+        assert!(matches!(
+            parse_bundle_entry(&head),
+            Err(EntryParseError::Method(EntryMethodRefusal::Head))
+        ));
     }
 
     /// The notice kind a committed transaction write announces (#1023). A POST

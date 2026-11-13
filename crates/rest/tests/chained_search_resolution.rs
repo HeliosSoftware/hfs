@@ -82,8 +82,9 @@ async fn search_ids(
     ids
 }
 
-/// `system|` on a chained or reverse-chained token terminal selects every code
-/// in that system, and nothing from another system.
+/// `system|` on a chained or reverse-chained token terminal, or on the `_has`
+/// a chain ends in, selects every code in that system, and nothing from
+/// another system.
 async fn assert_system_only_chains(server: &TestServer) {
     for (resource_type, key, value, expected) in [
         (
@@ -115,6 +116,19 @@ async fn assert_system_only_chains(server: &TestServer) {
         (
             "Patient",
             "_has:Observation:subject:code",
+            "http://unused.example|",
+            &[][..],
+        ),
+        // #2556: a chain that ends in `_has` has the same terminal.
+        (
+            "Observation",
+            "subject:Patient._has:Observation:subject:code",
+            "http://loinc.org|",
+            &["ob1"][..],
+        ),
+        (
+            "Observation",
+            "subject:Patient._has:Observation:subject:code",
             "http://unused.example|",
             &[][..],
         ),

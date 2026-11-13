@@ -1173,6 +1173,7 @@ async fn run_select_with_timeout(
         interrupt.interrupt();
     });
     let (engine, exec_result) = tokio::task::spawn_blocking(move || {
+        let mut engine = engine;
         let r = engine.execute_select(&sql, &bindings, max_rows);
         (engine, r)
     })

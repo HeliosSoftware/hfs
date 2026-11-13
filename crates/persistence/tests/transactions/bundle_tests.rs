@@ -130,6 +130,54 @@ async fn transaction_patch_updates_one_version_and_etag() {
     assert_eq!(stored.content()["name"][0]["family"], "After");
 }
 
+/// #2554: a transaction PATCH that deletes the only `name` stores the
+/// resource without `name`, not with `"name": []`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_result_is_stored_without_empty_elements() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({
+                "resourceType": "Patient", "id": "p1", "active": true,
+                "name": [{"family": "Before"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let delete_name = json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "operation", "part": [
+            {"name": "type", "valueCode": "delete"},
+            {"name": "path", "valueString": "Patient.name[0]"}
+        ]}]
+    });
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry("p1", delete_name, None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 200);
+    let stored = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.content(),
+        &json!({"resourceType": "Patient", "id": "p1", "active": true})
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn transaction_patch_overlapping_an_earlier_put_rolls_back() {
@@ -1445,6 +1493,65 @@ async fn test_bundle_entry_effects() {
         .sum();
     assert_eq!(delta, 0, "one create and one delete");
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 3);
+}
+
+/// A transaction `GET [type]/[id]` entry runs inside the backend, so its
+/// `ifNoneMatch` is evaluated there (#869): a tag naming the current version
+/// answers `304` with no resource, any other tag answers the full read.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_get_if_none_match() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "inm",
+            json!({"resourceType": "Patient", "id": "inm"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let get = |if_none_match: Option<&str>| BundleEntry {
+        method: BundleMethod::Get,
+        url: "Patient/inm".to_string(),
+        if_none_match: if_none_match.map(str::to_string),
+        ..Default::default()
+    };
+    let entries = vec![
+        get(None),
+        get(Some("W/\"1\"")),
+        get(Some("\"1\"")),
+        get(Some("*")),
+        get(Some("W/\"7\", W/\"1\"")),
+        get(Some("W/\"2\"")),
+        get(Some("not-a-tag")),
+    ];
+
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let statuses: Vec<u16> = result.entries.iter().map(|e| e.status).collect();
+    assert_eq!(statuses, vec![200, 304, 304, 304, 304, 200, 200]);
+
+    for (index, entry) in result.entries.iter().enumerate() {
+        assert_eq!(entry.effect, BundleEntryEffect::Read, "entry {index}");
+        if entry.status == 304 {
+            assert!(entry.resource.is_none(), "entry {index}: no body on 304");
+            assert!(entry.outcome.is_none(), "entry {index}: not a failure");
+        } else {
+            assert_eq!(
+                entry.resource.as_ref().and_then(|r| r["id"].as_str()),
+                Some("inm"),
+                "entry {index}: full read"
+            );
+            assert_eq!(entry.etag.as_deref(), Some("W/\"1\""), "entry {index}");
+        }
+    }
 }
 
 /// Test bundle with if-match failure.

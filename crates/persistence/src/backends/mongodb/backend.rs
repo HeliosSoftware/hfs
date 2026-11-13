@@ -33,6 +33,18 @@ use crate::search::{
 type StoredByTenant =
     Arc<RwLock<std::collections::HashMap<String, Vec<SearchParameterDefinition>>>>;
 
+/// Per `(tenant, type)`: the fingerprint the last `:missing=true` probe ran
+/// under and which parameters it found fresh (#1999), shared by every clone
+/// of the backend.
+type MissingMetaFresh = Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (String, String),
+            (String, super::missing_fingerprint::MissingFreshness),
+        >,
+    >,
+>;
+
 use super::schema;
 
 /// Builds a MongoDB client from a backend configuration.
@@ -154,14 +166,20 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 /// Composite search parameters are served via a grouped
 /// `(resource_id, composite_group)` pair check (#1206); forward/reverse
 /// chains remain unsupported.
+/// Cheap to clone: every field is a shared handle, so clones share the
+/// client, the registries, the gates and the lazily built extraction pool.
+/// The bulk-submit stream driver clones it into its batch writer tasks.
+#[derive(Clone)]
 pub struct MongoBackend {
     /// Bounded index-row observations used only to choose query execution order.
     pub(super) probe_cache: super::probe_cache::ProbeCache,
     /// Per-tenant cache of the `tuple_code` completeness marker.
-    pub(super) composite_marker_cache: super::composite_layout::MarkerCache,
+    pub(super) composite_marker_cache: Arc<super::composite_layout::MarkerCache>,
     /// The Bulk Data Submit writes of each manifest that are running on this
     /// instance (see [`super::bulk_submit::ManifestWritesInFlight`], #2310).
-    pub(super) manifest_writes: super::bulk_submit::ManifestWritesInFlight,
+    /// Shared (`Arc`) so the clones the bulk-submit stream driver hands its
+    /// batch writer tasks register their writes where the lease keeper looks.
+    pub(super) manifest_writes: Arc<super::bulk_submit::ManifestWritesInFlight>,
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
     /// pools, so each backend instance must reuse one client. Wrapped in an
@@ -198,16 +216,16 @@ pub struct MongoBackend {
     /// Rayon pool for `$reindex` sub-batch extraction; built lazily and only
     /// on a multi-thread runtime (#1403). `Err` remembers a failed build so
     /// the one warning fires once.
-    prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
+    prepare_pool: Arc<std::sync::OnceLock<Result<rayon::ThreadPool, String>>>,
     /// The one-permit admission gate for `prepare_pool` (#1403).
-    prepare_gate: tokio::sync::Semaphore,
+    prepare_gate: Arc<tokio::sync::Semaphore>,
     /// Permits for potentially broad standard searches (#1748), sized by
     /// [`MongoBackendConfig::broad_search_concurrency`]; `None` when it is
     /// unset, so no search waits.
-    broad_search_gate: Option<tokio::sync::Semaphore>,
+    broad_search_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
-    reindex_mode_logged: std::sync::atomic::AtomicBool,
+    reindex_mode_logged: Arc<std::sync::atomic::AtomicBool>,
     /// The last answer a write's topology check (`hello`) got. A transactional
     /// answer is kept, so later single-resource writes and transaction Bundles
     /// skip the check until a refused transaction, a failed transaction start, a
@@ -217,29 +235,28 @@ pub struct MongoBackend {
     /// change (#2258). Shared with the client's SDAM handler, hence the `Arc`.
     pub(super) write_topology: Arc<super::storage::WriteTopologyMemo>,
     /// Bounds how many transaction Bundles run at once (#1776).
-    transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
+    transaction_bundle_gate: Arc<super::transaction_bundle_gate::TransactionBundleGate>,
     /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
     /// a Bundle of at least this many entries writes its search rows after the
     /// commit; `None` never defers (#1975). Read through
     /// [`MongoBackend::deferred_search_index_min_entries`].
     deferred_index_min_entries: Option<usize>,
+    /// What this instance's post-commit search-row steps have done so far,
+    /// read through [`MongoBackend::deferred_index_step_totals`] (#2036).
+    /// Shared (`Arc`) so a clone's steps count toward the same totals.
+    pub(super) deferred_step_counters: Arc<super::deferred_step_totals::DeferredStepCounters>,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
-    reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    reindex_docs_per_resource: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
     /// Per `(tenant, type)`: the fingerprint the last `:missing=true` probe
     /// ran under and which parameters it found fresh (#1999).
-    pub(super) missing_meta_fresh: parking_lot::RwLock<
-        std::collections::HashMap<
-            (String, String),
-            (String, super::missing_fingerprint::MissingFreshness),
-        >,
-    >,
+    pub(super) missing_meta_fresh: MissingMetaFresh,
     /// Fingerprints this process has recorded (or is recording) in
     /// `missing_params_fingerprints`.
     pub(super) recorded_missing_fps: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// The runtime fingerprint records are spawned on, for stamps computed
     /// off-runtime on the `$reindex` rayon pool.
-    pub(super) missing_fp_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    pub(super) missing_fp_runtime: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
 }
 
 impl Debug for MongoBackend {
@@ -280,7 +297,7 @@ impl MongoBackend {
     /// Permits for potentially broad standard searches (#1748); `None` when
     /// no limit is configured.
     pub(super) fn broad_search_gate(&self) -> Option<&tokio::sync::Semaphore> {
-        self.broad_search_gate.as_ref()
+        self.broad_search_gate.as_deref()
     }
 
     /// `(resources, docs)` of this type's previous successful overlapped
@@ -451,6 +468,15 @@ pub struct MongoBackendConfig {
     /// against a failpoint raise it so a slow runner cannot end the page early.
     #[serde(default = "default_reindex_page_budget")]
     pub reindex_page_budget: Duration,
+
+    /// `search_index` `insert` commands in flight for one `$bulk-submit`
+    /// batch indexed inline (`HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY`,
+    /// default 4, min 1). A batch's index documents are split into that many
+    /// chunks and inserted concurrently, so `mongod` runs the B-tree inserts
+    /// on several threads instead of one connection at a time; the pool
+    /// (`HFS_MONGODB_MAX_CONNECTIONS`) bounds what is actually in flight.
+    #[serde(default = "default_bulk_ingest_index_concurrency")]
+    pub bulk_ingest_index_concurrency: usize,
 
     /// Wall-clock budget for one transaction Bundle, replays and pauses
     /// included (#1586). When the server aborts a transaction with a
@@ -681,6 +707,32 @@ pub struct MongoBackendConfig {
     /// since a loaded CI host can take more than a second to move the majority.
     #[serde(default = "default_settle_read_max_time_ms")]
     pub settle_read_max_time_ms: u64,
+
+    /// The most `resource_history` documents (versions) a `$purge` removes in one
+    /// transaction (#2146). A purge of one resource whose history is longer, and
+    /// a `purge_all` batch whose resources have more versions in all, does not
+    /// use a transaction: the resource is purged one command at a time, as before
+    /// #2146, and a batch is halved.
+    ///
+    /// The REST layer drops a request that outlives `HFS_REQUEST_TIMEOUT`, and
+    /// dropping the request aborts its transaction. A transaction that needs
+    /// longer than that is rolled back on every call and its resource can never
+    /// be purged, unless the cache is too small to hold it (code 388, which is
+    /// also run without a transaction). Counting the versions first is how a long
+    /// history is kept out of one. Only versions are counted: the search rows of
+    /// the resources are not, and neither is the size of anything.
+    ///
+    /// The limit bounds the time a purge transaction takes, not the cache it
+    /// holds. On a small cache a purge under the limit can still be rolled back
+    /// under cache pressure; the purge then runs the transaction once more after
+    /// 100 ms and, if that is rolled back too, runs without a transaction, so it
+    /// does not answer `503` for it.
+    ///
+    /// Default [`DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS`](super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS),
+    /// with the measurement behind it. Must be at least 1: [`MongoBackend::new`]
+    /// rejects `0`. No `HFS_*` variable sets it, like `settle_read_max_time_ms`.
+    #[serde(default = "default_purge_transaction_max_versions")]
+    pub purge_transaction_max_versions: u64,
 }
 
 /// Environment variable that sets
@@ -935,6 +987,29 @@ impl MongoBackendConfig {
         }
         Ok(())
     }
+
+    /// Applies `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` from `env`: the
+    /// number of `search_index` `insert` commands one inline-indexed
+    /// `$bulk-submit` batch keeps in flight. Trimmed; unset or empty leaves
+    /// the field unchanged; anything but a positive integer is an `Err`
+    /// naming the variable.
+    pub fn apply_bulk_ingest_env(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        const NAME: &str = "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY";
+        if let Some(raw) = env(NAME) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.bulk_ingest_index_concurrency = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| format!("{NAME} must be a positive integer; got {raw:?}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_connection_string() -> String {
@@ -971,6 +1046,13 @@ fn default_reindex_catch_up_margin_ms() -> u64 {
 
 fn default_reindex_overlap() -> bool {
     true
+}
+
+/// Measured on the 72k Synthea mix (#945 follow-up): 1 → 4 concurrent
+/// `insert` commands took the inline-indexed ingest from 24.4 s to 18.7 s,
+/// and 8 was only marginally better while using most of the default pool.
+fn default_bulk_ingest_index_concurrency() -> usize {
+    4
 }
 
 fn default_reindex_prefetch() -> bool {
@@ -1017,6 +1099,10 @@ fn default_settle_read_max_time_ms() -> u64 {
     super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
 }
 
+fn default_purge_transaction_max_versions() -> u64 {
+    super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+}
+
 impl Debug for MongoBackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Destructured without `..` so a new field fails to compile until it
@@ -1042,6 +1128,7 @@ impl Debug for MongoBackendConfig {
             reindex_prepare_threads,
             reindex_prefetch,
             reindex_page_budget,
+            bulk_ingest_index_concurrency,
             bundle_transaction_budget,
             bundle_transaction_deadline,
             single_write_deadline,
@@ -1053,6 +1140,7 @@ impl Debug for MongoBackendConfig {
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
             settle_read_max_time_ms,
+            purge_transaction_max_versions,
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
@@ -1078,6 +1166,10 @@ impl Debug for MongoBackendConfig {
             .field("reindex_prepare_threads", reindex_prepare_threads)
             .field("reindex_prefetch", reindex_prefetch)
             .field("reindex_page_budget", reindex_page_budget)
+            .field(
+                "bulk_ingest_index_concurrency",
+                bulk_ingest_index_concurrency,
+            )
             .field("bundle_transaction_budget", bundle_transaction_budget)
             .field("bundle_transaction_deadline", bundle_transaction_deadline)
             .field("single_write_deadline", single_write_deadline)
@@ -1101,6 +1193,10 @@ impl Debug for MongoBackendConfig {
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
             .field("settle_read_max_time_ms", settle_read_max_time_ms)
+            .field(
+                "purge_transaction_max_versions",
+                purge_transaction_max_versions,
+            )
             .finish()
     }
 }
@@ -1148,6 +1244,7 @@ impl Default for MongoBackendConfig {
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
             reindex_page_budget: default_reindex_page_budget(),
+            bulk_ingest_index_concurrency: default_bulk_ingest_index_concurrency(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
             single_write_deadline: None,
@@ -1159,6 +1256,7 @@ impl Default for MongoBackendConfig {
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
             settle_read_max_time_ms: default_settle_read_max_time_ms(),
+            purge_transaction_max_versions: default_purge_transaction_max_versions(),
         }
     }
 }
@@ -1241,6 +1339,13 @@ impl MongoBackend {
                 backend_name: "mongodb".to_owned(),
                 message: "settle_read_max_time_ms must be an integer from 1 to 2147483647"
                     .to_owned(),
+                source: None,
+            }));
+        }
+        if config.purge_transaction_max_versions == 0 {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "purge_transaction_max_versions must be at least 1".to_owned(),
                 source: None,
             }));
         }
@@ -1334,8 +1439,8 @@ impl MongoBackend {
 
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
-            composite_marker_cache: Default::default(),
-            manifest_writes: super::bulk_submit::ManifestWritesInFlight::default(),
+            composite_marker_cache: Arc::default(),
+            manifest_writes: Arc::default(),
             config,
             client: Arc::new(OnceCell::new()),
             pool_stats,
@@ -1346,17 +1451,20 @@ impl MongoBackend {
             missing_index_rx,
             missing_index_tx: Arc::new(tokio::sync::Mutex::new(Some(missing_index_tx))),
             references_normalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
-            transaction_bundle_gate,
+            prepare_pool: Arc::new(std::sync::OnceLock::new()),
+            prepare_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            transaction_bundle_gate: Arc::new(transaction_bundle_gate),
             deferred_index_min_entries,
-            broad_search_gate,
-            reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            deferred_step_counters: Default::default(),
+            broad_search_gate: broad_search_gate.map(Arc::new),
+            reindex_mode_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_topology: Default::default(),
-            reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
-            missing_meta_fresh: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            reindex_docs_per_resource: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            missing_meta_fresh: Arc::default(),
             recorded_missing_fps: Arc::default(),
-            missing_fp_runtime: std::sync::OnceLock::new(),
+            missing_fp_runtime: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -2071,6 +2179,18 @@ impl MongoBackend {
             return None;
         }
         self.deferred_index_min_entries
+    }
+
+    /// What the post-commit search-row steps of deferred transaction Bundles
+    /// (#1975) have done on this instance since it was created: how many ran,
+    /// the rows they wrote, their own wall time, and how many left work to the
+    /// repair (#2036). The same numbers feed the
+    /// `mongodb_deferred_search_index_*` metrics, but these are per instance
+    /// and can be read back: take a snapshot before a Bundle and one after,
+    /// and subtract with
+    /// [`DeferredIndexStepTotals::since`](super::DeferredIndexStepTotals::since).
+    pub fn deferred_index_step_totals(&self) -> super::DeferredIndexStepTotals {
+        self.deferred_step_counters.snapshot()
     }
 }
 
@@ -3179,6 +3299,56 @@ mod tests {
     }
 
     #[test]
+    fn purge_transaction_max_versions_defaults_survives_serde_and_rejects_zero() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(
+            default.purge_transaction_max_versions,
+            super::super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+        );
+        assert!(default.purge_transaction_max_versions >= 1);
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(
+            from_empty.purge_transaction_max_versions,
+            super::super::storage::DEFAULT_PURGE_TRANSACTION_MAX_VERSIONS
+        );
+
+        let config = MongoBackendConfig {
+            purge_transaction_max_versions: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.purge_transaction_max_versions, 3);
+        assert!(
+            format!("{config:?}").contains("purge_transaction_max_versions: 3"),
+            "{config:?}"
+        );
+
+        let err = MongoBackend::new(MongoBackendConfig {
+            purge_transaction_max_versions: 0,
+            ..Default::default()
+        })
+        .expect_err("0 is refused");
+        assert!(
+            err.to_string().contains("purge_transaction_max_versions"),
+            "{err}"
+        );
+        for valid in [1, u64::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    purge_transaction_max_versions: valid,
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
     fn sof_cursor_batch_size_defaults_parses_and_rejects() {
         let default = MongoBackendConfig::default();
         assert_eq!(default.sof_cursor_batch_size, 512);
@@ -3474,6 +3644,39 @@ mod tests {
             back.bundle_transaction_deadline,
             Some(Duration::from_secs(598))
         );
+    }
+
+    #[test]
+    fn apply_bulk_ingest_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        assert_eq!(config.bulk_ingest_index_concurrency, 4);
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(" 8 ".to_string()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        // Unset or blank leaves the field alone.
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(String::new()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        for bad in ["0", "-1", "many"] {
+            let err = config
+                .apply_bulk_ingest_env(|name| match name {
+                    "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(bad.to_string()),
+                    _ => None,
+                })
+                .unwrap_err();
+            assert!(
+                err.contains("HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

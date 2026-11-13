@@ -27,6 +27,7 @@ mod commit_deadline;
 mod composite_layout;
 mod composite_search;
 mod deferred_index;
+mod deferred_step_totals;
 mod login_sessions;
 mod missing_fingerprint;
 mod missing_index_builder;
@@ -50,4 +51,5 @@ mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
 pub use deferred_index::DeferredIndexRepairReport;
+pub use deferred_step_totals::DeferredIndexStepTotals;
 pub use search_index_builder::{BuildOutcome, IndexBuildMode};

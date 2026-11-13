@@ -205,6 +205,24 @@ async fn missing_container_yields_an_empty_result() {
     assert!(ids(&server, "/Patient?_in=nope").await.is_empty());
 }
 
+/// #2556: a chain whose last step is `_has`, R5's own example shape, on an R5
+/// server. Every Observation is p1's, and `g1` lists p1; `gdef` lists nobody.
+#[tokio::test]
+async fn chain_ending_in_has_resolves_on_r5() {
+    let (server, backend) = create_test_server().await;
+    seed(&backend).await;
+
+    assert_eq!(
+        ids(&server, "/Observation?patient._has:Group:member:_id=g1").await,
+        ["o1", "o2"]
+    );
+    assert!(
+        ids(&server, "/Observation?patient._has:Group:member:_id=gdef")
+            .await
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn compartment_search_resolves_membership() {
     let (server, backend) = create_test_server().await;
@@ -232,6 +250,12 @@ async fn unsupported_forms_are_refused_explicitly() {
         "/Patient?_in=List/l1&_contained=true",
         "/Observation?patient._in=List/l1",
         "/Patient?_has:Observation:patient:_in=List/ol",
+        "/Patient?_has:Observation:patient:_in:List=ol",
+        // #2556: nor in the `_has` a chain ends in, qualified or nested.
+        "/Observation?patient._has:Observation:patient:_in=List/ol",
+        "/Encounter?patient._has:Group:member:_in:List=l1",
+        "/Encounter?patient._has:Group:member:_in:Group=g1",
+        "/Encounter?patient._has:Observation:subject:_has:Group:member:_in:List=l1",
         "/Patient?_in:not=List/l1",
         "/Patient?_in=Patient/p1",
         "/Patient?_in=Group/gdef",

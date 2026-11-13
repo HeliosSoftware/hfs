@@ -693,5 +693,93 @@ class PerLegCharts(unittest.TestCase):
 
 
 
+class VersionTrend(unittest.TestCase):
+    """--version-dir: one run per earlier release tag, only on a release-tag run."""
+
+    def test_version_key(self):
+        k = history.version_key
+        self.assertIsNone(k("main"))
+        self.assertIsNone(k("feat/v1.2.3"))
+        self.assertIsNone(k("v1.2"))
+        self.assertLess(k("v0.2.9"), k("v0.2.10"))
+        self.assertLess(k("v0.10.0-rc1"), k("v0.10.0"))
+        self.assertLess(k("v0.9.9"), k("v0.10.0-rc1"))
+
+    def _payload(self):
+        runs = [  # newest first, as the API returns them
+            {"id": 90, "head_branch": "v0.2.9", "conclusion": "success", "created_at": "2026-11-16T10:00:00Z"},
+            {"id": 81, "head_branch": "v0.2.8", "conclusion": "success", "created_at": "2026-11-09T12:00:00Z"},
+            {"id": 80, "head_branch": "v0.2.8", "conclusion": "success", "created_at": "2026-11-09T10:00:00Z"},
+            {"id": 77, "head_branch": "main", "conclusion": "success", "created_at": "2026-11-05T10:00:00Z"},
+            {"id": 71, "head_branch": "v0.2.7", "conclusion": "cancelled", "created_at": "2026-11-03T10:00:00Z"},
+            {"id": 70, "head_branch": "v0.2.7", "conclusion": "failure", "created_at": "2026-11-02T10:00:00Z"},
+            {"id": 61, "head_branch": "v0.2.6", "conclusion": "success", "created_at": "2026-10-27T10:00:00Z"},
+            {"id": 51, "head_branch": "v0.2.5", "conclusion": "success", "created_at": "2026-10-20T10:00:00Z"},
+            {"id": 100, "head_branch": "v0.3.0", "conclusion": "success", "created_at": "2026-11-20T10:00:00Z"},
+        ]
+        calls = []
+
+        def fake(a):
+            calls.append(a[1])
+            if "/artifacts?" in a[1]:
+                rid = int(a[1].split("/runs/")[1].split("/")[0])
+                arts = [] if rid == 81 else [{"name": f"fhir-bench-report-data-{rid}"}]
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps({"artifacts": arts}))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": runs}))
+        return fake, calls
+
+    def test_newest_run_per_older_version(self):
+        fake, calls = self._payload()
+        with mock.patch.object(history, "_gh", fake):
+            got = history.fetch_version_runs("o/r", "w.yml", "v0.2.9", 999, 10)
+        # v0.2.9 itself and newer v0.3.0 left out; v0.2.8's newest run (81) has no artifact -> 80;
+        # v0.2.7's cancelled run skipped, its failed run kept; newest version first
+        self.assertEqual([r["id"] for r in got], [80, 70, 61, 51])
+        self.assertEqual([r["branch"] for r in got], ["v0.2.8", "v0.2.7", "v0.2.6", "v0.2.5"])
+        self.assertTrue(all("branch=" not in c for c in calls if "/artifacts?" not in c))
+
+    def test_max_versions_counts_the_current_run(self):
+        fake, _ = self._payload()
+        with mock.patch.object(history, "_gh", fake):
+            got = history.fetch_version_runs("o/r", "w.yml", "v0.2.9", 999, 3)
+            self.assertEqual([r["branch"] for r in got], ["v0.2.8", "v0.2.7"])
+            self.assertEqual(history.fetch_version_runs("o/r", "w.yml", "v0.2.9", 999, 1), [])
+            self.assertEqual(history.fetch_version_runs("o/r", "w.yml", "main", 999, 10), [])
+
+    def test_fetch_versions_downloads_without_legacy_and_swallows_errors(self):
+        got = []
+
+        def data(repo, run, d):
+            if run["id"] == 2:
+                raise RuntimeError("boom")
+            got.append((run["id"], d))
+        n = history.fetch_versions("o/r", "w.yml", "v1.0.0", 9, 10, "V",
+                                   list_fn=lambda *a: [{"id": 1}, {"id": 2}, {"id": 3}], data_fn=data)
+        self.assertEqual(n, 3)
+        self.assertEqual(got, [(1, "V"), (3, "V")])
+        boom = lambda *a: (_ for _ in ()).throw(RuntimeError("x"))
+        self.assertEqual(history.fetch_versions("o/r", "w.yml", "v1.0.0", 9, 10, "V", list_fn=boom), 0)
+
+    def _main(self, branch):
+        seen = []
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch.object(history, "fetch_versions", lambda *a: seen.append(a) or 0), \
+                mock.patch.object(history, "build", lambda *a, **k: "x\n"):
+            cur = os.path.join(t, "c.md")
+            open(cur, "w").write("")
+            rc = history.main(["--repo", "o/r", "--branch", branch, "--run-id", "5", "--current", cur,
+                               "--artifact-name", "a", "--out", os.path.join(t, "h.md"),
+                               "--version-dir", os.path.join(t, "v")])
+        self.assertEqual(rc, 0)
+        return seen
+
+    def test_main_fetches_versions_only_on_a_release_tag(self):
+        self.assertEqual(self._main("main"), [])
+        self.assertEqual(self._main("feature/v1.2.3"), [])
+        seen = self._main("v0.2.9")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][2:5], ("v0.2.9", "5", 10))
+
+
 if __name__ == "__main__":
     unittest.main()

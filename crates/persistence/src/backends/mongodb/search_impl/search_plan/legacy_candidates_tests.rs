@@ -621,9 +621,9 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
     let driver = parameter("code", "base");
     for (name, kind, value, matching, other) in cases {
         let mut rows = Vec::new();
-        for position in 1..7 {
+        for (position, fixture_row) in fixture.rows.iter().enumerate().take(7).skip(1) {
             let mut row = doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation",
-            "resource_id": &fixture.rows[position].id, "param_name": name };
+            "resource_id": &fixture_row.id, "param_name": name };
             row.extend(if position == 4 {
                 other.clone()
             } else {
@@ -801,10 +801,10 @@ async fn legacy_token_membership_shares_named_system_fallback() {
     let driver = parameter("code", "base");
     let sibling = parameter("marker", "urn:marker|red");
     let mut rows = Vec::new();
-    for position in 1..7 {
+    for (position, fixture_row) in fixture.rows.iter().enumerate().take(7).skip(1) {
         let row = doc! {
             "tenant_id": PLAN_TENANT, "resource_type": "Observation",
-            "resource_id": &fixture.rows[position].id, "param_name": "marker",
+            "resource_id": &fixture_row.id, "param_name": "marker",
             "value_token_system": if position < 4 { "urn:marker" } else { "urn:other" },
             "value_token_code": "red",
         };

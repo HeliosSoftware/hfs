@@ -509,6 +509,12 @@ mod tests {
 
     #[async_trait]
     impl SearchProvider for ScanOnly {
+        /// Only the `Unsupported` stub declines to search; a broken or
+        /// unavailable index is a search that fails, not one that is absent.
+        fn supports_search(&self) -> bool {
+            !matches!(self.search, Search::Unsupported)
+        }
+
         async fn search(
             &self,
             _tenant: &TenantContext,

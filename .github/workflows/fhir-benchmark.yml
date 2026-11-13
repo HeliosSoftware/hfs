@@ -1,7 +1,9 @@
 name: FHIR Server Benchmark
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Manual trigger only — runs the HealthSamurai FHIR Server Performance Benchmark
+# Manual trigger, plus one run per release: ci.yml's benchmark-release job
+# dispatches it on every `v*` tag once the release is out (default inputs, so
+# backend=core, tests=all). Runs the HealthSamurai FHIR Server Performance Benchmark
 # (https://github.com/HealthSamurai/fhir-server-performance-benchmark) against
 # HFS so we can measure ourselves against Aidbox / HAPI / Medplum and (later)
 # submit comparable numbers for the public report.
@@ -204,13 +206,17 @@ on:
         required: false
         default: "1g"
       es_sync_mode:
-        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
+        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 50ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
         type: choice
         required: false
         default: synchronous
         options:
           - synchronous
           - asynchronous
+      es_refresh_interval:
+        description: "*-elasticsearch legs: index refresh_interval, e.g. 50ms, 200ms, 1s. Empty = the es_sync_mode default (synchronous 50ms, asynchronous 1s). For a same-commit A/B of the interval, or to rerun one leg at the former 200ms"
+        required: false
+        default: ""
       mongo_wt_cache_gb:
         description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
         required: false
@@ -675,6 +681,7 @@ jobs:
       - name: Configure backend env
         env:
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_ES_REFRESH_INTERVAL: ${{ inputs.es_refresh_interval }}
         run: |
           set -euo pipefail
           BACKEND="${{ matrix.backend }}"
@@ -743,9 +750,16 @@ jobs:
               echo "ES volume:       $ES_VOLUME"
               echo "ES index prefix: $ES_PREFIX"
               # synchronous = this benchmark's default (see the es_sync_mode
-              # input): the conformance workflows' read-your-writes setting
-              # (inferno-us-core.yml — wait_for makes the refresh interval
-              # the price of every write, hence 200ms). Async import cannot
+              # input): read-your-writes, as in the conformance workflows
+              # (inferno-us-core.yml), but with a shorter refresh interval
+              # than their 200ms. wait_for makes the interval the price of
+              # every write, and a 50-VU closed loop is capped at about
+              # VUs / interval; 50ms was measured against 200ms on the full
+              # corpus in #2180, E-33 and E-34: insert x2.5, CRUD +71 %,
+              # import +34 %, setup 3.7x shorter, search unchanged. Below
+              # 50ms nothing more is gained (E-23: a refresh itself costs
+              # 40-47 ms). The conformance and UI workflows keep 200ms: they
+              # are not throughput tests. Async import cannot
               # finish the 1000-bundle corpus inside k6's 60-minute cap
               # (run 36412022609: 313/1000 bundles, drain gate
               # status=incomplete, 194,664 resources never reached the
@@ -757,10 +771,20 @@ jobs:
               # backlog before measuring — this is what run 36412022609
               # measured.
               case "${IN_ES_SYNC_MODE:-synchronous}" in
-                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
+                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=50ms ;;
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
               esac
+              # es_refresh_interval input: overrides the mode's interval for
+              # every Elasticsearch leg of this run (dispatch one leg alone
+              # to change only that leg). The value HFS ran with is recorded
+              # in runner-info.txt and printed in the leg summary.
+              if [ -n "${IN_ES_REFRESH_INTERVAL:-}" ]; then
+                if ! [[ "$IN_ES_REFRESH_INTERVAL" =~ ^[1-9][0-9]*(ms|s)$ ]]; then
+                  echo "::error::es_refresh_interval '$IN_ES_REFRESH_INTERVAL' must look like 50ms, 200ms or 1s"; exit 1
+                fi
+                REFRESH_INTERVAL="$IN_ES_REFRESH_INTERVAL"
+              fi
               {
                 echo "HFS_COMPOSITE_SYNC_MODE=$SYNC_MODE"
                 echo "HFS_ELASTICSEARCH_WRITE_REFRESH=$WRITE_REFRESH"
@@ -2347,6 +2371,9 @@ jobs:
       # history.md is NOT appended here any more: the last step does it, so the
       # report link lands after it. --data-dir receives the report-data.json of
       # earlier runs (artifact fhir-bench-report-data-<run id>) for the HTML trend.
+      # On a release tag (vX.Y.Z, the run ci.yml's benchmark-release job starts),
+      # --version-dir also receives that of the newest run of each of the
+      # earlier versions, for the HTML version trend; on a branch it stays empty.
       - name: Write run history
         if: always()
         continue-on-error: true
@@ -2365,7 +2392,7 @@ jobs:
           if [ "$N" -lt 1 ]; then N=1; fi
           if [ "$N" -gt 20 ]; then N=20; fi
           echo "HISTORY_RUNS_N=$N" >> "$GITHUB_ENV"
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend"
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend" --version-dir "$RUNNER_TEMP/versions" --max-versions 10
 
       # comparison.md exists only after the summary step, so it is staged here.
       - name: Stage comparison for the report
@@ -2398,6 +2425,8 @@ jobs:
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
             --trend-max $(( ${HISTORY_RUNS_N:-10} + 1 )) \
+            --version-dir "$RUNNER_TEMP/versions" \
+            --version-max 10 \
             --no-shapes
 
       # archive: false uploads the single .html as-is (not zipped), so it opens

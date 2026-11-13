@@ -23,7 +23,10 @@ use helios_persistence::backends::elasticsearch::{
 use helios_persistence::core::{Backend, SearchProvider};
 use helios_persistence::error::{BackendError, SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{SearchQuery, SortDirective, TotalMode};
+use helios_persistence::types::{
+    ContainedMode, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+    TotalMode,
+};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -290,6 +293,65 @@ async fn a_bad_query_that_mentions_index_not_found_is_still_a_bad_query() {
             "{error:?}"
         );
     }
+}
+
+/// #2510: a parameter that carries values but has no clause to build is
+/// refused before anything is sent. Dropped, the query is its filters alone
+/// and the cluster answers with every document of the type (the stub below
+/// would, if it were asked). `near` is a `special` parameter nothing indexes.
+#[tokio::test]
+async fn a_parameter_no_clause_can_be_built_for_is_refused_before_anything_is_sent() {
+    let server = MockServer::start().await;
+    for url_path in [SEARCH_PATH, COUNT_PATH] {
+        on_post(&server, url_path, |_| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1,
+                "hits": { "total": { "value": 1, "relation": "eq" }, "hits": [] }
+            }))
+        })
+        .await;
+    }
+    let es = backend(&server);
+    let near = SearchParameter {
+        name: "near".to_string(),
+        param_type: SearchParamType::Special,
+        values: vec![SearchValue::eq("42.0|-71.0|10|km")],
+        ..Default::default()
+    };
+    let plain = SearchQuery::new("Patient").with_parameter(near);
+    let mut contained = plain.clone();
+    contained.contained = ContainedMode::On;
+
+    let mut errors = Vec::new();
+    for query in [&plain, &contained] {
+        errors.push(es.search(&tenant(), query).await.map(|_| ()).unwrap_err());
+        errors.push(
+            es.search_count(&tenant(), query)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        );
+    }
+    errors.push(
+        es.search_ids(&tenant(), &plain)
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+    );
+    for error in errors {
+        assert!(
+            matches!(
+                &error,
+                StorageError::Search(SearchError::QueryParseError { message })
+                    if message.contains("'near'") && message.contains("every Patient")
+            ),
+            "{error:?}"
+        );
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing may be sent for a query that cannot be built"
+    );
 }
 
 // ---------------------------------------------------------------------------

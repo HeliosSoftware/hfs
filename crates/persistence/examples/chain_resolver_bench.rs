@@ -915,6 +915,7 @@ fn forward_parameter(
             reference_param: reference_param.clone(),
             target_type: qualifier.take(),
             target_param: target_param.clone(),
+            has: None,
         });
         reference_param = target_param;
         qualifier = next_qualifier;
@@ -1019,6 +1020,9 @@ impl<S: ResourceStorage> ResourceStorage for Counting<S> {
 // backend, or the instrumented pass would measure a path REST never takes.
 #[async_trait]
 impl<S: SearchProvider> SearchProvider for Counting<S> {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
     fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
         self.inner.supports_native_reverse_chains(tenant, query)
     }

@@ -167,7 +167,7 @@ rand = "0.8"
 
 # Direct SQLite fixture access for legacy-row REST tests. Bounded to the version
 # already used by helios-persistence; no new backend code is exposed.
-rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "serde_json", "functions"] }
 
 # Read streamed Parquet / Arrow IPC responses back in tests. Same versions as
 # helios-sof, which does the encoding.

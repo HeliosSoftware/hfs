@@ -25,10 +25,10 @@ pub(crate) enum DateRange {
 ///
 /// The search gate (`validate_date_values`) turns such a value into an error
 /// before a query is built, so this is only reached by a caller that skipped
-/// it. It must still be a clause and never `None`: the query builder collects
-/// value clauses with `filter_map`, so a `None` would silently drop the
-/// constraint and return every resource of the type — the very widening this
-/// handler used to perform by reading garbage as the year 2000 (#1293).
+/// it. It must still be a clause and never `None`: a `None` makes the query
+/// builder refuse the parameter (#2510), and used to drop the constraint and
+/// return every resource of the type — the very widening this handler used to
+/// perform by reading garbage as the year 2000 (#1293).
 pub(crate) fn match_none() -> Value {
     json!({ "match_none": {} })
 }

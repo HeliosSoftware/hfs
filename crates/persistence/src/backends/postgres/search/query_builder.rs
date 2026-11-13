@@ -2437,8 +2437,14 @@ impl PostgresQueryBuilder {
         let mut current = offset;
 
         for value in &param.values {
+            // A value not in the three-part form names nothing: it is a
+            // clause that matches nothing, as on the `_contained` path above,
+            // never a skipped one. Skipped, a lone short value left no
+            // condition at all and the search returned every resource of the
+            // type (#2510).
             let Some((predicate, params)) = Self::of_type_value_predicate(value, &mut current)
             else {
+                value_conditions.push(match_nothing().sql);
                 continue;
             };
             all_params.extend(params);
@@ -4063,6 +4069,7 @@ mod tests {
             reference_param: "subject".into(),
             target_type: Some("Patient".into()),
             target_param: "code".into(),
+            has: None,
         });
         ineligible.push(query);
         let mut query = base.clone();
@@ -6322,6 +6329,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }];
         let mut exact_token = token_param("code", Some(SearchModifier::Exact), "hello");
         exact_token.param_type = SearchParamType::Token;
@@ -8217,6 +8225,41 @@ mod tests {
         assert!(frag.sql.contains("value_token_code = $3"));
         assert!(frag.sql.contains("value_identifier_type_system = $4"));
         assert!(frag.sql.contains("value_identifier_type_code = $5"));
+        assert_eq!(frag.params.len(), 3);
+    }
+
+    /// #2510: a short `:of-type` value names nothing. It used to be skipped,
+    /// so alone it built no condition and the search returned every Patient,
+    /// and beside a full value it silently left the OR.
+    #[test]
+    fn of_type_short_value_matches_nothing() {
+        let of_type = |values: &[&str]| SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::OfType),
+            values: values
+                .iter()
+                .map(|v| SearchValue::new(SearchPrefix::Eq, *v))
+                .collect(),
+            chain: vec![],
+            components: vec![],
+        };
+
+        for short in ["MR|12345", "12345"] {
+            let query = SearchQuery::new("Patient").with_parameter(of_type(&[short]));
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect("a short :of-type value must still be a condition");
+            assert_eq!(frag.sql, "FALSE", "{short:?}");
+            assert!(frag.params.is_empty(), "{short:?}");
+        }
+
+        let query = SearchQuery::new("Patient").with_parameter(of_type(&[
+            "MR|12345",
+            "http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345",
+        ]));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+        assert!(frag.sql.starts_with("FALSE OR "), "{}", frag.sql);
+        assert!(frag.sql.contains("value_token_code = $3"), "{}", frag.sql);
         assert_eq!(frag.params.len(), 3);
     }
 

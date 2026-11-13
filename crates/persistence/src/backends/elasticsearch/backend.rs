@@ -161,13 +161,18 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_bulk_max_bytes")]
     pub bulk_max_bytes: usize,
 
-    /// How many `_bulk` requests of one page may be in flight at once
-    /// (default: 1, one request at a time).
+    /// How many `_bulk` requests of one page are in flight at once
+    /// (default: [`DEFAULT_BULK_CONCURRENCY`], 4).
     ///
     /// Requests of a page never touch the same document, so they can be sent
     /// together; what stays sequential is the chain a request produces — its
-    /// halves after a `413` or a timeout, and its `429` resends. Raising this
-    /// shortens a rebuild on a cluster that is not the bottleneck (#1125).
+    /// halves after a `413` or a timeout, and its `429` resends. The page is
+    /// cut into this many requests (at most one per 250 operations), so the
+    /// setting is what goes out: at 1 a 1,000-resource page is two sequential
+    /// requests of 500, at 4 it is four concurrent requests of 250. Measured
+    /// on the 72k Synthea mix: the `_bulk` wall of a page drops from ~100 ms
+    /// to ~30 ms and the deferred rebuild from 6.2k to ~11k resources/s
+    /// (#1125, #1749).
     #[serde(default = "default_bulk_concurrency")]
     pub bulk_concurrency: usize,
 
@@ -182,23 +187,31 @@ pub struct ElasticsearchConfig {
     #[serde(default)]
     pub contained_sweep_concurrency: usize,
 
-    /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
-    /// writes (default: `None`, which follows [`Self::write_refresh`]).
+    /// Refresh behavior for `$reindex`, the deferred rebuild and the
+    /// index-during-ingest sink's `_bulk` writes (default: `None` = no
+    /// per-request refresh, whatever [`Self::write_refresh`] says).
     ///
-    /// Lets a rebuild skip the per-request refresh wait (`False`) while
-    /// ordinary writes keep read-after-write visibility (`WaitFor`).
+    /// A bulk path never inherits `wait_for`: that policy blocks each request
+    /// until the next scheduled refresh, so a rebuild with
+    /// `write_refresh = wait_for` paid one `refresh_interval` per `_bulk`
+    /// request — 13× slower at the default `1s`, and the "import takes
+    /// forever" of #1749 at `30s`. Ordinary writes keep their own policy; set
+    /// this explicitly to make bulk writes refresh too.
     #[serde(default)]
     pub reindex_refresh: Option<WriteRefreshPolicy>,
 
     /// Threads that extract search values for one `$reindex` page (default:
-    /// `0` = cores − 1, clamped to 1–4; an explicit value is capped at 64).
+    /// `0` = cores − 1, clamped to 1–[`REINDEX_PREPARE_AUTO_MAX`]; an
+    /// explicit value is capped at 64).
     ///
     /// The page writer is the composite deployments' search target, and its
     /// extraction is pure CPU: on a 16-core host the post-import rebuild
     /// left 12 cores idle while HFS spent one on it (#1250). `1` extracts on
     /// the page's own thread, as every release before this knob did. The
     /// pool is used only on a multi-thread Tokio runtime and for pages of
-    /// at least 16 resources; one page at a time is admitted to it.
+    /// at least 16 resources; up to as many pages as the pool has threads
+    /// share it at once (the index-during-ingest sink writes several pages
+    /// concurrently), any further page extracts on its own thread.
     #[serde(default)]
     pub reindex_prepare_threads: usize,
 
@@ -255,15 +268,35 @@ fn default_bulk_max_bytes() -> usize {
     DEFAULT_BULK_MAX_BYTES
 }
 
+/// Default for [`ElasticsearchConfig::bulk_concurrency`]: four `_bulk`
+/// requests of a page in flight. One at a time (the default before #1749)
+/// left the cluster idle between requests; four is where a single-node
+/// cluster stopped gaining on the measured page sizes while its write pool
+/// stayed far from saturated.
+pub const DEFAULT_BULK_CONCURRENCY: usize = 4;
+
+/// Upper bound of the automatic (`reindex_prepare_threads = 0`) extraction
+/// width: cores − 1, clamped to 1–16. The former clamp of 4 mirrored the
+/// PostgreSQL writer, whose pages contend on the database; the Elasticsearch
+/// page writer is pure CPU until the `_bulk` send and halved its extraction
+/// time going from 4 to 8 threads (#1749).
+pub const REINDEX_PREPARE_AUTO_MAX: usize = 16;
+
 /// Built-in for [`ElasticsearchConfig::contained_sweep_concurrency`].
 pub(crate) const DEFAULT_CONTAINED_SWEEP_CONCURRENCY: usize = 16;
 
-/// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
-/// time, which is what every release before #1125 did.
-pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
-
 fn default_bulk_concurrency() -> usize {
     DEFAULT_BULK_CONCURRENCY
+}
+
+/// Permits of the prepare pool's admission gate: one per pool thread (see
+/// [`ElasticsearchBackend::reindex_prepare_gate`]), never below one.
+fn prepare_gate_permits(config: &ElasticsearchConfig) -> usize {
+    crate::search::reindex_prepare::resolve_prepare_width_capped(
+        config.reindex_prepare_threads,
+        REINDEX_PREPARE_AUTO_MAX,
+    )
+    .max(1)
 }
 
 impl Debug for ElasticsearchAuth {
@@ -432,7 +465,8 @@ pub struct ElasticsearchBackend {
     /// a multi-thread runtime (#1250). `Err` remembers a failed build so the
     /// one warning fires once.
     prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
-    /// The one-permit admission gate for `prepare_pool` (#1250).
+    /// The admission gate for `prepare_pool`: one permit per pool thread
+    /// (#1250, #1749).
     prepare_gate: tokio::sync::Semaphore,
     /// Whether `elasticsearch reindex writer configuration` has already been
     /// logged for this instance (#1250).
@@ -526,6 +560,7 @@ impl ElasticsearchBackend {
             );
         }
 
+        let prepare_gate = tokio::sync::Semaphore::new(prepare_gate_permits(&config));
         let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
@@ -533,7 +568,7 @@ impl ElasticsearchBackend {
             registries,
             schema_checked: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
+            prepare_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
@@ -551,6 +586,7 @@ impl ElasticsearchBackend {
         Self::validate_config(&config)?;
         let client = Self::build_client(&config)?;
 
+        let prepare_gate = tokio::sync::Semaphore::new(prepare_gate_permits(&config));
         let sweep_permits = Self::sweep_permits(&config);
         Ok(Self {
             client,
@@ -558,7 +594,7 @@ impl ElasticsearchBackend {
             registries,
             schema_checked: Default::default(),
             prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
+            prepare_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             contained_sweeps: tokio::sync::Semaphore::new(sweep_permits),
         })
@@ -680,13 +716,24 @@ impl ElasticsearchBackend {
     }
 
     /// The refresh policy a rebuild's `_bulk` writes use: the configured
-    /// [`ElasticsearchConfig::reindex_refresh`], or the ordinary write policy
-    /// when none is set.
+    /// [`ElasticsearchConfig::reindex_refresh`], or none when it is unset —
+    /// never the ordinary write policy, so `wait_for` on interactive writes
+    /// does not put one refresh wait on every bulk request (#1749).
     pub(crate) fn reindex_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
         self.config
             .reindex_refresh
-            .unwrap_or(self.config.write_refresh)
+            .unwrap_or(WriteRefreshPolicy::False)
             .as_refresh_param()
+    }
+
+    /// The extraction width the page writer runs at: the configured
+    /// [`ElasticsearchConfig::reindex_prepare_threads`], or cores − 1
+    /// clamped to 1–[`REINDEX_PREPARE_AUTO_MAX`] when it is `0`.
+    pub(crate) fn reindex_prepare_width(&self) -> usize {
+        crate::search::reindex_prepare::resolve_prepare_width_capped(
+            self.config.reindex_prepare_threads,
+            REINDEX_PREPARE_AUTO_MAX,
+        )
     }
 
     /// The byte budget of one `_bulk` request, or `usize::MAX` when the cap
@@ -756,13 +803,16 @@ impl ElasticsearchBackend {
     pub(super) fn reindex_prepare_pool(&self) -> Option<&rayon::ThreadPool> {
         crate::search::reindex_prepare::prepare_pool(
             &self.prepare_pool,
-            self.config.reindex_prepare_threads,
+            self.reindex_prepare_width(),
             "hfs-es-reindex",
             "Elasticsearch",
         )
     }
 
-    /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1250).
+    /// The admission gate for [`Self::reindex_prepare_pool`] (#1250): one
+    /// permit per pool thread, so as many pages as the pool can spread share
+    /// it (the ingest sink's writers each bring one) and only pages beyond
+    /// that extract inline.
     pub(super) fn reindex_prepare_gate(&self) -> &tokio::sync::Semaphore {
         &self.prepare_gate
     }
@@ -775,7 +825,7 @@ impl ElasticsearchBackend {
             return;
         }
         let configured = self.config.reindex_prepare_threads;
-        let prepare_threads = crate::search::reindex_prepare::resolve_prepare_width(configured);
+        let prepare_threads = self.reindex_prepare_width();
         let pool = if prepare_threads < 2 {
             "none"
         } else if !multi_thread {
@@ -1580,7 +1630,10 @@ mod tests {
         assert_eq!(config.nodes, vec!["http://localhost:9200"]);
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
+        assert_eq!(config.bulk_concurrency, DEFAULT_BULK_CONCURRENCY);
+        assert_eq!(config.bulk_concurrency, 4);
         assert_eq!(config.reindex_refresh, None);
+        assert_eq!(config.reindex_prepare_threads, 0);
         assert_eq!(config.refresh_interval, "1s");
     }
 
@@ -1655,10 +1708,12 @@ mod tests {
         assert_eq!(config.refresh_interval_parsed(), None);
     }
 
-    /// A rebuild follows the ordinary write policy unless it is given its
-    /// own, and a byte cap of `0` means "no cap", not "nothing fits" (#1125).
+    /// A rebuild never inherits the ordinary write policy: unset means no
+    /// per-request refresh even under `write_refresh = wait_for` (#1749),
+    /// an explicit policy is honoured, and a byte cap of `0` means "no cap",
+    /// not "nothing fits" (#1125).
     #[test]
-    fn reindex_refresh_falls_back_to_write_refresh_and_zero_bytes_is_uncapped() {
+    fn reindex_refresh_never_inherits_write_refresh_and_zero_bytes_is_uncapped() {
         let backend = |write_refresh, reindex_refresh, bulk_max_bytes| {
             ElasticsearchBackend::new(ElasticsearchConfig {
                 write_refresh,
@@ -1668,16 +1723,27 @@ mod tests {
             })
             .expect("client construction is lazy")
         };
-        let follows = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        let unset = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        assert!(
+            unset.reindex_refresh_param().is_none(),
+            "a bulk path must not inherit wait_for"
+        );
         assert!(matches!(
-            follows.reindex_refresh_param(),
+            unset.write_refresh_param(),
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
+        assert_eq!(unset.bulk_max_bytes(), usize::MAX);
+
+        let explicit = backend(
+            WriteRefreshPolicy::False,
+            Some(WriteRefreshPolicy::WaitFor),
+            0,
+        );
         assert!(matches!(
-            follows.write_refresh_param(),
+            explicit.reindex_refresh_param(),
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
-        assert_eq!(follows.bulk_max_bytes(), usize::MAX);
+        assert!(explicit.write_refresh_param().is_none());
 
         let own = backend(
             WriteRefreshPolicy::WaitFor,
@@ -1690,6 +1756,28 @@ mod tests {
             Some(elasticsearch::params::Refresh::WaitFor)
         ));
         assert_eq!(own.bulk_max_bytes(), 4096);
+    }
+
+    /// The prepare pool's gate admits one page per pool thread, so the
+    /// ingest sink's concurrent writers share the pool instead of three of
+    /// four extracting on their own thread (#1749).
+    #[test]
+    fn prepare_gate_has_one_permit_per_pool_thread() {
+        let permits = |threads| {
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                reindex_prepare_threads: threads,
+                ..Default::default()
+            })
+            .expect("client construction is lazy")
+            .reindex_prepare_gate()
+            .available_permits()
+        };
+        assert_eq!(permits(1), 1);
+        assert_eq!(permits(6), 6);
+        let auto = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).clamp(1, REINDEX_PREPARE_AUTO_MAX))
+            .unwrap_or(1);
+        assert_eq!(permits(0), auto);
     }
 
     /// The method-level view of the injective derivation. The exhaustive

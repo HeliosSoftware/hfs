@@ -73,7 +73,7 @@ parquet = "60.0"
 zip = "9"
 futures = "0.3"
 bytes = "1.5"
-rusqlite = { version = "0.33", features = ["bundled", "serde_json", "hooks"] }
+rusqlite = { version = "0.41", features = ["bundled", "serde_json", "hooks"] }
 sqlparser = "0.54"
 base64 = "0.22"
 

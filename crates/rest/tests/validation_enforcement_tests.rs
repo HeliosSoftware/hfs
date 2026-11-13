@@ -394,3 +394,78 @@ async fn enforce_mode_honors_meta_profile_claims() {
         .await;
     assert_eq!(response.status_code(), 201, "{}", response.text());
 }
+
+/// #2554: `off` and `log` drop empty elements before validation, so a body
+/// whose only fault is an empty element is stored, cleaned.
+#[tokio::test]
+async fn off_and_log_store_the_body_without_empty_elements() {
+    for mode in ["off", "log"] {
+        let server = create_test_server(mode).await;
+        let response = server
+            .post("/Patient")
+            .add_header("prefer", "return=representation")
+            .json(&json!({
+                "resourceType": "Patient",
+                "active": true,
+                "name": [{}],
+                "telecom": [],
+                "gender": null
+            }))
+            .await;
+        assert_eq!(response.status_code(), 201, "{mode}: {}", response.text());
+        let mut stored: Value = response.json();
+        let stored = stored.as_object_mut().unwrap();
+        stored.remove("id");
+        stored.remove("meta");
+        assert_eq!(
+            Value::Object(stored.clone()),
+            json!({"resourceType": "Patient", "active": true}),
+            "{mode}"
+        );
+    }
+}
+
+/// #2554: `enforce` validates the body as sent, so an empty element the
+/// validator flags (`ele-1` on `name[0]`, or an empty string) is still a 422,
+/// and nothing is stored.
+#[tokio::test]
+async fn enforce_mode_validates_the_body_before_dropping_empty_elements() {
+    let server = create_test_server("enforce").await;
+    for body in [
+        json!({"resourceType": "Patient", "active": true, "name": [{}]}),
+        json!({"resourceType": "Patient", "active": true, "gender": ""}),
+    ] {
+        let response = server.put("/Patient/strict-2554").json(&body).await;
+        assert_eq!(response.status_code(), 422, "{body}: {}", response.text());
+    }
+    server
+        .get("/Patient/strict-2554")
+        .await
+        .assert_status_not_found();
+}
+
+/// #2554: what passes `enforce` is still cleaned before it is stored: the
+/// validator does not flag an empty array or a `null` member.
+#[tokio::test]
+async fn enforce_mode_stores_a_passing_body_without_empty_elements() {
+    let server = create_test_server("enforce").await;
+    let response = server
+        .post("/Patient")
+        .add_header("prefer", "return=representation")
+        .json(&json!({
+            "resourceType": "Patient",
+            "active": true,
+            "telecom": [],
+            "gender": null
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201, "{}", response.text());
+    let mut stored: Value = response.json();
+    let stored = stored.as_object_mut().unwrap();
+    stored.remove("id");
+    stored.remove("meta");
+    assert_eq!(
+        Value::Object(stored.clone()),
+        json!({"resourceType": "Patient", "active": true})
+    );
+}

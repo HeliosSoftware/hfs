@@ -39,6 +39,27 @@ def bulk_txt(**kv):
     return "".join("%s=%s\n" % (k, v) for k, v in fields.items())
 
 
+class SummaryEsRefreshIntervalTest(SummaryRunMixin, unittest.TestCase):
+    """The synchronous Elasticsearch leg text names the interval the leg ran with."""
+    def runner_info(self, **kv):
+        fields = {"es_heap": "1g", "es_sync_mode": "synchronous", "es_write_refresh": "wait_for",
+                  "es_refresh_interval": "50ms", "max_parallel": "1"}
+        fields.update(kv)
+        return "".join("%s: %s\n" % (k, v) for k, v in fields.items())
+
+    def test_recorded_interval_is_printed(self):
+        for interval in ("50ms", "200ms"):
+            out = self.summary({"runner-info.txt": self.runner_info(es_refresh_interval=interval)},
+                               backend="postgres-elasticsearch")
+            self.assertIn("| **ES refresh interval** | `%s` |" % interval, out)
+            self.assertIn("`refresh=wait_for` against a %s `refresh_interval`" % interval, out)
+
+    def test_unrecorded_interval_names_no_number(self):
+        out = self.summary({"runner-info.txt": self.runner_info(es_refresh_interval="unknown")},
+                           backend="postgres-elasticsearch")
+        self.assertIn("`refresh=wait_for` against the index `refresh_interval`", out)
+
+
 class SummaryBulkImportTest(SummaryRunMixin, unittest.TestCase):
     def test_bulk_line_deferred_unchanged(self):
         out = self.summary({"bulk-import.txt": bulk_txt()})

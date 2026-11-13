@@ -205,6 +205,10 @@ impl ResourceStorage for FlakyIndex {
 
 #[async_trait]
 impl SearchProvider for FlakyIndex {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
+
     async fn search(
         &self,
         tenant: &TenantContext,
