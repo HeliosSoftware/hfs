@@ -3032,10 +3032,7 @@ impl PostgresBackend {
     ///
     /// This method uses the SearchParameterExtractor to dynamically extract
     /// searchable values based on the configured SearchParameterRegistry.
-    // Eight arguments, all of them distinct identity/coordinate values the
-    // write path already has in hand; bundling them into a struct would add a
-    // move on the hottest indexing path without removing a single argument.
-    #[allow(clippy::too_many_arguments)]
+    ///
     /// Indexes a mutation on its already guarded transaction connection.
     ///
     /// The caller holds the advisory write lock and an open transaction on
@@ -3043,6 +3040,9 @@ impl PostgresBackend {
     /// persisted overlay inside that same transaction (see
     /// [`PostgresBackend::authoritative_extractor`]). `index_fts_content_guarded`
     /// finishes the write on the same connection.
+    // Eight arguments, all of them distinct identity/coordinate values the
+    // write path already has in hand; bundling them into a struct would add a
+    // move on the hottest indexing path without removing a single argument.
     #[allow(clippy::too_many_arguments)]
     async fn index_resource_guarded<C>(
         &self,
