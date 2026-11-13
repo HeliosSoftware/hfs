@@ -357,7 +357,7 @@ async fn send_search_once(
     backend: &ElasticsearchBackend,
     op: ReadOp<'_>,
     index: &str,
-    body: Value,
+    body: &Value,
 ) -> SearchAttempt {
     let response = match op {
         ReadOp::Search => {
@@ -562,7 +562,7 @@ pub(super) async fn send_read_with_retry(
 ) -> StorageResult<Option<Value>> {
     let mut attempt: u32 = 0;
     let (attempts, last_failure) = loop {
-        let failure = match send_search_once(backend, op, index, body.clone()).await {
+        let failure = match send_search_once(backend, op, index, &body).await {
             SearchAttempt::Body(v) => return Ok(Some(v)),
             SearchAttempt::EmptyIndex => return Ok(None),
             SearchAttempt::Permanent(e) => return Err(e),
@@ -915,18 +915,14 @@ impl SearchProvider for ElasticsearchBackend {
         let over_fetched = es_query.over_fetched;
 
         // Execute search (with retry on transient shard-availability errors)
-        let body = match send_search_with_retry(self, &index, es_query.body).await? {
+        let mut body = match send_search_with_retry(self, &index, es_query.body).await? {
             Some(v) => v,
             None => return Ok(empty_index_result(query.wants_total())),
         };
 
-        // Parse hits
-        let hits = body
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // Parse hits: moved out of the response, not copied — each hit carries
+        // the full resource `content`.
+        let hits = take_hits(&mut body);
 
         // `hits.total` is only tracked when `_total` asks for one.
         let total = if query.wants_total() {
@@ -943,29 +939,17 @@ impl SearchProvider for ElasticsearchBackend {
         let mut hits_with_sort: Vec<(StoredResource, Option<Vec<Value>>)> = Vec::new();
         let mut scores: HashMap<String, f64> = HashMap::new();
 
-        for hit in &hits {
-            let source = match hit.get("_source") {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Skip deleted
-            if source
-                .get("is_deleted")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+        for hit in hits {
+            if let Some(ParsedHit {
+                stored,
+                score,
+                sort_values,
+            }) = parse_search_hit(hit, tenant)?
             {
-                continue;
-            }
-
-            if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
                 // Capture the relevance score for `Bundle.entry.search.score`.
-                // `_score` is null when a field sort overrides relevance scoring,
-                // so only record finite scores.
-                if let Some(score) = hit.get("_score").and_then(|s| s.as_f64()) {
+                if let Some(score) = score {
                     scores.insert(stored.url(), score);
                 }
-                let sort_values = hit.get("sort").and_then(Value::as_array).cloned();
                 hits_with_sort.push((stored, sort_values));
             }
         }
@@ -1298,7 +1282,7 @@ impl ElasticsearchBackend {
                     let Some(source) = sources.get(doc_id) else {
                         continue;
                     };
-                    let Some(stored) = parse_hit_to_stored_resource(source, tenant)? else {
+                    let Some(stored) = parse_hit_to_stored_resource(source.clone(), tenant)? else {
                         continue;
                     };
                     match local_id {
@@ -1665,18 +1649,13 @@ async fn execute_text_search(
     body: Value,
     tenant: &TenantContext,
 ) -> StorageResult<SearchResult> {
-    let body = match send_search_with_retry(backend, index, body).await? {
+    let mut body = match send_search_with_retry(backend, index, body).await? {
         Some(v) => v,
         // Text search has no `_total` and always tracks hits.
         None => return Ok(empty_index_result(true)),
     };
 
-    let hits = body
-        .get("hits")
-        .and_then(|h| h.get("hits"))
-        .and_then(|h| h.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let hits = take_hits(&mut body);
 
     let total = body
         .get("hits")
@@ -1685,8 +1664,8 @@ async fn execute_text_search(
         .and_then(|v| v.as_u64());
 
     let mut resources = Vec::new();
-    for hit in &hits {
-        if let Some(source) = hit.get("_source") {
+    for mut hit in hits {
+        if let Some(source) = hit.get_mut("_source").map(Value::take) {
             if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
                 resources.push(stored);
             }
@@ -1763,11 +1742,77 @@ impl RevincludeProvider for ElasticsearchBackend {
     }
 }
 
-/// Parses an ES hit's `_source` into a `StoredResource`.
+/// Moves the `hits.hits` array out of an ES search response, leaving `null`
+/// in its place, so the hits (each carrying a full `_source.content`) are not
+/// deep-copied. A missing or non-array value yields no hits, as before.
+fn take_hits(body: &mut Value) -> Vec<Value> {
+    match body
+        .get_mut("hits")
+        .and_then(|h| h.get_mut("hits"))
+        .map(Value::take)
+    {
+        Some(Value::Array(hits)) => hits,
+        _ => Vec::new(),
+    }
+}
+
+/// One search hit parsed by [`parse_search_hit`].
+#[derive(Debug)]
+struct ParsedHit {
+    stored: StoredResource,
+    /// `_score`; `None` when ES returns null (a field sort overrides
+    /// relevance scoring) or omits it.
+    score: Option<f64>,
+    /// The hit's `sort` array, for the page cursor.
+    sort_values: Option<Vec<Value>>,
+}
+
+/// Parses one entry of `hits.hits`, moving `_source` and `sort` out of the
+/// owned hit. Returns `None` for a non-object hit, a hit without `_source`,
+/// a deleted resource, or a `_source` the parser rejects.
+fn parse_search_hit(hit: Value, tenant: &TenantContext) -> StorageResult<Option<ParsedHit>> {
+    let Value::Object(mut hit) = hit else {
+        return Ok(None);
+    };
+    let Some(source) = hit.remove("_source") else {
+        return Ok(None);
+    };
+
+    // Skip deleted
+    if source
+        .get("is_deleted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let Some(stored) = parse_hit_to_stored_resource(source, tenant)? else {
+        return Ok(None);
+    };
+    let score = hit.get("_score").and_then(|s| s.as_f64());
+    let sort_values = match hit.remove("sort") {
+        Some(Value::Array(values)) => Some(values),
+        _ => None,
+    };
+    Ok(Some(ParsedHit {
+        stored,
+        score,
+        sort_values,
+    }))
+}
+
+/// Parses an ES hit's `_source` into a `StoredResource`, moving `content`
+/// out of the owned `_source` instead of copying it.
 fn parse_hit_to_stored_resource(
-    source: &Value,
+    mut source: Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
+    let content = source
+        .get_mut("content")
+        .map(Value::take)
+        .unwrap_or_else(|| json!({}));
+
     let resource_type = match source.get("resource_type").and_then(|v| v.as_str()) {
         Some(rt) => rt,
         None => return Ok(None),
@@ -1782,8 +1827,6 @@ fn parse_hit_to_stored_resource(
         .get("version_id")
         .and_then(|v| v.as_str())
         .unwrap_or("1");
-
-    let content = source.get("content").cloned().unwrap_or_else(|| json!({}));
 
     let fhir_version_str = source
         .get("fhir_version")
@@ -1867,10 +1910,10 @@ mod tests {
             )
         };
 
-        let a = parse_hit_to_stored_resource(&full, &tenant)
+        let a = parse_hit_to_stored_resource(full.clone(), &tenant)
             .unwrap()
             .unwrap();
-        let b = parse_hit_to_stored_resource(&trimmed, &tenant)
+        let b = parse_hit_to_stored_resource(trimmed.clone(), &tenant)
             .unwrap()
             .unwrap();
         assert_eq!(view(&a), view(&b));
@@ -1883,6 +1926,187 @@ mod tests {
             .unwrap();
         assert_eq!(view(&c), view(&d));
         assert_eq!(view(&a), view(&c));
+    }
+
+    /// `take_hits` moves the hit array out and leaves the rest of the
+    /// response (`hits.total`) readable; odd shapes yield no hits.
+    #[test]
+    fn take_hits_moves_the_array_and_keeps_the_total() {
+        let mut body = json!({
+            "hits": {
+                "total": { "value": 7 },
+                "hits": [{ "_id": "a", "sort": [1, "a"] }, { "_id": "b" }],
+            }
+        });
+        let hits = take_hits(&mut body);
+        assert_eq!(
+            hits,
+            vec![
+                json!({ "_id": "a", "sort": [1, "a"] }),
+                json!({ "_id": "b" })
+            ]
+        );
+        assert_eq!(body["hits"]["total"]["value"], json!(7));
+        assert!(take_hits(&mut json!({})).is_empty());
+        assert!(take_hits(&mut json!({ "hits": { "hits": {} } })).is_empty());
+    }
+
+    /// Shapes of `hits` / `hits.hits` that carry no hit array yield no hits
+    /// and leave the rest of the response alone.
+    #[test]
+    fn take_hits_odd_shapes_yield_no_hits() {
+        let mut null_hits = json!({ "hits": { "total": { "value": 0 }, "hits": null } });
+        assert!(take_hits(&mut null_hits).is_empty());
+        assert_eq!(null_hits["hits"]["total"]["value"], json!(0));
+
+        let mut scalar_hits = json!({ "hits": 3 });
+        assert!(take_hits(&mut scalar_hits).is_empty());
+        assert_eq!(scalar_hits, json!({ "hits": 3 }));
+
+        let mut array_hits = json!({ "hits": [{ "_source": {} }] });
+        assert!(take_hits(&mut array_hits).is_empty());
+        assert_eq!(array_hits, json!({ "hits": [{ "_source": {} }] }));
+
+        let mut no_hits = json!({ "took": 1 });
+        assert!(take_hits(&mut no_hits).is_empty());
+        assert_eq!(no_hits, json!({ "took": 1 }));
+    }
+
+    fn acme() -> TenantContext {
+        use crate::tenant::{TenantId, TenantPermissions};
+        TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access())
+    }
+
+    fn patient_source(id: &str) -> Value {
+        json!({
+            "resource_type": "Patient",
+            "resource_id": id,
+            "version_id": "2",
+            "fhir_version": "4.0",
+            "last_updated": "2024-05-01T10:00:00Z",
+            "content": { "resourceType": "Patient", "id": id },
+        })
+    }
+
+    /// `content` absent becomes `{}`; `content: null` stays `null`.
+    #[test]
+    fn parse_hit_content_absent_is_empty_object_and_null_stays_null() {
+        let tenant = acme();
+
+        let mut absent = patient_source("p1");
+        absent.as_object_mut().unwrap().remove("content");
+        let r = parse_hit_to_stored_resource(absent, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.content(), &json!({}));
+
+        let mut null = patient_source("p2");
+        null["content"] = Value::Null;
+        let r = parse_hit_to_stored_resource(null, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.content(), &Value::Null);
+        assert_eq!(r.url(), "Patient/p2");
+    }
+
+    /// A `_source` without `resource_type` (or `resource_id`) is not a
+    /// resource.
+    #[test]
+    fn parse_hit_without_resource_type_or_id_is_none() {
+        let tenant = acme();
+
+        let mut no_type = patient_source("p1");
+        no_type.as_object_mut().unwrap().remove("resource_type");
+        assert!(
+            parse_hit_to_stored_resource(no_type, &tenant)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut no_id = patient_source("p1");
+        no_id.as_object_mut().unwrap().remove("resource_id");
+        assert!(
+            parse_hit_to_stored_resource(no_id, &tenant)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `_score` and `sort` survive `_source` being moved out of the hit.
+    #[test]
+    fn parse_search_hit_keeps_score_and_sort() {
+        let tenant = acme();
+        let hit = json!({
+            "_id": "acme_Patient_p1",
+            "_score": 1.5,
+            "_source": patient_source("p1"),
+            "sort": [1714557600000_i64, "Patient/p1"],
+        });
+        let parsed = parse_search_hit(hit, &tenant).unwrap().unwrap();
+        assert_eq!(parsed.stored.url(), "Patient/p1");
+        assert_eq!(parsed.stored.version_id(), "2");
+        assert_eq!(
+            parsed.stored.content(),
+            &json!({ "resourceType": "Patient", "id": "p1" })
+        );
+        assert_eq!(parsed.score, Some(1.5));
+        assert_eq!(
+            parsed.sort_values,
+            Some(vec![json!(1714557600000_i64), json!("Patient/p1")])
+        );
+    }
+
+    /// A null `_score` (field sort) and a missing or non-array `sort` give
+    /// `None`, not an error.
+    #[test]
+    fn parse_search_hit_null_score_and_non_array_sort_are_none() {
+        let tenant = acme();
+        let hit = json!({ "_score": null, "_source": patient_source("p1") });
+        let parsed = parse_search_hit(hit, &tenant).unwrap().unwrap();
+        assert_eq!(parsed.score, None);
+        assert_eq!(parsed.sort_values, None);
+
+        let hit = json!({ "_source": patient_source("p1"), "sort": "x" });
+        let parsed = parse_search_hit(hit, &tenant).unwrap().unwrap();
+        assert_eq!(parsed.score, None);
+        assert_eq!(parsed.sort_values, None);
+    }
+
+    /// Non-object hits, hits without `_source`, deleted resources and
+    /// unparseable `_source` are skipped.
+    #[test]
+    fn parse_search_hit_skips_unusable_hits() {
+        let tenant = acme();
+        for hit in [
+            json!(null),
+            json!("hit"),
+            json!(7),
+            json!([{ "_source": patient_source("p1") }]),
+            json!({ "_id": "x", "_score": 1.0, "sort": [1] }),
+            json!({ "_source": null }),
+            json!({ "_source": { "resource_id": "p1" } }),
+        ] {
+            assert!(
+                parse_search_hit(hit.clone(), &tenant).unwrap().is_none(),
+                "{hit} should be skipped"
+            );
+        }
+
+        let mut deleted = patient_source("p1");
+        deleted["is_deleted"] = json!(true);
+        assert!(
+            parse_search_hit(json!({ "_source": deleted }), &tenant)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut not_deleted = patient_source("p1");
+        not_deleted["is_deleted"] = json!(false);
+        assert!(
+            parse_search_hit(json!({ "_source": not_deleted }), &tenant)
+                .unwrap()
+                .is_some()
+        );
     }
 
     use crate::error::{SearchError, StorageError};
