@@ -6,13 +6,14 @@ SELECT
   'r.tenant_id = $1
   AND r.resource_type = $2
   AND r.is_deleted = false' AS "pg_anchor"
-FROM resources r
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $3
-  AND r.id = ANY($4::text[])
-ORDER BY r.last_updated, r.id COLLATE "C"
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $3
+  AND res.id = ANY($4::text[])
+ORDER BY res.last_updated, res.id COLLATE "C"
 
 /* Runner bindings and output metadata:
 {

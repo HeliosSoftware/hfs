@@ -405,7 +405,7 @@ mod tests {
             assert_eq!(
                 run.query
                     .sql
-                    .matches(&format!("r.last_updated >= {placeholder}"))
+                    .matches(&format!(".last_updated >= {placeholder}"))
                     .count(),
                 3
             );
@@ -436,7 +436,7 @@ mod tests {
                 .finish("tenant", &filters)
                 .unwrap();
             let dial = dialect_for(dialect);
-            let since = format!("r.last_updated >= {}", dial.placeholder(4));
+            let since = format!(".last_updated >= {}", dial.placeholder(4));
             assert_eq!(
                 run.query.sql.matches(&since).count(),
                 3,
@@ -490,7 +490,7 @@ mod tests {
                     .contains(&dial.string_literal(&anchor_literal))
             );
             assert!(run.query.sql.contains("'resources r'"));
-            assert_eq!(run.query.sql.matches("r.last_updated >=").count(), 1);
+            assert_eq!(run.query.sql.matches(".last_updated >=").count(), 1);
             assert_eq!(run.params.len(), 4);
         }
     }
@@ -585,26 +585,27 @@ mod tests {
             } else {
                 ("?4", "?5")
             };
-            let collation = if dialect == SqlDialect::Postgres {
-                "\"C\""
+            // PostgreSQL scans the table as `res` (`r` is the detoasted copy).
+            let (collation, r) = if dialect == SqlDialect::Postgres {
+                ("\"C\"", "res")
             } else {
-                "BINARY"
+                ("BINARY", "r")
             };
             assert!(paged.query.sql.contains(&format!(
-                "AND r.id COLLATE {collation} > {after}\n  AND r.id COLLATE {collation} <= {through}"
+                "AND {r}.id COLLATE {collation} > {after}\n  AND {r}.id COLLATE {collation} <= {through}"
             )));
             assert!(
                 paged
                     .query
                     .sql
-                    .ends_with(&format!("ORDER BY r.id COLLATE {collation}"))
+                    .ends_with(&format!("ORDER BY {r}.id COLLATE {collation}"))
             );
             assert!(!paged.query.sql.contains("LIMIT"));
             assert!(!paged.query.sql.contains("last_updated\nORDER"));
             assert_eq!(paged.client_limit, Some(50));
             assert_eq!(plain.client_limit, None);
-            assert!(!plain.query.sql.contains("r.id COLLATE BINARY >"));
-            assert!(!plain.query.sql.contains("r.id COLLATE \"C\" >"));
+            assert!(!plain.query.sql.contains(".id COLLATE BINARY >"));
+            assert!(!plain.query.sql.contains(".id COLLATE \"C\" >"));
         }
     }
 }

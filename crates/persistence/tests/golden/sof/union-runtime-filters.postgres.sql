@@ -1,20 +1,22 @@
 SELECT
   ($3)::text AS "value"
-FROM resources r
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $5
-  AND r.id = ANY($6::text[])
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $5
+  AND res.id = ANY($6::text[])
 UNION ALL
 SELECT
   ($4)::text AS "value"
-FROM resources r
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $5
-  AND r.id = ANY($6::text[])
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $5
+  AND res.id = ANY($6::text[])
 
 /* Runner bindings and output metadata:
 {

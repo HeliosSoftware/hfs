@@ -1,14 +1,15 @@
 SELECT
   r.data->>'id' AS "id",
   CASE WHEN (r.data->>'active')::boolean IS TRUE THEN 'true' WHEN (r.data->>'active')::boolean IS FALSE THEN 'false' END AS "active"
-FROM resources r
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $3
-  AND r.id COLLATE "C" > $4
-  AND r.id COLLATE "C" <= $5
-ORDER BY r.id COLLATE "C"
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $3
+  AND res.id COLLATE "C" > $4
+  AND res.id COLLATE "C" <= $5
+ORDER BY res.id COLLATE "C"
 
 /* Runner bindings and output metadata:
 {

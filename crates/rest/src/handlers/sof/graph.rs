@@ -51,7 +51,8 @@ use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema, TerminologyKind, TerminologyRelation,
+    TableSchema, TerminologyKind, TerminologyRelation, project_view_definition,
+    referenced_identifiers,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -811,6 +812,7 @@ pub(crate) async fn execute_plan_counting(
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
+    let referenced = referenced_columns(plan, subject_sql);
 
     for node in &plan.nodes {
         match node {
@@ -819,13 +821,26 @@ pub(crate) async fn execute_plan_counting(
                 view,
             } => {
                 // An invalid `ansi/type` tag is a client error: name the view
-                // and column instead of silently dropping the tag.
-                let schema = TableSchema::try_from_view_definition(view).map_err(|e| {
+                // and column instead of silently dropping the tag. Checked on
+                // the view as declared, so a column the SQL never reads is
+                // still validated.
+                let declared = TableSchema::try_from_view_definition(view).map_err(|e| {
                     SqlQueryError::MalformedLibrary(format!(
                         "dependency view '{}': {e}",
                         artifact_display_name(view, internal_name)
                     ))
                 })?;
+                // #2574: read only the columns some SQL in the plan can name.
+                let projected = referenced
+                    .as_ref()
+                    .and_then(|referenced| project_view_definition(view, referenced));
+                let (view, schema) = match &projected {
+                    Some(projected) => match TableSchema::try_from_view_definition(projected) {
+                        Ok(schema) => (projected, schema),
+                        Err(_) => (view, declared),
+                    },
+                    None => (view, declared),
+                };
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
@@ -912,6 +927,8 @@ pub(crate) async fn execute_plan_counting(
                     table = %internal_name,
                     view = %view_label,
                     rows = inserted,
+                    columns = schema.columns.len(),
+                    projected = projected.is_some(),
                     elapsed_ms,
                     "materialized SQL query dependency"
                 );
@@ -1012,6 +1029,24 @@ pub(crate) async fn execute_plan_counting(
     .await?;
 
     Ok((result, leaf_schemas))
+}
+
+/// Every identifier the plan's SQL — the subject's and each interior SQLView
+/// node's — can resolve to a column, lower-cased; `None` when any of them may
+/// read columns it does not name (see
+/// [`helios_sof::sqlquery::referenced_identifiers`]).
+///
+/// One set for the whole plan: a dependency is read under labels by several
+/// consumers, and a name any of them spells is kept in every view. Coarser
+/// than a per-table analysis, and never wrong.
+fn referenced_columns(plan: &GraphPlan, subject_sql: &str) -> Option<HashSet<String>> {
+    let mut referenced = referenced_identifiers(subject_sql)?;
+    for node in &plan.nodes {
+        if let PlanNode::SqlView { sql, .. } = node {
+            referenced.extend(referenced_identifiers(sql)?);
+        }
+    }
+    Some(referenced)
 }
 
 /// Picks a human-readable name for a dependency artifact (a ViewDefinition
@@ -2553,5 +2588,180 @@ mod tests {
             message,
             "only SELECT queries are allowed; INSERT statements are not permitted"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — column projection (#2574): a dependency ViewDefinition is
+    // run with only the columns the plan's SQL can name.
+    // ------------------------------------------------------------------
+
+    /// Records the column names of every ViewDefinition it is asked to run,
+    /// and yields two rows carrying exactly those columns.
+    #[derive(Default)]
+    struct RecordingRunner {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SofRunner for RecordingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let columns: Vec<String> = view_definition["select"][0]["column"]
+                .as_array()
+                .expect("columns")
+                .iter()
+                .map(|c| c["name"].as_str().expect("name").to_string())
+                .collect();
+            self.seen.lock().unwrap().push(columns.clone());
+            let rows = (0..2).map(move |i| {
+                let row: serde_json::Map<String, Value> = columns
+                    .iter()
+                    .map(|name| (name.clone(), json!(format!("{name}{i}"))))
+                    .collect();
+                Ok(Value::Object(row))
+            });
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "recording-test-runner"
+        }
+    }
+
+    fn wide_view(name: &str, columns: &[&str]) -> Value {
+        let columns: Vec<Value> = columns
+            .iter()
+            .map(|c| json!({"path": c, "name": c, "type": "string"}))
+            .collect();
+        json!({"resourceType": "ViewDefinition", "name": name, "resource": "Patient",
+            "status": "active", "select": [{"column": columns}]})
+    }
+
+    async fn run_recorded(
+        plan: &GraphPlan,
+        subject_sql: &str,
+    ) -> (QueryResult, Vec<TableSchema>, Vec<Vec<String>>) {
+        let recorder = Arc::new(RecordingRunner::default());
+        let runner: Arc<dyn SofRunner> = recorder.clone();
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let (result, schemas) = execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            plan,
+            subject_sql,
+            &[],
+            limits(100, 100),
+        )
+        .await
+        .expect("plan runs");
+        let seen = recorder.seen.lock().unwrap().clone();
+        (result, schemas, seen)
+    }
+
+    fn wide_leaf_plan() -> GraphPlan {
+        GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: wide_view("wide", &["id", "gender", "birth", "city"]),
+            }],
+            subject_edges: vec![edge("p", "__sof_node_0")],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dependency_is_run_with_only_the_columns_the_sql_names() {
+        let (result, schemas, seen) = run_recorded(
+            &wide_leaf_plan(),
+            "SELECT p.Gender AS g FROM p WHERE city IS NOT NULL ORDER BY 1",
+        )
+        .await;
+        assert_eq!(seen, [["gender", "city"]]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Some(json!("gender0")));
+        // The table, and the schema reported for it, hold the same columns.
+        let names: Vec<_> = schemas[0].columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["gender", "city"]);
+    }
+
+    #[tokio::test]
+    async fn count_star_reads_one_column_and_counts_every_row() {
+        let (result, _, seen) = run_recorded(&wide_leaf_plan(), "SELECT count(*) FROM p").await;
+        assert_eq!(seen, [["id"]]);
+        assert_eq!(result.rows[0][0], Some(json!(2)));
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_keeps_every_column() {
+        let (result, _, seen) = run_recorded(&wide_leaf_plan(), "SELECT * FROM p").await;
+        assert_eq!(seen, [["id", "gender", "birth", "city"]]);
+        assert_eq!(result.columns, ["id", "gender", "birth", "city"]);
+    }
+
+    /// A column only an interior SQL View reads must survive, and a wildcard
+    /// in that SQL View keeps everything even when the subject names columns.
+    #[tokio::test]
+    async fn columns_read_by_an_interior_sql_view_are_kept() {
+        let plan = |view_sql: &str| GraphPlan {
+            nodes: vec![
+                PlanNode::Leaf {
+                    internal_name: "__sof_node_0".to_string(),
+                    view: wide_view("wide", &["id", "gender", "birth", "city"]),
+                },
+                PlanNode::SqlView {
+                    internal_name: "__sof_node_1".to_string(),
+                    sql: view_sql.to_string(),
+                    edges: vec![edge("p", "__sof_node_0")],
+                    name: "mid".to_string(),
+                },
+            ],
+            subject_edges: vec![edge("mid", "__sof_node_1")],
+        };
+        let (result, _, seen) = run_recorded(
+            &plan("SELECT id, birth AS born FROM p"),
+            "SELECT born FROM mid ORDER BY born",
+        )
+        .await;
+        assert_eq!(seen, [["id", "birth"]]);
+        assert_eq!(result.rows[1][0], Some(json!("birth1")));
+
+        let (_, _, seen) = run_recorded(&plan("SELECT * FROM p"), "SELECT id FROM mid").await;
+        assert_eq!(seen, [["id", "gender", "birth", "city"]]);
+    }
+
+    /// A dropped column is still validated: an invalid `ansi/type` tag on a
+    /// column the SQL never reads is the same client error as before.
+    #[tokio::test]
+    async fn an_unread_column_with_an_invalid_type_tag_is_still_rejected() {
+        let mut view = wide_view("wide", &["id", "gender"]);
+        view["select"][0]["column"][1]["tag"] = json!([{"name": "ansi/type", "value": "NOPE"}]);
+        let plan = GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view,
+            }],
+            subject_edges: vec![edge("p", "__sof_node_0")],
+        };
+        let runner: Arc<dyn SofRunner> = Arc::new(RecordingRunner::default());
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let err = execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT id FROM p",
+            &[],
+            limits(100, 100),
+        )
+        .await
+        .err()
+        .expect("invalid tag is rejected");
+        assert!(matches!(err, SqlQueryError::MalformedLibrary(_)), "{err:?}");
     }
 }
