@@ -114,6 +114,7 @@ pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod database_url;
+pub mod empty_elements;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;
@@ -181,6 +182,7 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use empty_elements::drop_empty_elements;
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,

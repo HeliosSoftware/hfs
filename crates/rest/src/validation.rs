@@ -7,8 +7,10 @@
 //! the mapping from validator issues onto FHIR `OperationOutcome` issues.
 //!
 //! The `$validate` operation uses [`ValidationService::validate_resource`]
-//! unconditionally; the write path (create/update/batch) goes through
-//! [`ValidationService::check_write`], which is gated by
+//! unconditionally; a client-supplied body on the write path
+//! (create/update/batch/transaction) goes through
+//! [`ValidationService::prepare_write`], which removes empty elements (#2554)
+//! and runs [`ValidationService::check_write`], gated by
 //! `HFS_VALIDATION_MODE` (`off` | `log` | `enforce`).
 
 use crate::config::ValidationConfig;
@@ -27,6 +29,7 @@ use helios_fhir_validator::{
 };
 use helios_observability::redact::redact_url;
 use helios_persistence::core::bulk_submit_input::redact_urls_in;
+use helios_persistence::core::drop_empty_elements;
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -182,9 +185,46 @@ impl ValidationService {
             .await
     }
 
+    /// The one entry point for a client-supplied resource body on a REST
+    /// write (create, update, conditional update, batch and transaction
+    /// `POST`/`PUT` entries): removes its empty objects, arrays, strings and
+    /// `null` members (#2554, see [`drop_empty_elements`]) and runs the
+    /// write-path gate, [`Self::check_write`].
+    ///
+    /// The order follows the mode. Under `enforce` the client asked for
+    /// strict checking, so the body is validated as sent and an empty element
+    /// the validator flags (`ele-1`) is still a `422`; what passes is cleaned
+    /// afterwards, so the stored copy carries none of the empty members the
+    /// validator does not flag (`[]`, `null`). Under `off` and `log` the body
+    /// is cleaned first, so `log` reports what is actually stored.
+    ///
+    /// `Ok(())` = proceed with the write, `resource` cleaned; `Err` = reject.
+    pub async fn prepare_write(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+        resource_type: &str,
+        resource: &mut Value,
+    ) -> Result<(), RestError> {
+        if self.mode == ValidationMode::Enforce {
+            self.check_write(tenant, version, resource_type, resource)
+                .await?;
+            drop_empty_elements(resource);
+        } else {
+            drop_empty_elements(resource);
+            self.check_write(tenant, version, resource_type, resource)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Write-path gate. `Ok(())` = proceed with the write; `Err` = reject
     /// (enforce mode with error-severity issues → `422` carrying the full
     /// OperationOutcome).
+    ///
+    /// A client-supplied body goes through [`Self::prepare_write`] instead;
+    /// this is called directly only for content the server already cleaned,
+    /// such as a PATCH result.
     pub async fn check_write(
         &self,
         tenant: &str,

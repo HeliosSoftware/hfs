@@ -130,6 +130,54 @@ async fn transaction_patch_updates_one_version_and_etag() {
     assert_eq!(stored.content()["name"][0]["family"], "After");
 }
 
+/// #2554: a transaction PATCH that deletes the only `name` stores the
+/// resource without `name`, not with `"name": []`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_result_is_stored_without_empty_elements() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({
+                "resourceType": "Patient", "id": "p1", "active": true,
+                "name": [{"family": "Before"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let delete_name = json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "operation", "part": [
+            {"name": "type", "valueCode": "delete"},
+            {"name": "path", "valueString": "Patient.name[0]"}
+        ]}]
+    });
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry("p1", delete_name, None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 200);
+    let stored = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.content(),
+        &json!({"resourceType": "Patient", "id": "p1", "active": true})
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn transaction_patch_overlapping_an_earlier_put_rolls_back() {
