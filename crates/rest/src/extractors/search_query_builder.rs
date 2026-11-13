@@ -335,9 +335,14 @@ pub fn unknown_search_params(
     registry: &SearchParameterRegistry,
 ) -> Vec<String> {
     let mut unknown = Vec::new();
-    for (name, _) in params.search_params() {
-        // Reverse chaining is validated when parsed; skip here.
+    for (name, value) in params.search_params() {
+        // A `_has` names no parameter of `resource_type`: its reference and
+        // search parameters belong to its source type, at every level (#2563).
         if name == "_has" || name.starts_with("_has:") {
+            let chain = name.strip_prefix("_has:").unwrap_or(value);
+            if !has_params_known(chain, registry) {
+                unknown.push(name.clone());
+            }
             continue;
         }
         // Strip modifier (`name:exact`, `subject:Patient`) then chain (`a.b`).
@@ -348,14 +353,53 @@ pub fn unknown_search_params(
             .split('.')
             .next()
             .unwrap_or(name);
-        let known = GLOBAL_SEARCH_PARAMS.contains(&base)
-            || registry.get_param(resource_type, base).is_some()
-            || registry.get_param("Resource", base).is_some();
+        let known = is_known_param(resource_type, base, registry)
+            // A chain that ends in `_has` (`patient._has:Group:member:_id`).
+            && name
+                .find("._has:")
+                .is_none_or(|at| has_params_known(&name[at + "._has:".len()..], registry));
         if !known {
             unknown.push(name.clone());
         }
     }
     unknown
+}
+
+/// Whether `code` is a parameter this server honours on `resource_type`: a
+/// global one, or one registered for the type or for `Resource`.
+fn is_known_param(resource_type: &str, code: &str, registry: &SearchParameterRegistry) -> bool {
+    GLOBAL_SEARCH_PARAMS.contains(&code)
+        || registry.get_param(resource_type, code).is_some()
+        || registry.get_param("Resource", code).is_some()
+}
+
+/// Whether every reference and search parameter of a `_has` chain —
+/// `Type:reference-param:search-param[:modifier-or-value]`, the part after
+/// `_has:` — is known on its source type, at every nesting level.
+///
+/// A malformed chain or an unknown source type counts as known here:
+/// [`parse_has_level`] refuses those with a more specific error.
+fn has_params_known(chain: &str, registry: &SearchParameterRegistry) -> bool {
+    let parts: Vec<&str> = chain.splitn(3, ':').collect();
+    let [source_type, reference_param, rest] = parts[..] else {
+        return true;
+    };
+    // No parameters at all: not a resource type (or a misspelt one), which the
+    // parser names as such rather than as an unknown parameter.
+    if registry.get_all_params(source_type).is_empty() {
+        return true;
+    }
+    if !is_known_param(source_type, reference_param, registry) {
+        return false;
+    }
+    if let Some(inner) = rest.strip_prefix("_has:") {
+        return has_params_known(inner, registry);
+    }
+    // The search parameter, without its modifier (or, in the
+    // `_has=Type:ref:param:value` form, its value).
+    let search_param = rest.split(':').next().unwrap_or(rest);
+    let search_param = search_param.split('.').next().unwrap_or(search_param);
+    is_known_param(source_type, search_param, registry)
 }
 
 /// The search-parameter type a `_sort` key is sorted by, or `None` when it
@@ -2736,6 +2780,73 @@ mod tests {
         assert!(unknown(vec![("_has:Observation:patient:code", "1")]).is_empty());
         assert!(unknown(vec![("name", "Smith")]).is_empty());
         assert_eq!(unknown(vec![("nope", "x")]), vec!["nope".to_string()]);
+    }
+
+    #[test]
+    fn test_unknown_search_params_checks_every_has_level() {
+        // #2563: an unknown reference or search parameter inside a `_has`
+        // matched nothing instead of being reported as unknown.
+        let registry = test_registry();
+        let unknown = |rt: &str, k: &str, v: &str| {
+            let sp = SearchParams::from_pairs(vec![(k.to_string(), v.to_string())]);
+            unknown_search_params(rt, &sp, &registry)
+        };
+        let is_unknown = |rt: &str, k: &str, v: &str| unknown(rt, k, v) == vec![k.to_string()];
+
+        // Known names, with a modifier, a global terminal, nesting and both forms.
+        for (k, v) in [
+            ("_has:Observation:patient:code", "1234-5"),
+            ("_has:Observation:subject:code:not", "1234-5"),
+            ("_has:Observation:patient:_id", "o1"),
+            (
+                "_has:Observation:patient:_has:Observation:subject:code",
+                "x",
+            ),
+            ("_has", "Observation:patient:code:1234-5"),
+        ] {
+            assert!(unknown("Patient", k, v).is_empty(), "{k}={v}");
+        }
+
+        // Unknown reference parameter, judged on the source type.
+        assert!(is_unknown("Patient", "_has:Observation:bogusref:code", "x"));
+        assert!(is_unknown("Patient", "_has", "Observation:bogusref:code:x"));
+        // `name` is a Patient parameter, not an Observation one.
+        assert!(is_unknown("Patient", "_has:Observation:patient:name", "x"));
+        assert!(is_unknown(
+            "Patient",
+            "_has:Observation:patient:bogus:not",
+            "x"
+        ));
+        assert!(is_unknown("Patient", "_has", "Observation:patient:bogus:x"));
+        // Either name at a nested level.
+        assert!(is_unknown(
+            "Patient",
+            "_has:Observation:patient:_has:Observation:bogusref:code",
+            "x"
+        ));
+        assert!(is_unknown(
+            "Patient",
+            "_has:Observation:patient:_has:Observation:subject:bogus",
+            "x"
+        ));
+        // A chain that ends in `_has` (#2556).
+        assert!(unknown("Observation", "patient._has:Observation:subject:code", "x").is_empty());
+        assert!(is_unknown(
+            "Observation",
+            "patient._has:Observation:bogusref:_id",
+            "x"
+        ));
+        assert!(is_unknown(
+            "Observation",
+            "subject:Patient._has:Observation:subject:bogus",
+            "x"
+        ));
+
+        // Malformed keys and unknown source types are left to the parser,
+        // which refuses them with a more specific error.
+        assert!(unknown("Patient", "_has:Observation:patient", "x").is_empty());
+        assert!(unknown("Patient", "_has", "x").is_empty());
+        assert!(unknown("Patient", "_has:Bogus:patient:code", "x").is_empty());
     }
 
     #[test]

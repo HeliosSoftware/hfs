@@ -529,6 +529,107 @@ mod basic_search {
     }
 
     #[tokio::test]
+    async fn test_unknown_param_inside_has_is_reported() {
+        // #2563: an unknown reference or search parameter inside a `_has` used
+        // to match nothing (a silent empty 200), even under strict handling.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        let strict_header = || {
+            (
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+        };
+
+        let all: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = get_bundle_entries(&all).len();
+        assert!(total > 0, "fixture should seed patients");
+
+        for (url, key) in [
+            (
+                "/Patient?_has:Group:bogusref:_id=g1",
+                "_has:Group:bogusref:_id",
+            ),
+            (
+                "/Patient?_has:Group:member:bogus=1",
+                "_has:Group:member:bogus",
+            ),
+            ("/Patient?_has=Group:bogusref:_id:g1", "_has"),
+            (
+                "/Patient?_has:Observation:subject:_has:Group:bogusref:_id=g1",
+                "_has:Observation:subject:_has:Group:bogusref:_id",
+            ),
+            (
+                "/Patient?_has:Observation:subject:_has:Group:member:bogus=1",
+                "_has:Observation:subject:_has:Group:member:bogus",
+            ),
+            (
+                "/Encounter?patient._has:Group:bogusref:_id=g1",
+                "patient._has:Group:bogusref:_id",
+            ),
+        ] {
+            let (name, value) = strict_header();
+            let strict = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(name, value)
+                .await;
+            assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST, "{url}");
+            let body: Value = strict.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
+            assert!(
+                body.to_string().contains(key),
+                "outcome must name '{key}': {body}"
+            );
+
+            // Lenient: ignored like any unknown parameter, and said so.
+            let lenient = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            lenient.assert_status_ok();
+            let body: Value = lenient.json();
+            assert!(
+                !self_link(&body).contains("bogus"),
+                "self link must not echo the ignored parameter ({url})"
+            );
+            let outcomes = outcome_entries(&body);
+            assert_eq!(outcomes.len(), 1, "ignored _has must be reported ({url})");
+            let text = outcomes[0]["resource"]["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(text.contains(key), "outcome must name '{key}': {text}");
+            if url.starts_with("/Patient") {
+                let matches = get_bundle_entries(&body)
+                    .into_iter()
+                    .filter(|e| e["search"]["mode"] == "match")
+                    .count();
+                assert_eq!(matches, total, "ignored _has must not filter ({url})");
+            }
+        }
+
+        // Known names at every level are still accepted under strict handling.
+        for url in [
+            "/Patient?_has:Group:member:_id=g1",
+            "/Patient?_has:Observation:subject:code=1234-5",
+            "/Patient?_has:Observation:subject:_has:Provenance:target:agent=x",
+            "/Encounter?patient._has:Group:member:_id=g1",
+        ] {
+            let (name, value) = strict_header();
+            server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(name, value)
+                .await
+                .assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
     async fn test_known_params_survive_lenient_handling() {
         // The self link still carries every parameter that was applied, and no
         // outcome entry is added when nothing was ignored.
