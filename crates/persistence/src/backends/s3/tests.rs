@@ -1990,6 +1990,36 @@ async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
     );
 }
 
+mod empty_elements_contract {
+    use crate as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/empty_elements_contract.rs"
+    ));
+}
+
+/// See `empty_elements_contract` (#2554). S3 has no `skip_unchanged`.
+#[tokio::test]
+async fn bulk_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+        &backend,
+        &tenant("tenant-empty-merge"),
+    )
+    .await;
+}
+
+/// See `empty_elements_contract` (#2554).
+#[tokio::test]
+async fn bulk_submit_replace_drops_empty_elements() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    empty_elements_contract::replace_import_drops_empty_elements(
+        &backend,
+        &tenant("tenant-empty-replace"),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn bulk_submit_lifecycle_and_processing() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));

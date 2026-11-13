@@ -792,6 +792,68 @@ async fn test_completed_submission_still_ingests_manifests() {
     }
 }
 
+/// #2554: a submitted line is stored without its empty objects, empty arrays
+/// and null members, as a REST write of the same body is.
+#[tokio::test]
+async fn test_submitted_resources_are_stored_without_empty_elements() {
+    let ndjson = concat!(
+        "{\"resourceType\":\"Patient\",\"id\":\"sub-empty\",\"active\":true,",
+        "\"name\":[{\"family\":\"A\",\"given\":[]},{}],\"telecom\":[],\"gender\":null}\n"
+    );
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "https://provider/patients.ndjson".to_string(),
+        ndjson.as_bytes().to_vec(),
+    );
+    let fetcher = Arc::new(MockFetcher {
+        files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider/patients.ndjson".to_string(),
+                count: Some(1),
+            }],
+            deleted: vec![],
+        },
+        manifests: std::collections::HashMap::new(),
+    });
+    let (server, backend, fetcher, output, _tmp) =
+        create_submit_server_with(fetcher, BulkSubmitConfig::default()).await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("empty-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    let stored = backend
+        .read(
+            &TenantContext::new(
+                TenantId::new("test-tenant"),
+                TenantPermissions::full_access(),
+            ),
+            "Patient",
+            "sub-empty",
+        )
+        .await
+        .unwrap()
+        .expect("Patient/sub-empty is ingested");
+    assert_eq!(
+        stored.content(),
+        &json!({
+            "resourceType": "Patient",
+            "id": "sub-empty",
+            "active": true,
+            "name": [{"family": "A"}]
+        })
+    );
+}
+
 /// `submissionStatus=stopped` aborts rather than completes.
 #[tokio::test]
 async fn test_stopped_status_aborts_submission() {

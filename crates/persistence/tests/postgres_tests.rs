@@ -2235,6 +2235,56 @@ mod postgres_integration {
         .await;
     }
 
+    mod empty_elements_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/empty_elements_contract.rs"
+        ));
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn postgres_bulk_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+            &create_backend().await,
+            &create_tenant(&format!(
+                "submit-empty-merge-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        )
+        .await;
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn postgres_bulk_submit_replace_drops_empty_elements() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        empty_elements_contract::replace_import_drops_empty_elements(
+            &create_backend().await,
+            &create_tenant(&format!(
+                "submit-empty-replace-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        )
+        .await;
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn postgres_bulk_submit_skip_unchanged_compares_the_clean_candidate() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        empty_elements_contract::skip_unchanged_compares_the_clean_candidate(
+            &create_backend().await,
+            &create_tenant(&format!(
+                "submit-empty-skip-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        )
+        .await;
+    }
+
     mod index_pending_contract {
         use helios_persistence as persistence;
         include!(concat!(
