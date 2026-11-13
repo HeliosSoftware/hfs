@@ -21,7 +21,7 @@ use crate::error::{
 };
 use crate::perf::{self, Phase};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{SearchParameter, StoredResource};
+use crate::types::{SearchParameter, StoredResource, merge_update_meta};
 
 use super::SqliteBackend;
 use super::backend::load_tenant_stored_params_with_conn;
@@ -758,8 +758,10 @@ impl Transaction for SqliteTransaction {
     async fn update(
         &mut self,
         current: &StoredResource,
-        resource: Value,
+        mut resource: Value,
     ) -> StorageResult<StoredResource> {
+        // Tags and security labels the update leaves out are kept (#2562).
+        merge_update_meta(current.content(), &mut resource);
         self.write_revision(current, resource, false).await
     }
 
@@ -1518,15 +1520,18 @@ mod tests {
         tx.update(&current, tagged("after")).await.unwrap();
         Box::new(tx).commit().await.unwrap();
 
+        // The update keeps the `before` tag the body leaves out (#2562), so it
+        // is indexed once more — exactly once: the previous version's row is
+        // cleared and the merged body re-indexed, not stacked on top.
         assert_eq!(
             rows_with_tag("before"),
-            0,
+            1,
             "the update must clear the previous version's index rows"
         );
         assert_eq!(rows_with_tag("after"), 1, "the new tag must be indexed");
         assert_eq!(
             total_rows(),
-            after_create,
+            after_create + 1,
             "an update must not accumulate rows on top of the create's"
         );
     }

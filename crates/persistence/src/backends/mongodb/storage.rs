@@ -39,7 +39,8 @@ use crate::search::reindex::{
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, StoredResource, absolute_reference_target, strip_reference_version,
+    SearchQuery, StoredResource, absolute_reference_target, merge_update_meta,
+    strip_reference_version,
 };
 
 use super::MongoBackend;
@@ -3079,46 +3080,10 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        // A lost race is not run again: `update` always carries a precondition
-        // (`current`'s version), and a writer that beat us to the document
-        // has, or is about to have, moved it on. The honest answer is the one
-        // PostgreSQL gives for the same race — `VersionConflict` -> 409 — not
-        // a second attempt. A transaction the server aborted for any other
-        // reason is run again, checking the original version each time. A
-        // `WriteConflict` on its history row or at its commit is not a lost
-        // race: the update holds the resource document by then, so it is run
-        // again too (#2342).
+        // Tags and security labels the update leaves out are kept (#2562).
         let mut resource = resource;
-        ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
-        let refused_commit = RefusedCommitSession::default();
-        let replayed = replay_aborted_writes("update", || async {
-            let mut session = refused_commit.take();
-            let attempt = self
-                .update_attempt(tenant, current, &resource, &mut session)
-                .await;
-            let attempt =
-                abort_failed_write(&mut session, attempt, WriteAttemptError::aborts_transaction)
-                    .await;
-            refused_commit.keep_after(&attempt, &mut session);
-            match attempt {
-                Ok(stored) => Ok(stored),
-                Err(WriteAttemptError::Storage(e)) => Err(e),
-                Err(WriteAttemptError::Conflict(e)) => Err(self
-                    .lost_race(
-                        tenant,
-                        current.resource_type(),
-                        current.id(),
-                        current.version_id(),
-                        &e,
-                    )
-                    .await),
-            }
-        });
-        let outcome =
-            commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
-                .await
-                .map_err(|err| self.unavailable_write_error("update", err))?;
-        Ok(outcome.into_resource(tenant, current.resource_type(), resource))
+        merge_update_meta(current.content(), &mut resource);
+        self.update_verbatim(tenant, current, resource).await
     }
 
     async fn delete(
@@ -3873,6 +3838,60 @@ impl ResourceStorage for MongoBackend {
             );
         }
         Ok(removed)
+    }
+}
+
+impl MongoBackend {
+    /// [`ResourceStorage::update`] without the #2562 merge: `resource` is
+    /// stored exactly as given, so a tag or security label it leaves out is
+    /// removed. For writes that must reproduce a body verbatim — restoring a
+    /// rolled-back bulk-submit update — not for client updates.
+    pub(crate) async fn update_verbatim(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        // A lost race is not run again: `update` always carries a precondition
+        // (`current`'s version), and a writer that beat us to the document
+        // has, or is about to have, moved it on. The honest answer is the one
+        // PostgreSQL gives for the same race — `VersionConflict` -> 409 — not
+        // a second attempt. A transaction the server aborted for any other
+        // reason is run again, checking the original version each time. A
+        // `WriteConflict` on its history row or at its commit is not a lost
+        // race: the update holds the resource document by then, so it is run
+        // again too (#2342).
+        let mut resource = resource;
+        ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
+        let refused_commit = RefusedCommitSession::default();
+        let replayed = replay_aborted_writes("update", || async {
+            let mut session = refused_commit.take();
+            let attempt = self
+                .update_attempt(tenant, current, &resource, &mut session)
+                .await;
+            let attempt =
+                abort_failed_write(&mut session, attempt, WriteAttemptError::aborts_transaction)
+                    .await;
+            refused_commit.keep_after(&attempt, &mut session);
+            match attempt {
+                Ok(stored) => Ok(stored),
+                Err(WriteAttemptError::Storage(e)) => Err(e),
+                Err(WriteAttemptError::Conflict(e)) => Err(self
+                    .lost_race(
+                        tenant,
+                        current.resource_type(),
+                        current.id(),
+                        current.version_id(),
+                        &e,
+                    )
+                    .await),
+            }
+        });
+        let outcome =
+            commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
+                .await
+                .map_err(|err| self.unavailable_write_error("update", err))?;
+        Ok(outcome.into_resource(tenant, current.resource_type(), resource))
     }
 }
 
@@ -7847,9 +7866,11 @@ impl MongoBackend {
         session: &mut ClientSession,
         tenant: &TenantContext,
         current: &StoredResource,
-        resource: Value,
+        mut resource: Value,
         writes: &mut BundleWrites,
     ) -> StorageResult<StoredResource> {
+        // Tags and security labels the update leaves out are kept (#2562).
+        merge_update_meta(current.content(), &mut resource);
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = current.resource_type();

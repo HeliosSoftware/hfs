@@ -72,6 +72,7 @@
 //! let decoded = PageCursor::decode(&encoded).unwrap();
 //! ```
 
+mod meta_update;
 mod pagination;
 mod search_capabilities;
 mod search_params;
@@ -89,6 +90,7 @@ pub use search_params::{
     SortDirective, SummaryMode, TotalMode, absolute_reference_target, strip_reference_version,
 };
 
+pub use meta_update::merge_update_meta;
 pub use stored_resource::{ResourceMeta, ResourceMethod, StoredResource, StoredResourceBuilder};
 
 pub use search_capabilities::{
