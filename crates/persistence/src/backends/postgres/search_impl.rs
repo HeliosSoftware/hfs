@@ -532,8 +532,10 @@ impl PostgresBackend {
         query: &SearchQuery,
         offset: usize,
     ) -> StorageResult<Option<SqlFragment>> {
+        // A parameter with values and no condition is a 400, not a wider
+        // search (#2508).
         let ordinary =
-            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout());
+            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout())?;
         if !self.supports_native_reverse_chains(tenant, query) {
             if query.reverse_chains.is_empty() {
                 return Ok(ordinary);
@@ -1029,7 +1031,7 @@ impl SearchProvider for PostgresBackend {
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
         let search_filter = if !query.parameters.is_empty() {
-            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())?
         } else {
             None
         };
@@ -1787,7 +1789,7 @@ impl PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let contained_type = query.resource_type.as_str();
         let matches: Vec<(String, String, Option<String>)> =
-            match PostgresQueryBuilder::build_contained(query) {
+            match PostgresQueryBuilder::build_contained(query)? {
                 Some(fragment) => {
                     let client = self.get_client().await?;
                     let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
@@ -2048,6 +2050,7 @@ mod fast_path_tests {
 
     fn filter_of(query: &SearchQuery) -> String {
         PostgresQueryBuilder::build_search_query(query, 2)
+            .expect("the query builds")
             .expect("condition")
             .sql
     }
