@@ -718,6 +718,10 @@ async fn has_resolution_issues_no_source_type_search() {
 /// #2556: a chain whose last step is `_has` reads its `_has` hop through the
 /// aggregation, with no Observation paging:
 /// Observation?subject:Patient._has:Observation:subject:code=<height>.
+///
+/// The chain's base is Observation too, so walking back out from the matched
+/// Patients is one id-only Observation search; the `_has` sources themselves
+/// are never searched.
 #[tokio::test]
 async fn chain_ending_in_has_issues_no_source_type_search() {
     let es = Arc::new(create_backend().await);
@@ -758,8 +762,12 @@ async fn chain_ending_in_has_issues_no_source_type_search() {
         .await
         .expect("resolve the chain ending in _has");
 
-    assert_eq!(counting.searches_of("Observation"), 0, "no source paging");
     assert_eq!(*counting.reference_calls.lock().unwrap(), 1);
+    // Only the walk back out to the base: no source paging.
+    assert_eq!(counting.searches_of("Observation"), 1, "no source paging");
+    // That walk and the Patient existence check, both id-only.
+    assert_eq!(counting.searches_of("Patient"), 1);
+    assert_eq!(*counting.id_calls.lock().unwrap(), 2);
     let result = counting
         .search(&t, &resolved)
         .await
