@@ -1732,6 +1732,25 @@ impl SearchProvider for CompositeStorage {
         ))
     }
 
+    fn supports_search(&self) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider. No provider at all means
+        // `search` answers `UnsupportedCapability`, so `false` (#514).
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.supports_search();
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.supports_search())
+            .unwrap_or(false)
+    }
+
     fn supports_contained_search(&self) -> bool {
         // Same routing as `search`: defer to the dedicated Search backend when
         // configured, otherwise the primary provider.
@@ -1817,9 +1836,9 @@ impl ConditionalStorage for CompositeStorage {
     /// Composed, not copied from the primary (#1384). With a dedicated search
     /// backend the composite resolves the criteria itself and needs only plain
     /// CRUD from the primary — which is how `s3-elasticsearch` serves all four
-    /// over a primary that declares none. Patch included (#1406): the patch is
-    /// applied by the shared [`apply_patch`](crate::core::apply_patch), not by
-    /// the primary.
+    /// over a primary that declares only an identifier-scoped create (#1435).
+    /// Patch included (#1406): the patch is applied by the shared
+    /// [`apply_patch`](crate::core::apply_patch), not by the primary.
     fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
         if self.has_dedicated_search_backend() {
             return true;
@@ -2562,6 +2581,17 @@ impl TextSearchProvider for CompositeStorage {
     }
 }
 
+/// A summary of the composite's system-level interactions.
+///
+/// The CapabilityStatement HFS serves at `GET /metadata` is **not** generated
+/// from this: `helios-rest` builds it from the per-capability methods
+/// ([`SearchProvider::supports_search`], [`SearchProvider::supports_contained_search`],
+/// [`SearchProvider::modifiers_for_param_type`],
+/// [`ConditionalStorage::supports_conditional`] and
+/// [`BundleProvider::supports_atomic_transactions`]), each of which the
+/// composite routes to the backend that serves the request. `resources` is left
+/// empty: no per-resource capabilities are populated here, and nothing reads
+/// them.
 impl CapabilityProvider for CompositeStorage {
     fn capabilities(&self) -> StorageCapabilities {
         use std::collections::HashSet;
@@ -2579,7 +2609,10 @@ impl CapabilityProvider for CompositeStorage {
             system_interactions.insert(crate::core::SystemInteraction::Transaction);
         }
         system_interactions.insert(crate::core::SystemInteraction::Batch);
-        system_interactions.insert(crate::core::SystemInteraction::SearchSystem);
+        // No `SearchSystem`: `GET [base]?params` and `POST [base]/_search` are
+        // refused with `501` by the REST layer, and `/metadata` dropped
+        // `search-system` for that reason (#1338). This summary still claimed
+        // it (#514).
         system_interactions.insert(crate::core::SystemInteraction::HistorySystem);
 
         StorageCapabilities {
@@ -2588,7 +2621,7 @@ impl CapabilityProvider for CompositeStorage {
             resources: resource_caps,
             system_interactions,
             supports_system_history: true,
-            supports_system_search: true,
+            supports_system_search: false,
             supported_sorts: vec!["_lastUpdated".to_string(), "_id".to_string()],
             supports_total: true,
             max_page_size: Some(1000),
@@ -3722,6 +3755,12 @@ mod tests {
 
     #[async_trait]
     impl SearchProvider for RecordingSearchProvider {
+        /// A provider whose `search` answers `UnsupportedCapability` says so,
+        /// as S3 does.
+        fn supports_search(&self) -> bool {
+            !self.unsupported.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn supports_native_reverse_chains(&self, _: &TenantContext, _: &SearchQuery) -> bool {
             self.native_reverse
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -4952,6 +4991,98 @@ mod tests {
         assert_eq!(caps.backend_name, "composite");
     }
 
+    /// The summary no longer claims system-level search: `GET [base]?params`
+    /// is refused with `501` by the REST layer, and `/metadata` dropped
+    /// `search-system` for that reason (#1338). It still claimed it until #514.
+    /// The statement HFS serves is built from the per-capability methods, not
+    /// from this, and no resource-level capabilities are populated.
+    #[test]
+    fn test_capabilities_do_not_claim_system_search() {
+        use crate::core::SystemInteraction;
+
+        let composite = make_composite_no_secondary();
+        let caps = composite.capabilities();
+        assert!(!caps.supports_system_search);
+        assert!(
+            !caps
+                .system_interactions
+                .contains(&SystemInteraction::SearchSystem)
+        );
+        assert!(!composite.supports_system_interaction(SystemInteraction::SearchSystem));
+        // What it does serve is unchanged.
+        assert!(caps.supports_system_history);
+        assert!(composite.supports_system_interaction(SystemInteraction::HistorySystem));
+        assert!(composite.supports_system_interaction(SystemInteraction::Batch));
+        assert!(caps.resources.is_empty());
+    }
+
+    /// `supports_search` follows the provider `search` reaches (#514): the
+    /// dedicated Search backend when one is configured, the primary's
+    /// provider otherwise, and `false` when there is none. Each answer is
+    /// checked against what a `search` call really does.
+    #[tokio::test]
+    async fn supports_search_follows_the_provider_search_reaches() {
+        use std::sync::atomic::Ordering;
+
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Patient");
+        let is_unsupported = |result: StorageResult<SearchResult>| {
+            matches!(
+                result,
+                Err(StorageError::Backend(
+                    BackendError::UnsupportedCapability { .. }
+                ))
+            )
+        };
+
+        // A dedicated Search backend answers for the composite, whatever the
+        // primary says.
+        let (mut composite, primary, search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        search.unsupported.store(true, Ordering::Relaxed);
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+
+        search.unsupported.store(false, Ordering::Relaxed);
+        primary.unsupported.store(true, Ordering::Relaxed);
+        assert!(
+            composite.supports_search(),
+            "the primary is not consulted while a search backend is configured"
+        );
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        // A configured Search backend with no provider registered falls back
+        // to the primary, in `supports_search` as in `search`.
+        composite.search_providers.remove("search");
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+        primary.unsupported.store(false, Ordering::Relaxed);
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+
+        // No provider at all: `search` is `UnsupportedCapability`.
+        composite.search_providers.remove("primary");
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+
+        // No Search backend configured: the primary's provider answers.
+        let (composite, primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        assert!(composite.supports_search());
+        assert!(composite.search(&tenant, &query).await.is_ok());
+        primary.unsupported.store(true, Ordering::Relaxed);
+        assert!(!composite.supports_search());
+        assert!(is_unsupported(composite.search(&tenant, &query).await));
+    }
+
     #[test]
     fn test_backend_name_is_composite() {
         let composite = make_composite_no_secondary();
@@ -5666,6 +5797,7 @@ mod tests {
                 reference_param: pair[0].0.to_string(),
                 target_type: pair[0].1.map(str::to_string),
                 target_param: pair[1].0.to_string(),
+                has: None,
             })
             .collect();
 

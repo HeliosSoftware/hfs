@@ -13,10 +13,15 @@
 //! leaves the driver's read retry on, on purpose: it shows a state-change error
 //! that outlasts that one retry (#2302). The same module covers the other
 //! single-document reads that used to stringify the driver error (#2301): the
-//! tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and
-//! the `$reindex` resource-type list and newest-resource probe. One test
-//! covers a read that goes through `or_query_error`, `$purge`'s history count,
-//! which answers a state-change error the same way since #2334. Since #2335 the
+//! tenant lookup, `delete_with_match`'s load, the existence check `$purge` used
+//! to make (#2271) and the `$reindex` resource-type list and newest-resource
+//! probe. One test covers `$purge`'s history count, which answered a
+//! state-change error the same way since #2334. Since #2146 `$purge` runs that
+//! count as its first command, inside its transaction, where the driver does not
+//! retry it and there is no existence check any more: the two `$purge` tests here
+//! fail the count on every attempt, which ends as `Unavailable` after the purge has
+//! been run again (`purge.rs` covers the single failure that is run again).
+//! Since #2335 the
 //! module also covers a cursor's later batch (`getMore`) of a history query and
 //! the bulk export and `$bulk-submit` job-store reads, which go through
 //! `or_query_error` too. No test asserts timing: after a dropped connection the
@@ -440,10 +445,15 @@ async fn a_dropped_connection_on_delete_with_match_is_unavailable_and_its_decisi
     );
 }
 
-/// `$purge` checks the resource exists with `count_documents`, an `aggregate`
-/// on the server. A failed check is `Unavailable` and purges nothing.
+/// `$purge`'s first command is the count of the resource's versions
+/// (`count_documents`, an `aggregate` on the server, #2146), which runs inside the
+/// purge's transaction. A dropped connection ends that attempt and the purge is run
+/// again like any single-resource write the server aborted, up to 4 attempts; a
+/// count that keeps failing is `Unavailable` and purges nothing. The attempts are
+/// all counted: each one starts a transaction on a new connection and reaches the
+/// failpoint before anything else.
 #[tokio::test]
-async fn a_dropped_connection_on_the_purge_check_is_unavailable_and_purges_nothing() {
+async fn a_dropped_connection_on_the_purge_version_count_is_unavailable_and_purges_nothing() {
     let app = "fp-read-dropped-purge";
     let Some((backend, tenant)) = backend_without_driver_retries("read_dropped_purge", app).await
     else {
@@ -451,8 +461,8 @@ async fn a_dropped_connection_on_the_purge_check_is_unavailable_and_purges_nothi
     };
     let Some(fail_point) = FailPoint::enable(
         app,
-        dropped_connection_on(&backend, "aggregate", "resources"),
-        doc! { "times": 1 },
+        dropped_connection_on(&backend, "aggregate", "resource_history"),
+        doc! { "times": 100 },
     )
     .await
     else {
@@ -466,10 +476,13 @@ async fn a_dropped_connection_on_the_purge_check_is_unavailable_and_purges_nothi
         panic!("expected Unavailable, got {result:?}");
     };
     assert!(
-        message.starts_with("Failed to check resource: ") && !message.contains("Kind:"),
+        message.starts_with("The purge was aborted by the database ") && !message.contains("Kind:"),
         "{message}"
     );
-    assert_eq!(entered, 1);
+    assert_eq!(
+        entered, 4,
+        "the purge was run again until its attempts ran out"
+    );
 
     let still_there = backend
         .read(&tenant, "Observation", "obs-1")
@@ -618,13 +631,14 @@ async fn a_state_change_that_outlasts_the_driver_read_retry_is_unavailable() {
     }
 }
 
-/// #2334: the same state-change error on a read that goes through `or_query_error`, not
-/// `read_driver_error`: `$purge`'s `resource_history` count, which runs right after the
-/// `resources` count. During an election the two counts used to answer differently (503, then
-/// 500); `classify_mongodb_error` now answers a state-change code `Unavailable` too, with the
-/// driver text in the log only. `count_documents` is an `aggregate`, and the `resources` count
-/// before it is on another namespace, so the failpoint does not fire on it. 11602 clears no
-/// connection pool, unlike 91 and 11600 (see above), so the driver's own retry still runs.
+/// #2334: the same state-change error on `$purge`'s `resource_history` count, a read that goes
+/// through `or_query_error` without a transaction and, since #2146, the first command of the
+/// purge's transaction, where the driver does not retry it and the server labels the failure a
+/// transient transaction abort. The purge is run again like any single-resource write (see
+/// `a_dropped_connection_on_the_purge_version_count_is_unavailable_and_purges_nothing`). A state change
+/// that outlasts the attempts answers `Unavailable` (a retryable 503) with the driver text left to
+/// the log, as it did when the count was a plain read, and purges nothing. `count_documents` is
+/// an `aggregate`.
 #[tokio::test]
 async fn a_state_change_on_the_purge_history_count_is_unavailable_and_purges_nothing() {
     let app = "fp-read-state-change-purge-history";
@@ -640,7 +654,7 @@ async fn a_state_change_on_the_purge_history_count_is_unavailable_and_purges_not
             "namespace": format!("{}.resource_history", backend.config().database_name),
             "errorCode": 11602,
         },
-        doc! { "times": 2 },
+        doc! { "times": 100 },
     )
     .await
     else {
@@ -655,15 +669,15 @@ async fn a_state_change_on_the_purge_history_count_is_unavailable_and_purges_not
     };
     assert_eq!(
         message,
-        "Failed to check resource history: the database is temporarily unavailable; retry the request"
+        "The purge was aborted by the database 4 times; retry the request"
     );
     assert!(
         !message.contains("Kind:") && !message.contains("InterruptedDueToReplStateChange"),
         "the client-facing message leaves the driver error to the log: {message}"
     );
     assert_eq!(
-        entered, 2,
-        "the driver retried the count once and the failure outlasted it"
+        entered, 4,
+        "the purge was run again until its attempts ran out"
     );
 
     let still_there = backend

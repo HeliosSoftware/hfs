@@ -1390,15 +1390,6 @@ async fn test_modifier_parity_suite() {
         &backend,
         "modifier-parity",
         &[
-            // A short `:of-type` value is read as `type-code|value`, or `value`.
-            Divergence {
-                label: "Patient?identifier:ofType=MR|12345",
-                expect: Expect::Ids(&["p1"]),
-            },
-            Divergence {
-                label: "Patient?identifier:ofType=12345",
-                expect: Expect::Ids(&["p1", "p2"]),
-            },
             // Terminology-backed token modifiers are not refused but degraded:
             // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
             // itself. Unreachable over REST, which expands them or answers 501 first.

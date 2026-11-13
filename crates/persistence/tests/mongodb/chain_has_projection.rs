@@ -162,6 +162,9 @@ impl<S: ResourceStorage> ResourceStorage for Counting<S> {
 
 #[async_trait]
 impl<S: SearchProvider> SearchProvider for Counting<S> {
+    fn supports_search(&self) -> bool {
+        self.inner.supports_search()
+    }
     fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
         self.inner.supports_native_reverse_chains(tenant, query)
     }
@@ -261,6 +264,7 @@ fn chain_by_family_query(family: &str) -> SearchQuery {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "family".to_string(),
+            has: None,
         }],
         ..Default::default()
     })
@@ -670,6 +674,72 @@ async fn forward_chain_reads_the_terminal_hop_without_bodies() {
     // backend's either way, so compare with the plain `search` result).
     let hidden = Counting::new(Arc::clone(&backend)).without_hook();
     assert_eq!(resolved_ids(&hidden, &t, &query).await, set(&["o1", "o2"]));
+}
+
+/// #2556: a chain whose last step is `_has` reads the `_has` hop through
+/// `search_reference_values` and the walk back through `search_ids`, never a
+/// body: Observation?subject:Patient._has:Observation:subject:code=<height>.
+#[tokio::test]
+async fn chain_ending_in_has_reads_no_bodies() {
+    let Some(backend) = create_backend("chain_to_has").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let t = create_tenant("chain-to-has");
+    for id in ["p1", "p2", "p3"] {
+        put(&*backend, &t, "Patient", patient(id, "Smith")).await;
+    }
+    for (id, code, subject) in [
+        ("o1", HEIGHT, "Patient/p1"),
+        ("o2", OTHER_CODE, "Patient/p1"),
+        ("o3", OTHER_CODE, "Patient/p2"),
+        ("o4", OTHER_CODE, "Patient/p3"),
+        ("o5", HEIGHT, "Patient/p3"),
+        // A Patient that was never created: its own reference makes it a
+        // `_has` match, but the chain cannot reach it.
+        ("o6", HEIGHT, "Patient/ghost"),
+    ] {
+        put(&*backend, &t, "Observation", observation(id, code, subject)).await;
+    }
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        chain: vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "_has".to_string(),
+            has: Some(Box::new(ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "code",
+                SearchValue::token(Some(LOINC), HEIGHT),
+            ))),
+        }],
+        ..Default::default()
+    });
+    let counting = Counting::new(Arc::clone(&backend));
+    let resolved = resolve_chains(&counting, &t, &query)
+        .await
+        .expect("resolve the chain ending in _has");
+
+    assert_eq!(counting.full_searches_of("Observation"), 0, "no body loads");
+    assert_eq!(counting.full_searches_of("Patient"), 0, "no body loads");
+    assert_eq!(counting.reference_calls(), 1, "one _has hop");
+    let result = counting
+        .search(&t, &resolved)
+        .await
+        .expect("Observation search");
+    assert_eq!(ids(&result), set(&["o1", "o2", "o4", "o5"]));
+
+    // The trait default (hook hidden) selects the same Observations.
+    let hidden = Counting::new(Arc::clone(&backend)).without_hook();
+    assert_eq!(
+        resolved_ids(&hidden, &t, &query).await,
+        set(&["o1", "o2", "o4", "o5"])
+    );
+    assert_eq!(hidden.reference_calls(), 0);
 }
 
 // ============================================================================

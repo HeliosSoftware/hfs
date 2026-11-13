@@ -157,6 +157,7 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY` | `32` | Queued + active notifications for one `(tenant, subscription_id)` |
 | `HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY` | `64` | Simultaneous channel attempts, shared by notifications and activation handshakes |
 | `HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY` | `8` | Running activation flows, shared by live writes and startup rehydration |
+| `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `$events` (number, timestamp, focus reference only; in memory, lost on restart); `0` disables the history |
 | `max_retries` *(config field)* | `10` | Delivery attempts per notification; `0` disables retries |
 | `retry_initial_delay` *(config field)* | `1s` | Base delay for delivery backoff |
 | `retry_max_delay` *(config field)* | `60s` | Maximum delivery backoff delay |
@@ -409,6 +410,14 @@ GET /Subscription/{id}/$status
 ```
 
 Returns a `Parameters` resource (R4) or `SubscriptionStatus` resource (R4B/R5/R6) with the current runtime status and event count.
+
+### Querying Past Events
+
+```bash
+GET /Subscription/{id}/$events?eventsSinceNumber=1&eventsUntilNumber=3
+```
+
+Returns a Bundle (`history` on R4/R4B, `subscription-notification` on R5/R6) whose first entry is the status with `type` `query-event` — a `Parameters` resource on R4, a `SubscriptionStatus` with `notificationEvent` on R4B/R5/R6 — using an absolute subscription reference like `$status`, followed by one id-only entry per event in the requested range. Without `eventsSinceNumber` the range starts at the oldest retained event; without `eventsUntilNumber` it ends at the current event count. An invalid range (non-numeric, below 1, since greater than until, or entirely older than the retained history) returns `400` with an `OperationOutcome`. An `eventsSinceNumber` beyond the event count — a client polling for the next event — returns the status with no events. The history is bounded by `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` and kept in memory only, like the event counter.
 
 ## Features
 

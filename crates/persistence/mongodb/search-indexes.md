@@ -240,13 +240,15 @@ Deferred bulk ingestion (`defer_indexing`) or offloaded indexing leaves
 metadata unknown and removes any old array on update; a whole-resource
 extraction failure does the same. A transaction Bundle that defers its
 value-index rows (#1975) leaves the metadata of the resources of deferred
-types it creates unknown until its post-commit step, or the deferred-index
-repair, writes it together with the rows from one extraction. Until then the
+types it creates, updates or restores unknown until its post-commit step, or
+the deferred-index repair, writes it together with the rows from one
+extraction (#2035: an update or a restore removes the array its previous
+version carried and extracts nothing in the transaction). Until then the
 resource still carries the deferral's `search_rows_pending` marker, and a
 `:missing=true` search on the metadata route leaves it out, as every
 row-driven search does, rather than listing it as missing every parameter. Its
-updates and deletes still write metadata in the transaction, and the step
-rewrites it after the SearchParameter reload (see
+deletes extract nothing and still write `missing_params: []` in the
+transaction, and the step writes the same `[]` (see
 [deferred search indexing for large transaction Bundles](../README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles)).
 Reindex updates metadata only when the resource version still matches the
 version read for that page.

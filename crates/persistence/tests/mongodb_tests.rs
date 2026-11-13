@@ -42,6 +42,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
 #[path = "reindex/clear_interrupted.rs"]
 mod clear_interrupted;
 
@@ -1513,6 +1516,12 @@ mod write_abort_retry;
 /// (503); any other keeps its driver error as `Internal`'s source.
 #[path = "mongodb/read_errors.rs"]
 mod read_errors;
+
+/// #2146: `purge` is one transaction where the deployment has them, a repeated
+/// `purge` finishes a half-done one, and `purge_all` removes a type in batches of
+/// ids, one transaction per batch.
+#[path = "mongodb/purge.rs"]
+mod purge;
 
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
 /// their turn. #1806: the gate's room is counted in entries, so small Bundles
@@ -15721,6 +15730,93 @@ mod bulk_submit {
         .await;
     }
 
+    mod empty_elements_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/empty_elements_contract.rs"
+        ));
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn test_submit_merge_applies_the_mode_before_dropping_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_merge").await else {
+            return;
+        };
+        empty_elements_contract::merge_import_applies_the_mode_before_dropping_empty_elements(
+            &backend,
+            &create_tenant("submit-empty-merge"),
+        )
+        .await;
+    }
+
+    /// See `empty_elements_contract` (#2554).
+    #[tokio::test]
+    async fn test_submit_replace_drops_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_replace").await else {
+            return;
+        };
+        empty_elements_contract::replace_import_drops_empty_elements(
+            &backend,
+            &create_tenant("submit-empty-replace"),
+        )
+        .await;
+    }
+
+    /// #2554: a second line for a resource staged earlier in the same batch
+    /// merges onto the staged, already clean content (the `Seen::Staged`
+    /// branch of the MongoDB bulk writer).
+    #[tokio::test]
+    async fn test_submit_merge_onto_a_staged_resource_drops_empty_elements() {
+        let Some(backend) = create_backend("submit_empty_staged").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-empty-staged");
+        let (submission, manifest) = seed(&backend, &tenant).await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient", "id": "ee-staged",
+                            "gender": "male", "name": [{"family": "Doe"}], "telecom": []
+                        }),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient", "id": "ee-staged",
+                            "gender": null, "name": [], "photo": [{}], "active": true
+                        }),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_import_mode(helios_persistence::core::ImportMode::Merge),
+            )
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let mut content = backend
+            .read(&tenant, "Patient", "ee-staged")
+            .await
+            .unwrap()
+            .expect("Patient/ee-staged is stored")
+            .content()
+            .clone();
+        content.as_object_mut().unwrap().remove("meta");
+        assert_eq!(
+            content,
+            json!({"resourceType": "Patient", "id": "ee-staged", "active": true})
+        );
+    }
+
     mod index_pending_contract {
         use helios_persistence as persistence;
         include!(concat!(
@@ -16013,6 +16109,129 @@ mod bulk_submit {
                 .unwrap()
                 .last_processed_line,
             10
+        );
+    }
+
+    /// Batches of one file written concurrently by the stream driver charge
+    /// the file watermark in file order: a later batch whose writes finished
+    /// first waits for the earlier batch's charge; and when the earlier batch
+    /// fails before charging, the later one is refused its charge — written
+    /// but uncharged, as a crash between its writes and `charge_batch` leaves
+    /// it — so the watermark never moves past lines that were not ingested
+    /// and a reclaimed manifest re-walks them.
+    #[tokio::test]
+    async fn test_sequenced_batches_charge_the_file_watermark_in_order() {
+        use helios_persistence::core::{BatchSequencer, BatchTicket};
+
+        let Some(backend) = create_backend("submit_sequenced_charge").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+        let patient = |line: u64, rid: &str| {
+            NdjsonEntry::new(
+                line,
+                "Patient",
+                json!({"resourceType": "Patient", "id": rid}),
+            )
+        };
+        let resume_line = |lines: &[(String, u64)], url: &str| {
+            lines.iter().find(|(u, _)| u == url).map(|(_, line)| *line)
+        };
+        let spawn_batch = |entries: Vec<NdjsonEntry>,
+                           options: BulkProcessingOptions,
+                           ticket: BatchTicket| {
+            let (backend, tenant, id, manifest_id) = (
+                backend.clone(),
+                tenant.clone(),
+                id.clone(),
+                manifest_id.clone(),
+            );
+            tokio::spawn(async move {
+                backend
+                    .process_entries_ticketed(&tenant, &id, &manifest_id, entries, &options, ticket)
+                    .await
+            })
+        };
+        let wait_written = |rid: &'static str| {
+            let (backend, tenant) = (backend.clone(), tenant.clone());
+            async move {
+                for _ in 0..100 {
+                    if backend
+                        .read(&tenant, "Patient", rid)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("{rid} was never written");
+            }
+        };
+
+        // Batch 1 finishes its writes first and waits for batch 0's charge.
+        let url = "https://provider.example/ordered.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![patient(3, "seq-c"), patient(4, "seq-d")],
+            options.clone(),
+            t1,
+        );
+        wait_written("seq-d").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!later.is_finished(), "batch 1 waits for batch 0's charge");
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), None);
+        backend
+            .process_entries_ticketed(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![patient(1, "seq-a"), patient(2, "seq-b")],
+                &options,
+                t0,
+            )
+            .await
+            .unwrap();
+        later.await.unwrap().unwrap();
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), Some(4));
+
+        // Batch 0 fails before charging: batch 1 is written but refused.
+        let url = "https://provider.example/poisoned.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![patient(3, "seq-g"), patient(4, "seq-h")],
+            options.clone(),
+            t1,
+        );
+        wait_written("seq-h").await;
+        drop(t0);
+        assert!(
+            later.await.unwrap().is_err(),
+            "a batch after a failed one must not charge"
+        );
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(
+            resume_line(&view.file_resume_lines, url),
+            None,
+            "the watermark stays below the uncharged batch, so a resume re-walks it"
+        );
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(
+            manifests[0].processed_entries, 4,
+            "only the charged batches are counted"
         );
     }
 
@@ -22107,6 +22326,18 @@ async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
         return;
     };
     scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_updated_since_view_bounds_counts_and_pages() {
+    let Some(backend) = create_backend("updated_since_view").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_updated_since_view_bounds_counts_and_pages \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(backend)).await;
 }
 
 #[tokio::test]

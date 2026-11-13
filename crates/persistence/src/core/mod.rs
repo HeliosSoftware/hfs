@@ -8,7 +8,8 @@
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
 //! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
-//! - [`CapabilityProvider`] - Runtime capability discovery
+//! - [`CapabilityProvider`] - Summary of a storage's capabilities (not the
+//!   source of `GET /metadata`; see below)
 //!
 //! # Trait Hierarchy
 //!
@@ -37,23 +38,31 @@
 //!
 //! # Backend Capabilities
 //!
-//! Not all backends support all features. Use [`CapabilityProvider`] to
-//! discover what a backend supports at runtime:
+//! Not all backends support all features. A storage answers what it really
+//! implements through per-capability methods on the storage traits, and the
+//! REST layer builds `GET /metadata` from those answers:
 //!
-//! ```ignore
-//! use helios_persistence::core::{CapabilityProvider, Interaction};
+//! - [`SearchProvider::supports_search`], [`SearchProvider::supports_contained_search`]
+//!   and [`SearchProvider::modifiers_for_param_type`]
+//! - [`ConditionalStorage::supports_conditional`]
+//! - [`BundleProvider::supports_atomic_transactions`]
+//! - [`Backend::supports`] for the declared [`BackendCapability`] list
 //!
-//! fn check_capabilities<S: CapabilityProvider>(storage: &S) {
-//!     if storage.supports_interaction("Patient", Interaction::HistoryType) {
-//!         // Use type-level history
+//! ```
+//! use helios_persistence::core::{ConditionalInteraction, ConditionalStorage, SearchProvider};
+//!
+//! fn describe<S: SearchProvider + ConditionalStorage>(storage: &S) {
+//!     if storage.supports_search() {
+//!         // `search` is implemented; a search request is served.
 //!     }
-//!
-//!     let caps = storage.capabilities();
-//!     println!("Backend: {}", caps.backend_name);
-//!     println!("Supports transactions: {}",
-//!         caps.system_interactions.contains(&SystemInteraction::Transaction));
+//!     if storage.supports_conditional(ConditionalInteraction::Update) {
+//!         // `PUT [type]?criteria` is served.
+//!     }
 //! }
 //! ```
+//!
+//! [`CapabilityProvider`] is a separate summary type. The REST layer does not
+//! read it, so it does not change what `/metadata` says.
 //!
 //! # Example: Implementing a Storage Backend
 //!
@@ -100,10 +109,12 @@ pub(crate) mod bulk_submit_legacy;
 pub mod bulk_submit_output;
 pub mod bulk_submit_publication;
 pub(crate) mod bulk_submit_receipts;
+pub mod bulk_submit_stream;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod database_url;
+pub mod empty_elements;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;
@@ -150,10 +161,16 @@ pub use bulk_submit_input::{
 };
 pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
 pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
+pub use bulk_submit_stream::{
+    BatchSequencer, BatchTicket, ChargeTurn, StreamBatchWriter, drive_ndjson_stream,
+    effective_batch_writers,
+};
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexContext, DeferredReindexHook,
-    IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
+    BulkSubmitJobStore, DEFAULT_REINDEX_IDS_MAX, DEFAULT_REINDEX_SINCE_MARGIN, DefaultSubmitWorker,
+    DeferredReindexContext, DeferredReindexHook, DeferredReindexScoping, IndexDrift,
+    IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex,
     PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    deferred_reindex_ledger_ids, deferred_reindex_since, fire_deferred_reindex,
 };
 pub use bundle_conditionals::{
     CONDITIONAL_MATCH_LIMIT, ConditionalTarget, check_identity_overlap, conditional_delete_entry,
@@ -165,6 +182,7 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use empty_elements::drop_empty_elements;
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -172,9 +190,9 @@ pub use history::{
 pub use patch::{PatchError, apply_patch, apply_patch_for_version, decode_bundle_patch_resource};
 pub use preconditions::{
     EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
-    bundle_if_none_exist_gate, conditional_if_match_gate, delete_under_precondition,
-    if_match_field_satisfied, multiple_matches_entry, not_supported_entry,
-    precondition_failed_entry,
+    bundle_if_none_exist_gate, bundle_read_result, conditional_if_match_gate,
+    delete_under_precondition, if_match_field_satisfied, multiple_matches_entry,
+    not_supported_entry, precondition_failed_entry,
 };
 pub use search::{
     FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,

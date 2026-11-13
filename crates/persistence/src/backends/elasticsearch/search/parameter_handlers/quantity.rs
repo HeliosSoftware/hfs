@@ -12,9 +12,10 @@ use crate::types::SearchPrefix;
 /// ([`FhirQuantityValue`]): only an unescaped `|` separates.
 ///
 /// Never returns `None` for a value it cannot read — see
-/// [`number::build_clause`](super::number::build_clause): the query builder's
-/// `filter_map` would drop the constraint and the search would return
-/// everything (#1319). It is [`match_none`](super::date::match_none) instead.
+/// [`number::build_clause`](super::number::build_clause): the query builder
+/// refuses a parameter over a `None` (#2510), and used to drop the constraint
+/// so that the search returned everything (#1319). It is
+/// [`match_none`](super::date::match_none) instead.
 pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Value> {
     let quantity = match FhirQuantityValue::parse(value) {
         Ok(quantity) => quantity,
@@ -297,7 +298,7 @@ mod tests {
         assert!((lte - canon(5.94)).abs() < 1e-12, "lte {lte}");
     }
 
-    /// The `filter_map` trap (#1319), as for numbers: never `None`.
+    /// The silent-drop trap (#1319), as for numbers: never `None`.
     #[test]
     fn an_invalid_number_part_is_match_none_never_none() {
         for prefix in [SearchPrefix::Eq, SearchPrefix::Ne, SearchPrefix::Lt] {

@@ -116,10 +116,13 @@ impl SubscriptionEngine {
     ) -> Self {
         let config = config.normalize_dispatch_limits();
         let topic_registry = Arc::new(InMemoryTopicRegistry::new());
-        let manager = Arc::new(SubscriptionManager::new(
-            Arc::clone(&topic_registry),
-            config.supported_channel_types.clone(),
-        ));
+        let manager = Arc::new(
+            SubscriptionManager::new(
+                Arc::clone(&topic_registry),
+                config.supported_channel_types.clone(),
+            )
+            .with_event_history_size(config.event_history_size),
+        );
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
         let rest_hook_channel = Arc::new(RestHookChannel::new());
         let ws_manager = Arc::new(WebSocketManager::new());
@@ -393,8 +396,14 @@ impl EngineCore {
             matched_subscriptions = matches.len(), "Subscription event evaluated");
         for matched in matches {
             let mut snapshot = matched.snapshot;
-            let Some(event_number) = self.manager.increment_event_count_if_current(&snapshot)
-            else {
+            let focus_reference = format!("{}/{}", event.resource_type, event.resource_id);
+            // Numbering and history share one guard; recorded before the
+            // scheduler reserve so a shed event is still queryable.
+            let Some(event_number) = self.manager.record_event_if_current(
+                &snapshot,
+                event.timestamp,
+                focus_reference.clone(),
+            ) else {
                 continue;
             };
             snapshot.subscription.events_since_start = event_number;
@@ -404,7 +413,7 @@ impl EngineCore {
             let event_data = NotificationEventData {
                 event_number,
                 timestamp: event.timestamp,
-                focus_reference: format!("{}/{}", event.resource_type, event.resource_id),
+                focus_reference,
             };
             let public_base_url =
                 (self.public_base_url_for_tenant)(&snapshot.subscription.tenant_id);

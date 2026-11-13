@@ -154,6 +154,8 @@ impl TokenHandler {
     /// - `Patient?identifier:of-type=http://terminology.hl7.org/CodeSystem/v2-0203|MR|12345`
     ///   matches patients with a Medical Record Number identifier with value "12345".
     ///
+    /// A value of fewer than three parts matches nothing.
+    ///
     /// This implementation uses the dedicated type columns:
     /// - `value_identifier_type_system` - stores identifier.type.coding[0].system
     /// - `value_identifier_type_code` - stores identifier.type.coding[0].code
@@ -199,42 +201,13 @@ impl TokenHandler {
                     SqlFragment::with_params(conditions.join(" AND "), params)
                 }
             }
-            2 => {
-                // type-code|value format (no type-system)
-                let type_code = parts[0];
-                let identifier_value = parts[1];
-
-                let mut conditions = Vec::new();
-                let mut params = Vec::new();
-
-                if !identifier_value.is_empty() {
-                    conditions.push(format!("value_token_code = ?{}", param_num));
-                    params.push(SqlParam::string(identifier_value));
-                    param_num += 1;
-                }
-
-                if !type_code.is_empty() {
-                    conditions.push(format!("value_identifier_type_code = ?{}", param_num));
-                    params.push(SqlParam::string(type_code));
-                }
-
-                if conditions.is_empty() {
-                    SqlFragment::new("1 = 0")
-                } else {
-                    SqlFragment::with_params(conditions.join(" AND "), params)
-                }
-            }
-            1 => {
-                // Just value (no type info)
-                SqlFragment::with_params(
-                    format!("value_token_code = ?{}", param_num),
-                    vec![SqlParam::string(value)],
-                )
-            }
-            _ => {
-                // Empty or invalid format - return empty match
-                SqlFragment::new("1 = 0")
-            }
+            // Fewer than three parts names nothing: the grammar is
+            // `type-system|type-code|identifier-value`, and FHIR requires all
+            // three. Matching nothing agrees with the shared `:of-type`
+            // expectation (`modifier_parity_suite`), MongoDB, Elasticsearch
+            // (#2510) and PostgreSQL. This used to read `MR|12345` as
+            // `type-code|value` and `12345` as a bare value.
+            _ => SqlFragment::new("1 = 0"),
         }
     }
 }
@@ -344,26 +317,16 @@ mod tests {
         assert_eq!(frag.params.len(), 2);
     }
 
+    /// A value of fewer than three parts names nothing (#2510): the shared
+    /// `:of-type` expectation, MongoDB, Elasticsearch and PostgreSQL all match
+    /// nothing for one. It used to be read as `type-code|value` or a bare value.
     #[test]
-    fn test_of_type_value_only() {
-        // Format with just type-code|value
-        let value = SearchValue::new(SearchPrefix::Eq, "MR|12345");
-        let frag = TokenHandler::build_sql(&value, Some(&SearchModifier::OfType), 0);
-
-        // Should match identifier value and type code
-        assert!(frag.sql.contains("value_token_code = ?1"));
-        assert!(frag.sql.contains("value_identifier_type_code = ?2"));
-        assert_eq!(frag.params.len(), 2);
-        // Verify parameters
-        if let SqlParam::String(s) = &frag.params[0] {
-            assert_eq!(s, "12345");
-        } else {
-            panic!("Expected string parameter for identifier value");
-        }
-        if let SqlParam::String(s) = &frag.params[1] {
-            assert_eq!(s, "MR");
-        } else {
-            panic!("Expected string parameter for type code");
+    fn test_of_type_with_fewer_than_three_parts_matches_nothing() {
+        for short in ["MR|12345", "12345", ""] {
+            let value = SearchValue::new(SearchPrefix::Eq, short);
+            let frag = TokenHandler::build_sql(&value, Some(&SearchModifier::OfType), 0);
+            assert_eq!(frag.sql, "1 = 0", "{short:?}");
+            assert!(frag.params.is_empty(), "{short:?}");
         }
     }
 

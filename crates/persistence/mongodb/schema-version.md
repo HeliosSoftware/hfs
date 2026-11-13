@@ -209,7 +209,7 @@ Each command changes only documents that match the values you give, and a second
   "
   ```
 
-  The newer build's own `DELETE /{type}/{id}/$purge` cannot do this afterwards: it answers NotFound for a resource that is already gone from `resources` and `resource_history`.
+  The newer build's own `DELETE /{type}/{id}/$purge` does the same afterwards since #2146: it answers NotFound only when its writes change nothing, so for a resource that is already gone from `resources` and `resource_history` it answers 200 and blanks the body if the change log still holds one (it also removes a search row or a sync failure of it). It answers NotFound when nothing of the resource is left.
 
 - A type purge (`purge_all`) does the same for every resource of the type, so the filters drop `resource_id`:
 

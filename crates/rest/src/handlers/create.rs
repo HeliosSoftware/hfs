@@ -64,7 +64,7 @@ pub async fn create_handler<S>(
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
-    FhirResource(resource): FhirResource,
+    FhirResource(mut resource): FhirResource,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
@@ -119,15 +119,20 @@ where
     // resources (#647). Internal callers that rely on caller-supplied ids
     // for idempotency (spec seeding) go straight to storage, not through
     // this handler.
-    let mut resource = resource;
     if let Some(obj) = resource.as_object_mut() {
         obj.remove("id");
     }
 
-    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    // Empty-element cleanup (#2554) and write-path validation
+    // (HFS_VALIDATION_MODE: off | log | enforce).
     state
         .validation()
-        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .prepare_write(
+            tenant.tenant_id(),
+            fhir_version,
+            &resource_type,
+            &mut resource,
+        )
         .await?;
 
     // #1014: an unknown ViewDefinition.resource is rejected on every write.
