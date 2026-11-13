@@ -4069,6 +4069,7 @@ mod tests {
             reference_param: "subject".into(),
             target_type: Some("Patient".into()),
             target_param: "code".into(),
+            has: None,
         });
         ineligible.push(query);
         let mut query = base.clone();
@@ -6328,6 +6329,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "name".to_string(),
+            has: None,
         }];
         let mut exact_token = token_param("code", Some(SearchModifier::Exact), "hello");
         exact_token.param_type = SearchParamType::Token;

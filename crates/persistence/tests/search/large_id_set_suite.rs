@@ -164,6 +164,7 @@ where
             reference_param: "encounter".to_string(),
             target_type: Some("Encounter".to_string()),
             target_param: "status".to_string(),
+            has: None,
         }],
         ..Default::default()
     });

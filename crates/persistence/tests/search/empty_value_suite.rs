@@ -158,6 +158,7 @@ fn chained(values: &[&str]) -> SearchQuery {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "family".to_string(),
+                has: None,
             }],
             ..Default::default()
         })

@@ -207,9 +207,10 @@ pub(crate) fn membership_supported(version: helios_fhir::FhirVersion) -> bool {
 }
 
 /// Refuses the `_in` forms this server does not resolve, from the raw query
-/// pairs: a chained (`patient._in`) or reverse-chained (`_has:…:_in`) `_in` is
-/// never answered, and a `CareTeam` container (`_in=CareTeam/1`, `_in:CareTeam`)
-/// is valid in the spec but not implemented. Without this a chained `_in` would
+/// pairs: a chained `_in` (`patient._in`) is never answered (nor is a `_has`
+/// terminal `_in`, which the query builder refuses), and a `CareTeam`
+/// container (`_in=CareTeam/1`, `_in:CareTeam`) is valid in the spec but not
+/// implemented. Without this a chained `_in` would
 /// slip past the unknown-parameter check (it is judged by its first segment) and
 /// reach a backend unresolved.
 pub(crate) fn validate_membership_params(
@@ -218,10 +219,10 @@ pub(crate) fn validate_membership_params(
 ) -> RestResult<()> {
     for (key, value) in pairs {
         let base = |name: &str| name.split(':').next().unwrap_or(name).to_string();
+        // A `_has` terminal `_in` (`_has:…:_in`, `patient._has:…:_in:List`)
+        // is refused where the `_has` is parsed, from its parsed terminal.
         let chained = key.contains('.') && base(key.rsplit('.').next().unwrap_or(key)) == "_in";
-        let reverse =
-            key.starts_with("_has:") && base(key.rsplit(':').next().unwrap_or(key)) == "_in";
-        if chained || reverse {
+        if chained {
             return Err(RestError::InvalidParameter {
                 param: key.clone(),
                 message: format!(
@@ -587,10 +588,7 @@ where
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {
-            chained.map(|p| {
-                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
-                format!("{}.{}", p.name, path.join("."))
-            })
+            chained.map(|p| p.chain_key())
         };
         if let Some(param) = refused {
             return Err(RestError::InvalidParameter {

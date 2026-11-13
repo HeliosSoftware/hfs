@@ -36,6 +36,7 @@ fn test_detect_multiple_features() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })
@@ -119,6 +120,7 @@ fn test_polyglot_query_routing() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })
@@ -252,6 +254,7 @@ fn test_analyzer_complete_analysis() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })
@@ -298,6 +301,7 @@ fn test_complexity_score_reflects_complexity() {
                 reference_param: "subject".to_string(),
                 target_type: Some("Patient".to_string()),
                 target_param: "name".to_string(),
+                has: None,
             }],
             components: vec![],
         })

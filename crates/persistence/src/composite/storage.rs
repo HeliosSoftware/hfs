@@ -5797,6 +5797,7 @@ mod tests {
                 reference_param: pair[0].0.to_string(),
                 target_type: pair[0].1.map(str::to_string),
                 target_param: pair[1].0.to_string(),
+                has: None,
             })
             .collect();
 

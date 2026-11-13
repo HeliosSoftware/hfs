@@ -915,6 +915,7 @@ fn forward_parameter(
             reference_param: reference_param.clone(),
             target_type: qualifier.take(),
             target_param: target_param.clone(),
+            has: None,
         });
         reference_param = target_param;
         qualifier = next_qualifier;

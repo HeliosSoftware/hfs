@@ -1172,6 +1172,7 @@ where
                     reference_param: "subject".to_string(),
                     target_type: Some("Patient".to_string()),
                     target_param: "name".to_string(),
+                    has: None,
                 }];
                 q.parameters.push(chained);
             },

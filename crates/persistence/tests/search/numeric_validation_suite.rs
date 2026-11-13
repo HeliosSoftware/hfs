@@ -226,6 +226,7 @@ fn chained(value: &str) -> SearchQuery {
                 reference_param: "result".to_string(),
                 target_type: Some("Observation".to_string()),
                 target_param: "value-quantity".to_string(),
+                has: None,
             }],
             ..Default::default()
         })

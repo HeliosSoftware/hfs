@@ -317,6 +317,7 @@ mod tests {
                 reference_param: "subject".into(),
                 target_type: None,
                 target_param: "x".into(),
+                has: None,
             }],
             components: vec![token("code"), quantity("value-quantity")],
             ..Default::default()

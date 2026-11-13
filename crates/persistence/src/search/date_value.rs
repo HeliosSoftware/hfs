@@ -1541,6 +1541,7 @@ mod tests {
             reference_param: "subject".to_string(),
             target_type: Some("Patient".to_string()),
             target_param: "birthdate".to_string(),
+            has: None,
         }];
         // Not a date parameter at all.
         let mut string = date_param("name", "2024-13-45");
