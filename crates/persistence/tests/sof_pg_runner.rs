@@ -1176,7 +1176,7 @@ mod sof_pg_runner_tests {
                 !sql.contains("MATERIALIZED")
                     && has_normalized_final_limit(sql)
                     && sql.starts_with("SELECT")
-                    && sql.contains("ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(")
+                    && sql.contains("ORDER BY res.last_updated, res.id COLLATE \"C\", COALESCE(")
                     && sql.contains(".ordinality,")
                     && *calls == 1
                     && *rows == 50
@@ -2963,11 +2963,11 @@ mod export_paging {
         assert!(!statements.is_empty(), "page statement must be recorded");
         for (sql, _) in &statements {
             assert!(
-                !sql.contains("ORDER BY r.last_updated"),
+                !sql.contains("ORDER BY res.last_updated"),
                 "export must not sort by last_updated: {sql}"
             );
             assert!(
-                sql.contains("ORDER BY r.id COLLATE \"C\""),
+                sql.contains("ORDER BY res.id COLLATE \"C\""),
                 "page must be served in id order: {sql}"
             );
         }
@@ -3410,7 +3410,8 @@ mod total_order_acceptance {
     #[tokio::test]
     async fn total_order_pg_literals_group_isolation_and_nul_validation() {
         let fixture = matrix::fixture();
-        let anchor = "r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false";
+        let anchor =
+            "res.tenant_id = $1\n  AND res.resource_type = $2\n  AND res.is_deleted = false";
         let view = matrix::patient_view(
             json!([{"column":[{"path":"id","name":"id"},{"path":"'resources r'","name":"literal"},
             {"path":format!("'{anchor}'"),"name":"anchor"}]}]),

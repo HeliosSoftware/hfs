@@ -4,13 +4,14 @@ SELECT
   (($5)::numeric)::text AS "decimal",
   CASE WHEN ($6)::boolean IS TRUE THEN 'true' WHEN ($6)::boolean IS FALSE THEN 'false' END AS "boolean",
   'resources r' AS "literal"
-FROM resources r
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $7
-  AND r.id = ANY($8::text[])
-ORDER BY r.last_updated, r.id COLLATE "C"
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $7
+  AND res.id = ANY($8::text[])
+ORDER BY res.last_updated, res.id COLLATE "C"
 LIMIT 50
 
 /* Runner bindings and output metadata:

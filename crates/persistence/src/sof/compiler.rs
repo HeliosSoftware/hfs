@@ -763,9 +763,10 @@ mod tests {
         let q = compile_pg(view).unwrap();
         assert_eq!(q.columns, vec!["id"]);
         assert!(q.sql.contains("r.data->>'id' AS \"id\""), "{}", q.sql);
-        assert!(q.sql.contains("r.tenant_id = $1"), "{}", q.sql);
-        assert!(q.sql.contains("r.resource_type = $2"), "{}", q.sql);
-        assert!(q.sql.contains("r.is_deleted = false"), "{}", q.sql);
+        // The table is scanned as `res`; `r` is its detoasted document.
+        assert!(q.sql.contains("res.tenant_id = $1"), "{}", q.sql);
+        assert!(q.sql.contains("res.resource_type = $2"), "{}", q.sql);
+        assert!(q.sql.contains("res.is_deleted = false"), "{}", q.sql);
     }
 
     #[test]

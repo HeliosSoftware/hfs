@@ -1,15 +1,16 @@
 SELECT
   r.data->>'id' AS "r",
   fe.value->>'family' AS "u0"
-FROM resources r
+FROM resources res
+CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
 JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'name') = 'array' THEN r.data->'name' WHEN jsonb_typeof(r.data->'name') IS NOT NULL THEN jsonb_build_array(r.data->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE
-WHERE r.tenant_id = $1
-  AND r.resource_type = $2
-  AND r.is_deleted = false
-  AND r.last_updated >= $3
-  AND r.id COLLATE "C" > $4
-  AND r.id COLLATE "C" <= $5
-ORDER BY r.id COLLATE "C", COALESCE(fe.ordinality, -1)
+WHERE res.tenant_id = $1
+  AND res.resource_type = $2
+  AND res.is_deleted = false
+  AND res.last_updated >= $3
+  AND res.id COLLATE "C" > $4
+  AND res.id COLLATE "C" <= $5
+ORDER BY res.id COLLATE "C", COALESCE(fe.ordinality, -1)
 
 /* Runner bindings and output metadata:
 {

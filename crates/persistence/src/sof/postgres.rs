@@ -946,17 +946,17 @@ mod tests {
     fn test_pg_export_page_sql_is_ranged_and_id_ordered() {
         let view = flat_view();
         let plain = runtime_sql(&view, &ViewFilters::default()).0;
-        assert!(plain.contains("ORDER BY r.last_updated, r.id COLLATE \"C\""));
-        assert!(!plain.contains("r.id COLLATE \"C\" >"));
+        assert!(plain.contains("ORDER BY res.last_updated, res.id COLLATE \"C\""));
+        assert!(!plain.contains(".id COLLATE \"C\" >"));
 
         let paged =
             SqlRunPlan::compile(&view, SqlDialect::Postgres, FhirVersion::default_enabled())
                 .unwrap()
                 .finish_paged("tenant", &ViewFilters::default())
                 .unwrap();
-        assert!(paged.query.sql.contains("r.id COLLATE \"C\" > $3"));
-        assert!(paged.query.sql.contains("r.id COLLATE \"C\" <= $4"));
-        assert!(paged.query.sql.ends_with("ORDER BY r.id COLLATE \"C\""));
+        assert!(paged.query.sql.contains("res.id COLLATE \"C\" > $3"));
+        assert!(paged.query.sql.contains("res.id COLLATE \"C\" <= $4"));
+        assert!(paged.query.sql.ends_with("ORDER BY res.id COLLATE \"C\""));
         // tenant, type, then the two range slots last.
         assert_eq!(paged.params.len(), 4);
     }
@@ -1027,8 +1027,11 @@ mod tests {
         };
         let (unlimited, bindings) = runtime_sql(&view, &filters);
         assert!(unlimited.contains("$3"), "{unlimited}");
-        assert!(unlimited.contains("r.last_updated >= $4"), "{unlimited}");
-        assert!(unlimited.contains("r.id = ANY($5::text[])"), "{unlimited}");
+        assert!(unlimited.contains("res.last_updated >= $4"), "{unlimited}");
+        assert!(
+            unlimited.contains("res.id = ANY($5::text[])"),
+            "{unlimited}"
+        );
         assert_eq!(bindings[2], "text:male");
         assert_eq!(bindings.last().unwrap(), "text[]:p-eligible");
         filters.limit = Some(50);
@@ -1099,8 +1102,8 @@ mod tests {
             ..Default::default()
         };
         let (unlimited, bindings) = runtime_sql(&view, &filters);
-        assert!(unlimited.contains("r.last_updated >= $4"));
-        assert!(unlimited.contains("r.id = ANY($5::text[])"));
+        assert!(unlimited.contains("res.last_updated >= $4"));
+        assert!(unlimited.contains("res.id = ANY($5::text[])"));
         let mut limits = vec![0, 1, 50, 10_000];
         #[cfg(target_pointer_width = "64")]
         limits.push(i64::MAX as usize);
@@ -1156,9 +1159,11 @@ mod tests {
         for (view, scans) in views {
             let (sql, _) = runtime_sql(&view, &filters);
             assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
-            assert_eq!(sql.matches("r.last_updated >= $3").count(), scans, "{sql}");
+            // Flat and `forEach` selects scan the table as `res`, `repeat`
+            // seeds and rejoins as `r`: either way every scan is guarded.
+            assert_eq!(sql.matches(".last_updated >= $3").count(), scans, "{sql}");
             let membership = if view["resource"] == "Patient" {
-                "r.id = ANY($4::text[])"
+                ".id = ANY($4::text[])"
             } else {
                 "si.value_reference = ANY("
             };
@@ -1184,7 +1189,7 @@ mod tests {
             let params: Vec<_> = run.params.into_iter().map(PgParam::from_runtime).collect();
             assert!(!sql.contains(" OR "), "{sql}");
             let (expected_params, first) = if resource == "Patient" {
-                assert!(sql.contains("r.id = ANY($3::text[])"), "{sql}");
+                assert!(sql.contains("res.id = ANY($3::text[])"), "{sql}");
                 (3, "p0")
             } else {
                 assert!(sql.contains("si.value_reference = ANY($"), "{sql}");

@@ -25,8 +25,60 @@ use super::ir::{
 /// ranking it per resource yields the 0-based `%rowIndex`.
 const REPEAT_ORD_PATH_COL: &str = "ord_path";
 
-/// Table every compiled view scans, always under alias `r`.
+/// Table every compiled view scans. Expressions always read it as `r`.
 const RESOURCES_TABLE: &str = "resources";
+
+/// Alias the expressions of a view read the resource through (`r.data`, `r.id`).
+const RESOURCE_ALIAS: &str = "r";
+
+/// Alias of the `resources` table itself in a PostgreSQL flat / `forEach`
+/// select, where `r` is the detoasted copy (see [`ResourceScan`]).
+const PG_SCAN_ALIAS: &str = "res";
+
+/// How one flat / `forEach` select reads `resources`.
+///
+/// SQLite scans the table as `r` directly. PostgreSQL scans it as
+/// [`PG_SCAN_ALIAS`] and exposes `r` through a one-row lateral subquery:
+///
+/// ```sql
+/// FROM resources res
+/// CROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, res.id AS id OFFSET 0) r
+/// ```
+///
+/// A resource large enough to be stored out of line (TOAST) is fetched and
+/// decompressed again by every `r.data` operator that touches it: once per
+/// column, and once per column per row of a `forEach`. `#> '{}'` returns the
+/// whole document already detoasted, and `OFFSET 0` keeps the planner from
+/// inlining the subquery back into each reference, so the document is
+/// unpacked once per resource whatever the number of columns or unnested
+/// rows (#2574). Row predicates and the ordering stay on the table alias, so
+/// index scans, keyset pages and sort-before-detoast plans are unchanged.
+struct ResourceScan {
+    /// Alias carrying the table's own columns (tenant, type, id, timestamps).
+    alias: &'static str,
+    /// `FROM` item(s) that bring both that alias and `r` into scope.
+    from: String,
+}
+
+impl ResourceScan {
+    fn new(table: &str, dialect: &dyn Dialect) -> Self {
+        if dialect.name() == "postgres" {
+            let alias = PG_SCAN_ALIAS;
+            Self {
+                alias,
+                from: format!(
+                    "{table} {alias}\nCROSS JOIN LATERAL (SELECT {alias}.data #> '{{}}' AS data, \
+                     {alias}.id AS id OFFSET 0) {RESOURCE_ALIAS}"
+                ),
+            }
+        } else {
+            Self {
+                alias: RESOURCE_ALIAS,
+                from: format!("{table} {RESOURCE_ALIAS}"),
+            }
+        }
+    }
+}
 
 /// Collation under which resource ids are ordered and range-compared.
 fn id_collation(dialect: &dyn Dialect) -> &'static str {
@@ -39,29 +91,32 @@ fn id_collation(dialect: &dyn Dialect) -> &'static str {
 
 /// Tenant, resource type, deletion and runtime predicates for one resource scan.
 /// Called at structural scan sites, never located in rendered SQL text.
-fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect) -> String {
+///
+/// `r` is the alias carrying the table's own columns: [`RESOURCE_ALIAS`], or
+/// the scan alias of a [`ResourceScan`].
+fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect, r: &str) -> String {
     let mut predicate = format!(
-        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
+        "{r}.tenant_id = {}\n  AND {r}.resource_type = {}\n  AND {r}.is_deleted = {}",
         dialect.placeholder(1),
         dialect.placeholder(2),
         dialect.bool_false()
     );
     if let Some(slot) = filter.since {
         predicate.push_str(&format!(
-            "\n  AND r.last_updated >= {}",
+            "\n  AND {r}.last_updated >= {}",
             dialect.placeholder(slot)
         ));
     }
     if let Some(slot) = filter.fhir_version {
         predicate.push_str(&format!(
-            "\n  AND r.fhir_version = {}",
+            "\n  AND {r}.fhir_version = {}",
             dialect.placeholder(slot)
         ));
     }
     if let Some((after, through)) = filter.id_range {
         let collation = id_collation(dialect);
         predicate.push_str(&format!(
-            "\n  AND r.id COLLATE {collation} > {}\n  AND r.id COLLATE {collation} <= {}",
+            "\n  AND {r}.id COLLATE {collation} > {}\n  AND {r}.id COLLATE {collation} <= {}",
             dialect.placeholder(after),
             dialect.placeholder(through)
         ));
@@ -76,13 +131,13 @@ fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect) -> St
             }
         };
         let membership = match compartment {
-            CompartmentFilter::Owner { refs } => list_match("r.id", *refs),
+            CompartmentFilter::Owner { refs } => list_match(&format!("{r}.id"), *refs),
             CompartmentFilter::NoMatches => "1=0".to_string(),
             CompartmentFilter::SearchIndex { param_names, refs } => format!(
                 "EXISTS (SELECT 1 FROM search_index si \
                  WHERE si.tenant_id = {} \
                    AND si.resource_type = {} \
-                   AND si.resource_id = r.id \
+                   AND si.resource_id = {r}.id \
                    AND si.param_name IN ({}) \
                    AND {})",
                 dialect.placeholder(1),
@@ -191,16 +246,18 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     }
     let select_clause = select_parts.join(",\n  ");
 
-    // Build FROM clause: `resources r` + any LATERAL joins, in order of appearance
-    // from the bottom of the tree upward (Scan first, then unnests).
-    let mut from_clause = format!("{} r", scan.table);
+    // Build FROM clause: the resource scan + any LATERAL joins, in order of
+    // appearance from the bottom of the tree upward (Scan first, then unnests).
+    let resource = ResourceScan::new(scan.table, dialect);
+    let r = resource.alias;
+    let mut from_clause = resource.from;
     for join in &frame.joins {
         from_clause.push('\n');
         from_clause.push_str(&join.sql);
     }
 
     // WHERE clause: tenant predicate first (so `$1`/`$2` line up), then filters.
-    let mut where_parts = vec![resource_scan_predicate(&scan.filter, dialect)];
+    let mut where_parts = vec![resource_scan_predicate(&scan.filter, dialect, r)];
     for pred in &frame.predicates {
         where_parts.push(pred.clone());
     }
@@ -211,9 +268,9 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     // joins into a subquery and must remove their outer alias references too.
     // A keyset page is ordered by id alone, the order its index serves.
     let id_collation = id_collation(dialect);
-    let mut order_parts = vec![format!("r.id COLLATE {id_collation}")];
+    let mut order_parts = vec![format!("{r}.id COLLATE {id_collation}")];
     if scan.filter.id_range.is_none() {
-        order_parts.insert(0, "r.last_updated".to_string());
+        order_parts.insert(0, format!("{r}.last_updated"));
     }
     order_parts.extend(
         frame
@@ -279,7 +336,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
 
     // The same bound filter guards every seed and the optional resource rejoin.
-    let tenant_pred = resource_scan_predicate(&scan.filter, dialect);
+    let tenant_pred = resource_scan_predicate(&scan.filter, dialect, RESOURCE_ALIAS);
     let mut where_pred = tenant_pred.clone();
     for p in &frame.predicates {
         where_pred.push_str("\n  AND ");
@@ -812,7 +869,7 @@ fn emit_recurse_general(
         .as_ref()
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
     let table = scan.table;
-    let tenant_pred = resource_scan_predicate(&scan.filter, dialect);
+    let tenant_pred = resource_scan_predicate(&scan.filter, dialect, RESOURCE_ALIAS);
     let mut seed_where = tenant_pred.clone();
     for p in &frame.predicates {
         seed_where.push_str("\n  AND ");
@@ -2772,6 +2829,61 @@ mod tests {
         }
     }
 
+    /// #2574: a PostgreSQL flat / `forEach` select unpacks the document once
+    /// per resource, and keeps its row predicates and ordering on the table.
+    #[test]
+    fn postgres_selects_read_one_detoasted_copy_of_the_resource() {
+        let flat = project(scan(), json_path("r.data", vec![field("id")]));
+        let for_each = project(
+            unnest(json_path("r.data", vec![field("name")])),
+            json_path("r.data", vec![field("id")]),
+        );
+        let since = ResourceFilter {
+            since: Some(3),
+            ..Default::default()
+        };
+        for mut plan in [flat, for_each] {
+            if let PlanNode::Project { parent, .. } = &mut plan {
+                let mut node = parent.as_mut();
+                while let PlanNode::LateralUnnest { parent, .. } = node {
+                    node = parent.as_mut();
+                }
+                if let PlanNode::Scan { filter, .. } = node {
+                    *filter = since.clone();
+                }
+            }
+            let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+            assert!(
+                pg.contains(
+                    "FROM resources res\nCROSS JOIN LATERAL (SELECT res.data #> '{}' AS data, \
+                     res.id AS id OFFSET 0) r\n"
+                ),
+                "{pg}"
+            );
+            // Every document read goes through the copy, never the table.
+            assert_eq!(pg.matches("res.data").count(), 1, "{pg}");
+            assert!(pg.contains("r.data->>'id' AS \"c\""), "{pg}");
+            assert!(
+                pg.contains(
+                    "WHERE res.tenant_id = $1\n  AND res.resource_type = $2\n  \
+                     AND res.is_deleted = false\n  AND res.last_updated >= $3\n"
+                ),
+                "{pg}"
+            );
+            assert!(
+                pg.contains("\nORDER BY res.last_updated, res.id COLLATE \"C\""),
+                "{pg}"
+            );
+
+            // SQLite parses the document once per row already (see
+            // `sqlite_json_source`) and keeps scanning the table as `r`.
+            let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+            assert!(sqlite.contains("FROM resources r\n"), "{sqlite}");
+            assert!(!sqlite.contains("LATERAL"), "{sqlite}");
+            assert!(sqlite.contains("r.last_updated >= ?3"), "{sqlite}");
+        }
+    }
+
     #[test]
     fn repeat_cells_rejoin_only_when_their_focus_needs_the_resource() {
         for root in ["r.data", "rec_0.node"] {
@@ -3042,15 +3154,15 @@ mod tests {
             } else {
                 "\"C\""
             };
-            let ordinal = if dialect.name() == "sqlite" {
-                "rowid"
+            let (ordinal, r) = if dialect.name() == "sqlite" {
+                ("rowid", "r")
             } else {
-                "ordinality"
+                ("ordinality", PG_SCAN_ALIAS)
             };
             assert_eq!(
                 emitted.sql.lines().last().unwrap(),
                 format!(
-                    "ORDER BY r.last_updated, r.id COLLATE {collation}, COALESCE(z_outer.{ordinal}, -1), COALESCE(a_inner.{ordinal}, -1), COALESCE(b_cartesian.{ordinal}, -1)"
+                    "ORDER BY {r}.last_updated, {r}.id COLLATE {collation}, COALESCE(z_outer.{ordinal}, -1), COALESCE(a_inner.{ordinal}, -1), COALESCE(b_cartesian.{ordinal}, -1)"
                 ),
                 "{label}: {}",
                 emitted.sql
@@ -3091,7 +3203,7 @@ mod tests {
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
         assert_eq!(
             pg.lines().last().unwrap(),
-            "ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(fe.ordinality, -1), COALESCE(live.ordinality, -1)"
+            "ORDER BY res.last_updated, res.id COLLATE \"C\", COALESCE(fe.ordinality, -1), COALESCE(live.ordinality, -1)"
         );
     }
 
@@ -3821,7 +3933,9 @@ mod tests {
         assert!(pg.contains("AS w0_0(value), "), "{pg}");
         assert!(pg.contains("AS w0_1(value), "), "{pg}");
         assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
-        assert!(!pg.contains("#>"), "{pg}");
+        // The only `#>` is the scan's whole-document read; no step is a path.
+        assert_eq!(pg.matches("#>").count(), 1, "{pg}");
+        assert!(pg.contains("res.data #> '{}' AS data"), "{pg}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod engine;
 pub mod library;
 pub mod output;
 pub mod params;
+pub mod projection;
 pub mod scan;
 pub mod terminology;
 
@@ -21,6 +22,7 @@ pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
 pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library};
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
+pub use projection::{project_view_definition, referenced_identifiers};
 pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
