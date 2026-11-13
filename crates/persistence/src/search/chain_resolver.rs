@@ -618,13 +618,17 @@ where
         outer.push('.');
     }
 
+    // One `_has` search for every candidate target type: an untyped,
+    // polymorphic last hop (`Observation?subject._has:…`) would otherwise run
+    // it, and any terminology expansion of its terminal, once per type.
+    let targets: Vec<&str> = terminal_types.iter().map(String::as_str).collect();
+    let Some(referenced) =
+        resolve_reverse_chain_references(storage, tenant, &targets, has, options, &outer).await?
+    else {
+        return Ok(None);
+    };
     let mut current_refs: Vec<String> = Vec::new();
-    for target in &terminal_types {
-        let Some(ids) =
-            resolve_reverse_chain_level(storage, tenant, target, has, options, &outer).await?
-        else {
-            return Ok(None);
-        };
+    for (target, ids) in terminal_types.iter().zip(referenced) {
         // The `_has` yields the ids its sources *refer to*. Only those of
         // resources that exist are reached by the chain, as a terminal
         // search's matches are and a top-level `_has`'s final search is.
@@ -791,6 +795,32 @@ async fn resolve_reverse_chain_level<S>(
 where
     S: SearchProvider + ?Sized,
 {
+    Ok(resolve_reverse_chain_references(
+        storage,
+        tenant,
+        &[base_type],
+        reverse_chain,
+        options,
+        outer,
+    )
+    .await?
+    .map(|mut ids| ids.pop().unwrap_or_default()))
+}
+
+/// [`resolve_reverse_chain_level`] for several base types at once, from one
+/// search of the source resources: the ids each of `base_types` is referred
+/// to by, in the order of `base_types`.
+async fn resolve_reverse_chain_references<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    base_types: &[&str],
+    reverse_chain: &ReverseChainedParameter,
+    options: ChainResolveOptions<'_>,
+    outer: &str,
+) -> StorageResult<Option<Vec<Vec<String>>>>
+where
+    S: SearchProvider + ?Sized,
+{
     // This level as written, less what follows the reference parameter.
     let level = format!(
         "{outer}_has:{}:{}:",
@@ -813,7 +843,7 @@ where
             return Ok(None);
         };
         if inner_ids.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(vec![Vec::new(); base_types.len()]));
         }
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
             name: "_id".to_string(),
@@ -869,11 +899,11 @@ where
         })
     };
 
-    let mut ids = Vec::new();
+    let mut ids: Vec<Vec<String>> = vec![Vec::new(); base_types.len()];
     let mut keep = |reference: &str| {
         if let Some((ref_type, ref_id)) = reference.split_once('/') {
-            if ref_type == base_type {
-                ids.push(ref_id.to_string());
+            if let Some(i) = base_types.iter().position(|t| *t == ref_type) {
+                ids[i].push(ref_id.to_string());
             }
         }
     };
@@ -1849,8 +1879,21 @@ mod tests {
     }
 
     /// The SQLite backend with its `search_reference_values` hidden, so the
-    /// resolver takes its fallback: drain the `_has` sources and extract.
-    struct NoReferenceHook<'a>(&'a SqliteBackend);
+    /// resolver takes its fallback: drain the `_has` sources and extract. It
+    /// records the resource type of every search it is asked for.
+    struct NoReferenceHook<'a>(&'a SqliteBackend, Mutex<Vec<String>>);
+
+    impl<'a> NoReferenceHook<'a> {
+        fn new(backend: &'a SqliteBackend) -> Self {
+            Self(backend, Mutex::new(Vec::new()))
+        }
+
+        /// How many searches of `resource_type` it was asked for.
+        fn searches_of(&self, resource_type: &str) -> usize {
+            let searched = self.1.lock().unwrap();
+            searched.iter().filter(|t| *t == resource_type).count()
+        }
+    }
 
     #[async_trait::async_trait]
     impl ResourceStorage for NoReferenceHook<'_> {
@@ -1907,6 +1950,7 @@ mod tests {
             t: &TenantContext,
             query: &SearchQuery,
         ) -> StorageResult<SearchResult> {
+            self.1.lock().unwrap().push(query.resource_type.clone());
             self.0.search(t, query).await
         }
         async fn search_ids(
@@ -1997,7 +2041,7 @@ mod tests {
                 ReverseChainedParameter::terminal("Group", "member", "_id", SearchValue::eq(group)),
             )
         };
-        let without_hook = NoReferenceHook(&b);
+        let without_hook = NoReferenceHook::new(&b);
         for (group, expected) in [
             ("g-live", &["e-live"][..]),
             ("g-ghost", &[][..]),
@@ -2036,6 +2080,35 @@ mod tests {
                 .is_some(),
             "SQLite answers the hook"
         );
+    }
+
+    /// #2556: an untyped last hop that can reach several types
+    /// (`Observation.subject`) searches the `_has` sources once, not once per
+    /// type it can reach.
+    #[tokio::test]
+    async fn forward_chain_ending_in_has_searches_sources_once() {
+        let b = backend();
+        let t = tenant();
+        seed_chain_to_has(&b, &t).await;
+        let reached = {
+            let reg = b.search_param_registry(&t);
+            let registry = reg.read();
+            registry
+                .get_param("Observation", "subject")
+                .and_then(|def| def.target.clone())
+                .unwrap_or_default()
+        };
+        assert!(reached.len() > 1, "Observation.subject reaches {reached:?}");
+
+        let query = chain_to_has(
+            "Observation",
+            &[("subject", None)],
+            ReverseChainedParameter::terminal("Group", "member", "_id", SearchValue::eq("g102")),
+        );
+        let without_hook = NoReferenceHook::new(&b);
+        let rewritten = resolve_chains(&without_hook, &t, &query).await.unwrap();
+        assert_positive_id_rewrite(&rewritten, &["o1"]);
+        assert_eq!(without_hook.searches_of("Group"), 1);
     }
 
     /// #2556: the `_has` a chain ends in is capped like a top-level one, and

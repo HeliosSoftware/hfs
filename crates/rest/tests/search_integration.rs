@@ -5451,8 +5451,12 @@ mod contained_search {
             ("_list=l1", "_list"),
             ("_has:Provenance:target:_id=prov1", "_has"),
             ("subject.family=Smith", "subject.family"),
-            // #2556: a chain that ends in `_has`.
-            ("subject._has:Provenance:target:_id=prov1", "subject._has"),
+            ("subject:Patient.family=Smith", "'subject:Patient.family'"),
+            // #2556: a chain that ends in `_has`, named in full.
+            (
+                "subject._has:Provenance:target:_id=prov1",
+                "'subject._has:Provenance:target:_id'",
+            ),
         ] {
             for mode in ["true", "both"] {
                 for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {

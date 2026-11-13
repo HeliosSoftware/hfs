@@ -322,6 +322,31 @@ pub struct SearchParameter {
     pub components: Vec<CompositeSearchComponent>,
 }
 
+impl SearchParameter {
+    /// A chained parameter's key as a request writes it, less the terminal
+    /// modifier: `subject:Patient.name`, or `patient._has:Group:member:_id`
+    /// for a chain that ends in `_has`. The name alone when not chained.
+    pub fn chain_key(&self) -> String {
+        let mut key = self.name.clone();
+        for (i, hop) in self.chain.iter().enumerate() {
+            if i > 0 {
+                key.push_str(&hop.reference_param);
+            }
+            if let Some(t) = &hop.target_type {
+                key.push(':');
+                key.push_str(t);
+            }
+            key.push('.');
+            match &hop.has {
+                Some(has) => key.push_str(&has.key_as_written()),
+                None if i + 1 == self.chain.len() => key.push_str(&hop.target_param),
+                None => {}
+            }
+        }
+        key
+    }
+}
+
 /// Component definition for a composite search parameter.
 ///
 /// Used when building composite search queries to define how each
@@ -552,6 +577,17 @@ impl ReverseChainedParameter {
             Some(modifier) => format!("{}:{modifier}", self.search_param),
             None => self.search_param.clone(),
         }
+    }
+
+    /// The key as a request writes it, less the terminal modifier:
+    /// `_has:Observation:subject:code`, or
+    /// `_has:Observation:subject:_has:Provenance:target:agent` when nested.
+    pub fn key_as_written(&self) -> String {
+        let rest = match &self.nested {
+            Some(inner) => inner.key_as_written(),
+            None => self.search_param.clone(),
+        };
+        format!("_has:{}:{}:{rest}", self.source_type, self.reference_param)
     }
 
     /// Returns the depth of nesting (1 for non-nested, 2+ for nested).
@@ -969,6 +1005,56 @@ impl SearchQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2556: a chained parameter's key as written, a chain that ends in a
+    /// (nested) `_has` included.
+    #[test]
+    fn test_chain_key() {
+        let hop = |reference: &str, target_type: Option<&str>, target: &str| ChainedParameter {
+            reference_param: reference.to_string(),
+            target_type: target_type.map(str::to_string),
+            target_param: target.to_string(),
+            has: None,
+        };
+        let param = |chain: Vec<ChainedParameter>| SearchParameter {
+            name: chain
+                .first()
+                .map_or("name".to_string(), |h| h.reference_param.clone()),
+            chain,
+            ..Default::default()
+        };
+
+        assert_eq!(param(vec![]).chain_key(), "name");
+        assert_eq!(
+            param(vec![hop("subject", None, "name")]).chain_key(),
+            "subject.name"
+        );
+        assert_eq!(
+            param(vec![
+                hop("subject", Some("Patient"), "organization"),
+                hop("organization", Some("Organization"), "name"),
+            ])
+            .chain_key(),
+            "subject:Patient.organization:Organization.name"
+        );
+
+        let mut last = hop("patient", None, "_has");
+        last.has = Some(Box::new(ReverseChainedParameter::nested(
+            "Observation",
+            "subject",
+            ReverseChainedParameter::terminal(
+                "Provenance",
+                "target",
+                "agent",
+                SearchValue::eq("Practitioner/1"),
+            )
+            .with_modifier(SearchModifier::Missing),
+        )));
+        assert_eq!(
+            param(vec![hop("encounter", Some("Encounter"), "patient"), last]).chain_key(),
+            "encounter:Encounter.patient._has:Observation:subject:_has:Provenance:target:agent"
+        );
+    }
 
     #[test]
     fn test_search_param_type_display() {

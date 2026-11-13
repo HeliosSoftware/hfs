@@ -588,10 +588,7 @@ where
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {
-            chained.map(|p| {
-                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
-                format!("{}.{}", p.name, path.join("."))
-            })
+            chained.map(|p| p.chain_key())
         };
         if let Some(param) = refused {
             return Err(RestError::InvalidParameter {
