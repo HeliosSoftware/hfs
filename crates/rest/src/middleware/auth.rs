@@ -388,12 +388,21 @@ fn patient_compartment_path_check(
         [_type, _id] => Ok(()),
         [_type, _id, "_history"] => Ok(()),
         ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
+        // The handler checks the payload it reads or changes (#2562).
+        [_type, _id, "$meta" | "$meta-add" | "$meta-delete"] => Ok(()),
         [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
         [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
         // Compartment search: the launch patient's own compartment only.
         ["Patient", id, _target] if *id == patient_id => Ok(()),
         [_compartment, _id, _target] => refuse("a search in another compartment"),
         [_type, _id, "_history", _vid] => Ok(()),
+        [
+            _type,
+            _id,
+            "_history",
+            _vid,
+            "$meta" | "$meta-add" | "$meta-delete",
+        ] => Ok(()),
         _ => refuse(routed_path),
     }
 }
@@ -531,7 +540,16 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 /// forms already are, so kicking one off with `POST` needs the same read scope,
 /// not a write one (#1123). System-level `/$export` is `$`-first and so is
 /// already method-agnostic (handled by the system-path guard below).
-const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+///
+/// `$meta` (#2562) reads the `Meta` of one resource or version.
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export", "$meta"];
+
+/// Operations that update the resource they are invoked on, whatever the
+/// HTTP method: `POST /{type}/{id}/$meta-add` changes that resource's
+/// labels and is authorized as `FhirOperation::Update` of the first-segment
+/// type, never as the `POST` → `Create` fallthrough (#2562). Covers the
+/// `_history/{vid}` forms too.
+const UPDATE_SHAPED_OPERATIONS: &[&str] = &["$meta-add", "$meta-delete"];
 
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
@@ -601,6 +619,12 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
     {
         return Some((resource_type, FhirOperation::Read));
+    }
+    if segments
+        .last()
+        .is_some_and(|s| UPDATE_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Update));
     }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
@@ -861,6 +885,53 @@ mod tests {
     #[test]
     fn test_extract_operation_metadata() {
         assert!(extract_operation("/metadata", "GET").is_none());
+    }
+
+    /// #2562: `$meta` reads, `$meta-add` / `$meta-delete` update, whatever
+    /// the method, at the instance and history-version levels.
+    #[test]
+    fn test_extract_operation_meta_operations() {
+        for method in ["GET", "POST"] {
+            for path in ["/Task/1/$meta", "/Task/1/_history/2/$meta"] {
+                assert_eq!(
+                    extract_operation(path, method),
+                    Some(("Task".to_string(), FhirOperation::Read)),
+                    "{method} {path}"
+                );
+            }
+        }
+        for path in [
+            "/Task/1/$meta-add",
+            "/Task/1/$meta-delete",
+            "/Task/1/_history/2/$meta-add",
+            "/Task/1/_history/2/$meta-delete",
+        ] {
+            assert_eq!(
+                extract_operation(path, "POST"),
+                Some(("Task".to_string(), FhirOperation::Update)),
+                "{path}"
+            );
+        }
+    }
+
+    /// #2562: a `patient/` scope reaches the instance and history-version
+    /// metadata operations; the handler checks the payload's membership.
+    #[test]
+    fn test_patient_scope_allows_instance_meta_operations() {
+        for path in [
+            "/Observation/o1/$meta",
+            "/Observation/o1/$meta-add",
+            "/Observation/o1/$meta-delete",
+            "/Observation/o1/_history/1/$meta",
+            "/Observation/o1/_history/1/$meta-add",
+        ] {
+            assert!(
+                patient_compartment_path_check(path, "POST", "p1").is_ok(),
+                "{path}"
+            );
+        }
+        assert!(patient_compartment_path_check("/Observation/$meta", "GET", "p1").is_err());
+        assert!(patient_compartment_path_check("/Observation/o1/$other", "POST", "p1").is_err());
     }
 
     #[test]

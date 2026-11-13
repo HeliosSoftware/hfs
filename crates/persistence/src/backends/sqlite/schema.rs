@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 48;
+pub const SCHEMA_VERSION: i32 = 49;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -737,6 +737,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             45 => migrate_v45_to_v46(conn)?,
             46 => migrate_v46_to_v47(conn)?,
             47 => migrate_v47_to_v48(conn)?,
+            48 => migrate_v48_to_v49(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2613,6 +2614,24 @@ fn migrate_v46_to_v47(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("v47 create idx_bulk_submissions_updated_at: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 48 to 49: adds `resources.meta_seq`, the
+/// same-version revision a metadata rewrite (`$meta-add` / `$meta-delete`)
+/// raises while the version id stays (#2562). Every write that advances the
+/// version sets it back to 0; existing rows start at 0.
+fn migrate_v48_to_v49(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "resources")?
+        .iter()
+        .any(|column| column == "meta_seq")
+    {
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN meta_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v49 add meta_seq: {e}")))?;
+    }
     Ok(())
 }
 

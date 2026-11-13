@@ -86,6 +86,11 @@ pub struct StoredResource {
     /// serialized.
     #[serde(skip)]
     local_reindex_origin: bool,
+
+    /// Same-version revision of the current row; see [`Self::meta_seq`].
+    /// Never serialized.
+    #[serde(skip)]
+    meta_seq: u64,
 }
 
 /// HTTP method that created a resource version.
@@ -133,6 +138,7 @@ impl StoredResource {
             etag,
             method: Some(ResourceMethod::Post),
             local_reindex_origin: false,
+            meta_seq: 0,
         }
     }
 
@@ -165,6 +171,7 @@ impl StoredResource {
             etag,
             method: None,
             local_reindex_origin: false,
+            meta_seq: 0,
         }
     }
 
@@ -324,6 +331,35 @@ impl StoredResource {
         self.local_reindex_origin
     }
 
+    /// The current row's same-version revision: `0` after every write that
+    /// advances the version, raised by each metadata rewrite that keeps it.
+    /// Stores without same-version writes always report `0`.
+    pub fn meta_seq(&self) -> u64 {
+        self.meta_seq
+    }
+
+    /// Sets [`Self::meta_seq`], as read from the store.
+    #[doc(hidden)]
+    pub fn with_meta_seq(mut self, meta_seq: u64) -> Self {
+        self.meta_seq = meta_seq;
+        self
+    }
+
+    /// Replaces the content and timestamp of this version without changing
+    /// its version id, as a metadata rewrite does.
+    #[doc(hidden)]
+    pub fn with_rewritten_content(
+        mut self,
+        content: Value,
+        last_modified: DateTime<Utc>,
+        meta_seq: u64,
+    ) -> Self {
+        self.content = content;
+        self.last_modified = last_modified;
+        self.meta_seq = meta_seq;
+        self
+    }
+
     /// Creates a new version of this resource with updated content.
     ///
     /// The new version will have:
@@ -349,6 +385,7 @@ impl StoredResource {
             etag,
             method: Some(method),
             local_reindex_origin: false,
+            meta_seq: 0,
         }
     }
 
@@ -374,6 +411,7 @@ impl StoredResource {
             etag,
             method: Some(ResourceMethod::Delete),
             local_reindex_origin: false,
+            meta_seq: 0,
         }
     }
 
@@ -534,6 +572,7 @@ impl StoredResourceBuilder {
             etag,
             method: self.method,
             local_reindex_origin: false,
+            meta_seq: 0,
         }
     }
 }

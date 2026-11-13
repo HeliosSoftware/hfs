@@ -546,3 +546,56 @@ fn non_breaking_space_is_valid_in_string_and_code() {
         );
     }
 }
+
+/// R5 `integer64` is a JSON string (R5 json.html#primitive): a string of
+/// digits passes, a JSON number does not, and the pack's regex still checks
+/// the digits (#2562).
+#[cfg(feature = "R5")]
+#[test]
+fn r5_integer64_is_a_json_string() {
+    let validator = Validator::new(core_registry(FhirVersion::R5));
+    let with = |value: serde_json::Value| {
+        json!({
+            "resourceType": "Patient",
+            "extension": [{"url": "http://example.org/n", "valueInteger64": value}]
+        })
+    };
+    let errors = |value: serde_json::Value| {
+        validator
+            .validate_sync(&with(value), &ValidationOptions::default())
+            .errors
+            .into_iter()
+            .filter(|e| e.severity == Severity::Error)
+            .collect::<Vec<_>>()
+    };
+    for accepted in [json!("1"), json!("0"), json!("-9223372036854775808")] {
+        assert!(errors(accepted.clone()).is_empty(), "{accepted} must pass");
+    }
+    for rejected in [json!(1), json!(1.0), json!("01")] {
+        let found = errors(rejected.clone());
+        assert!(
+            found.iter().any(|e| e.kind == ErrorKind::PrimitiveValue),
+            "{rejected} must be rejected: {found:?}"
+        );
+    }
+}
+
+/// An unknown element's issue carries an exact JSON Pointer next to its
+/// display path, so a key containing dots is addressable (#2562).
+#[test]
+fn unknown_element_issues_carry_an_exact_pointer() {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let patient = json!({
+        "resourceType": "Patient",
+        "name": [{"family": "keep", "fam.0.ily": false, "a/b~c": 1}]
+    });
+    let outcome = validator.validate_sync(&patient, &ValidationOptions::default());
+    let pointers: Vec<&str> = outcome
+        .errors
+        .iter()
+        .filter(|e| e.kind == ErrorKind::UnknownElement)
+        .map(|e| e.pointer.as_str())
+        .collect();
+    assert!(pointers.contains(&"/name/0/fam.0.ily"), "{pointers:?}");
+    assert!(pointers.contains(&"/name/0/a~1b~0c"), "{pointers:?}");
+}

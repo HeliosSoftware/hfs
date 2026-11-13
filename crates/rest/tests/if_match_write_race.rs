@@ -207,6 +207,20 @@ impl ResourceStorage for RacingPrimary {
     fn bulk_write_concurrency(&self) -> usize {
         self.concurrency
     }
+
+    // A PUT onto a deleted id restores it through the guarded restore
+    // (#2562); a wrapper delegates it like every other write.
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.inner
+            .restore_tombstone(tenant, resource_type, id, resource)
+            .await
+    }
 }
 
 fn server() -> (TestServer, Arc<RacingPrimary>) {

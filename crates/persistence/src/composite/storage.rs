@@ -254,6 +254,17 @@ impl Default for BackendHealth {
 }
 
 impl CompositeStorage {
+    /// Whether a metadata rewrite can be served: no secondary at all in the
+    /// runtime map (one that is supplied but disabled in the configuration
+    /// still receives writes), no configured search backend, and a primary
+    /// that rewrites in place. Capability, refusal and revision tracking all
+    /// answer with this one condition (#2562).
+    fn meta_rewrite_safe(&self) -> bool {
+        self.secondaries.is_empty()
+            && !self.has_dedicated_search_backend()
+            && self.primary.supports_meta_rewrite()
+    }
+
     fn has_dedicated_search_backend(&self) -> bool {
         self.config
             .backends_with_role(super::config::BackendRole::Search)
@@ -1383,6 +1394,87 @@ impl ResourceStorage for CompositeStorage {
         Ok(())
     }
 
+    async fn delete_at_revision(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        expected_meta_seq: u64,
+    ) -> StorageResult<()> {
+        self.primary
+            .delete_at_revision(
+                tenant,
+                resource_type,
+                id,
+                expected_version,
+                expected_meta_seq,
+            )
+            .await?;
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::Delete {
+                resource_type: resource_type.to_string(),
+                resource_id: id.to_string(),
+                tenant_id: tenant.tenant_id().clone(),
+            })
+            .await
+        {
+            warn!(error = %e, "Failed to sync delete to secondaries; recorded as needing a reindex");
+        }
+        Ok(())
+    }
+
+    fn tracks_meta_revision(&self) -> bool {
+        self.meta_rewrite_safe()
+    }
+
+    fn supports_meta_rewrite(&self) -> bool {
+        self.meta_rewrite_safe()
+    }
+
+    async fn rewrite_meta(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &crate::core::MetaTarget,
+        change: &crate::core::MetaChange,
+    ) -> StorageResult<crate::core::MetaRewrite> {
+        // Secondaries would need the rewrite too, and there is no
+        // revision-aware path to them; with none, the primary is the store.
+        if !self.meta_rewrite_safe() {
+            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "composite".to_string(),
+                capability: "meta_rewrite".to_string(),
+            }));
+        }
+        self.primary
+            .rewrite_meta(tenant, resource_type, id, target, change)
+            .await
+    }
+
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let restored = self
+            .primary
+            .restore_tombstone(tenant, resource_type, id, resource)
+            .await?;
+        // Secondaries still hold a row for the id: a restore syncs as an
+        // update, as `create_or_update`'s restore does.
+        if let Err(e) = self
+            .sync_to_secondaries(SyncEvent::updated(restored.clone()))
+            .await
+        {
+            warn!(error = %e, "Failed to sync restore to secondaries; recorded as needing a reindex");
+        }
+        Ok(restored)
+    }
+
     async fn count(
         &self,
         tenant: &TenantContext,
@@ -1984,16 +2076,40 @@ impl ConditionalStorage for CompositeStorage {
                 }
                 1 => {
                     // The match — and so the version `If-Match` is evaluated
-                    // against — is the search backend's copy. The primary's
-                    // `update` compares-and-swaps on that same version, so a
-                    // stale copy ends in `VersionConflict`, not in a write.
-                    let current = matches.into_iter().next().expect("single match must exist");
+                    // against — is the search backend's copy. The labels are
+                    // merged with the primary's content of that same version
+                    // (#2562), and the primary's `update` compares-and-swaps
+                    // on it, so a stale copy ends in `VersionConflict`, not in
+                    // a write.
+                    let matched = matches.into_iter().next().expect("single match must exist");
                     crate::core::conditional_if_match_gate(
                         if_match,
                         resource_type,
-                        Some(&current),
+                        Some(&matched),
                     )?;
-                    let updated = self.primary.update(tenant, &current, resource).await?;
+                    let current = match self.primary.read(tenant, resource_type, matched.id()).await
+                    {
+                        Ok(Some(current)) => current,
+                        Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                            return Err(StorageError::Resource(ResourceError::NotFound {
+                                resource_type: resource_type.to_string(),
+                                id: matched.id().to_string(),
+                            }));
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if current.version_id() != matched.version_id() {
+                        return Err(StorageError::Concurrency(
+                            crate::error::ConcurrencyError::VersionConflict {
+                                resource_type: resource_type.to_string(),
+                                id: current.id().to_string(),
+                                expected_version: matched.version_id().to_string(),
+                                actual_version: current.version_id().to_string(),
+                            },
+                        ));
+                    }
+                    let merged = crate::core::merge_update_labels(current.content(), &resource);
+                    let updated = self.primary.update(tenant, &current, merged).await?;
 
                     if let Err(e) = self
                         .sync_to_secondaries(SyncEvent::updated(updated.clone()))

@@ -91,6 +91,12 @@ pub struct ValidationError {
     /// Internal severity; REST maps it onto OperationOutcome.
     #[serde(skip)]
     pub severity: Severity,
+    /// The same location as an RFC 6901 JSON Pointer relative to the
+    /// validated resource (`/entry/0/resource/extra`), with each key exact
+    /// and escaped. Unlike `path` it can address the data unambiguously.
+    /// Empty for issues raised outside the structural walk. Not serialized.
+    #[serde(skip)]
+    pub pointer: String,
 }
 
 impl ValidationError {
@@ -101,7 +107,13 @@ impl ValidationError {
             message,
             extra: serde_json::Map::new(),
             severity: Severity::Error,
+            pointer: String::new(),
         }
+    }
+
+    pub fn with_pointer(mut self, pointer: String) -> Self {
+        self.pointer = pointer;
+        self
     }
 
     pub fn with_severity(mut self, severity: Severity) -> Self {

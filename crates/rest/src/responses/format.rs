@@ -49,16 +49,46 @@ pub fn format_resource_response(
     }
 }
 
+/// [`format_resource_response`] for content of a known FHIR version: XML is
+/// written through that version's typed model, so an element only that
+/// version defines (an R5 `valueInteger64`, say) is kept. JSON is unchanged.
+#[allow(clippy::result_large_err)]
+pub fn format_resource_response_for_version(
+    status: StatusCode,
+    headers: axum::http::HeaderMap,
+    content: &Value,
+    format: FhirFormat,
+    version: helios_fhir::FhirVersion,
+) -> Result<Response, RestError> {
+    match format {
+        #[cfg(feature = "xml")]
+        FhirFormat::Xml => {
+            let xml = value_to_xml_for(content, version).map_err(|e| RestError::InternalError {
+                message: format!("Failed to serialize to XML: {}", e),
+            })?;
+            Ok((status, headers, xml).into_response())
+        }
+        _ => {
+            let _ = version;
+            format_resource_response(status, headers, content, format)
+        }
+    }
+}
+
 /// Converts a `serde_json::Value` (JSON FHIR resource) to an XML string.
 ///
 /// This dispatches through the appropriate FHIR version's typed Resource enum
 /// to ensure proper XML serialization with FHIR namespace and structure.
 #[cfg(feature = "xml")]
 fn value_to_xml(value: &Value) -> Result<String, String> {
-    use helios_fhir::FhirVersion;
-
     // Determine version from the resource content or default to R4
-    let version = detect_fhir_version(value);
+    value_to_xml_for(value, detect_fhir_version(value))
+}
+
+/// [`value_to_xml`] through the typed model of `version`.
+#[cfg(feature = "xml")]
+fn value_to_xml_for(value: &Value, version: helios_fhir::FhirVersion) -> Result<String, String> {
+    use helios_fhir::FhirVersion;
 
     match version {
         #[cfg(feature = "R4")]

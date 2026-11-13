@@ -408,6 +408,29 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
         }));
     }
 
+    // The metadata operations (#2562). `$meta` reads any storage, at the
+    // instance and history-version levels only, so it names this server's
+    // own definition. `$meta-add` and `$meta-delete` are full HL7 instance
+    // operations, declared only where the storage rewrites metadata in place
+    // — the same condition under which they run rather than answer 501.
+    ops.push(serde_json::json!({
+        "name": "meta",
+        "definition": format!(
+            "/OperationDefinition/{}",
+            crate::handlers::meta::META_DEFINITION_ID
+        )
+    }));
+    if state.storage().supports_meta_rewrite() {
+        ops.push(serde_json::json!({
+            "name": "meta-add",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-add"
+        }));
+        ops.push(serde_json::json!({
+            "name": "meta-delete",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete"
+        }));
+    }
+
     ops
 }
 

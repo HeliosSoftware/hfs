@@ -195,7 +195,7 @@ impl SqliteTransaction {
         // SQL on every call, and the bulk ingest runs this once per entry.
         let result = conn
             .prepare_cached(
-                "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at
+                "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at, meta_seq
              FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             )
@@ -207,6 +207,7 @@ impl SqliteTransaction {
                     let is_deleted: i32 = row.get(3)?;
                     let fhir_version: String = row.get(4)?;
                     let deleted_at: Option<String> = row.get(5)?;
+                    let meta_seq: i64 = row.get(6)?;
                     Ok((
                         version_id,
                         data,
@@ -214,12 +215,21 @@ impl SqliteTransaction {
                         is_deleted,
                         fhir_version,
                         deleted_at,
+                        meta_seq,
                     ))
                 })
             });
 
         match result {
-            Ok((version_id, data, last_updated, is_deleted, fhir_version_str, deleted_at)) => {
+            Ok((
+                version_id,
+                data,
+                last_updated,
+                is_deleted,
+                fhir_version_str,
+                deleted_at,
+                meta_seq,
+            )) => {
                 if is_deleted != 0 && !include_deleted {
                     return Ok(None);
                 }
@@ -256,17 +266,20 @@ impl SqliteTransaction {
                 let fhir_version = FhirVersion::from_storage(&fhir_version_str)
                     .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    self.tenant.tenant_id().clone(),
-                    json_data,
-                    last_updated,
-                    last_updated,
-                    deleted_at,
-                    fhir_version,
-                )))
+                Ok(Some(
+                    StoredResource::from_storage(
+                        resource_type,
+                        id,
+                        version_id,
+                        self.tenant.tenant_id().clone(),
+                        json_data,
+                        last_updated,
+                        last_updated,
+                        deleted_at,
+                        fhir_version,
+                    )
+                    .with_meta_seq(meta_seq as u64),
+                ))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(internal_error(format!("Failed to read resource: {}", e))),
@@ -295,19 +308,19 @@ impl SqliteTransaction {
         let id = current.id();
 
         // Verify current version still matches (optimistic locking)
-        let db_version: Result<String, _> = conn
+        let db_version: Result<(String, i64), _> = conn
             .prepare_cached(
-                "SELECT version_id FROM resources
+                "SELECT version_id, meta_seq FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = ?4",
             )
             .and_then(|mut stmt| {
                 stmt.query_row(
                     params![tenant_id, resource_type, id, expected_deleted],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
             });
 
-        let db_version = match db_version {
+        let (db_version, db_meta_seq) = match db_version {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(StorageError::Resource(ResourceError::NotFound {
@@ -331,6 +344,13 @@ impl SqliteTransaction {
                     expected_version: current.version_id().to_string(),
                     actual_version: db_version,
                 },
+            ));
+        }
+        if db_meta_seq as u64 != current.meta_seq() {
+            return Err(crate::core::same_version_conflict(
+                resource_type,
+                id,
+                &db_version,
             ));
         }
 
@@ -367,7 +387,7 @@ impl SqliteTransaction {
         let updated = conn
             .execute(
                 "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3,
-                 is_deleted = 0, deleted_at = NULL
+                 is_deleted = 0, deleted_at = NULL, meta_seq = 0
              WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
                AND version_id = ?7 AND is_deleted = ?8",
                 params![
@@ -804,7 +824,7 @@ impl Transaction for SqliteTransaction {
 
         // Soft delete the resource
         conn.execute(
-            "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+            "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1, meta_seq = 0
              WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5",
             params![deleted_at, new_version_str, tenant_id, resource_type, id],
         )
@@ -932,8 +952,10 @@ impl ConditionalTransaction for SqliteTransaction {
         let query = conditional_query(resource_type, criteria);
         let backend = self.backend.clone();
         let tenant = self.tenant.clone();
-        self.with_connection(|conn| backend.search_with_connection(conn, &tenant, &query, None))
-            .map(|result| result.resources.items)
+        self.with_connection(|conn| {
+            backend.search_with_connection_probe(conn, &tenant, &query, None, false)
+        })
+        .map(|result| result.resources.items)
     }
 }
 

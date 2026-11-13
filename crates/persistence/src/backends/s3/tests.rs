@@ -855,6 +855,95 @@ async fn crud_happy_path_and_count() {
     assert_eq!(count_after_delete, 0);
 }
 
+/// #2562: S3 merges labels on PUT, restores only a tombstone, and refuses
+/// metadata rewrites: it has no commit point that keeps the current object
+/// and the history object consistent for a same-version edit.
+#[tokio::test]
+async fn put_merges_labels_and_metadata_rewrites_are_refused() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let task = |codes: &[&str]| {
+        let tags: Vec<Value> = codes
+            .iter()
+            .map(|c| json!({"system": "http://example.org/tags", "code": c}))
+            .collect();
+        json!({"resourceType": "Task", "id": "t1", "status": "requested", "intent": "order",
+               "meta": {"tag": tags}})
+    };
+    let codes = |resource: &StoredResource| -> Vec<String> {
+        resource.content()["meta"]["tag"]
+            .as_array()
+            .map(|t| {
+                t.iter()
+                    .map(|c| c["code"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    assert!(!backend.supports_meta_rewrite());
+    assert!(!backend.tracks_meta_revision());
+    for body in [task(&["a"]), task(&["b"])] {
+        crate::core::put_preserving_labels(
+            &backend,
+            &tenant,
+            "Task",
+            "t1",
+            body,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let current = backend.read(&tenant, "Task", "t1").await.unwrap().unwrap();
+    assert_eq!(codes(&current), ["a", "b"]);
+
+    let refused = backend
+        .rewrite_meta(
+            &tenant,
+            "Task",
+            "t1",
+            &crate::core::MetaTarget::Current {
+                expected_version: current.version_id().to_string(),
+                expected_meta_seq: 0,
+            },
+            &crate::core::MetaChange::Add(json!({"tag": [{"code": "c"}]})),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+
+    backend.delete(&tenant, "Task", "t1").await.unwrap();
+    let restored = crate::core::put_preserving_labels(
+        &backend,
+        &tenant,
+        "Task",
+        "t1",
+        task(&["r"]),
+        FhirVersion::default(),
+    )
+    .await
+    .unwrap();
+    assert!(restored.1, "a restore counts as created");
+    assert_eq!(codes(&restored.0), ["r"]);
+    let lost = backend
+        .restore_tombstone(&tenant, "Task", "t1", task(&["x"]))
+        .await;
+    assert!(
+        matches!(
+            lost,
+            Err(StorageError::Resource(ResourceError::NotFound { .. })
+                | StorageError::Concurrency(_))
+        ),
+        "{lost:?}"
+    );
+}
+
 /// #2523: nothing to delete is `NotFound` on S3, as on every other backend
 /// and as `ResourceStorage::delete` documents — also for a tombstone, which
 /// used to be `Gone` (`410` on a repeated `DELETE`, where the other backends

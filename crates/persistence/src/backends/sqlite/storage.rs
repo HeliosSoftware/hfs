@@ -20,7 +20,7 @@ use crate::core::transaction::{
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, bundle_if_match_gate,
+    PurgableStorage, ResourceStorage, VersionedStorage, bundle_if_match_gate,
     if_match_field_satisfied, normalize_etag,
 };
 use crate::error::TransactionError;
@@ -811,7 +811,7 @@ impl ResourceStorage for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         let result = conn.query_row(
-            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
+            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version, meta_seq
              FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
@@ -822,6 +822,7 @@ impl ResourceStorage for SqliteBackend {
                 let is_deleted: i32 = row.get(3)?;
                 let deleted_at: Option<String> = row.get(4)?;
                 let fhir_version: String = row.get(5)?;
+                let meta_seq: i64 = row.get(6)?;
                 Ok((
                     version_id,
                     data,
@@ -829,12 +830,21 @@ impl ResourceStorage for SqliteBackend {
                     is_deleted,
                     deleted_at,
                     fhir_version,
+                    meta_seq,
                 ))
             },
         );
 
         match result {
-            Ok((version_id, data, last_updated, is_deleted, deleted_at, fhir_version_str)) => {
+            Ok((
+                version_id,
+                data,
+                last_updated,
+                is_deleted,
+                deleted_at,
+                fhir_version_str,
+                meta_seq,
+            )) => {
                 // If deleted, return Gone error
                 if is_deleted != 0 {
                     let deleted_at = deleted_at.and_then(|s| {
@@ -861,17 +871,20 @@ impl ResourceStorage for SqliteBackend {
                 let fhir_version = FhirVersion::from_storage(&fhir_version_str)
                     .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    json_data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
+                Ok(Some(
+                    StoredResource::from_storage(
+                        resource_type,
+                        id,
+                        version_id,
+                        tenant.tenant_id().clone(),
+                        json_data,
+                        last_updated,
+                        last_updated,
+                        None,
+                        fhir_version,
+                    )
+                    .with_meta_seq(meta_seq as u64),
+                ))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(internal_error(format!("Failed to read resource: {}", e))),
@@ -943,9 +956,9 @@ impl ResourceStorage for SqliteBackend {
 
         let updated = tx
             .execute(
-                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
+                "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3, meta_seq = 0
                  WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6
-                   AND version_id = ?7 AND is_deleted = 0",
+                   AND version_id = ?7 AND meta_seq = ?8 AND is_deleted = 0",
                 params![
                     new_version_str,
                     data,
@@ -953,7 +966,8 @@ impl ResourceStorage for SqliteBackend {
                     tenant_id,
                     resource_type,
                     id,
-                    expected_version
+                    expected_version,
+                    current.meta_seq() as i64
                 ],
             )
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
@@ -1030,7 +1044,7 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None)
+        self.soft_delete(tenant, resource_type, id, None, None)
     }
 
     async fn delete_versioned(
@@ -1040,7 +1054,53 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, Some(expected_version))
+        self.soft_delete(tenant, resource_type, id, Some(expected_version), None)
+    }
+
+    async fn delete_at_revision(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        expected_meta_seq: u64,
+    ) -> StorageResult<()> {
+        self.soft_delete(
+            tenant,
+            resource_type,
+            id,
+            Some(expected_version),
+            Some(expected_meta_seq),
+        )
+    }
+
+    fn tracks_meta_revision(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    fn supports_meta_rewrite(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    async fn rewrite_meta(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &crate::core::MetaTarget,
+        change: &crate::core::MetaChange,
+    ) -> StorageResult<crate::core::MetaRewrite> {
+        self.rewrite_meta_in_place(tenant, resource_type, id, target, change)
+    }
+
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.restore_deleted(tenant, resource_type, id, resource)
     }
 
     async fn count(
@@ -1727,6 +1787,241 @@ impl ResourceStorage for SqliteBackend {
     }
 }
 
+impl SqliteBackend {
+    /// [`ResourceStorage::rewrite_meta`]: the targeted version's content
+    /// changed in place under the write lock. When it is the current
+    /// version, the current row, its history row and its search index change
+    /// together and `meta_seq` goes up by one; an older version changes only
+    /// its history row. The version id is kept and `last_updated` set to now.
+    fn rewrite_meta_in_place(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &crate::core::MetaTarget,
+        change: &crate::core::MetaChange,
+    ) -> StorageResult<crate::core::MetaRewrite> {
+        use crate::core::MetaTarget;
+        use rusqlite::OptionalExtension;
+
+        if !self.supports_meta_rewrite() {
+            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "sqlite".to_string(),
+                capability: "meta_rewrite".to_string(),
+            }));
+        }
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin metadata rewrite: {e}")))?;
+
+        let not_found = || {
+            StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+        };
+        let gone = || {
+            StorageError::Resource(ResourceError::Gone {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                deleted_at: None,
+            })
+        };
+
+        let current: Option<(String, i64, bool, Vec<u8>, String)> = tx
+            .query_row(
+                "SELECT version_id, meta_seq, is_deleted, data, fhir_version FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                params![tenant_id, resource_type, id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+        let Some((current_version, current_seq, current_deleted, current_data, fhir_version)) =
+            current
+        else {
+            return Err(not_found());
+        };
+
+        let (version_id, current_affected) = match target {
+            MetaTarget::Current {
+                expected_version,
+                expected_meta_seq,
+            } => {
+                if current_deleted {
+                    return Err(gone());
+                }
+                if *expected_version != current_version {
+                    return Err(StorageError::Concurrency(
+                        ConcurrencyError::VersionConflict {
+                            resource_type: resource_type.to_string(),
+                            id: id.to_string(),
+                            expected_version: expected_version.clone(),
+                            actual_version: current_version,
+                        },
+                    ));
+                }
+                if *expected_meta_seq != current_seq as u64 {
+                    return Err(crate::core::same_version_conflict(
+                        resource_type,
+                        id,
+                        &current_version,
+                    ));
+                }
+                (current_version.clone(), true)
+            }
+            MetaTarget::Historical { version_id } => {
+                let is_current = *version_id == current_version;
+                if is_current && current_deleted {
+                    return Err(gone());
+                }
+                (version_id.clone(), is_current)
+            }
+        };
+
+        let history: Option<(Vec<u8>, bool)> = tx
+            .query_row(
+                "SELECT data, is_deleted FROM resource_history
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND version_id = ?4",
+                params![tenant_id, resource_type, id, version_id],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| internal_error(format!("Failed to read history: {e}")))?;
+        let history_data = match history {
+            None => return Err(not_found()),
+            Some((_, true)) => return Err(gone()),
+            Some((data, false)) => data,
+        };
+
+        let base = if current_affected {
+            current_data
+        } else {
+            history_data
+        };
+        let mut content: Value = serde_json::from_slice(&base)
+            .map_err(|e| serialization_error(format!("Failed to deserialize resource: {e}")))?;
+        change.apply(&mut content);
+        let data = serde_json::to_vec(&content)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {e}")))?;
+
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+
+        if current_affected {
+            let updated = tx
+                .execute(
+                    "UPDATE resources SET data = ?1, last_updated = ?2, meta_seq = meta_seq + 1
+                     WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                       AND version_id = ?6 AND meta_seq = ?7 AND is_deleted = 0",
+                    params![
+                        data,
+                        last_updated,
+                        tenant_id,
+                        resource_type,
+                        id,
+                        version_id,
+                        current_seq
+                    ],
+                )
+                .map_err(|e| internal_error(format!("Failed to rewrite resource: {e}")))?;
+            if updated != 1 {
+                return Err(crate::core::same_version_conflict(
+                    resource_type,
+                    id,
+                    &version_id,
+                ));
+            }
+        }
+        let updated = tx
+            .execute(
+                "UPDATE resource_history SET data = ?1, last_updated = ?2
+                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                   AND version_id = ?6 AND is_deleted = 0",
+                params![data, last_updated, tenant_id, resource_type, id, version_id],
+            )
+            .map_err(|e| internal_error(format!("Failed to rewrite history: {e}")))?;
+        if updated != 1 {
+            return Err(not_found());
+        }
+
+        if current_affected && !self.is_search_offloaded() {
+            // The extractor reads this tenant's SearchParameter overlay. On a
+            // cache miss it is loaded here, through the connection that holds
+            // the write lock: another pooled connection cannot read the locked
+            // table (or does not exist in a one-connection pool), and an
+            // incomplete overlay would drop the custom parameters' entries.
+            let registry = match self.tenant_registries().cached(tenant_id) {
+                Some(registry) => registry,
+                None => {
+                    let stored = super::backend::load_tenant_stored_params_with_conn(
+                        &tx,
+                        self.config().fhir_version,
+                        tenant_id,
+                    )
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed to load this tenant's SearchParameter overlay; refusing to \
+                         reindex the rewritten resource against an incomplete registry: {e}"
+                        ))
+                    })?;
+                    self.tenant_registries().build_and_cache(tenant_id, stored)
+                }
+            };
+            // The handle acquired above is used as it is: a SearchParameter
+            // writer invalidating the cache now cannot send index preparation
+            // back to the loader while this transaction holds the lock.
+            let extractor = crate::search::SearchParameterExtractor::new(registry);
+            let prepared =
+                Self::prepare_index_with(&extractor, tenant_id, resource_type, id, &content);
+            self.delete_search_index(&tx, tenant_id, resource_type, id)?;
+            self.write_prepared_index(&tx, tenant_id, resource_type, id, &content, prepared)?;
+        }
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit metadata rewrite: {e}")))?;
+
+        if current_affected && resource_type == "SearchParameter" {
+            self.tenant_registries().invalidate(tenant_id);
+        }
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        let meta_seq = if current_affected {
+            current_seq as u64 + 1
+        } else {
+            0
+        };
+        Ok(crate::core::MetaRewrite {
+            resource: StoredResource::from_storage(
+                resource_type,
+                id,
+                version_id,
+                tenant.tenant_id().clone(),
+                content,
+                now,
+                now,
+                None,
+                fhir_version,
+            )
+            .with_meta_seq(meta_seq),
+            current_changed: current_affected,
+        })
+    }
+}
+
 // Search Index Helpers
 impl SqliteBackend {
     /// Soft-deletes a resource, optionally only at `expected_version`
@@ -1746,6 +2041,7 @@ impl SqliteBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
+        expected_meta_seq: Option<u64>,
     ) -> StorageResult<()> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
@@ -1757,14 +2053,14 @@ impl SqliteBackend {
             .map_err(|e| internal_error(format!("Failed to begin delete: {}", e)))?;
 
         // Check if resource exists and get its fhir_version
-        let result: Result<(String, Vec<u8>, String), _> = tx.query_row(
-            "SELECT version_id, data, fhir_version FROM resources
+        let result: Result<(String, Vec<u8>, String, i64), _> = tx.query_row(
+            "SELECT version_id, data, fhir_version, meta_seq FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
             params![tenant_id, resource_type, id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         );
 
-        let (current_version, data, fhir_version_str) = match result {
+        let (current_version, data, fhir_version_str, current_meta_seq) = match result {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(StorageError::Resource(ResourceError::NotFound {
@@ -1789,6 +2085,15 @@ impl SqliteBackend {
                 },
             ));
         }
+        if let Some(expected) = expected_meta_seq
+            && expected != current_meta_seq as u64
+        {
+            return Err(crate::core::same_version_conflict(
+                resource_type,
+                id,
+                &current_version,
+            ));
+        }
 
         let now = Utc::now();
         let deleted_at = now.to_rfc3339();
@@ -1803,7 +2108,7 @@ impl SqliteBackend {
         // predicate is what would say so if that ever stopped being true.
         let updated = tx
             .execute(
-                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1, meta_seq = 0
                  WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
                    AND version_id = ?6 AND is_deleted = 0",
                 params![
@@ -1950,7 +2255,7 @@ impl SqliteBackend {
 
         tx.execute(
             "UPDATE resources
-             SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL
+             SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL, meta_seq = 0
              WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
             params![
                 new_version_str,
@@ -2049,11 +2354,23 @@ impl SqliteBackend {
         resource_id: &str,
         resource: &Value,
     ) -> PreparedIndex {
+        let extractor = self.tenant_extractor(tenant_id);
+        Self::prepare_index_with(&extractor, tenant_id, resource_type, resource_id, resource)
+    }
+
+    /// [`Self::prepare_index`] with an extractor the caller already holds, so
+    /// no registry lookup happens here.
+    pub(crate) fn prepare_index_with(
+        extractor: &crate::search::SearchParameterExtractor,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> PreparedIndex {
         use super::search::fts::extract_searchable_content;
         use crate::search::converters::IndexValue;
 
         let _span = crate::perf::span(crate::perf::Phase::Extract);
-        let extractor = self.tenant_extractor(tenant_id);
         let rows = match extractor.extract(resource, resource_type) {
             Ok(values) => {
                 let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
@@ -3947,41 +4264,17 @@ impl ConditionalStorage for SqliteBackend {
         fhir_version: FhirVersion,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // `If-Match` names a version; nothing matched, so nothing
-                // can carry it and the create below must not run (#1381).
-                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
-                if upsert {
-                    // No match, but upsert is true - create new resource
-                    let created = self
-                        .create(tenant, resource_type, resource, fhir_version)
-                        .await?;
-                    Ok(ConditionalUpdateResult::Created(created))
-                } else {
-                    // No match and no upsert
-                    Ok(ConditionalUpdateResult::NoMatch)
-                }
-            }
-            1 => {
-                // Exactly one match - update it (preserves existing FHIR version).
-                // `update` compares-and-swaps on `existing`'s version, the one
-                // `If-Match` is evaluated against here.
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let updated = self.update(tenant, &existing, resource).await?;
-                Ok(ConditionalUpdateResult::Updated(updated))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalUpdateResult::MultipleMatches(n))
-            }
-        }
+        crate::core::conditional_update_resolving(
+            self,
+            tenant,
+            resource_type,
+            resource,
+            search_params,
+            upsert,
+            fhir_version,
+            if_match,
+        )
+        .await
     }
 
     async fn conditional_delete(
@@ -3991,30 +4284,14 @@ impl ConditionalStorage for SqliteBackend {
         search_params: &str,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // No match. A supplied `If-Match` fails against it, as it
-                // does on `DELETE [type]/[id]` for a missing resource.
-                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
-                Ok(ConditionalDeleteResult::NoMatch)
-            }
-            1 => {
-                // Exactly one match - delete it
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
-                Ok(ConditionalDeleteResult::Deleted(existing))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalDeleteResult::MultipleMatches(n))
-            }
-        }
+        crate::core::conditional_delete_resolving(
+            self,
+            tenant,
+            resource_type,
+            search_params,
+            if_match,
+        )
+        .await
     }
 
     /// The criteria resolver the provided
@@ -4046,8 +4323,17 @@ impl SqliteBackend {
             return Ok(Vec::new());
         };
 
-        // Use the SearchProvider implementation which uses the search index
-        let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
+        // The search body with the bounded probe off: its plan keeps the
+        // criteria in the statement that reads each row, so the selection,
+        // the body and its revision come from one snapshot (#2562). A probe
+        // reads the matching ids in a statement of its own first.
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let result = self
+            .run_blocking(move |conn| {
+                this.search_with_connection_probe(conn, &tenant, &query, None, false)
+            })
+            .await?;
 
         Ok(result.resources.items)
     }
@@ -4410,9 +4696,13 @@ impl SqliteBackend {
 
                 if let Some(target) = target {
                     return Ok(match &target.resolved {
-                        Some(existing) => crate::core::conditional_update_entry(
-                            tx.update(existing, resource).await?,
-                        ),
+                        Some(existing) => {
+                            let merged =
+                                crate::core::merge_update_labels(existing.content(), &resource);
+                            crate::core::conditional_update_entry(
+                                tx.update(existing, merged).await?,
+                            )
+                        }
                         None => BundleEntryResult::created(
                             tx.create(&target.resource_type, resource).await?,
                         ),
@@ -4439,7 +4729,9 @@ impl SqliteBackend {
 
                 match existing {
                     Some(existing) => {
-                        let updated = tx.update(&existing, resource).await?;
+                        let merged =
+                            crate::core::merge_update_labels(existing.content(), &resource);
+                        let updated = tx.update(&existing, merged).await?;
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
@@ -4789,7 +5081,7 @@ impl ReindexSource for SqliteBackend {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                "SELECT id, version_id, data, last_updated, fhir_version, meta_seq FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
                  AND id IN ({placeholders})"
             );
@@ -5076,7 +5368,7 @@ fn reindex_id_range_count_sql(bounds: &str) -> String {
 /// page size bound to `?{limit_param}`.
 fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
     format!(
-        "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+        "SELECT id, version_id, data, last_updated, fhir_version, meta_seq FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
          ORDER BY id ASC LIMIT ?{limit_param}"
     )
@@ -5114,7 +5406,7 @@ fn fetch_reindex_page_on(
     let (mut sql, mut params): (String, Vec<Box<dyn ToSql>>) =
         if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
             (
-                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                "SELECT id, version_id, data, last_updated, fhir_version, meta_seq FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
              AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4))"
                     .to_string(),
@@ -5127,7 +5419,7 @@ fn fetch_reindex_page_on(
             )
         } else {
             (
-                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                "SELECT id, version_id, data, last_updated, fhir_version, meta_seq FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0"
                     .to_string(),
                 vec![
@@ -5369,10 +5661,11 @@ struct RawReindexRow {
     data: Option<Vec<u8>>,
     last_updated: Option<String>,
     fhir_version: Option<String>,
+    meta_seq: u64,
 }
 
 impl RawReindexRow {
-    /// Column order: `id, version_id, data, last_updated, fhir_version`.
+    /// Column order: `id, version_id, data, last_updated, fhir_version, meta_seq`.
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: column_text(row, 0),
@@ -5385,6 +5678,7 @@ impl RawReindexRow {
             },
             last_updated: column_text(row, 3),
             fhir_version: column_text(row, 4),
+            meta_seq: row.get::<_, Option<i64>>(5).ok().flatten().unwrap_or(0) as u64,
         })
     }
 
@@ -5434,8 +5728,37 @@ impl RawReindexRow {
             last_modified,
             None, // not deleted
             fhir_version,
-        ))
+        )
+        .with_meta_seq(self.meta_seq))
     }
+}
+
+/// The stored `(version_id, meta_seq, is_deleted)` of `resource`'s row, or
+/// `None` when there is none.
+fn stored_revision(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource: &StoredResource,
+) -> StorageResult<Option<(String, u64, bool)>> {
+    use rusqlite::OptionalExtension;
+    conn.prepare_cached(
+        "SELECT version_id, meta_seq, is_deleted FROM resources
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_row(
+            params![tenant_id, resource.resource_type(), resource.id()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .optional()
+    })
+    .map_err(|e| internal_error(format!("Failed to read the stored revision: {e}")))
 }
 
 /// A column as text whatever its storage class, or `None` for NULL or an
@@ -5559,6 +5882,24 @@ impl SqliteBackend {
         let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
         let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
         for (resource, prepared) in resources.iter().zip(prepared) {
+            // Changed since the page was read, as the set-based path checks:
+            // a newer version, a same-version metadata rewrite or a delete
+            // already indexed itself, so this resource is left as it is.
+            match stored_revision(conn, tenant_id, resource) {
+                Ok(Some((version_id, meta_seq, is_deleted)))
+                    if is_deleted
+                        || version_id != resource.version_id()
+                        || meta_seq != resource.meta_seq() =>
+                {
+                    results.push(Ok(0));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    results.push(Err(e));
+                    continue;
+                }
+            }
             let outcome = {
                 let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
                 self.delete_search_index(conn, tenant_id, resource.resource_type(), resource.id())
@@ -5649,12 +5990,14 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("encode page ids: {e}")))?;
             let mut keys: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::with_capacity(ids.len());
-            let fetched_versions: std::collections::HashMap<&str, &str> =
-                resources.iter().map(|r| (r.id(), r.version_id())).collect();
+            let fetched_versions: std::collections::HashMap<&str, (&str, u64)> = resources
+                .iter()
+                .map(|r| (r.id(), (r.version_id(), r.meta_seq())))
+                .collect();
             let (mut min_key, mut max_key) = (i64::MAX, i64::MIN);
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, rowid, version_id, is_deleted FROM resources \
+                    "SELECT id, rowid, version_id, is_deleted, meta_seq FROM resources \
                      WHERE tenant_id = ?1 AND resource_type = ?2 \
                        AND id IN (SELECT value FROM json_each(?3))",
                 )
@@ -5666,18 +6009,21 @@ impl SqliteBackend {
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)? != 0,
+                        r.get::<_, i64>(4)? as u64,
                     ))
                 })
                 .map_err(|e| internal_error(format!("page key lookup: {e}")))?;
             for row in rows {
-                let (id, key, version_id, is_deleted) =
+                let (id, key, version_id, is_deleted, meta_seq) =
                     row.map_err(|e| internal_error(format!("page key row: {e}")))?;
                 // Changed since the page was read: a foreground update
                 // indexed the newer version inline, and a delete removed the
                 // rows. Writing this page's rows would replace the newer
                 // index or index a deleted resource, so the resource is left
                 // as it is (counted `Ok(0)` below).
-                if is_deleted || fetched_versions.get(id.as_str()) != Some(&version_id.as_str()) {
+                if is_deleted
+                    || fetched_versions.get(id.as_str()) != Some(&(version_id.as_str(), meta_seq))
+                {
                     superseded.insert(id);
                     continue;
                 }
@@ -6239,6 +6585,7 @@ impl ReindexTarget for SqliteBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SearchProvider;
     use crate::core::history::HistoryParams;
     use crate::tenant::{TenantId, TenantPermissions};
     use crate::types::{SearchParamType, SearchParameter, SearchValue};
@@ -6270,6 +6617,137 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// #2562: the metadata rewrite prepares index rows from the registry
+    /// handle it acquired, so a SearchParameter writer invalidating the cache
+    /// afterwards cannot send preparation back to the loader. Here the cache
+    /// is invalidated after the handle is taken and the only pooled
+    /// connection is held, as the rewrite holds it: rows for the custom
+    /// parameter are still prepared, from the retained snapshot alone.
+    #[tokio::test]
+    async fn index_preparation_uses_the_retained_registry_after_an_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = SqliteBackend::with_config(
+            dir.path().join("retained.db").to_str().unwrap(),
+            SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                max_connections: 1,
+                min_connections: 1,
+                connection_timeout_ms: 500,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+        let tenant_id = tenant.tenant_id().as_str();
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                json!({
+                    "resourceType": "SearchParameter", "id": "task-description",
+                    "url": "http://example.org/fhir/SearchParameter/task-description",
+                    "name": "task-description", "status": "active",
+                    "code": "task-description", "base": ["Task"],
+                    "type": "string", "expression": "Task.description"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let registry = backend.tenant_registry(tenant_id);
+        backend.tenant_registries().invalidate(tenant_id);
+        let held = backend.get_connection().unwrap();
+
+        let extractor = crate::search::SearchParameterExtractor::new(registry);
+        let prepared = SqliteBackend::prepare_index_with(
+            &extractor,
+            tenant_id,
+            "Task",
+            "t1",
+            &json!({"resourceType": "Task", "id": "t1", "status": "requested",
+                    "intent": "order", "description": "findme"}),
+        );
+        drop(held);
+        let rows = prepared.rows.expect("rows prepared");
+        assert!(
+            rows.iter().any(|row| row
+                .iter()
+                .any(|v| matches!(v, SqlValue::String(s) if s == "task-description"))),
+            "the custom parameter's row comes from the retained snapshot"
+        );
+        assert!(
+            backend.tenant_registries().cached(tenant_id).is_none(),
+            "preparation did not reload the cache"
+        );
+    }
+
+    /// #2562: the row-by-row reindex fallback, like the set-based page, leaves
+    /// a resource whose metadata was rewritten after the page was read: the
+    /// newer index entries stay and the stale page's are not written.
+    #[tokio::test]
+    async fn the_row_by_row_reindex_page_skips_a_resource_rewritten_after_the_read() {
+        use crate::search::reindex::ReindexSource;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let tag = |code: &str| json!({"system": "http://example.org/tags", "code": code});
+        let created = backend
+            .create(
+                &tenant,
+                "Task",
+                json!({"resourceType": "Task", "id": "x1", "status": "requested",
+                       "intent": "order", "meta": {"tag": [tag("a")]}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let page = backend
+            .fetch_resources_page(&tenant, "Task", None, 100)
+            .await
+            .unwrap();
+        backend
+            .rewrite_meta(
+                &tenant,
+                "Task",
+                "x1",
+                &crate::core::MetaTarget::Current {
+                    expected_version: created.version_id().to_string(),
+                    expected_meta_seq: created.meta_seq(),
+                },
+                &crate::core::MetaChange::Add(json!({"tag": [tag("b")]})),
+            )
+            .await
+            .unwrap();
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let prepared = page
+            .resources
+            .iter()
+            .map(|r| backend.prepare_index(tenant_id, r.resource_type(), r.id(), r.content()))
+            .collect();
+        let conn = backend.get_connection().unwrap();
+        let results = backend.write_reindex_page_rows(&conn, tenant_id, &page.resources, prepared);
+        drop(conn);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            *results[0].as_ref().unwrap(),
+            0,
+            "superseded, left as it is"
+        );
+
+        let found = backend
+            .resolve_conditional_matches(&tenant, "Task", "_tag=http://example.org/tags|b")
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1, "the rewrite's entries survive");
     }
 
     /// Patients with a string name, a token with a display text and a

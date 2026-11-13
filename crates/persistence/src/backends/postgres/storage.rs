@@ -1742,7 +1742,7 @@ impl ResourceStorage for PostgresBackend {
 
         let row = query_opt_cached(
             &client,
-            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version
+            "SELECT version_id, data, last_updated, is_deleted, deleted_at, fhir_version, meta_seq
                  FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
             &[&tenant_id, &resource_type, &id],
@@ -1758,6 +1758,7 @@ impl ResourceStorage for PostgresBackend {
                 let is_deleted: bool = row.get(3);
                 let deleted_at: Option<DateTime<Utc>> = row.get(4);
                 let fhir_version_str: String = row.get(5);
+                let meta_seq: i64 = row.get(6);
 
                 // If deleted, return Gone error
                 if is_deleted {
@@ -1771,17 +1772,20 @@ impl ResourceStorage for PostgresBackend {
                 let fhir_version = FhirVersion::from_storage(&fhir_version_str)
                     .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
+                Ok(Some(
+                    StoredResource::from_storage(
+                        resource_type,
+                        id,
+                        version_id,
+                        tenant.tenant_id().clone(),
+                        data,
+                        last_updated,
+                        last_updated,
+                        None,
+                        fhir_version,
+                    )
+                    .with_meta_seq(meta_seq as u64),
+                ))
             }
             None => Ok(None),
         }
@@ -1846,9 +1850,9 @@ impl ResourceStorage for PostgresBackend {
             let updated = execute_cached(
                 &transaction,
                 "WITH upd AS (
-                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                     UPDATE resources SET version_id = $1, data = $2, last_updated = $3, meta_seq = 0
                      WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                       AND is_deleted = FALSE AND version_id = $7
+                       AND is_deleted = FALSE AND version_id = $7 AND meta_seq = $9
                      RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
                  )
                  INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
@@ -1862,6 +1866,7 @@ impl ResourceStorage for PostgresBackend {
                     &id,
                     &expected_version,
                     &fhir_version_str,
+                    &(current.meta_seq() as i64),
                 ],
             )
             .await
@@ -1965,7 +1970,8 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None).await
+        self.soft_delete(tenant, resource_type, id, None, None)
+            .await
     }
 
     async fn delete_versioned(
@@ -1975,7 +1981,56 @@ impl ResourceStorage for PostgresBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, Some(expected_version))
+        self.soft_delete(tenant, resource_type, id, Some(expected_version), None)
+            .await
+    }
+
+    async fn delete_at_revision(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        expected_meta_seq: u64,
+    ) -> StorageResult<()> {
+        self.soft_delete(
+            tenant,
+            resource_type,
+            id,
+            Some(expected_version),
+            Some(expected_meta_seq),
+        )
+        .await
+    }
+
+    fn tracks_meta_revision(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    fn supports_meta_rewrite(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
+    async fn rewrite_meta(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &crate::core::MetaTarget,
+        change: &crate::core::MetaChange,
+    ) -> StorageResult<crate::core::MetaRewrite> {
+        self.rewrite_meta_in_place(tenant, resource_type, id, target, change)
+            .await
+    }
+
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.restore_deleted(tenant, resource_type, id, resource)
             .await
     }
 
@@ -2654,8 +2709,10 @@ impl PostgresBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
+        expected_meta_seq: Option<u64>,
     ) -> StorageResult<()> {
         tenant.check_permission(Operation::Delete, resource_type)?;
+        let expected_meta_seq = expected_meta_seq.map(|seq| seq as i64);
 
         let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -2790,15 +2847,24 @@ impl PostgresBackend {
                      SET is_deleted = TRUE,
                          deleted_at = $1,
                          last_updated = $1,
+                         meta_seq = 0,
                          version_id = ((CASE WHEN version_id ~ '^[0-9]+$' THEN version_id::bigint ELSE 0 END) + 1)::text
                      WHERE tenant_id = $2 AND resource_type = $3 AND id = $4
                        AND is_deleted = FALSE
                        AND ($5::text IS NULL OR version_id = $5::text)
+                       AND ($6::bigint IS NULL OR meta_seq = $6::bigint)
                      RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
                  )
                  INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
-                &[&now, &tenant_id, &resource_type, &id, &expected_version],
+                &[
+                    &now,
+                    &tenant_id,
+                    &resource_type,
+                    &id,
+                    &expected_version,
+                    &expected_meta_seq,
+                ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
@@ -2949,7 +3015,7 @@ impl PostgresBackend {
             execute_cached(
                 &transaction,
                 "UPDATE resources
-                 SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
+                 SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL, meta_seq = 0
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
                 &[&new_version_str, &resource, &now, &tenant_id, &resource_type, &id],
             )
@@ -3656,6 +3722,7 @@ impl PostgresBackend {
             version_id: String,
             last_updated: DateTime<Utc>,
             stored_bytes: i64,
+            meta_seq: i64,
         }
         let tenant_id = tenant.tenant_id().as_str();
         let resource_types: Vec<&str> = resources
@@ -3666,7 +3733,7 @@ impl PostgresBackend {
         let metadata = client
             .query(
                 "SELECT resource_type, id, is_deleted, version_id, last_updated,
-                        pg_column_size(data)::bigint
+                        pg_column_size(data)::bigint, meta_seq
                  FROM resources WHERE tenant_id = $1 AND (resource_type, id) IN
                  (SELECT * FROM unnest($2::text[], $3::text[]))",
                 &[&tenant_id, &resource_types, &resource_ids],
@@ -3683,6 +3750,7 @@ impl PostgresBackend {
                     version_id: row.get::<_, String>(3),
                     last_updated: row.get::<_, DateTime<Utc>>(4),
                     stored_bytes: row.get::<_, i64>(5),
+                    meta_seq: row.get::<_, i64>(6),
                 },
             );
         }
@@ -3706,6 +3774,7 @@ impl PostgresBackend {
                 Some(row) if !row.deleted => {
                     live.push(true);
                     let unchanged = row.version_id == supplied.version_id()
+                        && row.meta_seq as u64 == supplied.meta_seq()
                         && row.last_updated.timestamp_micros()
                             == supplied.last_modified().timestamp_micros();
                     if !unchanged {
@@ -5159,6 +5228,261 @@ const OFFLOADED_CONDITIONAL_REFUSAL: &str = "conditional criteria cannot be reso
      transaction when search is offloaded to a secondary backend; submit the entry in a batch \
      Bundle instead";
 
+impl PostgresBackend {
+    /// [`ResourceStorage::rewrite_meta`]: the targeted version's content
+    /// changed in place inside one guarded transaction. The advisory locks
+    /// come first, in the order every writer takes them, then the rows are
+    /// locked and read. When it is the current version, the current row, its
+    /// history row and its search index change together and `meta_seq` goes
+    /// up by one; an older version changes only its history row. The version
+    /// id is kept and `last_updated` set to now.
+    async fn rewrite_meta_in_place(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &crate::core::MetaTarget,
+        change: &crate::core::MetaChange,
+    ) -> StorageResult<crate::core::MetaRewrite> {
+        use crate::core::MetaTarget;
+
+        if !self.supports_meta_rewrite() {
+            return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "postgres".to_string(),
+                capability: "meta_rewrite".to_string(),
+            }));
+        }
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let mut client = self.guarded_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let not_found = || {
+            StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })
+        };
+        let gone = || {
+            StorageError::Resource(ResourceError::Gone {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+                deleted_at: None,
+            })
+        };
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin metadata rewrite: {e}")))?;
+        let write_result: StorageResult<(String, Value, String, bool, i64, DateTime<Utc>)> =
+            async {
+                if resource_type == "SearchParameter" {
+                    acquire_exclusive_write_gate(&transaction, tenant_id).await?;
+                } else {
+                    acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)])
+                        .await?;
+                }
+                let current = transaction
+                    .query_opt(
+                        "SELECT version_id, meta_seq, is_deleted, data, fhir_version FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3
+                     FOR UPDATE",
+                        &[&tenant_id, &resource_type, &id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+                let Some(current) = current else {
+                    return Err(not_found());
+                };
+                let current_version: String = current.get(0);
+                let current_seq: i64 = current.get(1);
+                let current_deleted: bool = current.get(2);
+                let current_data: Value = current.get(3);
+                let fhir_version: String = current.get(4);
+
+                let (version_id, current_affected) = match target {
+                    MetaTarget::Current {
+                        expected_version,
+                        expected_meta_seq,
+                    } => {
+                        if current_deleted {
+                            return Err(gone());
+                        }
+                        if *expected_version != current_version {
+                            return Err(StorageError::Concurrency(
+                                ConcurrencyError::VersionConflict {
+                                    resource_type: resource_type.to_string(),
+                                    id: id.to_string(),
+                                    expected_version: expected_version.clone(),
+                                    actual_version: current_version,
+                                },
+                            ));
+                        }
+                        if *expected_meta_seq != current_seq as u64 {
+                            return Err(crate::core::same_version_conflict(
+                                resource_type,
+                                id,
+                                &current_version,
+                            ));
+                        }
+                        (current_version.clone(), true)
+                    }
+                    MetaTarget::Historical { version_id } => {
+                        let is_current = *version_id == current_version;
+                        if is_current && current_deleted {
+                            return Err(gone());
+                        }
+                        (version_id.clone(), is_current)
+                    }
+                };
+
+                let history = transaction
+                    .query_opt(
+                        "SELECT data, is_deleted FROM resource_history
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND version_id = $4
+                     FOR UPDATE",
+                        &[&tenant_id, &resource_type, &id, &version_id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to read history: {e}")))?;
+                let history_data: Value = match history {
+                    None => return Err(not_found()),
+                    Some(row) if row.get::<_, bool>(1) => return Err(gone()),
+                    Some(row) => row.get(0),
+                };
+
+                let mut content = if current_affected {
+                    current_data
+                } else {
+                    history_data
+                };
+                change.apply(&mut content);
+                // Taken under the locks, after the change is known: a rewrite that
+                // started earlier but commits later never stamps an older time
+                // over a newer one.
+                let now = Utc::now();
+
+                if current_affected {
+                    let updated = transaction
+                    .execute(
+                        "UPDATE resources SET data = $1, last_updated = $2, meta_seq = meta_seq + 1
+                         WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
+                           AND version_id = $6 AND meta_seq = $7 AND is_deleted = FALSE",
+                        &[
+                            &content,
+                            &now,
+                            &tenant_id,
+                            &resource_type,
+                            &id,
+                            &version_id,
+                            &current_seq,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rewrite resource: {e}")))?;
+                    if updated != 1 {
+                        return Err(crate::core::same_version_conflict(
+                            resource_type,
+                            id,
+                            &version_id,
+                        ));
+                    }
+                }
+                let updated = transaction
+                    .execute(
+                        "UPDATE resource_history SET data = $1, last_updated = $2
+                     WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
+                       AND version_id = $6 AND is_deleted = FALSE",
+                        &[&content, &now, &tenant_id, &resource_type, &id, &version_id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to rewrite history: {e}")))?;
+                if updated != 1 {
+                    return Err(not_found());
+                }
+
+                if current_affected {
+                    let extractor = self
+                        .write_extractor(
+                            &transaction,
+                            tenant_id,
+                            !self.is_search_offloaded(),
+                            resource_type == "SearchParameter",
+                        )
+                        .await?;
+                    self.index_resource_guarded(
+                        &transaction,
+                        &extractor,
+                        tenant_id,
+                        resource_type,
+                        id,
+                        now,
+                        IndexWrite::Replace,
+                        &content,
+                    )
+                    .await?;
+                }
+                Ok((
+                    version_id,
+                    content,
+                    fhir_version,
+                    current_affected,
+                    current_seq,
+                    now,
+                ))
+            }
+            .await;
+
+        let (version_id, content, fhir_version, current_affected, current_seq, now) =
+            match write_result {
+                Ok(written) => {
+                    transaction.commit().await.map_err(|e| {
+                        internal_error(format!("Failed to commit metadata rewrite: {e}"))
+                    })?;
+                    client.mark_settled();
+                    written
+                }
+                Err(error) => {
+                    transaction.rollback().await.map_err(|e| {
+                        internal_error(format!("Failed to rollback metadata rewrite: {e}"))
+                    })?;
+                    client.mark_settled();
+                    return Err(error);
+                }
+            };
+        drop(client);
+
+        if current_affected
+            && resource_type == "SearchParameter"
+            && let Err(e) = self.reload_stored_cache().await
+        {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        let meta_seq = if current_affected {
+            current_seq as u64 + 1
+        } else {
+            0
+        };
+        Ok(crate::core::MetaRewrite {
+            resource: StoredResource::from_storage(
+                resource_type,
+                id,
+                version_id,
+                tenant.tenant_id().clone(),
+                content,
+                now,
+                now,
+                None,
+                fhir_version,
+            )
+            .with_meta_seq(meta_seq),
+            current_changed: current_affected,
+        })
+    }
+}
+
 #[async_trait]
 impl ConditionalStorage for PostgresBackend {
     fn supports_conditional(&self, interaction: crate::core::ConditionalInteraction) -> bool {
@@ -5211,41 +5535,17 @@ impl ConditionalStorage for PostgresBackend {
         fhir_version: FhirVersion,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult> {
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // `If-Match` names a version; nothing matched, so nothing
-                // can carry it and the create below must not run (#1381).
-                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
-                if upsert {
-                    // No match, but upsert is true - create new resource
-                    let created = self
-                        .create(tenant, resource_type, resource, fhir_version)
-                        .await?;
-                    Ok(ConditionalUpdateResult::Created(created))
-                } else {
-                    // No match and no upsert
-                    Ok(ConditionalUpdateResult::NoMatch)
-                }
-            }
-            1 => {
-                // Exactly one match - update it (preserves existing FHIR version).
-                // `update` compares-and-swaps on `existing`'s version, the one
-                // `If-Match` is evaluated against here.
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                let updated = self.update(tenant, &existing, resource).await?;
-                Ok(ConditionalUpdateResult::Updated(updated))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalUpdateResult::MultipleMatches(n))
-            }
-        }
+        crate::core::conditional_update_resolving(
+            self,
+            tenant,
+            resource_type,
+            resource,
+            search_params,
+            upsert,
+            fhir_version,
+            if_match,
+        )
+        .await
     }
 
     async fn conditional_delete(
@@ -5255,30 +5555,14 @@ impl ConditionalStorage for PostgresBackend {
         search_params: &str,
         if_match: &crate::core::EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult> {
-        // Find matching resources based on search parameters
-        let matches = self
-            .find_matching_resources(tenant, resource_type, search_params)
-            .await?;
-
-        match matches.len() {
-            0 => {
-                // No match. A supplied `If-Match` fails against it, as it
-                // does on `DELETE [type]/[id]` for a missing resource.
-                crate::core::conditional_if_match_gate(if_match, resource_type, None)?;
-                Ok(ConditionalDeleteResult::NoMatch)
-            }
-            1 => {
-                // Exactly one match - delete it
-                let existing = matches.into_iter().next().unwrap();
-                crate::core::conditional_if_match_gate(if_match, resource_type, Some(&existing))?;
-                crate::core::delete_under_precondition(self, tenant, if_match, &existing).await?;
-                Ok(ConditionalDeleteResult::Deleted(existing))
-            }
-            n => {
-                // Multiple matches - error condition
-                Ok(ConditionalDeleteResult::MultipleMatches(n))
-            }
-        }
+        crate::core::conditional_delete_resolving(
+            self,
+            tenant,
+            resource_type,
+            search_params,
+            if_match,
+        )
+        .await
     }
 
     /// The criteria resolver the provided
@@ -5837,9 +6121,13 @@ impl PostgresBackend {
 
                 if let Some(target) = target {
                     return Ok(match &target.resolved {
-                        Some(existing) => crate::core::conditional_update_entry(
-                            tx.update(existing, resource).await?,
-                        ),
+                        Some(existing) => {
+                            let merged =
+                                crate::core::merge_update_labels(existing.content(), &resource);
+                            crate::core::conditional_update_entry(
+                                tx.update(existing, merged).await?,
+                            )
+                        }
                         None => BundleEntryResult::created(
                             tx.create(&target.resource_type, resource).await?,
                         ),
@@ -5865,7 +6153,9 @@ impl PostgresBackend {
 
                 match existing {
                     Some(existing) => {
-                        let updated = tx.update(&existing, resource).await?;
+                        let merged =
+                            crate::core::merge_update_labels(existing.content(), &resource);
+                        let updated = tx.update(&existing, merged).await?;
                         Ok(BundleEntryResult::updated(updated))
                     }
                     None => {

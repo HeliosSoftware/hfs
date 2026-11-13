@@ -116,12 +116,16 @@ impl JsonClass {
 fn expected_json_class(type_name: &str) -> Option<JsonClass> {
     Some(match type_name {
         "boolean" => JsonClass::Boolean,
-        "integer" | "positiveInt" | "unsignedInt" | "integer64" => JsonClass::Integer,
+        "integer" | "positiveInt" | "unsignedInt" => JsonClass::Integer,
         "decimal" => JsonClass::Number,
         // Everything else — string, uri, code, dateTime, base64Binary, ... —
-        // is a JSON string. Unknown primitive names get no class check.
+        // is a JSON string. `integer64` is one too: FHIR represents it as a
+        // string in JSON, and the pack's regex then checks its digits.
+        // Unknown primitive names get no class check.
         "string" | "uri" | "url" | "canonical" | "oid" | "uuid" | "id" | "code" | "markdown"
-        | "base64Binary" | "instant" | "date" | "dateTime" | "time" | "xhtml" => JsonClass::String,
+        | "base64Binary" | "instant" | "date" | "dateTime" | "time" | "xhtml" | "integer64" => {
+            JsonClass::String
+        }
         _ => return None,
     })
 }

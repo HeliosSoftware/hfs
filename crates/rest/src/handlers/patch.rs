@@ -15,7 +15,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, PatchFormat, ResourceStorage, SearchProvider};
+use helios_persistence::core::{
+    ConditionalStorage, PatchFormat, ResourceStorage, SearchProvider, WRITE_ATTEMPTS,
+    is_same_version_conflict,
+};
 use serde_json::Value;
 use tracing::debug;
 
@@ -100,26 +103,6 @@ where
 
     let patch_format = parse_patch_format(content_type, &body)?;
 
-    // Read existing resource
-    let existing = state
-        .storage()
-        .read(tenant.context(), &resource_type, &id)
-        .await?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: resource_type.clone(),
-            id: id.clone(),
-        })?;
-
-    // A `patient/` scope patches inside the launch patient's compartment only
-    // (#1618): the resource must be in it now, and must still be in it after
-    // the patch (checked below, once the patched content exists).
-    compartment.assert_member(
-        || state.storage().search_param_registry(tenant.context()),
-        existing.fhir_version(),
-        existing.content(),
-        "patch",
-    )?;
-
     // Check the If-Match precondition (RFC 9110 §13.1.1).
     //
     // List-aware: satisfied when ANY supplied entity-tag matches. A malformed
@@ -132,48 +115,78 @@ where
             message: format!("Malformed If-Match header: {e}"),
         })?;
 
-    if !if_match.if_match_satisfied(Some(existing.version_id())) {
-        return Err(RestError::PreconditionFailed {
-            message: format!(
-                "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{}\"",
-                existing.version_id()
-            ),
-        });
-    }
+    let mut attempt = 0;
+    let stored = loop {
+        attempt += 1;
+        // Read existing resource
+        let existing = state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await?
+            .ok_or_else(|| RestError::NotFound {
+                resource_type: resource_type.clone(),
+                id: id.clone(),
+            })?;
 
-    // Apply the patch: the applier `PATCH [type]?criteria` uses inside the
-    // storage layer (#1406). It refuses a patch that changes `resourceType` or
-    // `id`.
-    let patched_content = helios_persistence::core::apply_patch_for_version(
-        existing.content(),
-        &patch_format,
-        existing.fhir_version(),
-    )?;
-
-    // The patch may not move the resource out of the compartment (#1618).
-    compartment.assert_member(
-        || state.storage().search_param_registry(tenant.context()),
-        existing.fhir_version(),
-        &patched_content,
-        "patch",
-    )?;
-
-    state
-        .validation()
-        .check_write(
-            tenant.tenant_id(),
+        // A `patient/` scope patches inside the launch patient's compartment only
+        // (#1618): the resource must be in it now, and must still be in it after
+        // the patch (checked below, once the patched content exists).
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
             existing.fhir_version(),
-            &resource_type,
-            &patched_content,
-        )
-        .await?;
-    super::sof::reject_unknown_view_definition_resource(&resource_type, &patched_content)?;
+            existing.content(),
+            "patch",
+        )?;
 
-    // Update the resource
-    let stored = state
-        .storage()
-        .update(tenant.context(), &existing, patched_content)
-        .await?;
+        if !if_match.if_match_satisfied(Some(existing.version_id())) {
+            return Err(RestError::PreconditionFailed {
+                message: format!(
+                    "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{}\"",
+                    existing.version_id()
+                ),
+            });
+        }
+
+        // Apply the patch: the applier `PATCH [type]?criteria` uses inside the
+        // storage layer (#1406). It refuses a patch that changes `resourceType` or
+        // `id`.
+        let patched_content = helios_persistence::core::apply_patch_for_version(
+            existing.content(),
+            &patch_format,
+            existing.fhir_version(),
+        )?;
+
+        // The patch may not move the resource out of the compartment (#1618).
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            existing.fhir_version(),
+            &patched_content,
+            "patch",
+        )?;
+
+        state
+            .validation()
+            .check_write(
+                tenant.tenant_id(),
+                existing.fhir_version(),
+                &resource_type,
+                &patched_content,
+            )
+            .await?;
+        super::sof::reject_unknown_view_definition_resource(&resource_type, &patched_content)?;
+
+        // Update the resource. A metadata rewrite keeps the version, so a lost
+        // compare-and-swap against one is read, checked and patched again (#2562).
+        match state
+            .storage()
+            .update(tenant.context(), &existing, patched_content)
+            .await
+        {
+            Ok(stored) => break stored,
+            Err(e) if is_same_version_conflict(&e) && attempt < WRITE_ATTEMPTS => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
 
     if resource_type == "StructureDefinition" {
         state.validation().upsert_stored_profile(
@@ -319,36 +332,57 @@ where
 
     let patch_format = parse_patch_format(content_type, &body)?;
 
-    let prepared = state
-        .storage()
-        .prepare_conditional_patch(
-            tenant.context(),
-            &resource_type,
-            &search_params,
-            &patch_format,
-            if_match,
-        )
-        .await
-        .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
-
     use helios_persistence::core::ConditionalPatchPreparation;
-    match prepared {
-        ConditionalPatchPreparation::Ready { current, patched } => {
-            state
-                .validation()
-                .check_write(
-                    tenant.tenant_id(),
-                    current.fhir_version(),
-                    &resource_type,
-                    &patched,
-                )
-                .await?;
-            super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
-            let stored = state
-                .storage()
-                .update(tenant.context(), &current, patched)
-                .await
-                .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
+
+    // A metadata rewrite between selection and write keeps the version but
+    // may change the match: resolve, patch and validate again (#2562).
+    let mut attempt = 0;
+    let patched = loop {
+        attempt += 1;
+        let prepared = match state
+            .storage()
+            .prepare_conditional_patch(
+                tenant.context(),
+                &resource_type,
+                &search_params,
+                &patch_format,
+                if_match,
+            )
+            .await
+        {
+            Err(e) if is_same_version_conflict(&e) && attempt < WRITE_ATTEMPTS => continue,
+            prepared => {
+                prepared.map_err(|e| super::update::conditional_write_error(e, &resource_type))?
+            }
+        };
+        let ConditionalPatchPreparation::Ready { current, patched } = prepared else {
+            break Err(prepared);
+        };
+        state
+            .validation()
+            .check_write(
+                tenant.tenant_id(),
+                current.fhir_version(),
+                &resource_type,
+                &patched,
+            )
+            .await?;
+        super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
+        match state
+            .storage()
+            .update(tenant.context(), &current, patched)
+            .await
+        {
+            Err(e) if is_same_version_conflict(&e) && attempt < WRITE_ATTEMPTS => continue,
+            written => {
+                break Ok(written
+                    .map_err(|e| super::update::conditional_write_error(e, &resource_type))?);
+            }
+        }
+    };
+
+    match patched {
+        Ok(stored) => {
             if resource_type == "StructureDefinition" {
                 state.validation().upsert_stored_profile(
                     tenant.tenant_id(),
@@ -385,13 +419,15 @@ where
                 },
             )
         }
-        ConditionalPatchPreparation::NoMatch => Err(RestError::NotFound {
+        Err(ConditionalPatchPreparation::MultipleMatches(count)) => {
+            Err(RestError::MultipleMatches {
+                operation: "patch".to_string(),
+                count,
+            })
+        }
+        Err(_) => Err(RestError::NotFound {
             resource_type,
             id: "conditional".to_string(),
-        }),
-        ConditionalPatchPreparation::MultipleMatches(count) => Err(RestError::MultipleMatches {
-            operation: "patch".to_string(),
-            count,
         }),
     }
 }

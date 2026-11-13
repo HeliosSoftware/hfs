@@ -379,6 +379,40 @@ where
             get(handlers::validate_instance_get_handler::<S>)
                 .post(handlers::validate_instance_post_handler::<S>),
         )
+        // Resource metadata operations (#2562): instance and history-version
+        // levels; the system and type levels answer `400 not-supported`.
+        .route(
+            "/$meta",
+            get(handlers::meta_unsupported_handler).post(handlers::meta_unsupported_handler),
+        )
+        .route(
+            "/{resource_type}/$meta",
+            get(handlers::meta_unsupported_handler).post(handlers::meta_unsupported_handler),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta",
+            get(handlers::meta_instance_handler::<S>).post(handlers::meta_instance_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-add",
+            post(handlers::meta_add_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$meta-delete",
+            post(handlers::meta_delete_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta",
+            get(handlers::meta_version_handler::<S>).post(handlers::meta_version_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta-add",
+            post(handlers::meta_add_version_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/_history/{version_id}/$meta-delete",
+            post(handlers::meta_delete_version_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))

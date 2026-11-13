@@ -14,7 +14,7 @@ pub mod operation_outcome;
 pub mod subsetting;
 
 pub use bundle::BundleBuilder;
-pub use format::format_resource_response;
+pub use format::{format_resource_response, format_resource_response_for_version};
 pub use headers::ResourceHeaders;
 pub use operation_outcome::OperationOutcomeBuilder;
 pub use subsetting::{SummaryMode, apply_elements, apply_summary};

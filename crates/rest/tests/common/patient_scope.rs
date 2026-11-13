@@ -620,6 +620,62 @@ pub async fn endpoints_that_cannot_be_confined_are_refused(server: &TestServer) 
 
 // --- Writes ------------------------------------------------------------------
 
+/// #2562: `$meta` reads, and `$meta-add` / `$meta-delete` writes, of the
+/// current and of a historical version stay inside the launch patient's
+/// compartment. A backend without metadata writes answers them 501 before it
+/// looks at the resource; either way another patient's resource is unchanged.
+pub async fn metadata_operations_stay_inside_the_compartment(server: &TestServer) {
+    let parameters = json!({"resourceType": "Parameters", "parameter": [{
+        "name": "meta",
+        "valueMeta": {"tag": [{"system": "http://example.org/tags", "code": "scoped"}]}
+    }]});
+    for path in ["/Observation/o1/$meta", "/Observation/o1/_history/1/$meta"] {
+        let r = get(server, P1_READ, path).await;
+        assert_eq!(r.status_code(), StatusCode::OK, "{path}: {}", r.text());
+    }
+    for path in ["/Observation/o2/$meta", "/Observation/o2/_history/1/$meta"] {
+        assert_forbidden(&get(server, P1_READ, path).await, path);
+    }
+
+    for path in [
+        "/Observation/o2/$meta-add",
+        "/Observation/o2/_history/1/$meta-add",
+        "/Observation/o2/$meta-delete",
+    ] {
+        let r = server
+            .post(path)
+            .add_header(AUTHORIZATION, bearer(P1_WRITE))
+            .json(&parameters)
+            .await;
+        assert!(
+            matches!(
+                r.status_code(),
+                StatusCode::FORBIDDEN | StatusCode::NOT_IMPLEMENTED
+            ),
+            "{path}: {} {}",
+            r.status_code(),
+            r.text()
+        );
+    }
+    let o2 = get(server, SYSTEM, "/Observation/o2").await.json::<Value>();
+    assert!(o2["meta"].get("tag").is_none(), "o2 unchanged: {o2}");
+
+    let r = server
+        .post("/Observation/o1/$meta-add")
+        .add_header(AUTHORIZATION, bearer(P1_WRITE))
+        .json(&parameters)
+        .await;
+    assert!(
+        matches!(
+            r.status_code(),
+            StatusCode::OK | StatusCode::NOT_IMPLEMENTED
+        ),
+        "o1: {} {}",
+        r.status_code(),
+        r.text()
+    );
+}
+
 pub async fn writes_stay_inside_the_compartment(server: &TestServer) {
     // Create: the payload must name the launch patient.
     let r = server
@@ -1167,7 +1223,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, metadata_operations_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(

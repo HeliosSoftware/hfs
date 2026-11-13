@@ -234,7 +234,7 @@ impl PostgresTransaction {
 
         let row = query_opt_cached(
             client,
-            "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at
+            "SELECT version_id, data, last_updated, is_deleted, fhir_version, deleted_at, meta_seq
                  FROM resources
                  WHERE tenant_id = $1 AND resource_type = $2 AND id = $3",
             &[&tenant_id, &resource_type, &id],
@@ -251,6 +251,7 @@ impl PostgresTransaction {
                 let fhir_version_str: String = row.get(4);
 
                 let deleted_at: Option<chrono::DateTime<Utc>> = row.get(5);
+                let meta_seq: i64 = row.get(6);
 
                 if is_deleted && !include_deleted {
                     return Ok(None);
@@ -263,17 +264,20 @@ impl PostgresTransaction {
                 let fhir_version = FhirVersion::from_storage(&fhir_version_str)
                     .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    self.tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    deleted_at,
-                    fhir_version,
-                )))
+                Ok(Some(
+                    StoredResource::from_storage(
+                        resource_type,
+                        id,
+                        version_id,
+                        self.tenant.tenant_id().clone(),
+                        data,
+                        last_updated,
+                        last_updated,
+                        deleted_at,
+                        fhir_version,
+                    )
+                    .with_meta_seq(meta_seq as u64),
+                ))
             }
             None => Ok(None),
         }
@@ -333,9 +337,9 @@ impl PostgresTransaction {
             client,
             "WITH upd AS (
                  UPDATE resources SET version_id = $1, data = $2, last_updated = $3,
-                     is_deleted = FALSE, deleted_at = NULL
+                     is_deleted = FALSE, deleted_at = NULL, meta_seq = 0
                  WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
-                   AND is_deleted = $9 AND version_id = $7
+                   AND is_deleted = $9 AND version_id = $7 AND meta_seq = $10
                  RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
              )
              INSERT INTO resource_history (tenant_id, resource_type, id, version_id, \
@@ -352,6 +356,7 @@ impl PostgresTransaction {
                 &expected_version,
                 &fhir_version_str,
                 &expected_deleted,
+                &(current.meta_seq() as i64),
             ],
         )
         .await
@@ -1434,7 +1439,7 @@ impl Transaction for PostgresTransaction {
         // Soft delete the resource
         execute_cached(
                 client,
-                "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
+                "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1, meta_seq = 0
                  WHERE tenant_id = $3 AND resource_type = $4 AND id = $5",
                 &[&now, &new_version_str, &tenant_id, &resource_type, &id],
             )

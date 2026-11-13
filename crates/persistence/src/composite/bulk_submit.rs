@@ -478,6 +478,18 @@ impl ResourceStorage for CompositeSubmitJobs {
             .await
     }
 
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.composite
+            .restore_tombstone(tenant, resource_type, id, resource)
+            .await
+    }
+
     async fn read(
         &self,
         tenant: &TenantContext,

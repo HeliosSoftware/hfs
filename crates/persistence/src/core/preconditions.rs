@@ -535,6 +535,40 @@ where
     }
 }
 
+/// Deletes the resource a conditional delete selected, only while it is
+/// still the revision that matched the criteria.
+///
+/// On a store that rewrites metadata in place
+/// ([`ResourceStorage::tracks_meta_revision`](super::ResourceStorage::tracks_meta_revision)),
+/// the match is pinned by version and [`StoredResource::meta_seq`] whether
+/// or not `If-Match` is present, so a resource changed after it was selected
+/// is not deleted (a same-version `VersionConflict`, which the caller
+/// resolves again). Everywhere else this is [`delete_under_precondition`].
+/// Instance and batch DELETE keep using [`delete_under_precondition`].
+pub async fn delete_conditional_match<S>(
+    storage: &S,
+    tenant: &crate::tenant::TenantContext,
+    if_match: &EntityTagPrecondition,
+    matched: &StoredResource,
+) -> crate::error::StorageResult<()>
+where
+    S: super::ResourceStorage + ?Sized,
+{
+    if storage.tracks_meta_revision() {
+        storage
+            .delete_at_revision(
+                tenant,
+                matched.resource_type(),
+                matched.id(),
+                matched.version_id(),
+                matched.meta_seq(),
+            )
+            .await
+    } else {
+        delete_under_precondition(storage, tenant, if_match, matched).await
+    }
+}
+
 /// Builds the `412` bundle entry result used by every backend.
 pub fn precondition_failed_entry(diagnostics: &str) -> BundleEntryResult {
     BundleEntryResult::error(

@@ -365,7 +365,7 @@ fn fast_path_sql(p: &FastPathParts<'_>) -> String {
     let sentinel = if p.with_probe {
         " UNION ALL \
          SELECT NULL::text, NULL::text, NULL::jsonb, NULL::timestamptz, \
-                NULL::text, NULL::timestamptz, TRUE AS needs_fallback \
+                NULL::text, NULL::timestamptz, TRUE AS needs_fallback, NULL::bigint AS meta_seq \
          WHERE NOT (SELECT usable FROM index_eligible)"
     } else {
         ""
@@ -373,7 +373,7 @@ fn fast_path_sql(p: &FastPathParts<'_>) -> String {
     format!(
         "{probe_cte}\
          SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
-                r.last_updated AS sort_key, (r.id IS NULL) AS needs_fallback \
+                r.last_updated AS sort_key, (r.id IS NULL) AS needs_fallback, r.meta_seq \
          FROM ( \
            SELECT DISTINCT resource_id, last_updated FROM search_index \
            WHERE tenant_id = $1 AND resource_type = $2 AND {pred}{guard}{boundary} \
@@ -640,10 +640,10 @@ impl PostgresBackend {
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
             Some(k) => format!(
-                "id, version_id, data, last_updated, fhir_version, {} AS sort_key",
+                "id, version_id, data, last_updated, fhir_version, {} AS sort_key, meta_seq",
                 k.expr
             ),
-            None => "id, version_id, data, last_updated, fhir_version".to_string(),
+            None => "id, version_id, data, last_updated, fhir_version, meta_seq".to_string(),
         };
 
         // ORDER BY for the first-page / offset paths.
@@ -853,6 +853,11 @@ impl PostgresBackend {
             let sort_key = keyset
                 .as_ref()
                 .map(|k| Self::read_cursor_value(row, 5, k.kind));
+            let meta_seq = row
+                .try_get::<_, Option<i64>>("meta_seq")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
 
             let fhir_version = FhirVersion::from_storage(&fhir_version_str)
                 .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
@@ -866,7 +871,8 @@ impl PostgresBackend {
                 last_updated,
                 None,
                 fhir_version,
-            );
+            )
+            .with_meta_seq(meta_seq as u64);
             parsed.push((resource, sort_key));
         }
 

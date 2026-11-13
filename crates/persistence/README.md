@@ -621,6 +621,53 @@ Backends can serve as primary (CRUD, versioning, and — where the backend suppo
 | S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused, batch only) | Archival/history storage                |
 | S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented (batch only, no transactions) | Large-scale + search                    |
 
+### Metadata labels and `$meta-add` / `$meta-delete` (#2562)
+
+Every update (`PUT`, conditional `PUT`, and the `PUT` entries of batch and
+transaction Bundles) keeps the tags and security labels of the version it
+replaces and adds the submitted ones; the submitted `meta.profile` replaces
+the stored one. A label is identified by `system` + `code`. A `PUT` therefore
+no longer removes a label; a `PATCH` that removes one explicitly does, and so
+does `$meta-delete` where it is available. Create, a `PUT` that creates or
+restores a resource, `$bulk-submit` (both import modes) and internal writes
+such as composite synchronisation keep the body as sent.
+
+`$meta` (instance and `_history/[vid]` levels) is served by every storage.
+`$meta-add` and `$meta-delete` change a version in place: the version id is
+kept and `lastUpdated` moves to now. They are served, and advertised in the
+CapabilityStatement, only where the change is atomic across the current row,
+the version's history row and the search index:
+
+| Storage                                                        | `$meta-add` / `$meta-delete` |
+| -------------------------------------------------------------- | ---------------------------- |
+| SQLite or PostgreSQL, search not offloaded                     | served                       |
+| Composite over SQLite or PostgreSQL with no secondary          | served (forwarded)           |
+| Composite with any secondary, supplied or configured           | `501`                        |
+| MongoDB                                                        | `501`                        |
+| S3                                                             | `501`                        |
+
+An in-place change keeps the version id, so SQLite and PostgreSQL carry a
+same-version revision, `resources.meta_seq` (SQLite schema v49, PostgreSQL
+v56). Every write that advances the version sets it to 0; each metadata
+rewrite raises it by one. Updates, deletes pinned by a conditional
+selection, and reindex pages compare it with the version id.
+
+Deployment requirements, documented rather than enforced:
+
+- Every process that writes a store runs a build with this change before
+  any `$meta-add` / `$meta-delete` is sent; a process still running an
+  older build compares the version id only and must be stopped or upgraded
+  first. A startup schema check does not stop a process already running.
+- A standalone process and a composite process with secondaries must not
+  write the same store at the same time: the capability belongs to each
+  backend object, not to the database.
+- Before a store that served metadata rewrites gets a secondary, stop the
+  standalone writers; the secondary's initial reindex then reads the
+  authoritative rows.
+
+Under these requirements no same-version change happens on a store while
+it serves a topology with secondaries.
+
 ### Backend Selection Guide
 
 | Use Case              | Recommended Backend | Rationale                                  |

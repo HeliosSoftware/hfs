@@ -40,6 +40,131 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 #[path = "search/large_id_set_suite.rs"]
 mod large_id_set_suite;
 
+#[path = "meta/meta_rewrite_suite.rs"]
+mod meta_rewrite_suite;
+
+/// #2562: a metadata rewrite reindexes the resource with this tenant's
+/// custom SearchParameters even when the registry cache is cold: the overlay
+/// is loaded through the connection that holds the write lock. Run on the
+/// in-memory shared-cache database and on a file database with a single
+/// pooled connection, where a second connection cannot read the locked table
+/// or does not exist.
+#[tokio::test]
+async fn sqlite_meta_rewrite_keeps_custom_search_entries_on_a_cold_registry() {
+    use helios_persistence::core::{ConditionalStorage, MetaChange, MetaTarget};
+
+    let dir = tempfile::tempdir().unwrap();
+    let one_connection = SqliteBackend::with_config(
+        dir.path().join("hfs2562-cold.db").to_str().unwrap(),
+        SqliteBackendConfig {
+            data_dir: Some(spec_data_dir()),
+            max_connections: 1,
+            min_connections: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    one_connection.init_schema().unwrap();
+
+    for (name, backend) in [
+        ("shared cache", create_backend()),
+        ("one connection", one_connection),
+    ] {
+        let tenant = create_tenant("meta-cold-registry");
+        let search_parameter = |id: &str, code: &str| {
+            json!({
+                "resourceType": "SearchParameter", "id": id,
+                "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+                "name": id, "status": "active", "code": code, "base": ["Task"],
+                "type": "string", "expression": "Task.description"
+            })
+        };
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter("task-description", "task-description"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Warm the overlay while no connection is held, so the ordinary create
+        // below indexes the custom parameter in both setups.
+        let _ = backend.search_param_registry(&tenant);
+        let task = backend
+            .create(
+                &tenant,
+                "Task",
+                json!({"resourceType": "Task", "id": "c1", "status": "requested",
+                       "intent": "order", "description": "findme"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let found = |backend: &SqliteBackend| {
+            let tenant = tenant.clone();
+            let backend = backend.clone();
+            async move {
+                backend
+                    .resolve_conditional_matches(&tenant, "Task", "task-description=findme")
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(
+            found(&backend).await,
+            1,
+            "{name}: indexed before the rewrite"
+        );
+
+        // An ordinary SearchParameter write invalidates the cached overlay.
+        backend
+            .create(
+                &tenant,
+                "SearchParameter",
+                search_parameter("task-other", "task-other"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .rewrite_meta(
+                &tenant,
+                "Task",
+                "c1",
+                &MetaTarget::Current {
+                    expected_version: task.version_id().to_string(),
+                    expected_meta_seq: 0,
+                },
+                &MetaChange::Add(json!({"tag": [{"code": "t"}]})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found(&backend).await,
+            1,
+            "{name}: custom entries survive the rewrite"
+        );
+    }
+}
+
+/// #2562: metadata rewrites and the same-version revision.
+#[tokio::test]
+async fn sqlite_meta_rewrites() {
+    let backend = create_backend();
+    meta_rewrite_suite::counter_lifecycle(&backend, "meta-counter").await;
+    meta_rewrite_suite::rewrite_consistency(&backend, "meta-consistency").await;
+    meta_rewrite_suite::stale_selection(&backend, "meta-selection").await;
+    meta_rewrite_suite::reindex_page_after_a_rewrite(&backend, "meta-reindex").await;
+    meta_rewrite_suite::conditional_writes_resolve_again_after_a_rewrite(
+        std::sync::Arc::new(backend),
+        "meta-reselect",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
     let backend = create_backend();

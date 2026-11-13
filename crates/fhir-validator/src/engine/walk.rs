@@ -91,16 +91,17 @@ pub(super) struct WalkCtx<'a> {
 
 impl WalkCtx<'_> {
     pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
-        self.errors.push(ValidationError::new(
-            kind,
-            self.path.render_dotted(),
-            message,
-        ));
+        self.errors.push(
+            ValidationError::new(kind, self.path.render_dotted(), message)
+                .with_pointer(self.path.render_pointer()),
+        );
     }
 
     fn error_with_severity(&mut self, kind: ErrorKind, message: String, severity: Severity) {
         self.errors.push(
-            ValidationError::new(kind, self.path.render_dotted(), message).with_severity(severity),
+            ValidationError::new(kind, self.path.render_dotted(), message)
+                .with_severity(severity)
+                .with_pointer(self.path.render_pointer()),
         );
     }
 }

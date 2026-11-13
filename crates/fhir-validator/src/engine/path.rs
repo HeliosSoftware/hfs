@@ -63,6 +63,21 @@ impl PathTracker {
     }
 
     /// Dot-joined conformance rendering: `Patient.name.0.given`.
+    /// RFC 6901 JSON Pointer to this location within the resource: the root
+    /// segment (the resource type) is the document itself, every key is
+    /// written exactly, with `~` as `~0` and `/` as `~1`.
+    pub(crate) fn render_pointer(&self) -> String {
+        let mut out = String::new();
+        for seg in self.segs.iter().skip(1) {
+            out.push('/');
+            match seg {
+                PathSeg::Key(k) => out.push_str(&k.replace('~', "~0").replace('/', "~1")),
+                PathSeg::Index(n) => out.push_str(&n.to_string()),
+            }
+        }
+        out
+    }
+
     pub(crate) fn render_dotted(&self) -> String {
         let mut out = String::new();
         for (i, seg) in self.segs.iter().enumerate() {
@@ -122,6 +137,20 @@ mod tests {
         assert_eq!(p.render_dotted(), "");
         p.push_key("x");
         assert_eq!(p.render_dotted(), ".x");
+    }
+
+    #[test]
+    fn renders_an_escaped_pointer_below_the_root() {
+        let mut p = PathTracker::new("Parameters");
+        p.push_key("parameter");
+        p.push_index(0);
+        p.push_key("valueMeta");
+        p.push_key("tag.0.code");
+        assert_eq!(p.render_pointer(), "/parameter/0/valueMeta/tag.0.code");
+        p.pop();
+        p.push_key("a/b~c");
+        assert_eq!(p.render_pointer(), "/parameter/0/valueMeta/a~1b~0c");
+        assert_eq!(PathTracker::new("Patient").render_pointer(), "");
     }
 
     #[test]

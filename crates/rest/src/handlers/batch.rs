@@ -23,9 +23,11 @@ use helios_persistence::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult,
     EntityTagPrecondition, IncludeProvider, PatchCandidateValidator, ResourceStorage,
-    RevincludeProvider, SearchProvider, SystemHistoryProvider, WriteKind, WriteNotice,
-    apply_patch_for_version, bundle_if_match_gate, bundle_read_result, conditional_update_entry,
-    decode_bundle_patch_resource, delete_under_precondition, precondition_failed_entry,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, WRITE_ATTEMPTS, WriteKind,
+    WriteNotice, apply_patch_for_version, bundle_if_match_gate, bundle_read_result,
+    conditional_update_entry, decode_bundle_patch_resource, delete_under_precondition,
+    is_same_version_conflict, merge_update_labels, precondition_failed_entry,
+    put_preserving_labels,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
@@ -1733,23 +1735,50 @@ where
             // does (#2527): a version written since is `VersionConflict` → 409,
             // a delete since is `NotFound` → 404 rather than a revival.
             // Without one it is the last-writer-wins upsert it always was.
+            //
+            // Either way the tags and security labels of the version written
+            // over are merged in (#2562); a lost race with a metadata rewrite,
+            // which keeps the version, reads, checks `ifMatch` and merges again.
             let written = match held {
-                Some(held) => state
-                    .storage()
-                    .update(tenant.context(), &held.current, resource)
-                    .await
-                    .map(|stored| (stored, false)),
+                Some(mut held) => {
+                    let mut attempt = 0;
+                    loop {
+                        attempt += 1;
+                        let merged = merge_update_labels(held.current.content(), &resource);
+                        match state
+                            .storage()
+                            .update(tenant.context(), &held.current, merged)
+                            .await
+                        {
+                            Err(e) if is_same_version_conflict(&e) && attempt < WRITE_ATTEMPTS => {
+                                held = match check_entry_if_match(
+                                    state,
+                                    tenant,
+                                    &resource_type,
+                                    &id,
+                                    if_match,
+                                )
+                                .await
+                                {
+                                    Ok(Some(held)) => held,
+                                    Ok(None) => break Err(e),
+                                    Err(failure) => return *failure,
+                                };
+                            }
+                            written => break written.map(|stored| (stored, false)),
+                        }
+                    }
+                }
                 None => {
-                    state
-                        .storage()
-                        .create_or_update(
-                            tenant.context(),
-                            &resource_type,
-                            &id,
-                            resource,
-                            fhir_version,
-                        )
-                        .await
+                    put_preserving_labels(
+                        state.storage(),
+                        tenant.context(),
+                        &resource_type,
+                        &id,
+                        resource,
+                        fhir_version,
+                    )
+                    .await
                 }
             };
             match written {
@@ -1953,89 +1982,107 @@ where
         Err(error) => return entry_failure(error.into()),
     };
 
-    let (current, candidate) = if let Some(criteria) = criteria {
-        if let Err(error) = super::conditional_support::require_patch(state.storage()) {
-            return entry_failure(error);
-        }
-        let if_match = match conditional_entry_if_match(if_match) {
-            Ok(if_match) => if_match,
-            Err(failure) => return *failure,
-        };
-        match state
-            .storage()
-            .prepare_conditional_patch(tenant.context(), resource_type, criteria, &patch, &if_match)
-            .await
-        {
-            Ok(ConditionalPatchPreparation::Ready { current, patched }) => (current, patched),
-            Ok(ConditionalPatchPreparation::NoMatch) => {
-                return entry_failure(RestError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: "conditional".to_string(),
-                });
-            }
-            Ok(ConditionalPatchPreparation::MultipleMatches(count)) => {
-                return entry_failure(RestError::MultipleMatches {
-                    operation: "patch".to_string(),
-                    count,
-                });
-            }
-            Err(error) => {
-                return entry_failure(super::update::conditional_write_error(error, resource_type));
-            }
-        }
-    } else {
-        if id.is_empty() {
-            return entry_failure(RestError::InvalidElementValue {
-                message: "PATCH entry request.url must address an instance ('[type]/[id]')"
-                    .to_string(),
-            });
-        }
-        let current = match state
-            .storage()
-            .read(tenant.context(), resource_type, id)
-            .await
-        {
-            Ok(Some(current)) => current,
-            Ok(None) => {
-                return entry_failure(RestError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                });
-            }
-            Err(error) => return entry_storage_failure(error),
-        };
-        if let Some(failure) = bundle_if_match_gate(if_match, Some(current.version_id())) {
-            return failure;
-        }
-        let candidate =
-            match apply_patch_for_version(current.content(), &patch, current.fhir_version()) {
-                Ok(candidate) => candidate,
-                Err(error) => return entry_failure(error.into()),
-            };
-        (current, candidate)
-    };
-
     let validator = RestPatchValidator {
         validation: state.validation(),
     };
-    if let Err(outcome) = validator
-        .validate_patch_candidate(
-            tenant.context(),
-            current.fhir_version(),
-            resource_type,
-            &candidate,
-        )
-        .await
-    {
-        return BundleEntryResult::error(422, outcome);
-    }
-    let stored = match state
-        .storage()
-        .update(tenant.context(), &current, candidate)
-        .await
-    {
-        Ok(stored) => stored,
-        Err(error) => return entry_storage_failure(error),
+    let mut attempt = 0;
+    let stored = loop {
+        attempt += 1;
+        let (current, candidate) = if let Some(criteria) = criteria {
+            if let Err(error) = super::conditional_support::require_patch(state.storage()) {
+                return entry_failure(error);
+            }
+            let if_match = match conditional_entry_if_match(if_match) {
+                Ok(if_match) => if_match,
+                Err(failure) => return *failure,
+            };
+            match state
+                .storage()
+                .prepare_conditional_patch(
+                    tenant.context(),
+                    resource_type,
+                    criteria,
+                    &patch,
+                    &if_match,
+                )
+                .await
+            {
+                Ok(ConditionalPatchPreparation::Ready { current, patched }) => (current, patched),
+                Ok(ConditionalPatchPreparation::NoMatch) => {
+                    return entry_failure(RestError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: "conditional".to_string(),
+                    });
+                }
+                Ok(ConditionalPatchPreparation::MultipleMatches(count)) => {
+                    return entry_failure(RestError::MultipleMatches {
+                        operation: "patch".to_string(),
+                        count,
+                    });
+                }
+                Err(error) if is_same_version_conflict(&error) && attempt < WRITE_ATTEMPTS => {
+                    continue;
+                }
+                Err(error) => {
+                    return entry_failure(super::update::conditional_write_error(
+                        error,
+                        resource_type,
+                    ));
+                }
+            }
+        } else {
+            if id.is_empty() {
+                return entry_failure(RestError::InvalidElementValue {
+                    message: "PATCH entry request.url must address an instance ('[type]/[id]')"
+                        .to_string(),
+                });
+            }
+            let current = match state
+                .storage()
+                .read(tenant.context(), resource_type, id)
+                .await
+            {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    return entry_failure(RestError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    });
+                }
+                Err(error) => return entry_storage_failure(error),
+            };
+            if let Some(failure) = bundle_if_match_gate(if_match, Some(current.version_id())) {
+                return failure;
+            }
+            let candidate =
+                match apply_patch_for_version(current.content(), &patch, current.fhir_version()) {
+                    Ok(candidate) => candidate,
+                    Err(error) => return entry_failure(error.into()),
+                };
+            (current, candidate)
+        };
+
+        if let Err(outcome) = validator
+            .validate_patch_candidate(
+                tenant.context(),
+                current.fhir_version(),
+                resource_type,
+                &candidate,
+            )
+            .await
+        {
+            return BundleEntryResult::error(422, outcome);
+        }
+        match state
+            .storage()
+            .update(tenant.context(), &current, candidate)
+            .await
+        {
+            Ok(stored) => break stored,
+            // A metadata rewrite kept the version: resolve, read and patch again.
+            Err(error) if is_same_version_conflict(&error) && attempt < WRITE_ATTEMPTS => continue,
+            Err(error) => return entry_storage_failure(error),
+        }
     };
     *audit_target = Some(AuditTarget::from_stored(&stored));
     super::write_event::report(

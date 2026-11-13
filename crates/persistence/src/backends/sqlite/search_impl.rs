@@ -516,10 +516,10 @@ impl SqliteBackend {
         // SELECT the sort key alongside the row so the next cursor can be built.
         let select_cols = match &keyset {
             Some(k) => format!(
-                "id, version_id, data, last_updated, fhir_version, {} AS sort_key",
+                "id, version_id, data, last_updated, fhir_version, meta_seq, {} AS sort_key",
                 k.expr
             ),
-            None => "id, version_id, data, last_updated, fhir_version".to_string(),
+            None => "id, version_id, data, last_updated, fhir_version, meta_seq".to_string(),
         };
 
         // ORDER BY for the first-page / offset paths.
@@ -626,7 +626,7 @@ impl SqliteBackend {
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
 
-        // The sort key (column 5) is selected only when keyset paging is active.
+        // The sort key (column 6) is selected only when keyset paging is active.
         let sort_kind = keyset.as_ref().map(|k| k.kind);
         let run = |sql: &str| -> StorageResult<Vec<RawRow>> {
             let mut stmt = conn
@@ -638,15 +638,24 @@ impl SqliteBackend {
                 let data: Vec<u8> = row.get(2)?;
                 let last_updated: String = row.get(3)?;
                 let fhir_version: String = row.get(4)?;
+                let meta_seq: i64 = row.get(5)?;
                 let sort_key = match sort_kind {
                     Some(SortValueKind::Number) => {
-                        row.get::<_, Option<f64>>(5)?.map(CursorValue::Decimal)
+                        row.get::<_, Option<f64>>(6)?.map(CursorValue::Decimal)
                     }
                     // Timestamps are stored as RFC3339 text, so read text.
-                    Some(_) => row.get::<_, Option<String>>(5)?.map(CursorValue::String),
+                    Some(_) => row.get::<_, Option<String>>(6)?.map(CursorValue::String),
                     None => None,
                 };
-                Ok((id, version_id, data, last_updated, fhir_version, sort_key))
+                Ok((
+                    id,
+                    version_id,
+                    data,
+                    last_updated,
+                    fhir_version,
+                    meta_seq,
+                    sort_key,
+                ))
             })
             .or_query_error("Failed to execute search")?
             .collect::<Result<Vec<_>, _>>()
@@ -665,7 +674,9 @@ impl SqliteBackend {
 
         // Parse rows, carrying the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
-        for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
+        for (id, version_id, data, last_updated_str, fhir_version_str, meta_seq, sort_key) in
+            raw_rows
+        {
             let json_data: serde_json::Value = serde_json::from_slice(&data)
                 .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
 
@@ -686,7 +697,8 @@ impl SqliteBackend {
                 last_updated,
                 None,
                 fhir_version,
-            );
+            )
+            .with_meta_seq(meta_seq as u64);
 
             parsed.push((resource, sort_key));
         }
@@ -756,7 +768,15 @@ impl SqliteBackend {
 }
 
 /// One `resources` row as the page statements return it, with its sort key.
-type RawRow = (String, String, Vec<u8>, String, String, Option<CursorValue>);
+type RawRow = (
+    String,
+    String,
+    Vec<u8>,
+    String,
+    String,
+    i64,
+    Option<CursorValue>,
+);
 
 /// Newest `resources` rows the early-exit attempts look at, narrowest first.
 /// A page the 512 newest cannot fill (a date range that the newest resources

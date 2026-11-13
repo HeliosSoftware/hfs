@@ -1839,7 +1839,8 @@ impl ConditionalStorage for MongoBackend {
                 // `If-Match` is evaluated against here.
                 let current = matches.into_iter().next().expect("single match must exist");
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
-                let updated = self.update(tenant, &current, resource).await?;
+                let merged = crate::core::merge_update_labels(current.content(), &resource);
+                let updated = self.update(tenant, &current, merged).await?;
                 Ok(ConditionalUpdateResult::Updated(updated))
             }
             n => Ok(ConditionalUpdateResult::MultipleMatches(n)),
@@ -1867,7 +1868,7 @@ impl ConditionalStorage for MongoBackend {
             1 => {
                 let current = matches.into_iter().next().expect("single match must exist");
                 crate::core::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
-                crate::core::delete_under_precondition(self, tenant, if_match, &current).await?;
+                crate::core::delete_conditional_match(self, tenant, if_match, &current).await?;
                 Ok(ConditionalDeleteResult::Deleted(current))
             }
             n => Ok(ConditionalDeleteResult::MultipleMatches(n)),

@@ -1558,6 +1558,17 @@ impl ResourceStorage for S3Backend {
             .await
     }
 
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.restore_deleted(tenant, resource_type, id, resource)
+            .await
+    }
+
     async fn count(
         &self,
         tenant: &TenantContext,

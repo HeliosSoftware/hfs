@@ -438,8 +438,9 @@ pub trait ConditionalTransaction: Transaction {
             )),
             1 => {
                 let existing = matches.remove(0);
+                let merged = super::merge_update_labels(existing.content(), &resource);
                 Ok(ConditionalUpdateResult::Updated(
-                    self.update(&existing, resource).await?,
+                    self.update(&existing, merged).await?,
                 ))
             }
             n => Ok(ConditionalUpdateResult::MultipleMatches(n)),

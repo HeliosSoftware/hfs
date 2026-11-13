@@ -62,6 +62,7 @@ where
         SQL_RUN_DEFINITION_ID => sql_run_definition(),
         SQL_EXPORT_DEFINITION_ID if export_available => sql_export_definition(),
         REINDEX_DEFINITION_ID if reindex_available => reindex_definition(),
+        crate::handlers::meta::META_DEFINITION_ID => meta_definition(),
         _ => {
             return Err(RestError::NotFound {
                 resource_type: "OperationDefinition".to_string(),
@@ -106,6 +107,37 @@ pub(crate) fn reindex_definition() -> Value {
             {
                 "name": "jobId", "use": "out", "min": 1, "max": "1", "type": "string",
                 "documentation": "Identifier to poll at [base]/$reindex-status/{jobId}."
+            }
+        ]
+    })
+}
+
+/// The `$meta` this server publishes: the base operation at the instance and
+/// history-version levels only. System- and type-level `$meta` answer `400`,
+/// which `Resource-meta` allows, so the definition this server cites is its
+/// own, with `base` naming HL7's (#2562).
+pub(crate) fn meta_definition() -> Value {
+    let id = crate::handlers::meta::META_DEFINITION_ID;
+    json!({
+        "resourceType": "OperationDefinition",
+        "id": id,
+        "url": format!("/OperationDefinition/{id}"),
+        "name": "MetaInstance",
+        "title": "Access a list of profiles, tags, and security labels (instance level)",
+        "status": "active",
+        "kind": "operation",
+        "code": "meta",
+        "base": "http://hl7.org/fhir/OperationDefinition/Resource-meta",
+        "affectsState": false,
+        "resource": ["Resource"],
+        "system": false,
+        "type": false,
+        "instance": true,
+        "description": "The profiles, tags, and security labels of the current version of a resource, or of the version named by [type]/[id]/_history/[vid]/$meta, with the meta's versionId and lastUpdated.",
+        "parameter": [
+            {
+                "name": "return", "use": "out", "min": 1, "max": "1", "type": "Meta",
+                "documentation": "The meta of the resource or version."
             }
         ]
     })

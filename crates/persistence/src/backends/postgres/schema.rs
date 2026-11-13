@@ -15,7 +15,7 @@ use crate::error::{BackendError, StorageResult};
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2367).
-pub const SCHEMA_VERSION: i32 = 55;
+pub const SCHEMA_VERSION: i32 = 56;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -590,6 +590,7 @@ async fn migrate_schema(
             // Not transactional: batched backfill and a concurrent index
             // build; the common loop stamps the marker after they finish.
             54 => migrate_v54_to_v55(client).await?,
+            55 => migrate_v55_to_v56(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -615,6 +616,21 @@ async fn migrate_v53_to_v54(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v53->v54 failed: {}", e)))?;
+    Ok(())
+}
+
+/// Migrate from schema version 55 to 56: adds `resources.meta_seq`, the
+/// same-version revision a metadata rewrite (`$meta-add` / `$meta-delete`)
+/// raises while the version id stays (#2562). Every write that advances the
+/// version sets it back to 0; existing rows start at 0. A constant default
+/// is a catalog-only change, so no table rewrite runs.
+async fn migrate_v55_to_v56(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "ALTER TABLE resources ADD COLUMN IF NOT EXISTS meta_seq BIGINT NOT NULL DEFAULT 0",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v55->v56 failed: {}", e)))?;
     Ok(())
 }
 

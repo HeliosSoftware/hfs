@@ -8,7 +8,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider, WriteKind};
+use helios_persistence::core::{
+    ConditionalStorage, ResourceStorage, SearchProvider, WRITE_ATTEMPTS, WriteKind,
+    is_same_version_conflict, merge_update_labels, put_preserving_labels,
+};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -201,10 +204,10 @@ where
     //   not change the outcome by construction: `current_version` was computed
     //   and then compared against a precondition that returns `true` without
     //   looking at it. Nothing else in this function consulted `existing`. So
-    //   the read is dropped outright and `create_or_update` does the single
-    //   read it was always going to do. Last-writer-wins is preserved exactly:
-    //   the decision is still made from the row `create_or_update` reads, at
-    //   the same instant it read it before.
+    //   the read is dropped outright and `put_preserving_labels` does the
+    //   single read the write needs. Last-writer-wins is preserved: the
+    //   decision is made from the row that helper reads, and a lost race is
+    //   read and merged again.
     //
     // * **`If-Match` present.** The read has to happen here, because the
     //   precondition is evaluated here. Handing the row it produced to `update`
@@ -240,63 +243,75 @@ where
     // (https://hl7.org/fhir/http.html#delete), so it is not an error — it means
     // there is no current version to match `If-Match` against, and (on the
     // no-precondition path) the storage layer restores the resource on write.
+    //
+    // Tags and security labels of the version written over are merged into
+    // the submitted body (#2562). A metadata rewrite keeps the version id, so
+    // a write that loses its compare-and-swap to one still meets `If-Match`:
+    // it reads again and merges again, up to `WRITE_ATTEMPTS` times.
     let (stored, created) = if if_match.is_present() {
-        let existing = match state
-            .storage()
-            .read(tenant.context(), &resource_type, &id)
-            .await
-        {
-            Ok(existing) => existing,
-            Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-            Err(e) => return Err(e.into()),
-        };
-
-        let current_version = existing.as_ref().map(|stored| stored.version_id());
-        if !if_match.if_match_satisfied(current_version) {
-            let message = match current_version {
-                Some(current) => format!(
-                    "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
-                ),
-                None => {
-                    "If-Match precondition failed: the resource has no current version to match"
-                        .to_string()
-                }
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let existing = match state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await
+            {
+                Ok(existing) => existing,
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+                Err(e) => return Err(e.into()),
             };
-            return Err(RestError::PreconditionFailed { message });
-        }
 
-        match existing {
-            Some(current) => (
-                state
-                    .storage()
-                    .update(tenant.context(), &current, resource)
-                    .await?,
-                false,
-            ),
-            None => {
-                state
-                    .storage()
-                    .create_or_update(
+            let current_version = existing.as_ref().map(|stored| stored.version_id());
+            if !if_match.if_match_satisfied(current_version) {
+                let message = match current_version {
+                    Some(current) => format!(
+                        "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
+                    ),
+                    None => {
+                        "If-Match precondition failed: the resource has no current version to match"
+                            .to_string()
+                    }
+                };
+                return Err(RestError::PreconditionFailed { message });
+            }
+
+            let written = match existing {
+                Some(current) => {
+                    let merged = merge_update_labels(current.content(), &resource);
+                    state
+                        .storage()
+                        .update(tenant.context(), &current, merged)
+                        .await
+                        .map(|stored| (stored, false))
+                }
+                None => {
+                    put_preserving_labels(
+                        state.storage(),
                         tenant.context(),
                         &resource_type,
                         &id,
-                        resource,
+                        resource.clone(),
                         fhir_version,
                     )
-                    .await?
+                    .await
+                }
+            };
+            match written {
+                Err(e) if is_same_version_conflict(&e) && attempt < WRITE_ATTEMPTS => continue,
+                written => break written?,
             }
         }
     } else {
-        state
-            .storage()
-            .create_or_update(
-                tenant.context(),
-                &resource_type,
-                &id,
-                resource,
-                fhir_version,
-            )
-            .await?
+        put_preserving_labels(
+            state.storage(),
+            tenant.context(),
+            &resource_type,
+            &id,
+            resource,
+            fhir_version,
+        )
+        .await?
     };
     super::sof::terminology::commit_library_write(
         &state,

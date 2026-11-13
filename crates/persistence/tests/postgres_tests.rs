@@ -152,6 +152,9 @@ mod conditional_criteria_suite;
 #[path = "search/large_id_set_suite.rs"]
 mod large_id_set_suite;
 
+#[path = "meta/meta_rewrite_suite.rs"]
+mod meta_rewrite_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -995,6 +998,169 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    /// #2562: a metadata rewrite that has to wait for the row stamps the time
+    /// it ran, not the time it started. A rewrite starts, then waits while
+    /// another writer changes the row and commits; when it runs it keeps that
+    /// writer's change, raises the revision again and never moves
+    /// `lastUpdated` back.
+    #[tokio::test]
+    async fn postgres_meta_rewrite_that_waited_does_not_move_last_updated_back() {
+        use helios_persistence::core::{MetaChange, MetaTarget, VersionedStorage};
+
+        let backend = std::sync::Arc::new(create_backend().await);
+        let tenant = create_tenant("meta-rewrite-wait");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let tag = |code: &str| json!({"system": "http://example.org/tags", "code": code});
+        backend
+            .create(
+                &tenant,
+                "Task",
+                json!({"resourceType": "Task", "id": "w1", "status": "requested",
+                       "intent": "order", "meta": {"tag": [tag("a")]}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut blocker = reindex_test_client().await;
+        let held = blocker.transaction().await.unwrap();
+        let blocker_pid: i32 = held
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        held.query(
+            "SELECT 1 FROM resources WHERE tenant_id = $1 AND resource_type = 'Task' \
+             AND id = 'w1' FOR UPDATE",
+            &[&tenant_id],
+        )
+        .await
+        .unwrap();
+
+        let waiting = {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let change = MetaChange::Add(json!({"tag": [tag("late")]}));
+            tokio::spawn(async move {
+                backend
+                    .rewrite_meta(
+                        &tenant,
+                        "Task",
+                        "w1",
+                        &MetaTarget::Historical {
+                            version_id: "1".to_string(),
+                        },
+                        &change,
+                    )
+                    .await
+            })
+        };
+        // Wait, bounded, until this rewrite is the session blocked by this
+        // blocker on the row lock — not merely scheduled.
+        let observer = reindex_test_client().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                       AND query LIKE '%FROM resources%FOR UPDATE%'",
+                    &[&blocker_pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rewrite never blocked on the held row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The other writer's change, committed while the rewrite waits.
+        let body = json!({"resourceType": "Task", "id": "w1", "status": "requested",
+                          "intent": "order", "meta": {"tag": [tag("a"), tag("between")]}});
+        for table in ["resources", "resource_history"] {
+            held.execute(
+                &format!(
+                    "UPDATE {table} SET data = $2, last_updated = clock_timestamp() \
+                     {} WHERE tenant_id = $1 AND resource_type = 'Task' AND id = 'w1' \
+                     AND version_id = '1'",
+                    if table == "resources" {
+                        ", meta_seq = meta_seq + 1"
+                    } else {
+                        ""
+                    }
+                ),
+                &[&tenant_id, &body],
+            )
+            .await
+            .unwrap();
+        }
+        let between: chrono::DateTime<chrono::Utc> = held
+            .query_one(
+                "SELECT last_updated FROM resources WHERE tenant_id = $1 \
+                 AND resource_type = 'Task' AND id = 'w1'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        held.commit().await.unwrap();
+
+        let rewrite = waiting.await.unwrap().unwrap();
+        assert!(rewrite.current_changed);
+        assert_eq!(rewrite.resource.meta_seq(), 2);
+        assert!(
+            rewrite.resource.last_modified() > between,
+            "{} must be after {between}",
+            rewrite.resource.last_modified()
+        );
+        let current = backend.read(&tenant, "Task", "w1").await.unwrap().unwrap();
+        let codes: Vec<&str> = current.content()["meta"]["tag"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["a", "between", "late"]);
+        assert_eq!(
+            current.last_modified().timestamp_micros(),
+            rewrite.resource.last_modified().timestamp_micros()
+        );
+        let version = backend
+            .vread(&tenant, "Task", "w1", "1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version.content(), current.content());
+        assert_eq!(
+            version.last_modified().timestamp_micros(),
+            current.last_modified().timestamp_micros()
+        );
+    }
+
+    /// #2562: metadata rewrites and the same-version revision.
+    #[tokio::test]
+    async fn postgres_meta_rewrites() {
+        let backend = create_backend().await;
+        let base = create_tenant("meta-rewrite-postgres");
+        let base = base.tenant_id().as_str();
+        super::meta_rewrite_suite::counter_lifecycle(&backend, &format!("{base}-c")).await;
+        super::meta_rewrite_suite::rewrite_consistency(&backend, &format!("{base}-r")).await;
+        super::meta_rewrite_suite::stale_selection(&backend, &format!("{base}-s")).await;
+        super::meta_rewrite_suite::reindex_page_after_a_rewrite(&backend, &format!("{base}-x"))
+            .await;
+        super::meta_rewrite_suite::conditional_writes_resolve_again_after_a_rewrite(
+            std::sync::Arc::new(backend),
+            &format!("{base}-u"),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {

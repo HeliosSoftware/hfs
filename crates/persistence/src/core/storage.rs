@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+use crate::core::meta_labels::{MetaChange, MetaRewrite, MetaTarget};
 use crate::core::preconditions::EntityTagPrecondition;
 use crate::core::sof_runner::SofRunner;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
@@ -688,6 +689,98 @@ pub trait ResourceStorage: Send + Sync {
             ));
         }
         self.delete(tenant, resource_type, id).await
+    }
+
+    /// Deletes the current version only while it is still the revision a
+    /// conditional delete selected: the same version id and the same
+    /// [`StoredResource::meta_seq`].
+    ///
+    /// The default is [`delete_versioned`](Self::delete_versioned), which is
+    /// exact for a store whose versions never change in place. A store that
+    /// rewrites metadata in place (see [`tracks_meta_revision`](Self::tracks_meta_revision))
+    /// overrides it with one predicate on both values; a miss is a
+    /// same-version `VersionConflict`.
+    async fn delete_at_revision(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+        expected_meta_seq: u64,
+    ) -> StorageResult<()> {
+        let _ = expected_meta_seq;
+        self.delete_versioned(tenant, resource_type, id, expected_version)
+            .await
+    }
+
+    /// Whether this store can change a version's metadata in place
+    /// (`$meta-add` / `$meta-delete`) here and now, so that
+    /// [`StoredResource::meta_seq`] of what it reads identifies a revision.
+    ///
+    /// Conditional writes compare that revision of the match they selected.
+    /// The default is `false`: no in-place change, so the version id alone
+    /// identifies what was read.
+    fn tracks_meta_revision(&self) -> bool {
+        false
+    }
+
+    /// Whether [`rewrite_meta`](Self::rewrite_meta) is served. It answers
+    /// with the same condition [`rewrite_meta`](Self::rewrite_meta) checks
+    /// before it changes anything.
+    fn supports_meta_rewrite(&self) -> bool {
+        false
+    }
+
+    /// Applies `change` to the targeted version in place (`$meta-add`,
+    /// `$meta-delete`): the version id is kept and `lastUpdated` is set to
+    /// now.
+    ///
+    /// Reading, changing and writing happen inside one atomic boundary.
+    /// When the current version is affected, its row and that version's
+    /// history row change together, the search index is rebuilt, and
+    /// [`StoredResource::meta_seq`] goes up by one.
+    ///
+    /// # Errors
+    ///
+    /// * `VersionConflict` - a [`MetaTarget::Current`] no longer matches
+    /// * `Gone` - the targeted version is a deletion
+    /// * `NotFound` - no such resource or version
+    /// * `UnsupportedCapability` - the default, and any store or topology for
+    ///   which [`supports_meta_rewrite`](Self::supports_meta_rewrite) is false
+    async fn rewrite_meta(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        target: &MetaTarget,
+        change: &MetaChange,
+    ) -> StorageResult<MetaRewrite> {
+        let _ = (tenant, resource_type, id, target, change);
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "meta_rewrite".to_string(),
+        }))
+    }
+
+    /// Restores a deleted resource with `resource` as its new current
+    /// version, only while the row is still a tombstone.
+    ///
+    /// A row that is live (another writer restored it) or gone is a definite
+    /// loss: `NotFound` or `VersionConflict`, depending on the store, and
+    /// nothing is written. [`put_preserving_labels`](super::put_preserving_labels)
+    /// then merges with the version that won.
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        let _ = (tenant, resource_type, id, resource);
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "restore_tombstone".to_string(),
+        }))
     }
 
     /// Checks if a resource exists.
@@ -1693,6 +1786,16 @@ pub trait ConditionalStorage: ResourceStorage {
             }
             Err(e) => return Err(e),
         };
+        if self.tracks_meta_revision()
+            && current.version_id() == matched.version_id()
+            && current.meta_seq() != matched.meta_seq()
+        {
+            return Err(super::same_version_conflict(
+                resource_type,
+                current.id(),
+                current.version_id(),
+            ));
+        }
         if current.version_id() != matched.version_id() {
             return Err(StorageError::Concurrency(
                 crate::error::ConcurrencyError::VersionConflict {

@@ -25894,3 +25894,145 @@ async fn mongodb_integration_offloaded_to_standalone_switch_rebuilds_and_reindex
         .unwrap();
     assert_eq!(ids(&missing), vec!["sw-nogender"]);
 }
+
+/// #2562: on MongoDB every update path merges the stored tags and security
+/// labels, a lost restore is a definite loss, and metadata rewrites are
+/// refused (and not advertised) until the store tracks a same-version
+/// revision.
+#[tokio::test]
+async fn mongodb_put_merges_labels_and_metadata_rewrites_are_refused() {
+    let Some(backend) = create_backend("meta_labels").await else {
+        eprintln!(
+            "Skipping mongodb_put_merges_labels_and_metadata_rewrites_are_refused (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-meta-labels");
+    let tag = |code: &str| json!({"system": "http://example.org/tags", "code": code});
+    let task = |id: &str, codes: &[&str]| {
+        let tags: Vec<_> = codes.iter().map(|c| tag(c)).collect();
+        json!({"resourceType": "Task", "id": id, "status": "requested", "intent": "order",
+               "identifier": [{"system": "http://example.org/ids", "value": id}],
+               "meta": {"tag": tags}})
+    };
+    let codes = |resource: &helios_persistence::types::StoredResource| -> Vec<String> {
+        resource.content()["meta"]["tag"]
+            .as_array()
+            .map(|tags| {
+                tags.iter()
+                    .map(|t| t["code"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let current = |id: &'static str| {
+        let backend = &backend;
+        let tenant = &tenant;
+        async move { backend.read(tenant, "Task", id).await.unwrap().unwrap() }
+    };
+
+    assert!(!backend.supports_meta_rewrite());
+    assert!(!backend.tracks_meta_revision());
+
+    // PUT without a precondition.
+    for body in [task("m1", &["a"]), task("m1", &["b"])] {
+        helios_persistence::core::put_preserving_labels(
+            &backend,
+            &tenant,
+            "Task",
+            "m1",
+            body,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(codes(&current("m1").await), ["a", "b"]);
+
+    let refused = backend
+        .rewrite_meta(
+            &tenant,
+            "Task",
+            "m1",
+            &helios_persistence::core::MetaTarget::Current {
+                expected_version: "2".to_string(),
+                expected_meta_seq: 0,
+            },
+            &helios_persistence::core::MetaChange::Add(json!({"tag": [tag("c")]})),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+    assert_eq!(codes(&current("m1").await), ["a", "b"]);
+
+    // Conditional update.
+    let updated = backend
+        .conditional_update(
+            &tenant,
+            "Task",
+            task("m1", &["c"]),
+            "identifier=http://example.org/ids|m1",
+            false,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(updated, ConditionalUpdateResult::Updated(_)));
+    assert_eq!(codes(&current("m1").await), ["a", "b", "c"]);
+
+    // Transaction PUT.
+    backend
+        .create(&tenant, "Task", task("m2", &["a"]), FhirVersion::default())
+        .await
+        .unwrap();
+    let entry = |url: &str, resource: serde_json::Value| BundleEntry {
+        method: BundleMethod::Put,
+        url: url.to_string(),
+        resource: Some(resource),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+        criteria: None,
+    };
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![
+            entry("Task/m2", task("m2", &["b"])),
+            entry("Task/m1", task("m1", &["d"])),
+        ],
+        "mongodb_put_merges_labels_and_metadata_rewrites_are_refused/transaction",
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(result.entries.iter().all(|e| e.status == 200), "{result:?}");
+    assert_eq!(codes(&current("m2").await), ["a", "b"]);
+    assert_eq!(codes(&current("m1").await), ["a", "b", "c", "d"]);
+
+    // A restore of a live resource is a definite loss and writes nothing.
+    backend.delete(&tenant, "Task", "m2").await.unwrap();
+    backend
+        .restore_tombstone(&tenant, "Task", "m2", task("m2", &["r"]))
+        .await
+        .unwrap();
+    let lost = backend
+        .restore_tombstone(&tenant, "Task", "m2", task("m2", &["x"]))
+        .await;
+    assert!(
+        matches!(
+            lost,
+            Err(StorageError::Resource(ResourceError::NotFound { .. })
+                | StorageError::Concurrency(ConcurrencyError::VersionConflict { .. }))
+        ),
+        "{lost:?}"
+    );
+    assert_eq!(codes(&current("m2").await), ["r"]);
+}

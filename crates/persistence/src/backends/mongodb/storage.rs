@@ -3148,6 +3148,17 @@ impl ResourceStorage for MongoBackend {
         .await
     }
 
+    async fn restore_tombstone(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.restore_deleted(tenant, resource_type, id, resource)
+            .await
+    }
+
     async fn exists(
         &self,
         tenant: &TenantContext,
@@ -7492,12 +7503,16 @@ impl MongoBackend {
 
                 if let Some(target) = target {
                     return Ok(match &target.resolved {
-                        Some(existing) => crate::core::conditional_update_entry(
-                            self.update_resource_in_bundle_transaction(
-                                db, session, tenant, existing, resource, writes,
+                        Some(existing) => {
+                            let merged =
+                                crate::core::merge_update_labels(existing.content(), &resource);
+                            crate::core::conditional_update_entry(
+                                self.update_resource_in_bundle_transaction(
+                                    db, session, tenant, existing, merged, writes,
+                                )
+                                .await?,
                             )
-                            .await?,
-                        ),
+                        }
                         None => {
                             BundleEntryResult::created(self.create_resource_in_bundle_transaction(
                                 index,
@@ -7529,9 +7544,11 @@ impl MongoBackend {
                             return Ok(failure);
                         }
 
+                        let merged =
+                            crate::core::merge_update_labels(existing.content(), &resource);
                         let updated = self
                             .update_resource_in_bundle_transaction(
-                                db, session, tenant, &existing, resource, writes,
+                                db, session, tenant, &existing, merged, writes,
                             )
                             .await?;
                         Ok(BundleEntryResult::updated(updated))
