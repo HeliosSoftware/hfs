@@ -18,7 +18,4 @@ proc-macro = true
 syn = { version = "2.0", features = ["full", "derive", "parsing"] } # Updated syn version and features
 quote = "1.0"
 proc-macro2 = "1.0"
-serde = { workspace = true }
-serde_json = { workspace = true }
 heck = "0.5" # For case conversion
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.8" }

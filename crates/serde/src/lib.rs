@@ -62,6 +62,12 @@
 //! // Deserialize from XML
 //! let patient: Patient = from_xml_str(&xml)?;
 //! ```
+
+// Not referenced by the library code, but linked on purpose: the crate's
+// `R4`/`R4B`/`R5`/`R6`/`xml` features forward to `helios-fhir`, and the
+// tests and examples use its resource types.
+use helios_fhir as _;
+
 pub mod error;
 pub mod json;
 #[cfg(feature = "xml")]

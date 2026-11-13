@@ -94,7 +94,6 @@ serde_urlencoded = "0.7"
 
 # Error handling
 thiserror = "2"
-anyhow = "1.0"
 
 # Logging and tracing
 tracing = "0.1"

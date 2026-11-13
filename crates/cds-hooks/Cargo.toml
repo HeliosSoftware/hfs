@@ -17,7 +17,6 @@ serde_json = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 async-trait = "0.1"
 thiserror = "1.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full"] }
