@@ -524,7 +524,7 @@ These functions extend the base FHIRPath specification with FHIR-specific capabi
     *   [extension()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full support with variable URL resolution)
     *   [hasValue()](https://build.fhir.org/fhirpath.html#functions): ✅ (Tests if primitive has actual value beyond extensions)
     *   [getValue()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
-    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ✅ (In-scope resolution: contained resources and resources in the evaluation context; returns a typed stub for unresolved `Type/id` references. No external/DB resolution — see [#167](https://github.com/HeliosSoftware/hfs/issues/167) for the storage-backed resolver follow-up.)
+    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ✅ (In-scope resolution: contained resources and resources in the evaluation context; returns a typed stub for unresolved `Type/id` references. The engine itself does no I/O. When HFS runs a SQL-on-FHIR view in process, references to stored resources are resolved too: `helios-persistence` reads them from the tenant's storage before evaluation and adds them to the evaluation context ([#167](https://github.com/HeliosSoftware/hfs/issues/167)). `fhirpath-cli` and `fhirpath-server` resolve in scope only.)
     *   [ofType()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full FHIR type support)
     *   [elementDefinition()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
     *   [slice()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented

@@ -13,6 +13,10 @@ These capabilities are available today in the current release.
 **Helios FHIR Server**
 
 - [FHIR REST API server](crates/hfs/README.md) with CRUD operations, search, history, and batch/transaction support
+- [`Patient/$everything`](crates/rest/README.md#patienteverything) ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) — instance- and type-level, returning the patient's compartment plus referenced supporting resources as a paged `searchset` Bundle, with `start` / `end`, `_since`, `_type`, and `_count`
+- [Administrative UI](crates/ui) — server-rendered management console under `/ui`: dashboard, resource browser and schema-driven editor, search builder, history diff, batch/transaction workspace, bulk export and bulk import, SQL-on-FHIR pages, Subscriptions, terminology, and tenant maintenance
+- [Natural-language search](book/src/components/natural-language-search.md) — `$nl-search` translates natural-language requests into FHIR searches through a configurable LLM endpoint
+- [Observability](crates/observability) — Prometheus `/metrics`, uptime, and optional OTLP trace export across all servers
 
 **Persistence**
 
@@ -22,24 +26,26 @@ These capabilities are available today in the current release.
 - [PostgreSQL as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#postgresql--elasticsearch)
 - [MongoDB as a primary store](crates/persistence/README.md#mongodb)
 - [MongoDB as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#mongodb--elasticsearch)
-- [S3 as a primary store](crates/persistence/README.md#s3)
+- [S3 as a primary store](crates/persistence/README.md#s3-backend)
 - [S3 as a primary store with Elasticsearch as a query secondary](crates/persistence/README.md#s3--elasticsearch)
 
 **Authentication & Authorization**
 
-- [SMART on FHIR authentication, authorization, and IdP integration](https://github.com/HeliosSoftware/hfs/discussions/45)
+- [SMART on FHIR authentication, authorization, and IdP integration](crates/auth/README.md) ([discussion #45](https://github.com/HeliosSoftware/hfs/discussions/45)) — JWT/JWKS validation, SMART v2 scopes, IdP guides (Keycloak, Okta, Auth0, Entra ID), and interactive browser sign-in for the web UI
+- [Patient-level access control](crates/auth/README.md#patient-scopes) ([#1618](https://github.com/HeliosSoftware/hfs/issues/1618)) — `patient/` scopes are confined to the SMART launch patient's compartment across search, instance reads and writes, `$everything`, `$export`, and Bundles
 
 **Clinical Decision Support**
 
-- [CDS Hooks](crates/cds-hooks/README.md) — HL7 CDS Hooks v3.0.0 protocol types, all 10 hook contexts, and async `CdsHooksService` trait
+- [CDS Hooks](crates/cds-hooks/README.md) — HL7 CDS Hooks v3.0.0-ballot protocol types, all 10 hook contexts, and async `CdsHooksService` trait
 
 **Compliance**
 
-- [Audit logging (AuditEvent resource support)](crates/audit/README.md) — REST, auth, and lifecycle audit events with IHE BALP profiles
+- [Audit logging (AuditEvent resource support)](crates/audit/README.md) — REST, auth, and lifecycle audit events with IHE BALP profiles, including the persistence-layer bulk export, purge, and reindex operations ([#168](https://github.com/HeliosSoftware/hfs/issues/168))
 
 **Terminology**
 
-- [Terminology service (HTS) — SQLite and PostgreSQL backends](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+- [Terminology service (HTS) — SQLite and PostgreSQL backends](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import in 13 formats, among them HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+- [Administrative UI for HTS](crates/hts-ui) — web console for browsing CodeSystems / ValueSets / ConceptMaps, exploring concepts and their relations and mappings, and running terminology imports
 
 **Standards**
 
@@ -57,6 +63,10 @@ These capabilities are available today in the current release.
 - [FHIRPath expression engine](crates/fhirpath/README.md) — CLI and HTTP server
 - [Python bindings (pysof)](crates/pysof/README.md)
 
+**Documentation**
+
+- [Project documentation website](https://heliossoftware.github.io/hfs/) — the mdBook under [`book/`](book/), published with each release
+
 ---
 
 ## 🔨 Now — Actively In Progress
@@ -65,18 +75,15 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🟡 In progress |
-| **Terminology** | [Administrative UI for HTS](crates/hts/README.md) — web-based management console for the terminology server: CodeSystem / ValueSet / ConceptMap browsing, terminology import and bootstrap sync monitoring, and operation testing | 🟡 In progress |
-| **Deployment** | Cluster support — multi-instance deployment behind a load balancer, with cluster-safe state | 🟡 In progress |
-| **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
-| **FHIR Server Capabilities** | `Patient/$everything` operation ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) — [FHIR `$everything`](https://hl7.org/fhir/operation-patient-everything.html) on `Patient/{id}` (and optionally at the type level), returning the patient record as a `searchset` Bundle with `_since`, `_type`, `_count`, and `start` / `end` support, composing the existing compartment search (`GET /Patient/{id}/{type}`, driven by `CompartmentDefinition`) into a single paged operation | 🟡 In progress |
+| **Deployment** | Cluster support — multi-instance deployment behind a load balancer, with cluster-safe state. A two-instance smoke harness ([`cluster-smoke.yml`](.github/workflows/cluster-smoke.yml)) covers shared-PostgreSQL CRUD today; web sign-in sessions are kept in the primary store | 🟡 In progress |
 
 ### Discussion Documents
 
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These are published as GitHub Discussions:
 
-- **[Validation](https://github.com/HeliosSoftware/hfs/discussions/215)** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **[Clustered / multi-instance deployment](https://github.com/HeliosSoftware/hfs/discussions/223)** — How HFS should behave when run as multiple instances behind a load balancer, and where the boundary lies between state that can safely stay in process memory and state that must be externalized to shared infrastructure. Considerations include: cluster-aware WebSocket Subscription delivery, where connected clients are tracked in process memory today ([#170](https://github.com/HeliosSoftware/hfs/issues/170)); database-backed SQL-on-FHIR export job state, so status URLs survive restarts and are visible across instances ([#169](https://github.com/HeliosSoftware/hfs/issues/169)); and per-instance observability (Prometheus `/metrics`, OTLP traces) with correct tenant isolation when resource data comes from a shared database but traffic metrics are per-instance ([#150](https://github.com/HeliosSoftware/hfs/issues/150)). Authentication is *not* on this list: `helios-auth` validates tokens locally and holds no cross-instance state ([#205](https://github.com/HeliosSoftware/hfs/issues/205))
+- **[Clustered / multi-instance deployment](https://github.com/HeliosSoftware/hfs/discussions/223)** — How HFS should behave when run as multiple instances behind a load balancer, and where the boundary lies between state that can safely stay in process memory and state that must be externalized to shared infrastructure. Open considerations: cluster-aware WebSocket Subscription delivery, where connected clients are tracked in process memory today ([#170](https://github.com/HeliosSoftware/hfs/issues/170)); database-backed SQL-on-FHIR export job state, so status URLs are visible across instances ([#169](https://github.com/HeliosSoftware/hfs/issues/169)); and `$reindex` job status, which is held on the node that accepted the kick-off. Observability ([#150](https://github.com/HeliosSoftware/hfs/issues/150)) has shipped with per-instance metrics and no tenant label. Authentication is *not* on this list: `helios-auth` validates tokens locally and holds no cross-instance state ([#205](https://github.com/HeliosSoftware/hfs/issues/205))
+
+The [Validation](https://github.com/HeliosSoftware/hfs/discussions/215) discussion document is complete, and the [validation engine](crates/fhir-validator/) it led to has shipped.
 
 ---
 
@@ -86,8 +93,7 @@ These items are well-understood and will be picked up once current work complete
 
 ### FHIR Server Capabilities
 
-- **Persistence-layer audit events** ([#168](https://github.com/HeliosSoftware/hfs/issues/168)) — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
-- **Database-backed SQL-on-FHIR export job state** ([#169](https://github.com/HeliosSoftware/hfs/issues/169)) — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$sql-export` operation with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Today, job status, tenant ownership, progress, and cancellation state live only in process memory: a server restart invalidates every in-flight and completed status URL (undermining the spec's 24-hour manifest validity), and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$sql-run` and Bulk Data `$export` are unaffected.
+- **Database-backed SQL-on-FHIR export job state** ([#169](https://github.com/HeliosSoftware/hfs/issues/169)) — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$sql-export` operation with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Completed jobs now survive a restart: the filesystem and S3 sinks write a manifest per completed job, and the controller reloads them at startup ([#1474](https://github.com/HeliosSoftware/hfs/issues/1474)). In-flight job status, progress, and cancellation state still live only in process memory, so a restart loses running jobs, and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$sql-run` and Bulk Data `$export` are unaffected.
 - **Cluster-aware Subscription notification delivery** ([#170](https://github.com/HeliosSoftware/hfs/issues/170)) — Identified by the same review: the Subscriptions engine tracks connected WebSocket clients in process memory (`crates/subscriptions/src/channels/ws_manager.rs`), so in a multi-instance deployment only the instance holding a client's connection can deliver its notifications. Subscription resources themselves are database-backed; what's needed is a shared delivery channel (e.g., a message bus or pub/sub fan-out) so resource events on any instance reach clients connected to any other. Until then, WebSocket subscription delivery is single-instance / sticky-session only (rest-hook channels are unaffected).
 
 ### Developer Experience
@@ -95,7 +101,6 @@ These items are well-understood and will be picked up once current work complete
 - **MCP Server for FHIR API** — Model Context Protocol integration for the FHIR REST API
 - **MCP Server for SQL on FHIR** — Model Context Protocol integration for analytics workflows
 - **Deployment Cookbooks** — Reference architectures and deployment templates covering standalone development servers, single-node production setups, composite storage configurations, and full CQRS architectures on AWS, Azure, and GCP
-- **Point internal build tools at hosted HTS** — Once `https://hts.heliossoftware.com` is available, switch `.github/workflows/inferno.yml` and any other internal build/CI tooling that needs a terminology service to point at the hosted endpoint (via `HFS_TERMINOLOGY_SERVER` / `FHIRPATH_TERMINOLOGY_SERVER`) 
 
 ---
 
@@ -105,15 +110,15 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 
 ### FHIR Server Capabilities
 
-- **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
+- **SMART on FHIR granular scopes** — Scopes narrowed by search parameters (for example `patient/Observation.rs?category=laboratory`). HFS already reads the launch context (`patient`, `encounter`, `fhirUser`) and confines `patient/` scopes to the launch patient's compartment. Launch itself is handled by the external authorization server, because HFS does not act as one
 - **GraphQL API** — [FHIR GraphQL](https://hl7.org/fhir/graphql.html) support for resource retrieval, search, and graph traversal as an alternative to the REST API
 
 ### SQL-on-FHIR & FHIRPath
 
-Follow-ups to `resolve()` in SQL-on-FHIR, which today dereferences references against the input bundle (and their `contained` resources) and can optionally fetch from explicitly allowlisted, trusted remote servers:
+Follow-ups to `resolve()` in SQL-on-FHIR, which today dereferences references against the input bundle (and their `contained` resources), against resources stored on the server when a view runs inside HFS ([#167](https://github.com/HeliosSoftware/hfs/issues/167)), and can optionally fetch from explicitly allowlisted, trusted remote servers:
 
 - **Logical (identifier-based) reference resolution** — `resolve()` handles literal `Reference.reference` strings (relative `Type/id`, absolute URLs, and `#contained` fragments). References that identify their target only by a business `identifier` (no `reference` string) are not yet resolved.
-- **Storage-backed and cross-run resolution cache for `resolve()`** ([#167](https://github.com/HeliosSoftware/hfs/issues/167)) — Resolve against server-stored resources, and persist fetched resources across runs, as a layer over the current in-bundle pool and per-run in-memory prefetch cache.
+- **Cross-run resolution cache for `resolve()`** — Persist fetched resources across runs, as a layer over the current per-run in-memory prefetch cache. Storage-backed resolution is one level deep today: references inside the fetched resources are not followed.
 - **Async FHIRPath evaluator** — The FHIRPath engine is synchronous (executed under Rayon by the SQL-on-FHIR core), so remote `resolve()` is handled by an up-front prefetch pass rather than inline I/O. A general async evaluator would let effectful functions (inline remote resolution, terminology lookups) run during evaluation.
 - **OAuth client-credentials for remote `resolve()`** — Trusted-server authentication is per-host bearer tokens today; a client-credentials grant flow would better suit servers fronted by OAuth.
 
@@ -137,13 +142,13 @@ An intelligent recommendation engine for storage configuration:
 ### Build & Dependencies
 
 - **Upgrade `lru` to the latest version** — `helios-sof` uses `lru` for the
-  streaming remote-`resolve()` cross-chunk cache. It is currently pinned to `0.12`
-  to match `aws-sdk-s3`, which pins `lru = "^0.12"` as a non-optional dependency
+  streaming remote-`resolve()` cross-chunk cache. It is currently pinned to `0.16`
+  to match `aws-sdk-s3`, which pins `lru = "^0.16.3"` as a non-optional dependency
   (pulled by the optional `s3` feature in `helios-persistence` / `helios-rest`).
   Matching the SDK keeps a single `lru` version compiled across all feature
-  combinations. The latest `lru` is 0.18; raising `helios-sof`'s pin would compile
-  two `lru` versions whenever `s3` is enabled, because the AWS SDK's `^0.12` pin (a
-  third-party crate we don't control) is semver-incompatible with 0.18. Bump
+  combinations. The latest `lru` is 0.19; raising `helios-sof`'s pin would compile
+  two `lru` versions whenever `s3` is enabled, because the AWS SDK's `^0.16` pin (a
+  third-party crate we don't control) is semver-incompatible with 0.19. Bump
   `helios-sof` to the latest `lru` once the AWS SDK updates its own pin, collapsing
   back to a single version. Tracked so the pin is re-evaluated on the next AWS SDK
   upgrade.
@@ -174,7 +179,7 @@ We welcome contributors and feedback at every level — from opening issues to j
 
 ## 📊 Gap Analysis — "FHIR Architecture Decisions" by Darren Devitt
 
-> **Note:** This section was generated by AI analysis of the HFS codebase evaluated against the criteria in [*FHIR Architecture Decisions*](https://darrendevitt.com/fhir-architecture-decisions-book/) (v1.0, 2026) by Darren Devitt — an independent guide to selecting FHIR servers and choosing between facade, hybrid, and FHIR-native architectural approaches. The analysis was first produced in April 2026 and last refreshed against the codebase in September 2026; it should be updated as features ship.
+> **Note:** This section was generated by AI analysis of the HFS codebase evaluated against the criteria in [*FHIR Architecture Decisions*](https://darrendevitt.com/fhir-architecture-decisions-book/) (v1.0, 2026) by Darren Devitt — an independent guide to selecting FHIR servers and choosing between facade, hybrid, and FHIR-native architectural approaches. The analysis was first produced in April 2026 and last refreshed against the codebase in November 2026; it should be updated as features ship.
 
 ### Context
 
@@ -187,14 +192,15 @@ Devitt's book defines nine key questions organizations must answer before choosi
 | **Multi-tenancy** | Tenant-first design with logical isolation at the query level, header- or URL-path-based tenant routing, and a tenant-maintenance page in the web UI. The book identifies multi-tenancy as a potential deal breaker (Ch. 3). |
 | **Multi-backend persistence** | SQLite, PostgreSQL, MongoDB, S3, Elasticsearch — supports the on-prem and cloud deployment flexibility the book emphasizes (Ch. 8 "Data location"). |
 | **Profile validation on write** | Ch. 1 Fig 1.1 shows "FHIR validation + Profile validation" as a core server responsibility on create; Ch. 6 warns that without it, data quality degrades in FHIR-native systems. [`helios-fhir-validator`](crates/fhir-validator/) validates structure, `meta.profile` claims, FHIRPath invariants, and required bindings against embedded R4–R6 core packages. Exposed as `$validate` (type and instance level), as opt-in write-path enforcement (`HFS_VALIDATION_MODE=off|log|enforce`, default `off`), and as the `validator-cli` tool. |
-| **Audit logging** | IHE BALP-compliant AuditEvent logging with pluggable sinks (file, database, CloudWatch, S3), covering REST, auth, and the `$export`, `$purge`, and `$reindex` operations. The book lists audit logging as "required for compliance" (Appendix I). |
-| **SMART on FHIR authentication** | JWT/JWKS validation, SMART v2 scope enforcement at resource-type level, dedicated operation scopes for `$purge`, `$reindex`, and `$bulk-submit`, and IdP integration guides (Keycloak, Okta, Auth0, Entra ID). The book calls SMART on FHIR "the expected authorization method" (Ch. 3). See the patient-level gap below. |
-| **Terminology service** | Complete standalone HTS with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, bulk import (HL7 packages, SNOMED CT, LOINC, ICD-10-CM, RxNorm), and its own web UI ([`helios-hts-ui`](crates/hts-ui)) for browsing CodeSystems / ValueSets / ConceptMaps, exploring concepts, and running imports. HFS wires to it for `:in` / `:not-in` search and FHIRPath `memberOf()` / `subsumes()`. The book notes terminology services are "often required and commonly missed in early product releases" (Appendix I). |
+| **Audit logging** | IHE BALP-compliant AuditEvent logging with pluggable sinks (file, database — any HFS backend, including S3 — and CloudWatch), covering REST, auth, and the `$export`, `$purge`, and `$reindex` operations. The book lists audit logging as "required for compliance" (Appendix I). |
+| **SMART on FHIR authentication** | JWT/JWKS validation, SMART v2 scope enforcement at resource-type level, dedicated operation scopes for `$purge`, `$reindex`, and `$bulk-submit`, and IdP integration guides (Keycloak, Okta, Auth0, Entra ID). `patient/` scopes are confined to the launch patient's compartment ([#1618](https://github.com/HeliosSoftware/hfs/issues/1618)): searches are filtered, instance reads and writes are checked against compartment membership, and operations that cannot be confined are refused. The book calls SMART on FHIR "the expected authorization method" (Ch. 3). |
+| **Terminology service** | Complete standalone HTS with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, bulk import in 13 formats (HL7 packages, SNOMED CT, LOINC, ICD-10-CM, RxNorm, UCUM, and others), and its own web UI ([`helios-hts-ui`](crates/hts-ui)) for browsing CodeSystems / ValueSets / ConceptMaps, exploring concepts, and running imports. HFS wires to it for `:in` / `:not-in` search and FHIRPath `memberOf()` / `subsumes()`. The book notes terminology services are "often required and commonly missed in early product releases" (Appendix I). |
+| **Patient-centric retrieval** | Ch. 6 — FHIR-native systems where "all queries are FHIR requests" expect standard patient-centric retrieval. `Patient/$everything` ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) at instance and type level returns the compartment plus supporting resources as a paged Bundle, alongside compartment search (`GET /Patient/{id}/{type}`) and `Patient/$export`. |
 | **Bulk data processing** | Appendix I "Bulk data processing". `$export` at system / Patient / Group level with `_typeFilter`, `_since`, and pre-signed S3 downloads; `$bulk-submit` for bulk ingestion (HFS as Data Consumer, with OAuth `private_key_jwt` and JWE-encrypted files); asynchronous `$sql-export` for tabular output. |
 | **Subscriptions / eventing** | Topic-based FHIR Subscriptions (R5 backport) with rest-hook, WebSocket, email, and FHIR Messaging channels, plus startup rehydration of stored subscriptions. This is the change-notification mechanism the hybrid sync models (Ch. 5) depend on. |
 | **SQL-on-FHIR / Analytics** | Full SQL-on-FHIR (3.0.0-ballot) with Parquet, CSV, NDJSON, JSON output, Python bindings, and `$sql-run` / `$sql-export` on the server. Addresses the "analytical queries" deal breaker (Ch. 3) and secondary use cases the book highlights. |
 | **Observability / performance measurement** | Ch. 8 "Performance" — the book insists on POC benchmarking. [`helios-observability`](crates/observability) exposes a Prometheus `GET /metrics` endpoint (request counts, latency histograms, uptime) across all servers, with optional OTLP trace export. Per-type stored-resource counts back the web UI dashboard chart; tenant is never a metric label. |
-| **Administrative web UI** | Server-rendered management console under `/ui` ([`helios-ui`](crates/ui)): dashboard, resource browser and schema-driven editor, visual search builder and saved queries, SearchParameter and CompartmentDefinition viewers, version history with diff, batch/transaction workspace, bulk export builder, SQL-on-FHIR query / view / export pages, and tenant maintenance. Reduces the "tooling around the server" burden the book catalogues in Appendix I. |
+| **Administrative web UI** | Server-rendered management console under `/ui` ([`helios-ui`](crates/ui)): dashboard, resource browser and schema-driven editor, visual search builder and saved queries, SearchParameter and CompartmentDefinition viewers, version history with diff, batch/transaction workspace, bulk export builder and bulk import (`$bulk-submit`) workspace, SQL-on-FHIR query / view / export pages, Subscriptions and terminology pages, and tenant maintenance. HTS has its own console ([`helios-hts-ui`](crates/hts-ui)). Reduces the "tooling around the server" burden the book catalogues in Appendix I. |
 | **AI-assisted search** | `$nl-search` translates natural-language requests into FHIR search queries through a configurable LLM endpoint (`HFS_NL_SEARCH_*`), with per-user/tenant rate limits, a daily cap, and a UI pane. Supports the AI-driven secondary use the book identifies as a growing adoption driver (Ch. 3). |
 | **Open-source flexibility** | Full source access and customization — the book identifies this as a key advantage of the open-source server category (Ch. 8). |
 
@@ -206,19 +212,16 @@ No outstanding critical gaps. Profile validation on write, flagged as critical i
 
 #### Significant
 
-| Gap | Book Reference | Current Status |
-|-----|---------------|----------------|
-| **No patient-level access control** | Ch. 3 "Authorization" — `patient/*` and `user/*` scope contexts are parsed but treated the same as `system/*`: enforcement is at resource-type level only, and search results are not filtered by patient compartment. The `CompartmentDefinition` machinery needed for enforcement now exists (compartment search `GET /Patient/{id}/{type}`, a compartment membership tester in the UI). | 🔭 Later |
+No outstanding significant gaps. Patient-level access control, flagged as significant in the September 2026 refresh, has shipped (see Strengths).
 
 #### Moderate
 
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
-| **No `$everything` operation** | Ch. 6 — FHIR-native systems where "all queries are FHIR requests" expect standard patient-centric retrieval. Partial substitutes exist: compartment search (`GET /Patient/{id}/Observation`) and `Patient/$export`. | 🔨 Now ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) |
 | **No interceptor/hook framework** | Ch. 1 "Platform Illusion," Appendix I "Proxy/intercept layer" — organizations need to inject business validation, governance rules, and custom logic into the CRUD pipeline. HFS has internal Axum middleware and configurable write-path validation, but no pluggable extension point; reacting to writes is possible out-of-band via Subscriptions, and CDS Hooks types are provided as a library only. | Not planned |
 | **No Provenance tracking** | Appendix I "Provenance tracking" — important for audit, trust, and multi-source systems. `Provenance` resources can be stored and searched like any other resource, but the server does not generate them; AuditEvent (who did what) is not the same as Provenance (where data came from). | Not planned |
-| **No general rate limiting** | Ch. 3 Q5 "Data consumers" — external consumers with SLAs require throttling and burst protection. Only `$nl-search` is rate-limited (per user/tenant window plus a daily cap); the FHIR REST surface has no throttling and relies on an upstream gateway. | Not planned |
-| **Single-instance state in some operations** | Ch. 8 "Scalability" — clustered deployment is supported for CRUD, search, and Bulk Data `$export`, but `$sql-export` job state ([#169](https://github.com/HeliosSoftware/hfs/issues/169)), WebSocket subscription delivery ([#170](https://github.com/HeliosSoftware/hfs/issues/170)), and `$reindex` status are held in process memory on one node. | 🟡 In progress ([discussion #223](https://github.com/HeliosSoftware/hfs/discussions/223)) |
+| **No general rate limiting** | Ch. 3 Q5 "Data consumers" — external consumers with SLAs require throttling and burst protection. Only `$nl-search` (per user/tenant window plus a daily cap) and `$bulk-submit` status polling are rate-limited; the rest of the FHIR REST surface has no throttling and relies on an upstream gateway. | Not planned |
+| **Single-instance state in some operations** | Ch. 8 "Scalability" — clustered deployment is supported for CRUD, search, and Bulk Data `$export`, but in-flight `$sql-export` job state ([#169](https://github.com/HeliosSoftware/hfs/issues/169); completed jobs survive a restart), WebSocket subscription delivery ([#170](https://github.com/HeliosSoftware/hfs/issues/170)), and `$reindex` status are held in process memory on one node. | 🟡 In progress ([discussion #223](https://github.com/HeliosSoftware/hfs/discussions/223)) |
 
 #### Minor
 
@@ -227,18 +230,19 @@ No outstanding critical gaps. Profile validation on write, flagged as critical i
 | **No StructureMap / data mapping** | Appendix I "Data mapping layer" — essential for facade and hybrid architectures. FHIRPath extraction and SQL-on-FHIR flattening exist but no bidirectional transformation. | Not planned |
 | **No de-identification** | Appendix I "Secondary use and testing" — needed for AI/analytics secondary use, a growing driver for FHIR adoption (Ch. 3). | Not planned |
 | **No GraphQL API** | Ch. 6 — alternative query surface for FHIR-native consumers. | 🔭 Later |
+| **No SMART granular scopes** | Ch. 3 "Authorization" — scopes narrowed by search parameters (`patient/Observation.rs?category=…`) are not supported; enforcement is per resource type and, for `patient/` scopes, per compartment. | 🔭 Later |
 | **No MCP server** | Not covered by the book; relevant to the AI secondary-use driver (Ch. 3). Design is converging in [RFC discussion #231](https://github.com/HeliosSoftware/hfs/discussions/231). | 🔵 Design |
 
 ### Architectural Fit
 
 Using Devitt's framework (Chapters 4–7), HFS is currently best suited for:
 
-- **FHIR-native Variant A** (single source of truth, greenfield) — strong fit: profile validation on the write path, multi-tenancy, audit, terminology, and an administrative UI
+- **FHIR-native Variant A** (single source of truth, greenfield) — strong fit: profile validation on the write path, multi-tenancy, audit, terminology, `Patient/$everything`, and administrative UIs for HFS and HTS
 - **Hybrid Variant A** (sync-only, read-only FHIR server) — good fit: Subscriptions (rest-hook, WebSocket, email, messaging) and Bulk Data (`$export`, `$bulk-submit`) provide the sync pipeline in both directions
 - **Analytics / AI secondary use** — strong fit: SQL-on-FHIR, Parquet, Python bindings, async `$sql-export`, and natural-language search
+- **Patient-facing applications** — good fit: `patient/` scopes are confined to the launch patient's compartment, and `Patient/$everything` honors the launch context. Scopes cannot yet be narrowed by search parameters (granular scopes)
 
 HFS is not yet ready for:
 
 - **Hybrid Variant B** (sync with write-back facade) — no interceptor hooks to route writes to the upstream system; Subscriptions can notify the facade after the fact but cannot veto or redirect a write
 - **FHIR-native Variant B/C** (mixed or distributed source of truth) — no server-generated Provenance to track which source each resource came from
-- **Patient-facing applications** — no patient-level access control enforcement; a patient-context token can read any patient's data its resource-type scopes allow
