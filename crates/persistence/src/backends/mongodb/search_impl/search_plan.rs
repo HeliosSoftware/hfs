@@ -1041,9 +1041,18 @@ impl MongoBackend {
         {
             return Ok(None);
         }
-        let compartment = query.compartment.as_ref().filter(|compartment| {
-            !compartment.params.is_empty() && !compartment.reference.is_empty()
-        });
+        // A compartment that matches nothing is not "no compartment": planning
+        // from the remaining parameters alone would answer a wider question.
+        // The candidate collector answers it (an empty id set), and the plan
+        // stays out of it (#2509).
+        if query
+            .compartment
+            .as_ref()
+            .is_some_and(CompartmentMembership::matches_nothing)
+        {
+            return Ok(None);
+        }
+        let compartment = query.compartment.as_ref();
         let missing_resource_filter = query
             .parameters
             .iter()

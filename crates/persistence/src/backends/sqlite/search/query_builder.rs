@@ -613,12 +613,14 @@ impl QueryBuilder {
 
         // Compartment membership: a resource is in the compartment if it
         // references the compartment via ANY of the membership params (OR),
-        // per the FHIR CompartmentDefinition. Applied as a single subquery.
+        // per the FHIR CompartmentDefinition. Applied as a single subquery. A
+        // membership that can match nothing still adds its (empty) condition:
+        // skipping it would widen the search to every resource of the type
+        // (#2509).
         if let Some(comp) = &query.compartment {
             // Last condition appended, so no need to advance `current_offset`.
-            if let Some(condition) = self.build_compartment_condition(comp, current_offset) {
-                conditions.push(ParameterCondition::Other(condition));
-            }
+            let condition = self.build_compartment_condition(comp, current_offset);
+            conditions.push(ParameterCondition::Other(condition));
         }
 
         // When every condition is a positive `resource_key IN (<subquery>)`,
@@ -708,7 +710,9 @@ impl QueryBuilder {
     ///
     /// `query.compartment` is one more branch, on the contained resource's
     /// own references. With no criterion at all the result is every contained
-    /// resource of the type (#1383), so this always returns `Some`. The rows
+    /// resource of the type (#1383), so this always returns `Some`. A
+    /// compartment that [matches nothing](CompartmentMembership::matches_nothing)
+    /// is a criterion no row satisfies, not the absence of one (#2509). The rows
     /// are unordered; the caller sorts them before paging.
     pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
         // (branch, negated)
@@ -818,7 +822,14 @@ impl QueryBuilder {
         // every branch did.
         let mut names_prove_branches = true;
         if let Some(comp) = &query.compartment {
-            if !comp.params.is_empty() && !comp.reference.is_empty() {
+            if comp.matches_nothing() {
+                // No contained resource is a member of a compartment through no
+                // parameter, or of one with no reference: an entity filter no
+                // row satisfies empties the result however the other
+                // criteria group (#2509), where adding no branch would leave
+                // every contained resource of the type matching.
+                entity_filters.push("0 = 1".to_string());
+            } else {
                 let in_list = comp
                     .params
                     .iter()
@@ -1013,15 +1024,17 @@ impl QueryBuilder {
     /// Builds the compartment-membership subquery: matches resources that
     /// reference `comp.reference` via ANY of `comp.params` (logical OR), which
     /// is how a resource joins a FHIR compartment. Reference matching mirrors the
-    /// standard reference handler (version-agnostic). Returns `None` if there are
-    /// no membership params or no reference.
+    /// standard reference handler (version-agnostic). A membership with no
+    /// params or no reference matches nothing
+    /// ([`CompartmentMembership::matches_nothing`]), so it yields a condition
+    /// that no row satisfies, never an absent one (#2509).
     fn build_compartment_condition(
         &self,
         comp: &CompartmentMembership,
         param_offset: usize,
-    ) -> Option<SqlFragment> {
-        if comp.params.is_empty() || comp.reference.is_empty() {
-            return None;
+    ) -> SqlFragment {
+        if comp.matches_nothing() {
+            return SqlFragment::new("1 = 0");
         }
 
         // Membership params come from the bundled FHIR CompartmentDefinitions
@@ -1041,7 +1054,7 @@ impl QueryBuilder {
         // The absolute-URL form is a second select, `UNION ALL`-ed: an `OR`
         // arm would not repeat the tenant/type/param tests and SQLite would
         // walk every row of the type (see `build_parameter_condition`).
-        Some(SqlFragment::with_params(
+        SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
@@ -1053,7 +1066,7 @@ impl QueryBuilder {
                  AND value_reference_target IS NOT NULL AND value_reference_target = ?{p1})"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],
-        ))
+        )
     }
 
     /// Builds a condition for a single search parameter.
@@ -3076,6 +3089,173 @@ mod tests {
             "{:?}",
             frag.params
         );
+    }
+
+    /// The memberships that match nothing (#2509): no params, no reference,
+    /// neither.
+    fn empty_memberships() -> Vec<(&'static str, CompartmentMembership)> {
+        vec![
+            (
+                "no params",
+                CompartmentMembership {
+                    params: vec![],
+                    reference: "Patient/p1".to_string(),
+                },
+            ),
+            (
+                "empty reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string()],
+                    reference: String::new(),
+                },
+            ),
+            // The reference every backend matches on is the stripped one: this
+            // one names nothing, and would otherwise be an exact match on `""`.
+            (
+                "version-only reference",
+                CompartmentMembership {
+                    params: vec!["subject".to_string()],
+                    reference: "/_history/1".to_string(),
+                },
+            ),
+            ("neither", CompartmentMembership::default()),
+        ]
+    }
+
+    /// #2509: a compartment that matches nothing is a condition no row
+    /// satisfies. Left out, the query would match every resource of the type,
+    /// widening a patient-confined search to the whole type.
+    #[test]
+    fn empty_compartment_membership_matches_nothing() {
+        let builder = QueryBuilder::new("tenant1", "Observation");
+        let code = contained_param("code", SearchParamType::Token, None, &["X"]);
+        let not_status = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Not),
+            &["final"],
+        );
+        let missing = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Missing),
+            &["false"],
+        );
+
+        for (label, membership) in empty_memberships() {
+            // Alone: the base select with a condition nothing satisfies.
+            let mut alone = SearchQuery::new("Observation");
+            alone.compartment = Some(membership.clone());
+            let fragment = builder.build(&alone).unwrap();
+            assert_eq!(
+                fragment.sql,
+                "SELECT DISTINCT resource_key FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND (1 = 0)",
+                "{label}"
+            );
+
+            // Beside ordinary, `:not` and `:missing` parameters it is ANDed in,
+            // never the only thing the other conditions are left to answer.
+            for (name, parameter) in [
+                ("code", code.clone()),
+                ("status:not", not_status.clone()),
+                ("status:missing", missing.clone()),
+            ] {
+                let mut query = SearchQuery::new("Observation").with_parameter(parameter);
+                query.compartment = Some(membership.clone());
+                let fragment = builder.build(&query).unwrap();
+                assert!(
+                    fragment.sql.starts_with(
+                        "SELECT DISTINCT resource_key FROM search_index WHERE tenant_id = ?1"
+                    ),
+                    "{label} + {name}: must not be the bare parameter subquery: {}",
+                    fragment.sql
+                );
+                assert!(
+                    fragment.sql.ends_with("AND (1 = 0))"),
+                    "{label} + {name}: {}",
+                    fragment.sql
+                );
+                assert!(!fragment.sql.contains(" INTERSECT "), "{label} + {name}");
+            }
+
+            // Embedded in an outer query, as every caller does.
+            let embedded = QueryBuilder::new("tenant1", "Observation")
+                .with_param_offset(4)
+                .build(&alone)
+                .unwrap();
+            assert!(
+                embedded.sql.ends_with("AND (1 = 0)"),
+                "{label}: {}",
+                embedded.sql
+            );
+            assert!(embedded.params.is_empty(), "{label}: binds nothing");
+        }
+
+        // A real membership is a positive membership subquery, unchanged.
+        let mut real = SearchQuery::new("Observation");
+        real.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        let fragment = builder.build(&real).unwrap();
+        assert!(!fragment.sql.contains("1 = 0"), "{}", fragment.sql);
+        assert!(
+            fragment
+                .sql
+                .starts_with("SELECT resource_key FROM search_index"),
+            "{}",
+            fragment.sql
+        );
+    }
+
+    /// #2509: the `_contained` branch. No criterion at all is every contained
+    /// resource of the type (#1383); a compartment that matches nothing is a
+    /// criterion, not the absence of one.
+    #[test]
+    fn empty_compartment_membership_matches_no_contained_resource() {
+        let builder = QueryBuilder::new("t", "Observation");
+        let code = contained_param("code", SearchParamType::Token, None, &["X"]);
+        let not_status = contained_param(
+            "status",
+            SearchParamType::Token,
+            Some(SearchModifier::Not),
+            &["final"],
+        );
+
+        for (label, membership) in empty_memberships() {
+            for (name, parameters) in [
+                ("alone", vec![]),
+                ("code", vec![code.clone()]),
+                ("status:not", vec![not_status.clone()]),
+            ] {
+                for mode in [ContainedMode::On, ContainedMode::Both] {
+                    let mut query = contained_query(parameters.clone());
+                    query.contained = mode;
+                    query.compartment = Some(membership.clone());
+                    let frag = builder.build_contained(&query).unwrap();
+                    let (filter, grouping) = frag
+                        .sql
+                        .split_once(" GROUP BY ")
+                        .expect("the contained select groups per entity");
+                    assert!(
+                        filter.contains("contained_type = ?2 AND 0 = 1"),
+                        "{label} + {name}: {}",
+                        frag.sql
+                    );
+                    assert!(grouping.starts_with("resource_type"), "{}", frag.sql);
+                }
+            }
+        }
+
+        // A real membership adds a branch and no impossible filter.
+        let mut real = contained_query(vec![]);
+        real.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        let frag = builder.build_contained(&real).unwrap();
+        assert!(!frag.sql.contains("0 = 1"), "{}", frag.sql);
     }
 
     /// #1383: `_has` and `_list` select top-level resources.

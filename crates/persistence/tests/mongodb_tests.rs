@@ -1212,6 +1212,11 @@ mod token_code_system_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic empty compartment membership suite (#2509). Same
+/// `#[path]` arrangement.
+#[path = "search/empty_compartment_suite.rs"]
+mod empty_compartment_suite;
+
 /// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
 #[path = "search/total_mode_suite.rs"]
 mod total_mode_suite;
@@ -1320,6 +1325,23 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
         return;
     };
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
+}
+
+/// #2509: a compartment membership with no params or no reference matches
+/// nothing, on the plain, complement (`:not`/`:missing`), sorted, counted and
+/// `_contained` paths, where it used to be read as "no compartment". Needs the
+/// spec search parameters.
+#[tokio::test]
+async fn mongodb_empty_compartment_membership_matches_nothing() {
+    let Some(backend) = create_backend_with_full_registry("empty_compartment").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    empty_compartment_suite::empty_membership_matches_nothing_on_every_path(
+        &backend,
+        "empty-compartment-2509",
+    )
+    .await;
 }
 
 /// #2394: `value_reference` is stored normalized and old rows are rewritten

@@ -183,6 +183,11 @@ mod conditional_if_match_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic empty compartment membership suite (#2509). Same
+/// `#[path]` arrangement.
+#[path = "search/empty_compartment_suite.rs"]
+mod empty_compartment_suite;
+
 /// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
 #[path = "search/total_mode_suite.rs"]
 mod total_mode_suite;
@@ -35709,6 +35714,20 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #2509: a compartment membership with no params or no reference matches
+    /// nothing, on the plain, `:not`/`:missing`, sorted, counted and
+    /// `_contained` paths, where it used to be read as "no compartment" and
+    /// matched every resource of the type. A real membership is the control.
+    #[tokio::test]
+    async fn postgres_integration_empty_compartment_membership_matches_nothing() {
+        let backend = create_backend().await;
+        super::empty_compartment_suite::empty_membership_matches_nothing_on_every_path(
+            &backend,
+            &unique_base("empty_compartment"),
         )
         .await;
     }
