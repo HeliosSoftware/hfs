@@ -36,7 +36,7 @@ edition = "2024"
 license = "MIT"
 authors = ["Helios Software"]
 repository = "https://github.com/HeliosSoftware/hfs"
-rust-version = "1.91.1"
+rust-version = "1.95"
 
 [workspace.dependencies]
 serde = { version = "=1.0.224", features = ["derive"] }
