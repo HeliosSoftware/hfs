@@ -50,7 +50,14 @@ env:
   CARGO_INCREMENTAL: 0
   # The 16 MB main-thread stack the Windows builds link with (ci.yml's
   # "Configure Rust to use LLD (Windows)"); deep FHIR recursion needs it.
-  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/STACK:16777216"
+  #
+  # /DEBUG:NONE: rustc always passes /DEBUG to link.exe, even with debug=0,
+  # so every test binary got its own .pdb. On the EPYC 7763 runners D: (the
+  # checkout and target dir) is small, and the PDBs filled it: free space at
+  # the end of the build fell 9 -> 1 GB over a week until the link failed
+  # with LNK1140 "limit exceeded for program database" (runs 43567143907,
+  # 43686272175). Panics still print their messages; backtraces lose names.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/STACK:16777216 -C link-arg=/DEBUG:NONE"
   CLIPPY_ARGS: >-
     -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant
     -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if
@@ -182,7 +189,9 @@ jobs:
         run: |
           Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors
           "{0:N1} GB RAM" -f ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+          # Out-String: otherwise it joins the processor table above and the
+          # FreeGB column is cut off.
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}} | Out-String
 
       - name: Select the tests that do not need Docker
         run: |
@@ -213,7 +222,12 @@ jobs:
       - name: Disk after build
         if: always()
         shell: pwsh
-        run: Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}} | Out-String
+          if (Test-Path target) {
+            "target: {0:N1} GB" -f ((Get-ChildItem target -Recurse -File -Force | Measure-Object Length -Sum).Sum / 1GB)
+            "  .pdb: {0:N1} GB" -f ((Get-ChildItem target -Recurse -File -Force -Filter *.pdb | Measure-Object Length -Sum).Sum / 1GB)
+          }
 
   test-python:
     name: Test Python (Windows)
