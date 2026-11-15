@@ -46,7 +46,7 @@
 # MONGO_TXN_LIFETIME_S. Also appends a tuning table to $GITHUB_STEP_SUMMARY.
 set -euo pipefail
 
-MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-2}"
+MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-3.5}"
 if ! [[ "$MONGO_WT_CACHE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
    || ! awk -v v="$MONGO_WT_CACHE_GB" 'BEGIN { exit !(v >= 0.25 && v <= 6) }'; then
   echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB'); the Docker host is shared with all CI"

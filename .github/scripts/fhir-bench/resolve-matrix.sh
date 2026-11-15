@@ -181,9 +181,10 @@ case "$ES_SYNC_MODE" in
     FAIL=1 ;;
 esac
 
-# mongo_wt_cache_gb: decimal, 0.25..6 (parity with Postgres's
-# shared_buffers default; mongod's own default risks a host OOM).
-MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-2}"
+# mongo_wt_cache_gb: decimal, 0.25..6. Default 3.5: the four largest Synthea
+# transaction Bundles need at least 3.25 GB to load (2 GB refuses them with
+# TooLargeForCache); mongod's own default risks a host OOM.
+MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-3.5}"
 if ! [[ "$MONGO_WT_CACHE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
    || ! awk -v v="$MONGO_WT_CACHE_GB" 'BEGIN { exit !(v >= 0.25 && v <= 6) }'; then
   echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB')"
