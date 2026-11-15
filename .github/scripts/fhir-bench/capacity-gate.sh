@@ -69,7 +69,7 @@ case "$BACKEND" in
     fi
     ;;
   mongodb|mongodb-elasticsearch)
-    MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-2}"
+    MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-3.5}"
     # WT cache can be fractional (0.25..6) — let awk do the math.
     NEED_PRIMARY_MB=$(awk -v g="$MONGO_WT_CACHE_GB" 'BEGIN { printf "%d", g * 1024 + 1024 }')
     ;;

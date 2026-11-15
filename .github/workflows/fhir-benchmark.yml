@@ -218,9 +218,9 @@ on:
         required: false
         default: ""
       mongo_wt_cache_gb:
-        description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
+        description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 3.5 = the smallest round value that lets the four largest Synthea transaction Bundles load (3.25 is the measured minimum); mongod's own default (~5 GB here) risks a host OOM"
         required: false
-        default: "2"
+        default: "3.5"
       hfs_mongo_max_connections:
         description: "HFS MongoDB pool size (HFS default 10 starves crud's 300 VUs; 32 matches hfs_pg_max_connections)"
         required: false
@@ -1310,7 +1310,7 @@ jobs:
           # Mongo/ES values read n/a off their own legs. CAPACITY_* were
           # written to $GITHUB_ENV by "Docker host capacity gate", above.
           case "$BACKEND" in
-            mongodb*) MONGO_POOL_REC="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"; MONGO_WT_REC="${IN_MONGO_WT_CACHE_GB:-2}" ;;
+            mongodb*) MONGO_POOL_REC="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"; MONGO_WT_REC="${IN_MONGO_WT_CACHE_GB:-3.5}" ;;
             *)        MONGO_POOL_REC=n/a; MONGO_WT_REC=n/a ;;
           esac
           case "$BACKEND" in
