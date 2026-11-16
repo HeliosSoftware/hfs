@@ -301,6 +301,18 @@ pub enum RestError {
         message: String,
     },
 
+    /// A SQL query (`$sql-run`, `$sql-export`) ran out of its configured time
+    /// limit, `HFS_SOF_SQLQUERY_TIMEOUT_SECS`: its own SQL, a SQL View's, or
+    /// the materialization of a ViewDefinition it depends on (HTTP 504, code
+    /// `timeout`, #2577). Same status and code as [`RestError::GatewayTimeout`],
+    /// and for the same reasons (no `Retry-After`: the query is deterministically
+    /// too slow for the budget), but the advice the client gets is about the
+    /// query, not about search parameters.
+    SqlQueryTimeout {
+        /// The limit, in seconds, as configured.
+        secs: u64,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -470,6 +482,9 @@ impl fmt::Display for RestError {
             }
             RestError::GatewayTimeout { message } => {
                 write!(f, "Backend timeout: {}", message)
+            }
+            RestError::SqlQueryTimeout { secs } => {
+                write!(f, "SQL query timeout: exceeded {}s", secs)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -653,6 +668,16 @@ impl RestError {
                         .to_string(),
                 )
             }
+            RestError::SqlQueryTimeout { secs } => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                format!(
+                    "The SQL query exceeded the server's {secs}-second time limit. Each \
+                     ViewDefinition it depends on is materialized in full before the query \
+                     runs: narrow those views (a 'where', fewer columns) or simplify the query, \
+                     and try again."
+                ),
+            ),
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",

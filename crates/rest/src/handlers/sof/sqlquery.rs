@@ -582,9 +582,10 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                  HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
             ),
         },
-        SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
-            message: format!("query exceeded {secs}s timeout"),
-        },
+        // The query's own SQL, a SQL View's, or the materialization of a
+        // dependency ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS: a 504 with code
+        // `timeout`, as a cancelled CRUD statement answers, not a 422 (#2577).
+        SqlQueryError::Timeout { secs } => RestError::SqlQueryTimeout { secs },
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
@@ -674,6 +675,33 @@ mod tests {
                 .headers()
                 .contains_key(axum::http::header::RETRY_AFTER),
             "a 503 must carry Retry-After"
+        );
+    }
+
+    /// #2577: a query that ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS — its own
+    /// SQL, a SQL View's, or a dependency's materialization — is a 504 with an
+    /// OperationOutcome code of `timeout` naming the budget, not a 422 and not
+    /// a 500; and no `Retry-After`, since a prompt retry would only repeat the
+    /// same too-slow query.
+    #[test]
+    fn a_timeout_is_a_504_with_code_timeout() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 });
+        assert!(
+            matches!(rest, RestError::SqlQueryTimeout { secs: 30 }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+        assert!(message.contains("30-second"), "names the budget: {message}");
+
+        let response = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 }).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            !response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a cancelled query is not retried by waiting"
         );
     }
 

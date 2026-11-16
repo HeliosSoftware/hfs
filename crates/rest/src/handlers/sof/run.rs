@@ -1764,6 +1764,9 @@ pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
         SofError::Cancelled => RestError::InternalError {
             message: "View execution was cancelled".to_string(),
         },
+        // The store stopped a statement of the view at its time limit: a 504
+        // with code `timeout`, as a cancelled CRUD statement answers (#2577).
+        SofError::Timeout(message) => RestError::GatewayTimeout { message },
         // A declared-column misfit surfaced by a runner's columnar builder.
         SofError::Backend(ref msg) if declared_misfit_detail(msg).is_some() => {
             RestError::UnprocessableEntity {
