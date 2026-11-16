@@ -3265,6 +3265,10 @@ async fn an_update_that_lost_its_connection_runs_again_only_after_its_failed_att
 /// and met the open transaction's insert on every attempt, so the create gave up
 /// as `Unavailable` after the policy's four attempts. The first write is
 /// seeded as in `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again`.
+///
+/// The create carries its own id: a create of an id the backend minted sends no
+/// index `delete` in a transaction (`create_commands.rs`), so only a
+/// client-supplied id reaches the held command.
 #[tokio::test]
 async fn a_create_runs_again_only_after_its_failed_attempt_is_aborted() {
     let app = "fp-2307-create";
@@ -3296,7 +3300,7 @@ async fn a_create_runs_again_only_after_its_failed_attempt_is_aborted() {
         .create(
             &tenant,
             "Observation",
-            new_observation("final"),
+            observation("obs-2307", "final"),
             FhirVersion::default(),
         )
         .await;
