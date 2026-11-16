@@ -7,6 +7,10 @@
 //! duplicate as `AlreadyExists` (pinned by `storage.rs`'s
 //! `create_command_tests`, which reaches the attempt directly).
 //!
+//! The command counts scope their failpoint to one collection
+//! ([`counted_create`]), so a lookup mongod itself runs for the session does
+//! not count.
+//!
 //! These tests pin what stays the same: the resource reads back and is found
 //! by search, a duplicate create of a client id is `AlreadyExists` with nothing
 //! extra written, and two concurrent creates of one id end as exactly one
@@ -19,16 +23,45 @@
 use super::*;
 
 use crate::bulk_submit::FailPoint;
+use helios_persistence::error::StorageResult;
+use helios_persistence::types::StoredResource;
 
-/// A `failCommand` configuration that matches the existence check (`find`) and
-/// the search-index deletes (`delete`) without failing them, so its `count` is
-/// how many of them the scoped client sent.
-fn counting_find_and_delete() -> Document {
-    doc! {
-        "failCommands": ["find", "delete"],
+/// The collections a create's counted commands go to: its existence check
+/// (`find` on `resources`) and its two search-index deletes.
+const COUNTED: [(&str, &str); 3] = [
+    ("find", "resources"),
+    ("delete", "search_index"),
+    ("delete", "search_index_contained"),
+];
+
+/// Runs one create of `resource` under a `failCommand` that matches, without
+/// failing, the scoped client's `command` on `collection` of the backend's
+/// database, and returns the create's result and how many commands matched.
+///
+/// The failpoint is scoped to one namespace, not only to the client's
+/// `appName`: when a session runs its first transaction, mongod looks the
+/// session up in `config.transactions` with a `find` under the client's own
+/// operation, so an unscoped `find` count also includes that lookup. Whether
+/// the counted create reuses a session that already ran a transaction depends
+/// on the driver's session pool, so such a count is 1 higher at random.
+async fn counted_create(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    app: &str,
+    (command, collection): (&str, &str),
+    resource: serde_json::Value,
+) -> Option<(StorageResult<StoredResource>, i64)> {
+    let data = doc! {
+        "failCommands": [command],
+        "namespace": format!("{}.{collection}", backend.config().database_name),
         "blockConnection": true,
         "blockTimeMS": 0_i32,
-    }
+    };
+    let fail_point = FailPoint::enable(app, data, doc! { "times": 1000 }).await?;
+    let result = backend
+        .create(tenant, "Observation", resource, FhirVersion::default())
+        .await;
+    Some((result, fail_point.off_and_count().await))
 }
 
 fn observation(id: Option<&str>, status: &str) -> serde_json::Value {
@@ -81,8 +114,9 @@ async fn warm_tenant(backend: &MongoBackend, tenant: &TenantContext) {
         .expect("the warm-up create commits");
 }
 
-/// A `POST` sends no `find` and no `delete`; it reads back as written, its
-/// history row and search rows are stored, and search finds it.
+/// A `POST` sends no `find` on `resources` and no `delete` on either search
+/// index collection; it reads back as written, its history row and search
+/// rows are stored, and search finds it. One create per counted command.
 #[tokio::test]
 async fn a_post_create_sends_no_existence_check_and_no_index_delete() {
     let app = "fp-create-commands-post";
@@ -91,53 +125,49 @@ async fn a_post_create_sends_no_existence_check_and_no_index_delete() {
     };
     let tenant = create_tenant("create_commands_post");
     warm_tenant(&backend, &tenant).await;
-    let Some(fail_point) =
-        FailPoint::enable(app, counting_find_and_delete(), doc! { "times": 1000 }).await
-    else {
-        return;
-    };
 
-    let result = backend
-        .create(
-            &tenant,
-            "Observation",
-            observation(None, "final"),
-            FhirVersion::default(),
-        )
-        .await;
-    let entered = fail_point.off_and_count().await;
+    let mut ids = Vec::new();
+    for counted in COUNTED {
+        let Some((result, entered)) =
+            counted_create(&backend, &tenant, app, counted, observation(None, "final")).await
+        else {
+            return;
+        };
+        let stored = result.expect("the create commits");
+        assert_eq!(stored.version_id(), "1");
+        assert_eq!(
+            entered, 0,
+            "a create of a minted id in a transaction sends no {counted:?}"
+        );
 
-    let stored = result.expect("the create commits");
-    assert_eq!(stored.version_id(), "1");
-    assert_eq!(
-        entered, 0,
-        "a create of a minted id in a transaction sends no find and no delete"
-    );
+        let id = stored.id().to_string();
+        let read = backend
+            .read(&tenant, "Observation", &id)
+            .await
+            .unwrap()
+            .expect("the created resource reads back");
+        assert_eq!(read.content(), stored.content());
+        assert_eq!(read.content()["status"], "final");
+        assert_eq!(read.version_id(), "1");
 
-    let id = stored.id().to_string();
-    let read = backend
-        .read(&tenant, "Observation", &id)
-        .await
-        .unwrap()
-        .expect("the created resource reads back");
-    assert_eq!(read.content(), stored.content());
-    assert_eq!(read.content()["status"], "final");
-    assert_eq!(read.version_id(), "1");
-
-    let (resources, history, index) = rows(&backend, &tenant, &id).await;
-    assert_eq!((resources, history), (1, 1));
-    assert!(index > 0, "the create stored its search rows");
+        let (resources, history, index) = rows(&backend, &tenant, &id).await;
+        assert_eq!((resources, history), (1, 1));
+        assert!(index > 0, "the create stored its search rows");
+        ids.push(id);
+    }
 
     let found = backend
         .search(&tenant, &status_query("final"))
         .await
         .expect("search");
-    let ids: Vec<&str> = found.resources.items.iter().map(|r| r.id()).collect();
-    assert_eq!(ids, [id.as_str()]);
+    let mut found: Vec<&str> = found.resources.items.iter().map(|r| r.id()).collect();
+    found.sort_unstable();
+    ids.sort_unstable();
+    assert_eq!(found, ids);
 }
 
 /// A create of a client-supplied id still sends its existence check and both
-/// search-index deletes.
+/// search-index deletes: one of each, one create per counted command.
 #[tokio::test]
 async fn a_create_of_a_client_id_keeps_its_existence_check_and_index_delete() {
     let app = "fp-create-commands-client";
@@ -146,30 +176,26 @@ async fn a_create_of_a_client_id_keeps_its_existence_check_and_index_delete() {
     };
     let tenant = create_tenant("create_commands_client");
     warm_tenant(&backend, &tenant).await;
-    let Some(fail_point) =
-        FailPoint::enable(app, counting_find_and_delete(), doc! { "times": 1000 }).await
-    else {
-        return;
-    };
 
-    let result = backend
-        .create(
+    for (n, counted) in COUNTED.into_iter().enumerate() {
+        let id = format!("obs-client-{n}");
+        let Some((result, entered)) = counted_create(
+            &backend,
             &tenant,
-            "Observation",
-            observation(Some("obs-client"), "final"),
-            FhirVersion::default(),
+            app,
+            counted,
+            observation(Some(&id), "final"),
         )
-        .await;
-    let entered = fail_point.off_and_count().await;
-
-    result.expect("the create commits");
-    assert_eq!(
-        entered, 3,
-        "one find (existence) and two deletes (search_index, search_index_contained)"
-    );
-    let (resources, history, index) = rows(&backend, &tenant, "obs-client").await;
-    assert_eq!((resources, history), (1, 1));
-    assert!(index > 0);
+        .await
+        else {
+            return;
+        };
+        result.expect("the create commits");
+        assert_eq!(entered, 1, "a create of a client id sends one {counted:?}");
+        let (resources, history, index) = rows(&backend, &tenant, &id).await;
+        assert_eq!((resources, history), (1, 1));
+        assert!(index > 0);
+    }
 }
 
 /// A second create of a stored client id is `AlreadyExists`, and writes
