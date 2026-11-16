@@ -52,7 +52,7 @@ use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
     TableSchema, TerminologyKind, TerminologyRelation, project_view_definition,
-    referenced_identifiers,
+    push_down_view_definition, pushable_predicates, referenced_identifiers,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -820,6 +820,13 @@ pub(crate) async fn execute_plan_counting(
     let leaf_runner: Arc<dyn SofRunner> = runner
         .with_statement_timeout(budget)
         .unwrap_or_else(|| Arc::clone(runner));
+    // A filter of the subject's SQL can be pushed into a dependency only when
+    // the subject is the sole reader of it (#2574): an interior SQL View
+    // reads its dependencies in full.
+    let subject_only = !plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node, PlanNode::SqlView { .. }));
 
     for node in &plan.nodes {
         match node {
@@ -848,6 +855,18 @@ pub(crate) async fn execute_plan_counting(
                     },
                     None => (view, declared),
                 };
+                // #2574: yield only the rows the subject's WHERE can keep, when
+                // the subject is one plain SELECT over this one dependency and
+                // reads it under one label; the SQL still runs its whole WHERE.
+                let pushed = subject_only
+                    .then(|| labels_by_target.get(internal_name))
+                    .flatten()
+                    .and_then(|labels| match labels.as_slice() {
+                        [label] => pushable_predicates(subject_sql, label),
+                        _ => None,
+                    })
+                    .and_then(|predicates| push_down_view_definition(view, &predicates));
+                let view = pushed.as_ref().unwrap_or(view);
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
@@ -992,6 +1011,7 @@ pub(crate) async fn execute_plan_counting(
                     rows = inserted,
                     columns = schema.columns.len(),
                     projected = projected.is_some(),
+                    pushed = pushed.is_some(),
                     elapsed_ms,
                     "materialized SQL query dependency"
                 );
@@ -2534,6 +2554,105 @@ mod tests {
         .expect("the plan runs");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(*budget.lock().unwrap(), Some(Duration::from_secs(7)));
+    }
+
+    /// A `SofRunner` that keeps the last ViewDefinition it was asked to run
+    /// and yields one row.
+    struct ViewRecordingRunner {
+        seen: Arc<std::sync::Mutex<Option<Value>>>,
+    }
+
+    #[async_trait]
+    impl SofRunner for ViewRecordingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            *self.seen.lock().unwrap() = Some(view_definition);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                json!({"id": "o1", "status": "final"}),
+            )])))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "view-recording-test-runner"
+        }
+    }
+
+    fn typed_observation_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition", "resource": "Observation",
+            "name": "obs_flat", "url": "http://example.org/obs_flat",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "status", "path": "status", "type": "code"}
+            ]}]
+        })
+    }
+
+    async fn view_seen_for(subject_edges: Vec<Edge>, subject_sql: &str) -> Value {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let runner: Arc<dyn SofRunner> = Arc::new(ViewRecordingRunner {
+            seen: Arc::clone(&seen),
+        });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: typed_observation_view(),
+            }],
+            subject_edges,
+        };
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            subject_sql,
+            &[],
+            limits(1000, 1000),
+        )
+        .await
+        .expect("the plan runs");
+        let seen = seen.lock().unwrap().clone();
+        seen.expect("the runner was asked for the view")
+    }
+
+    /// #2574: a plain filter of the subject's WHERE on a typed column of its
+    /// one dependency reaches the runner as a `where` of the view.
+    #[tokio::test]
+    async fn a_plain_where_filter_is_pushed_into_the_dependency_view() {
+        let seen = view_seen_for(
+            vec![edge("obs", "__sof_node_0")],
+            "SELECT id FROM obs o WHERE o.status = 'final' AND id IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            seen["where"],
+            json!([{"path": "(status) = 'final'"}, {"path": "(id).exists()"}])
+        );
+    }
+
+    /// A dependency read under two labels, or by a query that is not one
+    /// plain SELECT over it, is run as declared: the filter stays in the SQL.
+    #[tokio::test]
+    async fn a_filter_is_not_pushed_when_the_dependency_has_two_labels_or_the_sql_is_not_plain() {
+        let two_labels = view_seen_for(
+            vec![edge("a", "__sof_node_0"), edge("b", "__sof_node_0")],
+            "SELECT a.id FROM a WHERE a.status = 'final'",
+        )
+        .await;
+        assert!(two_labels.get("where").is_none(), "{two_labels}");
+
+        let joined = view_seen_for(
+            vec![edge("obs", "__sof_node_0")],
+            "SELECT x.id FROM obs x JOIN obs y ON x.id = y.id WHERE x.status = 'final'",
+        )
+        .await;
+        assert!(joined.get("where").is_none(), "{joined}");
     }
 
     /// A `SofRunner` whose view never yields a row nor ends.
