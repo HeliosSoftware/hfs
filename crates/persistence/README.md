@@ -862,6 +862,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   indexes are described in [MongoDB history indexes](mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
+- Minimum server version: MongoDB 7.0.48 (CVE-2026-118383, a pre-authentication use-after-free in
+  replication, is fixed in 7.0.48; on newer lines use 8.0.37, 8.3.16 or 9.0.7 or later). CI, the
+  benchmark and the tests run `mongo:7.0.48`.
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
   `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
   chained/`_has` work via the REST-layer resolver)
@@ -887,9 +890,12 @@ To roll back to an older build on purpose, follow [Rolling back to an older buil
 # Build with MongoDB support
 cargo build --bin hfs --features mongodb --release
 
-# Start MongoDB (example using Docker)
+# Start MongoDB (example using Docker): a single-member replica set, which
+# transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:8.0
+  mongo:7.0.48 --replSet rs0 --bind_ip_all
+docker exec mongo mongosh --quiet --eval \
+  'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # Start the server
 HFS_STORAGE_BACKEND=mongodb \
@@ -1763,7 +1769,7 @@ cargo test -p helios-persistence --features mongodb --test mongodb_tests \
 ```
 
 To find where a lone Bundle aborts on your own hardware and cache size, run the ceiling harness
-(#1976, #2252, #2350). It starts its own `mongo:7.0` replica set with the cache you name and prints
+(#1976, #2252, #2350). It starts its own `mongo:7.0.48` replica set with the cache you name and prints
 `V1_CEILING_*` lines: the abort entry, the dirty bytes per entry, the BSON and JSON bytes of a
 Bundle (`V1_CEILING_PAYLOAD`) and, for a control Bundle you give it, whether it commits and where
 it aborts. The knobs are listed at the top of
@@ -1796,9 +1802,12 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 # Build with MongoDB and Elasticsearch support
 cargo build --bin hfs --features mongodb,elasticsearch --release
 
-# Start MongoDB (example using Docker)
+# Start MongoDB (example using Docker): a single-member replica set, which
+# transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:8.0
+  mongo:7.0.48 --replSet rs0 --bind_ip_all
+docker exec mongo mongosh --quiet --eval \
+  'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # Start Elasticsearch (example using Docker)
 docker run -d --name es -p 9200:9200 \
@@ -2403,7 +2412,7 @@ first attempt had already deleted the resources. Calling `purge_tenant_data` aga
 the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
 `500` `too-costly`, as described above.
 
-**Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger
+**Ceiling test.** An ignored test starts its own `mongo:7.0.48` replica set with a small WiredTiger
 cache and sends one lone synthetic Bundle (`COPIES` copies of a 267-entry fixture, so 15 copies are
 4,005 entries) through one backend per variant, each on a database of its own:
 

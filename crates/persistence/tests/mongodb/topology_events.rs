@@ -338,7 +338,7 @@ async fn a_dropped_connection_the_driver_reports_as_unknown_forgets_the_kept_ans
 async fn a_replica_set_restarted_as_a_standalone_server_takes_its_next_write_without_a_503() {
     let started = super::container_cleanup::with_cleanup_label(
         Mongo::default()
-            .with_tag("7.0")
+            .with_tag("7.0.48")
             .with_cmd([
                 "bash",
                 "-c",

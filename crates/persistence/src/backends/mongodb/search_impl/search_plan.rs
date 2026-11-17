@@ -4649,7 +4649,7 @@ mod candidate_tests {
         let (uri, _container) = match std::env::var("HFS_TEST_MONGODB_URL") {
             Ok(uri) => (uri, None),
             Err(_) => match testcontainers_modules::mongo::Mongo::default()
-                .with_tag("7.0")
+                .with_tag("7.0.48")
                 .start()
                 .await
             {

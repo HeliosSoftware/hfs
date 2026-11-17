@@ -35,7 +35,7 @@
 //!                      a `postgres:16` testcontainer with its default,
 //!                      untuned configuration; `mongodb` uses
 //!                      `HFS_TEST_MONGODB_URL` when set, else starts a
-//!                      single-node replica-set `mongo:7.0` testcontainer, and
+//!                      single-node replica-set `mongo:7.0.48` testcontainer, and
 //!                      drops its `chain_bench` database first)
 //! * `--iters N`        timed iterations per query (default 20; fewer for a
 //!                      query whose single run exceeds `--slow-ms`)
@@ -1636,11 +1636,11 @@ async fn main() {
                     Ok(url) => url,
                     Err(_) => {
                         let started = Mongo::default()
-                            .with_tag("7.0")
+                            .with_tag("7.0.48")
                             .with_cmd(["mongod", "--bind_ip_all", "--replSet", "rs0"])
                             .start()
                             .await
-                            .expect("start mongo:7.0");
+                            .expect("start mongo:7.0.48");
                         let mut init = started
                             .exec(ExecCommand::new([
                                 "mongosh",

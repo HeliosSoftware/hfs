@@ -177,9 +177,9 @@ docker run -d --name hfs-es -p 9200:9200 \
   -v hfs-es-data:/usr/share/elasticsearch/data \
   elasticsearch:8.15.0
 
-# MongoDB 7.0 (mongodb, mongo-es) — a single-node replica set: transaction Bundles
+# MongoDB 7.0, minimum 7.0.48 (CVE-2026-118383) (mongodb, mongo-es) — a single-node replica set: transaction Bundles
 # need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
-docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0.48 --replSet rs0 --bind_ip_all
 docker exec hfs-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)

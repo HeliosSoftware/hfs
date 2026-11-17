@@ -429,7 +429,7 @@ mod shared_mongo {
         NoAddress(testcontainers::TestcontainersError),
     }
 
-    /// Starts a mongo:7.0 single-member replica set (`rs0`) for one test or
+    /// Starts a mongo:7.0.48 single-member replica set (`rs0`) for one test or
     /// harness alone, and returns it with its URL. It has a writable primary when
     /// this returns. The container is removed when the first element is dropped.
     ///
@@ -457,7 +457,7 @@ mod shared_mongo {
         .chain(extra_flags.iter().copied());
         let container = super::container_cleanup::with_cleanup_label(
             Mongo::default()
-                .with_tag("7.0")
+                .with_tag("7.0.48")
                 .with_cmd(command)
                 .with_ulimit("nofile", 64000, Some(64000))
                 .with_startup_timeout(Duration::from_secs(120)),
@@ -497,7 +497,7 @@ mod shared_mongo {
                 // `SHARED` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
                 let container = super::container_cleanup::with_cleanup_label(
-                    Mongo::default().with_tag("7.0")
+                    Mongo::default().with_tag("7.0.48")
                         .with_label("github.run_id", &run_id)
                         // Cap WiredTiger's cache. By default mongod sizes it to
                         // ~50% of *host* RAM (ignoring container limits), so on CI
