@@ -1,24 +1,6 @@
 name: Docker lint
 
-# Lints the runtime Dockerfile that the tag-only `docker-build` job in ci.yml
-# publishes as ghcr.io/heliossoftware/{hfs,hts,sof-server,fhirpath-server}.
-#
-# Gates (fail the job):
-#   - hadolint, at the failure threshold and ignores in .hadolint.yaml;
-#   - `docker build --check` (BuildKit's own Dockerfile checks);
-#   - `trivy config` misconfigurations at HIGH or CRITICAL.
-# Report only (never fails the job): `trivy image` on an image built from a
-# staged context, HIGH and CRITICAL, written to the job summary. Base-image
-# CVEs appear and get fixed upstream on Debian's schedule, not this PR's.
-#
-# The staged context holds a stub `hfs` script, not a real binary, so this
-# runs in minutes with no cargo build. The image scan therefore covers the
-# OS layer only; the Rust dependencies are not visible to Trivy anyway (the
-# release binaries are not built with cargo-auditable).
-#
-# GitHub-hosted runner, unlike the self-hosted docker jobs in ci.yml: those
-# reach a remote Docker host through DOCKER_HOST, where bind mounts of the
-# checkout do not work, and the Trivy/hadolint containers here need them.
+# The image is built from a stub binary, so `trivy image` sees the OS layer only.
 
 on:
   pull_request:
@@ -37,7 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Tool images, pinned by version and index digest.
   HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
   TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
 

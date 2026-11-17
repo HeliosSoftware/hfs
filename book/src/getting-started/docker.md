@@ -43,37 +43,31 @@ docker run -p 8090:8090 -v hts-data:/data ghcr.io/heliossoftware/hts:latest
 
 ## Building Custom Images
 
-A generic Dockerfile at the repo root supports all server binaries via the
-`BINARY_NAME` build arg. It is runtime-only: it compiles nothing and copies an
-already-built binary out of the build context. So build the binary first, stage
-a context folder that holds it, and build against that folder. Building against
-the repo root fails.
+The root Dockerfile serves every server binary via the `BINARY_NAME` build
+arg. It compiles nothing: build the binary, stage it in a context folder, and
+build against that folder (not the repo root).
 
 ```bash
-# 1. Build the binary, with the features your deployment needs
+# 1. Build the binary
 cargo build --release -p helios-hfs --features postgres,s3
 
-# 2. Stage the context: the binary, plus data/ for the hfs image only
+# 2. Stage the binary, plus data/ for hfs only
 mkdir -p docker-context
 cp target/release/hfs docker-context/
 cp -r data docker-context/data
 
-# 3. Build with the root Dockerfile against the staged context
+# 3. Build against the staged context
 docker build -f Dockerfile --build-arg BINARY_NAME=hfs -t hfs docker-context
 ```
 
-The other servers use the same steps with their own binary and no `data/`, for
-example `--build-arg BINARY_NAME=sof-server` or
-`--build-arg BINARY_NAME=fhirpath-server --build-arg EXPOSE_PORT=3000`.
+Other servers: same steps, no `data/`, e.g. `--build-arg BINARY_NAME=sof-server`.
 
-> **Details:** Base image is `debian:13.7-slim` (trixie), pinned by digest. The
-> server runs as the non-root user `helios` (uid/gid 1000). Default exposed
-> port is 8080. Host-binding environment variables (`HFS_SERVER_HOST`,
-> `SOF_SERVER_HOST`, `FHIRPATH_SERVER_HOST`, `HTS_SERVER_HOST`) are set to
-> `0.0.0.0` inside the container. `/data` is the only writable directory: keep
-> databases and export output there (the image already points the HTS database
-> and the bulk export and submit output there). The image has a `HEALTHCHECK`
-> on `GET /health`.
+> **Details:** Base image is `debian:13.7-slim`, pinned by digest. The server
+> runs as non-root user `helios` (uid/gid 1000). Default exposed port is 8080.
+> Host-binding variables (`HFS_SERVER_HOST`, `SOF_SERVER_HOST`,
+> `FHIRPATH_SERVER_HOST`, `HTS_SERVER_HOST`) are set to `0.0.0.0`. `/data` is
+> the only writable directory; the image already puts the HTS database and
+> export output there.
 
 Set `HFS_BASE_URL` to the address used outside the container. For a TLS proxy
 that publishes HFS below `/fhir`, use

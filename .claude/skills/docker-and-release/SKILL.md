@@ -49,52 +49,19 @@ Build arguments:
 | `BINARY_NAME` | none (required) | Binary to copy in and exec; build fails if unset |
 | `EXPOSE_PORT` | `8080` | `EXPOSE`d port — CI uses `3000` for fhirpath-server, `8090` for hts |
 | `BOOTSTRAP_DIR` | `""` | Sets `HTS_BOOTSTRAP_DIR`; the hts image bakes in `crates/hts/terminology-data` and points here for first-boot auto-import |
-| `VERSION`, `REVISION`, `CREATED` | `dev`, `unknown`, `""` | OCI labels `org.opencontainers.image.version/revision/created`; the tag jobs in `ci.yml` do not pass them yet |
+| `VERSION`, `REVISION`, `CREATED` | `dev`, `unknown`, `""` | OCI labels; CI does not pass them yet |
 
 Container assumptions:
 
-- Base image is `debian:13.7-slim` (trixie), pinned by tag **and** by the digest of
-  its multi-platform index. Dependabot (`.github/dependabot.yml`, ecosystem
-  `docker`) proposes the next tag + digest weekly; do not hand-edit to a floating
-  tag. The build also runs `apt-get upgrade`, so trixie-security fixes newer than
-  the pinned base still land.
-- Runtime user is `helios`, uid/gid 1000, set as numeric `USER 1000:1000` — not `hfs`.
+- Base image is `debian:13.7-slim`, pinned by digest; Dependabot bumps it. The build runs `apt-get upgrade`.
+- Runtime user is `helios`, numeric `USER 1000:1000` — not `hfs`.
 - Default exposed port is `8080` (overridable via `EXPOSE_PORT`).
 - Server host variables are set to `0.0.0.0` inside the container: `HFS_SERVER_HOST`, `SOF_SERVER_HOST`, `FHIRPATH_SERVER_HOST`, and `HTS_SERVER_HOST`.
-- `HFS_DATABASE_URL` defaults to `:memory:`, and `/data` is a `VOLUME` owned by
-  uid 1000 — the only writable directory (`/app` is root-owned). So the image sets
-  `HTS_DATABASE_URL=/data/hts.db`, `HFS_BULK_EXPORT_OUTPUT_DIR=/data/bulk-export`,
-  `HFS_BULK_SUBMIT_OUTPUT_DIR=/data/bulk-submit` and `HFS_EXPORT_DIR=/data/exports`;
-  the binaries' own defaults are relative to `/app` and fail with "unable to open
-  database file" (hts) or "Permission denied" (hfs `$export`). `HFS_DATA_DIR` is
-  left unset on purpose: hfs reads the shipped search parameters from `/app/data`.
-- `HEALTHCHECK` probes `GET /health` with bash's `/dev/tcp` (the image has no
-  curl or wget) on the port from the binary's own `*_SERVER_PORT` variable;
-  start period 120 s covers the hts first-boot import (~55 s).
+- `HFS_DATABASE_URL` defaults to `:memory:`. `/data` (a `VOLUME`) is the only writable directory, so the image sets `HTS_DATABASE_URL=/data/hts.db`, `HFS_BULK_EXPORT_OUTPUT_DIR=/data/bulk-export`, `HFS_BULK_SUBMIT_OUTPUT_DIR=/data/bulk-submit` and `HFS_EXPORT_DIR=/data/exports`. `HFS_DATA_DIR` stays `/app/data` (shipped search parameters).
+- `HEALTHCHECK` probes `GET /health` via bash `/dev/tcp`.
 - Only the `hfs` image ships `data/` (the search-parameter definitions); CI gates this behind `include_data`. Without it the server falls back to a handful of embedded search parameters.
 
-Linting: `.github/workflows/docker-lint.yml` runs on PRs touching `Dockerfile`,
-`.dockerignore` or `.hadolint.yaml`. It fails on hadolint warnings
-(`.hadolint.yaml`; every ignore needs a reason comment), `docker build --check`,
-and `trivy config` HIGH/CRITICAL; `trivy image` is report-only. Same checks
-locally:
-
-```bash
-docker run --rm -i -v "$PWD/.hadolint.yaml:/.hadolint.yaml:ro" \
-  hadolint/hadolint:v2.15.1 hadolint --config /.hadolint.yaml - < Dockerfile
-docker build --check -f Dockerfile --build-arg BINARY_NAME=hfs docker-context
-docker run --rm -v "$PWD:/repo:ro" aquasec/trivy:0.76.2 \
-  config --severity HIGH,CRITICAL --exit-code 1 /repo/Dockerfile
-docker save hfs -o hfs.tar && docker run --rm -v "$PWD:/w:ro" aquasec/trivy:0.76.2 \
-  image --input /w/hfs.tar --severity HIGH,CRITICAL
-```
-
-Trivy sees only the OS packages: the release binaries are not built with
-`cargo-auditable`, so Rust dependency CVEs are not in its report.
-
-The compose files under `docker/` (bulk-export, bulk-submit, keycloak) are
-local developer and test stacks, not shipped; they are not linted or covered by
-Dependabot.
+`.github/workflows/docker-lint.yml` runs hadolint (`.hadolint.yaml`), `docker build --check` and Trivy on PRs that touch the Dockerfile.
 
 CI builds these images in the `docker-build` job of `ci.yml`, on tags only. It
 downloads the binary as an artifact, stages `docker-context/` exactly as above,
