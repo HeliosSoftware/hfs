@@ -1,0 +1,40 @@
+# Dependabot version updates for what the release ships or runs on.
+#
+# - docker: the root Dockerfile's base image (pinned by tag + index digest).
+#   Debian rebuilds the slim image for every point release and security
+#   batch; this is how the pinned digest moves forward.
+# - github-actions: the third-party actions in .github/workflows and
+#   the composite actions under .github/actions, grouped into one weekly PR.
+#
+# The compose stacks under docker/ are local developer scenarios, not
+# shipped, so they are deliberately left out. Other ecosystems (cargo, npm,
+# pip) are out of scope for this file.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "build(docker)"
+    groups:
+      base-image:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: weekly
+      day: tuesday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
