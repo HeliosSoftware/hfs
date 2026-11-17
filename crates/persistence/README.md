@@ -419,10 +419,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
   multiple fields. A MongoDB search-parameter sort with no filter asks the server for only the
   first `offset + _count + 1` ids, so memory follows the page, not the size of the type; it
-  answers 422 when `offset + _count` exceeds 300,000. A MongoDB `:not` or `:missing=true` search
-  with no positive parameter (or with only a compartment) reads the type in batches instead of
-  loading every id; past 300,000 matching ids it falls back to the query plan when one applies,
-  and otherwise answers 422.
+  answers 422 when `offset + _count` exceeds 300,000. A filtered single-parameter sort whose
+  matches exceed 300,000 reads the parameter's rows in sort order and checks them against the
+  search in batches, instead of answering 422; see `mongodb/search-indexes.md`. A MongoDB
+  `:not` or `:missing=true` search with no positive parameter (or with only a compartment) reads
+  the type in batches instead of loading every id; past 300,000 matching ids it falls back to the
+  query plan when one applies, and otherwise answers 422.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at

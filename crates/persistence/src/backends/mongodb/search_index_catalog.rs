@@ -37,6 +37,12 @@
 //! covered range scan. Rows written before it have no `tuple_code`; the planner
 //! uses the index only for a tenant whose rows are known complete
 //! (`composite_layout`).
+//!
+//! Generation 7 (#2588) adds `idx_search_date_end`, the date rows ordered by
+//! the end of their range, so a descending date sort over more matches than
+//! the id-set cap reads its rows in sort order. It is partial on `value_date`,
+//! like `idx_search_date_v3`, so rows written before #1391 are in it too, with
+//! a null end.
 
 use mongodb::{
     IndexModel,
@@ -51,6 +57,8 @@ pub(crate) const SEARCH_INDEX_COLLECTION: &str = "search_index";
 /// from a standard search by construction.
 pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &str = "search_index_contained";
 pub(crate) const SEARCH_DATE_RANGE_INDEX: &str = "idx_search_date_v3";
+/// Date rows by range end, then start: the order of a descending date sort.
+pub(crate) const SEARCH_DATE_END_INDEX: &str = "idx_search_date_end";
 
 /// The composite search index that composite and filtered sort queries hint.
 pub(crate) const SEARCH_COMPOSITE_INDEX: &str = "idx_search_composite";
@@ -70,7 +78,8 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// Generation 5 = generation 4 plus `idx_search_reference_target_v2` over the
 /// absolute-reference side field `value_reference_target` (#2394).
 /// Generation 6 = generation 5 plus [`COMPOSITE_TUPLE_INDEX`] (cq-p3).
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 6;
+/// Generation 7 = generation 6 plus [`SEARCH_DATE_END_INDEX`] (#2588).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 7;
 
 /// The generation that added `value_date_end` to every date row (#1391), and
 /// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
@@ -177,6 +186,18 @@ fn value_v1(name: &'static str, value_keys: &[&str]) -> SearchIndexSpec {
     }
 }
 
+/// The value index whose first value key is `field`, so its rows come in
+/// value order: what a parameter sort past the id-set cap walks.
+pub(crate) fn value_index_led_by(field: &str) -> Option<&'static str> {
+    current_specs()
+        .into_iter()
+        .find(|spec| {
+            spec.build == IndexBuild::Background
+                && spec.keys.keys().nth(LEADING.len()).map(String::as_str) == Some(field)
+        })
+        .map(|spec| spec.name)
+}
+
 /// Every index `search_index` should have once the current generation is
 /// complete.
 pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
@@ -193,6 +214,22 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
         // `[value_date, value_date_end)` and a search may bound either end.
         // Partial on `value_date` only, which every date row carries.
         value_v2(SEARCH_DATE_RANGE_INDEX, &["value_date", "value_date_end"]),
+        // Generation 7 (#2588): a descending date sort orders by the range
+        // end. Partial on `value_date`, not on the end, so a row written
+        // before #1391 is a null-end key here rather than absent.
+        SearchIndexSpec {
+            name: SEARCH_DATE_END_INDEX,
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "resource_type": 1_i32,
+                "param_name": 1_i32,
+                "value_date_end": 1_i32,
+                "value_date": 1_i32,
+                "resource_id": 1_i32,
+            },
+            partial: Some(doc! { "value_date": { "$exists": true } }),
+            build: IndexBuild::Background,
+        },
         value_v2("idx_search_number_v2", &["value_number"]),
         value_v2(
             "idx_search_quantity_v2",
@@ -475,6 +512,7 @@ mod tests {
                 "idx_search_string_v2",
                 "idx_search_token_v2",
                 "idx_search_date_v3",
+                SEARCH_DATE_END_INDEX,
                 "idx_search_number_v2",
                 "idx_search_quantity_v2",
                 COMPOSITE_TUPLE_INDEX,
@@ -488,7 +526,7 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 6);
+        assert_eq!(SEARCH_INDEX_GENERATION, 7);
         assert_eq!(COMPOSITE_TUPLE_GENERATION, 6);
     }
 
@@ -515,6 +553,47 @@ mod tests {
             Some(doc! { "value_date": { "$exists": true } })
         );
         assert_eq!(date.build, IndexBuild::Background);
+    }
+
+    #[test]
+    fn date_end_orders_by_the_range_end_and_is_partial_on_the_start() {
+        let date = current_specs()
+            .into_iter()
+            .find(|s| s.name == SEARCH_DATE_END_INDEX)
+            .unwrap();
+        let keys: Vec<&str> = date.keys.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "tenant_id",
+                "resource_type",
+                "param_name",
+                "value_date_end",
+                "value_date",
+                "resource_id"
+            ]
+        );
+        assert_eq!(
+            date.partial,
+            Some(doc! { "value_date": { "$exists": true } })
+        );
+        assert_eq!(date.build, IndexBuild::Background);
+    }
+
+    #[test]
+    fn every_sortable_value_field_has_an_index_led_by_it() {
+        for (field, index) in [
+            ("value_string", "idx_search_string_v2"),
+            ("value_token_code", "idx_search_token_v2"),
+            ("value_date", "idx_search_date_v3"),
+            ("value_number", "idx_search_number_v2"),
+            ("value_quantity_value", "idx_search_quantity_v2"),
+            ("value_reference", "idx_search_reference_v2"),
+            ("value_uri", "idx_search_uri_v2"),
+        ] {
+            assert_eq!(value_index_led_by(field), Some(index), "{field}");
+        }
+        assert_eq!(value_index_led_by("value_token_system"), None);
     }
 
     #[test]
@@ -631,7 +710,13 @@ mod tests {
                 spec.name
             );
             assert_eq!(keys.last(), Some(&"resource_id"), "{}", spec.name);
-            let leading_value = keys[3];
+            // The date-end index keeps rows without an end, so it is
+            // partial on the start that every date row carries.
+            let leading_value = if spec.name == SEARCH_DATE_END_INDEX {
+                "value_date"
+            } else {
+                keys[3]
+            };
             let partial = spec
                 .partial
                 .as_ref()
@@ -756,7 +841,7 @@ mod tests {
         let cmd = create_indexes_command(&background);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index"));
         let indexes = cmd.get_array("indexes").unwrap();
-        assert_eq!(indexes.len(), 11);
+        assert_eq!(indexes.len(), 12);
         let first = indexes[0].as_document().unwrap();
         assert_eq!(first.get_str("name"), Ok("idx_search_string_v2"));
         assert_eq!(first.get_document("key").unwrap(), &background[0].keys);
