@@ -13,7 +13,7 @@ The generic Dockerfile supports all server binaries through the `BINARY_NAME` bu
 argument. It is **runtime-only** — it compiles nothing, and copies an
 already-built binary out of the build context. So the context must be staged
 first; building against the repo root fails with
-`chmod: cannot access '/app/<binary>': No such file or directory` (and transfers
+`mv: cannot stat '/app/<binary>': No such file or directory` (and transfers
 the whole workspace, `target/` included, on the way to that error).
 
 ```bash
@@ -46,19 +46,18 @@ Build arguments:
 
 | Arg | Default | Purpose |
 |---|---|---|
-| `BINARY_NAME` | none (required) | Binary to copy in and exec; build fails if unset |
+| `BINARY_NAME` | none (required) | Binary in the context; installed as `/app/server`; build fails if unset |
 | `EXPOSE_PORT` | `8080` | `EXPOSE`d port — CI uses `3000` for fhirpath-server, `8090` for hts |
 | `BOOTSTRAP_DIR` | `""` | Sets `HTS_BOOTSTRAP_DIR`; the hts image bakes in `crates/hts/terminology-data` and points here for first-boot auto-import |
-| `VERSION`, `REVISION`, `CREATED` | `dev`, `unknown`, `""` | OCI labels; CI does not pass them yet |
 
 Container assumptions:
 
-- Base image is `debian:13.7-slim`, pinned by digest; Dependabot bumps it. The build runs `apt-get upgrade`.
-- Runtime user is `helios`, numeric `USER 1000:1000` — not `hfs`.
+- Two stages, both pinned by digest (Dependabot bumps them): a `debian:13.7-slim` builder renames the binary to `/app/server` and creates `/data`; the runtime is `gcr.io/distroless/cc-debian13` (glibc, libgcc, libssl3, zlib, zstd, ca-certificates; `distroless/base` lacks libgcc_s).
+- No shell: exec-form `ENTRYPOINT ["/app/server"]`, no `HEALTHCHECK` (probe `/health` from the orchestrator). For a shell, build with the `cc-debian13:debug` base and `--entrypoint sh`.
+- Runtime user is numeric `USER 1000:1000` (no named user).
 - Default exposed port is `8080` (overridable via `EXPOSE_PORT`).
 - Server host variables are set to `0.0.0.0` inside the container: `HFS_SERVER_HOST`, `SOF_SERVER_HOST`, `FHIRPATH_SERVER_HOST`, and `HTS_SERVER_HOST`.
 - `HFS_DATABASE_URL` defaults to `:memory:`. `/data` (a `VOLUME`) is the only writable directory, so the image sets `HTS_DATABASE_URL=/data/hts.db`, `HFS_BULK_EXPORT_OUTPUT_DIR=/data/bulk-export`, `HFS_BULK_SUBMIT_OUTPUT_DIR=/data/bulk-submit` and `HFS_EXPORT_DIR=/data/exports`. `HFS_DATA_DIR` stays `/app/data` (shipped search parameters).
-- `HEALTHCHECK` probes `GET /health` via bash `/dev/tcp`.
 - Only the `hfs` image ships `data/` (the search-parameter definitions); CI gates this behind `include_data`. Without it the server falls back to a handful of embedded search parameters.
 
 `.github/workflows/docker-lint.yml` runs hadolint (`.hadolint.yaml`), `docker build --check` and Trivy on PRs that touch the Dockerfile.

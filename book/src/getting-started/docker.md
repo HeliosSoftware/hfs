@@ -62,12 +62,14 @@ docker build -f Dockerfile --build-arg BINARY_NAME=hfs -t hfs docker-context
 
 Other servers: same steps, no `data/`, e.g. `--build-arg BINARY_NAME=sof-server`.
 
-> **Details:** Base image is `debian:13.7-slim`, pinned by digest. The server
-> runs as non-root user `helios` (uid/gid 1000). Default exposed port is 8080.
+> **Details:** Runtime base is `gcr.io/distroless/cc-debian13`, pinned by
+> digest: no shell, no package manager, no `HEALTHCHECK`. The binary is
+> `/app/server`, run as uid/gid 1000. Default exposed port is 8080.
 > Host-binding variables (`HFS_SERVER_HOST`, `SOF_SERVER_HOST`,
 > `FHIRPATH_SERVER_HOST`, `HTS_SERVER_HOST`) are set to `0.0.0.0`. `/data` is
 > the only writable directory; the image already puts the HTS database and
-> export output there.
+> export output there. To get a shell, build with the
+> `gcr.io/distroless/cc-debian13:debug` base and run `--entrypoint sh`.
 
 Set `HFS_BASE_URL` to the address used outside the container. For a TLS proxy
 that publishes HFS below `/fhir`, use

@@ -1,5 +1,1 @@
 failure-threshold: warning
-
-ignored:
-  # DL3008: security updates drop pinned .debs; the base is digest-pinned instead.
-  - DL3008
