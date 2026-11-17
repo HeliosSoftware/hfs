@@ -1534,6 +1534,12 @@ mod transaction_retry;
 #[path = "mongodb/write_abort_retry.rs"]
 mod write_abort_retry;
 
+/// A create of a minted id in a transaction sends no existence check and no
+/// search-index delete; duplicates and concurrent creates of one id still end
+/// as `AlreadyExists`.
+#[path = "mongodb/create_commands.rs"]
+mod create_commands;
+
 /// #2271: a transient driver failure of a single-document read is `Unavailable`
 /// (503); any other keeps its driver error as `Internal`'s source.
 #[path = "mongodb/read_errors.rs"]
