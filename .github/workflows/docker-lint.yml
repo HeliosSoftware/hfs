@@ -1,0 +1,98 @@
+name: Docker lint
+
+# Lints the runtime Dockerfile that the tag-only `docker-build` job in ci.yml
+# publishes as ghcr.io/heliossoftware/{hfs,hts,sof-server,fhirpath-server}.
+#
+# Gates (fail the job):
+#   - hadolint, at the failure threshold and ignores in .hadolint.yaml;
+#   - `docker build --check` (BuildKit's own Dockerfile checks);
+#   - `trivy config` misconfigurations at HIGH or CRITICAL.
+# Report only (never fails the job): `trivy image` on an image built from a
+# staged context, HIGH and CRITICAL, written to the job summary. Base-image
+# CVEs appear and get fixed upstream on Debian's schedule, not this PR's.
+#
+# The staged context holds a stub `hfs` script, not a real binary, so this
+# runs in minutes with no cargo build. The image scan therefore covers the
+# OS layer only; the Rust dependencies are not visible to Trivy anyway (the
+# release binaries are not built with cargo-auditable).
+#
+# GitHub-hosted runner, unlike the self-hosted docker jobs in ci.yml: those
+# reach a remote Docker host through DOCKER_HOST, where bind mounts of the
+# checkout do not work, and the Trivy/hadolint containers here need them.
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".hadolint.yaml"
+      - ".github/workflows/docker-lint.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Tool images, pinned by version and index digest.
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  dockerfile:
+    name: hadolint, build check, Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: hadolint
+        run: |
+          docker run --rm -i \
+            -v "$PWD/.hadolint.yaml:/.hadolint.yaml:ro" \
+            "$HADOLINT_IMAGE" hadolint --no-color --config /.hadolint.yaml - < Dockerfile
+
+      - name: Stage a build context (stub binary + data/)
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-context"
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/docker-context/hfs"
+          cp -r data "$RUNNER_TEMP/docker-context/data"
+
+      - name: docker build --check
+        run: |
+          docker build --check -f Dockerfile \
+            --build-arg BINARY_NAME=hfs "$RUNNER_TEMP/docker-context"
+
+      - name: Build the image (no push)
+        run: |
+          docker build -f Dockerfile \
+            --build-arg BINARY_NAME=hfs \
+            --build-arg VERSION="pr-${{ github.event.pull_request.number || 'manual' }}" \
+            --build-arg REVISION="${{ github.sha }}" \
+            -t hfs-docker-lint:ci "$RUNNER_TEMP/docker-context"
+          docker save hfs-docker-lint:ci -o "$RUNNER_TEMP/image.tar"
+
+      - name: trivy config (fails on HIGH/CRITICAL)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" "$TRIVY_IMAGE" \
+            config --severity HIGH,CRITICAL --exit-code 1 /repo/Dockerfile
+
+      - name: trivy image (report only)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$TRIVY_IMAGE" \
+            image --quiet --input /scan/image.tar \
+            --severity HIGH,CRITICAL --exit-code 0 \
+            --format table | tee "$RUNNER_TEMP/trivy-image.txt"
+          {
+            echo "### trivy image (report only, HIGH/CRITICAL)"
+            echo '```'
+            cat "$RUNNER_TEMP/trivy-image.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
