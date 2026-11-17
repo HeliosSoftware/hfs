@@ -34,24 +34,46 @@ docker run -p 3000:3000 ghcr.io/heliossoftware/fhirpath-server:latest
 docker run -p 8080:8080 ghcr.io/heliossoftware/sof-server:latest
 ```
 
-## Building Custom Images
-
-A generic Dockerfile at the repo root supports all server binaries via the `BINARY_NAME` build arg:
+## Terminology Server
 
 ```bash
-# Build the HFS server image
-docker build --build-arg BINARY_NAME=hfs -t hfs .
-
-# Build the SOF server image
-docker build --build-arg BINARY_NAME=sof-server -t sof-server .
-
-# Build the FHIRPath server image
-docker build --build-arg BINARY_NAME=fhirpath-server -t fhirpath-server .
+# First start imports the bundled terminology into /data/hts.db (about a minute)
+docker run -p 8090:8090 -v hts-data:/data ghcr.io/heliossoftware/hts:latest
 ```
 
-The Dockerfile expects the binary and `data/` files to be pre-staged in the build context. In CI, the binary is built separately and copied in before the Docker build step.
+## Building Custom Images
 
-> **Details:** Base image is `debian:bookworm-slim`. The server runs as non-root user `hfs`. Default exposed port is 8080. Host-binding environment variables (`HFS_SERVER_HOST`, `SOF_SERVER_HOST`, `FHIRPATH_SERVER_HOST`) are automatically set to `0.0.0.0` inside the container.
+A generic Dockerfile at the repo root supports all server binaries via the
+`BINARY_NAME` build arg. It is runtime-only: it compiles nothing and copies an
+already-built binary out of the build context. So build the binary first, stage
+a context folder that holds it, and build against that folder. Building against
+the repo root fails.
+
+```bash
+# 1. Build the binary, with the features your deployment needs
+cargo build --release -p helios-hfs --features postgres,s3
+
+# 2. Stage the context: the binary, plus data/ for the hfs image only
+mkdir -p docker-context
+cp target/release/hfs docker-context/
+cp -r data docker-context/data
+
+# 3. Build with the root Dockerfile against the staged context
+docker build -f Dockerfile --build-arg BINARY_NAME=hfs -t hfs docker-context
+```
+
+The other servers use the same steps with their own binary and no `data/`, for
+example `--build-arg BINARY_NAME=sof-server` or
+`--build-arg BINARY_NAME=fhirpath-server --build-arg EXPOSE_PORT=3000`.
+
+> **Details:** Base image is `debian:13.7-slim` (trixie), pinned by digest. The
+> server runs as the non-root user `helios` (uid/gid 1000). Default exposed
+> port is 8080. Host-binding environment variables (`HFS_SERVER_HOST`,
+> `SOF_SERVER_HOST`, `FHIRPATH_SERVER_HOST`, `HTS_SERVER_HOST`) are set to
+> `0.0.0.0` inside the container. `/data` is the only writable directory: keep
+> databases and export output there (the image already points the HTS database
+> and the bulk export and submit output there). The image has a `HEALTHCHECK`
+> on `GET /health`.
 
 Set `HFS_BASE_URL` to the address used outside the container. For a TLS proxy
 that publishes HFS below `/fhir`, use
