@@ -66,6 +66,17 @@ ENV FHIRPATH_SERVER_HOST=0.0.0.0
 ENV HTS_SERVER_HOST=0.0.0.0
 ENV HTS_BOOTSTRAP_DIR=${BOOTSTRAP_DIR}
 
+# Everything the servers write goes under the /data volume, the only directory
+# the runtime user owns. The built-in defaults are relative to /app (root-owned),
+# so without these `hts` exits at startup ("unable to open database file:
+# ./data/hts.db") and an hfs `$export` fails with "Permission denied" creating
+# ./data/exports. HFS_DATA_DIR is NOT moved: hfs reads the search parameters
+# shipped in /app/data from it.
+ENV HTS_DATABASE_URL=/data/hts.db
+ENV HFS_BULK_EXPORT_OUTPUT_DIR=/data/bulk-export
+ENV HFS_BULK_SUBMIT_OUTPUT_DIR=/data/bulk-submit
+ENV HFS_EXPORT_DIR=/data/exports
+
 # Numeric uid:gid (the `helios` user above), so runtimes that enforce
 # runAsNonRoot can verify it without reading /etc/passwd.
 USER 1000:1000
