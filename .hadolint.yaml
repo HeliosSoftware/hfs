@@ -1,0 +1,11 @@
+# hadolint configuration, read by .github/workflows/docker-lint.yml (and by a
+# local `docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro"
+# hadolint/hadolint:v2.15.1 < Dockerfile`). Every ignore needs a reason.
+failure-threshold: warning
+
+ignored:
+  # DL3008 (pin apt package versions): the image pins the Debian release by tag
+  # and index digest instead. Debian security updates replace the exact
+  # versions in place (the old .deb leaves the mirror), so `pkg=<version>`
+  # pins break the build on the next DSA instead of protecting it.
+  - DL3008

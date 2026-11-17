@@ -7,3 +7,10 @@ target/
 **/*.rs
 **/node_modules/
 **/__pycache__/
+# Never send local secrets or env files into an image layer.
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+*.key
