@@ -112,7 +112,8 @@ mod shared_mongo {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let container = crate::container_cleanup::with_cleanup_label(
             Mongo::default()
-                .with_tag("7.0.48")
+                .with_tag("9.0.8")
+                .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
                 .with_label("github.run_id", &run_id)
                 // Every fixture owns a database of collection and index files,
                 // and WiredTiger panics (taking `mongod` down) on EMFILE. Some

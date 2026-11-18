@@ -62,8 +62,9 @@
 #                                     pair.
 #   capture_backend_stats SUITE      per-suite ES/Mongo/composite snapshot.
 #                                     Writes <suite>-esstat.txt,
-#                                     <suite>-mongostat.txt and (ES legs)
-#                                     <suite>-syncmetrics.txt.
+#                                     <suite>-mongostat.txt,
+#                                     <suite>-tcmalloc.txt (mongo-tcmalloc.sh)
+#                                     and (ES legs) <suite>-syncmetrics.txt.
 #   write_import_completeness SUITE  import-completeness.txt plus the
 #                                     <1000-bundles ::warning:: (import
 #                                     suite only; a no-op for any other
@@ -324,6 +325,10 @@ capture_backend_stats() {
         });' 2>/dev/null || true
       timeout 60 docker stats --no-stream --format '{{.Name}} mem={{.MemUsage}} cpu={{.CPUPerc}}' "$MONGO_CONTAINER" 2>/dev/null || true
     } > "$RESULTS_DIR/${suite}-mongostat.txt" 2>&1 || echo "::warning::Mongo stats capture failed for $suite"
+    # tcmalloc per-CPU cache sizing after load (sized 0 = an affected
+    # leg, see mongo-tcmalloc.sh's header). Never fails.
+    bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/mongo-tcmalloc.sh" \
+      > "$RESULTS_DIR/${suite}-tcmalloc.txt" 2>&1 || true
   fi
   case "$BACKEND" in
     *-elasticsearch)

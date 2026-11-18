@@ -507,8 +507,14 @@ fn is_queued_drop(error: &mongodb::error::Error) -> bool {
 /// `lsid: { id: UUID("<uuid>"), uid: BinData(0, <hash>) }`; ordinary requests
 /// carry an empty string.
 fn lsid_from_debug_info(debug_info: &str) -> Option<uuid::Uuid> {
-    const MARKER: &str = "UUID(\"";
-    let start = debug_info.find(MARKER)? + MARKER.len();
+    // MongoDB 7.0 writes `lsid: { id: UUID("<uuid>"), uid: BinData(...) }`;
+    // 9.0 writes `lsid: <uuid>, <uid>, ...` with a bare UUID (#2605).
+    const UUID_MARKER: &str = "UUID(\"";
+    const BARE_MARKER: &str = "lsid: ";
+    let start = match debug_info.find(UUID_MARKER) {
+        Some(at) => at + UUID_MARKER.len(),
+        None => debug_info.find(BARE_MARKER)? + BARE_MARKER.len(),
+    };
     debug_info
         .get(start..start + 36)
         .and_then(|text| uuid::Uuid::parse_str(text).ok())
@@ -852,6 +858,12 @@ fn lsid_is_read_from_a_lock_debug_info() {
     assert_eq!(
         lsid_from_debug_info(open_transaction),
         Some(uuid::Uuid::parse_str("b7766088-61ce-408f-9677-91803d44c7ae").expect("uuid"))
+    );
+    // MongoDB 9.0 prints the session id as a bare UUID (#2605).
+    let open_transaction_9 = "lsid: fa429f72-c7d8-4b1e-9a55-0d3c2b6e1f10, 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=, (None), (None)";
+    assert_eq!(
+        lsid_from_debug_info(open_transaction_9),
+        Some(uuid::Uuid::parse_str("fa429f72-c7d8-4b1e-9a55-0d3c2b6e1f10").expect("uuid"))
     );
     assert_eq!(lsid_from_debug_info(""), None, "an ordinary request");
     assert_eq!(lsid_from_debug_info("no lsid here"), None);
