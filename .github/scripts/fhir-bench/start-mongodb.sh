@@ -52,7 +52,7 @@ if ! [[ "$MONGO_WT_CACHE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
   echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB'); the Docker host is shared with all CI"
   exit 1
 fi
-MONGO_IMAGE="mongo:7.0"
+MONGO_IMAGE="mongo:7.0.48"
 MONGO_TXN_LIFETIME_S=900
 MONGO_OPLOG_MB=2048
 
@@ -151,6 +151,12 @@ mongo_read_int() {
 }
 WT_MAX_BYTES=$(mongo_read_int 'Number(db.serverStatus().wiredTiger.cache["maximum bytes configured"])') || true
 TXN_LIFETIME=$(mongo_read_int 'Number(db.adminCommand({ getParameter: 1, transactionLifetimeLimitSeconds: 1 }).transactionLifetimeLimitSeconds)') || true
+MONGO_SERVER_VERSION=$(mongo_eval 'db.version()' 2>/dev/null | tr -d '\r' | tail -n 1) || true
+[[ "$MONGO_SERVER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || MONGO_SERVER_VERSION=unknown
+if [ "$MONGO_SERVER_VERSION" != "unknown" ] && [ "$MONGO_SERVER_VERSION" != "${MONGO_IMAGE#mongo:}" ]; then
+  echo "::warning::mongod reports $MONGO_SERVER_VERSION but the image is $MONGO_IMAGE"
+fi
+echo "mongod version: $MONGO_SERVER_VERSION"
 echo "WiredTiger cache max: $WT_MAX_BYTES bytes; transactionLifetimeLimitSeconds: $TXN_LIFETIME"
 if [ "$TXN_LIFETIME" = '?' ]; then
   echo "::error::could not read transactionLifetimeLimitSeconds after 5 attempts (2s apart) — cannot confirm import transactions won't abort at mongod's 60s default"
@@ -174,6 +180,7 @@ fi
   echo "| setting | value |"
   echo "|---|---|"
   echo "| image | \`$MONGO_IMAGE\` — single-member replica set \`rs0\`, directConnection |"
+  echo "| mongod version (db.version()) | \`$MONGO_SERVER_VERSION\` |"
   echo "| --wiredTigerCacheSizeGB | \`$MONGO_WT_CACHE_GB\` (mongod reports $WT_MAX_BYTES bytes) |"
   echo "| transactionLifetimeLimitSeconds | \`$TXN_LIFETIME\` |"
   echo "| --oplogSize | \`${MONGO_OPLOG_MB}MB\` |"
