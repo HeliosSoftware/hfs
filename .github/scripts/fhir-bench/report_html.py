@@ -46,17 +46,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LEG_FILES = ("runner-info.txt", "import.json", "crud.json", "search.json", "sql-run.json", "insert.json",
              "prewarm.json", "host-contention.txt", "bulk-import.txt")
 
-# v8 colours of the six known legs (validated with the dataviz palette validator).
+# Colours of the six known legs, the single source for the HTML report (it reads them from D.palette): six separate
+# hues, each +Elasticsearch leg with its own hue (not a tint of its database), chosen for contrast against each theme's
+# surface and for min pairwise deltaE2000 also under protan/deutan simulation. The report adds a marker shape per leg.
 PAL_KNOWN = {
-    "dark": {"postgres": "#236bcf", "sqlite": "#008622", "mongodb": "#9348b1",
-             "postgres-elasticsearch": "#4a91f8", "sqlite-elasticsearch": "#3fac4a",
-             "mongodb-elasticsearch": "#b96dd8"},
-    "light": {"postgres": "#1a52a1", "sqlite": "#036819", "mongodb": "#723789",
-              "postgres-elasticsearch": "#4780d2", "sqlite-elasticsearch": "#419547",
-              "mongodb-elasticsearch": "#9f63b9"}}
-# Hues for any other backend, cycled in the order of the sorted backend names.
-PAL_EXTRA = {"dark": ["#c9a227", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
-             "light": ["#8a6d00", "#a63a6e", "#16757c", "#a8501a", "#5b6785", "#4a7a1c"]}
+    "dark": {"postgres": "#6cb6ff", "sqlite": "#2f9226", "mongodb": "#8f5aec",
+             "postgres-elasticsearch": "#e3c94a", "sqlite-elasticsearch": "#e8829b",
+             "mongodb-elasticsearch": "#6ff5e4"},
+    "light": {"postgres": "#0a35cc", "sqlite": "#2b5f0c", "mongodb": "#8a7bff",
+              "postgres-elasticsearch": "#9a9100", "sqlite-elasticsearch": "#8a1550",
+              "mongodb-elasticsearch": "#2a9488"}}
+# Hues for any other backend, cycled in the order of the sorted backend names (kept away from the six above).
+PAL_EXTRA = {"dark": ["#756657", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
+             "light": ["#8a6d00", "#d94b78", "#16757c", "#a8501a", "#5b6785", "#6b725f"]}
 KNOWN_BASES = ("postgres", "sqlite", "mongodb")
 
 
@@ -805,7 +807,7 @@ def _hex_mix(a, b, t):
 
 
 def palette(order):
-    """{theme: {leg: hex}}: v8 colours for the six known legs, a stable cycle for any other backend;
+    """{theme: {leg: hex}}: PAL_KNOWN for the six known legs, a stable cycle for any other backend;
     the +Elasticsearch variant of an unknown backend is a lighter tint of its base colour."""
     bases = sorted({l[:-len("-elasticsearch")] if l.endswith("-elasticsearch") else l for l in order}
                    - set(KNOWN_BASES))

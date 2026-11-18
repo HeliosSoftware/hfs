@@ -34,9 +34,22 @@ p{margin:4px 0 10px}
 .meta{color:var(--ink-2);font-size:.9rem;display:flex;flex-wrap:wrap;gap:4px 16px}
 .meta b{color:var(--ink);font-weight:600}
 code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
-nav.toc{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 0}
-nav.toc a{color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:999px;padding:2px 10px;font-size:.85rem}
+nav.toc{margin:14px 0 0}
+nav.toc ul{list-style:none;margin:0;padding:0}
+nav.toc>ul{display:flex;flex-wrap:wrap;gap:6px}
+nav.toc li ul{display:none}
+nav.toc a{display:inline-block;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:999px;padding:2px 10px;font-size:.85rem}
 nav.toc a:hover{color:var(--ink);border-color:var(--axis)}
+nav.toc a.on{color:var(--ink);border-color:var(--accent)}
+/* wide screens: the index becomes a fixed left sidebar with every sub-section; the page shifts right, keeping its width */
+@media screen and (min-width:1400px){
+  .wrap{margin-left:max(252px,calc((100% - 1100px) / 2))}
+  nav.toc{position:fixed;top:16px;left:16px;width:220px;max-height:calc(100vh - 32px);overflow:auto;margin:0;z-index:5}
+  nav.toc>ul{display:block}
+  nav.toc li ul{display:block;padding-left:12px}
+  nav.toc a{display:block;border:0;border-left:2px solid transparent;border-radius:0;padding:2px 8px}
+  nav.toc a.on{border-left-color:var(--accent)}
+}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
 .verdict{margin-top:16px;border-left:6px solid var(--warn);background:var(--surface)}
 .verdict .title{font-weight:700;font-size:1.05rem}
@@ -86,7 +99,17 @@ td.n,th.n{text-align:right;white-space:nowrap}
 .seg button .dots{display:inline-flex;gap:2px}
 .seg button .dots i{width:7px;height:7px;border-radius:50%;display:block}
 .seg button:hover{color:var(--ink)}
-.seg button[aria-pressed="true"]{background:color-mix(in srgb,var(--c,var(--accent)) 28%,var(--surface));color:var(--ink);font-weight:600}
+.seg button:disabled{opacity:.5;cursor:default}
+/* pressed state, for every selector (leg pills, All, Compare branches, branch chips); aria-pressed is the source of truth.
+   Selected: solid fill + check + heavier text; not selected: neutral outline, muted text, hollow dot. The check's space is
+   always reserved and the heavier look is a text-shadow, so nothing changes width. */
+.seg button[aria-pressed]::before{content:"✓";display:inline-block;width:.9em;margin-right:-2px;text-align:center;font-weight:800;visibility:hidden}
+.seg button[aria-pressed="true"]::before{visibility:visible}
+.seg button[aria-pressed="true"]{background:var(--c,var(--accent));border-color:var(--c,var(--accent));color:var(--on,var(--on-accent,#fff));text-shadow:0 0 .6px currentColor,0 0 .6px currentColor}
+.seg button[aria-pressed="true"] .dot{background:var(--on,var(--on-accent,#fff));border:0}
+.seg button[aria-pressed="false"]{background:transparent;border-color:var(--border);color:var(--muted)}
+.seg button[aria-pressed="false"] .dot{background:transparent;border:2px solid var(--c,var(--muted))}
+.seg button[aria-pressed="false"]:hover{color:var(--ink);border-color:var(--axis)}
 .seg button:focus-visible,[data-tip]:focus-visible,.theme button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .legkey{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:.82rem;color:var(--ink-2);margin:12px 0 0;align-items:center}
 .legkey span{display:inline-flex;align-items:center;gap:6px}
@@ -127,6 +150,21 @@ footer{margin-top:40px;font-size:.8rem;color:var(--muted)}
   a{color:inherit}
 }
 figure{margin:0}
+/* enlarge button of the trend panels, and the dialog it opens */
+.xp{float:right;min-width:24px;min-height:24px;margin:-3px -3px 0 6px;padding:2px 4px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--ink-2);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font:inherit;font-size:.9rem;line-height:1}
+.xp:hover{color:var(--ink);border-color:var(--axis)}
+.xp:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+dialog#zoomDlg{padding:0;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--ink);width:min(1100px,calc(100vw - 32px));max-width:none;max-height:calc(100dvh - 32px)}
+dialog#zoomDlg::backdrop{background:rgba(0,0,0,.55)}
+#zoomDlg .zin{padding:14px 16px}
+#zoomDlg .ztop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#zoomDlg .ztop h3{margin:0;flex:1 1 auto}
+#zoomDlg .ztop .seg{margin:0}
+#zoomDlg .zbtn{float:none;margin:0}
+#zoomDlg details{margin-top:8px;font-size:.88rem}
+.col .xh{visibility:hidden}
+.col:hover .xh,.col:focus .xh{visibility:visible}
+@media (max-width:700px){ dialog#zoomDlg{width:100vw;height:100dvh;max-height:100dvh;margin:0;border:0;border-radius:0} }
 /*__PRINT_RULE__*/
 </style>
 </head>
@@ -139,7 +177,15 @@ figure{margin:0}
   </div>
   <div class="meta" id="meta"></div>
   <nav class="toc" aria-label="Sections">
-    <a href="#summary-section">Summary</a><a href="#validity-section">1 · Validity</a><a href="#results">2 · Results</a><a href="#detail">3 · Detail</a><a href="#data">4 · Data</a><a href="#glossary">Glossary</a>
+    <ul>
+      <li><a href="#summary-section">Run summary</a></li>
+      <li><a href="#validity-section">1 · Is this run valid?</a></li>
+      <li><a href="#results">2 · Results</a><ul><li><a href="#headTitle">Headline numbers</a></li><li><a href="#thrTitle">Throughput by suite</a></li><li><a href="#latTitle">Latency by suite</a></li></ul></li>
+      <li><a href="#trend-section">3 · Trend</a></li>
+      <li><a href="#detail">4 · Detail</a><ul><li><a href="#timelineTitle">Timeline and host load</a></li><li><a href="#bulkTitle">Bulk Import</a></li><li><a href="#batchTitle">Batch/Transaction Import</a></li><li><a href="#batchLatTitle">Latency per Bundle</a></li><li><a href="#impcmpTitle">Import comparison</a></li><li><a href="#sqlBlock">SQL-on-FHIR $sql-run by view</a></li><li><a href="#shapeBlock">Search by query shape</a></li></ul></li>
+      <li><a href="#data">5 · Full data</a><ul><li><a href="#healthTitle">Health of each leg</a></li><li><a href="#countsTitle">Result size cross-check</a></li></ul></li>
+      <li><a href="#glossary">Glossary</a></li>
+    </ul>
   </nav>
   <div class="legkey" id="legkey" aria-label="Leg colours"></div>
   <div class="card verdict" id="verdict" role="status"></div>
@@ -169,64 +215,25 @@ figure{margin:0}
   <p class="how" id="prevLegend">Change is against the nearest earlier run with a value; for ingest and indexing only against runs with the same indexing mode (Elasticsearch legs: deferred before #2248, inline since; other legs always deferred). For Elasticsearch legs the comparable measure across both modes is Bulk Import until searchable (resources/s).</p>
   <p class="how" id="hostNote"></p>
 
-  <h3>Throughput by suite, all legs</h3>
+  <h3 id="thrTitle">Throughput by suite, all legs</h3>
   <p class="how"><b>How to read this:</b> longer bar = more per second (the search indexing panel is in seconds: shorter is better); each panel has its own scale, so compare legs within a panel, not across panels.</p>
   <div class="legend"><span>† ‡ ⚠ validity marks (see glossary)</span></div>
   <div class="grid2" id="thr"></div>
 
-  <h3>Latency by suite (logarithmic scale)</h3>
+  <h3 id="latTitle">Latency by suite (logarithmic scale)</h3>
   <p class="how"><b>How to read this:</b> the dot is the median (p50), the vertical tick is the p95 and the end of the line is the p99; further left is faster and each axis mark is 10 times the previous one.</p>
   <div class="legend"><span>● p50 (typical)</span><span>┃ p95 (slowest 1 in 20)</span><span>┤ p99 (slowest 1 in 100)</span></div>
   <div class="grid2 wide" id="lat"></div>
 </section>
 
-<section id="detail">
-  <h2><span class="num">3</span>Detail</h2>
-
-  <h3>Timeline and host load</h3>
-  <p class="how"><b>How to read this:</b> pick <b>All</b> to compare every leg at once: one line per leg in its own colour (dashed line and diamond markers = the leg with Elasticsearch), with the leg name at the end of the line and the phases of each leg in a lane below. Pick a single leg to see its phase bands. The line is the Docker host load (1-minute average); <span id="cpuHow"></span></p>
-  <div class="seg" role="group" aria-label="Leg or all legs" id="segTime"></div>
-  <figure class="card chart" id="timeline"></figure>
-  <p class="note">There is only one reading at the start and one at the end of each phase; between readings the line is an interpolation. Each band covers the whole suite step (k6 plus diagnostic captures), not just the load. In the <b>All</b> view the legs are aligned at their own start, not at the same clock time.</p>
-
-  <h3>Bulk Import (/ui/bulk-import, <span class="mono">$bulk-submit</span>) by phase</h3>
-  <p class="how"><b>How to read this:</b> each bar is the time until the data can be searched; shorter is better. The official clock adds ingest and search indexing; the NDJSON conversion beforehand is shown separately. Where indexing runs <b>inline (during ingest)</b>, as on the Elasticsearch legs, it has no bar of its own: its time is inside the ingest bar. The colour of each bar is the leg.</p>
-  <div class="legend"><span><span class="sw neutral t"></span>conversion (not in the total)</span><span><span class="sw neutral"></span>ingest</span><span><span class="sw neutral h"></span>search indexing (deferred rebuild)</span></div>
-  <figure class="card chart" id="bulk"></figure>
-
-  <h3>Batch/Transaction Import (/ui/batch, k6 <span class="mono">import</span>) by phase</h3>
-  <p class="how"><b>How to read this:</b> each bar is the whole k6 step; shorter is better. The solid part is the import scenario, which is what resources/s divides by; the light part is k6 <span class="mono">setup()</span>, which seeds the Bundles before the load starts. Below each bar: resources, resources/s, Bundles completed out of <span id="proseTarget">the target</span> (<span class="mk">†</span> if the corpus is incomplete) and the error rate (<span class="mk">‡</span> above the threshold).</p>
-  <div class="legend"><span><span class="sw neutral t"></span>k6 setup() (seed Bundles)</span><span><span class="sw neutral"></span>import scenario</span></div>
-  <figure class="card chart" id="batch"></figure>
-  <h4 style="margin:12px 0 2px;font-size:.92rem">Latency per Bundle (logarithmic scale)</h4>
-  <p class="how"><b>How to read this:</b> time of one whole Bundle (<span class="mono">iteration_duration</span>): the dot is p50, the vertical tick p95 and the end of the line p99; further left is faster.</p>
-  <figure class="card chart" id="batchLat"></figure>
-
-  <h3>Import: Batch/Transaction vs Bulk (resources/s)</h3>
-  <p class="how"><b>How to read this:</b> for each leg, the solid bar is the Batch/Transaction Import and the outlined bar is the Bulk Import; longer is faster.</p>
-  <div class="legend"><span><span class="sw neutral"></span>Batch/Transaction (/ui/batch)</span><span><span class="sw neutral o"></span>Bulk (/ui/bulk-import)</span></div>
-  <figure class="card chart" id="impcmp"></figure>
-  <p class="note">These are different workloads: the Batch/Transaction Import is <span id="proseImpVus">concurrent</span> k6 clients posting Bundles, and the Bulk Import is a single <span class="mono">$bulk-submit</span> job; compare them as two ways to load data, not as the same test.</p>
-
-  <div id="sqlBlock">
-  <h3>SQL-on-FHIR <span class="mono">$sql-run</span> by view (logarithmic scale)</h3>
-  <p class="how"><b>How to read this:</b> one panel per ViewDefinition run by the <span class="mono">sql-run</span> suite; the dot is p50, the tick p95 and the end of the line p99 of the requests to that view; further left is faster.</p>
-  <div class="grid2 wide" id="sqlviews"></div>
-  </div>
-
-  <div id="shapeBlock">
-  <h3>Search by query shape</h3>
-  <p class="how"><b>How to read this:</b> the search average hides slow queries; here each row is a query type, the dark part reaches the median and the light part reaches the p95.</p>
-  <div class="seg" role="group" aria-label="Leg" id="segShape"></div>
-  <div class="legend" id="shapeLeg"></div>
-  <figure class="card chart" id="shapes"></figure>
-  <p class="note">Percentiles by index without interpolation, same as <span class="mono">search_by_shape.py</span> in CI; that is why they do not match k6 exactly.</p>
-  </div>
-
+<section id="trend-section">
+  <h2><span class="num">3</span>Trend</h2>
   <h3 id="trendTitle"></h3>
-  <div class="seg" role="group" aria-label="Leg" id="segTrend"></div>
+  <div class="seg" role="group" aria-label="Legs" id="segTrend"></div>
+  <div class="seg" role="group" aria-label="Branches" id="segBranch" style="display:none"></div>
   <p class="note" id="trendNote"></p>
-  <p class="how"><b>How to read this:</b> one point per run (leg colour = this run, orange = other runs), higher is better; with a single data point per date and different hosts, the line shows context, not a proven trend.</p>
+  <p class="how"><b>How to read this:</b> one point per run (leg colour = this run, orange = other runs), higher is better; with a single data point per date and different hosts, the line shows context, not a proven trend. Pick several legs to overlay them: one colour per leg (dashed = Elasticsearch), values in the tooltip. A dotted segment skips runs without a value: it is a gap, not a measurement.</p>
+  <div class="legend" id="trendLeg" style="display:none"></div>
   <div class="grid2" id="trend"></div>
   <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
   <p class="note" id="trendHost"></p>
@@ -234,23 +241,67 @@ figure{margin:0}
   <div id="vtrendBlock" style="display:none">
   <h3 id="vtrendTitle"></h3>
   <p class="note" id="vtrendNote"></p>
-  <p class="how"><b>How to read this:</b> one point per release version (its newest benchmark run), oldest version on the left; the leg buttons above pick the leg. Leg colour = this run, orange = earlier versions; higher is better except seconds. Runs of different versions may have run on different runners, so a step between two versions is a lead to check, not a proven regression.</p>
+  <p class="how"><b>How to read this:</b> one point per release version (its newest benchmark run), oldest version on the left; the first leg selected above picks the leg. Leg colour = this run, orange = earlier versions; higher is better except seconds. Runs of different versions may have run on different runners, so a step between two versions is a lead to check, not a proven regression.</p>
   <div class="grid2" id="vtrend"></div>
   <div class="card scroll" style="margin-top:10px"><table id="vtrendCtx"></table></div>
   <p class="note" id="vtrendHost"></p>
   </div>
 </section>
 
+<section id="detail">
+  <h2><span class="num">4</span>Detail</h2>
+
+  <h3 id="timelineTitle">Timeline and host load</h3>
+  <p class="how"><b>How to read this:</b> pick <b>All</b> to compare every leg at once: one line per leg in its own colour (dashed line and diamond markers = the leg with Elasticsearch), with the leg name at the end of the line and the phases of each leg in a lane below. Pick a single leg to see its phase bands. The line is the Docker host load (1-minute average); <span id="cpuHow"></span></p>
+  <div class="seg" role="group" aria-label="Leg or all legs" id="segTime"></div>
+  <figure class="card chart" id="timeline"></figure>
+  <p class="note">There is only one reading at the start and one at the end of each phase; between readings the line is an interpolation. Each band covers the whole suite step (k6 plus diagnostic captures), not just the load. In the <b>All</b> view the legs are aligned at their own start, not at the same clock time.</p>
+
+  <h3 id="bulkTitle">Bulk Import (/ui/bulk-import, <span class="mono">$bulk-submit</span>) by phase</h3>
+  <p class="how"><b>How to read this:</b> each bar is the time until the data can be searched; shorter is better. The official clock adds ingest and search indexing; the NDJSON conversion beforehand is shown separately. Where indexing runs <b>inline (during ingest)</b>, as on the Elasticsearch legs, it has no bar of its own: its time is inside the ingest bar. The colour of each bar is the leg.</p>
+  <div class="legend"><span><span class="sw neutral t"></span>conversion (not in the total)</span><span><span class="sw neutral"></span>ingest</span><span><span class="sw neutral h"></span>search indexing (deferred rebuild)</span></div>
+  <figure class="card chart" id="bulk"></figure>
+
+  <h3 id="batchTitle">Batch/Transaction Import (/ui/batch, k6 <span class="mono">import</span>) by phase</h3>
+  <p class="how"><b>How to read this:</b> each bar is the whole k6 step; shorter is better. The solid part is the import scenario, which is what resources/s divides by; the light part is k6 <span class="mono">setup()</span>, which seeds the Bundles before the load starts. Below each bar: resources, resources/s, Bundles completed out of <span id="proseTarget">the target</span> (<span class="mk">†</span> if the corpus is incomplete) and the error rate (<span class="mk">‡</span> above the threshold).</p>
+  <div class="legend"><span><span class="sw neutral t"></span>k6 setup() (seed Bundles)</span><span><span class="sw neutral"></span>import scenario</span></div>
+  <figure class="card chart" id="batch"></figure>
+  <h4 id="batchLatTitle" style="margin:12px 0 2px;font-size:.92rem">Latency per Bundle (logarithmic scale)</h4>
+  <p class="how"><b>How to read this:</b> time of one whole Bundle (<span class="mono">iteration_duration</span>): the dot is p50, the vertical tick p95 and the end of the line p99; further left is faster.</p>
+  <figure class="card chart" id="batchLat"></figure>
+
+  <h3 id="impcmpTitle">Import: Batch/Transaction vs Bulk (resources/s)</h3>
+  <p class="how"><b>How to read this:</b> for each leg, the solid bar is the Batch/Transaction Import and the outlined bar is the Bulk Import; longer is faster.</p>
+  <div class="legend"><span><span class="sw neutral"></span>Batch/Transaction (/ui/batch)</span><span><span class="sw neutral o"></span>Bulk (/ui/bulk-import)</span></div>
+  <figure class="card chart" id="impcmp"></figure>
+  <p class="note">These are different workloads: the Batch/Transaction Import is <span id="proseImpVus">concurrent</span> k6 clients posting Bundles, and the Bulk Import is a single <span class="mono">$bulk-submit</span> job; compare them as two ways to load data, not as the same test.</p>
+
+  <div id="sqlBlock">
+  <h3 id="sqlTitle">SQL-on-FHIR <span class="mono">$sql-run</span> by view (logarithmic scale)</h3>
+  <p class="how"><b>How to read this:</b> one panel per ViewDefinition run by the <span class="mono">sql-run</span> suite; the dot is p50, the tick p95 and the end of the line p99 of the requests to that view; further left is faster.</p>
+  <div class="grid2 wide" id="sqlviews"></div>
+  </div>
+
+  <div id="shapeBlock">
+  <h3 id="shapeTitle">Search by query shape</h3>
+  <p class="how"><b>How to read this:</b> the search average hides slow queries; here each row is a query type, the dark part reaches the median and the light part reaches the p95.</p>
+  <div class="seg" role="group" aria-label="Leg" id="segShape"></div>
+  <div class="legend" id="shapeLeg"></div>
+  <figure class="card chart" id="shapes"></figure>
+  <p class="note">Percentiles by index without interpolation, same as <span class="mono">search_by_shape.py</span> in CI; that is why they do not match k6 exactly.</p>
+  </div>
+</section>
+
 <section id="data">
-  <h2><span class="num">4</span>Full data</h2>
+  <h2><span class="num">5</span>Full data</h2>
   <p class="lead">All the numbers of the run; tap a header to sort.</p>
   <div class="card scroll"><table id="full"></table></div>
   <p class="marks" id="marksNote"></p>
 
-  <h3>Health of each leg</h3>
+  <h3 id="healthTitle">Health of each leg</h3>
   <div class="card scroll"><table id="health"></table></div>
 
-  <h3>Result size cross-check</h3>
+  <h3 id="countsTitle">Result size cross-check</h3>
   <p class="how"><b>How to read this:</b> totals each leg returned for the same queries; if they differ, the legs did not search over the same data.</p>
   <div class="card scroll"><table id="counts"></table></div>
 </section>
@@ -274,6 +325,22 @@ figure{margin:0}
 <footer id="foot"></footer>
 </div>
 <div id="tip" role="tooltip"></div>
+<dialog id="zoomDlg" aria-labelledby="zoomTitle">
+  <div class="zin">
+    <div class="ztop">
+      <h3 id="zoomTitle"></h3>
+      <div class="seg" role="group" aria-label="Chart options" id="zoomBar"></div>
+      <button type="button" class="xp zbtn" id="zoomPrev" aria-label="Previous chart">&#8592;</button>
+      <button type="button" class="xp zbtn" id="zoomNext" aria-label="Next chart">&#8594;</button>
+      <button type="button" class="xp zbtn" id="zoomClose" aria-label="Close">&#10005;</button>
+    </div>
+    <div class="u" id="zoomSub"></div>
+    <div class="legend" id="zoomLeg" style="display:none"></div>
+    <div class="chart" id="zoomChart" data-big="1"></div>
+    <p class="note">Hover a run (or tab to it) to see every series at that run; ← and → walk the nine charts; Esc closes.</p>
+    <details><summary>Data table</summary><div class="scroll"><table id="zoomTable"></table></div></details>
+  </div>
+</dialog>
 
 <script>
 "use strict";
@@ -282,9 +349,10 @@ const LEGS = D.order || [];
 const L = D.legs || {};
 const FIRST = LEGS.includes(D.headline) ? D.headline : LEGS[0];
 const TH = D.thresholds;
-/* Leg colours: one hue per backend, a lighter tint for the +Elasticsearch variant (dashed lines, diamond markers).
-   Validated with the dataviz validate_palette.js (see palette/validator-results.txt). */
-const LEGPAL = D.palette || {dark:{}, light:{}};
+/* Leg colours: one source, report_html.py PAL_KNOWN / PAL_EXTRA (dark and light values), embedded as D.palette. Six
+   separate hues for the known legs, each with its own marker shape (legShape) and a dashed line for Elasticsearch,
+   so colour is never the only cue. */
+const LEGPAL = {dark: Object.assign({}, (D.palette||{}).dark), light: Object.assign({}, (D.palette||{}).light)};
 const SURFHEX = {dark:"#161b22", light:"#ffffff"};
 let THEME = document.documentElement.getAttribute("data-theme")==="light" ? "light" : "dark";
 const legCol = l => (LEGPAL[THEME][l]) || (THEME==="dark"?"#8b949e":"#59636e");
@@ -296,7 +364,9 @@ function relLum(h){ const [r,g,b]=hexRgb(h).map(v=>{v/=255; return v<=.04045?v/1
 function contrastOf(a,b){ const x=relLum(a), y=relLum(b); return (Math.max(x,y)+.05)/(Math.min(x,y)+.05); }
 const onColor = h => contrastOf(h,"#ffffff") >= contrastOf(h,"#0d1117") ? "#ffffff" : "#0d1117";
 const NB = "Batch/Transaction Import (/ui/batch)", NK = "Bulk Import (/ui/bulk-import)", NKI = "↳ ingest, until Completed", NKX = "↳ search indexing (seconds)", NSQ = "SQL-on-FHIR $sql-run", NSR = "SQL-on-FHIR $sql-run (rows/s)";
-function legVars(){ const r = document.documentElement.style; Object.keys(LEGPAL.dark).forEach(l=>r.setProperty("--leg-"+l, legCol(l))); LEGS.forEach(l=>r.setProperty("--leg-"+l, legCol(l))); }
+// text colour on a solid fill of c (a hex or a var(--token) of the current theme)
+function onOf(c){ let h = c; try{ const m = /^var\((--[\w-]+)\)$/.exec(c); if(m) h = getComputedStyle(document.documentElement).getPropertyValue(m[1]).trim(); }catch(e){} return /^#[0-9a-f]{6}$/i.test(h) ? onColor(h) : "#ffffff"; }
+function legVars(){ const r = document.documentElement.style; [...new Set(Object.keys(LEGPAL.dark).concat(LEGS))].forEach(l=>{ r.setProperty("--leg-"+l, legCol(l)); r.setProperty("--on-leg-"+l, onColor(legCol(l))); }); r.setProperty("--on-accent", onOf("var(--accent)")); }
 legVars();
 const SUITES = ["prewarm","import","crud","search","sql-run","insert"];
 const NF = new Intl.NumberFormat("en-US",{maximumFractionDigits:0});
@@ -465,7 +535,9 @@ function roundRight(x,y,w,h,r,fill,extra=""){
 function panels(hostId, prefix, P){
   const host = $(hostId);
   if(!host.dataset.built){
-    host.innerHTML = P.map(([k,t,u])=>`<div class="card panel"><h4>${t}</h4><div class="u">${u}</div><div class="chart" id="${prefix}-${k}"></div></div>`).join("");
+    // trend panels get an enlarge button (opens #zoomDlg; one delegated listener on data-xp)
+    const xp = (k,t) => prefix==="tr" || prefix==="vtr" ? `<button type="button" class="xp noprint" data-xp="${prefix}-${k}" aria-label="Enlarge chart: ${esc(t)}"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M8.5 1.5h4v4M12.5 1.5l-4.5 4.5M5.5 12.5h-4v-4M1.5 12.5l4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>` : "";
+    host.innerHTML = P.map(([k,t,u])=>`<div class="card panel"><h4>${xp(k,t)}${t}</h4><div class="u">${u}</div><div class="chart" id="${prefix}-${k}"></div></div>`).join("");
     host.dataset.built = 1;
   }
 }
@@ -547,9 +619,11 @@ const LAT_P = [["search","Search","per request"],["crud","CRUD","per request"],[
 function renderLat(){ panels("lat","lat",LAT_P); LAT_P.forEach(([k,t])=>latPanel($("lat-"+k), k, t)); }
 
 /* ---------- selectors ---------- */
-const sel = {kpi: FIRST, time: "all", shape: FIRST, trend: FIRST};
+// trend: the selected legs, in the order they were picked (the first one drives the context table and the version trend);
+// cmp: Compare branches on; brOff: branches switched off in that view; yfit: Zoom Y (trend y axis from min to max)
+const sel = {kpi: FIRST, time: "all", shape: FIRST, trend: FIRST ? [FIRST] : [], cmp: false, brOff: new Set(), yfit: false};
 function seg(id, key, render, withAll){
-  const btn = l => `<button type="button" data-leg="${esc(l)}" aria-pressed="${l===sel[key]}" style="--c:var(--leg-${esc(l)})"><span class="dot${isES(l)?" es":""}" aria-hidden="true"></span>${esc(LBL(l))}</button>`;
+  const btn = l => `<button type="button" data-leg="${esc(l)}" aria-pressed="${l===sel[key]}" style="--c:var(--leg-${esc(l)});--on:var(--on-leg-${esc(l)})"><span class="dot${isES(l)?" es":""}" aria-hidden="true"></span>${esc(LBL(l))}</button>`;
   const all = withAll ? `<button type="button" data-leg="all" aria-pressed="${sel[key]==="all"}" style="--c:var(--accent)"><span class="dots" aria-hidden="true">${LEGS.map(l=>`<i style="background:var(--leg-${esc(l)})"></i>`).join("")}</span>All</button>` : "";
   $(id).innerHTML = all+LEGS.map(btn).join("");
   $(id).addEventListener("click", e=>{
@@ -558,6 +632,29 @@ function seg(id, key, render, withAll){
     $(id).querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed", x===b));
     render();
   });
+}
+// multi-select leg buttons: each one toggles its leg (at least one stays selected), All selects every leg;
+// while single() is true they pick one leg and All is hidden. Returns the function that re-syncs the buttons.
+function segMulti(id, key, render, single){
+  const host = $(id);
+  const btn = l => `<button type="button" data-leg="${esc(l)}" style="--c:var(--leg-${esc(l)});--on:var(--on-leg-${esc(l)})"><span class="dot${isES(l)?" es":""}" aria-hidden="true"></span>${esc(LBL(l))}</button>`;
+  host.innerHTML = `<button type="button" data-leg="all" style="--c:var(--accent)"><span class="dots" aria-hidden="true">${LEGS.map(l=>`<i style="background:var(--leg-${esc(l)})"></i>`).join("")}</span>All</button>`+LEGS.map(btn).join("");
+  const sync = () => host.querySelectorAll("button").forEach(x=>{
+    const l = x.dataset.leg;
+    x.setAttribute("aria-pressed", l==="all" ? sel[key].length===LEGS.length : sel[key].includes(l));
+    if(l==="all") x.style.display = single() ? "none" : "";
+  });
+  host.addEventListener("click", e=>{
+    const b = e.target.closest("button"); if(!b) return;
+    const l = b.dataset.leg, cur = sel[key];
+    if(l==="all") sel[key] = cur.concat(LEGS.filter(x=>!cur.includes(x)));
+    else if(single()) sel[key] = [l];
+    else if(cur.includes(l)){ if(cur.length>1) sel[key] = cur.filter(x=>x!==l); }
+    else sel[key] = cur.concat(l);
+    render(); sync();
+  });
+  sync();
+  return sync;
 }
 
 /* ---------- timeline ---------- */
@@ -573,10 +670,18 @@ function legSeries(leg){
   return {leg, P, t0:P[0].s, t1:P[P.length-1].s, phases:phases.filter(f=>f.b!=null)};
 }
 const phLabel = s => s==="bulk-import" ? "bulk" : s;
+// one marker shape per known leg (any other backend: circle, diamond for its +Elasticsearch variant)
+const LEG_SHAPE = {"postgres":"circle", "postgres-elasticsearch":"diamond", "sqlite":"square", "sqlite-elasticsearch":"cross", "mongodb":"triangle", "mongodb-elasticsearch":"triangle-down"};
+const legShape = l => LEG_SHAPE[l] || (isES(l) ? "diamond" : "circle");
 function marker(x,y,leg,r,extra=""){
-  const c = legCol(leg);
-  if(isES(leg)) return `<path d="M${x},${y-r-1.5}L${x+r+1.5},${y}L${x},${y+r+1.5}L${x-r-1.5},${y}Z" fill="${c}" stroke="${CSURF()}" stroke-width="1.5"${extra}/>`;
-  return `<circle cx="${x}" cy="${y}" r="${r}" fill="${c}" stroke="${CSURF()}" stroke-width="1.5"${extra}/>`;
+  const c = legCol(leg), sh = legShape(leg), f = `fill="${c}" stroke="${CSURF()}" stroke-width="1.5"${extra}`, q = r+1.5;
+  if(sh==="diamond") return `<path d="M${x},${y-q}L${x+q},${y}L${x},${y+q}L${x-q},${y}Z" ${f}/>`;
+  if(sh==="square") return `<rect x="${x-r}" y="${y-r}" width="${2*r}" height="${2*r}" ${f}/>`;
+  if(sh==="triangle") return `<path d="M${x},${y-q}L${x+q},${y+r}L${x-q},${y+r}Z" ${f}/>`;
+  if(sh==="triangle-down") return `<path d="M${x},${y+q}L${x+q},${y-r}L${x-q},${y-r}Z" ${f}/>`;
+  if(sh==="cross"){ const d = `M${x-r},${y-r}L${x+r},${y+r}M${x+r},${y-r}L${x-r},${y+r}`;
+    return `<g${extra}><path d="${d}" stroke="${CSURF()}" stroke-width="6" stroke-linecap="round"/><path d="${d}" stroke="${c}" stroke-width="3" stroke-linecap="round"/></g>`; }
+  return `<circle cx="${x}" cy="${y}" r="${r}" ${f}/>`;
 }
 const dash = leg => isES(leg) ? ' stroke-dasharray="7 4"' : "";
 function timeAxis(X, t0, total, y){
@@ -833,54 +938,193 @@ function renderShapes(){
 }
 
 /* ---------- trend ---------- */
-// T: the points to chart (default: this branch's runs); byVersion: one point per release version, labelled with its tag
+// x order of the runs, as run_key in report_html.py: numeric run id, then date
+const runKey = t => { const r = String(t.run||""); return [/^\d+$/.test(r) ? +r : 0, t.date||""]; };
+const cmpRun = (a,b) => { const x = runKey(a), y = runKey(b); return x[0]-y[0] || (x[1]<y[1] ? -1 : x[1]>y[1] ? 1 : 0); };
+// Compare branches: colours of the branches that are neither this run's (leg colour) nor main (--prev); colour-blind safe
+// hues kept away from the six leg colours, from main's orange and from each other; brMark shapes stay the main cue
+const BRPAL = {dark:["#d2f5b7","#c83a67","#1d8071","#85789f"], light:["#3c8baa","#a98d6a","#8f615e","#585a7f"]};
+function brMark(sh, x, y, r, col, hollow){
+  const f = hollow ? `fill="var(--surface)" stroke="${col}" stroke-width="2"` : `fill="${col}" stroke="var(--surface)" stroke-width="2"`;
+  if(sh==="square") return `<rect x="${x-r+1}" y="${y-r+1}" width="${2*r-2}" height="${2*r-2}" ${f}/>`;
+  if(sh==="triangle") return `<path d="M${x},${y-r-1}L${x+r+1},${y+r}L${x-r-1},${y+r}Z" ${f}/>`;
+  return `<circle cx="${x}" cy="${y}" r="${r}" ${f}/>`;
+}
+// branches of one leg (L[leg].trend_branches, absent today): this run's branch first, then main, then the rest
+function trendBranches(leg){
+  const tb = L[leg] && L[leg].trend_branches;
+  if(!tb || typeof tb!=="object" || !Object.keys(tb).length) return null;
+  const ref = D.ref || "", names = new Set(ref ? [ref] : []);
+  LEGS.forEach(l=>Object.keys((L[l] && L[l].trend_branches) || {}).forEach(b=>names.add(b)));
+  const own = (tb[ref] && tb[ref].length) ? tb[ref] : (L[leg].trend || []).filter(t=>ref && t.branch===ref);
+  // shapes and palette colours go only to branches with data for this leg, so the visible ones stay distinct
+  let i = 0, k = 0;
+  return [...names].sort((a,b)=>(a===ref?-1:b===ref?1:0) || (a==="main"?-1:b==="main"?1:0) || a.localeCompare(b)).map(n=>{
+    const T = (n===ref ? own : (Array.isArray(tb[n]) ? tb[n] : [])).slice().sort(cmpRun);
+    const col = n===ref ? legCol(leg) : n==="main" ? "var(--prev)" : T.length ? BRPAL[THEME][k++ % BRPAL[THEME].length] : "var(--muted)";
+    return {name: n, br: true, leg, T, col, shape: ["circle","square","triangle"][T.length ? i++ % 3 : 0]};
+  });
+}
+// the series of the trend panels: one per selected leg, or one per branch shown (Compare branches, a single leg)
+function trendSeries(T){
+  const legs = sel.trend;
+  if(sel.cmp && legs.length===1){ const B = trendBranches(legs[0]); if(B) return B.filter(s=>s.T.length && !sel.brOff.has(s.name)); }
+  if(legs.length<=1) return [{leg:legs[0], T, col:null}];
+  return legs.map(l=>({leg:l, T:(L[l] && L[l].trend) || [], col:legCol(l)}));
+}
+// y axis: a "nice" step (1, 2, 2.5, 5 or 10 x 10^n) splitting range into at most n intervals, and a short tick label (no unit)
+function niceStep(range, n){
+  if(!(range>0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(range/n)));
+  return [1,2,2.5,5,10].map(m=>m*p).find(s=>s >= range/n*(1-1e-9)) || 10*p;
+}
+const NFK = new Intl.NumberFormat("en-US",{maximumFractionDigits:2});
+function axisFmt(v, step){
+  const a = Math.abs(v);
+  if(a >= 1e6) return NFK.format(v/1e6)+"M";
+  if(a >= 1000) return NFK.format(v/1000)+"k";
+  return step < 1 ? NF1.format(v) : NF.format(v);
+}
+// legend of several trend series: line (dashed = Elasticsearch) and the series' marker, plus the dotted gap key
+function trendLegendHtml(S){
+  return S.map(s=>`<span><svg width="26" height="12" aria-hidden="true"><line x1="1" y1="6" x2="25" y2="6" stroke="${s.col}" stroke-width="2"${!s.br&&isES(s.leg)?' stroke-dasharray="7 4"':""}/>${s.br?brMark(s.shape,13,6,4,s.col,false):marker(13,6,s.leg,3.5)}</svg>${esc(s.br?s.name:LBL(s.leg))}</span>`).join("")+
+    `<span><svg width="26" height="12" aria-hidden="true"><line x1="2" y1="6" x2="24" y2="6" stroke="var(--muted)" stroke-width="2" stroke-dasharray="1 5" stroke-linecap="round"/></svg>gap (runs without a value)</span>`;
+}
+// T: the points to chart (default: this branch's runs); byVersion: one point per release version, labelled with its tag.
+// el.dataset.big (the enlarge dialog): taller, more ticks, wider lines, a hover column per run, legend and data table.
 function trendPanel(el, key, title, unit, T = trendOf(), byVersion = false){
-  const vals = T.map(t => key==="bulk" ? (t.bulk?t.bulk.rps:null) : key==="bulk_ingest" ? (t.bulk?t.bulk.ingest_rps:null) : key==="bulk_index" ? (t.bulk?t.bulk.index_eff:null) : (t.suites[key]?t.suites[key].rps:null));
-  if(!vals.some(ok)){ el.innerHTML = NODATA; return; }
-  const w = widthOf(el), ml = 8, mr = 8, mt = 18, ph = 90, mb = 24, pw = w-ml-mr;
-  const max = Math.max(...vals.filter(ok))*1.15;
-  const step = T.length>1 ? (pw-60)/(T.length-1) : pw;
-  const X = i => T.length===1 ? ml+pw/2 : ml+30+i*step, Y = v => mt+ph-v/max*ph;
-  let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
+  const big = !!(el.dataset && el.dataset.big);
+  const valOf = t => key==="bulk" ? (t.bulk?t.bulk.rps:null) : key==="bulk_ingest" ? (t.bulk?t.bulk.ingest_rps:null) : key==="bulk_index" ? (t.bulk?t.bulk.index_eff:null) : (t.suites&&t.suites[key]?t.suites[key].rps:null);
+  // a single series keeps its own order (col null = today's colours); several share the union of their runs, in run order
+  const S = byVersion ? [{leg:sel.trend[0], T, col:null}] : trendSeries(T), one = S.length===1;
+  const U = one ? S[0].T : [...new Map([].concat(...S.map(s=>s.T)).map(t=>[String(t.run), t])).values()].sort(cmpRun);
+  const at = new Map(U.map((t,i)=>[String(t.run), i]));
+  S.forEach(s=>{ s.P = []; s.v = []; s.T.forEach((t,j)=>{ const i = one ? j : at.get(String(t.run)); s.P[i] = t; s.v[i] = valOf(t); }); });
+  const sname = s => s.br ? s.name : LBL(s.leg);
+  if(big){ const zl = $("zoomLeg"); zl.innerHTML = S.length>1 ? trendLegendHtml(S) : ""; zl.style.display = S.length>1 ? "" : "none"; }
+  const vals = [].concat(...S.map(s=>s.v.filter(ok)));
+  if(!vals.length){ el.innerHTML = NODATA; if(big) $("zoomTable").innerHTML = ""; return; }
+  const N = U.length, w = widthOf(el), ml = 38, mr = 8, mt = 18, mb = 24, pw = w-ml-mr;
+  const ph = big ? Math.max(260, Math.min(420, Math.round(innerHeight*0.55))) : 90, nInt = big ? 5 : 3, lw = big ? 2.5 : 2;
+  // y domain: common to the visible series of this panel; from 0, or (Zoom Y) min..max with a range of at least 5 % of max
+  const fit = sel.yfit && (sel.cmp || big);
+  let lo = 0, hi = Math.max(...vals);
+  if(fit){ lo = Math.min(...vals); const need = Math.abs(hi)*0.05; if(hi-lo < need){ const mid = (hi+lo)/2; lo = mid-need/2; hi = mid+need/2; } }
+  const ys = niceStep(hi-lo, nInt);
+  const y0 = fit ? Math.max(Math.min(...vals) >= 0 ? 0 : -Infinity, Math.floor(lo/ys)*ys) : 0;
+  let y1 = Math.ceil(hi/ys)*ys; if(!(y1 > y0)) y1 = y0+ys;
+  const step = N>1 ? (pw-28)/(N-1) : pw;
+  const X = i => N===1 ? ml+pw/2 : ml+14+i*step, Y = v => mt+ph-(v-y0)/(y1-y0)*ph;
+  let b = "";
+  for(let k=0, n=Math.round((y1-y0)/ys); k<=n; k++){
+    const v = y0+k*ys, y = Y(v);
+    b += `<line x1="${ml}" y1="${y}" x2="${ml+pw}" y2="${y}" stroke="${k===0 && !fit ? "var(--axis)" : "var(--grid)"}" stroke-width="1"/>`;
+    b += txt(ml-6, y+3.5, axisFmt(v, ys), {anchor:"end", size:10.5, fill:"var(--muted)"});
+  }
+  if(fit) b += txt(ml, 10, "zoomed", {size:10, fill:"var(--muted)"});
   // ingest / indexing seconds only join across runs that indexed the same way (inline vs deferred)
   const modeSeries = key==="bulk_ingest" || key==="bulk_index";
   const sameMode = (p, q) => !modeSeries || (p.index_inline != null && q.index_inline != null && p.index_inline === q.index_inline);
   // a failed or cancelled rebuild is not a valid until-searchable / indexing time: hollow point, ‡, no line in or out
   const idxSeries = key==="bulk" || key==="bulk_index";
   const bad = t => idxSeries && (t.index_status==="failed" || t.index_status==="cancelled");
-  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])&&!bad(T[i-1])&&!bad(T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
-  T.forEach((t,i)=>{
+  // each point joins the nearest earlier point of its series that has a value; a join that skips a run is dotted (a gap,
+  // not a measurement). Never across indexing modes, never to or from a bad point, never over one (it stops the search).
+  // A branch series only counts its own runs as skipped: other branches' runs never cut or dot it.
+  // Solid lines are drawn first, dashed (Elasticsearch) and dotted (gap) ones on top.
+  const gapDash = ' stroke-dasharray="1 5" stroke-linecap="round"';
+  let solid = "", dashed = "";
+  S.forEach(s=>{
+    const lc = s.col || "var(--prev)", ld = !one && !s.br && isES(s.leg) ? ' stroke-dasharray="7 4"' : "";
+    let j = -1;
+    for(let i=0;i<N;i++){
+      const p = s.P[i];
+      if(!p || (!ok(s.v[i]) && !bad(p))) continue;
+      if(j>=0&&ok(s.v[j])&&ok(s.v[i])&&sameMode(s.P[j],p)&&!bad(s.P[j])&&!bad(p)){
+        let gap = false;
+        for(let k=j+1;k<i;k++) if(!s.br || s.P[k]) gap = true;
+        const seg = `<line x1="${X(j)}" y1="${Y(s.v[j])}" x2="${X(i)}" y2="${Y(s.v[i])}" stroke="${lc}" stroke-width="${lw}"${gap?gapDash:ld}/>`;
+        if(gap || ld) dashed += seg; else solid += seg;
+      }
+      j = i;
+    }
+  });
+  U.forEach((t,i)=>{
     const cur = String(t.run)===String(D.run), br = !byVersion && D.ref && t.branch!==D.ref;
     // version tags are wider than dates: drop the "v" and, when the points are close, label every other one (always the last)
-    const vlab = byVersion && (cur || step >= 42 || (T.length-1-i)%2===0);
-    if(!byVersion || vlab) b += txt(X(i), mt+ph+15, byVersion ? (t.branch||"n/a").replace(/^v/,"") : short(t.date)+(br?" *":""), {anchor:"middle", size:byVersion?10.5:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
-    if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, byVersion ? "–" : "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
-    const col = cur?legCol(sel.trend):"var(--prev)";
-    const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
-                     : bad(t) ? `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
-                     : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
+    const vlab = byVersion && (cur || step >= 42 || (N-1-i)%2===0);
+    // dates: every dk-th label counted back from the last (always shown), so no two shown labels overlap (~50px each, " *" included);
+    // all of them when they fit. Every point keeps its tooltip with the full date and run.
+    const dk = Math.max(1, Math.ceil(50/step)), dlab = !byVersion && (N-1-i)%dk===0;
+    if(dlab || vlab) b += txt(X(i), mt+ph+15, byVersion ? (t.branch||"n/a").replace(/^v/,"") : short(t.date)+(br?" *":""), {anchor:"middle", size:byVersion?10.5:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
+    if(one && !ok(S[0].v[i])) b += txt(X(i), mt+ph-6, byVersion ? "–" : "no data", {anchor:"middle", size:10, fill:"var(--muted)"});
+  });
+  b += solid + dashed;
+  S.forEach(s=>s.P.forEach((t,i)=>{
+    if(!ok(s.v[i])) return;
+    const cur = String(t.run)===String(D.run), br = !byVersion && !s.br && D.ref && t.branch!==D.ref;
+    const col = s.col || (cur?legCol(s.leg):"var(--prev)"), x = X(i), y = Y(s.v[i]), r = cur?6:5;
+    const shape = s.br ? brMark(s.shape, x, y, r, col, bad(t))
+                     : br ? `<rect x="${x-5}" y="${y-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : bad(t) ? `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : one ? `<circle cx="${x}" cy="${y}" r="${r}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`
+                     : marker(x, y, s.leg, r-1);
     let m = (t.markers||{})[key]||"";
     if(bad(t) && !m.includes("‡")) m += "‡";
     const der = (t.source==="comparison.md"||t.rounded) ? "\nderived from comparison.md (rounded)" : "";
-    const dfr = modeSeries && t.index_inline === false && isEs(sel.trend) ? "\ndeferred indexing (before #2248)" : "";
-    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
-    b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
-  });
+    const dfr = modeSeries && t.index_inline === false && isEs(s.leg) ? "\ndeferred indexing (before #2248)" : "";
+    const who = one ? "" : sname(s)+" · ", sha = s.br && t.sha ? " · "+String(t.sha).slice(0,9) : "";
+    b += `<g${tipAttr(`${who}${t.run} · ${fdate(t.date)}\n${t.branch||(s.br?s.name:"")}${sha}\n${thr(s.v[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
+    // value labels: a single series only (several: values in the tooltip); small panels label the current run, the
+    // dialog every point up to 20 runs. The † ‡ marks stay painted on their point even without a label.
+    if(one && (cur || (big && N<=20))) b += txt(x, y-10, thr(s.v[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
+    else if(m) b += txt(x, y-9, m, {anchor:"middle", size:11, fill:"var(--bad)", weight:700});
+  }));
+  if(big){
+    // a transparent column per run on top: its tooltip lists every series at that run; the guide line shows on hover
+    const cw = N>1 ? step : pw;
+    U.forEach((t,i)=>{
+      const sha = t.sha ? " · "+String(t.sha).slice(0,9) : "";
+      const rows = S.map(s=>{ const p = s.P[i]; if(!p) return null; let m = (p.markers||{})[key]||""; if(bad(p) && !m.includes("‡")) m += "‡"; return `${sname(s)}: ${ok(s.v[i])?thr(s.v[i])+" "+unit:"no data"}${m?" "+m:""}`; }).filter(Boolean);
+      b += `<g class="col"${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}${sha}\n${rows.join("\n")}`)}><rect x="${X(i)-cw/2}" y="${mt}" width="${cw}" height="${ph}" fill="transparent"/><line class="xh" x1="${X(i)}" y1="${mt}" x2="${X(i)}" y2="${mt+ph}" stroke="var(--axis)" stroke-width="1"/></g>`;
+    });
+    $("zoomTable").innerHTML = `<thead><tr><th>${byVersion?"Version":"Run"}</th><th>Start</th>${S.map(s=>`<th class="n">${esc(sname(s))}</th>`).join("")}</tr></thead><tbody>`+
+      U.map((t,i)=>`<tr><td class="mono">${esc(byVersion ? t.branch||"n/a" : t.run)}</td><td>${fdate(t.date)}</td>${S.map(s=>`<td class="n">${ok(s.v[i])?thr(s.v[i]):"–"}</td>`).join("")}</tr>`).join("")+"</tbody>";
+  }
   el.innerHTML = svg(w, mt+ph+mb, b, (byVersion?"Version trend ":"Trend ")+title);
 }
-const trendOf = () => (L[sel.trend] && L[sel.trend].trend) || [];
+const trendOf = () => (L[sel.trend[0]] && L[sel.trend[0]].trend) || [];
+// Zoom Y (y axis from min to max instead of 0): one global toggle, shown with Compare branches and in the dialog
+const YFIT_BTN = () => `<button type="button" data-yfit="1" aria-pressed="${sel.yfit}" title="y axis from the lowest to the highest value instead of from 0">Zoom Y</button>`;
+// Compare branches toggle and branch chips: only with one leg selected that has trend_branches
+function renderBranchBar(){
+  const el = $("segBranch"), B = sel.trend.length===1 ? trendBranches(sel.trend[0]) : null;
+  if(!B){ sel.cmp = false; el.style.display = "none"; el.innerHTML = ""; return; }
+  el.style.display = "";
+  el.innerHTML = `<button type="button" data-cmp="1" aria-pressed="${sel.cmp}" title="one line per branch of this leg">Compare branches</button>`+(sel.cmp ? YFIT_BTN()+B.map(s=>{
+    const n = s.T.length;
+    return n ? `<button type="button" data-br="${esc(s.name)}" aria-pressed="${!sel.brOff.has(s.name)}" style="--c:${s.col};--on:${onOf(s.col)}"><span class="dot" aria-hidden="true"></span>${esc(s.name)} · ${n} point${n===1?"":"s"}</button>`
+             : `<button type="button" disabled style="--c:${s.col}"><span class="dot" aria-hidden="true"></span>${esc(s.name)} · no data for this leg</button>`;
+  }).join("") : "");
+}
 function renderTrend(){
-  const TT = trendOf();
-  $("trendTitle").textContent = "Trend of "+LBL(sel.trend)+" ("+TT.length+" run"+(TT.length===1?"":"s")+")";
+  renderBranchBar();
+  const TT = trendOf(), legs = sel.trend, S = trendSeries(TT), many = legs.length>1;
+  const who = legs.map(LBL).join(", ")+(sel.cmp?" by branch":"");
+  const AT = [...new Map([].concat(...S.map(s=>s.T)).map(t=>[String(t.run), t])).values()], nR = AT.length;
+  $("trendTitle").textContent = "Trend of "+who+" ("+nR+" run"+(nR===1?"":"s")+")";
   $("trend").dataset.built = ""; $("trendCtx").dataset.built = "";
-  const nEarlier = TT.filter(t => String(t.run)!==String(D.run)).length;
-  const nDer = TT.filter(t => t.source==="comparison.md").length;
-  const derNote = nDer ? nDer+" of the "+nEarlier+" earlier run"+(nEarlier===1?"":"s")+" shown "+(nDer===1?"is":"are")+" derived from comparison.md: values are rounded; ES ingest and indexing values before #2248 measure deferred indexing. No line joins ingest or indexing points of different indexing modes." : "";
-  $("trendNote").textContent = (TT.length < 2
-    ? "Only "+TT.length+" data point"+(TT.length===1?"":"s")+" for this leg ("+(D.history_runs||0)+" earlier run"+(D.history_runs===1?"":"s")+" found): a trend needs at least 2 runs, so the charts below show what exists without drawing a line."
-    : "") + (derNote ? (TT.length < 2 ? " " : "") + derNote : "");
-  if(!TT.length){ $("trend").innerHTML = NODATA; $("trendCtx").innerHTML = ""; return; }
-  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
+  const nEarlier = AT.filter(t => String(t.run)!==String(D.run)).length;
+  const nDer = AT.filter(t => t.source==="comparison.md").length;
+  const derNote = nDer ? nDer+" of the "+nEarlier+" earlier run"+(nEarlier===1?"":"s")+" shown "+(nDer===1?"is":"are")+" derived from comparison.md: values are rounded; ES ingest and indexing values before #2248 measure deferred indexing. No line joins ingest or indexing points of different indexing modes, nor a failed or cancelled rebuild; a dotted line skips runs without a value." : "";
+  $("trendNote").textContent = (nR < 2
+    ? "Only "+nR+" data point"+(nR===1?"":"s")+" for "+(many?"the selected legs":"this leg")+" ("+(D.history_runs||0)+" earlier run"+(D.history_runs===1?"":"s")+" found): a trend needs at least 2 runs, so the charts below show what exists without drawing a line."
+    : "") + (derNote ? (nR < 2 ? " " : "") + derNote : "");
+  const lg = $("trendLeg");
+  lg.style.display = S.length>1 ? "" : "none";
+  lg.innerHTML = S.length>1 ? trendLegendHtml(S) : "";
+  if(!nR){ $("trend").innerHTML = NODATA; $("trendCtx").innerHTML = ""; return; }
+  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+who]);
   panels("trend","tr",P);
   if(!$("trendCtx").dataset.built){
     let h = `<thead><tr><th>Run</th><th>Start</th><th>Branch</th><th>Runner</th><th class="n">Load at crud start</th><th class="n">pg ms/call in crud</th><th>Notes</th></tr></thead><tbody>`;
@@ -890,7 +1134,7 @@ function renderTrend(){
       if(!t.suites.import) notes.push("no import");
       if(!t.suites.search) notes.push("no search");
       if(t.source==="comparison.md"||t.rounded) notes.push("derived from comparison.md (rounded values)");
-      if(t.bulk && t.index_inline === false && isEs(sel.trend) && !(t.notes||[]).some(x => /before #2248/.test(x))) notes.push("deferred indexing (before #2248)");
+      if(t.bulk && t.index_inline === false && isEs(sel.trend[0]) && !(t.notes||[]).some(x => /before #2248/.test(x))) notes.push("deferred indexing (before #2248)");
       if(HOSTCH.some(c => hostBefore(t.date, c))) notes.push("older Docker host");
       if(t.partial_run) notes.push("run failed: some legs missing");
       (t.notes||[]).forEach(x => notes.push(esc(x)));
@@ -900,22 +1144,22 @@ function renderTrend(){
     $("trendCtx").innerHTML = h+"</tbody>"; $("trendCtx").dataset.built = 1;
   }
   const hs = HOSTCH.filter(c => TT.some(t => hostBefore(t.date, c)) && TT.some(t => !hostBefore(t.date, c)));
-  $("trendHost").textContent = hs.map(c => c.legend).join(" ");
+  $("trendHost").textContent = (many ? "The table above follows "+LBL(legs[0])+", the first selected leg. " : "") + hs.map(c => c.legend).join(" ");
   P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
 }
-/* version trend: only on a run of a release tag (D.version); same leg buttons as the trend above */
-const vtrendOf = () => (L[sel.trend] && L[sel.trend].vtrend) || [];
+/* version trend: only on a run of a release tag (D.version); it follows the first leg selected in the trend above */
+const vtrendOf = () => (L[sel.trend[0]] && L[sel.trend[0]].vtrend) || [];
 function renderVTrend(){
   $("vtrendBlock").style.display = D.version ? "" : "none";
   if(!D.version) return;
   const VT = vtrendOf();
-  $("vtrendTitle").textContent = "Trend of "+LBL(sel.trend)+" across versions ("+VT.length+" version"+(VT.length===1?"":"s")+", up to "+D.version+")";
+  $("vtrendTitle").textContent = "Trend of "+LBL(sel.trend[0])+" across versions ("+VT.length+" version"+(VT.length===1?"":"s")+", up to "+D.version+")";
   $("vtrend").dataset.built = ""; $("vtrendCtx").dataset.built = "";
   $("vtrendNote").textContent = VT.length < 2
     ? "Only "+VT.length+" version with data for this leg ("+(D.version_runs||0)+" earlier version run"+(D.version_runs===1?"":"s")+" found): a trend needs at least 2 versions, so the charts below show what exists without drawing a line."
     : "";
   if(!VT.length){ $("vtrend").innerHTML = NODATA; $("vtrendCtx").innerHTML = ""; return; }
-  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
+  const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend[0])]);
   panels("vtrend","vtr",P);
   if(!$("vtrendCtx").dataset.built){
     let h = `<thead><tr><th>Version</th><th>Run</th><th>Start</th><th>Commit</th><th>Runner</th><th class="n">Load at crud start</th><th class="n">pg ms/call in crud</th><th>Notes</th></tr></thead><tbody>`;
@@ -923,7 +1167,7 @@ function renderVTrend(){
       const notes = [];
       if(!t.suites.import) notes.push("no import");
       if(!t.suites.search) notes.push("no search");
-      if(t.bulk && t.index_inline === false && isEs(sel.trend)) notes.push("deferred indexing (before #2248)");
+      if(t.bulk && t.index_inline === false && isEs(sel.trend[0])) notes.push("deferred indexing (before #2248)");
       if(HOSTCH.some(c => hostBefore(t.date, c))) notes.push("older Docker host");
       if(t.partial_run) notes.push("run failed: some legs missing");
       (t.notes||[]).forEach(x => notes.push(esc(x)));
@@ -936,6 +1180,52 @@ function renderVTrend(){
   $("vtrendHost").textContent = hs.map(c => c.legend).join(" ");
   P.forEach(([k,t,u])=>trendPanel($("vtr-"+k), k, t, u.split(" ")[0], VT, true));
 }
+
+/* ---------- enlarge dialog (trend and version trend panels) ---------- */
+// the dialog only remembers which panel it shows ("tr-crud", "vtr-bulk", ...); drawing reads sel and the theme like the panels
+let ZOOM = null;
+function drawZoom(){
+  const dlg = $("zoomDlg");
+  if(!ZOOM || !dlg.open) return;
+  const i = ZOOM.indexOf("-"), pre = ZOOM.slice(0,i), k = ZOOM.slice(i+1), p = THR_P.find(x=>x[0]===k);
+  if(!p) return;
+  const VT = pre==="vtr", u = p[2].split(" ")[0];
+  $("zoomTitle").textContent = (VT ? "Version trend · " : "Trend · ")+p[1];
+  $("zoomSub").textContent = u+" · "+(VT ? LBL(sel.trend[0]) : sel.trend.map(LBL).join(", ")+(sel.cmp?" by branch":""));
+  $("zoomBar").innerHTML = YFIT_BTN();
+  if(VT) trendPanel($("zoomChart"), k, p[1], u, vtrendOf(), true);
+  else trendPanel($("zoomChart"), k, p[1], u);
+}
+function openZoom(id){
+  const dlg = $("zoomDlg");
+  if(!dlg || typeof dlg.showModal!=="function") return;
+  ZOOM = id;
+  dlg.appendChild($("tip"));   // the tooltip must live in the top layer with the dialog
+  if(!dlg.open) dlg.showModal();
+  drawZoom();
+}
+function walkZoom(d){
+  if(!ZOOM) return;
+  const i = ZOOM.indexOf("-"), pre = ZOOM.slice(0,i), n = THR_P.length, j = THR_P.findIndex(x=>x[0]===ZOOM.slice(i+1));
+  ZOOM = pre+"-"+THR_P[((j+d)%n+n)%n][0];
+  drawZoom();
+}
+(function(){
+  const dlg = $("zoomDlg");
+  document.addEventListener("click", e=>{ const b = e.target.closest && e.target.closest("[data-xp]"); if(b) openZoom(b.dataset.xp); });
+  dlg.addEventListener("click", e=>{ if(e.target===dlg) dlg.close(); });
+  dlg.addEventListener("keydown", e=>{ if(e.key==="ArrowLeft"||e.key==="ArrowRight"){ if(e.target.closest && e.target.closest("details")) return; e.preventDefault(); walkZoom(e.key==="ArrowLeft"?-1:1); } });
+  dlg.addEventListener("close", ()=>{
+    const tip = $("tip"); tip.style.opacity = 0; document.body.appendChild(tip);
+    const back = ZOOM && document.querySelector('[data-xp="'+ZOOM+'"]');   // the panels were rebuilt: query again
+    ZOOM = null;
+    if(back) back.focus();
+  });
+  $("zoomPrev").addEventListener("click", ()=>walkZoom(-1));
+  $("zoomNext").addEventListener("click", ()=>walkZoom(1));
+  $("zoomClose").addEventListener("click", ()=>dlg.close());
+  $("zoomBar").addEventListener("click", e=>{ const b = e.target.closest("button"); if(b && b.dataset.yfit){ sel.yfit = !sel.yfit; redrawTrend(); } });
+})();
 
 /* ---------- tables ---------- */
 function sortable(table){
@@ -1061,10 +1351,42 @@ function renderLegKey(){
   $("legkey").innerHTML = LEGS.map(l=>`<span><svg width="26" height="10" aria-hidden="true"><line x1="1" y1="5" x2="25" y2="5" stroke="var(--leg-${esc(l)})" stroke-width="3"${isES(l)?' stroke-dasharray="6 3"':""}/></svg>${esc(LBL(l))}</span>`).join("")+
     `<span class="note">Each leg keeps its colour everywhere; dashed line = with Elasticsearch.</span>`;
 }
-function drawCharts(){ legVars(); [renderLegKey, renderThr, renderLat, renderTimeline, renderBulk, renderBatch, renderBatchLat, renderImpCmp, renderSqlViews, renderShapes, renderTrend, renderVTrend].forEach(safe); }
+/* index: hide the entries whose section is hidden at run time (no shapes, no $sql-run, no comparison.md, ...) */
+function syncToc(){
+  document.querySelectorAll("nav.toc a").forEach(a=>{
+    const t = document.getElementById(a.getAttribute("href").slice(1));
+    a.parentElement.style.display = t && t.getClientRects().length ? "" : "none";
+  });
+}
+function drawCharts(){ legVars(); [renderLegKey, renderThr, renderLat, renderTimeline, renderBulk, renderBatch, renderBatchLat, renderImpCmp, renderSqlViews, renderShapes, renderTrend, renderVTrend, drawZoom, syncToc].forEach(safe); }
 [renderHeader, renderSummary, renderValidity, renderKpis].forEach(safe);
-if(LEGS.length){ seg("segKpi","kpi",renderKpis); seg("segTime","time",renderTimeline,true); seg("segShape","shape",renderShapes); seg("segTrend","trend",()=>{ safe(renderTrend); safe(renderVTrend); }); }
+let trendSegSync = () => {};
+const redrawTrend = () => { safe(renderTrend); safe(renderVTrend); safe(drawZoom); };
+if(LEGS.length){ seg("segKpi","kpi",renderKpis); seg("segTime","time",renderTimeline,true); seg("segShape","shape",renderShapes); trendSegSync = segMulti("segTrend","trend",redrawTrend,()=>sel.cmp); }
+$("segBranch").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b || b.disabled) return;
+  if(b.dataset.cmp) sel.cmp = !sel.cmp;
+  else if(b.dataset.yfit) sel.yfit = !sel.yfit;
+  else if(sel.brOff.has(b.dataset.br)) sel.brOff.delete(b.dataset.br);
+  else if(sel.trend.length===1 && (trendBranches(sel.trend[0])||[]).filter(s=>s.T.length && !sel.brOff.has(s.name)).length>1) sel.brOff.add(b.dataset.br);
+  redrawTrend(); trendSegSync();
+});
 drawCharts();
+/* index: highlight the section in view (needs IntersectionObserver; without it the index simply stays unlit) */
+(function(){
+  try{
+    if(!("IntersectionObserver" in window)) return;
+    const links = [...document.querySelectorAll("nav.toc a")], tgt = a => document.getElementById(a.getAttribute("href").slice(1));
+    const pick = () => {
+      let on = null;
+      links.forEach(a=>{ const t = tgt(a); if(t && t.getClientRects().length && t.getBoundingClientRect().top <= innerHeight*0.3) on = a; });
+      links.forEach(a=>a.classList.toggle("on", !!on && a.parentElement.contains(on)));
+    };
+    const io = new IntersectionObserver(pick, {rootMargin:"0px 0px -70% 0px", threshold:0});
+    links.forEach(a=>{ const t = tgt(a); if(t) io.observe(t); });
+    pick();
+  }catch(e){}
+})();
 [renderFull, renderHealth, renderCounts].forEach(safe);
 $("foot").innerHTML = `Generated by <span class="mono">report_html.py</span> from the artifacts of run <span class="mono">${esc(D.run)}</span>${D.ref?" on <span class='mono'>"+esc(D.ref)+"</span>":""} (k6 <span class="mono">--summary-export</span>, the <span class="mono">*.txt</span> files of each leg and, if present, <span class="mono">search-points.json</span> read as a stream). Numbers use a comma for thousands and a dot for decimals, as in the GitHub summary. Works offline.`;
 let rt, lastW = innerWidth;
@@ -1081,7 +1403,7 @@ $("thLight").addEventListener("click", ()=>setTheme("light", true));
 $("thDark").setAttribute("aria-pressed", THEME==="dark"); $("thLight").setAttribute("aria-pressed", THEME==="light");
 /* print is always light */
 let beforePrintTheme = null;
-addEventListener("beforeprint", ()=>{ beforePrintTheme = THEME; THEME = "light"; document.documentElement.setAttribute("data-theme","light"); drawCharts(); });
+addEventListener("beforeprint", ()=>{ try{ if($("zoomDlg").open) $("zoomDlg").close(); }catch(e){} beforePrintTheme = THEME; THEME = "light"; document.documentElement.setAttribute("data-theme","light"); drawCharts(); });
 addEventListener("afterprint", ()=>{ if(beforePrintTheme){ THEME = beforePrintTheme; document.documentElement.setAttribute("data-theme", THEME); beforePrintTheme = null; } drawCharts(); });
 </script>
 </body>
