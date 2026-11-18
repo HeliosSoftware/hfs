@@ -865,22 +865,26 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Server version: CI, the benchmark and the tests run MongoDB 9.0.8 (`mongo:9.0.8`). The minimum
   patch levels are 7.0.48, 8.0.37, 8.3.16 or 9.0.7 on their lines (CVE-2026-118383, a
   pre-authentication use-after-free in replication, is fixed in those releases).
-  - **Allocator setting for 8.x and 9.x in a container.** The official `mongo:8.x` and `mongo:9.x`
-    images start mongod with `GLIBC_TUNABLES=glibc.pthread.rseq=0` (tcmalloc per-CPU caches). In a
-    container with no memory limit (Docker's default) mongod gives those caches capacity 0, so
-    every allocation takes one shared lock: in the benchmark search ran up to 31% and sql-run up
-    to 65% slower than on 7.0.48
-    ([SERVER-109273](https://jira.mongodb.org/browse/SERVER-109273), open). Start the container
-    with `-e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760`, as every example here and CI do;
-    `-e GLIBC_TUNABLES=` (set empty, per-thread caches) is the fallback. With the setting, 9.0.8 is at
-    or above 7.0.48 on every benchmark suite. Check it with
+  - **Allocator setting for 8.x and 9.x in a container.** mongod 8.x and 9.x size tcmalloc's
+    per-CPU caches from the container's memory limit. In a container started without one
+    (Docker's default) `/sys/fs/cgroup/memory.max` holds the text `max`, mongod does not parse it,
+    and the caches get capacity 0, so every allocation takes one shared lock: in the benchmark
+    search ran up to 31% and sql-run up to 65% slower than on 7.0.48
+    ([SERVER-109273](https://jira.mongodb.org/browse/SERVER-109273), open, no fix version). A
+    memory limit (`--memory 16g` gave 32 MB per CPU on 9.0.8) or
+    `-e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760`, as every example here and CI do, avoids
+    it. The official images' `GLIBC_TUNABLES=glibc.pthread.rseq=0` is not the cause; starting with
+    `-e GLIBC_TUNABLES=` (set empty) only works around it, by moving tcmalloc to per-thread
+    caches, and makes mongod log an rseq warning. With the setting, 8.3.17 and 9.0.8 reached or
+    passed 7.0.48 on search and sql-run in the benchmark (single runs). Check it with
     `db.serverStatus({ tcmalloc: 2 }).tcmalloc.maxPerCPUCacheSizeBytes`, which must be above 0.
     7.0 uses the older tcmalloc and is not affected.
   - **Large imports on 8.3 and 9.0.** With default WiredTiger pages an import stalled for 60 s or
     more several times; starting mongod with
     `--wiredTigerCollectionConfigString memory_page_max=16MB --wiredTigerIndexConfigString memory_page_max=16MB`
     (what the benchmark does) removed the stalls with no insert p99 penalty. These strings apply
-    to collections and indexes created after mongod starts with them.
+    to collections and indexes created after mongod starts with them: a database created earlier keeps its
+    page size and its stalls, and there is no tested migration yet (recreate it and import again).
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
   `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
   chained/`_has` work via the REST-layer resolver)
