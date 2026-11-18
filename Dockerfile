@@ -1,35 +1,29 @@
-FROM debian:trixie-slim
+# Pinned by digest; Dependabot bumps them.
+FROM debian:13.7-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
 
 ARG BINARY_NAME
+
+# Copy staged build context (binary + optional data files)
+COPY . /app/
+
+# Fixed binary path, so the exec-form ENTRYPOINT needs no shell
+RUN test -n "$BINARY_NAME" || { echo "BINARY_NAME build arg is required"; exit 1; } && \
+    mv "/app/$BINARY_NAME" /app/server && \
+    chmod 755 /app/server && \
+    mkdir /data
+
+FROM gcr.io/distroless/cc-debian13@sha256:809d04afa1be033c441f76bb0051878c342fb76d0ea236bc6dc94b655fa0fbd6
+
 ARG EXPOSE_PORT=8080
 # Optional: directory inside the image that `hts run` will auto-import on
 # first boot when the target DB is empty. Empty string = no bootstrap. Used
 # by the hts image to point at the baked-in terminology-data/ directory.
 ARG BOOTSTRAP_DIR=""
 
-# Validate BINARY_NAME is set
-RUN test -n "$BINARY_NAME" || { echo "BINARY_NAME build arg is required"; exit 1; }
-
-# Install runtime dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libssl3t64 ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN groupadd -g 1000 helios && useradd -u 1000 -g helios -m helios
-
 WORKDIR /app
 
-# Copy staged build context (binary + optional data files)
-COPY . /app/
-
-RUN chmod +x /app/${BINARY_NAME}
-
-# Persist BINARY_NAME for the entrypoint
-ENV BINARY_NAME=${BINARY_NAME}
-
-# Create writable data directory for SQLite and other persistent data
-RUN mkdir -p /data && chown helios:helios /data
+COPY --from=builder /app /app
+COPY --from=builder --chown=1000:1000 /data /data
 VOLUME /data
 
 # Default host binding for all servers (each binary reads only its own env var)
@@ -40,8 +34,15 @@ ENV FHIRPATH_SERVER_HOST=0.0.0.0
 ENV HTS_SERVER_HOST=0.0.0.0
 ENV HTS_BOOTSTRAP_DIR=${BOOTSTRAP_DIR}
 
-USER helios
+# Write state under /data: /app is root-owned (HFS_DATA_DIR stays, it holds shipped search params)
+ENV HTS_DATABASE_URL=/data/hts.db
+ENV HFS_BULK_EXPORT_OUTPUT_DIR=/data/bulk-export
+ENV HFS_BULK_SUBMIT_OUTPUT_DIR=/data/bulk-submit
+ENV HFS_EXPORT_DIR=/data/exports
+
+# Numeric, so runAsNonRoot can verify it
+USER 1000:1000
 
 EXPOSE ${EXPOSE_PORT}
 
-ENTRYPOINT ["sh", "-c", "exec /app/${BINARY_NAME} \"$@\"", "--"]
+ENTRYPOINT ["/app/server"]

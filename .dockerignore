@@ -7,3 +7,10 @@ target/
 **/*.rs
 **/node_modules/
 **/__pycache__/
+# Keep local secrets out of image layers
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+*.key
