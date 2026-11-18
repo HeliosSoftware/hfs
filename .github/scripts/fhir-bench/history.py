@@ -239,7 +239,9 @@ def fetch_runs(repo, workflow, branch, exclude_id, max_runs):
         print(f"history: branch run list failed: {e}", file=sys.stderr)
     if branch != "main":
         try:
-            for n in _with_artifacts(repo, _list_runs(repo, workflow, "main", 20), 1, exclude_id):
+            # as many main runs as the branch's own history (max_runs), not one: a branch with
+            # few runs of its own is compared against main's whole recent history
+            for n in _with_artifacts(repo, _list_runs(repo, workflow, "main", LIST_CAP), max(1, max_runs), exclude_id):
                 if all(n["id"] != r["id"] for r in runs):
                     runs.append(n)
         except Exception as e:  # noqa: BLE001

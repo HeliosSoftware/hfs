@@ -545,6 +545,21 @@ class RunSelection(unittest.TestCase):
             got = history.fetch_runs("o/r", "w.yml", "main", 99, 3)
         self.assertEqual([r["id"] for r in got], [10, 8, 6])
 
+    def test_branch_gets_max_runs_of_main_not_one(self):
+        def fake(a):
+            if a[1].endswith("/artifacts?per_page=100"):
+                arts = [{"name": "fhir-bench-report-data-1"}]
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps({"artifacts": arts}))
+            if "branch=main" in a[1]:
+                runs = [{"id": i, "conclusion": "success", "head_branch": "main"} for i in range(20, 0, -1)]
+            else:
+                runs = [{"id": 100, "conclusion": "success", "head_branch": "feat"}]
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": runs}))
+        with mock.patch.object(history, "_gh", fake):
+            got = history.fetch_runs("o/r", "w.yml", "feat", 999, 5)
+        self.assertEqual([r["id"] for r in got if r["branch"] == "main"], [20, 19, 18, 17, 16])
+        self.assertEqual(len(got), 6)
+
     def test_only_benchmark_data_artifacts_count(self):
         def has(names):
             arts = {"artifacts": [{"name": n} for n in names]}

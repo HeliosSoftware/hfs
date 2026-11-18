@@ -313,6 +313,19 @@ jobs:
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
+      # This job runs first, so its summary is the first block of the run's Summary page. The
+      # direct link to the HTML report does not exist yet (its artifact id appears only at the end,
+      # in the Compare legs job), so this one goes to the run's Artifacts list, where
+      # fhir-bench-report-<run id>.html is the full report; the direct link is in the Compare legs summary.
+      - name: Link to the full HTML report
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            printf '# [Full HTML report: open the run Artifacts](%s/%s/actions/runs/%s#artifacts)\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf '_Open `fhir-bench-report-%s.html` (trends against main, every suite and leg). It appears when the run finishes; the direct link is also at the top of the "Compare legs" summary._\n' "$GITHUB_RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ────────────────────────────────────────────────────────────────────────────
   # Compile one release `hfs` binary with all four backends (sqlite, postgres,
   # mongodb, elasticsearch) always linked in — the backend is
