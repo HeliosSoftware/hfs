@@ -367,6 +367,13 @@ const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 /// `Transient` instead of `TooLargeForCache`.
 const CACHE_OVERFLOW_ROLLBACK_REASON: &str = "rolled back because of cache overflow";
 
+/// MongoDB 9.0 words the same rollback differently: "Rollback ocurred while
+/// performing initial write to '<ns>'. Reason: 'Cache capacity has overflown'"
+/// (a labelled 112, seen on a lone deferred Bundle's ledger write on 9.0.8,
+/// #2605). Unmatched, the Bundle was replayed three times and ended `Transient`
+/// instead of `TooLargeForCache`, as on 7.0 before #1975.
+const CACHE_CAPACITY_OVERFLOW_REASON: &str = "Cache capacity has overflown";
+
 /// The part of mongod's `WriteConflict` message for a transaction whose
 /// snapshot predates a catalog change on the collection it writes, such as an
 /// index build starting or committing ("Unable to write to collection ... due
@@ -994,6 +1001,7 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
         || server_error_message(err, WRITE_CONFLICT_CODE).is_some_and(|message| {
             message.contains(EVICTION_ROLLBACK_REASON)
                 || message.contains(CACHE_OVERFLOW_ROLLBACK_REASON)
+                || message.contains(CACHE_CAPACITY_OVERFLOW_REASON)
         })
 }
 
@@ -14071,6 +14079,9 @@ mod transient_abort_tests {
     /// the cache, as a lone deferred Bundle's ledger insert received it (#1975).
     const CACHE_OVERFLOW_112: &str = "Caused by :: Rollback ocurred while performing initial write to 'hfs.search_index_pending'. Reason: 'transaction rolled back because of cache overflow' :: Please retry your operation or multi-document transaction.";
 
+    /// MongoDB 9.0.8's wording of the same cache-overflow rollback (#2605).
+    const CACHE_CAPACITY_OVERFLOW_112: &str = "Caused by :: Rollback ocurred while performing initial write to 'hfs.search_index_pending'. Reason: 'Cache capacity has overflown' :: Please retry your operation or multi-document transaction.";
+
     /// A `WriteConflict` (112) the way a single write reports it: as a
     /// per-write error rather than a failed command.
     fn write_conflict_write_error(errmsg: &str) -> MongoError {
@@ -15589,6 +15600,12 @@ mod transient_abort_tests {
             write_conflict_write_error(EVICTION_112),
             command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CACHE_OVERFLOW_112),
             write_conflict_write_error(CACHE_OVERFLOW_112),
+            command_error_with_message(
+                WRITE_CONFLICT_CODE,
+                "WriteConflict",
+                CACHE_CAPACITY_OVERFLOW_112,
+            ),
+            write_conflict_write_error(CACHE_CAPACITY_OVERFLOW_112),
         ] {
             assert!(is_eviction_rollback(&driver), "{driver}");
         }

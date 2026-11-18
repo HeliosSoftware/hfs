@@ -4649,7 +4649,8 @@ mod candidate_tests {
         let (uri, _container) = match std::env::var("HFS_TEST_MONGODB_URL") {
             Ok(uri) => (uri, None),
             Err(_) => match testcontainers_modules::mongo::Mongo::default()
-                .with_tag("7.0.48")
+                .with_tag("9.0.8")
+                .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
                 .start()
                 .await
             {

@@ -22,7 +22,7 @@ name: FHIR Server Benchmark
 #
 #   k6 (runner) ──HTTP──▶ HFS (runner, :8081-:8086, one port per backend)
 #        │                  ├──SQL────▶ postgres:18             (postgres, postgres-elasticsearch)
-#        │                  ├──Mongo──▶ mongo:7.0.48, 1-member rs0 (mongodb, mongodb-elasticsearch)
+#        │                  ├──Mongo──▶ mongo:9.0.8, 1-member rs0 (mongodb, mongodb-elasticsearch)
 #        │                  └──HTTP───▶ elasticsearch:8.15.0    (*-elasticsearch: serves every search)
 #        └──HTTP──▶ tgz bundle server container  (Synthea import corpus)
 #

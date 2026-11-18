@@ -862,9 +862,25 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   indexes are described in [MongoDB history indexes](mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
-- Minimum server version: MongoDB 7.0.48 (CVE-2026-118383, a pre-authentication use-after-free in
-  replication, is fixed in 7.0.48; on newer lines use 8.0.37, 8.3.16 or 9.0.7 or later). CI, the
-  benchmark and the tests run `mongo:7.0.48`.
+- Server version: CI, the benchmark and the tests run MongoDB 9.0.8 (`mongo:9.0.8`). The minimum
+  patch levels are 7.0.48, 8.0.37, 8.3.16 or 9.0.7 on their lines (CVE-2026-118383, a
+  pre-authentication use-after-free in replication, is fixed in those releases).
+  - **Allocator setting for 8.x and 9.x in a container.** The official `mongo:8.x` and `mongo:9.x`
+    images start mongod with `GLIBC_TUNABLES=glibc.pthread.rseq=0` (tcmalloc per-CPU caches). In a
+    container with no memory limit (Docker's default) mongod gives those caches capacity 0, so
+    every allocation takes one shared lock: in the benchmark search ran up to 31% and sql-run up
+    to 65% slower than on 7.0.48
+    ([SERVER-109273](https://jira.mongodb.org/browse/SERVER-109273), open). Start the container
+    with `-e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760`, as every example here and CI do;
+    `-e GLIBC_TUNABLES=` (set empty, per-thread caches) is the fallback. With the setting, 9.0.8 is at
+    or above 7.0.48 on every benchmark suite. Check it with
+    `db.serverStatus({ tcmalloc: 2 }).tcmalloc.maxPerCPUCacheSizeBytes`, which must be above 0.
+    7.0 uses the older tcmalloc and is not affected.
+  - **Large imports on 8.3 and 9.0.** With default WiredTiger pages an import stalled for 60 s or
+    more several times; starting mongod with
+    `--wiredTigerCollectionConfigString memory_page_max=16MB --wiredTigerIndexConfigString memory_page_max=16MB`
+    (what the benchmark does) removed the stalls with no insert p99 penalty. These strings apply
+    to collections and indexes created after mongod starts with them.
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
   `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
   chained/`_has` work via the REST-layer resolver)
@@ -893,7 +909,8 @@ cargo build --bin hfs --features mongodb --release
 # Start MongoDB (example using Docker): a single-member replica set, which
 # transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:7.0.48 --replSet rs0 --bind_ip_all
+  -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 \
+  mongo:9.0.8 --replSet rs0 --bind_ip_all
 docker exec mongo mongosh --quiet --eval \
   'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
@@ -1769,7 +1786,7 @@ cargo test -p helios-persistence --features mongodb --test mongodb_tests \
 ```
 
 To find where a lone Bundle aborts on your own hardware and cache size, run the ceiling harness
-(#1976, #2252, #2350). It starts its own `mongo:7.0.48` replica set with the cache you name and prints
+(#1976, #2252, #2350). It starts its own `mongo:9.0.8` replica set with the cache you name and prints
 `V1_CEILING_*` lines: the abort entry, the dirty bytes per entry, the BSON and JSON bytes of a
 Bundle (`V1_CEILING_PAYLOAD`) and, for a control Bundle you give it, whether it commits and where
 it aborts. The knobs are listed at the top of
@@ -1805,7 +1822,8 @@ cargo build --bin hfs --features mongodb,elasticsearch --release
 # Start MongoDB (example using Docker): a single-member replica set, which
 # transaction Bundles need (a standalone server answers them with 501)
 docker run -d --name mongo -p 27017:27017 \
-  mongo:7.0.48 --replSet rs0 --bind_ip_all
+  -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 \
+  mongo:9.0.8 --replSet rs0 --bind_ip_all
 docker exec mongo mongosh --quiet --eval \
   'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
@@ -2412,7 +2430,7 @@ first attempt had already deleted the resources. Calling `purge_tenant_data` aga
 the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
 `500` `too-costly`, as described above.
 
-**Ceiling test.** An ignored test starts its own `mongo:7.0.48` replica set with a small WiredTiger
+**Ceiling test.** An ignored test starts its own `mongo:9.0.8` replica set with a small WiredTiger
 cache and sends one lone synthetic Bundle (`COPIES` copies of a 267-entry fixture, so 15 copies are
 4,005 entries) through one backend per variant, each on a database of its own:
 

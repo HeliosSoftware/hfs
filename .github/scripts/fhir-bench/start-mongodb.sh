@@ -26,7 +26,7 @@
 #                            on the Postgres leg.
 #   --oplogSize 2048         default is ~5% of free disk (~8GB here).
 # Data lives in a labelled NAMED volume for the same reaper reason as
-# Postgres's. mongo:7.0 also declares an anonymous /data/configdb
+# Postgres's. The mongo image also declares an anonymous /data/configdb
 # volume; that one is deliberately left unnamed — the workflow's "Stop
 # ephemeral MongoDB" step's `docker rm -fv` and docker-host-gc's
 # anonymous-volume sweep both already remove it, so a named/labelled
@@ -37,6 +37,33 @@
 #   RUN_ID                         github.run_id
 #   IN_MONGO_WT_CACHE_GB           inputs.mongo_wt_cache_gb
 #   IN_HFS_MONGO_MAX_CONNECTIONS   inputs.hfs_mongo_max_connections
+#
+# Optional environment (not set by the workflow; for local runs):
+#   IN_MONGO_IMAGE                 official mongo:<version> tag; empty = mongo:9.0.8
+#
+# Two settings for every image other than mongo:7.x (#2605):
+#   -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760
+#                            the official mongo:8.x / 9.x images start
+#                            mongod with GLIBC_TUNABLES=glibc.pthread.rseq=0
+#                            (tcmalloc per-CPU caches). This container has
+#                            no memory limit (no --memory: the shared
+#                            host's page cache is the point), so mongod
+#                            sizes those caches at 0 and every malloc/free
+#                            takes tcmalloc's central lock (SERVER-109273,
+#                            https://jira.mongodb.org/browse/SERVER-109273):
+#                            search -31% and sql-run -65% against 7.0.48.
+#                            The variable gives the caches a real size and
+#                            keeps MongoDB's per-CPU mode (no startup
+#                            warning); `-e GLIBC_TUNABLES=` (set empty) is
+#                            the measured fallback.
+#   --wiredTigerCollectionConfigString / --wiredTigerIndexConfigString
+#     memory_page_max=16MB   8.3 and 9.0 stalled the import for 60 s or more
+#                            with default pages; 16 MB pages removed the
+#                            stalls with no insert p99 penalty (E-73, E-74
+#                            in #2180).
+# mongo:7.x gets neither: it ships the older tcmalloc (not affected) and
+# never stalled. mongo-tcmalloc.sh reports which allocator state mongod
+# ended up in; its verdict goes into the tuning table below.
 #
 # Also reads, already exported to $GITHUB_ENV by earlier steps:
 #   MONGO_CONTAINER, MONGO_VOLUME, HFS_MONGODB_DATABASE   "Configure backend env"
@@ -52,7 +79,28 @@ if ! [[ "$MONGO_WT_CACHE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
   echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB'); the Docker host is shared with all CI"
   exit 1
 fi
-MONGO_IMAGE="mongo:7.0.48"
+MONGO_IMAGE="${IN_MONGO_IMAGE:-mongo:9.0.8}"
+# Official image only: the flags below (and mongosh inside the
+# container) are what mongo:<tag> ships, and a free-text image name
+# would otherwise be a way to run anything on the shared Docker host.
+if ! [[ "$MONGO_IMAGE" =~ ^mongo:[0-9][0-9A-Za-z._-]*$ ]]; then
+  echo "::error::IN_MONGO_IMAGE must be an official mongo:<version> tag, e.g. mongo:9.0.8 (got '$MONGO_IMAGE')"
+  exit 1
+fi
+MONGO_PAGE_MAX=16MB
+MONGO_TCMALLOC_PER_CPU_BYTES=10485760
+MONGO_ENV_ARGS=()
+MONGO_WT_ARGS=()
+if [[ "$MONGO_IMAGE" =~ ^mongo:7($|[.-]) ]]; then
+  MONGO_IS_7X=1
+else
+  MONGO_IS_7X=0
+  MONGO_ENV_ARGS=(-e "MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=$MONGO_TCMALLOC_PER_CPU_BYTES")
+  MONGO_WT_ARGS=(
+    --wiredTigerCollectionConfigString "memory_page_max=$MONGO_PAGE_MAX"
+    --wiredTigerIndexConfigString "memory_page_max=$MONGO_PAGE_MAX"
+  )
+fi
 MONGO_TXN_LIFETIME_S=900
 MONGO_OPLOG_MB=2048
 
@@ -84,12 +132,14 @@ docker run -d \
   --log-driver local \
   -v "$MONGO_VOLUME:/data/db" \
   -p 0:27017 \
+  ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
   "$MONGO_IMAGE" \
   --replSet rs0 \
   --bind_ip_all \
   --wiredTigerCacheSizeGB "$MONGO_WT_CACHE_GB" \
   --oplogSize "$MONGO_OPLOG_MB" \
-  --setParameter "transactionLifetimeLimitSeconds=$MONGO_TXN_LIFETIME_S" >/dev/null
+  --setParameter "transactionLifetimeLimitSeconds=$MONGO_TXN_LIFETIME_S" \
+  ${MONGO_WT_ARGS[@]+"${MONGO_WT_ARGS[@]}"} >/dev/null
 
 # 10s, not 60s: this is called from wall-clock-deadline loops below,
 # and a mongod that accepts TCP but never answers (host memory
@@ -167,6 +217,31 @@ if [ "$TXN_LIFETIME" != "$MONGO_TXN_LIFETIME_S" ]; then
   exit 1
 fi
 
+# What mongod parsed for the WiredTiger config strings (empty = none
+# passed, the mongo:7.x case). Read back, not echoed from the flags.
+MONGO_WT_CONFIG_STRINGS=$(mongo_eval 'const w = (db.adminCommand({ getCmdLineOpts: 1 }).parsed.storage || {}).wiredTiger || {}; print("collection=" + ((w.collectionConfig || {}).configString || "") + " index=" + ((w.indexConfig || {}).configString || ""))' 2>/dev/null | tr -d '\r' | tail -n 1) || MONGO_WT_CONFIG_STRINGS="?"
+echo "WiredTiger config strings: ${MONGO_WT_CONFIG_STRINGS:-?}"
+if [ "$MONGO_IS_7X" = 0 ] \
+   && [ "$MONGO_WT_CONFIG_STRINGS" != "collection=memory_page_max=$MONGO_PAGE_MAX index=memory_page_max=$MONGO_PAGE_MAX" ]; then
+  echo "::warning::mongod did not report memory_page_max=$MONGO_PAGE_MAX for collections and indexes (got '${MONGO_WT_CONFIG_STRINGS:-?}'); imports on 8.3/9.0 may stall"
+fi
+
+# Allocator state at startup (mongo-tcmalloc.sh never fails). The full
+# report goes to the step log; its key fields go into the table below.
+TCM_REPORT=$(bash "$(dirname "${BASH_SOURCE[0]}")/mongo-tcmalloc.sh" 2>&1) || true
+echo "tcmalloc check (mongo-tcmalloc.sh):"
+printf '%s\n' "$TCM_REPORT" | sed 's/^/  /'
+tcm_field() { printf '%s\n' "$TCM_REPORT" | sed -n "s/^$1: //p" | tail -n 1; }
+TCM_VERDICT=$(tcm_field verdict)
+TCM_MAX_PER_CPU=$(tcm_field maxPerCPUCacheSizeBytes)
+TCM_CPU_CACHE=$(tcm_field cpuCache)
+TCM_ENV_SIZE=$(tcm_field container_MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES)
+TCM_ENV_GLIBC=$(tcm_field container_GLIBC_TUNABLES)
+case "$TCM_VERDICT" in
+  AFFECTED*) echo "::warning::mongod's tcmalloc per-CPU caches have no capacity (SERVER-109273): reads under concurrency will be several times slower; see start-mongodb.sh" ;;
+  "")        echo "::warning::mongo-tcmalloc.sh gave no verdict; allocator state unknown" ;;
+esac
+
 {
   echo "MONGO_PORT=$MONGO_PORT"
   echo "HFS_DATABASE_URL=mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
@@ -181,6 +256,13 @@ fi
   echo "|---|---|"
   echo "| image | \`$MONGO_IMAGE\` — single-member replica set \`rs0\`, directConnection |"
   echo "| mongod version (db.version()) | \`$MONGO_SERVER_VERSION\` |"
+  if [ "$MONGO_IS_7X" = 1 ]; then
+    echo "| extra container env | none (mongo:7.x ships the older tcmalloc) |"
+  else
+    echo "| extra container env | \`MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=$MONGO_TCMALLOC_PER_CPU_BYTES\` (SERVER-109273; see start-mongodb.sh) |"
+  fi
+  echo "| tcmalloc (startup) | ${TCM_VERDICT:-unknown}; maxPerCPUCacheSizeBytes \`${TCM_MAX_PER_CPU:-?}\`; cpuCache \`${TCM_CPU_CACHE:-?}\`; container GLIBC_TUNABLES \`${TCM_ENV_GLIBC:-?}\`, MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES \`${TCM_ENV_SIZE:-?}\` |"
+  echo "| WiredTiger config strings (mongod parsed) | \`${MONGO_WT_CONFIG_STRINGS:-?}\` |"
   echo "| --wiredTigerCacheSizeGB | \`$MONGO_WT_CACHE_GB\` (mongod reports $WT_MAX_BYTES bytes) |"
   echo "| transactionLifetimeLimitSeconds | \`$TXN_LIFETIME\` |"
   echo "| --oplogSize | \`${MONGO_OPLOG_MB}MB\` |"
