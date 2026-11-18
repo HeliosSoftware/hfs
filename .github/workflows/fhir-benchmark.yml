@@ -2404,6 +2404,18 @@ jobs:
           # report_html.py finds comparison.md inside --run-dir (or its parent).
           cp comparison.md report-input/ 2>/dev/null || true
 
+      # Compare branches in the HTML trend: report-data.json of the newest runs (at most 10 each) of every
+      # other branch that already ran this workflow and still has that artifact; release tags and this
+      # branch are excluded. Reads existing artifacts only, never re-runs anything; best effort.
+      - name: Fetch other branches report data
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/fhir-bench/branch_data.py --repo "$GITHUB_REPOSITORY" --workflow fhir-benchmark.yml --exclude-run-id "$GITHUB_RUN_ID" --current-branch "$GITHUB_REF_NAME" --out-dir "$RUNNER_TEMP/branches" --per-branch 10 --max-branches 8 --time-budget 240
+
       - name: Build HTML report
         if: always()
         continue-on-error: true
@@ -2425,6 +2437,7 @@ jobs:
             --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
+            --branch-trend-dir "$RUNNER_TEMP/branches" \
             --trend-max $(( ${HISTORY_RUNS_N:-10} + 1 )) \
             --version-dir "$RUNNER_TEMP/versions" \
             --version-max 10 \

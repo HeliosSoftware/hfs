@@ -622,6 +622,8 @@ function renderLat(){ panels("lat","lat",LAT_P); LAT_P.forEach(([k,t])=>latPanel
 // trend: the selected legs, in the order they were picked (the first one drives the context table and the version trend);
 // cmp: Compare branches on; brOff: branches switched off in that view; yfit: Zoom Y (trend y axis from min to max)
 const sel = {kpi: FIRST, time: "all", shape: FIRST, trend: FIRST ? [FIRST] : [], cmp: false, brOff: new Set(), yfit: false};
+// Compare branches starts with this run's branch and main drawn; every other branch is a chip that starts off
+LEGS.forEach(l=>Object.keys((L[l] && L[l].trend_branches) || {}).forEach(b=>{ if(b!=="main" && b!==D.ref) sel.brOff.add(b); }));
 function seg(id, key, render, withAll){
   const btn = l => `<button type="button" data-leg="${esc(l)}" aria-pressed="${l===sel[key]}" style="--c:var(--leg-${esc(l)});--on:var(--on-leg-${esc(l)})"><span class="dot${isES(l)?" es":""}" aria-hidden="true"></span>${esc(LBL(l))}</button>`;
   const all = withAll ? `<button type="button" data-leg="all" aria-pressed="${sel[key]==="all"}" style="--c:var(--accent)"><span class="dots" aria-hidden="true">${LEGS.map(l=>`<i style="background:var(--leg-${esc(l)})"></i>`).join("")}</span>All</button>` : "";
@@ -968,7 +970,16 @@ function trendBranches(leg){
 // the series of the trend panels: one per selected leg, or one per branch shown (Compare branches, a single leg)
 function trendSeries(T){
   const legs = sel.trend;
-  if(sel.cmp && legs.length===1){ const B = trendBranches(legs[0]); if(B) return B.filter(s=>s.T.length && !sel.brOff.has(s.name)); }
+  if(sel.cmp && legs.length===1){
+    const B = trendBranches(legs[0]);
+    if(B){
+      const V = B.filter(s=>s.T.length && !sel.brOff.has(s.name));
+      // this leg has neither this run's branch nor main: show its first branch rather than an empty chart
+      const f = V.length ? null : B.find(s=>s.T.length);
+      if(f){ sel.brOff.delete(f.name); V.push(f); }
+      return V;
+    }
+  }
   if(legs.length<=1) return [{leg:legs[0], T, col:null}];
   return legs.map(l=>({leg:l, T:(L[l] && L[l].trend) || [], col:legCol(l)}));
 }

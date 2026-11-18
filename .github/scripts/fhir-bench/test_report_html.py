@@ -685,6 +685,45 @@ class LegacyTrend(unittest.TestCase):
         _, tr, _ = self.R.leg_trend("sqlite", cur, [(n2, d2)], "30")
         self.assertIs([t for t in tr if t["run"] == "28"][0]["index_inline"], True)
 
+    def test_branch_trend_dir_feeds_trend_branches_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            cur, hist, bdir = os.path.join(t, "cur"), os.path.join(t, "hist"), os.path.join(t, "branches")
+            make_leg(cur, "sqlite", False)
+            self.hist(hist, "20", "report-data.json", self.pt("20"))
+            branch_of = {"30": "main", "31": "main", "32": "fix/y", "33": "feature/x", "34": "v0.2.9", "35": None}
+            for rid, br in branch_of.items():
+                p = self.pt(rid)
+                p["branch"] = br or "from-point"
+                self.hist(bdir, rid, "report-data.json", p)
+            for i in range(40, 49):  # more than trend_max - 1 points of one branch
+                p = self.pt(str(i))
+                p["date"] = "2026-11-%02dT10:00:00Z" % (i - 30)
+                self.hist(bdir, str(i), "report-data.json", p)
+            with open(os.path.join(bdir, "branches.json"), "w", encoding="utf-8") as fh:
+                json.dump({rid: {"branch": br} for rid, br in branch_of.items() if br}, fh)
+            out, dump = os.path.join(t, "o.html"), os.path.join(t, "d.json")
+            base = ["--run-dir", cur, "--run-id", "777", "--branch", "feature/x", "--trend-dir", hist, "--no-shapes"]
+            r = run(base + ["--out", out, "--dump-json", dump, "--branch-trend-dir", bdir, "--trend-max", "4"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            html = open(out, encoding="utf-8").read()
+            data = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
+            tb = data["legs"]["sqlite"]["trend_branches"]
+            self.assertEqual(sorted(tb), ["fix/y", "from-point", "main"])  # no current branch, no tag
+            self.assertEqual([p["run"] for p in tb["main"]], ["46", "47", "48"])  # newest trend_max - 1
+            self.assertEqual([p["run"] for p in tb["fix/y"]], ["32"])
+            self.assertNotIn("trend_branches", json.load(open(dump))["legs"]["sqlite"])
+            # the branch trend itself does not change
+            r = run(base + ["--out", os.path.join(t, "p.html"), "--trend-max", "4"])
+            plain = json.loads(open(os.path.join(t, "p.html"), encoding="utf-8").read().split("const D = ", 1)[1].split(";\n", 1)[0])
+            for k in ("trend", "prev", "prev_by"):
+                self.assertEqual(data["legs"]["sqlite"][k], plain["legs"]["sqlite"][k], k)
+            self.assertEqual(plain["legs"]["sqlite"]["trend_branches"], {})
+
+    def test_template_branch_chips_start_off_except_main_and_current(self):
+        tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        self.assertIn('if(b!=="main" && b!==D.ref) sel.brOff.add(b);', tpl)
+        self.assertIn("L[leg].trend_branches", tpl)
+
     def test_template_uses_per_metric_reference_and_legend(self):
         tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
         self.assertIn("prev_by", tpl)
