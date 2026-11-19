@@ -325,6 +325,9 @@ jobs:
             printf '# [Full HTML report: open the run Artifacts](%s/%s/actions/runs/%s#artifacts)\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
             printf '_Open `fhir-bench-report-%s.html` (trends against main, every suite and leg). It appears when the run finishes; the direct link is also at the top of the "Compare legs" summary._\n' "$GITHUB_RUN_ID"
           } >> "$GITHUB_STEP_SUMMARY"
+          # Annotations list warnings first, then notices in job order: this job runs first, and the
+          # three retention warnings are gone, so this notice is among the first lines of the Annotations block.
+          echo "::notice title=Full HTML report (when the run ends)::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID#artifacts"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Compile one release `hfs` binary with all four backends (sqlite, postgres,
@@ -2376,7 +2379,7 @@ jobs:
         with:
           name: fhir-bench-comparison-${{ github.run_id }}
           path: comparison.md
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
       # Trend over the last runs of this branch. Display only: it can never
@@ -2467,7 +2470,7 @@ jobs:
           name: fhir-bench-report-${{ github.run_id }}
           path: fhir-bench-report-${{ github.run_id }}.html
           archive: false
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
       # The data the next runs read through history.py --data-dir.
@@ -2480,7 +2483,7 @@ jobs:
           path: |
             report-data.json
             run-timing.json
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
       # The whole job summary is written HERE, link first: the summary is
