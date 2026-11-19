@@ -1,0 +1,10 @@
+[00:15:37] drain gate start
+probe DELETE http=204
+[00:15:38] es_count=1965870 "index_total":2114150 stable_polls=0
+[00:15:43] es_count=1965870 "index_total":2114150 stable_polls=1
+[00:15:49] es_count=1965870 "index_total":2114150 stable_polls=2
+status=drained es_count=1965870 pg_count=1632062
+needs_reindex: # TYPE composite_secondary_sync_needs_reindex gauge composite_secondary_sync_needs_reindex{service="hfs"} 0 
+es_health: {"cluster_name":"docker-cluster","status":"yellow","timed_out":false,"number_of_nodes":1,"number_of_data_nodes":1,"active_primary_shards":30,"active_shards":30,"relocating_shards":0,"initializing_shards":0,"unassigned_shards":28,"delayed_unassigned_shards":0,"number_of_pending_tasks":0,"number_of_in_flight_fetch":0,"task_max_waiting_in_queue_millis":0,"active_shards_percent_as_number":51.724137931034484}
+es_readonly_blocks: {}
+[00:15:50] drain gate end
