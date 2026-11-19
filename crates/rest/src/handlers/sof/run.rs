@@ -64,6 +64,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
+use helios_auth::Principal;
 use helios_fhir::FhirVersion;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, ViewFilters};
@@ -163,12 +164,14 @@ pub async fn sql_run_handler<S>(
     Query(query_params): Query<RunQueryParams>,
     tenant: TenantExtractor,
     headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
     body: Option<axum::extract::Json<Value>>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
     let body_value = body.map(|j| j.0);
+    let principal = principal.map(|axum::Extension(p)| p);
 
     // Unknown parameter names are deliberately ignored: this handler does
     // not introduce general strict validation. `view` is the pre-ballot
@@ -210,6 +213,19 @@ where
     // — only the inline shorthand is in scope.
     if subject.kind == SubjectKind::ViewDefinition && subject_ref.resource.is_some() {
         lint_inline_view_definition(&subject.resource)?;
+    }
+
+    // A ViewDefinition reads the resource type it names, so that type needs
+    // the same Search grant a plain search on it would. Inline `resource`
+    // data is transformed instead of server data and reads nothing. A
+    // Library subject is checked once its dependency graph is resolved, in
+    // `run_library_subject`.
+    if subject.kind == SubjectKind::ViewDefinition && body_params.inline_resources.is_empty() {
+        super::authz::check_read_scopes(
+            principal.as_ref(),
+            "$sql-run",
+            super::authz::view_resource_type(&subject.resource),
+        )?;
     }
 
     // `resource` carries inline FHIR resources to transform instead of using
@@ -285,6 +301,7 @@ where
                 &headers,
                 subject.resource,
                 filters,
+                principal.as_ref(),
             )
             .await
         }

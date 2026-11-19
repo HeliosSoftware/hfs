@@ -52,6 +52,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
@@ -107,6 +108,7 @@ pub(super) async fn run_library_subject<S>(
     headers: &HeaderMap,
     library_json: Value,
     filters: ViewFilters,
+    principal: Option<&Principal>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -201,6 +203,13 @@ where
         .map_err(super::graph::errors_to_rest_error)?;
 
     super::graph::check_max_nodes(&plan, max_vds)?;
+
+    // Every leaf ViewDefinition in the plan reads the resource type it names.
+    super::authz::check_read_scopes(
+        principal,
+        "$sql-run",
+        super::authz::plan_resource_types(&plan),
+    )?;
 
     // Bind Library.parameter values from the supplied `parameters` Parameters.
     let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())
