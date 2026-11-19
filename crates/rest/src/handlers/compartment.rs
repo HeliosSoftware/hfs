@@ -23,6 +23,7 @@ use crate::extractors::{
 };
 use crate::handlers::search::append_ignored_params_outcome;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::state::AppState;
 
 /// Handler for compartment search.
@@ -42,11 +43,18 @@ use crate::state::AppState;
 /// # Response
 ///
 /// Returns a Bundle of type "searchset" containing matching resources.
+///
+/// Under a compartment-confined grant the matches are confined by the path
+/// (the authorization middleware admits only the launch patient's own
+/// compartment), but an `_include` or `_revinclude` follows references
+/// wherever they lead, so the included resources are filtered to the
+/// compartment's members as a type-level search filters them.
 pub async fn compartment_search_handler<S>(
     State(state): State<AppState<S>>,
     Path((compartment_type, compartment_id, target_type)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -155,7 +163,7 @@ where
     let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
 
     // Execute the search
-    let result = state
+    let mut result = state
         .storage()
         .search(tenant.context(), &query)
         .await
@@ -163,6 +171,13 @@ where
             tracing::warn!(error = %e, "Compartment search failed");
             RestError::from(e)
         })?;
+
+    // An include follows references wherever they lead; under a compartment-
+    // confined grant only the launch patient's resources may come back.
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(&tenant);

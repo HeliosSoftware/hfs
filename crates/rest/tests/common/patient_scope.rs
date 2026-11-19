@@ -547,6 +547,26 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
     assert_eq!(included_ids(&r.json()), ["p1", "pr1"]);
 }
 
+pub async fn compartment_search_includes_outside_the_compartment_are_dropped(server: &TestServer) {
+    // The matches of a compartment search are confined by the path, but an
+    // include follows references wherever they lead: o3's performer is a
+    // Practitioner, which is in no patient's compartment.
+    let r = get(
+        server,
+        P1_READ,
+        "/Patient/p1/Observation?_id=o3&_include=Observation:performer&_include=Observation:subject",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["o3"]);
+    let included = included_ids(&bundle);
+    assert!(
+        included.iter().all(|id| id == "p1"),
+        "included resources outside the compartment: {included:?}\n{bundle}"
+    );
+}
+
 pub async fn types_outside_the_patient_compartment_are_not_reachable(server: &TestServer) {
     assert_forbidden(&get(server, P1_READ, "/Practitioner/pr1").await, "read");
     assert_forbidden(&get(server, P1_READ, "/Practitioner").await, "search");
@@ -1167,7 +1187,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, compartment_search_includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(
