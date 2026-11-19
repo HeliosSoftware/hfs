@@ -313,21 +313,67 @@ jobs:
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
-      # This job runs first, so its summary is the first block of the run's Summary page. The
-      # direct link to the HTML report does not exist yet (its artifact id appears only at the end,
-      # in the Compare legs job), so this one goes to the run's Artifacts list, where
-      # fhir-bench-report-<run id>.html is the full report; the direct link is in the Compare legs summary.
-      - name: Link to the full HTML report
+      # The first block of the run's Summary page is this job's summary. The report's own artifact id
+      # exists only at the end of the Compare legs job, and a step summary cannot be edited later, so
+      # this job uploads a tiny redirect page as its own HTML artifact (its URL is known right now).
+      # Opened in the browser, the page asks the public Actions API for the artifact
+      # fhir-bench-report-<run id>.html and jumps to it; while the run is still going it waits and
+      # retries; if the run ended without a report it says so. The summary heading links to that page.
+      - name: Write report redirect page
         if: always()
         continue-on-error: true
         run: |
+          cat > "$RUNNER_TEMP/open-fhir-bench-report-$GITHUB_RUN_ID.html" <<'EOF'
+          <!doctype html><html lang="en"><head><meta charset="utf-8">
+          <meta name="color-scheme" content="dark light"><title>FHIR Benchmark report</title></head>
+          <body style="font:16px system-ui;margin:3rem">
+          <p id="m">Looking for the report...</p>
+          <p><a id="r">Open the run</a> | <a id="a">Run artifacts</a></p>
+          <script>
+          const repo="__REPO__",run="__RUN__",web="https://github.com/"+repo+"/actions/runs/"+run,
+                api="https://api.github.com/repos/"+repo+"/actions/runs/"+run,m=document.getElementById("m");
+          document.getElementById("r").href=web;document.getElementById("a").href=web+"#artifacts";
+          async function go(){
+            try{
+              const l=await fetch(api+"/artifacts?per_page=100&name=fhir-bench-report-"+run+".html");
+              if(!l.ok)throw new Error("HTTP "+l.status);
+              const f=((await l.json()).artifacts||[]).filter(x=>!x.expired).sort((x,y)=>y.id-x.id)[0];
+              if(f){location.replace(web+"/artifacts/"+f.id);return;}
+              const s=await fetch(api);if(!s.ok)throw new Error("HTTP "+s.status);
+              if((await s.json()).status==="completed"){m.textContent="This run finished without an HTML report (not built, or expired). The comparison tables are in the Compare legs summary of the run.";}
+              else{m.textContent="The run is still in progress; the report appears when it ends. Retrying every 2 minutes.";setTimeout(go,120000);}
+            }catch(e){m.textContent="Could not look up the report ("+e.message+"). Use the links below.";}
+          }
+          go();
+          </script></body></html>
+          EOF
+          sed -i "s|__REPO__|$GITHUB_REPOSITORY|; s|__RUN__|$GITHUB_RUN_ID|" "$RUNNER_TEMP/open-fhir-bench-report-$GITHUB_RUN_ID.html"
+
+      - name: Upload report redirect page
+        id: redirect
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: open-fhir-bench-report-${{ github.run_id }}
+          path: ${{ runner.temp }}/open-fhir-bench-report-${{ github.run_id }}.html
+          archive: false
+          overwrite: true
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Link to the full HTML report
+        if: always()
+        continue-on-error: true
+        env:
+          REDIRECT_URL: ${{ steps.redirect.outputs.artifact-url }}
+        run: |
+          URL="${REDIRECT_URL:-$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID#artifacts}"
           {
-            printf '# [Full HTML report: open the run Artifacts](%s/%s/actions/runs/%s#artifacts)\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-            printf '_Open `fhir-bench-report-%s.html` (trends against main, every suite and leg). It appears when the run finishes; the direct link is also at the top of the "Compare legs" summary._\n' "$GITHUB_RUN_ID"
+            printf '# [Open the full HTML report](%s)\n\n' "$URL"
+            printf '_Opens the report directly once the run has finished; before that the page waits and retries. Sign-in to GitHub required._\n'
           } >> "$GITHUB_STEP_SUMMARY"
-          # Annotations list warnings first, then notices in job order: this job runs first, and the
-          # three retention warnings are gone, so this notice is among the first lines of the Annotations block.
-          echo "::notice title=Full HTML report (when the run ends)::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID#artifacts"
+          echo "::notice title=Full HTML report (when the run ends)::$URL"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Compile one release `hfs` binary with all four backends (sqlite, postgres,
