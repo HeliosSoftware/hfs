@@ -47,7 +47,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: crates/ui/e2e/playwright-report/
@@ -158,7 +158,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -213,7 +213,7 @@ jobs:
       RUN_CONTAINER: ui-e2e-${{ matrix.fhir_version }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -288,7 +288,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report-${{ matrix.fhir_version }}
           path: crates/ui/e2e/multiversion-results-${{ matrix.fhir_version }}/

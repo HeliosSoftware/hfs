@@ -58,7 +58,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: GC the Docker host
         uses: ./.github/actions/docker-host-gc

@@ -189,7 +189,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -229,7 +229,7 @@ jobs:
       # the artifact paths would collide.
       - name: Checkout baseline ref
         if: inputs.baseline_ref != ''
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.baseline_ref }}
           path: baseline-src
@@ -274,7 +274,7 @@ jobs:
 
     steps:
       - name: Checkout HTS
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -287,7 +287,7 @@ jobs:
       # Set the `tx_benchmark_ref` input to pin a specific ref for a one-off
       # re-baseline run.
       - name: Checkout tx-benchmark
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: HeliosSoftware/tx-benchmark
           ref: ${{ inputs.tx_benchmark_ref || '' }}
