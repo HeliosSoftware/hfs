@@ -100,6 +100,7 @@ pub struct SqlQueryRunQuery {
 /// `filters` carries the request's `patient`, `group` and `_since` and narrows
 /// every dependency ViewDefinition. `_limit` is not in it and still caps only
 /// the final rows (applied after SQL, unchanged).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
