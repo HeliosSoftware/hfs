@@ -33,15 +33,16 @@ XY_W_CELL = 440  # two cells must fit GitHub's ~1012 px content width
 SPREAD_NOTE = 50.0
 MAX_OUT_BYTES = 600_000  # a step summary is capped at 1 MiB; the report text comes first
 
-# Leg colours: the six known legs keep the colours of the approved prototype's HTML report
-# (mid tones readable on both GitHub themes); any other leg name gets one of EXTRA, picked
-# by a hash of its name so it is stable, and moved on if another leg of the chart has it.
+# Leg colours: one mid tone per known leg from the HTML report's families (blue, gold, green, pink, violet,
+# teal), since GitHub draws these charts with one colour set on both its light and dark pages: each has
+# contrast >= 3:1 against #ffffff and #0d1117. Any other leg name gets one of EXTRA (kept away from the six),
+# picked by a hash of its name so it is stable, and moved on if another leg of the chart has it.
 LEG_COLOURS = {
-    "postgres": "#236bcf", "sqlite": "#008622", "mongodb": "#9348b1",
-    "postgres-elasticsearch": "#4a91f8", "sqlite-elasticsearch": "#3fac4a",
-    "mongodb-elasticsearch": "#b96dd8",
+    "postgres": "#2b97ee", "sqlite": "#76a062", "mongodb": "#6b4fb8",
+    "postgres-elasticsearch": "#81600e", "sqlite-elasticsearch": "#b2819d",
+    "mongodb-elasticsearch": "#317368",
 }
-EXTRA = ["#db6d28", "#bf8700", "#cf222e", "#1b9aaa", "#e5609a", "#6e7781", "#8a5a00", "#57ab5a",
+EXTRA = ["#db6d28", "#bf8700", "#cf222e", "#1b9aaa", "#e5609a", "#6e7781", "#805846", "#646e46",
          "#c2410c", "#0e7490"]
 
 MARKERS = "†‡⚠"
