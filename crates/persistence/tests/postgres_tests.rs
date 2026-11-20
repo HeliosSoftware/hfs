@@ -6312,6 +6312,17 @@ mod postgres_integration {
              AND param_name IN ('code', 'value-quantity')",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
+                &[],
+            )
+            .await
+            .unwrap();
         client
             .execute(
                 "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
@@ -6673,8 +6684,12 @@ mod postgres_integration {
                         .filter_map(|field| plan[field].as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let raw = predicates.contains("value_quantity_value");
-                    let canonical = predicates.contains("value_quantity_canonical_value");
+                    // `gt` on a point is `high > v` now (#2602), so a quantity arm is
+                    // recognised by either bound column.
+                    let raw = predicates.contains("value_quantity_value")
+                        || predicates.contains("value_quantity_high");
+                    let canonical = predicates.contains("value_quantity_canonical_value")
+                        || predicates.contains("value_quantity_canonical_high");
                     if converted {
                         assert!(
                             !(raw && canonical),
@@ -6729,6 +6744,17 @@ mod postgres_integration {
                     '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
             &[&tenant_id],
         ).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
+                &[],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
@@ -9044,6 +9070,17 @@ mod postgres_integration {
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) SELECT $1,'Observation','quantity-'||n,'patient',CASE WHEN n<=32 THEN 'Patient/anchor' ELSE 'Patient/decoy-'||n END FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) SELECT $1,'Observation','quantity-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
         client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_quantity_value,value_quantity_unit,value_quantity_canonical_value,value_quantity_canonical_unit) SELECT $1,'Observation','quantity-'||n,'value-quantity',CASE WHEN n<=8 OR n>32 THEN 160 ELSE 90 END,'cm',CASE WHEN n<=8 OR n>32 THEN 1.6 ELSE 0.9 END,'m' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        // Fixture rows are written by hand, so give each the upper bound the
+        // storage writer would (a point: high = value, #2602).
+        client
+            .execute(
+                "UPDATE search_index SET value_quantity_high = value_quantity_value,
+             value_quantity_canonical_high = value_quantity_canonical_value
+             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
+                &[],
+            )
+            .await
+            .unwrap();
         client
             .batch_execute("ANALYZE resources; ANALYZE search_index")
             .await
