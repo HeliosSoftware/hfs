@@ -300,6 +300,20 @@ pub fn is_time_unit(unit: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Known defect of octofhir-ucum 0.5.2 (fixed upstream in 0.6.1 and later):
+    /// its build script divides the units defined as `X/N` twice, so the UCUM
+    /// month (`mo` = `a_j`/12 = 2,629,800 s) canonicalizes to 219,150 s. Remove
+    /// the `ignore` when the dependency is upgraded (tracked as a separate task
+    /// referenced from #2602).
+    #[test]
+    #[ignore = "octofhir-ucum 0.5.2 divides `mo` twice; fixed upstream in >= 0.6.1"]
+    fn canonicalize_quantity_month_is_a_twelfth_of_a_year() {
+        let (month, _) = canonicalize_quantity(1.0, "mo").unwrap();
+        let (year, _) = canonicalize_quantity(1.0, "a").unwrap();
+        assert_eq!(month, 2_629_800.0);
+        assert_eq!(month * 12.0, year);
+    }
+
     #[test]
     fn test_validate_unit() {
         assert!(validate_unit("mg"));

@@ -2950,6 +2950,14 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   the search value as written, and filters on the unit code verbatim, so on
   MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
   stored as `kg`.
+- **Known limitation of the UCUM library (octofhir-ucum 0.5.2).** Units defined
+  as a fraction of another (the month `mo`, `mo_j`, `mo_g`, `deg`, `[ft_us]`
+  and about 140 more) have a wrong canonical factor, so a cross-unit search such
+  as `12|http://unitsofmeasure.org|mo` against `1 a` does not match, and a
+  `Range` such as `1 a`..`20 mo` is dropped as inverted. Searches within one
+  unit, and the units `a`, `wk`, `d`, `h` and `min`, are not affected. It is
+  fixed upstream; the dependency upgrade (and a reindex of the affected
+  canonical values) is a separate task.
 - The eq/ne-vs-comparator precision rule itself (implicit-precision range for
   `eq`/`ne`, exact value for the other comparators) is unified across
   SQLite, PostgreSQL, Elasticsearch, and MongoDB. `ap` (approximately equal)
