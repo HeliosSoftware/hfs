@@ -2903,4 +2903,128 @@ mod date_end_filter_tests {
         );
         fixture.close().await;
     }
+
+    /// One date row per live resource with a distinct second-resolution start,
+    /// one second wide: a late `gt` bound selects a small tail while
+    /// `idx_search_date_v3` would read every key of the parameter.
+    async fn add_second_rows(fixture: &Fixture) {
+        let rows: Vec<_> = fixture
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(number, row)| {
+                let start = BASE_MS + number as i64 * 1_000;
+                doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                "resource_id":&row.id, "param_name":"date",
+                "value_date":DateTime::from_millis(start),
+                "value_date_end":DateTime::from_millis(start + 1_000) }
+            })
+            .collect();
+        for chunk in rows.chunks(2_000) {
+            fixture
+                .db
+                .collection::<Document>("search_index")
+                .insert_many(chunk.to_vec())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The date filter and hint HFS builds for a frontier-wrapped page (the
+    /// `_id` batch path wraps the filter before the access is chosen).
+    fn wrapped_command(
+        backend: &MongoBackend,
+        db: &mongodb::Database,
+        raw: &str,
+        boundary: &Document,
+    ) -> (Document, Option<String>) {
+        let parameter = date_parameter(raw);
+        let filter = backend
+            .build_search_index_filter(PLAN_TENANT, "Observation", &parameter)
+            .unwrap();
+        let wrapped = doc! { "$and": [filter, boundary.clone()] };
+        let predicate =
+            backend.planning_predicate(db, PLAN_TENANT, "Observation", &parameter, wrapped, true);
+        let hint = predicate.hint().map(|hint| match hint {
+            mongodb::options::Hint::Name(name) => name,
+            other => panic!("unexpected hint {other:?}"),
+        });
+        (predicate.filter, hint)
+    }
+
+    const WRAPPED: [&str; 4] = [
+        "gt2020-03-01",
+        "ge2020-03-01",
+        "ne2020-03-01",
+        "eq2020-03-01",
+    ];
+
+    /// With the end index ready a frontier-wrapped `gt` is hinted to it, a
+    /// wrapped `ge`/`ne` is left to the planner, and start-bounded prefixes
+    /// keep v3. Without the end index every wrapped command keeps v3.
+    #[tokio::test]
+    async fn wrapped_date_filters_hint_by_end_index_readiness() {
+        let Some(fixture) = Fixture::new("date-end-wrapped-hints", 40).await else {
+            return;
+        };
+        let boundary = doc! { "resource_id": { "$gt": "r00010" } };
+        // Ready first: the next step drops the end index for good.
+        let ready: Vec<_> = WRAPPED
+            .into_iter()
+            .map(|raw| wrapped_command(&fixture.backend, &fixture.db, raw, &boundary).1)
+            .collect();
+        assert_eq!(
+            ready,
+            vec![
+                Some(SEARCH_DATE_END_INDEX.to_owned()),
+                None,
+                None,
+                Some(SEARCH_DATE_RANGE_INDEX.to_owned()),
+            ]
+        );
+        let plain = backend_without_date_end(&fixture).await;
+        for raw in WRAPPED {
+            let (_, hint) = wrapped_command(&plain, &fixture.db, raw, &boundary);
+            assert_eq!(hint.as_deref(), Some(SEARCH_DATE_RANGE_INDEX), "{raw}");
+        }
+        fixture.close().await;
+    }
+
+    /// On second-resolution starts, the command HFS sends for a later page
+    /// examines about its matches, not every key of the parameter.
+    #[tokio::test]
+    async fn wrapped_gt_and_ge_later_pages_examine_a_bounded_number_of_keys() {
+        const ROWS: usize = 5_000;
+        let Some(fixture) = Fixture::new("date-end-wrapped-keys", ROWS).await else {
+            return;
+        };
+        add_second_rows(&fixture).await;
+        // 01:15:00 is 4,500 seconds in: about 500 of the 5,000 rows match.
+        let raw_late = ["gt2020-01-01T01:15:00Z", "ge2020-01-01T01:15:00Z"];
+        let boundary = doc! { "resource_id": { "$gt": "r04600" } };
+        for raw in raw_late {
+            let (filter, hint) = wrapped_command(&fixture.backend, &fixture.db, raw, &boundary);
+            assert_ne!(hint.as_deref(), Some(SEARCH_DATE_RANGE_INDEX), "{raw}");
+            let mut find = doc! { "find":"search_index", "filter":filter.clone() };
+            if let Some(hint) = &hint {
+                find.insert("hint", hint.as_str());
+            }
+            let reply = fixture
+                .db
+                .run_command(doc! { "explain": find, "verbosity": "executionStats" })
+                .await
+                .unwrap();
+            let stats = reply.get_document("executionStats").unwrap();
+            let keys = stats
+                .get_i64("totalKeysExamined")
+                .unwrap_or_else(|_| i64::from(stats.get_i32("totalKeysExamined").unwrap()));
+            let returned = stats.get_i32("nReturned").unwrap_or(0) as i64;
+            assert!(returned > 0 && returned < 500, "{raw}: {returned} matches");
+            assert!(
+                keys <= returned * 3 + 20,
+                "{raw}: {keys} keys examined for {returned} matches (hint {hint:?})"
+            );
+        }
+        fixture.close().await;
+    }
 }

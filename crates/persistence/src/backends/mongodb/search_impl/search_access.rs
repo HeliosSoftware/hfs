@@ -25,6 +25,16 @@ pub(super) enum IndexAccess {
     DateEndRange,
 }
 
+/// Whether a root `$and` (a cursor frontier around the predicate) holds a
+/// `$or` among its terms.
+fn wraps_or(filter: &Document) -> bool {
+    filter.get_array("$and").is_ok_and(|terms| {
+        terms
+            .iter()
+            .any(|term| term.as_document().is_some_and(|d| d.contains_key("$or")))
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PredicateAccess {
     pub(super) discovery: IndexAccess,
@@ -57,7 +67,10 @@ impl PredicateAccess {
     /// whose single bound is `value_date_end`. A root `$or` (`ge`, `ne`, comma
     /// lists) mixes end-bounded and start-bounded arms and stays unhinted so
     /// MongoDB plans each arm. A root `$and` (a cursor frontier wrapped around
-    /// the predicate) keeps today's `idx_search_date_v3` hint.
+    /// the predicate) is judged by what it wraps: a single end-bounded arm
+    /// (`gt`) keeps the end hint, which the extra `resource_id` bound does not
+    /// change (59k keys against 997k under v3); a wrapped `$or` (`ge`, `ne`)
+    /// stays unhinted. Without the end index every shape keeps the v3 hint.
     pub(super) fn new_with_date_end(
         filter: &Document,
         parameter: &SearchParameter,
@@ -86,9 +99,9 @@ impl PredicateAccess {
             IndexAccess::DateRange => Some(SEARCH_DATE_RANGE_INDEX),
             IndexAccess::DateEndRange if !date_end_ready => Some(SEARCH_DATE_RANGE_INDEX),
             IndexAccess::DateEndRange if filter.contains_key("$or") => None,
-            IndexAccess::DateEndRange if filter.contains_key("$and") => {
-                Some(SEARCH_DATE_RANGE_INDEX)
-            }
+            // A wrapped `ge`/`ne` keeps its `$or` inside the `$and`: the end
+            // hint reads ~1M keys there (#2601), v3 too, so MongoDB plans.
+            IndexAccess::DateEndRange if wraps_or(filter) => None,
             IndexAccess::DateEndRange => Some(SEARCH_DATE_END_INDEX),
         };
         Self {
@@ -547,6 +560,7 @@ mod tests {
         "value_date_end": { "$gt": 1 } };
         let rooted_or = doc! { "$or": [flat.clone(), { "value_date": { "$gte": 1 } }] };
         let wrapped = doc! { "$and": [flat.clone(), { "resource_id": { "$gt": "c" } }] };
+        let wrapped_or = doc! { "$and": [rooted_or.clone(), { "resource_id": { "$gt": "c" } }] };
         let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
         let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
         let gt = parameter("gt2024-01-01");
@@ -559,7 +573,10 @@ mod tests {
             (&flat, &gt, false, false, None),
             (&rooted_or, &ge, true, true, None),
             (&rooted_or, &ge, true, false, v3.clone()),
-            (&wrapped, &gt, true, true, v3.clone()),
+            (&wrapped, &gt, true, true, end.clone()),
+            (&wrapped, &gt, true, false, v3.clone()),
+            (&wrapped_or, &ge, true, true, None),
+            (&wrapped_or, &ge, true, false, v3.clone()),
         ] {
             let access = PredicateAccess::new_with_date_end(filter, parameter, indexes, end_ready);
             assert_eq!(

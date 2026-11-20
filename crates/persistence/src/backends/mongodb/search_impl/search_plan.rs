@@ -5372,6 +5372,34 @@ mod index_intersection_tests {
     }
 
     #[test]
+    fn frontier_wrapped_date_filters_keep_the_end_hint_or_go_unhinted() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        let boundary = doc! { "resource_id": { "$gt": "cursor" } };
+        // The `_id` batch path wraps the filter before the access is chosen.
+        let wrapped = |raw: &str, ready: bool| {
+            let plain = date_predicate_with(raw, ready);
+            let parameter = SearchParameter {
+                name: "date".to_owned(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![crate::types::SearchValue::parse(raw)],
+                chain: vec![],
+                components: vec![],
+            };
+            let filter = doc! { "$and": [plain.filter, boundary.clone()] };
+            IndexPredicate::new_with_date_end(filter, &parameter, true, ready).hint()
+        };
+        assert_eq!(wrapped("gt2024-11-01", true), end);
+        assert_eq!(wrapped("ge2024-11-01", true), None);
+        assert_eq!(wrapped("ne2024-11-01", true), None);
+        assert_eq!(wrapped("eq2024-11-01", true), v3);
+        for raw in ["gt2024-11-01", "ge2024-11-01", "ne2024-11-01"] {
+            assert_eq!(wrapped(raw, false), v3, "{raw}");
+        }
+    }
+
+    #[test]
     fn date_prefixes_choose_their_discovery_hint() {
         let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
         let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
