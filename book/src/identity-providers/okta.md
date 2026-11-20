@@ -87,6 +87,12 @@ whose `scopes_supported` lists them.
 `system/*.cruds` was also requested in the verified setup. `user/*.cruds`
 alone was not tested as sufficient.
 
+The cross-tenant admin API (`/admin/tenants`, `/console/metrics/tenants`,
+`/console/metrics/traffic`) takes only `system/*` scopes, with the bit the
+method implies: `r` to list tenants or read the metrics, `c` to register a
+tenant, and `d` to deregister or purge one. `system/Patient.rs` and
+`user/*.cruds` are refused there with `403`.
+
 ## 3. Register the login application
 
 The web UI signs users in through an OIDC application.

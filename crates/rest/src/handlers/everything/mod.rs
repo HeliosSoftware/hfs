@@ -5,6 +5,7 @@
 //! Design: #966 (implemented in #1118).
 
 pub(crate) mod cursor;
+pub(crate) mod grants;
 pub(crate) mod params;
 pub(crate) mod scope;
 pub(crate) mod walk;
@@ -25,6 +26,7 @@ use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::handlers::bulk_common::{pairs_from_parameters, parse_query_pairs};
 use crate::state::AppState;
 use cursor::EverythingCursor;
+use grants::TypeGrants;
 use params::EverythingParams;
 use walk::{WalkLimits, WalkOutput};
 
@@ -84,6 +86,10 @@ fn launch_patient_id(principal: Option<&Principal>) -> Option<String> {
 /// if its `patient` claim was missing or unusable — so under such a grant the
 /// launch patient is always usable here and the fallback to every patient is
 /// only ever taken by a `user/` or `system/` grant.
+///
+/// The middleware admits the operation on a `Patient` read alone; which member
+/// and supporting types the walk may return is decided per type here, from the
+/// token's scopes ([`grants`]).
 pub async fn patient_everything_type_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
@@ -138,8 +144,13 @@ where
     // self/next links, which echo the request as made.
     let patient_id = path_id.clone().or(launch_patient);
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+    let grants = TypeGrants::for_principal(request.extensions().get::<Principal>())
+        .walking(patient_id.as_deref());
     let pairs = decode_pairs(request).await?;
-    let params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
+    let mut params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
+    // Before the fingerprint: a cursor minted under other grants walks other
+    // segments and must not resume this walk.
+    let omitted_members = grants::narrow_member_types(&mut params, fhir_version, &grants)?;
     let fp_input =
         params.fingerprint_input(patient_id.as_deref(), tenant.tenant_id(), fhir_version);
     let resume = match &params.cursor {
@@ -163,6 +174,7 @@ where
                 &params,
                 resume,
                 limits,
+                &grants,
             )
             .await?
         }
@@ -174,6 +186,7 @@ where
                 &params,
                 resume,
                 limits,
+                &grants,
             )
             .await?
         }
@@ -226,6 +239,26 @@ where
                     "diagnostics": format!(
                         "Supporting resources exceeded the server's limit of {} and were truncated",
                         state.everything_max_unpaged()
+                    )
+                }]
+            })));
+    }
+    let omitted: std::collections::BTreeSet<&str> = omitted_members
+        .iter()
+        .chain(out.omitted_supporting_types.iter())
+        .map(String::as_str)
+        .collect();
+    if !omitted.is_empty() {
+        bundle
+            .entry
+            .push(BundleEntry::outcome_entry(serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "information",
+                    "code": "informational",
+                    "diagnostics": format!(
+                        "Omitted resource types the token's scopes do not cover: {}",
+                        omitted.into_iter().collect::<Vec<_>>().join(", ")
                     )
                 }]
             })));
