@@ -398,7 +398,8 @@ them, and exposes results through a status manifest.
   (poll / cancel), and `GET /bulk-submit-file/{poll_token}/{part}` (HFS-hosted
   status artifacts). See the [API Endpoints](#api-endpoints) table.
 - **Scope**: every surface requires the `system/bulk-submit` SMART scope when auth is
-  enabled; status, cancel, and file surfaces also enforce submission ownership.
+  enabled; status, cancel and file surfaces, and a kick-off or status kick-off that
+  names an existing submission, also enforce submission ownership.
 - **Poll pacing**: an in-progress poll advertises `Retry-After`
   (`HFS_BULK_SUBMIT_RETRY_AFTER`). While the submission is still pre-ingest — queued,
   reading the remote manifest, sizing or downloading files — the shorter

@@ -17,7 +17,7 @@ HFS implements the FHIR Bulk Data Submit operation from the Argo25 branch as the
 | cancel | DELETE | `/bulk-submit-status/{poll_token}` | `202`; subsequent poll returns `404` |
 | HFS-served artifact | GET | `/bulk-submit-file/{poll_token}/{part}` | `200` `application/fhir+ndjson` |
 
-All surfaces require the `system/bulk-submit` SMART scope when auth is enabled. Status, cancel, and file endpoints also enforce submission ownership through `owner_subject` or a system wildcard scope.
+All surfaces require the `system/bulk-submit` SMART scope when auth is enabled. Status, cancel and file endpoints, and a kick-off or status kick-off that names an existing submission, also enforce submission ownership through `owner_subject` or a system wildcard scope; a non-owner is answered `404`.
 
 ## Kick-off Parameters
 

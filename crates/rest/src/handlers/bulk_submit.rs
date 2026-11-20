@@ -212,12 +212,41 @@ fn check_submit_scope(principal: Option<&Principal>) -> RestResult<()> {
     Ok(())
 }
 
-/// Ownership check for status / cancel / file surfaces: the principal must own the
-/// submission (subject match) or hold a system wildcard scope. Auth-disabled → allowed.
+/// Ownership check for the status / cancel / file surfaces and for a kick-off
+/// that names an existing submission: the principal must own the submission
+/// (subject match) or hold a system wildcard scope. Auth-disabled → allowed.
 fn owns_submission(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
     match principal {
         None => true,
         Some(p) => owner_subject == Some(p.subject.as_str()) || p.scopes.has_system_wildcard(),
+    }
+}
+
+/// The recorded owner of an existing submission. The job store keeps it on the
+/// submission row and exposes it on the poll-token target only, so the token
+/// is ensured (minted once, then reused) and resolved.
+async fn submission_owner(
+    jobs: &std::sync::Arc<dyn helios_persistence::core::BulkSubmitJobStore>,
+    ctx: &TenantContext,
+    sub_id: &SubmissionId,
+) -> RestResult<Option<String>> {
+    let token = jobs
+        .ensure_poll_token(ctx, sub_id)
+        .await
+        .map_err(RestError::from)?;
+    Ok(jobs
+        .resolve_poll_token(&token)
+        .await
+        .map_err(RestError::from)?
+        .and_then(|target| target.owner_subject))
+}
+
+/// The `404` for a submission the principal does not own: the surface does not
+/// confirm that another client's submission exists.
+fn not_owned(sub_id: &SubmissionId) -> RestError {
+    RestError::NotFound {
+        resource_type: "Submission".to_string(),
+        id: sub_id.to_string(),
     }
 }
 
@@ -566,6 +595,13 @@ where
         .await
         .map_err(RestError::from)?
     {
+        // An existing submission is continued by its owner only: the key is
+        // two client-chosen body values, and everything below (replace,
+        // attach, stop, complete) acts on that submission.
+        let owner = submission_owner(&jobs, ctx, &sub_id).await?;
+        if !owns_submission(principal.as_ref(), owner.as_deref()) {
+            return Err(not_owned(&sub_id));
+        }
         if existing_status.is_terminal() {
             // A status-only kick-off that restates the terminal status the
             // submission already has is not a further submission — it is the
@@ -767,10 +803,11 @@ where
     jobs.get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "Submission".to_string(),
-            id: sub_id.to_string(),
-        })?;
+        .ok_or_else(|| not_owned(&sub_id))?;
+    let owner = submission_owner(&jobs, ctx, &sub_id).await?;
+    if !owns_submission(principal.as_ref(), owner.as_deref()) {
+        return Err(not_owned(&sub_id));
+    }
 
     let token = jobs
         .ensure_poll_token(ctx, &sub_id)
