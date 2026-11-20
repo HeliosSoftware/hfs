@@ -6770,7 +6770,15 @@ impl MongoBackend {
             return Ok(doc! { field: { field_op: boundary } });
         }
 
+        // The `$or` alone is only a filter: MongoDB then starts the index walk
+        // at the first row of the type and discards everything before the
+        // cursor, so a deep page reads every row ahead of it. The redundant
+        // inclusive bound on the sorted field (every row the `$or` accepts
+        // satisfies it) gives the planner a range to seek to on
+        // `RESOURCES_TYPE_SCAN_INDEX`.
+        let inclusive_op = if ascending { "$gte" } else { "$lte" };
         Ok(doc! {
+            field: { inclusive_op: boundary.clone() },
             "$or": [
                 { field: { field_op: boundary.clone() } },
                 { field: boundary, "id": { id_op: id } }
@@ -9893,7 +9901,7 @@ mod cursor_keyset_tests {
         ));
         assert_eq!(
             backend().build_cursor_condition(&cursor, &default).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
                 { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
             ]}
@@ -9910,7 +9918,7 @@ mod cursor_keyset_tests {
         let asc = keyset(&["_lastUpdated"]).unwrap();
         assert_eq!(
             backend().build_cursor_condition(&cursor, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$gte": ts.clone() }, "$or": [
                 { "last_updated": { "$gt": ts.clone() } },
                 { "last_updated": ts.clone(), "id": { "$gt": "p-5" } }
             ]}
@@ -9921,7 +9929,7 @@ mod cursor_keyset_tests {
                 .unwrap();
         assert_eq!(
             backend().build_cursor_condition(&prev, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
                 { "last_updated": ts, "id": { "$lt": "p-5" } }
             ]}
