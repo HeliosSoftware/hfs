@@ -114,7 +114,9 @@ gated on their own operation scope — `system/purge` and `system/reindex` — a
 precedent. A token that may soft-delete a Patient must not thereby be able to
 destroy it irrecoverably, and a token that may write a resource must not be able
 to rebuild the whole tenant's search index. As with `system/bulk-submit`, a
-`system/*.<perm>` wildcard also grants them.
+`system/*` wildcard also grants them, but only when it carries the permission
+bit the operation implies: `d` for `$purge`, `u` for `$reindex`, `c` for
+`$bulk-submit`. A read-only `system/*.rs` grants none of them.
 
 **`$purge`** permanently deletes a resource and all of its versions. This is not
 the FHIR `delete` interaction: an ordinary `DELETE` is a *soft* delete that
