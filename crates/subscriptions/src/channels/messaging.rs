@@ -10,20 +10,20 @@
 //!
 //! 1. **TLS enforcement** — full-resource payloads are rejected over plain
 //!    HTTP (matches the rest-hook channel).
-//! 2. **SSRF guard** — receiver endpoints whose host is a literal loopback /
-//!    private / link-local / unspecified IP are rejected by default. Operators
-//!    set `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` for local development.
+//! 2. **SSRF guard** — receiver endpoints that are, or resolve to, a loopback /
+//!    private / link-local / unspecified IP are rejected by default, and
+//!    redirects are never followed (see [`super::egress`]). Operators set
+//!    `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` for local development.
 //! 3. **Outbound auth** — the server's outbound credential
-//!    (`HFS_OUTBOUND_BEARER_TOKEN`) is attached only to requests for a host
+//!    (`HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN`, else
+//!    `HFS_OUTBOUND_BEARER_TOKEN`) is attached only to requests for a host
 //!    named in `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS`, and only over
 //!    HTTPS unless private endpoints are allowed. The endpoint is written by
 //!    whoever can write a Subscription, so without that list no receiver gets
 //!    the credential. Subscription-supplied `Authorization` headers are
 //!    forwarded to any endpoint and take precedence.
 
-use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use helios_auth::OutboundAuthProvider;
@@ -31,6 +31,7 @@ use helios_persistence::core::bulk_submit_input::{redact_url, redact_urls_in};
 use reqwest::{Client, Url};
 use tracing::{debug, warn};
 
+use crate::channels::egress::{self, check_endpoint_host};
 use crate::channels::{ChannelDispatcher, DispatchResult};
 use crate::error::SubscriptionError;
 use crate::manager::{ActiveSubscription, PayloadContent};
@@ -67,13 +68,30 @@ impl CredentialHost {
         if entry.is_empty() {
             return None;
         }
-        let url = Url::parse(&format!("https://{entry}")).ok()?;
-        if url.path() != "/" || url.query().is_some() || url.username() != "" {
+        // A wildcard would parse as a literal host that matches nothing.
+        if entry.contains('*') {
             return None;
         }
+        let url = Url::parse(&format!("https://{entry}")).ok()?;
+        if url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.username() != ""
+            || url.password().is_some()
+        {
+            return None;
+        }
+        // `Url::port` drops the scheme's default, which would turn an
+        // explicit `host:443` into "any port"; read the port the entry names.
+        let port = match entry.rsplit_once(':') {
+            Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(port.parse().ok()?)
+            }
+            _ => None,
+        };
         Some(Self {
             host: url.host_str()?.to_ascii_lowercase(),
-            port: url.port(),
+            port,
         })
     }
 
@@ -90,13 +108,8 @@ impl MessagingChannel {
     /// Create a messaging channel with the given source endpoint (HFS base
     /// URL) and outbound auth provider.
     pub fn new(source_endpoint: String, auth_provider: Arc<dyn OutboundAuthProvider>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
-
         Self {
-            client,
+            client: egress::build_client(false),
             auth_provider,
             source_endpoint,
             source_endpoint_resolver: None,
@@ -121,6 +134,7 @@ impl MessagingChannel {
     /// enable this to dispatch to `127.0.0.1` mock servers.
     pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
         self.private_endpoints_allowed = allowed;
+        self.client = egress::build_client(allowed);
         self
     }
 
@@ -139,7 +153,7 @@ impl MessagingChannel {
                 if parsed.is_none() {
                     warn!(
                         entry = entry.as_ref(),
-                        "HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS entry is not a host or host:port; skipped"
+                        "HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS entry is not a host or host:port (wildcards are not supported); skipped"
                     );
                 }
                 parsed
@@ -257,6 +271,15 @@ impl MessagingChannel {
                         "Message delivery failed (client error)"
                     );
                     Ok(DispatchResult::PermanentError(format!("HTTP {status}")))
+                } else if response.status().is_redirection() {
+                    warn!(
+                        subscription_id = %subscription.id,
+                        status,
+                        "Message delivery failed (endpoint redirects; redirects are not followed)"
+                    );
+                    Ok(DispatchResult::PermanentError(format!(
+                        "HTTP {status}: redirects are not followed"
+                    )))
                 } else {
                     warn!(
                         subscription_id = %subscription.id,
@@ -269,7 +292,14 @@ impl MessagingChannel {
             Err(e) => {
                 // reqwest's message ends with `for url (...)`, query included.
                 let error = redact_urls_in(&e.to_string());
-                if e.is_timeout() {
+                if let Some(reason) = egress::blocked_resolution(&e) {
+                    warn!(
+                        subscription_id = %subscription.id,
+                        reason = %reason,
+                        "Message delivery refused"
+                    );
+                    Ok(DispatchResult::PermanentError(reason))
+                } else if e.is_timeout() {
                     warn!(
                         subscription_id = %subscription.id,
                         "Message delivery timed out"
@@ -295,48 +325,6 @@ impl MessagingChannel {
             }
         }
     }
-}
-
-/// Inspect the receiver URL and return a rejection reason if its host is a
-/// literal private/loopback/link-local/unspecified IP. DNS-resolved private
-/// targets are not blocked by this check.
-fn check_endpoint_host(endpoint: &str) -> Option<String> {
-    let url = match Url::parse(endpoint) {
-        Ok(u) => u,
-        Err(_) => {
-            return Some(format!("invalid endpoint URL: {}", redact_url(endpoint)));
-        }
-    };
-
-    let host = url.host_str()?;
-    let ip: IpAddr = match host.parse() {
-        Ok(ip) => ip,
-        Err(_) => return None, // hostname — not an SSRF concern at this layer
-    };
-
-    let is_blocked = match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || is_v6_private_or_link(&v6),
-    };
-
-    if is_blocked {
-        Some(format!(
-            "endpoint host {ip} is a private/loopback IP; set HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true to allow"
-        ))
-    } else {
-        None
-    }
-}
-
-fn is_v6_private_or_link(addr: &std::net::Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    // fc00::/7 — Unique Local Addresses (RFC 4193)
-    let unique_local = (segments[0] & 0xfe00) == 0xfc00;
-    // fe80::/10 — Link-Local Addresses
-    let link_local = (segments[0] & 0xffc0) == 0xfe80;
-    unique_local || link_local
 }
 
 #[async_trait]
@@ -638,6 +626,49 @@ mod tests {
         assert!(dev.credential_destination("http://receiver.example.org/x"));
     }
 
+    /// An entry that names the scheme's default port still names a port.
+    #[test]
+    fn credential_host_entry_keeps_an_explicit_default_port() {
+        let channel = MessagingChannel::new(SOURCE.to_string(), Arc::new(NoOpOutboundAuthProvider))
+            .with_credential_hosts(["receiver.example.org:443", "[2001:db8::1]:8443"]);
+        assert_eq!(
+            channel.credential_hosts,
+            vec![
+                CredentialHost {
+                    host: "receiver.example.org".to_string(),
+                    port: Some(443)
+                },
+                CredentialHost {
+                    host: "[2001:db8::1]".to_string(),
+                    port: Some(8443)
+                },
+            ]
+        );
+        assert!(channel.credential_destination("https://receiver.example.org/x"));
+        assert!(channel.credential_destination("https://receiver.example.org:443/x"));
+        assert!(
+            !channel.credential_destination("https://receiver.example.org:8443/x"),
+            "an explicit :443 entry must not match another port"
+        );
+        assert!(channel.credential_destination("https://[2001:db8::1]:8443/x"));
+        assert!(!channel.credential_destination("https://[2001:db8::1]/x"));
+    }
+
+    #[test]
+    fn credential_host_entries_that_are_not_a_bare_host_are_skipped() {
+        let channel = MessagingChannel::new(SOURCE.to_string(), Arc::new(NoOpOutboundAuthProvider))
+            .with_credential_hosts([
+                "*.example.org",
+                "https://receiver.example.org",
+                "user@receiver.example.org",
+                ":pw@receiver.example.org",
+                "receiver.example.org#x",
+                "receiver.example.org:notaport",
+                "receiver.example.org:99999",
+            ]);
+        assert_eq!(channel.credential_hosts, vec![]);
+    }
+
     #[tokio::test]
     async fn subscription_authorization_takes_precedence_over_outbound() {
         let server = MockServer::start().await;
@@ -802,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn ssrf_guard_passes_through_dns_names() {
-        // We don't block DNS-resolved hosts at this layer; rely on network policy.
+        // A DNS name passes the literal check and is judged when it resolves.
         // Use a hostname that won't resolve so we get a connection error
         // (still proves the guard didn't trip).
         let channel = MessagingChannel::new(SOURCE.to_string(), Arc::new(NoOpOutboundAuthProvider));
@@ -826,6 +857,63 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// `localhost` is not an IP literal, so only the connect-time check can
+    /// stop it; a blocked name is a permanent error and nothing is sent.
+    #[tokio::test]
+    async fn ssrf_guard_rejects_a_name_that_resolves_to_loopback() {
+        let server = MockServer::start().await;
+        let channel = MessagingChannel::new(
+            SOURCE.to_string(),
+            Arc::new(StaticBearerOutboundAuthProvider::new("outbound-token")),
+        )
+        .with_credential_hosts(["localhost"]);
+        let sub = test_subscription(
+            &format!("http://localhost:{}/x", server.address().port()),
+            PayloadContent::IdOnly,
+        );
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+        match result {
+            DispatchResult::PermanentError(msg) => {
+                assert!(msg.contains("resolves to a private/loopback IP"), "{msg}")
+            }
+            other => panic!("expected PermanentError, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A redirect would carry the request, and the Subscription's headers,
+    /// to a host nobody checked.
+    #[tokio::test]
+    async fn redirect_is_a_permanent_error_and_is_not_followed() {
+        let target = MockServer::start().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/elsewhere", target.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let channel = channel_with_noop();
+        let mut sub = test_subscription(&format!("{}/x", server.uri()), PayloadContent::IdOnly);
+        sub.channel.headers = vec!["X-Api-Key: receiver-secret".to_string()];
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+        match result {
+            DispatchResult::PermanentError(msg) => {
+                assert!(msg.contains("redirects are not followed"), "{msg}")
+            }
+            other => panic!("expected PermanentError, got {other:?}"),
+        }
+        assert!(target.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

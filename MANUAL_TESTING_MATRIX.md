@@ -263,6 +263,7 @@ export HFS_DEFAULT_FHIR_VERSION=R4
 # HFS_MAX_BODY_SIZE: the 128 MiB default already covers every per-patient Synthea bundle (#1662)
 export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
+export HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true  # T9 receivers listen on loopback
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
 export HFS_EXPORT_DIR=$WORK/sql-exports               # T7 fs sink
 # composites: read-your-write for T2 and T4; the rebuild skips the refresh wait
@@ -1500,9 +1501,10 @@ For each backend row, attach to the release issue:
 - **SQL export job list is per user and per tenant** and lives in the settings
   document; a restart turns in-progress cards into *Cancelled · the server no longer
   knows this job*. Expected.
-- **Rest-hook to loopback** works for `id-only` payloads without extra flags;
-  `full-resource` payloads require an `https://` endpoint.
-  `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` only affects the messaging channel.
+- **Rest-hook to loopback** needs `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`
+  (it covers rest-hook and messaging; without it a loopback or private endpoint,
+  by address or by name, is a permanent delivery error). `full-resource`
+  payloads require an `https://` endpoint. Redirects are never followed.
 - **One AWS credential chain per process**: with MinIO as the primary store, the S3
   export/sink buckets must also live in MinIO.
 - **R6 fixtures**: the T0 build (`--workspace --all-features`, which includes

@@ -64,6 +64,13 @@ pub struct SubscriptionConfig {
     /// Lifetime of WebSocket binding tokens in seconds.
     pub ws_token_lifetime_secs: i64,
 
+    /// When `true`, rest-hook delivery to private/loopback/link-local IPs is
+    /// permitted. Default `false`: the endpoint is chosen by whoever writes
+    /// the Subscription. Set `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`
+    /// to opt in (local development and CI). The messaging channel has its
+    /// own copy in [`MessagingSettings::allow_private_endpoints`].
+    pub allow_private_endpoints: bool,
+
     /// SMTP settings for the email channel. `None` disables the email dispatcher.
     pub smtp: Option<SmtpSettings>,
 
@@ -112,13 +119,15 @@ pub struct MessagingSettings {
     /// HFS base URL (`HFS_BASE_URL`).
     pub source_endpoint: String,
 
-    /// When `true`, dispatch to private/loopback/link-local IPs is permitted.
+    /// When `true`, dispatch to endpoints that are, or resolve to,
+    /// private/loopback/link-local IPs is permitted.
     /// Default `false` (SSRF guard on). Set
     /// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` to opt in.
     pub allow_private_endpoints: bool,
 
     /// Receivers (`host` or `host:port`) that may be sent the server's
-    /// outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the
+    /// outbound credential (`HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN`, else
+    /// `HFS_OUTBOUND_BEARER_TOKEN`) when the
     /// Subscription supplies no `Authorization` header of its own. Empty by
     /// default: the endpoint is chosen by whoever writes the Subscription, so
     /// no receiver gets the credential until the operator names it here
@@ -147,6 +156,7 @@ impl Default for SubscriptionConfig {
             off_threshold: 10,
             supported_channel_types: vec!["rest-hook".to_string()],
             ws_token_lifetime_secs: 30,
+            allow_private_endpoints: false,
             smtp: None,
             messaging: None,
             persist_status: true,

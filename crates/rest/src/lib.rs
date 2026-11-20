@@ -693,6 +693,11 @@ where
     // app state — the subscription engine (constructed below) consumes it.
     #[cfg(feature = "subscriptions")]
     let outbound_auth_provider = auth_config.outbound_provider();
+    #[cfg(feature = "subscriptions")]
+    let outbound_token_configured = auth_config
+        .outbound_bearer_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
 
     // Create application state
     let mut state = AppState::with_auth_and_audit(
@@ -881,23 +886,51 @@ where
                 supported.push("email".to_string());
                 info!("Email subscription channel ENABLED");
             }
+            // A credential for messaging receivers alone, so they need not be
+            // handed the one the server's own self-calls use.
+            let messaging_token = std::env::var("HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN")
+                .ok()
+                .filter(|t| !t.trim().is_empty());
             if let Some(settings) = &messaging {
                 supported.push("message".to_string());
                 info!("FHIR Messaging subscription channel ENABLED");
-                if settings.credential_hosts.is_empty() {
-                    info!(
-                        "FHIR Messaging deliveries carry no server credential; name the receivers that may get HFS_OUTBOUND_BEARER_TOKEN in HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS"
-                    );
-                } else {
-                    info!(
+                match (
+                    settings.credential_hosts.is_empty(),
+                    messaging_token.is_some(),
+                    outbound_token_configured,
+                ) {
+                    (true, false, false) => info!(
+                        "FHIR Messaging deliveries carry no server credential; name the receivers that may get one in HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS"
+                    ),
+                    // Before the receiver list existed every messaging
+                    // endpoint got the bearer; say loudly that none does now.
+                    (true, _, _) => warn!(
+                        "A server credential is configured but HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS names no receiver, so FHIR Messaging deliveries carry none; a receiver that expects it will reject them"
+                    ),
+                    (false, false, false) => warn!(
                         hosts = ?settings.credential_hosts,
-                        "FHIR Messaging deliveries to these receivers carry the server credential"
-                    );
+                        "HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS names receivers but no credential is configured (HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN or HFS_OUTBOUND_BEARER_TOKEN)"
+                    ),
+                    (false, true, _) => info!(
+                        hosts = ?settings.credential_hosts,
+                        "FHIR Messaging deliveries to these receivers carry HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN"
+                    ),
+                    (false, false, true) => warn!(
+                        hosts = ?settings.credential_hosts,
+                        "FHIR Messaging deliveries to these receivers carry HFS_OUTBOUND_BEARER_TOKEN, the credential the server's own self-calls use; set HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN to give receivers a separate one"
+                    ),
                 }
+            }
+            let allow_private_endpoints = subscription_private_endpoints_allowed();
+            if allow_private_endpoints {
+                warn!(
+                    "HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS is set: subscription deliveries may reach loopback and private addresses (local development and CI only)"
+                );
             }
             let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
             let sub_config = helios_subscriptions::SubscriptionConfig {
                 supported_channel_types: supported,
+                allow_private_endpoints,
                 smtp,
                 messaging,
                 handshake_initial_delay: subscription_duration_ms_from_env(
@@ -929,8 +962,14 @@ where
             };
             let sub_config =
                 subscription_dispatch_config(sub_config, |name| std::env::var(name).ok());
-            // Outbound auth provider was built above (static bearer when
+            // The engine attaches this to messaging deliveries for listed
+            // receivers only: the messaging token when one is set, else the
+            // outbound provider built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
+            let outbound_auth_provider = match messaging_token.as_deref() {
+                Some(token) => helios_auth::outbound::provider_from_token(Some(token)),
+                None => outbound_auth_provider,
+            };
             let public_url = PublicUrl::parse(&config.base_url)
                 .expect("validated ServerConfig has a valid public base URL");
             let tenant_path_routing = config.multitenancy.routing_mode.supports_url_path();
@@ -1437,6 +1476,16 @@ fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSe
     })
 }
 
+/// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS`: whether rest-hook and messaging
+/// deliveries may reach loopback and private addresses. Off unless set to
+/// `true` or `1`.
+#[cfg(feature = "subscriptions")]
+fn subscription_private_endpoints_allowed() -> bool {
+    std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false)
+}
+
 #[cfg(feature = "subscriptions")]
 fn build_messaging_settings_from_env(
     base_url: &str,
@@ -1456,9 +1505,7 @@ fn build_messaging_settings_from_env(
     let source_endpoint_is_explicit = configured_source_endpoint.is_some();
     let source_endpoint = configured_source_endpoint.unwrap_or_else(|| base_url.to_string());
 
-    let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
-        .unwrap_or(false);
+    let allow_private_endpoints = subscription_private_endpoints_allowed();
 
     let credential_hosts = std::env::var("HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS")
         .map(|v| {

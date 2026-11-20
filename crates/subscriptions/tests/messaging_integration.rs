@@ -194,6 +194,7 @@ fn engine_with_messaging_enabled(receiver: &MockServer) -> SubscriptionEngine {
             allow_private_endpoints: true, // wiremock binds to 127.0.0.1
             credential_hosts: vec![receiver.address().to_string()],
         }),
+        allow_private_endpoints: true, // receivers are on loopback
         ..Default::default()
     };
     SubscriptionEngine::with_outbound_auth(
