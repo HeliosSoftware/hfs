@@ -350,9 +350,15 @@ where
     // the job is pinned to the launch patient, and any `patient` parameter the
     // client sent must name that same patient. A system-level or Group export
     // cannot be confined, so a `patient/`-granted type refuses the kick-off.
-    // Types the token does not cover at all keep today's behaviour: refused
-    // when named in `_type`, not judged when `_type` is absent (best effort).
+    // A type the token does not cover is refused when named in `_type`.
+    // With `_type` absent the job is narrowed to the types the token may
+    // read: an empty list means every type the tenant holds, which is what a
+    // wildcard token gets, and a per-type token gets its types rather than
+    // the whole tenant materialized under its name (the per-file read check
+    // on download exists only on the HFS-served path, not for presigned
+    // output URLs).
     let mut patient_refs = patient_refs;
+    let mut resource_types = resource_types;
     if let Some(p) = principal {
         let explicit = !resource_types.is_empty();
         let types_to_check: Vec<String> = if explicit {
@@ -364,9 +370,11 @@ where
                 .collect()
         };
         let mut confined_to: Option<String> = None;
+        let mut granted: Vec<String> = Vec::new();
+        let mut refused_any = false;
         for t in &types_to_check {
             match helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read) {
-                Ok(helios_auth::AccessScope::Unrestricted) => {}
+                Ok(helios_auth::AccessScope::Unrestricted) => granted.push(t.clone()),
                 Ok(helios_auth::AccessScope::PatientCompartment { patient_id }) => {
                     if !matches!(level, ExportLevel::Patient) {
                         return Err(RestError::Forbidden {
@@ -385,6 +393,7 @@ where
                         });
                     }
                     confined_to = Some(patient_id);
+                    granted.push(t.clone());
                 }
                 Err(e @ helios_auth::AuthError::PatientContextRequired { .. }) => {
                     return Err(RestError::Forbidden {
@@ -396,8 +405,18 @@ where
                         message: e.to_string(),
                     });
                 }
-                Err(_) => {}
+                Err(_) => refused_any = true,
             }
+        }
+        if !explicit && refused_any {
+            if granted.is_empty() {
+                return Err(RestError::Forbidden {
+                    message:
+                        "the token grants read on no resource type, so there is nothing to export"
+                            .to_string(),
+                });
+            }
+            resource_types = granted;
         }
         if let Some(launch_patient) = confined_to {
             let launch_ref = format!("Patient/{launch_patient}");
