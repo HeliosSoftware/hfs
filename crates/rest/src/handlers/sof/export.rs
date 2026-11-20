@@ -93,6 +93,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::core::search::SearchProvider;
 use helios_sof::fhir_format::accept_requires_unsupported_fhir_xml;
@@ -213,11 +214,13 @@ pub async fn sql_export_handler<S>(
     State(state): State<AppState<S>>,
     headers: HeaderMap,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    principal: Option<axum::Extension<Principal>>,
     body: Option<axum::Json<Value>>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     if let Err(resp) = check_prefer_async(&headers) {
         return Ok(resp);
     }
@@ -248,7 +251,7 @@ where
     inputs.fhir_version =
         get_content_type_fhir_version(&headers).or_else(|| get_accept_fhir_version(&headers));
 
-    let work = extract_subjects_from_body(&state, &tenant, &body).await?;
+    let work = extract_subjects_from_body(&state, &tenant, principal.as_ref(), &body).await?;
     if work.is_empty() {
         return Ok(missing_subject_response());
     }
@@ -282,6 +285,7 @@ fn missing_subject_response() -> Response {
 async fn extract_subjects_from_body<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    principal: Option<&Principal>,
     body: &Value,
 ) -> Result<ExportWork, RestError>
 where
@@ -303,6 +307,11 @@ where
 
     // Shorthand: a bare ViewDefinition body is a single unnamed subject.
     if rt == "ViewDefinition" {
+        super::authz::check_read_scopes(
+            principal,
+            "$sql-export",
+            super::authz::view_resource_type(body),
+        )?;
         work.views.push(NamedView {
             name: subject_output_name(None, body, 0),
             view: body.clone(),
@@ -391,15 +400,23 @@ where
 
         let output_name = subject_output_name(name.as_deref(), &subject.resource, index);
         match subject.kind {
-            SubjectKind::ViewDefinition => work.views.push(NamedView {
-                name: output_name,
-                view: subject.resource,
-            }),
+            SubjectKind::ViewDefinition => {
+                super::authz::check_read_scopes(
+                    principal,
+                    "$sql-export",
+                    super::authz::view_resource_type(&subject.resource),
+                )?;
+                work.views.push(NamedView {
+                    name: output_name,
+                    view: subject.resource,
+                })
+            }
             SubjectKind::SqlQuery | SubjectKind::SqlView => {
                 work.queries.push(
                     prepare_named_sqlquery(
                         state,
                         tenant,
+                        principal,
                         Some(output_name),
                         &subject.resource,
                         bindings.as_ref(),
@@ -442,6 +459,7 @@ fn subject_output_name(explicit: Option<&str>, resource: &Value, index: usize) -
 async fn prepare_named_sqlquery<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    principal: Option<&Principal>,
     name_hint: Option<String>,
     library_json: &Value,
     supplied_params: Option<&Value>,
@@ -475,6 +493,13 @@ where
         .map_err(super::graph::errors_to_rest_error)?;
 
     super::graph::check_max_nodes(&plan, max_vds)?;
+
+    // Every leaf ViewDefinition in the plan reads the resource type it names.
+    super::authz::check_read_scopes(
+        principal,
+        "$sql-export",
+        super::authz::plan_resource_types(&plan),
+    )?;
 
     let bindings = helios_sof::sqlquery::bind_supplied_params(&library.parameters, supplied_params)
         .map_err(sqlquery_err_to_rest)?;

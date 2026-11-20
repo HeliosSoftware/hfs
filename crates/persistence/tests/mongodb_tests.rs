@@ -452,6 +452,9 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            // As in `shared()`: keep mongod 9.0 from dropping profiler entries.
+            "--setParameter",
+            "internalQueryGlobalProfilingLockDeadlineMs=10000",
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
@@ -530,6 +533,12 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            // mongod 9.0 gives each profiler write 1 ms to get its
+                            // lock and silently drops the entry when it cannot;
+                            // the plan tests then read an empty system.profile
+                            // (#2636).
+                            "--setParameter",
+                            "internalQueryGlobalProfilingLockDeadlineMs=10000",
                             "--replSet",
                             "rs0",
                             "--oplogSize",
@@ -8602,7 +8611,8 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
 /// rather than a type-wide `distinct`.
 #[tokio::test]
 async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
-    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+    // The plan guard below needs the bounded plan, which a timed-out probe changes.
+    let Some(backend) = create_backend_with_stable_probes("param_sort_bounded").await else {
         eprintln!(
             "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
         );

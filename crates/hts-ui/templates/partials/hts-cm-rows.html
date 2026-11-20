@@ -69,7 +69,7 @@
                   </a>
                 </td>
                 <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td class="col-url">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
                 <td>
                   {#-
                     Stacked mapping cell: prefix labels (`S:` / `T:`) let
