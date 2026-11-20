@@ -9820,6 +9820,43 @@ mod cursor_keyset_tests {
         }
     }
 
+    /// #2603: the `id` tie-break follows the direction of `last_updated`
+    /// (mirrored for previous pages), so every order is one
+    /// `RESOURCES_TYPE_SCAN_INDEX` serves forward or backward.
+    #[test]
+    fn last_updated_sort_document_id_follows_the_sort_direction() {
+        for (sort, previous, expected) in [
+            (
+                "_lastUpdated",
+                false,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+            (
+                "_lastUpdated",
+                true,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                false,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                true,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+        ] {
+            let query =
+                SearchQuery::new("Patient").with_sort(crate::types::SortDirective::parse(sort));
+            assert_eq!(
+                backend().build_sort_document(&query, previous).unwrap(),
+                expected,
+                "{sort} previous={previous}"
+            );
+        }
+    }
+
     #[test]
     fn index_cursor_filter_excludes_timestamp_cursors_and_first_pages() {
         let backend = backend();
