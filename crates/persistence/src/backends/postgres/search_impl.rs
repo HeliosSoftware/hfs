@@ -1077,7 +1077,11 @@ impl SearchProvider for PostgresBackend {
             .map(|fragment| fragment.params)
             .unwrap_or_default();
         let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < $3 OR (last_updated = $3 AND id > $4))"
+            // The leading `last_updated <= $3` is implied by the `OR`; it only
+            // gives the planner a range to seek to on `idx_resources_search`
+            // instead of filtering every row before the cursor (same shape as
+            // the descending keyset in `keyset_page_clauses`).
+            " AND (last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
         } else {
             ""
         };
