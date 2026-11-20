@@ -50,13 +50,16 @@ impl QuantityHandler {
 
         // Raw match: numeric comparison plus the stored unit/system verbatim.
         let raw = {
-            let num = Self::build_numeric_condition(
+            let predicate =
+                crate::search::quantity_interval_predicate(value.prefix, num_value, num_str);
+            let num = Self::build_interval_condition(
                 &format!("{table}value_quantity_value"),
-                num_value,
-                num_str,
-                value.prefix,
+                &format!("{table}value_quantity_high"),
+                &predicate,
+                |v| Some(v),
                 param_num,
-            );
+            )
+            .expect("the identity mapping never fails");
             let mut conditions = vec![num.sql];
             let mut params = num.params;
             let mut next_param = param_num + params.len();
@@ -94,14 +97,13 @@ impl QuantityHandler {
         raw
     }
 
-    /// Builds the canonical-column predicate. For `eq`/`ne` the search value's
-    /// implicit-precision *bounds* (range endpoints, derived from `num_str`)
-    /// are each canonicalized with the supplied UCUM code, so unit
-    /// equivalence is honored without losing implicit-precision semantics to
-    /// float rounding. For every other comparator the exact search value is
-    /// canonicalized and compared with a single boundary, since the FHIR spec
-    /// says those prefixes ignore implicit precision. Returns `None` if the
-    /// unit cannot be canonicalized.
+    /// Builds the canonical-column predicate: the same interval predicate as
+    /// the raw branch, with every bound of it mapped through UCUM
+    /// canonicalization by the supplied code, over the canonical low and high
+    /// columns. For `eq`/`ne` the bounds are the search value's
+    /// implicit-precision range; the comparators use the exact value, since
+    /// the FHIR spec says they ignore implicit precision. Returns `None` if
+    /// the unit cannot be canonicalized.
     fn build_canonical_condition(
         table: &str,
         code: &str,
@@ -111,76 +113,79 @@ impl QuantityHandler {
         param_num: usize,
     ) -> Option<(String, Vec<SqlParam>)> {
         use helios_fhirpath::ucum::canonicalize_quantity as canon;
-        let col = format!("{table}value_quantity_canonical_value");
-
-        let (sql, mut params, unit) = match prefix {
-            SearchPrefix::Eq | SearchPrefix::Ne => {
-                let (lo, hi) = crate::search::implicit_range(value, num_str);
-                let (lo, unit) = canon(lo, code)?;
-                let (hi, _) = canon(hi, code)?;
-                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                let sql = if matches!(prefix, SearchPrefix::Eq) {
-                    format!("{col} >= ?{} AND {col} < ?{}", param_num, param_num + 1)
-                } else {
-                    format!("({col} < ?{} OR {col} >= ?{})", param_num, param_num + 1)
-                };
-                (sql, vec![SqlParam::float(lo), SqlParam::float(hi)], unit)
-            }
-            // gt/lt/ge/le/sa/eb compare against the exact canonicalized
-            // value: per the FHIR spec, the implicit precision is ignored
-            // for these prefixes.
-            SearchPrefix::Gt | SearchPrefix::Sa => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} > ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Lt | SearchPrefix::Eb => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} < ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Ge => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} >= ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Le => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} <= ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            // ap: the shared window, both ends canonicalized.
-            SearchPrefix::Ap => {
-                let (lo, hi) = crate::search::approx_range(value, num_str);
-                let (lo, unit) = canon(lo, code)?;
-                let (hi, _) = canon(hi, code)?;
-                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                (
-                    format!("{col} BETWEEN ?{} AND ?{}", param_num, param_num + 1),
-                    vec![SqlParam::float(lo), SqlParam::float(hi)],
-                    unit,
-                )
-            }
-        };
-
+        let (_, unit) = canon(value, code)?;
+        let predicate = crate::search::quantity_interval_predicate(prefix, value, num_str);
+        let fragment = Self::build_interval_condition(
+            &format!("{table}value_quantity_canonical_value"),
+            &format!("{table}value_quantity_canonical_high"),
+            &predicate,
+            |bound| canon(bound, code).map(|(c, _)| c),
+            param_num,
+        )?;
+        let mut params = fragment.params;
         let unit_param = param_num + params.len();
         params.push(SqlParam::string(&unit));
         Some((
-            format!("{sql} AND {table}value_quantity_canonical_unit = ?{unit_param}"),
+            format!(
+                "{} AND {table}value_quantity_canonical_unit = ?{unit_param}",
+                fragment.sql
+            ),
             params,
         ))
+    }
+
+    /// Renders a [`QuantityIntervalPredicate`] over a stored closed interval
+    /// whose lower end is `low_col` and upper end `high_col` (#2602). Every
+    /// bound is passed through `map` (identity for the raw columns, UCUM
+    /// canonicalization for the canonical ones); `None` from `map` aborts.
+    /// A point (`high = low`) behaves exactly as the old single-column
+    /// comparison; `gt`/`ge`/`eb`/`eq`/`ne` constrain the upper end, which
+    /// the `idx_search_quantity_high` indexes lead with.
+    fn build_interval_condition(
+        low_col: &str,
+        high_col: &str,
+        predicate: &crate::search::QuantityIntervalPredicate,
+        map: impl Fn(f64) -> Option<f64>,
+        param_num: usize,
+    ) -> Option<SqlFragment> {
+        use crate::search::{Cmp, QuantityBound};
+        let op = |cmp: Cmp| match cmp {
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        };
+        let mut params = Vec::new();
+        let mut groups = Vec::new();
+        for group in &predicate.any_of {
+            let mut terms = Vec::new();
+            for bound in group {
+                let (col, cmp, v) = match *bound {
+                    QuantityBound::Low(cmp, v) => (low_col, cmp, v),
+                    QuantityBound::High(cmp, v) => (high_col, cmp, v),
+                };
+                params.push(SqlParam::float(map(v)?));
+                terms.push(format!(
+                    "{col} {} ?{}",
+                    op(cmp),
+                    param_num + params.len() - 1
+                ));
+            }
+            groups.push(terms.join(" AND "));
+        }
+        let sql = if groups.len() == 1 {
+            groups.remove(0)
+        } else {
+            format!(
+                "({})",
+                groups
+                    .iter()
+                    .map(|g| format!("({g})"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        };
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// Builds the numeric comparison part of the condition against `column`.
@@ -289,7 +294,7 @@ mod tests {
         // gt/le ignore implicit precision and compare against the exact
         // search value, per the FHIR spec.
         let gt = QuantityHandler::build_sql(&SearchValue::new(SearchPrefix::Gt, "60|kg"), 0);
-        assert!(gt.sql.contains("value_quantity_value > ?1"));
+        assert!(gt.sql.contains("value_quantity_high > ?1"));
         match &gt.params[0] {
             SqlParam::Float(f) => assert!((*f - 60.0).abs() < 1e-9),
             _ => panic!("expected float param"),
@@ -321,7 +326,7 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Gt, "60|http://unitsofmeasure.org|kg");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("value_quantity_canonical_value > ?"));
+        assert!(frag.sql.contains("value_quantity_canonical_high > ?"));
 
         // The canonical bound must equal canon(60.0, "kg") exactly, not a
         // value widened by half the implicit precision (e.g. 60.5).
@@ -342,12 +347,22 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Ap, "100");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("BETWEEN"));
-        // The shared window (#1390): [90, 110] around 100.
+        // The shared window (#1390): [90, 110] around 100, as an interval
+        // overlap: `low <= 110 AND high >= 90`.
+        assert!(
+            frag.sql.contains("value_quantity_value <= ?1"),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains("value_quantity_high >= ?2"),
+            "{}",
+            frag.sql
+        );
         assert!(
             matches!(
                 frag.params.as_slice(),
-                [SqlParam::Float(lo), SqlParam::Float(hi), ..]
+                [SqlParam::Float(hi), SqlParam::Float(lo), ..]
                     if (lo - 90.0).abs() < 1e-9 && (hi - 110.0).abs() < 1e-9
             ),
             "{:?}",

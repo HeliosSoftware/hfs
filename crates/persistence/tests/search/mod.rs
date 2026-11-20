@@ -100,6 +100,10 @@ pub mod number_tests;
 /// Elasticsearch test binaries via `#[path]` (#1340).
 pub mod numeric_validation_suite;
 pub mod pagination_tests;
+/// Backend-agnostic scenarios for `Range` values of quantity parameters,
+/// shared with the PostgreSQL, MongoDB and Elasticsearch test binaries via
+/// `#[path]` (#2602).
+pub mod quantity_range_suite;
 pub mod quantity_tests;
 pub mod reference_tests;
 /// Backend-agnostic `_revinclude` reference-form scenarios, shared with the
@@ -125,6 +129,16 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// The shared quantity `Range` table (#2602): a `Range` is one closed
+/// interval, a missing bound is open, and every prefix compares against the
+/// interval. PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn quantity_range_targets_are_intervals() {
+    let backend = make_sqlite_backend();
+    quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range").await;
 }
 
 /// A compartment membership with no params or no reference matches nothing,

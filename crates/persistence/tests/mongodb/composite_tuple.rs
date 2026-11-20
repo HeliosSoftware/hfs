@@ -155,6 +155,7 @@ async fn tuple_path_used(backend: &MongoBackend, tenant: &TenantContext) -> bool
     probe.remove("_id");
     probe.insert("composite_group", 9_999_i32);
     probe.insert("value_quantity_value", 123_456.0);
+    probe.insert("value_quantity_high", 123_456.0);
     probe.insert("tuple_code", vec![Bson::from("c:tuple-probe")]);
     let inserted = rows.insert_one(&probe).await.unwrap().inserted_id;
     let hit = !found(backend, tenant, "tuple-probe$gt123455")

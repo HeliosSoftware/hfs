@@ -985,6 +985,17 @@ impl SearchParameterExtractor {
                 for value in values {
                     let converted = ValueConverter::convert(&value, sub_type, &param.code)?;
                     for idx_value in converted {
+                        // Composite rows store one point per component; a
+                        // Range (low != high) cannot be represented (#2602).
+                        if let IndexValue::Quantity { high, .. } = &idx_value {
+                            if *high != crate::search::QuantityHigh::Point {
+                                tracing::debug!(
+                                    param = %param.code,
+                                    "Range component of a composite parameter is not indexed"
+                                );
+                                continue;
+                            }
+                        }
                         results.push(
                             ExtractedValue::new(&param.code, &param.url, sub_type, idx_value)
                                 .with_composite_group(group)
@@ -1762,6 +1773,7 @@ mod tests {
                     unit: Some("kg".into()),
                     system: None,
                     code: None,
+                    high: crate::search::QuantityHigh::Point,
                 },
             )
             .with_composite_group(group)

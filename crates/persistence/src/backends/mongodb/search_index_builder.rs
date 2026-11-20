@@ -91,10 +91,10 @@ use super::schema::{
     set_search_index_empty_at_generation, set_search_index_generation,
 };
 use super::search_index_catalog::{
-    DATE_RANGE_GENERATION, IndexBuild, SEARCH_DATE_END_INDEX, SEARCH_INDEX_COLLECTION,
-    SEARCH_INDEX_CONTAINED_COLLECTION, SEARCH_INDEX_GENERATION, SearchIndexSpec,
-    create_indexes_command, current_specs, superseded_contained_spec, superseded_date_v2_spec,
-    superseded_v1_specs,
+    DATE_RANGE_GENERATION, IndexBuild, QUANTITY_RANGE_GENERATION, SEARCH_DATE_END_INDEX,
+    SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION, SEARCH_INDEX_GENERATION,
+    SEARCH_QUANTITY_HIGH_INDEX, SearchIndexSpec, create_indexes_command, current_specs,
+    superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
 };
 use crate::types::{absolute_reference_target, strip_reference_version};
 
@@ -214,21 +214,16 @@ impl Inspection {
         inspection
     }
 
-    /// An unavailable generation-7 date-end index must not disable verified
-    /// generation-6 plans. Every older background index still has to pass the
-    /// same key, partial-filter, options and buildUUID checks as a full build.
+    /// An unavailable generation-7 date-end index or generation-8 quantity
+    /// high index must not disable verified generation-6 plans. Every older
+    /// background index still has to pass the same key, partial-filter,
+    /// options and buildUUID checks as a full build.
     fn existing_indexes_ready(&self) -> bool {
-        self.missing
-            .iter()
-            .all(|spec| spec.name == SEARCH_DATE_END_INDEX)
-            && self
-                .in_progress
-                .iter()
-                .all(|name| name == SEARCH_DATE_END_INDEX)
-            && self
-                .conflicting
-                .iter()
-                .all(|(name, _)| name == SEARCH_DATE_END_INDEX)
+        let additive =
+            |name: &str| name == SEARCH_DATE_END_INDEX || name == SEARCH_QUANTITY_HIGH_INDEX;
+        self.missing.iter().all(|spec| additive(spec.name))
+            && self.in_progress.iter().all(|name| additive(name))
+            && self.conflicting.iter().all(|(name, _)| additive(name))
     }
 }
 
@@ -342,6 +337,33 @@ fn date_rows_notice(recorded: Option<i32>, at_boot: &RowsAtBoot) -> DateRowsNoti
         },
         RowsAtBoot::NoEarlierRows | RowsAtBoot::DateRangesRecorded => DateRowsNotice::Silent,
     }
+}
+
+/// Whether `record_if_needed` logs the #2602 reminder: only on a transition
+/// from a recorded generation below [`QUANTITY_RANGE_GENERATION`]. A database
+/// with no generation recorded is new (or its rows are covered by the date
+/// reminder's own boot read), and a `Range` produced no quantity row before
+/// #2602, so a database already at the generation has nothing to reindex.
+fn quantity_range_reindex_reminder(recorded: Option<i32>) -> bool {
+    recorded.is_some_and(|generation| generation < QUANTITY_RANGE_GENERATION)
+}
+
+/// Sets `value_quantity_high = value_quantity_value` on every quantity row
+/// that has no high yet (#2602), in one server-side `update_many` per
+/// collection. Idempotent: a row that has a high is not selected, so it is
+/// safe to rerun after a failure and a no-op on a database written by this
+/// version. A `Quantity` or `Age` is a point, so this is exactly what
+/// the writer stores for one.
+pub(super) fn quantity_high_backfill_filter() -> Document {
+    doc! {
+        "value_quantity_value": { "$exists": true },
+        "value_quantity_high": { "$exists": false },
+    }
+}
+
+/// The pipeline update paired with [`quantity_high_backfill_filter`].
+pub(super) fn quantity_high_backfill_update() -> Vec<Document> {
+    vec![doc! { "$set": { "value_quantity_high": "$value_quantity_value" } }]
 }
 
 pub(super) struct SearchIndexBuilder {
@@ -497,6 +519,27 @@ impl SearchIndexBuilder {
             );
         }
 
+        // #2602: a quantity row written before it has no `value_quantity_high`
+        // and would fail every comparison on it. Runs in every mode, like the
+        // two steps above, and only while this generation is not recorded, so
+        // a database already at it pays no collection scan. A failure is
+        // retried on the next boot, since the generation is recorded later.
+        if get_search_index_generation(&self.database).await? != Some(SEARCH_INDEX_GENERATION) {
+            let backfilled = self.backfill_quantity_high().await.map_err(|e| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("quantity high backfill failed: {e}"),
+                    source: Some(Box::new(e)),
+                })
+            })?;
+            if backfilled > 0 {
+                tracing::info!(
+                    rows = backfilled,
+                    "set value_quantity_high on quantity rows written before #2602"
+                );
+            }
+        }
+
         let mut inspection = self.inspect().await?;
 
         if !inspection.conflicting.is_empty() {
@@ -605,9 +648,35 @@ impl SearchIndexBuilder {
         }
     }
 
+    /// One-time backfill of `value_quantity_high` (#2602) over `search_index`
+    /// and `search_index_contained`. Returns the number of rows rewritten.
+    async fn backfill_quantity_high(&self) -> StorageResult<u64> {
+        let mut total = 0u64;
+        for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+            let coll = self.database.collection::<Document>(collection);
+            let result = coll
+                .update_many(
+                    quantity_high_backfill_filter(),
+                    quantity_high_backfill_update(),
+                )
+                .await?;
+            total += result.modified_count;
+        }
+        Ok(total)
+    }
+
     async fn record_if_needed(&self) -> StorageResult<()> {
         let recorded = get_search_index_generation(&self.database).await?;
         if recorded != Some(SEARCH_INDEX_GENERATION) {
+            if quantity_range_reindex_reminder(recorded) {
+                tracing::warn!(
+                    from_generation = ?recorded,
+                    to_generation = SEARCH_INDEX_GENERATION,
+                    "a Range indexed before #2602 produced no quantity row, so Condition onset-age \
+                     and abatement-age, and context-quantity, will not match it until it is \
+                     reindexed; run `$reindex` (Quantity and Age rows are not affected)"
+                );
+            }
             // The one moment an upgrade is visible: once this generation is
             // recorded, this branch is not taken again. `date_rows_notice`
             // gives the #1391 reminder only on a transition from below
@@ -1142,7 +1211,7 @@ mod builder_tests {
     }
 
     #[test]
-    fn existing_index_readiness_ignores_only_the_new_date_end_index() {
+    fn existing_index_readiness_ignores_only_the_additive_date_end_and_quantity_high_indexes() {
         let ready = ready_background_indexes();
         assert!(Inspection::from_existing(&ready).existing_indexes_ready());
         for name in ready.iter().map(|index| index.name.as_str()) {
@@ -1150,7 +1219,7 @@ mod builder_tests {
             missing.retain(|index| index.name != name);
             assert_eq!(
                 Inspection::from_existing(&missing).existing_indexes_ready(),
-                name == SEARCH_DATE_END_INDEX,
+                name == SEARCH_DATE_END_INDEX || name == SEARCH_QUANTITY_HIGH_INDEX,
                 "missing {name}"
             );
             for defect in ["keys", "partial", "hidden", "building"] {
@@ -1165,7 +1234,7 @@ mod builder_tests {
                 }
                 assert_eq!(
                     Inspection::from_existing(&changed).existing_indexes_ready(),
-                    name == SEARCH_DATE_END_INDEX,
+                    name == SEARCH_DATE_END_INDEX || name == SEARCH_QUANTITY_HIGH_INDEX,
                     "{defect}: {name}"
                 );
             }
@@ -1852,5 +1921,55 @@ mod existing_readiness_prime_tests {
         let primed = primed(&database).await;
         database.drop().await.unwrap();
         assert!(!primed);
+    }
+}
+
+#[cfg(test)]
+mod quantity_range_tests {
+    use super::*;
+
+    /// #2602: the reminder is given only on the way up from below the
+    /// generation that stores the interval, never on a new database.
+    #[test]
+    fn quantity_reindex_reminder_fires_only_when_crossing_the_generation() {
+        assert!(!quantity_range_reindex_reminder(None));
+        assert!(quantity_range_reindex_reminder(Some(
+            QUANTITY_RANGE_GENERATION - 1
+        )));
+        assert!(quantity_range_reindex_reminder(Some(4)));
+        assert!(!quantity_range_reindex_reminder(Some(
+            QUANTITY_RANGE_GENERATION
+        )));
+    }
+
+    /// The backfill selects only quantity rows with no high and makes each a
+    /// point, so rerunning it is a no-op.
+    #[test]
+    fn quantity_high_backfill_selects_unfilled_quantity_rows_and_copies_the_value() {
+        assert_eq!(
+            quantity_high_backfill_filter(),
+            doc! {
+                "value_quantity_value": { "$exists": true },
+                "value_quantity_high": { "$exists": false },
+            }
+        );
+        assert_eq!(
+            quantity_high_backfill_update(),
+            vec![doc! { "$set": { "value_quantity_high": "$value_quantity_value" } }]
+        );
+    }
+
+    #[test]
+    fn the_quantity_high_index_does_not_disable_existing_plans() {
+        let existing = Inspection {
+            missing: vec![
+                current_specs()
+                    .into_iter()
+                    .find(|s| s.name == SEARCH_QUANTITY_HIGH_INDEX)
+                    .unwrap(),
+            ],
+            ..Inspection::default()
+        };
+        assert!(existing.existing_indexes_ready());
     }
 }

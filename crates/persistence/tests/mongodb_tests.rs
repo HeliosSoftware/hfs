@@ -760,6 +760,23 @@ async fn mongodb_date_period_targets_are_ranges() {
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
 }
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
+/// #2602: a `Range` was not indexed for quantity parameters. It is one
+/// closed `[value_quantity_value, value_quantity_high]` interval now. Needs
+/// the full registry so `Condition.onset-age` and friends extract.
+#[tokio::test]
+async fn mongodb_quantity_range_targets_are_intervals() {
+    let Some(backend) = create_backend_with_full_registry("quantity_range").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range-2602").await;
+}
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]

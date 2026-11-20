@@ -252,7 +252,7 @@ fn cmp_index_rows(a: &[SqlValue], b: &[SqlValue]) -> std::cmp::Ordering {
     // order the partial indexes of `schema::SEARCH_VALUE_INDEXES` lead with
     // them. A row populates the columns of one search parameter type, so
     // within a `param_name` the first populated columns decide.
-    const KEY: [usize; 19] = [
+    const KEY: [usize; 21] = [
         3,  // param_name
         5,  // value_string                  idx_search_string
         23, // value_string_folded           idx_search_string_folded
@@ -264,8 +264,10 @@ fn cmp_index_rows(a: &[SqlValue], b: &[SqlValue]) -> std::cmp::Ordering {
         11, // value_number                  idx_search_number
         12, // value_quantity_value          idx_search_quantity
         13, // value_quantity_unit
+        29, // value_quantity_high           idx_search_quantity_high
         22, // value_quantity_canonical_unit idx_search_quantity_canonical
         21, // value_quantity_canonical_value
+        30, // value_quantity_canonical_high  idx_search_quantity_canonical_high
         15, // value_reference               idx_search_reference
         20, // value_reference_display       idx_search_reference_display
         16, // value_uri                     idx_search_uri

@@ -1781,6 +1781,10 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending if col == "value_date" => {
                         ("MAX", "value_date_end")
                     }
+                    // Likewise a quantity row is an interval (#2602).
+                    crate::types::SortDirection::Descending if col == "value_quantity_value" => {
+                        ("MAX", "value_quantity_high")
+                    }
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(

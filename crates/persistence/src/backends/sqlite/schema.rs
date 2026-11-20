@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 48;
+pub const SCHEMA_VERSION: i32 = 49;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -32,7 +32,7 @@ pub const SCHEMA_VERSION: i32 = 48;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 20] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -84,6 +84,14 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 18] = [
     (
         "idx_search_quantity_canonical",
         "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value) WHERE value_quantity_canonical_value IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_high",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_high ON search_index(tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value, resource_key) WHERE value_quantity_high IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_canonical_high",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical_high ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value) WHERE value_quantity_canonical_high IS NOT NULL",
     ),
     (
         "idx_search_string_folded",
@@ -737,6 +745,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             45 => migrate_v45_to_v46(conn)?,
             46 => migrate_v46_to_v47(conn)?,
             47 => migrate_v47_to_v48(conn)?,
+            48 => migrate_v48_to_v49(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2692,6 +2701,69 @@ fn migrate_v47_to_v48(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 48 to version 49 (#2602): the upper bound of
+/// a quantity row. A `Range` is indexed as the closed interval `[low, high]`
+/// — `value_quantity_value` stays the lower end — and a `Quantity`/`Age` as a
+/// point, so every existing quantity row gets `high = value` (raw and
+/// canonical). Rows of a stored `Range` were never indexed and need
+/// `POST /$reindex`. The backfill runs in rowid batches of one transaction
+/// each; the high-leading partial indexes are built afterwards over final data.
+fn migrate_v48_to_v49(conn: &Connection) -> StorageResult<()> {
+    let columns = table_columns(conn, "search_index")?;
+    for column in ["value_quantity_high", "value_quantity_canonical_high"] {
+        if !columns.iter().any(|c| c == column) {
+            conn.execute(
+                &format!("ALTER TABLE search_index ADD COLUMN {column} REAL"),
+                [],
+            )
+            .map_err(|e| migration_err(format!("v49 add {column}: {e}")))?;
+        }
+    }
+
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| migration_err(format!("v49 begin backfill batch: {e}")))?;
+        // Last rowid of the next batch of rows still without a high bound.
+        let last: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(rowid) FROM (
+                     SELECT rowid FROM search_index
+                      WHERE rowid > ?1 AND value_quantity_value IS NOT NULL
+                        AND value_quantity_high IS NULL
+                      ORDER BY rowid LIMIT ?2)",
+                rusqlite::params![after, BATCH],
+                |row| row.get(0),
+            )
+            .map_err(|e| migration_err(format!("v49 read quantity rows: {e}")))?;
+        let Some(last) = last else {
+            break;
+        };
+        tx.execute(
+            "UPDATE search_index
+                SET value_quantity_high = value_quantity_value,
+                    value_quantity_canonical_high = value_quantity_canonical_value
+              WHERE rowid > ?1 AND rowid <= ?2
+                AND value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
+            rusqlite::params![after, last],
+        )
+        .map_err(|e| migration_err(format!("v49 backfill value_quantity_high: {e}")))?;
+        after = last;
+        tx.commit()
+            .map_err(|e| migration_err(format!("v49 commit backfill batch: {e}")))?;
+    }
+
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        if name == "idx_search_quantity_high" || name == "idx_search_quantity_canonical_high" {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v49 create {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -4471,6 +4543,74 @@ mod tests {
         // A replay is a no-op.
         migrate_v46_to_v47(&conn).unwrap();
         assert_eq!(count(&conn), 1);
+    }
+
+    /// v48 -> v49 adds the quantity upper bound columns, backfills
+    /// `high = value` (raw and canonical) for existing quantity rows, leaves
+    /// non-quantity rows NULL, and builds the high-leading indexes (#2602).
+    #[test]
+    fn migrate_v48_to_v49_backfills_quantity_high() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute("DROP INDEX idx_search_quantity_high", [])
+            .unwrap();
+        conn.execute("DROP INDEX idx_search_quantity_canonical_high", [])
+            .unwrap();
+        conn.execute(
+            "ALTER TABLE search_index DROP COLUMN value_quantity_high",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                 value_quantity_value, value_quantity_canonical_value)
+             VALUES ('t', 'Observation', 'q1', 'value-quantity', 5.0, 5000.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
+             VALUES ('t', 'Patient', 'p1', 'family', 'x')",
+            [],
+        )
+        .unwrap();
+        force_schema_version(&conn, 48).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let high: (Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT value_quantity_high, value_quantity_canonical_high
+                   FROM search_index WHERE resource_id = 'q1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(high, (Some(5.0), Some(5000.0)));
+        let none: Option<f64> = conn
+            .query_row(
+                "SELECT value_quantity_high FROM search_index WHERE resource_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(none, None);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index'
+                   AND name IN ('idx_search_quantity_high', 'idx_search_quantity_canonical_high')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+        // A replay is a no-op.
+        migrate_v48_to_v49(&conn).unwrap();
     }
 
     /// v47 -> v48 adds `value_reference_target`, backfills it for absolute

@@ -499,6 +499,15 @@ fn fast_index_pred(
 /// ahead of the sort key in those indexes, so the scan seeks straight to the
 /// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
 /// stops mattering, and there is nothing to guard.
+///
+/// # Interval storage (#2602)
+///
+/// A quantity is a closed interval `[value_quantity_value, value_quantity_high]`.
+/// `gt`/`ge`/`eb` now compare the `high` column and `lt`/`le`/`sa` the `value`
+/// column, but the guard is unchanged: it repeats the outer predicate verbatim,
+/// so its `EXISTS` seeks `idx_search_quantity_high` for the former and
+/// `idx_search_quantity` for the latter, and `high` shares the pooled-histogram
+/// problem described above.
 fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     let [param] = query.parameters.as_slice() else {
         return false;

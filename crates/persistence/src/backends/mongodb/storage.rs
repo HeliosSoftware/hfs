@@ -5806,9 +5806,15 @@ impl MongoBackend {
                 value,
                 unit,
                 system,
+                high,
                 ..
             } => {
+                // #2602: the row is the closed interval
+                // `[value_quantity_value, value_quantity_high]`; a `Quantity`
+                // or `Age` is a point (`high = value`), and an open side of a
+                // `Range` is the finite sentinel.
                 doc.insert("value_quantity_value", *value);
+                doc.insert("value_quantity_high", high.resolve(*value));
                 if let Some(unit) = unit {
                     doc.insert("value_quantity_unit", unit.clone());
                 }

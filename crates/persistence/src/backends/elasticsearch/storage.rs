@@ -650,10 +650,17 @@ pub(crate) fn build_es_document(
                 unit,
                 system,
                 code,
+                high,
             } => {
+                // `value` is the lower bound of the closed interval the row
+                // covers and `high` the upper one (#2602): a point for a
+                // `Quantity` or `Age`, the bounds of a `Range` otherwise, with
+                // an open side as a finite sentinel (ES cannot store `±Inf`).
+                let high_value = high.resolve(*value);
                 let mut qty = json!({
                     "name": ev.param_name,
                     "value": value,
+                    "high": high_value,
                 });
                 if let Some(u) = unit {
                     qty["unit"] = json!(u);
@@ -666,12 +673,16 @@ pub(crate) fn build_es_document(
                 }
                 // UCUM-canonical value/unit so quantity search matches equivalent
                 // units (g ⇄ mg). Uses the code if present, else the unit display.
-                if let Some((cv, cu)) = code
-                    .as_deref()
-                    .or(unit.as_deref())
-                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                // Each bound is converted on its own; an open side keeps its
+                // sentinel (scaling `f64::MAX` would overflow).
+                if let Some(u) = code.as_deref().or(unit.as_deref())
+                    && let Some((_, cu)) = helios_fhirpath::ucum::canonicalize_quantity(1.0, u)
                 {
+                    let (cv, ch) = crate::search::canonical_range(*value, high_value, |x| {
+                        helios_fhirpath::ucum::canonicalize_quantity(x, u).map_or(x, |(v, _)| v)
+                    });
                     qty["canonical_value"] = json!(cv);
+                    qty["canonical_high"] = json!(ch);
                     qty["canonical_unit"] = json!(cu);
                 }
                 quantity_params.push(qty);
@@ -3758,6 +3769,70 @@ mod tests {
                 { "name": "combo", "group_id": 1, "date": ["2017-01-01T00:00:00.000Z"] },
             ])
         );
+    }
+
+    /// #2602: a quantity row is the interval `[value, high]`: a point for a
+    /// `Quantity`, the bounds of a `Range` otherwise, an open side as a finite
+    /// sentinel that is never scaled by the UCUM canonicalization.
+    #[test]
+    fn document_indexes_a_quantity_as_an_interval() {
+        use crate::search::converters::QuantityHigh;
+        let qty = |value: f64, high: QuantityHigh| {
+            let value = IndexValue::Quantity {
+                value,
+                unit: Some("a".into()),
+                system: Some("http://unitsofmeasure.org".into()),
+                code: Some("a".into()),
+                high,
+            };
+            ExtractedValue::new(
+                "onset-age",
+                "http://hl7.org/fhir/SearchParameter/Condition-onset-age",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Condition",
+            "c1",
+            "1",
+            test_instant(),
+            &json!({ "resourceType": "Condition", "id": "c1" }),
+            FhirVersion::default(),
+            &[
+                qty(45.0, QuantityHigh::Point),
+                qty(40.0, QuantityHigh::At(50.0)),
+                qty(60.0, QuantityHigh::Open),
+                qty(crate::search::QUANTITY_OPEN_LOW, QuantityHigh::At(10.0)),
+            ],
+        );
+        let rows = doc["search_params"]["quantity"].as_array().expect("rows");
+        assert_eq!(
+            (rows[0]["value"].as_f64(), rows[0]["high"].as_f64()),
+            (Some(45.0), Some(45.0))
+        );
+        assert_eq!(
+            (rows[1]["value"].as_f64(), rows[1]["high"].as_f64()),
+            (Some(40.0), Some(50.0))
+        );
+        assert_eq!(
+            rows[2]["high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[2]["canonical_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[3]["value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_LOW)
+        );
+        assert_eq!(
+            rows[3]["canonical_value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_LOW)
+        );
+        assert!(rows[3]["canonical_high"].as_f64().unwrap().is_finite());
     }
 
     /// #1391: a `Period` indexes as one range, its open ends at the edges of

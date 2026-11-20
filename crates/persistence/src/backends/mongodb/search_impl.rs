@@ -33,7 +33,7 @@ use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
     COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
-    SEARCH_DATE_END_INDEX, value_index_led_by,
+    SEARCH_DATE_END_INDEX, SEARCH_QUANTITY_HIGH_INDEX, value_index_led_by,
 };
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
@@ -129,6 +129,9 @@ fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
 /// The `search_index` field a date row stores the end of its range in
 /// (#1391); `value_date` holds the start.
 const VALUE_DATE_END: &str = "value_date_end";
+/// Upper end of a quantity row's closed interval (#2602); the lower end is
+/// `value_quantity_value`.
+const VALUE_QUANTITY_HIGH: &str = "value_quantity_high";
 
 /// Reads a date search value with the grammar every backend shares.
 ///
@@ -784,6 +787,14 @@ pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static st
 fn sort_key_expression(value_field: &str, direction: crate::types::SortDirection) -> Bson {
     if value_field == "value_date" && direction == crate::types::SortDirection::Descending {
         Bson::Document(doc! { "$ifNull": [format!("${VALUE_DATE_END}"), "$value_date"] })
+    } else if value_field == "value_quantity_value"
+        && direction == crate::types::SortDirection::Descending
+    {
+        // #2602: a Range sorts descending by where it ends. A row written
+        // before the high was backfilled falls back to its value.
+        Bson::Document(
+            doc! { "$ifNull": [format!("${VALUE_QUANTITY_HIGH}"), "$value_quantity_value"] },
+        )
     } else {
         Bson::String(format!("${value_field}"))
     }
@@ -4123,8 +4134,10 @@ impl MongoBackend {
         self.search_indexes_ready()
             && matches!(directives, [directive]
                 if value_index_led_by(sort_value_field(directive)).is_some()
-                    && (sort_value_field(directive) != "value_date"
-                        || directive.direction != crate::types::SortDirection::Descending
+                    && (!matches!(
+                        sort_value_field(directive),
+                        "value_date" | "value_quantity_value"
+                    ) || directive.direction != crate::types::SortDirection::Descending
                         || self.date_end_index_ready()))
     }
 
@@ -4353,37 +4366,61 @@ impl MongoBackend {
                 value_field: { "$exists": true, "$ne": Bson::Null },
             }
         };
-        let plans: Vec<(Document, Document, &'static str, &'static str)> =
-            if value_field == "value_date" && directive.direction == SortDirection::Descending {
-                let mut ended = rows(value_field);
-                ended.insert(VALUE_DATE_END, doc! { "$ne": Bson::Null });
-                let mut open = rows(value_field);
-                open.insert(VALUE_DATE_END, Bson::Null);
-                vec![
-                    (
-                        ended,
-                        doc! { VALUE_DATE_END: order },
-                        SEARCH_DATE_END_INDEX,
-                        VALUE_DATE_END,
-                    ),
-                    (
-                        open,
-                        doc! { VALUE_DATE_END: order, "value_date": order },
-                        SEARCH_DATE_END_INDEX,
-                        "value_date",
-                    ),
-                ]
-            } else {
-                let index = value_index_led_by(value_field).ok_or_else(|| {
-                    internal_error(format!("no search_index index is led by {value_field}"))
-                })?;
-                vec![(
-                    rows(value_field),
-                    doc! { value_field: order },
-                    index,
-                    value_field,
-                )]
-            };
+        let plans: Vec<(Document, Document, &'static str, &'static str)> = if value_field
+            == "value_quantity_value"
+            && directive.direction == SortDirection::Descending
+        {
+            // #2602: a descending quantity sorts by the interval end. Rows with
+            // a high come from `idx_search_quantity_high`, and rows not yet
+            // backfilled, which sort by their value, from its null-high keys.
+            let mut ended = rows(value_field);
+            ended.insert(VALUE_QUANTITY_HIGH, doc! { "$ne": Bson::Null });
+            let mut open = rows(value_field);
+            open.insert(VALUE_QUANTITY_HIGH, Bson::Null);
+            vec![
+                (
+                    ended,
+                    doc! { VALUE_QUANTITY_HIGH: order },
+                    SEARCH_QUANTITY_HIGH_INDEX,
+                    VALUE_QUANTITY_HIGH,
+                ),
+                (
+                    open,
+                    doc! { VALUE_QUANTITY_HIGH: order, "value_quantity_value": order },
+                    SEARCH_QUANTITY_HIGH_INDEX,
+                    "value_quantity_value",
+                ),
+            ]
+        } else if value_field == "value_date" && directive.direction == SortDirection::Descending {
+            let mut ended = rows(value_field);
+            ended.insert(VALUE_DATE_END, doc! { "$ne": Bson::Null });
+            let mut open = rows(value_field);
+            open.insert(VALUE_DATE_END, Bson::Null);
+            vec![
+                (
+                    ended,
+                    doc! { VALUE_DATE_END: order },
+                    SEARCH_DATE_END_INDEX,
+                    VALUE_DATE_END,
+                ),
+                (
+                    open,
+                    doc! { VALUE_DATE_END: order, "value_date": order },
+                    SEARCH_DATE_END_INDEX,
+                    "value_date",
+                ),
+            ]
+        } else {
+            let index = value_index_led_by(value_field).ok_or_else(|| {
+                internal_error(format!("no search_index index is led by {value_field}"))
+            })?;
+            vec![(
+                rows(value_field),
+                doc! { value_field: order },
+                index,
+                value_field,
+            )]
+        };
         let mut streams = Vec::with_capacity(plans.len());
         for (filter, sort, index, key_field) in plans {
             let cursor = search_index
@@ -6463,9 +6500,10 @@ impl MongoBackend {
         let quantity = crate::search::FhirQuantityValue::parse(&value.value)
             .map_err(|error| invalid_number_value(param, &value.value, &error))?;
 
-        let mut filter = doc! {
-            "value_quantity_value": Self::numeric_condition(value.prefix, &quantity.number)?
-        };
+        // #2602: a row is the closed interval `[value_quantity_value,
+        // value_quantity_high]`; a point row is the case `low = high`.
+        let mut filter =
+            Self::quantity_interval_filter(&quantity.number.interval_predicate(value.prefix));
         if let Some(system) = quantity.system {
             filter.insert("value_quantity_system", system);
         }
@@ -6474,6 +6512,47 @@ impl MongoBackend {
         }
 
         Ok(filter)
+    }
+
+    /// The filter a [`QuantityIntervalPredicate`] makes on the stored interval:
+    /// one group is a flat document (one condition per bound, bounds on the
+    /// same field merged), several groups an `$or` of such documents.
+    fn quantity_interval_filter(predicate: &crate::search::QuantityIntervalPredicate) -> Document {
+        use crate::search::{Cmp, QuantityBound};
+        let group_doc = |group: &[QuantityBound]| {
+            let mut doc = Document::new();
+            for bound in group {
+                let (field, cmp, v) = match *bound {
+                    QuantityBound::Low(c, v) => ("value_quantity_value", c, v),
+                    QuantityBound::High(c, v) => (VALUE_QUANTITY_HIGH, c, v),
+                };
+                let op = match cmp {
+                    Cmp::Lt => "$lt",
+                    Cmp::Le => "$lte",
+                    Cmp::Gt => "$gt",
+                    Cmp::Ge => "$gte",
+                };
+                match doc.get_document_mut(field) {
+                    Ok(existing) => {
+                        existing.insert(op, v);
+                    }
+                    Err(_) => {
+                        doc.insert(field, doc! { op: v });
+                    }
+                }
+            }
+            doc
+        };
+        match predicate.any_of.as_slice() {
+            [only] => group_doc(only),
+            groups => {
+                let arms: Vec<Bson> = groups
+                    .iter()
+                    .map(|g| Bson::Document(group_doc(g)))
+                    .collect();
+                doc! { "$or": arms }
+            }
+        }
     }
 
     /// Builds a MongoDB filter for a number parameter, comparing against
@@ -7714,6 +7793,124 @@ mod date_filter_tests {
         );
     }
 
+    /// #2602: every prefix of a quantity search is a condition on the stored
+    /// closed interval, and a point row (`high = low`) behaves as before.
+    #[test]
+    fn quantity_prefixes_compare_the_stored_interval() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = |raw: &str| {
+            backend
+                .build_quantity_filter("onset-age", &SearchValue::parse(raw))
+                .unwrap()
+        };
+        let high = |raw: &str| {
+            filter(raw)
+                .get_document("value_quantity_high")
+                .unwrap()
+                .clone()
+        };
+        let low = |raw: &str| {
+            filter(raw)
+                .get_document("value_quantity_value")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(high("gt45"), doc! { "$gt": 45.0 });
+        assert_eq!(high("ge45"), doc! { "$gte": 45.0 });
+        assert_eq!(high("eb45"), doc! { "$lt": 45.0 });
+        assert_eq!(low("lt45"), doc! { "$lt": 45.0 });
+        assert_eq!(low("le45"), doc! { "$lte": 45.0 });
+        assert_eq!(low("sa45"), doc! { "$gt": 45.0 });
+        // `ap`: the interval overlaps the approximation window.
+        let ap = filter("ap45");
+        assert!(
+            ap.get_document("value_quantity_value")
+                .unwrap()
+                .contains_key("$lte")
+        );
+        assert!(
+            ap.get_document("value_quantity_high")
+                .unwrap()
+                .contains_key("$gte")
+        );
+        let ne = filter("ne45");
+        assert_eq!(ne.get_array("$or").unwrap().len(), 2);
+    }
+
+    /// A Range (low 40, high 50) is found by the filter the way the shared
+    /// predicate says, for every prefix: evaluates the produced documents.
+    #[test]
+    fn quantity_filter_agrees_with_the_shared_interval_predicate() {
+        let eval = |doc: &Document, low: f64, high: f64| -> bool {
+            let group = |d: &Document| {
+                d.iter().all(|(field, cond)| {
+                    let stored = if field == "value_quantity_high" {
+                        high
+                    } else {
+                        low
+                    };
+                    cond.as_document().unwrap().iter().all(|(op, v)| {
+                        let v = v.as_f64().unwrap();
+                        match op.as_str() {
+                            "$lt" => stored < v,
+                            "$lte" => stored <= v,
+                            "$gt" => stored > v,
+                            "$gte" => stored >= v,
+                            other => panic!("{other}"),
+                        }
+                    })
+                })
+            };
+            match doc.get_array("$or") {
+                Ok(arms) => arms.iter().any(|a| group(a.as_document().unwrap())),
+                Err(_) => group(doc),
+            }
+        };
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        for prefix in ["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            for text in ["35", "40", "45", "50", "55"] {
+                let raw = format!("{prefix}{text}");
+                let filter = backend
+                    .build_quantity_filter("onset-age", &SearchValue::parse(&raw))
+                    .unwrap();
+                let value = SearchValue::parse(&raw);
+                let number = crate::search::FhirQuantityValue::parse(&value.value)
+                    .unwrap()
+                    .number;
+                let expected = number.interval_predicate(value.prefix);
+                for (l, h) in [
+                    (40.0, 50.0),
+                    (45.0, 45.0),
+                    (40.0, 40.0),
+                    (f64::MIN, 10.0),
+                    (60.0, f64::MAX),
+                ] {
+                    assert_eq!(
+                        eval(&filter, l, h),
+                        expected.matches(l, h),
+                        "{raw} [{l},{h}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #2602: a descending quantity sort reads the interval end.
+    #[test]
+    fn descending_quantity_sort_reads_the_interval_end() {
+        use crate::types::SortDirection;
+        assert_eq!(
+            sort_key_expression("value_quantity_value", SortDirection::Descending),
+            Bson::Document(doc! { "$ifNull": ["$value_quantity_high", "$value_quantity_value"] })
+        );
+        assert_eq!(
+            sort_key_expression("value_quantity_value", SortDirection::Ascending),
+            Bson::String("$value_quantity_value".to_string())
+        );
+    }
+
     /// Garbage stays an error, not a silent full scan — under every prefix,
     /// and now for values chrono used to be the judge of.
     #[test]
@@ -7819,10 +8016,12 @@ mod date_filter_tests {
             Ok("http://example.org")
         );
         assert_eq!(filter.get_str("value_quantity_unit"), Ok("a|b"));
+        // `gt` on a closed interval bounds the high end (#2602).
         assert_eq!(
-            filter.get_document("value_quantity_value").unwrap(),
+            filter.get_document("value_quantity_high").unwrap(),
             &doc! { "$gt": 5.4 }
         );
+        assert!(!filter.contains_key("value_quantity_value"));
     }
 }
 
@@ -8487,11 +8686,16 @@ mod number_quantity_precision_tests {
             .build_search_index_filter("t1", "Observation", &param)
             .expect("valid filter");
 
-        let bounds = filter
+        // `eq`: the stored interval lies inside the implicit-precision range:
+        // `s <= low` and `high < e` (#2602).
+        let low = filter
             .get_document("value_quantity_value")
             .expect("value_quantity_value condition");
-        assert!((bounds.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
-        assert!((bounds.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
+        assert!((low.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
+        let high = filter
+            .get_document("value_quantity_high")
+            .expect("value_quantity_high condition");
+        assert!((high.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
         assert_eq!(filter.get_str("value_quantity_unit").unwrap(), "kg");
     }
 
@@ -8678,13 +8882,23 @@ mod composite_component_filter_tests {
         // satisfy this `$not` -- this pins that the guard is present
         // alongside it, not merged into a single top-level key that a
         // sibling absence could still slip past.
+        // #2602: `ne` on the interval is `low < s OR high >= e`, an `$or`
+        // whose arms each name a quantity field, so a sibling row that lacks
+        // both matches neither arm.
         let predicate = and_arms[1].as_document().expect("typed predicate arm");
+        let arms = predicate.get_array("$or").expect("ne is an $or of bounds");
+        assert_eq!(arms.len(), 2, "{predicate:?}");
         assert!(
-            predicate
-                .get_document("value_quantity_value")
-                .expect("value_quantity_value condition")
-                .contains_key("$not"),
-            "quantity ne must build a $not-wrapped range predicate: {predicate:?}"
+            arms[0]
+                .as_document()
+                .unwrap()
+                .contains_key("value_quantity_value")
+        );
+        assert!(
+            arms[1]
+                .as_document()
+                .unwrap()
+                .contains_key("value_quantity_high")
         );
     }
 

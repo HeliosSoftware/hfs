@@ -685,6 +685,8 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high` and `quantity.canonical_high` (schema version 4), added in place. Quantity documents indexed earlier keep matching as before, but `Range` values (`onset-age`, `abatement-age`, `context-quantity`) were never indexed, so run `POST /$reindex` once to make them searchable; the startup log warns once per affected index. See [Quantity prefix semantics](#sqlite-search-implementation).
+
 ```bash
 # Build with Elasticsearch support
 cargo build --bin hfs --features sqlite,elasticsearch --release
@@ -829,7 +831,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with PostgreSQL and Elasticsearch support
@@ -1819,7 +1821,7 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with MongoDB and Elasticsearch support
@@ -1865,7 +1867,7 @@ S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (inge
 
 **Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with S3 and Elasticsearch support
@@ -2950,10 +2952,49 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   stored as `kg`.
 - The eq/ne-vs-comparator precision rule itself (implicit-precision range for
   `eq`/`ne`, exact value for the other comparators) is unified across
-  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
-  (approximately equal), whose tolerance is not unified across backends.
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. `ap` (approximately equal)
+  shares one margin too: `m = max(0.1 * |v|, implicit_precision / 2)`, matching
+  `[v - m, v + m]` (#1390).
 - Date parameters are unaffected by this rule and keep their own
   calendar-precision range comparison.
+
+**Quantity prefix semantics (`Range` targets, #2602):**
+
+A quantity parameter whose expression selects a `Range` (`onset-age`,
+`abatement-age`, `context-quantity`) indexes it as the closed interval
+`[L, H]` from `low` to `high`, with unit and system taken from the bound that
+has a value. A missing bound leaves that side open (stored as the finite
+sentinels `f64::MIN` / `f64::MAX`). A `Quantity` or `Age` is a point, `L = H`,
+so its results are unchanged. A `Range` with `low > high`, or whose bounds
+carry different systems or codes, is skipped with a warning. With `v` the
+search number, `[s, e)` its implicit-precision range, and `m` the `ap` margin:
+
+| Prefix | Matches when the stored interval `[L, H]` ... | For a point `x` |
+|---|---|---|
+| `eq` | lies inside the search range: `s <= L` and `H < e` | `s <= x < e` |
+| `ne` | is not inside it: `L < s` or `H >= e` | `x < s` or `x >= e` |
+| `gt` | extends above `v`: `H > v` | `x > v` |
+| `lt` | extends below `v`: `L < v` | `x < v` |
+| `ge` | `H >= v` | `x >= v` |
+| `le` | `L <= v` | `x <= v` |
+| `sa` | starts after `v`: `L > v` | `x > v` |
+| `eb` | ends before `v`: `H < v` | `x < v` |
+| `ap` | overlaps `[v - m, v + m]`: `L <= v + m` and `H >= v - m` | `v - m <= x <= v + m` |
+
+So `onset-age=45` does not match an `onsetRange` of 40 to 50 years (the
+search range does not contain the whole interval), while `gt45`, `lt45`,
+`ge45`, `le45` and `ap45` all do. Sorting ascending
+uses the low bound and descending the high bound, so a range with no `low`
+sorts first. Composite parameters still index only point quantities: a `Range`
+component with `low != high` is not indexed in a composite row.
+
+**Upgrading from a build before #2602.** Each backend gains a high bound on the
+quantity row (SQLite and PostgreSQL migrate and backfill `high = value`;
+MongoDB backfills once at startup under search index generation 8;
+Elasticsearch adds `quantity.high` / `quantity.canonical_high`, schema
+version 4). Existing `Quantity` and `Age` values keep working unchanged, but
+`Range` values stored earlier were never indexed, so they are searchable only
+after you run `POST /$reindex` once.
 
 **Date prefix semantics (range targets, #1391):**
 

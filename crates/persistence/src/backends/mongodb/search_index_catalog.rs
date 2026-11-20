@@ -60,6 +60,11 @@ pub(crate) const SEARCH_DATE_RANGE_INDEX: &str = "idx_search_date_v3";
 /// Date rows by range end, then start: the order of a descending date sort.
 pub(crate) const SEARCH_DATE_END_INDEX: &str = "idx_search_date_end";
 
+/// Quantity rows by interval upper bound, then lower bound (#2602): a search
+/// bounded on the high end (`gt`, `ge`, `eb`, `ap`, ...) and a descending
+/// quantity sort lead with `value_quantity_high`.
+pub(crate) const SEARCH_QUANTITY_HIGH_INDEX: &str = "idx_search_quantity_high";
+
 /// The composite search index that composite and filtered sort queries hint.
 pub(crate) const SEARCH_COMPOSITE_INDEX: &str = "idx_search_composite";
 /// Token+quantity composite groups, keyed by the group's token codes.
@@ -79,7 +84,17 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// absolute-reference side field `value_reference_target` (#2394).
 /// Generation 6 = generation 5 plus [`COMPOSITE_TUPLE_INDEX`] (cq-p3).
 /// Generation 7 = generation 6 plus [`SEARCH_DATE_END_INDEX`] (#2588).
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 7;
+/// Generation 8 = generation 7 plus [`SEARCH_QUANTITY_HIGH_INDEX`] (#2602);
+/// quantity rows gain `value_quantity_high`, backfilled to `value_quantity_value`.
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 8;
+
+/// The generation that writes `value_quantity_high` (#2602). Pinned like
+/// [`DATE_RANGE_GENERATION`]: a database recorded below it has no `Range`
+/// quantity rows, because a `Range` produced none before, so the `$reindex`
+/// reminder fires only on a transition from below it.
+pub(crate) const QUANTITY_RANGE_GENERATION: i32 = 8;
+
+const _: () = assert!(QUANTITY_RANGE_GENERATION <= SEARCH_INDEX_GENERATION);
 
 /// The generation that added `value_date_end` to every date row (#1391), and
 /// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
@@ -235,6 +250,23 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
             "idx_search_quantity_v2",
             &["value_quantity_value", "value_quantity_unit"],
         ),
+        // Generation 8 (#2602): a quantity row is the closed interval
+        // `[value_quantity_value, value_quantity_high]` and a search may bound
+        // either end. Partial on `value_quantity_value`, not on the high, so a
+        // row not yet backfilled is a null-high key here rather than absent.
+        SearchIndexSpec {
+            name: SEARCH_QUANTITY_HIGH_INDEX,
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "resource_type": 1_i32,
+                "param_name": 1_i32,
+                "value_quantity_high": 1_i32,
+                "value_quantity_value": 1_i32,
+                "resource_id": 1_i32,
+            },
+            partial: Some(doc! { "value_quantity_value": { "$exists": true } }),
+            build: IndexBuild::Background,
+        },
         // Generation 6: equality on the group's code, then the quantity range,
         // then `resource_id` (ESR), so a code+value composite is covered.
         // `tuple_code` is an array (the bare code and `system|code` of each
@@ -515,6 +547,7 @@ mod tests {
                 SEARCH_DATE_END_INDEX,
                 "idx_search_number_v2",
                 "idx_search_quantity_v2",
+                SEARCH_QUANTITY_HIGH_INDEX,
                 COMPOSITE_TUPLE_INDEX,
                 "idx_search_reference_v2",
                 "idx_search_reference_target_v2",
@@ -526,8 +559,9 @@ mod tests {
                 COMPOSITE_SLOT_PROBE_INDEX,
             ]
         );
-        assert_eq!(SEARCH_INDEX_GENERATION, 7);
+        assert_eq!(SEARCH_INDEX_GENERATION, 8);
         assert_eq!(COMPOSITE_TUPLE_GENERATION, 6);
+        assert_eq!(QUANTITY_RANGE_GENERATION, 8);
     }
 
     #[test]
@@ -578,6 +612,31 @@ mod tests {
             Some(doc! { "value_date": { "$exists": true } })
         );
         assert_eq!(date.build, IndexBuild::Background);
+    }
+
+    #[test]
+    fn quantity_high_orders_by_the_interval_end_and_is_partial_on_the_low() {
+        let spec = current_specs()
+            .into_iter()
+            .find(|s| s.name == SEARCH_QUANTITY_HIGH_INDEX)
+            .unwrap();
+        let keys: Vec<&str> = spec.keys.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "tenant_id",
+                "resource_type",
+                "param_name",
+                "value_quantity_high",
+                "value_quantity_value",
+                "resource_id"
+            ]
+        );
+        assert_eq!(
+            spec.partial,
+            Some(doc! { "value_quantity_value": { "$exists": true } })
+        );
+        assert_eq!(spec.build, IndexBuild::Background);
     }
 
     #[test]
@@ -714,6 +773,9 @@ mod tests {
             // partial on the start that every date row carries.
             let leading_value = if spec.name == SEARCH_DATE_END_INDEX {
                 "value_date"
+            } else if spec.name == SEARCH_QUANTITY_HIGH_INDEX {
+                // Same reason, for the interval end (#2602).
+                "value_quantity_value"
             } else {
                 keys[3]
             };
@@ -841,7 +903,7 @@ mod tests {
         let cmd = create_indexes_command(&background);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index"));
         let indexes = cmd.get_array("indexes").unwrap();
-        assert_eq!(indexes.len(), 12);
+        assert_eq!(indexes.len(), 13);
         let first = indexes[0].as_document().unwrap();
         assert_eq!(first.get_str("name"), Ok("idx_search_string_v2"));
         assert_eq!(first.get_document("key").unwrap(), &background[0].keys);

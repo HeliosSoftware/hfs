@@ -26,6 +26,8 @@
 //! as `eq`, so `ap0` is `[-0.5, 0.5]` and `ap1e2` is `[50, 150]`. See
 //! [`approx_range`].
 
+use crate::types::SearchPrefix;
+
 /// Returns the implicit precision (ULP of the least significant digit) of a
 /// decimal value from its string form: `"100"` → 1.0, `"100.0"` → 0.1.
 ///
@@ -100,6 +102,121 @@ pub fn approx_range(value: f64, num_str: &str) -> (f64, f64) {
     }
     let margin = (value.abs() * 0.1).max(implicit_precision(num_str) / 2.0);
     (value - margin, value + margin)
+}
+
+/// Finite stand-in for "no lower bound" on a stored `Range` (#2602). Finite
+/// because Elasticsearch cannot store `±Inf`; never canonicalized.
+pub const QUANTITY_OPEN_LOW: f64 = f64::MIN;
+/// Finite stand-in for "no upper bound" on a stored `Range` (#2602).
+pub const QUANTITY_OPEN_HIGH: f64 = f64::MAX;
+
+/// A comparison operator in a [`QuantityBound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmp {
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+}
+
+impl Cmp {
+    fn holds(self, stored: f64, bound: f64) -> bool {
+        match self {
+            Cmp::Lt => stored < bound,
+            Cmp::Le => stored <= bound,
+            Cmp::Gt => stored > bound,
+            Cmp::Ge => stored >= bound,
+        }
+    }
+}
+
+/// One comparison of the stored closed interval `[L, H]` against a bound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuantityBound {
+    /// `L <cmp> bound`, on the lower end (`value_quantity_value`).
+    Low(Cmp, f64),
+    /// `H <cmp> bound`, on the upper end (the `high` column).
+    High(Cmp, f64),
+}
+
+/// Prefix semantics of a quantity search against a stored closed interval
+/// `[L, H]` (#2602), in disjunctive normal form: any group whose bounds all
+/// hold matches. For a point (`L = H = x`) every prefix agrees with the
+/// point rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantityIntervalPredicate {
+    /// OR of ANDs.
+    pub any_of: Vec<Vec<QuantityBound>>,
+}
+
+impl QuantityIntervalPredicate {
+    /// Whether the stored interval `[low, high]` matches.
+    pub fn matches(&self, low: f64, high: f64) -> bool {
+        self.any_of.iter().any(|group| {
+            group.iter().all(|b| match *b {
+                QuantityBound::Low(c, v) => c.holds(low, v),
+                QuantityBound::High(c, v) => c.holds(high, v),
+            })
+        })
+    }
+}
+
+/// Builds the interval predicate for `prefix` and the search value `value`
+/// written as `num_str`.
+///
+/// | prefix | condition on `[L, H]` |
+/// |---|---|
+/// | `eq` | `s ≤ L ∧ H < e` (`[s, e)` = implicit range) |
+/// | `ne` | `L < s ∨ H ≥ e` |
+/// | `gt` / `ge` | `H > v` / `H ≥ v` |
+/// | `lt` / `le` | `L < v` / `L ≤ v` |
+/// | `sa` / `eb` | `L > v` / `H < v` |
+/// | `ap` | `L ≤ v+m ∧ H ≥ v−m` |
+pub fn quantity_interval_predicate(
+    prefix: SearchPrefix,
+    value: f64,
+    num_str: &str,
+) -> QuantityIntervalPredicate {
+    use QuantityBound::{High, Low};
+    let any_of = match prefix {
+        SearchPrefix::Eq => {
+            let (s, e) = implicit_range(value, num_str);
+            vec![vec![Low(Cmp::Ge, s), High(Cmp::Lt, e)]]
+        }
+        SearchPrefix::Ne => {
+            let (s, e) = implicit_range(value, num_str);
+            vec![vec![Low(Cmp::Lt, s)], vec![High(Cmp::Ge, e)]]
+        }
+        SearchPrefix::Gt => vec![vec![High(Cmp::Gt, value)]],
+        SearchPrefix::Ge => vec![vec![High(Cmp::Ge, value)]],
+        SearchPrefix::Lt => vec![vec![Low(Cmp::Lt, value)]],
+        SearchPrefix::Le => vec![vec![Low(Cmp::Le, value)]],
+        SearchPrefix::Sa => vec![vec![Low(Cmp::Gt, value)]],
+        SearchPrefix::Eb => vec![vec![High(Cmp::Lt, value)]],
+        SearchPrefix::Ap => {
+            let (lo, hi) = approx_range(value, num_str);
+            vec![vec![Low(Cmp::Le, hi), High(Cmp::Ge, lo)]]
+        }
+    };
+    QuantityIntervalPredicate { any_of }
+}
+
+/// Maps both bounds of a stored interval through `canonicalize` (UCUM
+/// conversion), leaving the open-side sentinels untouched: scaling
+/// `f64::MAX` would overflow to `inf`.
+pub fn canonical_range(low: f64, high: f64, canonicalize: impl Fn(f64) -> f64) -> (f64, f64) {
+    let conv = |v: f64| {
+        if v == QUANTITY_OPEN_LOW || v == QUANTITY_OPEN_HIGH {
+            v
+        } else {
+            canonicalize(v)
+        }
+    };
+    (conv(low), conv(high))
 }
 
 #[cfg(test)]
@@ -285,5 +402,69 @@ mod tests {
             );
             assert!(lo <= hi, "implicit_range({text:?}) = [{lo}, {hi})");
         }
+    }
+
+    #[test]
+    fn interval_predicate_on_a_point_equals_the_point_rules() {
+        let prefixes = [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Gt,
+            SearchPrefix::Lt,
+            SearchPrefix::Ge,
+            SearchPrefix::Le,
+            SearchPrefix::Sa,
+            SearchPrefix::Eb,
+            SearchPrefix::Ap,
+        ];
+        let texts = ["45", "5.4", "0", "-2", "100", "1e2"];
+        for text in texts {
+            let v: f64 = text.parse().unwrap();
+            let (s, e) = implicit_range(v, text);
+            let (alo, ahi) = approx_range(v, text);
+            let mut xs = vec![v, s, e, alo, ahi, v - 1.0, v + 1.0, 0.0];
+            xs.push(f64::from_bits(e.to_bits() + 1));
+            for prefix in prefixes {
+                let pred = quantity_interval_predicate(prefix, v, text);
+                for &x in &xs {
+                    let point = match prefix {
+                        SearchPrefix::Eq => x >= s && x < e,
+                        SearchPrefix::Ne => x < s || x >= e,
+                        SearchPrefix::Gt | SearchPrefix::Sa => x > v,
+                        SearchPrefix::Lt | SearchPrefix::Eb => x < v,
+                        SearchPrefix::Ge => x >= v,
+                        SearchPrefix::Le => x <= v,
+                        SearchPrefix::Ap => x >= alo && x <= ahi,
+                    };
+                    assert_eq!(pred.matches(x, x), point, "{prefix:?} {text} x={x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interval_predicate_on_ranges() {
+        let p = |prefix, v: f64| quantity_interval_predicate(prefix, v, &v.to_string());
+        // [40, 50]
+        assert!(p(SearchPrefix::Gt, 45.0).matches(40.0, 50.0));
+        assert!(p(SearchPrefix::Lt, 45.0).matches(40.0, 50.0));
+        assert!(!p(SearchPrefix::Sa, 45.0).matches(40.0, 50.0));
+        assert!(!p(SearchPrefix::Eb, 45.0).matches(40.0, 50.0));
+        assert!(p(SearchPrefix::Ap, 45.0).matches(40.0, 50.0));
+        assert!(!p(SearchPrefix::Eq, 45.0).matches(40.0, 50.0));
+        assert!(p(SearchPrefix::Ne, 45.0).matches(40.0, 50.0));
+        // open high: [60, ∞)
+        assert!(p(SearchPrefix::Gt, 1000.0).matches(60.0, QUANTITY_OPEN_HIGH));
+        assert!(!p(SearchPrefix::Lt, 50.0).matches(60.0, QUANTITY_OPEN_HIGH));
+        // open low: (-∞, 10]
+        assert!(p(SearchPrefix::Lt, -1000.0).matches(QUANTITY_OPEN_LOW, 10.0));
+        assert!(p(SearchPrefix::Eb, 20.0).matches(QUANTITY_OPEN_LOW, 10.0));
+    }
+
+    #[test]
+    fn canonical_range_keeps_open_sentinels() {
+        let (l, h) = canonical_range(QUANTITY_OPEN_LOW, 2.0, |v| v * 1e300);
+        assert_eq!(l, QUANTITY_OPEN_LOW);
+        assert_eq!(h, 2.0e300);
     }
 }

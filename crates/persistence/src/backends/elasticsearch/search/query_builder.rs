@@ -621,6 +621,14 @@ impl<'a> EsQueryBuilder<'a> {
                         }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
+                        // A quantity is an interval `[value, high]` (#2602),
+                        // sorted like a date: an ascending sort orders by the
+                        // lower bound, a descending one by the upper bound.
+                        Some(SearchParamType::Quantity)
+                            if matches!(directive.direction, SortDirection::Descending) =>
+                        {
+                            ("quantity", "search_params.quantity.high")
+                        }
                         Some(SearchParamType::Quantity) => {
                             ("quantity", "search_params.quantity.value")
                         }
@@ -673,6 +681,13 @@ impl<'a> EsQueryBuilder<'a> {
                     // its type.
                     if field == "search_params.date.end" {
                         clause["unmapped_type"] = json!("date");
+                    }
+                    // Same for `search_params.quantity.high` (schema version 4,
+                    // #2602). A document indexed before it has no `high`, so a
+                    // descending sort puts it after those that have one; the
+                    // `$reindex` the upgrade asks for fixes that.
+                    if field == "search_params.quantity.high" {
+                        clause["unmapped_type"] = json!("double");
                     }
                     sort_clauses.push(json!({ field: clause }));
                 }

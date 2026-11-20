@@ -130,6 +130,11 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
@@ -35504,6 +35509,18 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #2602: a `Range` was not indexed for quantity parameters. It is one
+    /// closed `[value_quantity_value, value_quantity_high]` interval now.
+    #[tokio::test]
+    async fn postgres_integration_quantity_range_targets_are_intervals() {
+        let backend = create_backend().await;
+        super::quantity_range_suite::quantity_ranges_are_intervals(
+            &backend,
+            &unique_base("quantity_range"),
+        )
+        .await;
     }
 
     /// #1606: PostgreSQL sorted a missing value as the largest, so it came

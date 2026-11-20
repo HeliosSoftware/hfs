@@ -15,7 +15,7 @@ use crate::error::{BackendError, StorageResult};
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2367).
-pub const SCHEMA_VERSION: i32 = 55;
+pub const SCHEMA_VERSION: i32 = 56;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -590,6 +590,8 @@ async fn migrate_schema(
             // Not transactional: batched backfill and a concurrent index
             // build; the common loop stamps the marker after they finish.
             54 => migrate_v54_to_v55(client).await?,
+            // Same shape as v55: column, batched backfill, concurrent indexes.
+            55 => migrate_v55_to_v56(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -815,6 +817,197 @@ async fn build_reference_target(client: &mut deadpool_postgres::Client) -> Stora
              WHERE value_reference ~ '^https?://' AND value_reference_target IS NULL \
                AND {expr} IS NOT NULL \
              LIMIT {REFERENCE_TARGET_SWEEP_ROWS}))"
+    );
+    loop {
+        let filled = client
+            .execute(sweep.as_str(), &[])
+            .await
+            .map_err(|e| failed("sweep", &e))?;
+        if filled == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Heap blocks per committed batch of the v56 backfill.
+const QUANTITY_HIGH_BACKFILL_BLOCKS: u64 = 2_000;
+
+/// Rows per statement of the v56 final sweep.
+const QUANTITY_HIGH_SWEEP_ROWS: u64 = 10_000;
+
+/// The v56 indexes that lead with the upper bound of a quantity interval, as
+/// `(name, CREATE INDEX body after the name)`. They serve `gt`/`ge`/`eb` (and the
+/// `high` half of `eq`/`ne`/`ap`) the way `idx_search_date_end` serves dates.
+const QUANTITY_HIGH_INDEXES: [(&str, &str); 2] = [
+    (
+        "idx_search_quantity_high",
+        "ON search_index (tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value) \
+         INCLUDE (resource_id, last_updated) \
+         WHERE value_quantity_high IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_canonical_high",
+        "ON search_index (tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value) \
+         WHERE value_quantity_canonical_high IS NOT NULL",
+    ),
+];
+
+/// v55 -> v56: `value_quantity_high` and `value_quantity_canonical_high`, the
+/// upper bound of a quantity interval (#2602).
+///
+/// A `Range` is indexed as the closed interval `[value_quantity_value,
+/// value_quantity_high]`; a `Quantity` or `Age` is a point, so every existing row
+/// gets `high = value` (and `canonical_high = canonical_value`) and keeps
+/// matching exactly what it matched before. Stored `Range` values never produced
+/// a row, so they become searchable only after `POST /$reindex`.
+///
+/// Steps, each safe to repeat, as in v55: add the columns under a `lock_timeout`;
+/// backfill in committed batches of heap blocks selected by `ctid` range; build
+/// the two partial indexes `CONCURRENTLY` (an invalid leftover is dropped
+/// first); sweep rows written meanwhile by an instance that was not yet upgraded.
+/// `statement_timeout` is disabled for the step and restored.
+async fn migrate_v55_to_v56(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let failed = |what: &str, e: &dyn std::fmt::Display| {
+        pg_error(format!("Migration v55->v56 failed ({what}): {e}"))
+    };
+    let previous_timeout: String = client
+        .query_one("SELECT current_setting('statement_timeout')", &[])
+        .await
+        .map_err(|e| failed("read statement_timeout", &e))?
+        .get(0);
+    client
+        .batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| failed("disable statement_timeout", &e))?;
+    let result = build_quantity_high(client).await;
+    let restore = client
+        .execute(
+            "SELECT set_config('statement_timeout', $1, false)",
+            &[&previous_timeout],
+        )
+        .await;
+    result?;
+    restore.map_err(|e| failed("restore statement_timeout", &e))?;
+
+    if let Err(e) =
+        analyze_search_index_with_timeout(client, post_migration_analyze_timeout()).await
+    {
+        tracing::warn!(
+            "Migration v55->v56: optional ANALYZE failed ({e}); the planner has no statistics on value_quantity_high until autovacuum analyzes search_index"
+        );
+    }
+    Ok(())
+}
+
+async fn build_quantity_high(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let failed = |what: &str, e: &dyn std::fmt::Display| {
+        pg_error(format!("Migration v55->v56 failed ({what}): {e}"))
+    };
+
+    // 1. The columns, behind a bounded lock wait, retried.
+    const ATTEMPTS: u32 = 60;
+    for attempt in 1..=ATTEMPTS {
+        let outcome: Result<(), tokio_postgres::Error> = async {
+            let tx = client.transaction().await?;
+            tx.batch_execute("SET LOCAL lock_timeout = '2s'").await?;
+            tx.batch_execute(
+                "ALTER TABLE search_index \
+                     ADD COLUMN IF NOT EXISTS value_quantity_high DOUBLE PRECISION, \
+                     ADD COLUMN IF NOT EXISTS value_quantity_canonical_high DOUBLE PRECISION",
+            )
+            .await?;
+            tx.commit().await
+        }
+        .await;
+        match outcome {
+            Ok(()) => break,
+            Err(e)
+                if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+                    && attempt < ATTEMPTS =>
+            {
+                tracing::warn!(
+                    "Migration v55->v56: waiting for a lock on search_index, attempt {attempt}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(failed("add columns", &e)),
+        }
+    }
+
+    // 2. Backfill by block range: a point's upper bound is its value.
+    let batch_sql = |first_block: u64, block_count: u64| {
+        format!(
+            "UPDATE search_index SET value_quantity_high = value_quantity_value, \
+                    value_quantity_canonical_high = value_quantity_canonical_value \
+             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL \
+             AND ctid >= '({first_block},0)'::tid AND ctid < '({},0)'::tid",
+            first_block + block_count
+        )
+    };
+    let mut first_block = 0_u64;
+    loop {
+        let blocks: i64 = client
+            .query_one(
+                "SELECT pg_relation_size('search_index') / current_setting('block_size')::bigint",
+                &[],
+            )
+            .await
+            .map_err(|e| failed("table size", &e))?
+            .get(0);
+        if first_block >= blocks.max(0) as u64 {
+            break;
+        }
+        let sql = batch_sql(first_block, QUANTITY_HIGH_BACKFILL_BLOCKS);
+        client
+            .execute(sql.as_str(), &[])
+            .await
+            .map_err(|e| failed("backfill", &e))?;
+        first_block += QUANTITY_HIGH_BACKFILL_BLOCKS;
+    }
+
+    // 3. The indexes, built without blocking writers.
+    for (name, body) in QUANTITY_HIGH_INDEXES {
+        let invalid: Option<bool> = client
+            .query_opt(
+                "SELECT NOT (i.indisvalid AND i.indisready) FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = current_schema() AND c.relname = $1",
+                &[&name],
+            )
+            .await
+            .map_err(|e| failed("inspect index", &e))?
+            .map(|row| row.get(0));
+        if invalid == Some(true) {
+            client
+                .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+                .await
+                .map_err(|e| failed("drop invalid index", &e))?;
+        }
+        if let Err(e) = client
+            .batch_execute(&format!(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} {body}"
+            ))
+            .await
+        {
+            if let Err(drop_error) = client
+                .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+                .await
+            {
+                tracing::warn!(%drop_error, "Could not drop the invalid {name}");
+            }
+            return Err(failed("create index", &e));
+        }
+    }
+
+    // 4. Rows written during the build by a not-yet-upgraded instance.
+    let sweep = format!(
+        "UPDATE search_index SET value_quantity_high = value_quantity_value, \
+                value_quantity_canonical_high = value_quantity_canonical_value \
+         WHERE ctid = ANY (ARRAY( \
+             SELECT ctid FROM search_index \
+             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL \
+             LIMIT {QUANTITY_HIGH_SWEEP_ROWS}))"
     );
     loop {
         let filled = client
@@ -7667,7 +7860,7 @@ mod postgres_integration_migrations {
             .await
             .expect("migrate v54 to v55");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 55);
+        assert_eq!(SCHEMA_VERSION, 56);
         for (i, vector) in vectors.iter().enumerate() {
             let got: Option<String> = client
                 .query_one(
@@ -8884,7 +9077,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 55);
+        assert_eq!(SCHEMA_VERSION, 56);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
