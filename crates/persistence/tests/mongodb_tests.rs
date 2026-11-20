@@ -5866,9 +5866,12 @@ fn collect_index_names(doc: &Document, out: &mut Vec<String>) {
     }
 }
 
-/// #2603: the ascending `_lastUpdated` order (`last_updated 1, id 1`) must be
-/// one `idx_resources_type_scan` serves directly, with and without a cursor
-/// predicate, so no page needs a blocking in-memory SORT stage.
+/// #2603: checks that MongoDB serves the orders `(last_updated 1, id 1)` and
+/// `(last_updated -1, id -1)` straight from `idx_resources_type_scan`, with
+/// and without a cursor predicate, with no blocking SORT stage. The sort
+/// documents are written by hand here, so this does NOT exercise the
+/// backend's own sort; that is pinned by the unit test
+/// `last_updated_sort_document_id_follows_the_sort_direction`.
 #[tokio::test]
 async fn mongodb_last_updated_ascending_page_uses_type_scan_without_sort() {
     let Some(backend) = create_backend("last_updated_asc_plan").await else {
