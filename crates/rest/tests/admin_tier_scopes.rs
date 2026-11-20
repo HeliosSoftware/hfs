@@ -18,6 +18,9 @@ const READ_ONLY: &str = "read-only-token";
 const FULL: &str = "full-token";
 const DELETE_ONLY: &str = "delete-only-token";
 const USER_WILDCARD: &str = "user-token";
+const V1_READ: &str = "v1-read-token";
+const V1_WRITE: &str = "v1-write-token";
+const TENANT_BOUND_FULL: &str = "tenant-bound-full-token";
 
 /// One bearer per scope shape under test.
 struct StubProvider;
@@ -30,12 +33,17 @@ impl AuthProvider for StubProvider {
             h if h == format!("Bearer {FULL}") => "system/*.cruds",
             h if h == format!("Bearer {DELETE_ONLY}") => "system/*.d",
             h if h == format!("Bearer {USER_WILDCARD}") => "user/*.cruds",
+            h if h == format!("Bearer {V1_READ}") => "system/*.read",
+            h if h == format!("Bearer {V1_WRITE}") => "system/*.write",
+            h if h == format!("Bearer {TENANT_BOUND_FULL}") => "system/*.cruds",
             _ => return Err(AuthError::InvalidSignature),
         };
+        let tenant_id = (authorization_header == format!("Bearer {TENANT_BOUND_FULL}"))
+            .then(|| "tenanta".to_string());
         Ok(Principal {
             subject: "demo-sub".to_string(),
             issuer: "https://idp.example.com".to_string(),
-            tenant_id: None,
+            tenant_id,
             scopes: ScopeSet::parse(scopes),
             jti: None,
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
@@ -132,12 +140,8 @@ async fn a_read_only_system_wildcard_can_look_but_not_register_or_deregister() {
         .add_header(AUTHORIZATION, bearer(FULL))
         .await
         .json::<serde_json::Value>();
-    assert!(
-        list.as_array()
-            .map(|rows| rows.iter().all(|r| r["id"] != "acme"))
-            .unwrap_or(true),
-        "{list}"
-    );
+    let rows = list["tenants"].as_array().expect("tenants array");
+    assert!(rows.iter().all(|r| r["id"] != "acme"), "{list}");
 }
 
 #[tokio::test]
@@ -204,4 +208,102 @@ async fn a_user_context_wildcard_is_refused_on_every_method() {
             response.text()
         );
     }
+}
+
+#[tokio::test]
+async fn head_is_held_to_the_read_bit() {
+    let server = server();
+    let response = server
+        .method(axum::http::Method::HEAD, "/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(READ_ONLY))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_unmounted_method_is_held_to_the_update_bit_before_routing() {
+    let server = server();
+    // Authorization runs before routing: a read-only token is refused on
+    // the `u` bit rather than told the method is not allowed.
+    let refused = server
+        .method(axum::http::Method::PUT, "/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(READ_ONLY))
+        .await;
+    assert_forbidden_for_bit(&refused, "u");
+
+    let full = server
+        .method(axum::http::Method::PUT, "/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(FULL))
+        .await;
+    assert_eq!(full.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn smart_v1_scopes_grant_nothing_on_the_admin_tier() {
+    // HFS parses SMART v2 scopes only, so `.read` / `.write` are not
+    // permission bits and the admin tier admits neither.
+    let server = server();
+    for token in [V1_READ, V1_WRITE] {
+        let list = server
+            .get("/admin/tenants")
+            .add_header(AUTHORIZATION, bearer(token))
+            .await;
+        assert_forbidden_for_bit(&list, "r");
+        let create = server
+            .post("/admin/tenants")
+            .add_header(AUTHORIZATION, bearer(token))
+            .json(&json!({ "id": "acme" }))
+            .await;
+        assert_forbidden_for_bit(&create, "c");
+    }
+}
+
+#[tokio::test]
+#[ignore = "#2673: the admin tier ignores the JWT tenant claim"]
+async fn a_tenant_bound_token_cannot_administer_other_tenants() {
+    let server = server();
+    let setup = server
+        .post("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(FULL))
+        .json(&json!({ "id": "tenantb" }))
+        .await;
+    assert_eq!(setup.status_code(), StatusCode::CREATED, "{}", setup.text());
+
+    let list = server
+        .get("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
+        .await;
+    assert_eq!(list.status_code(), StatusCode::FORBIDDEN, "{}", list.text());
+
+    let create = server
+        .post("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
+        .json(&json!({ "id": "tenantc" }))
+        .await;
+    assert_eq!(
+        create.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        create.text()
+    );
+
+    let purge = server
+        .delete("/admin/tenants/tenantb?purge=true")
+        .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
+        .await;
+    assert_eq!(
+        purge.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        purge.text()
+    );
+
+    let list = server
+        .get("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(FULL))
+        .await
+        .json::<serde_json::Value>();
+    let rows = list["tenants"].as_array().expect("tenants array");
+    assert!(rows.iter().any(|r| r["id"] == "tenantb"), "{list}");
+    assert!(rows.iter().all(|r| r["id"] != "tenantc"), "{list}");
 }
