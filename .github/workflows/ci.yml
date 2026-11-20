@@ -114,7 +114,7 @@ jobs:
           exit 1
 
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -358,7 +358,7 @@ jobs:
       # sparse checkout keeps this job as cheap as it was before it had any
       # checkout at all.
       - name: Check out the Docker host GC action
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           # Into its own directory, never the shared runner checkout. A sparse
           # checkout there deletes every file outside .github/actions, and the
@@ -442,7 +442,7 @@ jobs:
     needs: [test-rust]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -542,7 +542,7 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -583,7 +583,7 @@ jobs:
       CARGO_BUILD_JOBS: default
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -642,7 +642,7 @@ jobs:
       CARGO_BUILD_JOBS: default
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -697,7 +697,7 @@ jobs:
       CARGO_BUILD_JOBS: default
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -773,7 +773,7 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -815,7 +815,7 @@ jobs:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.os == 'Linux')
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -1000,7 +1000,7 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -1156,7 +1156,7 @@ jobs:
 
       # Upload to Codecov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -1188,7 +1188,7 @@ jobs:
       FHIRPATH_TERMINOLOGY_SERVER: https://hts.heliossoftware.com
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
           fetch-depth: 0 # Need full history for change detection
@@ -1235,7 +1235,7 @@ jobs:
             console.log('FhirPath Validator download completed');
 
       - name: Checkout FHIR Test Cases
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: FHIR/fhir-test-cases
           path: fhir-test-cases
@@ -1813,7 +1813,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install mdBook
         run: |
@@ -1849,7 +1849,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -1988,7 +1988,7 @@ jobs:
             artifact_release_dir: target/aarch64-unknown-linux-gnu/release
     steps:
       - name: Checkout (for Dockerfile)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Determine version
         id: version
