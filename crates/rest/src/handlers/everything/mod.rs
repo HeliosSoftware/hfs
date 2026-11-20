@@ -144,7 +144,8 @@ where
     // self/next links, which echo the request as made.
     let patient_id = path_id.clone().or(launch_patient);
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
-    let grants = TypeGrants::for_principal(request.extensions().get::<Principal>());
+    let grants = TypeGrants::for_principal(request.extensions().get::<Principal>())
+        .walking(patient_id.as_deref());
     let pairs = decode_pairs(request).await?;
     let mut params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
     // Before the fingerprint: a cursor minted under other grants walks other

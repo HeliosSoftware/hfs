@@ -278,7 +278,9 @@ user/Observation.rs` token gets the patient, its observations and nothing else,
 and the bundle carries an `information` OperationOutcome entry naming the
 omitted types. An explicit `_type` naming a member type the token may not
 search is `403`. Wildcard grants (`patient/*.rs`, `user/*.rs`, `system/*.rs`)
-are not narrowed.
+are not narrowed. A `patient/` grant covers only the launch patient's
+compartment, so a token that pairs `user/Patient.rs` with `patient/` grants
+gets another patient's `$everything` without the types those grants cover.
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.

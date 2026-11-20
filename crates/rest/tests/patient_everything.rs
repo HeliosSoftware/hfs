@@ -583,6 +583,54 @@ async fn a_patient_only_read_scope_gets_the_patient_alone() {
     assert!(notes[0].contains("Organization"), "{}", notes[0]);
 }
 
+/// A `patient/` grant is confined to the launch patient even when the token
+/// also carries a `user/Patient` grant: the middleware admits
+/// `Patient/<other>/$everything` on the unconfined Patient read, so the walk
+/// must not treat the `patient/` grant as covering another patient's members.
+#[tokio::test]
+async fn a_patient_scope_does_not_cover_another_patients_members() {
+    for scopes in [
+        "user/Patient.rs patient/Observation.rs",
+        "user/Patient.rs patient/*.rs",
+    ] {
+        let mut principal = scoped_principal(scopes);
+        principal.launch_context = patient_context("p1");
+        let server = server_with_principal(10_000, principal).await;
+        seed(&server).await;
+
+        let response = server.get("/Patient/p2/$everything").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{scopes}: {}",
+            response.text()
+        );
+        let (resources, notes) = resources_and_notes(&response.json());
+        assert_eq!(resources, vec!["Patient/p2".to_string()], "{scopes}");
+        assert_eq!(notes.len(), 1, "{scopes}: {notes:?}");
+        assert!(notes[0].contains("Observation"), "{scopes}: {}", notes[0]);
+
+        // The launch patient's own members are still granted.
+        let response = server.get("/Patient/p1/$everything").await;
+        let (resources, _) = resources_and_notes(&response.json());
+        for id in [
+            "Patient/p1",
+            "Observation/o1",
+            "Observation/o2",
+            "Observation/o3",
+        ] {
+            assert!(
+                resources.contains(&id.to_string()),
+                "{scopes}: missing {id} in {resources:?}"
+            );
+        }
+        assert!(
+            !resources.contains(&"Observation/other".to_string()),
+            "{scopes}: {resources:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_explicit_type_the_scopes_do_not_grant_is_refused() {
     let server = server_with_principal(

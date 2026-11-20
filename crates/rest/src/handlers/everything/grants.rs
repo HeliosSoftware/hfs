@@ -5,30 +5,48 @@
 //! itself keeps only the compartment member types the token may search and
 //! the supporting resource types it may read, as `Patient/$export` does.
 
-use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
+use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 
 use super::params::EverythingParams;
 use crate::error::{RestError, RestResult};
 
 /// Per-type grants of the principal behind a `$everything` request. With no
-/// principal (authentication off) every type is permitted.
+/// principal (authentication off) every type is permitted. A `patient/`
+/// grant permits a type only on a walk of its launch patient ([`Self::walking`]).
 #[derive(Clone)]
 pub(crate) struct TypeGrants {
     principal: Option<Principal>,
+    walk_patient: Option<String>,
 }
 
 impl TypeGrants {
     pub(crate) fn for_principal(principal: Option<&Principal>) -> Self {
         Self {
             principal: principal.cloned(),
+            walk_patient: None,
         }
+    }
+
+    /// The patient whose compartment the walk visits, if it visits one.
+    ///
+    /// A grant that rests on a `patient/` scope covers only the launch
+    /// patient's compartment. The middleware admits `Patient/<id>/$everything`
+    /// on the `Patient` read alone, which a `user/` or `system/` grant gives
+    /// for any patient, so such a grant permits a type only when the walk is
+    /// of that launch patient.
+    pub(crate) fn walking(mut self, patient: Option<&str>) -> Self {
+        self.walk_patient = patient.map(str::to_string);
+        self
     }
 
     /// Everything permitted: the authentication-off posture.
     #[cfg(test)]
     pub(crate) fn all() -> Self {
-        Self { principal: None }
+        Self {
+            principal: None,
+            walk_patient: None,
+        }
     }
 
     /// A compartment member type the walk may search.
@@ -44,7 +62,13 @@ impl TypeGrants {
     fn permits(&self, resource_type: &str, operation: FhirOperation) -> bool {
         match &self.principal {
             None => true,
-            Some(p) => SmartScopePolicy::check(p, resource_type, operation).is_ok(),
+            Some(p) => match SmartScopePolicy::check(p, resource_type, operation) {
+                Ok(AccessScope::Unrestricted) => true,
+                Ok(AccessScope::PatientCompartment { patient_id }) => {
+                    self.walk_patient.as_deref() == Some(patient_id.as_str())
+                }
+                Err(_) => false,
+            },
         }
     }
 }
@@ -145,6 +169,32 @@ mod tests {
         // A read-only grant on a member type does not let the walk search it.
         let p = principal("user/Patient.rs user/Condition.r");
         assert!(!TypeGrants::for_principal(Some(&p)).permits_member("Condition"));
+    }
+
+    #[test]
+    fn a_patient_grant_permits_only_a_walk_of_the_launch_patient() {
+        let mut p = principal("user/Patient.rs patient/Observation.rs patient/Practitioner.r");
+        p.launch_context = Some(helios_auth::LaunchContext {
+            patient: Some("p1".to_string()),
+            ..Default::default()
+        });
+        let own = TypeGrants::for_principal(Some(&p)).walking(Some("p1"));
+        assert!(own.permits_member("Observation"));
+        assert!(own.permits_supporting("Practitioner"));
+        for other in [
+            TypeGrants::for_principal(Some(&p)).walking(Some("p2")),
+            TypeGrants::for_principal(Some(&p)).walking(None),
+        ] {
+            assert!(!other.permits_member("Observation"));
+            assert!(!other.permits_supporting("Practitioner"));
+        }
+        // An unconfined grant is not tied to the walk's patient.
+        let p = principal("user/Patient.rs user/Observation.rs");
+        assert!(
+            TypeGrants::for_principal(Some(&p))
+                .walking(Some("p2"))
+                .permits_member("Observation")
+        );
     }
 
     #[test]
