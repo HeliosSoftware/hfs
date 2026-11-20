@@ -3569,16 +3569,36 @@ impl MongoBackend {
                             .await?,
                     );
                 }
-                self.param_sorted_window(
-                    db,
-                    tenant_id,
-                    &query.resource_type,
-                    directives,
-                    id_direction,
-                    offset,
-                    page_size + 1,
-                )
-                .await?
+                let walked = if self.walks_unfiltered_date_desc(directives) {
+                    self.unfiltered_date_desc_walk(
+                        db,
+                        tenant_id,
+                        query,
+                        missing_support,
+                        &directives[0],
+                        id_direction,
+                        offset,
+                        page_size + 1,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                match walked {
+                    Some(ids) => ids,
+                    None => {
+                        self.param_sorted_window(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            directives,
+                            id_direction,
+                            offset,
+                            page_size + 1,
+                        )
+                        .await?
+                    }
+                }
             }
             // Bounded by the cap like the unfiltered window. The order does
             // not change the count, so the total is the unsorted query's,
@@ -4148,6 +4168,90 @@ impl MongoBackend {
         offset: usize,
         take: usize,
     ) -> StorageResult<Vec<String>> {
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let streams = self
+            .sort_row_streams(&search_index, tenant_id, &query.resource_type, directive)
+            .await?;
+        self.param_sorted_filtered_window_over(
+            streams,
+            db,
+            tenant_id,
+            query,
+            missing_support,
+            directive,
+            id_direction,
+            offset,
+            take,
+        )
+        .await
+    }
+
+    /// Whether an unfiltered sort can walk `idx_search_date_end` instead of
+    /// grouping every row of the parameter: a single descending `value_date`
+    /// key, with the value indexes built (#2601).
+    fn walks_unfiltered_date_desc(&self, directives: &[crate::types::SortDirective]) -> bool {
+        self.search_indexes_ready()
+            && self.date_end_index_ready()
+            && matches!(directives, [directive]
+                if sort_value_field(directive) == "value_date"
+                    && directive.direction == crate::types::SortDirection::Descending)
+    }
+
+    /// The window of an unfiltered descending date sort, read in end order
+    /// from `idx_search_date_end` and cut after `offset + take` live ids.
+    /// `None` when that index was rejected (dropped after the readiness
+    /// check): the caller then groups the rows as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn unfiltered_date_desc_walk(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        directive: &crate::types::SortDirective,
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let Some(streams) = self
+            .open_sort_row_streams(&search_index, tenant_id, &query.resource_type, directive)
+            .await?
+        else {
+            tracing::warn!(
+                index = SEARCH_DATE_END_INDEX,
+                "date end index rejected for the unfiltered date sort; grouping the rows"
+            );
+            return Ok(None);
+        };
+        self.param_sorted_filtered_window_over(
+            streams,
+            db,
+            tenant_id,
+            query,
+            missing_support,
+            directive,
+            id_direction,
+            offset,
+            take,
+        )
+        .await
+        .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn param_sorted_filtered_window_over(
+        &self,
+        mut streams: Vec<SortRowStream>,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        directive: &crate::types::SortDirective,
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
 
         let resource_type = query.resource_type.as_str();
@@ -4167,9 +4271,6 @@ impl MongoBackend {
         };
 
         let wanted = offset.saturating_add(take);
-        let mut streams = self
-            .sort_row_streams(&search_index, tenant_id, resource_type, directive)
-            .await?;
         // Every resource a row was read for, matching or not: its first row
         // held its key, so its later rows are skipped.
         let mut keyed: HashSet<String> = HashSet::new();
@@ -4338,6 +4439,25 @@ impl MongoBackend {
         resource_type: &str,
         directive: &crate::types::SortDirective,
     ) -> StorageResult<Vec<SortRowStream>> {
+        self.open_sort_row_streams(search_index, tenant_id, resource_type, directive)
+            .await?
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the sort index for {} is missing",
+                    directive.parameter
+                ))
+            })
+    }
+
+    /// [`Self::sort_row_streams`], answering `None` when a hinted index does
+    /// not exist rather than failing.
+    async fn open_sort_row_streams(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+    ) -> StorageResult<Option<Vec<SortRowStream>>> {
         use crate::types::SortDirection;
 
         let order = match directive.direction {
@@ -4386,15 +4506,18 @@ impl MongoBackend {
             };
         let mut streams = Vec::with_capacity(plans.len());
         for (filter, sort, index, key_field) in plans {
-            let cursor = search_index
+            let opened = search_index
                 .find(filter)
                 .search_deadline()?
                 .projection(doc! { "_id": 0, "resource_id": 1, key_field: 1 })
                 .sort(sort)
                 .hint(Hint::Name(index.to_owned()))
                 .batch_size(CANDIDATE_BATCH_SIZE as u32)
-                .await
-                .or_query_error("Failed to open a sort-key cursor")?;
+                .await;
+            let cursor = match opened {
+                Err(error) if search_access::hint_rejected(&error) => return Ok(None),
+                opened => opened.or_query_error("Failed to open a sort-key cursor")?,
+            };
             streams.push(SortRowStream {
                 cursor,
                 key_field,
@@ -4402,7 +4525,7 @@ impl MongoBackend {
                 exhausted: false,
             });
         }
-        Ok(streams)
+        Ok(Some(streams))
     }
 
     async fn matching_resource_ids(
@@ -4595,7 +4718,12 @@ impl MongoBackend {
                 Some(filter) => filter.clone(),
                 None => self.build_search_index_filter(tenant_id, resource_type, normal[i])?,
             };
-            let access = PredicateAccess::new(&filter, normal[i], self.search_indexes_ready());
+            let access = PredicateAccess::new_with_date_end(
+                &filter,
+                normal[i],
+                self.search_indexes_ready(),
+                self.date_end_index_ready(),
+            );
             Ok((filter, access))
         };
 
@@ -4903,7 +5031,12 @@ impl MongoBackend {
                 Some(filter) => filter.clone(),
                 None => self.build_search_index_filter(tenant_id, resource_type, param)?,
             };
-            let access = PredicateAccess::new(&filter, param, self.search_indexes_ready());
+            let access = PredicateAccess::new_with_date_end(
+                &filter,
+                param,
+                self.search_indexes_ready(),
+                self.date_end_index_ready(),
+            );
             let passing = matching_index_ids(
                 search_index,
                 &candidates,

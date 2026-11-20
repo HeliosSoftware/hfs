@@ -117,6 +117,70 @@ fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
+fn date_param(raw: &str) -> SearchParameter {
+    SearchParameter {
+        name: "date".to_owned(),
+        param_type: SearchParamType::Date,
+        modifier: None,
+        values: vec![SearchValue::parse(raw)],
+        chain: vec![],
+        components: vec![],
+    }
+}
+
+/// #2601: explain of the end-bounded arm of `date=gt<day>` on `search_index`,
+/// unhinted and forced onto each date index, so the keys examined and the
+/// index bounds of `idx_search_date_v3` and `idx_search_date_end` can be
+/// compared. Enabled with `HFS_TEST_COMPLEMENT_BENCH_EXPLAIN=1`.
+async fn explain_end_bound(backend: &MongoBackend, tenant: &TenantContext) {
+    let db = backend.get_database().await.unwrap();
+    let bound = mongodb::bson::DateTime::parse_rfc3339_str("2020-10-01T00:00:00Z").unwrap();
+    for hint in [
+        None,
+        Some("idx_search_date_v3"),
+        Some("idx_search_date_end"),
+    ] {
+        let mut find = doc! {
+            "find": "search_index",
+            "filter": {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "param_name": "date",
+                "value_date": {"$ne": null},
+                "value_date_end": {"$gt": bound},
+            },
+        };
+        if let Some(name) = hint {
+            find.insert("hint", name);
+        }
+        let explained = db
+            .run_command(doc! {"explain": find, "verbosity": "executionStats"})
+            .await;
+        match explained {
+            Ok(result) => {
+                let stats = result.get_document("executionStats").ok();
+                let plan = result
+                    .get_document("queryPlanner")
+                    .and_then(|planner| planner.get_document("winningPlan"))
+                    .map(|plan| plan.to_string())
+                    .unwrap_or_default();
+                println!(
+                    "explain gt end-bound hint={}: returned={:?} keys={:?} docs={:?} ms={:?}\n  plan={plan}",
+                    hint.unwrap_or("none"),
+                    stats.and_then(|s| s.get("nReturned")),
+                    stats.and_then(|s| s.get("totalKeysExamined")),
+                    stats.and_then(|s| s.get("totalDocsExamined")),
+                    stats.and_then(|s| s.get("executionTimeMillis")),
+                );
+            }
+            Err(error) => println!(
+                "explain gt end-bound hint={}: error: {error}",
+                hint.unwrap_or("none")
+            ),
+        }
+    }
+}
+
 fn percentile(sorted: &[f64], fraction: f64) -> f64 {
     let index = ((sorted.len() as f64 * fraction).ceil() as usize).clamp(1, sorted.len());
     sorted[index - 1]
@@ -178,6 +242,27 @@ async fn complement_sort_bench() {
     shapes.push(("_sort=date typed page 1", by_typed_date.clone()));
     by_typed_date.offset = Some(deep_offset as u32);
     shapes.push(("_sort=date typed deep offset", by_typed_date));
+    // #2601: `-date` without a filter, first page and deep offset (typed like
+    // the server resolves it).
+    let mut typed_desc = SortDirective::parse("-date");
+    typed_desc.param_type = Some(SearchParamType::Date);
+    let mut by_desc = page(vec![]).with_sort(typed_desc);
+    shapes.push(("_sort=-date typed page 1", by_desc.clone()));
+    by_desc.offset = Some(deep_offset as u32);
+    shapes.push(("_sort=-date typed deep offset", by_desc));
+    // #2601: end-bounded date prefixes, with an exact total. `gt` is one arm;
+    // `ge` and `ne` are a root `$or` of an end-bounded and a start-bounded arm;
+    // `lt` leads with a `value_date` bound and stays on `idx_search_date_v3`.
+    for (label, raw) in [
+        ("date=gt2020-10-01 (total)", "gt2020-10-01"),
+        ("date=ge2020-10-01 (total)", "ge2020-10-01"),
+        ("date=ne2020-10-01 (total)", "ne2020-10-01"),
+        ("date=lt2020-02-01 (total, control)", "lt2020-02-01"),
+    ] {
+        let mut query = page(vec![date_param(raw)]);
+        query.total = Some(TotalMode::Accurate);
+        shapes.push((label, query));
+    }
     let mut compartment = page(vec![token_with("status", SearchModifier::Not, "final")]);
     compartment.compartment = Some(helios_persistence::types::CompartmentMembership {
         params: vec!["subject".into()],
@@ -185,6 +270,9 @@ async fn complement_sort_bench() {
     });
     shapes.push(("compartment + status:not=final", compartment));
 
+    if std::env::var("HFS_TEST_COMPLEMENT_BENCH_EXPLAIN").is_ok() {
+        explain_end_bound(&backend, &tenant).await;
+    }
     println!("| shape | outcome | p50 ms | p95 ms | peak RSS MB |");
     println!("|---|---|---:|---:|---:|");
     for (label, query) in shapes {
@@ -200,7 +288,11 @@ async fn complement_sort_bench() {
             let observed = backend.search(&tenant, &query).await;
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             outcome = match observed {
-                Ok(result) => format!("page {}", result.resources.items.len()),
+                Ok(result) => format!(
+                    "page {} total {:?}",
+                    result.resources.items.len(),
+                    result.total
+                ),
                 Err(error) => format!("error: {error}"),
             };
             if run > 0 {

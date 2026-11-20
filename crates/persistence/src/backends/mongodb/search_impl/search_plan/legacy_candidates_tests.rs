@@ -141,7 +141,7 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
 
     for total in [TotalMode::None, TotalMode::Accurate] {
         let mut query = SearchQuery::new("Observation")
-            .with_parameter(date_parameter("ge2025-01-01"))
+            .with_parameter(date_parameter("eq2025"))
             .with_parameter(date_parameter("lt2025-07-01"))
             .with_sort(SortDirective::parse("_lastUpdated"))
             .with_count(20);
@@ -378,7 +378,7 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
     );
     // The ID-ordered control keeps the existing batched plan.
     let mut control = SearchQuery::new("Observation")
-        .with_parameter(date_parameter("ge2025-01-01"))
+        .with_parameter(date_parameter("eq2025"))
         .with_parameter(date_parameter("lt2025-07-01"))
         .with_sort(SortDirective::parse("_id"))
         .with_count(20);
@@ -427,12 +427,12 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
         .map(|row| SearchValue::eq(&row.id))
         .collect();
     let queries = [
-        SearchQuery::new("Observation").with_parameter(date_parameter("ge2025-01-01")),
+        SearchQuery::new("Observation").with_parameter(date_parameter("eq2025")),
         SearchQuery::new("Observation")
-            .with_parameter(date_parameter("ge2025-01-01"))
+            .with_parameter(date_parameter("eq2025"))
             .with_parameter(date_parameter("lt2025-07-01")),
         SearchQuery::new("Observation")
-            .with_parameter(date_parameter("ge2025-01-01"))
+            .with_parameter(date_parameter("eq2025"))
             .with_parameter(seed),
     ];
     for dropped in [false, true] {
@@ -481,7 +481,7 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
         return;
     };
     add_dates(&fixture, 12).await;
-    let single = SearchQuery::new("Observation").with_parameter(date_parameter("ge2025-01-01"));
+    let single = SearchQuery::new("Observation").with_parameter(date_parameter("eq2025"));
     let pair = single
         .clone()
         .with_parameter(date_parameter("lt2025-07-01"));

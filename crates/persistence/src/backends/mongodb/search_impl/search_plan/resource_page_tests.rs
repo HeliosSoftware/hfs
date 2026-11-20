@@ -2462,7 +2462,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
         .unwrap();
     let mut date = parameter("date", "2026-01-01");
     date.param_type = SearchParamType::Date;
-    date.values[0].prefix = SearchPrefix::Ge;
+    date.values[0].prefix = SearchPrefix::Eq;
     let mut excluded = parameter("code", "right");
     excluded.modifier = Some(SearchModifier::Not);
     let mut query = SearchQuery::new("Observation")
