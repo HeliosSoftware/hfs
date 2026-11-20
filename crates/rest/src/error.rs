@@ -313,6 +313,15 @@ pub enum RestError {
         secs: u64,
     },
 
+    /// The store stopped a statement of a ViewDefinition at its time limit
+    /// (HTTP 504, code `timeout`, #2577). Same status and code as
+    /// [`RestError::GatewayTimeout`], and like it no `Retry-After`, but the
+    /// advice the client gets is about the view, not about search parameters.
+    ViewTimeout {
+        /// The store's own text, for the server log only.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -485,6 +494,9 @@ impl fmt::Display for RestError {
             }
             RestError::SqlQueryTimeout { secs } => {
                 write!(f, "SQL query timeout: exceeded {}s", secs)
+            }
+            RestError::ViewTimeout { message } => {
+                write!(f, "View statement timeout: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -665,6 +677,23 @@ impl RestError {
                     "The request exceeded the server's time limit for a single operation. \
                      Narrow the request — add or tighten search parameters, reduce _count, \
                      or request a smaller date range — and try again."
+                        .to_string(),
+                )
+            }
+            RestError::ViewTimeout { message } => {
+                // As `GatewayTimeout`: the store's text (SQLSTATE, driver
+                // wording) is the operator's, the client gets advice it can
+                // act on and nothing that names the backend.
+                tracing::warn!(
+                    error.detail = %message,
+                    "backend cancelled a view statement at its server-side time limit"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "The view exceeded the server's time limit for a single statement. \
+                     Narrow it — a 'where' in the ViewDefinition, fewer columns, or a \
+                     'patient', 'group', '_since' or '_limit' parameter — and try again."
                         .to_string(),
                 )
             }
