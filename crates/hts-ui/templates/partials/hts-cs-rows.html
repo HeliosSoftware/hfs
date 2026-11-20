@@ -67,7 +67,7 @@
                   </a>
                 </td>
                 <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
-                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td class="col-url">{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
                 <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
                 <td>
                   {% if row.status.is_empty() %}

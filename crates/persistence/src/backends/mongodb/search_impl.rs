@@ -6839,8 +6839,9 @@ impl MongoBackend {
 
     /// The keyset predicate for `cursor` over `keyset`'s field, in the
     /// order [`Self::build_sort_document`] produces for the same query:
-    /// the sorted field first, then `id` descending (ascending in previous
-    /// mode) as the tie-break when the field is not `id` itself.
+    /// the sorted field first, then `id` in the same direction as the sorted
+    /// field (mirrored in previous mode) as the tie-break when the field is
+    /// not `id` itself.
     fn build_cursor_condition(
         &self,
         cursor: &PageCursor,
@@ -6892,9 +6893,9 @@ impl MongoBackend {
         // sort direction, flipped when walking back to the previous page.
         let ascending = (keyset.direction == crate::types::SortDirection::Ascending) != previous;
         let field_op = if ascending { "$gt" } else { "$lt" };
-        // `id` is the secondary key in descending order (see
-        // `build_sort_document`), so the tie-break is `$lt` going forward.
-        let id_op = if previous { "$gt" } else { "$lt" };
+        // `id` follows the direction of the sorted field (see
+        // `build_sort_document`), so the tie-break uses the same operator.
+        let id_op = field_op;
 
         let id = cursor.resource_id().to_string();
 
@@ -6902,7 +6903,15 @@ impl MongoBackend {
             return Ok(doc! { field: { field_op: boundary } });
         }
 
+        // The `$or` alone is only a filter: MongoDB then starts the index walk
+        // at the first row of the type and discards everything before the
+        // cursor, so a deep page reads every row ahead of it. The redundant
+        // inclusive bound on the sorted field (every row the `$or` accepts
+        // satisfies it) gives the planner a range to seek to on
+        // `RESOURCES_TYPE_SCAN_INDEX`.
+        let inclusive_op = if ascending { "$gte" } else { "$lte" };
         Ok(doc! {
+            field: { inclusive_op: boundary.clone() },
             "$or": [
                 { field: { field_op: boundary.clone() } },
                 { field: boundary, "id": { id_op: id } }
@@ -6951,8 +6960,14 @@ impl MongoBackend {
             sort.insert(field, dir);
         }
 
+        // The tie-break follows the direction of `last_updated` (already
+        // negated in previous mode) so the order is one that
+        // `RESOURCES_TYPE_SCAN_INDEX` serves forward or backward.
         if !sort.contains_key("id") {
-            sort.insert("id", if previous_mode { 1_i32 } else { -1_i32 });
+            let id_dir =
+                sort.get_i32("last_updated")
+                    .unwrap_or(if previous_mode { 1_i32 } else { -1_i32 });
+            sort.insert("id", id_dir);
         }
 
         Ok(sort)
@@ -9946,6 +9961,43 @@ mod cursor_keyset_tests {
         }
     }
 
+    /// #2603: the `id` tie-break follows the direction of `last_updated`
+    /// (mirrored for previous pages), so every order is one
+    /// `RESOURCES_TYPE_SCAN_INDEX` serves forward or backward.
+    #[test]
+    fn last_updated_sort_document_id_follows_the_sort_direction() {
+        for (sort, previous, expected) in [
+            (
+                "_lastUpdated",
+                false,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+            (
+                "_lastUpdated",
+                true,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                false,
+                doc! { "last_updated": -1_i32, "id": -1_i32 },
+            ),
+            (
+                "-_lastUpdated",
+                true,
+                doc! { "last_updated": 1_i32, "id": 1_i32 },
+            ),
+        ] {
+            let query =
+                SearchQuery::new("Patient").with_sort(crate::types::SortDirective::parse(sort));
+            assert_eq!(
+                backend().build_sort_document(&query, previous).unwrap(),
+                expected,
+                "{sort} previous={previous}"
+            );
+        }
+    }
+
     #[test]
     fn index_cursor_filter_excludes_timestamp_cursors_and_first_pages() {
         let backend = backend();
@@ -9965,8 +10017,8 @@ mod cursor_keyset_tests {
         }
     }
 
-    /// `_lastUpdated` keeps `id` (descending) as the tie-break, in both
-    /// explicit directions and for the default sort.
+    /// `_lastUpdated` uses `id` as the tie-break, in the same direction as
+    /// the sort, for both explicit directions and the default sort.
     #[test]
     fn last_updated_sort_cursor_compares_last_updated_then_id() {
         let r = resource("p-5", "2026-01-02T03:04:05Z");
@@ -9982,7 +10034,7 @@ mod cursor_keyset_tests {
         ));
         assert_eq!(
             backend().build_cursor_condition(&cursor, &default).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
                 { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
             ]}
@@ -9999,9 +10051,9 @@ mod cursor_keyset_tests {
         let asc = keyset(&["_lastUpdated"]).unwrap();
         assert_eq!(
             backend().build_cursor_condition(&cursor, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$gte": ts.clone() }, "$or": [
                 { "last_updated": { "$gt": ts.clone() } },
-                { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
+                { "last_updated": ts.clone(), "id": { "$gt": "p-5" } }
             ]}
         );
 
@@ -10010,9 +10062,9 @@ mod cursor_keyset_tests {
                 .unwrap();
         assert_eq!(
             backend().build_cursor_condition(&prev, &asc).unwrap(),
-            doc! { "$or": [
+            doc! { "last_updated": { "$lte": ts.clone() }, "$or": [
                 { "last_updated": { "$lt": ts.clone() } },
-                { "last_updated": ts, "id": { "$gt": "p-5" } }
+                { "last_updated": ts, "id": { "$lt": "p-5" } }
             ]}
         );
     }

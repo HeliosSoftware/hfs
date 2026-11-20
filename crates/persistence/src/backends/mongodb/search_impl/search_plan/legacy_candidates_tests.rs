@@ -146,7 +146,10 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
             let mut query = SearchQuery::new("Observation")
                 .with_parameter(date_parameter(case.raw()))
                 .with_parameter(date_parameter("lt2025-07-01"))
-                .with_sort(SortDirective::parse("_lastUpdated"))
+                // Descending keeps the fixture's shape: every row ties on
+                // `last_updated`, so the id tiebreak (now the same direction as
+                // the sort) puts these low-id matches last in the real index order.
+                .with_sort(SortDirective::parse("-_lastUpdated"))
                 .with_count(20);
             query.total = Some(total);
             profile_start(&fixture.db).await;

@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +63,7 @@ jobs:
           echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
 
       - name: Checkout subscriptions-test-kit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: HeliosSoftware/subscriptions-test-kit
           path: subscriptions-test-kit
@@ -192,7 +192,7 @@ jobs:
       TEST_GROUP_ID: subscriptions_r5_backport_r4_server-subscriptions_r4_server_workflow
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8

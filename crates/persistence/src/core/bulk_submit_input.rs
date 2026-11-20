@@ -45,6 +45,49 @@ pub struct RemoteManifest {
     pub deleted: Vec<RemoteFile>,
 }
 
+/// Why a [`FileTokenProvider`] attached no bearer token to a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTokenError {
+    /// The OAuth metadata URL, or the token endpoint it names, is outside the
+    /// providers the operator trusts; no client assertion was presented.
+    UntrustedProvider {
+        /// The metadata URL or token endpoint, reduced to its origin.
+        origin: String,
+    },
+    /// The request's destination is neither the token endpoint's origin nor a
+    /// trusted provider origin, so the token obtained there was withheld.
+    UntrustedDestination {
+        /// Origin of the URL the request was for.
+        destination: String,
+        /// Origin of the token endpoint that issued the token.
+        token_origin: String,
+    },
+    /// Discovery or the token request did not yield a token.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for FileTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UntrustedProvider { origin } => write!(
+                f,
+                "{origin} is not a trusted bulk-submit provider (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS)"
+            ),
+            Self::UntrustedDestination {
+                destination,
+                token_origin,
+            } => write!(
+                f,
+                "the token is withheld from {destination}: it is not the token endpoint's origin \
+                 ({token_origin}) and HFS_BULK_SUBMIT_TRUSTED_PROVIDERS does not list it"
+            ),
+            Self::Unavailable(reason) => write!(f, "no token could be obtained: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for FileTokenError {}
+
 /// Optional hook for acquiring an OAuth bearer token to fetch protected files.
 ///
 /// Wired by the HFS binary in Phase 5 to a SMART Backend Services client
@@ -53,9 +96,20 @@ pub struct RemoteManifest {
 /// operation scope (see the spec's file-retrieval authorization rule).
 #[async_trait]
 pub trait FileTokenProvider: Send + Sync {
-    /// Returns a bearer token (without the `Bearer ` prefix) for the given OAuth
-    /// metadata endpoints and scope, or `None` if a token cannot be obtained.
-    async fn token(&self, oauth_metadata_urls: &[String], scope: &str) -> Option<String>;
+    /// Returns a bearer token (without the `Bearer ` prefix) for a request to
+    /// `destination`, obtained through the given OAuth metadata endpoints with
+    /// `scope`.
+    ///
+    /// The metadata URLs and the destination both come from the submitter, so
+    /// the implementation decides whether the token may be presented to that
+    /// destination at all: a token minted at one provider's endpoint must not
+    /// travel to a host the submitter chose.
+    async fn token(
+        &self,
+        oauth_metadata_urls: &[String],
+        scope: &str,
+        destination: &str,
+    ) -> Result<String, FileTokenError>;
 }
 
 /// Fetches the remote manifest and streams the NDJSON files it references.

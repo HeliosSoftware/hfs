@@ -272,9 +272,18 @@ struct Fixture {
     rows: Vec<Row>,
 }
 
+/// The probe timeout of [`Fixture::new`] and [`Fixture::with_search_timeout`].
+///
+/// These tests assert the plan a search takes and the commands it sends. With
+/// the backend default ([`DEFAULT_PROBE_TIMEOUT_MS`], 10 ms) a loaded host
+/// times a probe out, and the search then takes a different, still correct
+/// plan that the assertions do not expect. A test about probe timeouts
+/// passes its own through [`Fixture::with_probe_timeout`].
+const STABLE_PROBE_TIMEOUT_MS: u64 = 10_000;
+
 impl Fixture {
     async fn new(label: &str, count: usize) -> Option<Self> {
-        Self::with_probe_timeout(label, count, DEFAULT_PROBE_TIMEOUT_MS).await
+        Self::with_probe_timeout(label, count, STABLE_PROBE_TIMEOUT_MS).await
     }
 
     async fn with_probe_timeout(label: &str, count: usize, probe_timeout_ms: u64) -> Option<Self> {
@@ -286,7 +295,7 @@ impl Fixture {
         count: usize,
         search_timeout_ms: Option<u64>,
     ) -> Option<Self> {
-        Self::with_timeouts(label, count, DEFAULT_PROBE_TIMEOUT_MS, search_timeout_ms).await
+        Self::with_timeouts(label, count, STABLE_PROBE_TIMEOUT_MS, search_timeout_ms).await
     }
 
     async fn with_timeouts(
@@ -1268,7 +1277,7 @@ async fn configured_probe_budget_reaches_the_plan_that_probes() {
     let configured = MongoBackend::new(config).unwrap();
     assert_eq!(
         fixture.backend.probe_timeout(),
-        Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS)
+        Duration::from_millis(STABLE_PROBE_TIMEOUT_MS)
     );
     assert_eq!(configured.probe_timeout(), Duration::from_millis(27));
 
