@@ -488,6 +488,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, a file-retrieval token is sent only to the origin of the token endpoint that issued it. Set, the `oauthMetadataUrl`, the token endpoint it names and every URL the token is sent to must be listed origins (the token endpoint's own origin always qualifies as a destination). An entry with a path, query or fragment fails startup. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 ##### `$bulk-submit` indexing mode per storage backend
@@ -521,6 +522,14 @@ Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` code default (the benchma
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
 `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+
+The `oauthMetadataUrl`, the `manifestUrl` and the file URLs all come from the
+submitter, so the token never leaves for a host the submitter chose: it is
+attached only to a request whose origin is the token endpoint's own, or one
+listed in `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`. Any other request fails with a
+manifest-level error that names the origin to list. A provider whose files live
+on a different host from its authorization server (presigned object storage, a
+separate FHIR server) therefore needs its origins listed.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
