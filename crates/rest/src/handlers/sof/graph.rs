@@ -738,8 +738,17 @@ pub(crate) struct ExecLimits {
     /// v2 PR #353.
     pub max_rows: usize,
     /// SQL execution timeout in seconds, applied per statement (each
-    /// interior SQLView's own SQL, and the subject's).
+    /// interior SQLView's own SQL, and the subject's), and the budget the
+    /// runner is asked to bound each of a dependency's statements with
+    /// ([`SofRunner::with_statement_timeout`]).
     pub timeout_secs: u64,
+    /// Whether materializing a leaf dependency is also bounded as a whole by
+    /// `timeout_secs`. `$sql-run` answers one request and sets it, so a
+    /// dependency ends at the budget whatever the runner. A `$sql-export` job
+    /// does not: it runs in the background and reads a dependency in pages,
+    /// each its own bounded statement, so a dependency that takes longer in
+    /// total than one statement may is exactly what the job is for (#2577).
+    pub bound_materialization: bool,
 }
 
 /// Materializes every node in `plan`, then executes `subject_sql` against
@@ -896,14 +905,19 @@ pub(crate) async fn execute_plan_counting(
                         .await
                         .map_err(MaterializeFailure::Rows)
                 };
-                // Materializing a dependency runs under the same budget as
-                // each SQL statement of the query, whatever the runner: a
-                // runner that executes statements also has the store stop them
-                // at this budget (`with_statement_timeout`), so the statement
-                // ends on the server too, not only here (#2577).
-                let (returned_engine, inserted) = match tokio::time::timeout(budget, materialize)
-                    .await
-                {
+                // For `$sql-run`, materializing a dependency runs under the
+                // same budget as each SQL statement of the query, whatever the
+                // runner: a runner that executes statements also has the store
+                // stop them at this budget (`with_statement_timeout`), so the
+                // statement ends on the server too, not only here (#2577). An
+                // export job leaves the whole unbounded and relies on the
+                // runner's per-statement budget (`bound_materialization`).
+                let outcome = if limits.bound_materialization {
+                    tokio::time::timeout(budget, materialize).await
+                } else {
+                    Ok(materialize.await)
+                };
+                let (returned_engine, inserted) = match outcome {
                     Ok(Ok(v)) => v,
                     Ok(Err(MaterializeFailure::Start(SofError::Unavailable(message)))) => {
                         warn!(
@@ -2114,6 +2128,7 @@ mod tests {
             max_source_rows_per_vd,
             max_rows,
             timeout_secs: 5,
+            bound_materialization: true,
         }
     }
 
@@ -2548,6 +2563,7 @@ mod tests {
                 max_source_rows_per_vd: 1000,
                 max_rows: 1000,
                 timeout_secs: 7,
+                bound_materialization: true,
             },
         )
         .await
@@ -2695,6 +2711,7 @@ mod tests {
                 max_source_rows_per_vd: 1000,
                 max_rows: 1000,
                 timeout_secs: 1,
+                bound_materialization: true,
             },
         )
         .await
@@ -2708,6 +2725,72 @@ mod tests {
             started.elapsed() < Duration::from_secs(20),
             "the budget, not the test harness, ended the run"
         );
+    }
+
+    /// A `SofRunner` whose view yields its one row only after `delay`.
+    struct SlowStoreRunner {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl SofRunner for SlowStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let delay = self.delay;
+            Ok(Box::pin(futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(json!({"id": "p0"}))
+            })))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "slow-store-test-runner"
+        }
+    }
+
+    /// #2577: an export job (`bound_materialization: false`) reads a
+    /// dependency for as long as it takes; only its statements are bounded,
+    /// by the runner. The same slow dependency ends a `$sql-run` at the
+    /// budget.
+    #[tokio::test]
+    async fn an_export_dependency_may_outlive_the_statement_budget() {
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        for bound_materialization in [false, true] {
+            let runner: Arc<dyn SofRunner> = Arc::new(SlowStoreRunner {
+                delay: Duration::from_millis(1500),
+            });
+            let outcome = execute_plan(
+                InMemorySqlEngine::open().expect("open engine"),
+                &runner,
+                &tenant,
+                &ViewFilters::default(),
+                &plan,
+                "SELECT * FROM obs",
+                &[],
+                ExecLimits {
+                    max_source_rows_per_vd: 1000,
+                    max_rows: 1000,
+                    timeout_secs: 1,
+                    bound_materialization,
+                },
+            )
+            .await;
+            if bound_materialization {
+                let err = outcome.err().expect("a $sql-run ends at the budget");
+                assert!(
+                    matches!(err, SqlQueryError::Timeout { secs: 1 }),
+                    "got {err:?}"
+                );
+            } else {
+                let (result, _) = outcome.expect("an export reads the dependency through");
+                assert_eq!(result.rows.len(), 1);
+            }
+        }
     }
 
     /// A node reached under two labels is named by the alphabetically first,

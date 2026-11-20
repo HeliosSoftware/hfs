@@ -194,7 +194,7 @@ jobs:
         run: |
           MONGO_CONTAINER="mongo-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
           docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 --replSet rs0 --bind_ip_all
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
 
           for i in {1..30}; do

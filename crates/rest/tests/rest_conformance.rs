@@ -356,6 +356,67 @@ mod response_headers {
         );
     }
 
+    /// A response with `Last-Modified` and no `Cache-Control` is subject to
+    /// heuristic freshness, so a browser could answer a later read from its
+    /// cache with the version before the client's own update (#2598). Every
+    /// FHIR response therefore says `no-cache`; a handler that sets a stricter
+    /// policy of its own keeps it.
+    #[tokio::test]
+    async fn test_fhir_responses_forbid_heuristic_caching() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        for path in [
+            "/Patient/patient-1",
+            "/Patient/patient-1/_history/1",
+            "/Patient/patient-1/_history",
+            "/Patient?family=Smith",
+            "/metadata",
+        ] {
+            let response = server
+                .get(path)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-cache"),
+                "{path} should answer with Cache-Control: no-cache"
+            );
+        }
+
+        let not_modified = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("if-none-match"),
+                HeaderValue::from_static("W/\"1\""),
+            )
+            .await;
+        assert_eq!(not_modified.status_code(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_modified
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("no-cache")
+        );
+
+        let health = server.get("/_readiness").await;
+        health.assert_status_ok();
+        assert_eq!(
+            health
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "/_readiness keeps its own stricter policy"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_returns_last_modified() {
         let (server, backend) = create_test_server().await;

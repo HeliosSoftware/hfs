@@ -22,7 +22,7 @@ name: FHIR Server Benchmark
 #
 #   k6 (runner) ──HTTP──▶ HFS (runner, :8081-:8086, one port per backend)
 #        │                  ├──SQL────▶ postgres:18             (postgres, postgres-elasticsearch)
-#        │                  ├──Mongo──▶ mongo:7.0, 1-member rs0 (mongodb, mongodb-elasticsearch)
+#        │                  ├──Mongo──▶ mongo:9.0.8, 1-member rs0 (mongodb, mongodb-elasticsearch)
 #        │                  └──HTTP───▶ elasticsearch:8.15.0    (*-elasticsearch: serves every search)
 #        └──HTTP──▶ tgz bundle server container  (Synthea import corpus)
 #
@@ -312,6 +312,68 @@ jobs:
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
+
+      # The first block of the run's Summary page is this job's summary. The report's own artifact id
+      # exists only at the end of the Compare legs job, and a step summary cannot be edited later, so
+      # this job uploads a tiny redirect page as its own HTML artifact (its URL is known right now).
+      # Opened in the browser, the page asks the public Actions API for the artifact
+      # fhir-bench-report-<run id>.html and jumps to it; while the run is still going it waits and
+      # retries; if the run ended without a report it says so. The summary heading links to that page.
+      - name: Write report redirect page
+        if: always()
+        continue-on-error: true
+        run: |
+          cat > "$RUNNER_TEMP/open-fhir-bench-report-$GITHUB_RUN_ID.html" <<'EOF'
+          <!doctype html><html lang="en"><head><meta charset="utf-8">
+          <meta name="color-scheme" content="dark light"><title>FHIR Benchmark report</title></head>
+          <body style="font:16px system-ui;margin:3rem">
+          <p id="m">Looking for the report...</p>
+          <p><a id="r">Open the run</a> | <a id="a">Run artifacts</a></p>
+          <script>
+          const repo="__REPO__",run="__RUN__",web="https://github.com/"+repo+"/actions/runs/"+run,
+                api="https://api.github.com/repos/"+repo+"/actions/runs/"+run,m=document.getElementById("m");
+          document.getElementById("r").href=web;document.getElementById("a").href=web+"#artifacts";
+          async function go(){
+            try{
+              const l=await fetch(api+"/artifacts?per_page=100&name=fhir-bench-report-"+run+".html");
+              if(!l.ok)throw new Error("HTTP "+l.status);
+              const f=((await l.json()).artifacts||[]).filter(x=>!x.expired).sort((x,y)=>y.id-x.id)[0];
+              if(f){location.replace(web+"/artifacts/"+f.id);return;}
+              const s=await fetch(api);if(!s.ok)throw new Error("HTTP "+s.status);
+              if((await s.json()).status==="completed"){m.textContent="This run finished without an HTML report (not built, or expired). The comparison tables are in the Compare legs summary of the run.";}
+              else{m.textContent="The run is still in progress; the report appears when it ends. Retrying every 2 minutes.";setTimeout(go,120000);}
+            }catch(e){m.textContent="Could not look up the report ("+e.message+"). Use the links below.";}
+          }
+          go();
+          </script></body></html>
+          EOF
+          sed -i "s|__REPO__|$GITHUB_REPOSITORY|; s|__RUN__|$GITHUB_RUN_ID|" "$RUNNER_TEMP/open-fhir-bench-report-$GITHUB_RUN_ID.html"
+
+      - name: Upload report redirect page
+        id: redirect
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: open-fhir-bench-report-${{ github.run_id }}
+          path: ${{ runner.temp }}/open-fhir-bench-report-${{ github.run_id }}.html
+          archive: false
+          overwrite: true
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Link to the full HTML report
+        if: always()
+        continue-on-error: true
+        env:
+          REDIRECT_URL: ${{ steps.redirect.outputs.artifact-url }}
+        run: |
+          URL="${REDIRECT_URL:-$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID#artifacts}"
+          {
+            printf '# [Open the full HTML report](%s)\n\n' "$URL"
+            printf '_Opens the report directly once the run has finished; before that the page waits and retries. Sign-in to GitHub required._\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Full HTML report (when the run ends)::$URL"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Compile one release `hfs` binary with all four backends (sqlite, postgres,
@@ -2267,11 +2329,13 @@ jobs:
     needs: [setup, benchmark]
     if: ${{ always() && needs.benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
-    # 20, was 10: the steps added after the summary (unzip the leg results,
-    # history, the HTML report) can take a few minutes on top of the original
-    # summary + uploads. All of them are continue-on-error with their own
-    # timeouts, so this is headroom, not a new way to fail the run.
-    timeout-minutes: 20
+    # 30, was 20 (10 before that): the steps after the comparison (unzip the leg
+    # results, history, the HTML report) can take a few minutes on top of the
+    # original uploads, and the job summary is now written by the LAST step
+    # (report link first), so a job that ran out of time would lose it entirely.
+    # All of them are continue-on-error with their own timeouts, so this is
+    # headroom, not a new way to fail the run.
+    timeout-minutes: 30
     continue-on-error: true
     permissions:
       contents: read
@@ -2347,10 +2411,9 @@ jobs:
             echo "::warning::compare_legs.py missing (checkout failed); no comparison written"
             printf '## FHIR Benchmark — leg comparison\n\n_Not available: the comparison script could not be checked out._\n' > comparison.md
           fi
-          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
-          # Collapsed "### Charts" section, appended right after the tables.
-          # Display only: never fails the step.
-          python3 .github/scripts/fhir-bench/md_charts.py compare --in comparison.md --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
+          # comparison.md is NOT appended to the job summary here any more: the
+          # last step ("Append report link, comparison and history") does it, so
+          # the link to the full HTML report is the first thing in the summary.
 
       # Raw Markdown for pasting into an issue or PR (the summary page only
       # offers rendered tables). Named fhir-bench-*, NOT fhir-benchmark-*, so a
@@ -2362,14 +2425,14 @@ jobs:
         with:
           name: fhir-bench-comparison-${{ github.run_id }}
           path: comparison.md
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
       # Trend over the last runs of this branch. Display only: it can never
       # fail the run (continue-on-error, a 5 minute timeout, and the summary append is guarded).
       # It runs after "Upload comparison" so a slow `gh` call can never cost the run its artifact.
-      # history.md is NOT appended here any more: the last step does it, so the
-      # report link lands after it. --data-dir receives the report-data.json of
+      # history.md is NOT appended here: the last step does it, after the report
+      # link and the comparison. --data-dir receives the report-data.json of
       # earlier runs (artifact fhir-bench-report-data-<run id>) for the HTML trend.
       # On a release tag (vX.Y.Z, the run ci.yml's benchmark-release job starts),
       # --version-dir also receives that of the newest run of each of the
@@ -2403,6 +2466,18 @@ jobs:
           # report_html.py finds comparison.md inside --run-dir (or its parent).
           cp comparison.md report-input/ 2>/dev/null || true
 
+      # Compare branches in the HTML trend: report-data.json of the newest runs (at most 10 each) of every
+      # other branch that already ran this workflow and still has that artifact; release tags and this
+      # branch are excluded. Reads existing artifacts only, never re-runs anything; best effort.
+      - name: Fetch other branches report data
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/fhir-bench/branch_data.py --repo "$GITHUB_REPOSITORY" --workflow fhir-benchmark.yml --exclude-run-id "$GITHUB_RUN_ID" --current-branch "$GITHUB_REF_NAME" --out-dir "$RUNNER_TEMP/branches" --per-branch 10 --max-branches 8 --time-budget 240
+
       - name: Build HTML report
         if: always()
         continue-on-error: true
@@ -2424,6 +2499,7 @@ jobs:
             --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
+            --branch-trend-dir "$RUNNER_TEMP/branches" \
             --trend-max $(( ${HISTORY_RUNS_N:-10} + 1 )) \
             --version-dir "$RUNNER_TEMP/versions" \
             --version-max 10 \
@@ -2440,7 +2516,7 @@ jobs:
           name: fhir-bench-report-${{ github.run_id }}
           path: fhir-bench-report-${{ github.run_id }}.html
           archive: false
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
       # The data the next runs read through history.py --data-dir.
@@ -2453,18 +2529,37 @@ jobs:
           path: |
             report-data.json
             run-timing.json
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: ignore
 
-      # LAST on purpose: history table, then the link to the full report.
+      # The whole job summary is written HERE, link first: the summary is
+      # append-only and the artifact URL exists only after "Upload HTML report",
+      # so this step runs last but writes the link at the top, then the
+      # comparison tables and charts, then the history.
       # The artifact link works for signed-in viewers of the repository only.
-      - name: Append history and report link
+      # The notice annotation shows the same link at the top of the run's
+      # Summary page, above the per-leg job summaries.
+      - name: Append report link, comparison and history
         if: always()
         continue-on-error: true
         env:
           REPORT_URL: ${{ steps.report.outputs.artifact-url }}
         run: |
-          if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi
+          # REPORT_URL is set only when "Upload HTML report" really uploaded the
+          # report (no file, no URL). So the big link below appears only when
+          # there is a report to open; otherwise a plain note says it is missing.
           if [ -n "$REPORT_URL" ]; then
-            printf '\n[Full report (HTML)](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"
+            {
+              printf '# [Open the full HTML report](%s)\n\n' "$REPORT_URL"
+              printf '_Trends over the last runs, every suite and leg, branch comparison and the timeline, in one page._\n\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Full HTML report::$REPORT_URL"
+          else
+            printf '> The full HTML report is not available for this run (it could not be built or uploaded); the tables below are complete. See the step "Build HTML report" in the Compare legs job.\n\n' >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Full HTML report::not available for this run (build or upload failed)"
           fi
+          if [ -f comparison.md ]; then cat comparison.md >> "$GITHUB_STEP_SUMMARY"; fi
+          # Collapsed "### Charts" section, appended right after the tables.
+          # Display only: never fails the step.
+          python3 .github/scripts/fhir-bench/md_charts.py compare --in comparison.md --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
+          if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi

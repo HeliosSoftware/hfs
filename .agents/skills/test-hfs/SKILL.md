@@ -53,7 +53,7 @@ cargo test -- --nocapture
 
 ### MongoDB on a RAM-backed mongod
 
-`mongodb_tests` starts its own `mongo:7.0` single-node replica set unless
+`mongodb_tests` starts its own `mongo:9.0.8` single-node replica set unless
 `HFS_TEST_MONGODB_URL` is set; then it connects to that URL instead. On a
 host with slow disk syncs, putting `/data/db` on tmpfs cuts the run sharply
 (one VPS: 2927 s against a disk-backed mongod, about 1740 s against tmpfs).
@@ -63,7 +63,7 @@ Start it with the harness container's own flags (the `with_cmd` list in
 ```bash
 MSYS_NO_PATHCONV=1 docker run -d --name mongodb-tests-tmpfs \
     -p 127.0.0.1:27019:27017 --tmpfs /data/db --ulimit nofile=64000:64000 \
-    mongo:7.0 mongod --bind_ip_all --wiredTigerCacheSizeGB 0.25 \
+    -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 mongod --bind_ip_all --wiredTigerCacheSizeGB 0.25 \
     --setParameter enableTestCommands=1 --replSet rs0 --oplogSize 128 \
     --setParameter minSnapshotHistoryWindowInSeconds=5
 for _ in $(seq 60); do
@@ -211,7 +211,7 @@ rate and two runs compare. It also prints documents-per-resource per collection,
 which is the write-volume half of a MongoDB ingest number:
 
 ```bash
-docker run -d --name bench-mongo -p 27018:27018 mongo:7.0 \
+docker run -d --name bench-mongo -p 27018:27018 -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 \
     --port 27018 --replSet rs --bind_ip_all
 docker exec bench-mongo mongosh --port 27018 --quiet \
     --eval 'rs.initiate({_id:"rs",members:[{_id:0,host:"localhost:27018"}]})'

@@ -367,6 +367,13 @@ const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 /// `Transient` instead of `TooLargeForCache`.
 const CACHE_OVERFLOW_ROLLBACK_REASON: &str = "rolled back because of cache overflow";
 
+/// MongoDB 9.0 words the same rollback differently: "Rollback ocurred while
+/// performing initial write to '<ns>'. Reason: 'Cache capacity has overflown'"
+/// (a labelled 112, seen on a lone deferred Bundle's ledger write on 9.0.8,
+/// #2605). Unmatched, the Bundle was replayed three times and ended `Transient`
+/// instead of `TooLargeForCache`, as on 7.0 before #1975.
+const CACHE_CAPACITY_OVERFLOW_REASON: &str = "Cache capacity has overflown";
+
 /// The part of mongod's `WriteConflict` message for a transaction whose
 /// snapshot predates a catalog change on the collection it writes, such as an
 /// index build starting or committing ("Unable to write to collection ... due
@@ -994,6 +1001,7 @@ fn is_eviction_rollback(err: &MongoError) -> bool {
         || server_error_message(err, WRITE_CONFLICT_CODE).is_some_and(|message| {
             message.contains(EVICTION_ROLLBACK_REASON)
                 || message.contains(CACHE_OVERFLOW_ROLLBACK_REASON)
+                || message.contains(CACHE_CAPACITY_OVERFLOW_REASON)
         })
 }
 
@@ -2919,11 +2927,13 @@ impl ResourceStorage for MongoBackend {
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
         let mut resource = resource;
-        let id = resource
-            .get("id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(crate::types::new_resource_id);
+        let supplied_id = resource.get("id").and_then(Value::as_str).map(String::from);
+        // Whether this call minted the id: a `POST`, whose id the REST layer
+        // strips. No other write can have stored anything under it, which is
+        // what lets an attempt in a transaction skip its existence check and
+        // its search-index delete ([`Self::create_attempt`]).
+        let id_assigned = supplied_id.is_none();
+        let id = supplied_id.unwrap_or_else(crate::types::new_resource_id);
         ensure_resource_identity(resource_type, &id, &mut resource);
         let refused_commit = RefusedCommitSession::default();
         let replayed = replay_aborted_writes("create", || async {
@@ -2933,6 +2943,7 @@ impl ResourceStorage for MongoBackend {
                     tenant,
                     resource_type,
                     &id,
+                    id_assigned,
                     &resource,
                     fhir_version,
                     &mut session,
@@ -4268,11 +4279,24 @@ impl MongoBackend {
     /// `session` receives the attempt's session (`None` without a
     /// transaction), so its caller can abort a failed attempt's transaction
     /// before anything runs next ([`abort_failed_write`], #2307).
+    ///
+    /// `id_assigned` says [`ResourceStorage::create`] minted `id` itself (a
+    /// fresh UUIDv7, never stored before). In a transaction such an attempt
+    /// skips the existence check and the search-index delete: no other write
+    /// can hold a document or a search row under an id nobody had, and an
+    /// earlier attempt of this write that did not commit left nothing behind.
+    /// The `resources` identity index still answers a duplicate as
+    /// `AlreadyExists`. A client-supplied id keeps both, since rows under it
+    /// may survive a write that ran without a transaction (a type-wide purge
+    /// removes `resources` before `search_index`), and so does every attempt
+    /// without a transaction, which can itself leave such rows.
+    #[allow(clippy::too_many_arguments)]
     async fn create_attempt(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
+        id_assigned: bool,
         resource: &Value,
         fhir_version: FhirVersion,
         session: &mut Option<ClientSession>,
@@ -4287,6 +4311,9 @@ impl MongoBackend {
             .await?;
         *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
+        // A server-minted id in a transaction: nothing is stored under it yet
+        // (see the doc comment above).
+        let fresh_insert = transaction_active && id_assigned;
 
         // Check if resource already exists (including deleted resources).
         let identity_filter = doc! {
@@ -4295,7 +4322,9 @@ impl MongoBackend {
             "id": id,
         };
 
-        let existing = if let Some(active_session) = session.as_mut() {
+        let existing = if fresh_insert {
+            None
+        } else if let Some(active_session) = session.as_mut() {
             resources
                 .find_one(identity_filter.clone())
                 .session(active_session)
@@ -4341,7 +4370,7 @@ impl MongoBackend {
         // write of the same id won, and a server-assigned id has no rival.
         if let Some(active_session) = session.as_mut() {
             resources
-                .insert_one(resource_doc.clone())
+                .insert_one(resource_doc)
                 .session(active_session)
                 .await
                 .map_err(|e| {
@@ -4401,9 +4430,17 @@ impl MongoBackend {
                 .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
-            .await
-            .map_err(in_search_index_step)?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            fresh_insert,
+            session,
+        )
+        .await
+        .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "create",
@@ -4624,9 +4661,17 @@ impl MongoBackend {
             })?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
-            .await
-            .map_err(in_search_index_step)?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            false,
+            session,
+        )
+        .await
+        .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "update",
@@ -5291,9 +5336,17 @@ impl MongoBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again (`index_resource` clears stale rows first).
-        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
-            .await
-            .map_err(in_search_index_step)?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            false,
+            session,
+        )
+        .await
+        .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "restore",
@@ -5478,6 +5531,10 @@ impl MongoBackend {
         )
     }
 
+    /// Replaces `resource_id`'s search rows with `docs`. `fresh_insert` skips
+    /// the delete of the old rows: only a create in a transaction of an id it
+    /// minted passes it ([`Self::create_attempt`]), where there are none.
+    #[allow(clippy::too_many_arguments)]
     async fn index_resource(
         &self,
         db: &mongodb::Database,
@@ -5485,14 +5542,17 @@ impl MongoBackend {
         resource_type: &str,
         resource_id: &str,
         docs: SearchIndexDocuments,
+        fresh_insert: bool,
         session: &mut Option<ClientSession>,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
         }
 
-        self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
-            .await?;
+        if !fresh_insert {
+            self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
+                .await?;
+        }
 
         if docs.is_empty() {
             return Ok(());
@@ -14019,6 +14079,9 @@ mod transient_abort_tests {
     /// the cache, as a lone deferred Bundle's ledger insert received it (#1975).
     const CACHE_OVERFLOW_112: &str = "Caused by :: Rollback ocurred while performing initial write to 'hfs.search_index_pending'. Reason: 'transaction rolled back because of cache overflow' :: Please retry your operation or multi-document transaction.";
 
+    /// MongoDB 9.0.8's wording of the same cache-overflow rollback (#2605).
+    const CACHE_CAPACITY_OVERFLOW_112: &str = "Caused by :: Rollback ocurred while performing initial write to 'hfs.search_index_pending'. Reason: 'Cache capacity has overflown' :: Please retry your operation or multi-document transaction.";
+
     /// A `WriteConflict` (112) the way a single write reports it: as a
     /// per-write error rather than a failed command.
     fn write_conflict_write_error(errmsg: &str) -> MongoError {
@@ -15537,6 +15600,12 @@ mod transient_abort_tests {
             write_conflict_write_error(EVICTION_112),
             command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CACHE_OVERFLOW_112),
             write_conflict_write_error(CACHE_OVERFLOW_112),
+            command_error_with_message(
+                WRITE_CONFLICT_CODE,
+                "WriteConflict",
+                CACHE_CAPACITY_OVERFLOW_112,
+            ),
+            write_conflict_write_error(CACHE_CAPACITY_OVERFLOW_112),
         ] {
             assert!(is_eviction_rollback(&driver), "{driver}");
         }
@@ -18027,3 +18096,10 @@ mod reference_document_tests {
         assert_eq!(doc.get_str("value_reference_target"), Ok("Patient/p1"));
     }
 }
+
+/// A create of a minted id in a transaction skips its existence check; the
+/// identity index still answers a duplicate as `AlreadyExists` (needs a replica
+/// set, skips without one).
+#[cfg(test)]
+#[path = "create_command_tests.rs"]
+mod create_command_tests;

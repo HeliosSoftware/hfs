@@ -61,7 +61,8 @@ docker rm -f "$MONGO_NAME" "$ES_NAME" >/dev/null 2>&1 || true
 # The replica-set member host must match the published port, or the driver
 # rediscovers the advertised host:port and every operation dies with
 # ReplicaSetNoPrimary.
-docker run -d --name "$MONGO_NAME" -p "$MONGO_PORT:$MONGO_PORT" mongo:7.0 \
+docker run -d --name "$MONGO_NAME" -p "$MONGO_PORT:$MONGO_PORT" \
+  -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 \
   --port "$MONGO_PORT" --replSet rscheck --bind_ip_all >/dev/null
 docker run -d --name "$ES_NAME" -p "$ES_PORT:9200" \
   -e discovery.type=single-node -e xpack.security.enabled=false \

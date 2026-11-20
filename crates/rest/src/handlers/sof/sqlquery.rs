@@ -213,6 +213,7 @@ where
         max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
+        bound_materialization: true,
     };
     let materialized = std::sync::atomic::AtomicUsize::new(0);
     let executed = super::graph::execute_plan_counting(

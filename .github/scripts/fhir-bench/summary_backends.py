@@ -265,7 +265,8 @@ if backend.endswith("-elasticsearch"):
               "the drain gate reported status=incomplete with 194,664 resources never indexed).")
 if backend.startswith("mongodb"):
     pg_shared_buffers = os.environ.get("IN_PG_SHARED_BUFFERS") or "2GB"
-    print(f"\n**How to read this leg.** MongoDB 7.0 single-member replica set (directConnection); "
+    print(f"\n**How to read this leg.** MongoDB 9.0 single-member replica set (directConnection; "
+          "image and allocator state in the MongoDB tuning table); "
           f"WiredTiger cache **{ri.get('mongo_wt_cache_gb', '?')} GB** (Postgres: shared_buffers "
           f"{pg_shared_buffers}; both also use the host page cache). Each FHIR "
           "transaction bundle is one multi-document transaction (lifetime "

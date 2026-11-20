@@ -228,9 +228,10 @@ class Compare(unittest.TestCase):
 
     def test_known_legs_keep_prototype_colours_for_short_labels(self):
         c = mc.leg_colours(["postgres+ES", "sqlite", "mongodb-elasticsearch"])
-        self.assertEqual(c["postgres+ES"], "#4a91f8")
-        self.assertEqual(c["sqlite"], "#008622")
-        self.assertEqual(c["mongodb-elasticsearch"], "#b96dd8")
+        self.assertEqual(c["postgres+ES"], "#81600e")
+        self.assertEqual(c["sqlite"], "#76a062")
+        self.assertEqual(c["mongodb-elasticsearch"], "#317368")
+        self.assertFalse(set(mc.EXTRA) & set(mc.LEG_COLOURS.values()))
 
     def test_prefix_invariant(self):
         for text in (ONE_LEG, many(SIX), many(SIX[:2]), ONE_LEG.rstrip("\n")):
@@ -276,7 +277,7 @@ class Leg(unittest.TestCase):
         self.assertIn("postgres: Import throughput (resources/s)", out)
         self.assertIn("postgres: latency per suite (ms)", out)
         self.assertIn("bar [2175, 1425, 2186]", out)
-        self.assertIn('"plotColorPalette": "#236bcf"', out)
+        self.assertIn('"plotColorPalette": "#2b97ee"', out)
         self.assertIn("section Suites", out)
         self.assertIn("2000-01-02 00:03:00", out)  # crossed midnight UTC
 

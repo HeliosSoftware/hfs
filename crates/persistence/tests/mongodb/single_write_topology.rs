@@ -1820,7 +1820,8 @@ async fn a_transaction_bundle_topology_check_that_is_refused_is_rolled_back() {
 async fn single_resource_writes_still_work_on_a_standalone_server() {
     let started = super::container_cleanup::with_cleanup_label(
         Mongo::default()
-            .with_tag("7.0")
+            .with_tag("9.0.8")
+            .with_env_var("MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES", "10485760")
             .with_cmd([
                 "mongod",
                 "--bind_ip_all",
