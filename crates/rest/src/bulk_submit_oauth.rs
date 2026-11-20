@@ -20,6 +20,39 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+/// Bounds on the metadata GET and the token POST, so a provider that accepts
+/// the connection and never answers cannot hold a submit worker slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    /// Establishing the connection.
+    pub connect: Duration,
+    /// Idle time allowed between two reads of a response.
+    pub read: Duration,
+    /// The whole request, start to finish.
+    pub total: Duration,
+}
+
+impl Default for ClientTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(30),
+            total: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Longest lifetime honoured for a provider-issued token, whatever its
+/// `expires_in` says: the value is the provider's to choose, so it bounds
+/// the cache entry, never the arithmetic.
+const MAX_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a token is served from the cache: `expires_in` less a 30 s
+/// refresh margin, at least 1 s, at most [`MAX_TOKEN_TTL`].
+fn token_ttl(expires_in: u64) -> Duration {
+    Duration::from_secs(expires_in.saturating_sub(30).max(1)).min(MAX_TOKEN_TTL)
+}
+
 /// Acquires read-scoped bearer tokens via SMART Backend Services `client_credentials`.
 pub struct JwtClientCredentialsTokenProvider {
     client: reqwest::Client,
@@ -34,8 +67,24 @@ pub struct JwtClientCredentialsTokenProvider {
 
 impl JwtClientCredentialsTokenProvider {
     /// Builds a provider from a `client_id`, a PEM private key, and a signing alg
-    /// (`ES384` or `RS384`). Returns `None` if the key can't be parsed.
+    /// (`ES384` or `RS384`), with the default [`ClientTimeouts`]. Returns `None`
+    /// if the key can't be parsed.
     pub fn new(client_id: &str, private_key_pem: &str, signing_alg: &str) -> Option<Arc<Self>> {
+        Self::new_with_timeouts(
+            client_id,
+            private_key_pem,
+            signing_alg,
+            ClientTimeouts::default(),
+        )
+    }
+
+    /// [`Self::new`] with explicit bounds on the metadata and token requests.
+    pub fn new_with_timeouts(
+        client_id: &str,
+        private_key_pem: &str,
+        signing_alg: &str,
+        timeouts: ClientTimeouts,
+    ) -> Option<Arc<Self>> {
         let (alg, key) = match signing_alg {
             "ES384" => (
                 Algorithm::ES384,
@@ -49,8 +98,15 @@ impl JwtClientCredentialsTokenProvider {
         };
         let kid = derive_public_jwk(private_key_pem, signing_alg)
             .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
+        // `Client::new()` panics the same way when the TLS backend cannot start.
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read)
+            .timeout(timeouts.total)
+            .build()
+            .expect("bulk-submit OAuth HTTP client configuration is valid");
         Some(Arc::new(Self {
-            client: reqwest::Client::new(),
+            client,
             client_id: client_id.to_string(),
             signing_alg: alg,
             encoding_key: key,
@@ -118,9 +174,11 @@ impl JwtClientCredentialsTokenProvider {
             .get("expires_in")
             .and_then(|v| v.as_u64())
             .unwrap_or(300);
-        // Refresh ~30s before expiry.
-        let ttl = expires_in.saturating_sub(30).max(1);
-        Some((token, Instant::now() + Duration::from_secs(ttl)))
+        // Refresh ~30s before expiry. `expires_in` is the provider's number:
+        // bounded, and added with checked arithmetic, so no value it sends
+        // can fault the worker.
+        let expiry = Instant::now().checked_add(token_ttl(expires_in))?;
+        Some((token, expiry))
     }
 }
 
@@ -214,6 +272,18 @@ MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDDL2uAdbDMvTFQ/r+Tz\n\
 k5K6g75uWMf/NsVu7ay2lO8vuu9EC12UBjDQ+297+9I7+IlSzRmoWKUT0fVrOeoB\n\
 gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
 -----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn token_ttl_keeps_the_refresh_margin_within_bounds() {
+        assert_eq!(token_ttl(300), Duration::from_secs(270));
+        assert_eq!(token_ttl(31), Duration::from_secs(1));
+        assert_eq!(token_ttl(30), Duration::from_secs(1));
+        assert_eq!(token_ttl(0), Duration::from_secs(1));
+        assert_eq!(token_ttl(7 * 24 * 60 * 60), MAX_TOKEN_TTL);
+        assert_eq!(token_ttl(u64::MAX), MAX_TOKEN_TTL);
+        // What the overflow was: adding the bounded value never panics.
+        let _ = Instant::now() + token_ttl(u64::MAX);
+    }
 
     #[test]
     fn test_new_rejects_unsupported_alg() {
