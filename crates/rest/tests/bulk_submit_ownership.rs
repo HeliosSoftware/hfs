@@ -29,6 +29,8 @@ const PROVIDER_A: &str = "provider-a-token";
 const PROVIDER_B: &str = "provider-b-token";
 /// `system/*.cruds`: the operator.
 const WILDCARD: &str = "wildcard-token";
+/// `system/*.c`: a create-only wildcard, without the `d` that stopping takes.
+const CREATE_WILDCARD: &str = "create-wildcard-token";
 
 struct StubProvider;
 
@@ -41,6 +43,7 @@ impl AuthProvider for StubProvider {
         let scopes = match token {
             PROVIDER_A | PROVIDER_B => "system/bulk-submit",
             WILDCARD => "system/*.cruds",
+            CREATE_WILDCARD => "system/*.c",
             _ => return Err(AuthError::InvalidSignature),
         };
         Ok(Principal {
@@ -274,4 +277,42 @@ async fn a_system_wildcard_may_act_on_any_submission() {
     );
     let stopped = kickoff(&server, WILDCARD, &status_only("stopped")).await;
     assert_eq!(stopped.status_code(), StatusCode::OK, "{}", stopped.text());
+}
+
+#[tokio::test]
+async fn a_wildcard_needs_the_delete_bit_to_stop_a_submission_it_does_not_own() {
+    let (server, _tmp) = server();
+
+    let created = kickoff(
+        &server,
+        PROVIDER_A,
+        &manifest_kickoff("https://provider/manifest-a.json"),
+    )
+    .await;
+    assert_eq!(created.status_code(), StatusCode::OK, "{}", created.text());
+
+    // Stopping is the cancel handler's abort, which asks for `d`.
+    let stopped = kickoff(&server, CREATE_WILDCARD, &status_only("stopped")).await;
+    assert_eq!(
+        stopped.status_code(),
+        StatusCode::NOT_FOUND,
+        "{}",
+        stopped.text()
+    );
+    // Looking takes `r`.
+    let status = status_kickoff(&server, CREATE_WILDCARD).await;
+    assert_eq!(
+        status.status_code(),
+        StatusCode::NOT_FOUND,
+        "{}",
+        status.text()
+    );
+    // Continuing takes `c`, which the operation itself asks for.
+    let completed = kickoff(&server, CREATE_WILDCARD, &status_only("completed")).await;
+    assert_eq!(
+        completed.status_code(),
+        StatusCode::OK,
+        "{}",
+        completed.text()
+    );
 }

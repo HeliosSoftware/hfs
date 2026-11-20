@@ -170,14 +170,7 @@ impl PatientCompartment {
             return Ok(());
         };
         if query.resource_type == "Patient" {
-            // A second `_id` parameter is ANDed with any the client sent, so
-            // `GET /Patient?_id=<other>` matches nothing rather than leaking.
-            query.parameters.push(SearchParameter {
-                name: "_id".to_string(),
-                param_type: SearchParamType::Token,
-                values: vec![SearchValue::new(SearchPrefix::Eq, patient_id)],
-                ..Default::default()
-            });
+            pin_to_patient(query, patient_id);
             return Ok(());
         }
         let params = helios_fhir::get_compartment_params(version, "Patient", &query.resource_type);
@@ -199,6 +192,40 @@ impl PatientCompartment {
             params: params.iter().map(|s| s.to_string()).collect(),
             reference: format!("Patient/{patient_id}"),
         });
+        Ok(())
+    }
+
+    /// Confines a compartment search, `GET /{compartment}/{id}/{type}` or
+    /// `/{compartment}/{id}/*`, whose `query` already carries the path's
+    /// compartment filter.
+    ///
+    /// The middleware admits only the launch patient's own compartment
+    /// (`patient_compartment_path_check`); a confined request naming any other
+    /// compartment is refused here too, rather than trusted. The path's
+    /// filter confines every member type but one: the Patient compartment
+    /// lists Patient through `link`, so `GET /Patient/{launch}/Patient` would
+    /// match the *other* patients whose `link` names the launch patient. A
+    /// Patient query is pinned to the launch patient's id, as a type-level
+    /// Patient search is ([`Self::confine_query`]).
+    ///
+    /// Does nothing when the request is not confined.
+    pub fn confine_compartment_query(
+        &self,
+        compartment_type: &str,
+        compartment_id: &str,
+        query: &mut SearchQuery,
+    ) -> RestResult<()> {
+        let Some(patient_id) = self.patient_id() else {
+            return Ok(());
+        };
+        if compartment_type != "Patient" || compartment_id != patient_id {
+            return Err(self.outside_compartment(
+                "search in another compartment is not permitted under a patient/ scope".to_string(),
+            ));
+        }
+        if query.resource_type == "Patient" {
+            pin_to_patient(query, patient_id);
+        }
         Ok(())
     }
 
@@ -226,6 +253,18 @@ impl PatientCompartment {
     pub fn outside_compartment(&self, message: String) -> RestError {
         RestError::Forbidden { message }
     }
+}
+
+/// Pins a Patient query to one patient's id. The extra `_id` parameter is
+/// ANDed with any the client sent, so `_id=<other>` matches nothing rather
+/// than leaking.
+fn pin_to_patient(query: &mut SearchQuery, patient_id: &str) {
+    query.parameters.push(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::new(SearchPrefix::Eq, patient_id)],
+        ..Default::default()
+    });
 }
 
 impl<S> FromRequestParts<S> for PatientCompartment
@@ -391,5 +430,38 @@ mod tests {
             reference: "Encounter/e1".into(),
         });
         assert!(scope.confine_query(FhirVersion::R4, &mut other).is_err());
+    }
+    #[test]
+    fn a_compartment_search_pins_patient_and_refuses_other_compartments() {
+        let scope = PatientCompartment::confined_to("p1");
+        let mut patients = SearchQuery::new("Patient");
+        scope
+            .confine_compartment_query("Patient", "p1", &mut patients)
+            .unwrap();
+        assert_eq!(patients.parameters.len(), 1);
+        assert_eq!(patients.parameters[0].name, "_id");
+        assert_eq!(patients.parameters[0].values[0].value, "p1");
+
+        let mut observations = SearchQuery::new("Observation");
+        scope
+            .confine_compartment_query("Patient", "p1", &mut observations)
+            .unwrap();
+        assert!(observations.parameters.is_empty());
+
+        for (compartment_type, id) in [("Patient", "p2"), ("Encounter", "p1")] {
+            let err = scope
+                .confine_compartment_query(compartment_type, id, &mut SearchQuery::new("Patient"))
+                .unwrap_err();
+            assert!(
+                matches!(err, RestError::Forbidden { .. }),
+                "{compartment_type}/{id}"
+            );
+        }
+
+        let mut unconfined = SearchQuery::new("Patient");
+        PatientCompartment::unconfined()
+            .confine_compartment_query("Encounter", "e1", &mut unconfined)
+            .unwrap();
+        assert!(unconfined.parameters.is_empty());
     }
 }

@@ -64,6 +64,13 @@ Create app role**:
 Use any SMART v2 scope as the value, for example `system/Patient.rs`.
 App Role values accept `/` and `*`.
 
+The cross-tenant admin API (`/admin/tenants`, `/console/metrics/tenants`,
+`/console/metrics/traffic`) needs a `system/*` scope carrying the bit the
+request's method implies: `r` to list tenants or read the metrics, `c` to
+register a tenant, and `d` to deregister or purge one. The read-only role
+can therefore **look but not change** tenants; the full-access role can do
+both. `user/` and `patient/` scopes are refused there with `403`.
+
 > **Use App Roles, not delegated scopes.** Entra ID does not allow `/` in the
 > name of a scope under *Expose an API*, so a SMART scope cannot be a
 > delegated permission. Grant SMART scopes to people as App Roles too.

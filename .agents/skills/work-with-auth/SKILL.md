@@ -14,7 +14,7 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 - Enforces SMART v2 scopes (e.g. `system/Patient.rs`) via `SmartScopePolicy` / `ScopeSet` / `SmartPermissions`.
 - Derives the tenant from a JWT claim (`HFS_AUTH_TENANT_CLAIM`, default `tenant_id`).
 - Parses the SMART launch context (`patient`/`encounter`/`fhirUser`; claim names via `HFS_AUTH_PATIENT_CLAIM` / `HFS_AUTH_ENCOUNTER_CLAIM` / `HFS_AUTH_FHIR_USER_CLAIM`) onto `Principal::launch_context`. Type-level `Patient/$everything` narrows to the `patient` context.
-- Confines a `patient/` scope to the launch patient's compartment (#1618): `SmartScopePolicy::check` returns `AccessScope::PatientCompartment` for a grant that rests on a `patient/` scope (`403` when the token has no usable `patient` claim — never widened to `user/`); `authz_middleware` stores it in the request extensions and refuses paths that cannot be confined (history, conditional writes, other compartments, most `$`-operations); handlers read it through `helios_rest::patient_compartment::PatientCompartment` to filter searches (compartment filter, Patient pinned by `_id`, includes dropped) and to judge instance payloads with `PatientCompartmentMatcher`. `Patient/$export` is pinned to the launch patient; bundles confine `GET` entries and refuse writes. See the auth README "Patient scopes".
+- Confines a `patient/` scope to the launch patient's compartment (#1618): `SmartScopePolicy::check` returns `AccessScope::PatientCompartment` for a grant that rests on a `patient/` scope (`403` when the token has no usable `patient` claim — never widened to `user/`); `authz_middleware` stores it in the request extensions and refuses paths that cannot be confined (history, conditional writes, other compartments, most `$`-operations); handlers read it through `helios_rest::patient_compartment::PatientCompartment` to filter searches (compartment filter, Patient pinned by `_id` also on `/Patient/{launch}/Patient` and `/*`, includes dropped) and to judge instance payloads with `PatientCompartmentMatcher`. `Patient/$export` is pinned to the launch patient; bundles confine `GET` entries and refuse writes. Every hop of a chained or `_has` search is judged like a direct search on its type (`helios_rest::chain_access::ChainAccess`, a `ChainHopGuard` passed in `ChainResolveOptions`, #2501): no Search scope is `403`, a `patient/`-only grant is confined. See the auth README "Patient scopes".
 - Serves `/.well-known/smart-configuration` (SMART discovery), populated from the `HFS_SMART_*` endpoints.
 - Holds no cross-instance state: validation is local, so instances behind a load balancer need no shared infrastructure.
 
@@ -64,14 +64,16 @@ what gets checked. `crates/auth/tests/bearer_token_reuse.rs` pins this behavior.
 ## Named operation scopes
 
 Some operations are gated on a named scope of their own rather than on resource
-permissions, via `ScopeSet::grants_operation(name)` — which matches a literal
-`system/{name}` **or** any `system/*.<perm>` wildcard:
+permissions, via `ScopeSet::grants_operation(name, wildcard_permission)` — which
+matches a literal `system/{name}` **or** a `system/*.<perm>` wildcard whose
+bits include the one the operation implies (a read-only `system/*.rs` grants
+none of them):
 
-| Scope | Grants |
-|---|---|
-| `system/bulk-submit` | `$bulk-submit` ingestion |
-| `system/purge` | `$purge` — permanent, irreversible deletion of a resource and its history |
-| `system/reindex` | `$reindex` — rebuilding a tenant's entire search index |
+| Scope | Wildcard bit | Grants |
+|---|---|---|
+| `system/bulk-submit` | `c` | `$bulk-submit` ingestion |
+| `system/purge` | `d` | `$purge` — permanent, irreversible deletion of a resource and its history |
+| `system/reindex` | `u` | `$reindex` — rebuilding a tenant's entire search index |
 
 These deliberately do **not** fall out of ordinary resource scopes: a token that
 may soft-delete a Patient (`system/Patient.d`) must not thereby be able to
