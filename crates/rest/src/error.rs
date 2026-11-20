@@ -1120,6 +1120,8 @@ impl From<SearchError> for RestError {
             | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
+            // A chain hop through a type the token may not search (#2501).
+            SearchError::ChainHopRefused { message } => RestError::Forbidden { message },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
                 message: format!("Search returned {} results, maximum is {}", count, max),
             },

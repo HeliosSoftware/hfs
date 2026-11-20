@@ -152,6 +152,7 @@ pub mod build_info;
 pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
+pub mod chain_access;
 pub mod config;
 mod dashboard;
 pub mod error;
