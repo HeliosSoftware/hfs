@@ -24,7 +24,7 @@
 //!   plain navigation `path`, `collection` unset or `false`, and a declared
 //!   `type` whose comparison semantics match the literal's: string literals
 //!   on string-family types (`string`, `code`, `id`, `uri`, …), numeric
-//!   literals on `integer`, `integer64`, `positiveInt`, `unsignedInt` and
+//!   literals of at most 15 significant digits on `integer`, `integer64`, `positiveInt`, `unsignedInt` and
 //!   `decimal`, boolean literals on `boolean`. Date, time and binary types are
 //!   never compared (a string literal against a FHIRPath date is not the text
 //!   comparison SQL makes), and a column without a declared `type` is never
@@ -222,7 +222,9 @@ fn literal_of(expr: &Expr) -> Option<Literal> {
     match expr {
         Expr::Value(SqlValue::SingleQuotedString(text)) => Some(Literal::Str(text.clone())),
         Expr::Value(SqlValue::Boolean(value)) => Some(Literal::Bool(*value)),
-        Expr::Value(SqlValue::Number(text, _)) if is_plain_number(text) => {
+        Expr::Value(SqlValue::Number(text, _))
+            if is_plain_number(text) && significant_digits(text) <= MAX_PUSHED_DIGITS =>
+        {
             Some(Literal::Num(text.clone()))
         }
         Expr::Nested(inner) => literal_of(inner),
@@ -230,7 +232,32 @@ fn literal_of(expr: &Expr) -> Option<Literal> {
     }
 }
 
-/// Digits with at most one point: what a FHIRPath number literal also is.
+/// The most significant digits a pushed numeric literal may have.
+///
+/// Two reasons, both about keeping every row the SQL would keep. A FHIRPath
+/// integer is an `i64` and a decimal a `rust_decimal`, so a longer literal
+/// (`99999999999999999999`) does not parse and the view fails instead of
+/// returning the rows. And the SQL engine compares numbers as `f64`, while a
+/// store may compare the pushed `where` exactly (PostgreSQL's `numeric`), so
+/// `= 5.0000000000000001` is `5` to the SQL but not to the store. Any decimal
+/// of at most 15 significant digits survives the round trip through `f64`.
+const MAX_PUSHED_DIGITS: usize = 15;
+
+/// The significant digits of a plain number: its digits without the point,
+/// leading zeros and a fraction's trailing zeros.
+fn significant_digits(text: &str) -> usize {
+    let text = if text.contains('.') {
+        text.trim_end_matches('0')
+    } else {
+        text
+    };
+    text.chars()
+        .filter(char::is_ascii_digit)
+        .skip_while(|c| *c == '0')
+        .count()
+}
+
+/// Digits with at most one point: the shape of a FHIRPath number literal.
 /// Exponents and other spellings are not pushed.
 fn is_plain_number(text: &str) -> bool {
     let mut points = 0;
@@ -452,6 +479,55 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A numeric literal past 15 significant digits is left to the SQL: past
+    /// `i64` it does not parse as FHIRPath (the view failed with a 500), and
+    /// past `f64` precision the store's exact comparison drops rows the SQL's
+    /// float comparison keeps (`= 5.0000000000000001` on PostgreSQL).
+    #[test]
+    fn a_numeric_literal_past_fifteen_significant_digits_is_not_pushed() {
+        let predicates = pushable_predicates(
+            "SELECT id FROM t WHERE a = 99999999999999999999 AND b = 9223372036854775808 \
+             AND c = 5.0000000000000001 AND d = 0.1000000000000000000001 \
+             AND e = 123456789012345 AND f = 0.000000000000000000001 AND g = 1.500000000000000000 \
+             AND h = 00000000000000000000042",
+            "t",
+        )
+        .expect("the short literals are pushable");
+        assert_eq!(
+            predicates,
+            vec![
+                eq("e", Literal::Num("123456789012345".into())),
+                eq("f", Literal::Num("0.000000000000000000001".into())),
+                eq("g", Literal::Num("1.500000000000000000".into())),
+                eq("h", Literal::Num("00000000000000000000042".into())),
+            ]
+        );
+
+        let columns: Vec<Value> = ["e", "f", "g", "h"]
+            .map(|name| json!({"name": name, "path": "valueQuantity.value", "type": "decimal"}))
+            .into();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation",
+            "select": [{"column": columns}]
+        });
+        let pushed = push_down_view_definition(&view, &predicates).expect("pushed");
+        for entry in pushed["where"].as_array().expect("where entries") {
+            let path = entry["path"].as_str().expect("a path");
+            helios_fhirpath::parse_expression(path)
+                .unwrap_or_else(|e| panic!("pushed `{path}` must parse as FHIRPath: {e}"));
+        }
+    }
+
+    #[test]
+    fn significant_digits_ignore_the_point_leading_zeros_and_fraction_trailing_zeros() {
+        assert_eq!(significant_digits("0"), 0);
+        assert_eq!(significant_digits("100"), 3);
+        assert_eq!(significant_digits("007"), 1);
+        assert_eq!(significant_digits("0.0010"), 1);
+        assert_eq!(significant_digits("12.340"), 4);
+        assert_eq!(significant_digits("5.0000000000000001"), 17);
     }
 
     #[test]
