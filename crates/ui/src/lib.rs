@@ -2085,10 +2085,14 @@ async fn scope_request_authorization(
     conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
-/// The UI routes whose handlers act on storage themselves — the tenant
-/// registry and the bulk-submit store — rather than through the FHIR API.
-/// The API-backed pages carry the browser's credential on their self-call and
-/// so already answer `401` without one; these would act with none.
+/// The UI routes that would act for an anonymous caller with the server's
+/// own authority: the tenant registry and the bulk-submit store, whose
+/// handlers act on storage themselves rather than through the FHIR API, and
+/// the bulk-export pages, whose self-calls fall back to the outbound service
+/// credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the browser brought none,
+/// so an anonymous visitor could kick off, poll and download a tenant export
+/// as that credential. The other API-backed pages carry the browser's
+/// credential on their self-call and so already answer `401` without one.
 fn acts_on_storage_directly(path: &str) -> bool {
     path == "/ui/tenants"
         || path.starts_with("/ui/tenants/")
@@ -2096,6 +2100,8 @@ fn acts_on_storage_directly(path: &str) -> bool {
         || path.starts_with("/ui/tenant/")
         || path == "/ui/bulk-import"
         || path.starts_with("/ui/bulk-import/")
+        || path == "/ui/bulk-export"
+        || path.starts_with("/ui/bulk-export/")
 }
 
 /// Middleware (#1619): in the bearer-only posture — authentication enabled,

@@ -50,7 +50,10 @@ async fn status(method: &str, uri: &str) -> (StatusCode, String) {
     (code, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-/// The routes whose handlers act on storage themselves (#1619).
+/// The routes that would act for an anonymous caller with the server's own
+/// authority: the ones whose handlers act on storage themselves (#1619) and
+/// the bulk-export pages, whose self-calls fall back to the outbound service
+/// credential.
 const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/ui/tenants"),
     ("GET", "/ui/tenants/rows"),
@@ -68,6 +71,18 @@ const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ui/bulk-import/some-id/abort"),
     ("POST", "/ui/bulk-import/some-id/complete"),
     ("POST", "/ui/bulk-import/some-id/edit"),
+    ("GET", "/ui/bulk-export"),
+    ("GET", "/ui/bulk-export/new"),
+    ("GET", "/ui/bulk-export/active"),
+    ("GET", "/ui/bulk-export/active/some-id"),
+    ("GET", "/ui/bulk-export/active/some-id/detail"),
+    ("GET", "/ui/bulk-export/active/some-id/card"),
+    ("GET", "/ui/bulk-export/active/some-id/download"),
+    ("POST", "/ui/bulk-export"),
+    ("POST", "/ui/bulk-export/active/some-id/cancel"),
+    ("POST", "/ui/bulk-export/active/some-id/retry"),
+    ("POST", "/ui/bulk-export/active/some-id/rerun"),
+    ("POST", "/ui/bulk-export/active/some-id/delete"),
 ];
 
 async fn html(uri: &str) -> String {
