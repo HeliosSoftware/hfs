@@ -8,10 +8,12 @@ use serde_json::{Value, json};
 
 use common::everything::*;
 
-/// A SMART app token: patient-context scopes plus the given launch context. The scopes are
-/// inert in these tests: `server_with_principal` injects the `Principal` after
-/// authentication, so `authz_middleware` never evaluates them, and narrowing does not
-/// depend on the scope type.
+/// A SMART app token: patient-context scopes plus the given launch context.
+/// `server_with_principal` injects the `Principal` after authentication, so
+/// `authz_middleware` never evaluates the scopes; the walk still reads them
+/// per type, and `patient/*.rs` with a usable launch context grants every
+/// member type. Narrowing to the launch patient does not depend on the scope
+/// context.
 fn smart_principal(context: Option<LaunchContext>) -> Principal {
     Principal {
         subject: "smart-app".to_string(),
@@ -402,7 +404,11 @@ async fn type_level_without_usable_launch_context_walks_every_patient() {
         smart_principal(patient_context("Group/g1")),
         smart_principal(patient_context("https://other.example/fhir/Patient/p1")),
     ];
-    for principal in principals {
+    for mut principal in principals {
+        // A `patient/` grant without a usable launch context never reaches the
+        // handler (the policy refuses it); the fallback to every patient is a
+        // `user/` or `system/` grant's, so that is the scope under test here.
+        principal.scopes = ScopeSet::parse("user/*.rs");
         let label = format!("{:?}", principal.launch_context);
         let server = server_with_principal(10_000, principal).await;
         seed(&server).await;
@@ -481,4 +487,183 @@ async fn type_level_cursor_does_not_cross_launch_context() {
             resp.text()
         );
     }
+}
+
+// ---- per-type scopes ------------------------------------------------------
+
+/// A `user/` token with the given scopes and no launch context: the walk is
+/// not narrowed to a patient, only to the types the scopes grant.
+fn scoped_principal(scopes: &str) -> Principal {
+    Principal {
+        subject: "scoped-client".to_string(),
+        issuer: "https://idp.example.com".to_string(),
+        scopes: ScopeSet::parse(scopes),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        ..Default::default()
+    }
+}
+
+/// `Type/id` of every resource entry, plus the diagnostics of every
+/// OperationOutcome entry.
+fn resources_and_notes(bundle: &Value) -> (Vec<String>, Vec<String>) {
+    let mut resources = Vec::new();
+    let mut notes = Vec::new();
+    for entry in bundle["entry"].as_array().into_iter().flatten() {
+        let resource = &entry["resource"];
+        if resource["resourceType"] == "OperationOutcome" {
+            for issue in resource["issue"].as_array().into_iter().flatten() {
+                notes.push(issue["diagnostics"].as_str().unwrap_or("").to_string());
+            }
+        } else if let (Some(rt), Some(id)) =
+            (resource["resourceType"].as_str(), resource["id"].as_str())
+        {
+            resources.push(format!("{rt}/{id}"));
+        }
+    }
+    (resources, notes)
+}
+
+#[tokio::test]
+async fn per_type_scopes_narrow_members_and_supporting_resources() {
+    let server = server_with_principal(
+        10_000,
+        scoped_principal("user/Patient.rs user/Observation.rs user/Practitioner.r"),
+    )
+    .await;
+    seed(&server).await;
+
+    for path in ["/Patient/p1/$everything", "/Patient/$everything"] {
+        let response = server.get(path).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{path}: {}",
+            response.text()
+        );
+        let (mut resources, notes) = resources_and_notes(&response.json());
+        resources.sort();
+        let mut expected = vec![
+            "Observation/o1",
+            "Observation/o2",
+            "Observation/o3",
+            "Patient/p1",
+            "Practitioner/dr1",
+        ];
+        if path == "/Patient/$everything" {
+            expected.extend(["Observation/other", "Patient/p2"]);
+        }
+        expected.sort();
+        assert_eq!(resources, expected, "{path}");
+        // One note names what was left out: the member types the token
+        // cannot search and the supporting type it cannot read.
+        assert_eq!(notes.len(), 1, "{path}: {notes:?}");
+        for omitted in ["Condition", "Encounter", "Organization"] {
+            assert!(notes[0].contains(omitted), "{path}: {}", notes[0]);
+        }
+        assert!(!notes[0].contains("Observation"), "{path}: {}", notes[0]);
+        assert!(!notes[0].contains("Practitioner"), "{path}: {}", notes[0]);
+    }
+}
+
+#[tokio::test]
+async fn a_patient_only_read_scope_gets_the_patient_alone() {
+    let server = server_with_principal(10_000, scoped_principal("user/Patient.rs")).await;
+    seed(&server).await;
+    let response = server.get("/Patient/p1/$everything").await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let (resources, notes) = resources_and_notes(&response.json());
+    assert_eq!(resources, vec!["Patient/p1".to_string()]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("Observation"), "{}", notes[0]);
+    assert!(notes[0].contains("Organization"), "{}", notes[0]);
+}
+
+#[tokio::test]
+async fn an_explicit_type_the_scopes_do_not_grant_is_refused() {
+    let server = server_with_principal(
+        10_000,
+        scoped_principal("user/Patient.rs user/Observation.rs"),
+    )
+    .await;
+    seed(&server).await;
+
+    let refused = server
+        .get("/Patient/p1/$everything?_type=Observation,Condition")
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        refused.text()
+    );
+    assert!(refused.text().contains("Condition"), "{}", refused.text());
+
+    // The granted type alone is served, and only the unreadable supporting
+    // type is noted.
+    let granted = server
+        .get("/Patient/p1/$everything?_type=Observation")
+        .await;
+    assert_eq!(granted.status_code(), StatusCode::OK, "{}", granted.text());
+    let (mut resources, notes) = resources_and_notes(&granted.json());
+    resources.sort();
+    assert_eq!(
+        resources,
+        vec![
+            "Observation/o1",
+            "Observation/o2",
+            "Observation/o3",
+            "Patient/p1"
+        ]
+    );
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("Practitioner"), "{}", notes[0]);
+    assert!(!notes[0].contains("Condition"), "{}", notes[0]);
+}
+
+#[tokio::test]
+async fn a_wildcard_read_scope_is_not_narrowed() {
+    for scopes in ["system/*.rs", "user/*.rs"] {
+        let server = server_with_principal(10_000, scoped_principal(scopes)).await;
+        seed(&server).await;
+        let response = server.get("/Patient/p1/$everything").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{scopes}: {}",
+            response.text()
+        );
+        let (resources, notes) = resources_and_notes(&response.json());
+        assert_eq!(resources.len(), 9, "{scopes}: {resources:?}");
+        assert!(notes.is_empty(), "{scopes}: {notes:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_does_not_carry_across_different_grants() {
+    let wide = server_with_principal(10_000, scoped_principal("user/*.rs")).await;
+    seed(&wide).await;
+    let first = wide
+        .get("/Patient/p1/$everything?_count=2")
+        .await
+        .json::<Value>();
+    let next = next_link(&first).expect("a next link");
+
+    let narrow = server_with_principal(
+        10_000,
+        scoped_principal("user/Patient.rs user/Observation.rs"),
+    )
+    .await;
+    seed(&narrow).await;
+    let resumed = narrow.get(&path_of(&next)).await;
+    assert_eq!(
+        resumed.status_code(),
+        StatusCode::BAD_REQUEST,
+        "{}",
+        resumed.text()
+    );
 }
