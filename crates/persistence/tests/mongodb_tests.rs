@@ -776,6 +776,39 @@ async fn mongodb_missing_sort_values_sort_last() {
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
 }
 
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
+
+/// #2603: resources sharing one `last_updated` page forward and back with no
+/// gap or repeat, in the default, ascending and descending orders.
+#[tokio::test]
+async fn mongodb_tied_timestamps_page_without_gaps() {
+    let Some(backend) = create_backend_with_full_registry("tiebreak_2603").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let db = backend.get_database().await.unwrap();
+    tiebreak_order_suite::tied_timestamps_page_without_gaps(
+        &backend,
+        "tiebreak-2603",
+        async |tenant_id: &str, resource_type: &str| {
+            use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+            let at = BsonDateTime::from_millis(981_173_106_789);
+            let result = db
+                .collection::<Document>("resources")
+                .update_many(
+                    doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+                    doc! { "$set": { "last_updated": at } },
+                )
+                .await
+                .unwrap();
+            assert!(result.matched_count > 0, "no {resource_type} rows to pin");
+        },
+    )
+    .await;
+}
+
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
@@ -5829,6 +5862,78 @@ fn collect_index_names(doc: &Document, out: &mut Vec<String>) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// #2603: the ascending `_lastUpdated` order (`last_updated 1, id 1`) must be
+/// one `idx_resources_type_scan` serves directly, with and without a cursor
+/// predicate, so no page needs a blocking in-memory SORT stage.
+#[tokio::test]
+async fn mongodb_last_updated_ascending_page_uses_type_scan_without_sort() {
+    let Some(backend) = create_backend("last_updated_asc_plan").await else {
+        eprintln!(
+            "Skipping mongodb_last_updated_ascending_page_uses_type_scan_without_sort (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-last-updated-asc-plan");
+    create_cursor_paging_patients(&backend, &tenant, 9).await;
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+
+    let base = doc! {
+        "tenant_id": tenant.tenant_id().as_str(),
+        "resource_type": "Patient",
+        "is_deleted": false,
+    };
+    let mut with_cursor = base.clone();
+    with_cursor.insert(
+        "$or",
+        vec![
+            mongodb::bson::Bson::Document(
+                doc! { "last_updated": { "$gt": mongodb::bson::DateTime::from_millis(0) } },
+            ),
+            mongodb::bson::Bson::Document(
+                doc! { "last_updated": mongodb::bson::DateTime::from_millis(0), "id": { "$gt": "cp-1" } },
+            ),
+        ],
+    );
+
+    for (label, filter) in [("first page", base), ("cursor page", with_cursor)] {
+        for sort in [
+            doc! { "last_updated": 1_i32, "id": 1_i32 },
+            doc! { "last_updated": -1_i32, "id": -1_i32 },
+        ] {
+            let explain = database
+                .run_command(doc! {
+                    "explain": {
+                        "find": "resources",
+                        "filter": filter.clone(),
+                        "sort": sort.clone(),
+                        "limit": 21_i32,
+                    },
+                    "verbosity": "queryPlanner",
+                })
+                .await
+                .expect("explain failed");
+            let winning_plan = explain
+                .get_document("queryPlanner")
+                .and_then(|q| q.get_document("winningPlan"))
+                .expect("explain missing winningPlan");
+            assert!(
+                !contains_stage_named(winning_plan, "SORT"),
+                "{label} {sort:?}: winning plan has a blocking SORT: {winning_plan:?}"
+            );
+            let mut index_names = Vec::new();
+            collect_index_names(winning_plan, &mut index_names);
+            assert!(
+                index_names.iter().any(|n| n == "idx_resources_type_scan"),
+                "{label} {sort:?}: expected idx_resources_type_scan, got {index_names:?}"
+            );
         }
     }
 }
@@ -23953,9 +24058,9 @@ async fn mongodb_predicate_plans_preserve_dates_live_scope_and_cursor_pages() {
                     };
                     let expected_total = (total_mode != TotalMode::None).then_some(expected_count);
                     expected.sort();
-                    if sort != "_id" {
+                    if sort != "_id" && sort != "_lastUpdated" {
                         expected.reverse();
-                    } // Timestamp ties use descending ID.
+                    } // Timestamp ties follow the sort direction (ID ascending for `_lastUpdated`).
                     let mut request = query.clone();
                     let mut pages = Vec::new();
                     let mut previous = loop {

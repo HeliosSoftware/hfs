@@ -135,6 +135,10 @@ mod date_period_suite;
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
+
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
@@ -35515,6 +35519,40 @@ mod postgres_integration {
             &backend,
             &unique_base("sort_missing"),
             true,
+        )
+        .await;
+    }
+
+    /// #2603: resources sharing one `last_updated` page forward and back with
+    /// no gap or repeat, in the default, ascending and descending orders.
+    #[tokio::test]
+    async fn postgres_integration_tied_timestamps_page_without_gaps() {
+        let backend = create_backend().await;
+        let pin_backend = backend.clone();
+        super::tiebreak_order_suite::tied_timestamps_page_without_gaps(
+            &backend,
+            &unique_base("tiebreak"),
+            async |tenant_id: &str, resource_type: &str| {
+                let client = pin_backend.get_client().await.unwrap();
+                let at = tie_instant();
+                let changed = client
+                    .execute(
+                        "UPDATE resources SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+                assert!(changed > 0, "no {resource_type} rows to pin");
+                client
+                    .execute(
+                        "UPDATE search_index SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+            },
         )
         .await;
     }

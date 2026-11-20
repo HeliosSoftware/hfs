@@ -157,11 +157,12 @@ fn ids_of(result: &helios_persistence::core::SearchResult) -> Vec<String> {
 }
 
 /// The sort the documented orders mean, independent of the backend's own
-/// builder: the final directive is `id`, descending unless named.
+/// builder: the final directive is `id`, in the direction of the sort
+/// unless named.
 fn sort_document(sort: &str) -> Document {
     match sort {
         "" => doc! { "last_updated": -1, "id": -1 },
-        "_lastUpdated" => doc! { "last_updated": 1, "id": -1 },
+        "_lastUpdated" => doc! { "last_updated": 1, "id": 1 },
         "-_lastUpdated" => doc! { "last_updated": -1, "id": -1 },
         "_lastUpdated,_id" => doc! { "last_updated": 1, "id": 1 },
         "_id" => doc! { "id": 1 },
