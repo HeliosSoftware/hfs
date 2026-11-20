@@ -195,6 +195,9 @@ pub struct MongoBackend {
     /// Publishes the post-boot `search_index` build's outcome once, from the
     /// task `init_schema` spawns. `None` until that task finishes.
     search_index_rx: tokio::sync::watch::Receiver<Option<BuildOutcome>>,
+    /// Verified pre-generation-7 value indexes. Published independently of
+    /// the new date-end build so existing query plans remain available.
+    existing_search_indexes_ready: Arc<std::sync::atomic::AtomicBool>,
     /// The sending half, taken (leaving `None`) by `init_schema` the one time
     /// it runs; `wait_for_search_index_build` reads "already taken" as
     /// "`init_schema` has run". A `Mutex` only to make `take()` safe from
@@ -1447,6 +1450,7 @@ impl MongoBackend {
             registries,
             stored_by_tenant,
             search_index_rx,
+            existing_search_indexes_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
             missing_index_rx,
             missing_index_tx: Arc::new(tokio::sync::Mutex::new(Some(missing_index_tx))),
@@ -1776,7 +1780,16 @@ impl MongoBackend {
             }
             let builder =
                 SearchIndexBuilder::new(db.clone(), self.config.index_build, rows_at_boot)
-                    .with_references_flag(self.references_normalized_flag());
+                    .with_references_flag(self.references_normalized_flag())
+                    .with_existing_readiness_flag(Arc::clone(&self.existing_search_indexes_ready));
+            // An already-maintained database can use its verified existing
+            // indexes as soon as boot returns, before the new index builds.
+            if let Err(error) = builder.prime_existing_readiness().await {
+                tracing::warn!(
+                    %error,
+                    "could not verify existing search indexes at boot; keeping fallback plans"
+                );
+            }
             let handle = tokio::spawn(async move {
                 let outcome = builder.run().await;
                 let _ = tx.send(Some(outcome));
@@ -1826,10 +1839,18 @@ impl MongoBackend {
         Ok(())
     }
 
-    /// A query may hint value indexes only after the existing builder confirms
-    /// they are usable. Pending/disabled/failed builds keep automatic planning;
-    /// no extra listIndexes request is needed on the search path.
+    /// Existing value-index plans remain available after their specifications
+    /// are verified, even while the additive date-end index is unavailable.
+    /// No extra listIndexes request is needed on the search path.
     pub(super) fn search_indexes_ready(&self) -> bool {
+        self.existing_search_indexes_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.date_end_index_ready()
+    }
+
+    /// The new descending-date walk waits for the full current build. Keeping
+    /// this separate prevents the existing-index flag from enabling its hint.
+    pub(super) fn date_end_index_ready(&self) -> bool {
         matches!(
             self.search_index_rx.borrow().as_ref(),
             Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
@@ -2820,7 +2841,37 @@ mod tests {
         ] {
             sender.send(Some(outcome)).unwrap();
             assert_eq!(backend.search_indexes_ready(), ready);
+            assert_eq!(backend.date_end_index_ready(), ready);
         }
+    }
+
+    #[tokio::test]
+    async fn verified_existing_indexes_survive_a_pending_skipped_or_failed_date_end_build() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        backend
+            .existing_search_indexes_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(backend.search_indexes_ready());
+        assert!(!backend.date_end_index_ready());
+        let sender = backend.search_index_tx.lock().await;
+        let sender = sender.as_ref().unwrap();
+        for outcome in [
+            BuildOutcome::Skipped {
+                missing: vec![super::super::search_index_catalog::SEARCH_DATE_END_INDEX.into()],
+            },
+            BuildOutcome::Failed {
+                message: "date-end build failed".into(),
+            },
+        ] {
+            sender.send(Some(outcome)).unwrap();
+            assert!(backend.search_indexes_ready());
+            assert!(!backend.date_end_index_ready());
+        }
+        backend
+            .existing_search_indexes_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!backend.search_indexes_ready());
+        assert!(!backend.date_end_index_ready());
     }
 
     #[test]

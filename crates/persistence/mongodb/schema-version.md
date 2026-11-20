@@ -72,6 +72,7 @@ The version does not cover:
 | #2352 | 16 | 4 | – |
 | #2394 | 17 | 5 | `idx_search_reference_target_v2`, reference backfill |
 | cq-p3 | 17 | 6 | `idx_search_composite_tuple_qty`, `tuple_code` on token+quantity composite rows, the `search_layout` markers |
+| #2588 | 17 | 7 | `idx_search_date_end` |
 
 cq-p3 keeps `SCHEMA_VERSION` at 17 on purpose. Everything it adds is guarded by the generation, not the version: a build at generation 5 (or lower) that starts on the database records its own generation, every generation-6 instance then stops trusting the `tuple_code` markers within 30 seconds, and the next generation-6 boot deletes them before it records 6 again. A version 18 would add nothing to that and would make a rollback to a #2394 build also lower `version` by hand. `search_layout` holds only those markers and needs no schema step: MongoDB creates it on the first marker write. See [Token+quantity composites](search-indexes.md#tokenquantity-composites-generation-6).
 
@@ -164,7 +165,7 @@ Each mongosh command connects with the URL alone, so a URL with a query string s
    - `NumberInt` stores a 32-bit integer, the type HFS writes.
    - Change only `version`; `search_indexes` belongs to the generation steps.
 
-6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are generation 4 up to v16, generation 5 from v17, and generation 6 from cq-p3 (still v17); see [search_index generations after v0.2.6](#search_index-generations-after-v026).
+6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are generation 4 up to v16, generation 5 from v17, generation 6 from cq-p3 and generation 7 from #2588 (both still v17); see [search_index generations after v0.2.6](#search_index-generations-after-v026).
 
 7. Start the older build. Its schema steps create nothing new, except that v0.2.0 and v0.2.1 build `idx_resources_type_deleted` and the generation-1 indexes. It records its own version and ignores what the table lists above its version. v0.2.0 and v0.2.1 also replace the whole `schema_version` document at each start, which removes `search_indexes` (the generation and `contained_rows_moved`) along with the old version. The newer build then treats the generation as unrecorded: it moves the contained rows again and logs the `$reindex` reminder for #1391.
 

@@ -91,9 +91,10 @@ use super::schema::{
     set_search_index_empty_at_generation, set_search_index_generation,
 };
 use super::search_index_catalog::{
-    DATE_RANGE_GENERATION, IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
-    SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
-    superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
+    DATE_RANGE_GENERATION, IndexBuild, SEARCH_DATE_END_INDEX, SEARCH_INDEX_COLLECTION,
+    SEARCH_INDEX_CONTAINED_COLLECTION, SEARCH_INDEX_GENERATION, SearchIndexSpec,
+    create_indexes_command, current_specs, superseded_contained_spec, superseded_date_v2_spec,
+    superseded_v1_specs,
 };
 use crate::types::{absolute_reference_target, strip_reference_version};
 
@@ -110,9 +111,9 @@ pub enum BuildOutcome {
         /// value indexes, `idx_search_date_v2`, the old contained index).
         dropped: Vec<String>,
     },
-    /// `IndexBuildMode::Off`: these background specs are missing; nothing changed.
+    /// `IndexBuildMode::Off`: these background specs are not ready; nothing changed.
     Skipped {
-        /// Names of the background specs that are missing.
+        /// Names of the background specs that are missing or still building.
         missing: Vec<String>,
     },
     /// The run stopped. Nothing was dropped. The message is what was logged.
@@ -189,6 +190,46 @@ struct Inspection {
     /// generation-2 `idx_search_date_v2` (#1391), plus the generation-2
     /// `search_index` contained-row index name if it is still there.
     superseded_present: Vec<String>,
+}
+
+impl Inspection {
+    fn from_existing(existing: &[ListedIndex]) -> Self {
+        let mut inspection = Inspection::default();
+        for spec in current_specs()
+            .into_iter()
+            .filter(|s| s.build == IndexBuild::Background)
+        {
+            match existing.iter().find(|d| d.name == spec.name) {
+                None => inspection.missing.push(spec),
+                Some(actual) => match classify_spec(&spec, actual) {
+                    SpecStatus::Conflicting => inspection
+                        .conflicting
+                        .push((spec.name.to_string(), actual.clone())),
+                    SpecStatus::InProgress => inspection.in_progress.push(spec.name.to_string()),
+                    SpecStatus::Ready => {}
+                },
+            }
+        }
+        inspection.superseded_present = superseded_present(existing);
+        inspection
+    }
+
+    /// An unavailable generation-7 date-end index must not disable verified
+    /// generation-6 plans. Every older background index still has to pass the
+    /// same key, partial-filter, options and buildUUID checks as a full build.
+    fn existing_indexes_ready(&self) -> bool {
+        self.missing
+            .iter()
+            .all(|spec| spec.name == SEARCH_DATE_END_INDEX)
+            && self
+                .in_progress
+                .iter()
+                .all(|name| name == SEARCH_DATE_END_INDEX)
+            && self
+                .conflicting
+                .iter()
+                .all(|(name, _)| name == SEARCH_DATE_END_INDEX)
+    }
 }
 
 /// One `listIndexes` `firstBatch` entry, normalised to the fields this module
@@ -310,6 +351,9 @@ pub(super) struct SearchIndexBuilder {
     /// Published to `MongoBackend` once the reference backfill is complete
     /// (#2394). `None` in tests that do not care.
     references_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Independent readiness of the pre-generation-7 indexes, after the
+    /// existing maintenance steps. None in builder-only tests.
+    existing_readiness_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SearchIndexBuilder {
@@ -319,6 +363,7 @@ impl SearchIndexBuilder {
             mode,
             rows_at_boot,
             references_flag: None,
+            existing_readiness_flag: None,
         }
     }
 
@@ -330,6 +375,33 @@ impl SearchIndexBuilder {
     ) -> Self {
         self.references_flag = Some(flag);
         self
+    }
+
+    pub(super) fn with_existing_readiness_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.existing_readiness_flag = Some(flag);
+        self
+    }
+
+    fn publish_existing_readiness(&self, ready: bool) {
+        if let Some(flag) = &self.existing_readiness_flag {
+            flag.store(ready, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Prime an already-maintained database before serving. A database still
+    /// needing either correctness backfill waits for run_inner to finish it.
+    /// The recorded index generation is deliberately not readiness evidence.
+    pub(super) async fn prime_existing_readiness(&self) -> StorageResult<()> {
+        self.publish_existing_readiness(false);
+        if contained_rows_moved(&self.database).await?
+            && references_normalized(&self.database).await?
+        {
+            self.inspect().await?;
+        }
+        Ok(())
     }
 
     /// What `search_index` held at boot (#2268). `init_schema` awaits this
@@ -585,6 +657,16 @@ impl SearchIndexBuilder {
     /// has at most 21, well under the default batch, so `firstBatch` is
     /// complete.
     async fn inspect(&self) -> StorageResult<Inspection> {
+        let inspection = self.inspect_specs().await;
+        self.publish_existing_readiness(
+            inspection
+                .as_ref()
+                .is_ok_and(Inspection::existing_indexes_ready),
+        );
+        inspection
+    }
+
+    async fn inspect_specs(&self) -> StorageResult<Inspection> {
         let reply = match self
             .database
             .run_command(list_indexes_command(SEARCH_INDEX_COLLECTION))
@@ -606,24 +688,7 @@ impl SearchIndexBuilder {
         };
         let existing = listed_indexes(&reply, SEARCH_INDEX_COLLECTION)?;
 
-        let mut inspection = Inspection::default();
-        for spec in current_specs()
-            .into_iter()
-            .filter(|s| s.build == IndexBuild::Background)
-        {
-            match existing.iter().find(|d| d.name == spec.name) {
-                None => inspection.missing.push(spec),
-                Some(actual) => match classify_spec(&spec, actual) {
-                    SpecStatus::Conflicting => inspection
-                        .conflicting
-                        .push((spec.name.to_string(), actual.clone())),
-                    SpecStatus::InProgress => inspection.in_progress.push(spec.name.to_string()),
-                    SpecStatus::Ready => {}
-                },
-            }
-        }
-        inspection.superseded_present = superseded_present(&existing);
-        Ok(inspection)
+        Ok(Inspection::from_existing(&existing))
     }
 
     /// One-time move of contained rows out of `search_index` (#1160). Runs
@@ -865,15 +930,18 @@ fn is_only_duplicate_keys(e: &mongodb::error::Error) -> bool {
 }
 
 /// [`IndexBuildMode::Off`]'s decision for one [`Inspection`]: `None` when
-/// every background spec is present and no superseded index remains (the
+/// every background spec is ready and no superseded index remains (the
 /// caller then records the generation and reports `UpToDate`); otherwise
-/// warns about every missing spec and every superseded name — including
+/// warns about missing or building specs and every superseded name — including
 /// `idx_search_contained` once [`SearchIndexBuilder::inspect`] marks it
 /// superseded (#1160) — and reports `Skipped`. Never builds or drops
 /// anything. Pure apart from the `tracing` calls, so it is unit-testable
 /// without a live server.
 fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
-    if inspection.missing.is_empty() && inspection.superseded_present.is_empty() {
+    if inspection.missing.is_empty()
+        && inspection.in_progress.is_empty()
+        && inspection.superseded_present.is_empty()
+    {
         return None;
     }
     for spec in &inspection.missing {
@@ -881,6 +949,13 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
             index = spec.name,
             "HFS_MONGODB_INDEX_BUILD=off: generation-{SEARCH_INDEX_GENERATION} search_index index is missing; \
              build it with crates/persistence/mongodb/search-index-v2.mongosh.js"
+        );
+    }
+    for name in &inspection.in_progress {
+        tracing::warn!(
+            index = %name,
+            "HFS_MONGODB_INDEX_BUILD=off: search_index index is still building; \
+             leaving the build incomplete until the index is usable"
         );
     }
     for name in &inspection.superseded_present {
@@ -895,6 +970,7 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
             .missing
             .iter()
             .map(|s| s.name.to_string())
+            .chain(inspection.in_progress.iter().cloned())
             .collect(),
     })
 }
@@ -1050,6 +1126,52 @@ pub(super) fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> Spe
 #[cfg(test)]
 mod builder_tests {
     use super::*;
+
+    fn ready_background_indexes() -> Vec<ListedIndex> {
+        current_specs()
+            .into_iter()
+            .filter(|spec| spec.build == IndexBuild::Background)
+            .map(|spec| ListedIndex {
+                name: spec.name.to_string(),
+                key: spec.keys,
+                partial: spec.partial,
+                in_progress: false,
+                extra_options: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn existing_index_readiness_ignores_only_the_new_date_end_index() {
+        let ready = ready_background_indexes();
+        assert!(Inspection::from_existing(&ready).existing_indexes_ready());
+        for name in ready.iter().map(|index| index.name.as_str()) {
+            let mut missing = ready.clone();
+            missing.retain(|index| index.name != name);
+            assert_eq!(
+                Inspection::from_existing(&missing).existing_indexes_ready(),
+                name == SEARCH_DATE_END_INDEX,
+                "missing {name}"
+            );
+            for defect in ["keys", "partial", "hidden", "building"] {
+                let mut changed = ready.clone();
+                let index = changed.iter_mut().find(|index| index.name == name).unwrap();
+                match defect {
+                    "keys" => index.key = doc! { "resource_id": 1 },
+                    "partial" => index.partial = None,
+                    "hidden" => index.extra_options.push("hidden".into()),
+                    "building" => index.in_progress = true,
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    Inspection::from_existing(&changed).existing_indexes_ready(),
+                    name == SEARCH_DATE_END_INDEX,
+                    "{defect}: {name}"
+                );
+            }
+        }
+        assert!(!Inspection::from_existing(&[]).existing_indexes_ready());
+    }
 
     #[test]
     fn list_indexes_command_includes_build_uuids() {
@@ -1447,6 +1569,42 @@ mod builder_tests {
     }
 
     #[test]
+    fn off_mode_does_not_complete_while_an_exact_spec_is_still_building() {
+        for name in [SEARCH_DATE_END_INDEX, "idx_search_date_v3"] {
+            let entries: Vec<Document> = ready_background_indexes()
+                .into_iter()
+                .map(|index| {
+                    let building = index.name == name;
+                    let spec = doc! {
+                        "name": index.name,
+                        "key": index.key,
+                        "partialFilterExpression": index.partial.unwrap(),
+                    };
+                    if building {
+                        doc! { "spec": spec, "buildUUID": "unfinished-build" }
+                    } else {
+                        spec
+                    }
+                })
+                .collect();
+            let listed = listed_indexes(
+                &doc! { "cursor": { "firstBatch": entries } },
+                SEARCH_INDEX_COLLECTION,
+            )
+            .unwrap();
+            let inspection = Inspection::from_existing(&listed);
+            assert!(inspection.missing.is_empty());
+            assert_eq!(inspection.in_progress, vec![name.to_string()]);
+            assert_eq!(
+                off_mode_decision(&inspection),
+                Some(BuildOutcome::Skipped {
+                    missing: vec![name.to_string()],
+                })
+            );
+        }
+    }
+
+    #[test]
     fn off_mode_decision_is_none_when_nothing_missing_or_superseded() {
         let inspection = Inspection::default();
         assert_eq!(off_mode_decision(&inspection), None);
@@ -1464,7 +1622,7 @@ mod tuple_marker_record_tests {
 
     /// A fresh database on the test server, `None` (and a skip line) without
     /// one. The caller drops it.
-    async fn scratch_database(label: &str) -> Option<Database> {
+    pub(super) async fn scratch_database(label: &str) -> Option<Database> {
         let Ok(uri) = std::env::var("HFS_TEST_MONGODB_URL") else {
             if std::env::var("HFS_TEST_REQUIRE_MONGODB").is_ok_and(|value| !value.is_empty()) {
                 panic!("{label}: HFS_TEST_MONGODB_URL unset");
@@ -1584,5 +1742,115 @@ mod tuple_marker_record_tests {
         database.drop().await.unwrap();
         assert!(outcome.is_err(), "the delete on a view must fail");
         assert_eq!(recorded, Some(5));
+    }
+}
+
+/// `prime_existing_readiness` against a real server, called without `run`, so
+/// the result cannot come from a builder inspection that raced ahead.
+#[cfg(test)]
+mod existing_readiness_prime_tests {
+    use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
+    use super::tuple_marker_record_tests::scratch_database;
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A database a full build left with every index and both maintenance
+    /// markers complete.
+    async fn built_database(label: &str) -> Option<Database> {
+        let database = scratch_database(label).await?;
+        let outcome = SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Inline,
+            RowsAtBoot::NoEarlierRows,
+        )
+        .run()
+        .await;
+        assert!(matches!(outcome, BuildOutcome::Built { .. }), "{outcome:?}");
+        Some(database)
+    }
+
+    fn off_builder(database: &Database, flag: &Arc<AtomicBool>) -> SearchIndexBuilder {
+        SearchIndexBuilder::new(
+            database.clone(),
+            IndexBuildMode::Off,
+            RowsAtBoot::DateRangesRecorded,
+        )
+        .with_existing_readiness_flag(Arc::clone(flag))
+    }
+
+    async fn primed(database: &Database) -> bool {
+        let flag = Arc::new(AtomicBool::new(false));
+        off_builder(database, &flag)
+            .prime_existing_readiness()
+            .await
+            .unwrap();
+        flag.load(Ordering::Acquire)
+    }
+
+    async fn drop_search_index(database: &Database, name: &str) {
+        database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .drop_index(name)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn priming_publishes_existing_indexes_while_date_end_is_missing() {
+        let Some(database) = built_database("priming_with_date_end_missing").await else {
+            return;
+        };
+        drop_search_index(&database, SEARCH_DATE_END_INDEX).await;
+        let flag = Arc::new(AtomicBool::new(false));
+        let builder = off_builder(&database, &flag);
+        builder.prime_existing_readiness().await.unwrap();
+        let primed = flag.load(Ordering::Acquire);
+        // The date-end capability follows the build outcome, not this flag.
+        let outcome = builder.run().await;
+        database.drop().await.unwrap();
+        assert!(
+            primed,
+            "verified existing indexes must be primed before run"
+        );
+        assert_eq!(
+            outcome,
+            BuildOutcome::Skipped {
+                missing: vec![SEARCH_DATE_END_INDEX.to_string()],
+            }
+        );
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn priming_waits_for_both_maintenance_markers() {
+        for marker in ["contained_rows_moved", "references_normalized"] {
+            let Some(database) = built_database("priming_with_a_marker_unset").await else {
+                return;
+            };
+            let field = format!("search_indexes.{marker}");
+            database
+                .collection::<Document>("schema_version")
+                .update_one(
+                    doc! { "_id": "schema_version" },
+                    doc! { "$unset": { field: "" } },
+                )
+                .await
+                .unwrap();
+            let primed = primed(&database).await;
+            database.drop().await.unwrap();
+            assert!(!primed, "{marker} unset");
+        }
+    }
+
+    #[tokio::test]
+    async fn priming_rejects_a_missing_existing_index() {
+        let Some(database) = built_database("priming_with_an_existing_index_missing").await else {
+            return;
+        };
+        drop_search_index(&database, SEARCH_DATE_RANGE_INDEX).await;
+        let primed = primed(&database).await;
+        database.drop().await.unwrap();
+        assert!(!primed);
     }
 }
