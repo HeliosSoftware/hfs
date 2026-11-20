@@ -1,6 +1,6 @@
 //! Search and conditional-operation implementation for MongoDB backend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -33,6 +33,7 @@ use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
     COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
+    SEARCH_DATE_END_INDEX, value_index_led_by,
 };
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
@@ -361,6 +362,179 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
         docs.push(doc);
     }
     Ok(docs)
+}
+
+/// The candidate set a parameter sort orders: none (the whole type), the
+/// matches, or matches over the id-set cap, which are never collected.
+enum SortCandidates {
+    Type,
+    Matched(HashSet<String>),
+    OverCap,
+}
+
+/// A search's parameters as `retain_matching_candidates` checks them, with
+/// its `:identifier` references resolved.
+struct SearchChecks<'q> {
+    normal: Vec<&'q SearchParameter>,
+    missing: Vec<&'q SearchParameter>,
+    not_params: Vec<&'q SearchParameter>,
+    identifier_filters: HashMap<usize, Document>,
+}
+
+/// One index-ordered stream of a sort key's rows: each row's `resource_id`
+/// and its key, read a batch at a time.
+struct SortRowStream {
+    cursor: Cursor<Document>,
+    key_field: &'static str,
+    buffered: VecDeque<(String, Bson)>,
+    exhausted: bool,
+}
+
+impl SortRowStream {
+    /// Reads batches until a row is buffered or the cursor is done.
+    async fn fill(&mut self) -> StorageResult<()> {
+        let key_field = self.key_field;
+        while self.buffered.is_empty() && !self.exhausted {
+            let batch = read_cursor_batch(&mut self.cursor, CANDIDATE_BATCH_SIZE).await?;
+            self.exhausted = batch.len() < CANDIDATE_BATCH_SIZE;
+            self.buffered.extend(batch.into_iter().filter_map(|row| {
+                let id = row.get_str("resource_id").ok()?.to_string();
+                let key = row
+                    .get(key_field)
+                    .filter(|key| **key != Bson::Null)?
+                    .clone();
+                Some((id, key))
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// The next row in key order across `streams`, each already in that order.
+async fn next_sort_row(
+    streams: &mut [SortRowStream],
+    direction: crate::types::SortDirection,
+) -> StorageResult<Option<(String, Bson)>> {
+    for stream in streams.iter_mut() {
+        stream.fill().await?;
+    }
+    let mut next: Option<usize> = None;
+    for (index, stream) in streams.iter().enumerate() {
+        let Some((_, key)) = stream.buffered.front() else {
+            continue;
+        };
+        let first = next.is_none_or(|best| {
+            let (_, best_key) = streams[best].buffered.front().expect("filled above");
+            let ordering = compare_sort_keys(key, best_key);
+            match direction {
+                crate::types::SortDirection::Ascending => ordering.is_lt(),
+                crate::types::SortDirection::Descending => ordering.is_gt(),
+            }
+        });
+        if first {
+            next = Some(index);
+        }
+    }
+    Ok(next.and_then(|index| streams[index].buffered.pop_front()))
+}
+
+/// A prefix of matching resources in key order. Only the remaining window's
+/// best ids are retained within a tie; completed keys and the current tie
+/// together hold at most `wanted` ids. The separate first-key deduplication
+/// set belongs to the caller.
+struct ParamSortWindow {
+    wanted: usize,
+    id_direction: crate::types::SortDirection,
+    ordered: Vec<String>,
+    key: Option<Bson>,
+    tied: BTreeSet<String>,
+}
+
+impl ParamSortWindow {
+    fn new(wanted: usize, id_direction: crate::types::SortDirection) -> Self {
+        Self {
+            wanted,
+            id_direction,
+            ordered: Vec::new(),
+            key: None,
+            tied: BTreeSet::new(),
+        }
+    }
+
+    /// Observe every first-key candidate, including rejected ones: a new key
+    /// closes the preceding tie. Returns true once the window is complete.
+    fn push(&mut self, id: String, key: Bson, matches: bool) -> bool {
+        use crate::types::SortDirection;
+
+        if self
+            .key
+            .as_ref()
+            .is_none_or(|previous| compare_sort_keys(previous, &key).is_ne())
+        {
+            self.finish_key();
+            if self.ordered.len() == self.wanted {
+                return true;
+            }
+            self.key = Some(key);
+        }
+        if matches {
+            let remaining = self.wanted - self.ordered.len();
+            if self.tied.len() == remaining {
+                let replaces = match self.id_direction {
+                    SortDirection::Ascending => self.tied.last().is_some_and(|last| &id < last),
+                    SortDirection::Descending => self.tied.first().is_some_and(|first| &id > first),
+                };
+                if !replaces {
+                    return false;
+                }
+                match self.id_direction {
+                    SortDirection::Ascending => self.tied.pop_last(),
+                    SortDirection::Descending => self.tied.pop_first(),
+                };
+            }
+            self.tied.insert(id);
+        }
+        false
+    }
+
+    fn finish_key(&mut self) {
+        let tied = std::mem::take(&mut self.tied).into_iter();
+        match self.id_direction {
+            crate::types::SortDirection::Ascending => self.ordered.extend(tied),
+            crate::types::SortDirection::Descending => self.ordered.extend(tied.rev()),
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.finish_key();
+        self.ordered
+    }
+}
+
+/// A search's parameters as `retain_matching_candidates` checks them:
+/// positive ones, `:missing` and `:not`. `_id` and `_lastUpdated` are
+/// resource-level and left out.
+fn split_parameters(
+    query: &SearchQuery,
+) -> (
+    Vec<&SearchParameter>,
+    Vec<&SearchParameter>,
+    Vec<&SearchParameter>,
+) {
+    let mut normal = Vec::new();
+    let mut missing = Vec::new();
+    let mut not_params = Vec::new();
+    for param in &query.parameters {
+        if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+            continue;
+        }
+        match &param.modifier {
+            Some(SearchModifier::Missing) => missing.push(param),
+            Some(SearchModifier::Not) => not_params.push(param),
+            _ => normal.push(param),
+        }
+    }
+    (normal, missing, not_params)
 }
 
 /// Orders `(resource_id, keys)` pairs the way the server's
@@ -1432,9 +1606,26 @@ impl MongoBackend {
                 &mut probe_facts,
             )
             .await?;
-        let (filter_plan, matched_ids) = self
+        let param_sorted = query
+            .sort
+            .iter()
+            .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"));
+        // A parameter sort whose matches exceed the id-set cap may still walk
+        // its sort index (#2588); it keeps the error in case it cannot.
+        let (filter_plan, matched_ids, over_cap) = match self
             .plan_or_matching_ids(&db, tenant_id, query, &missing_support, filter_plan)
-            .await?;
+            .await
+        {
+            Err(error @ StorageError::Search(SearchError::TooManyResults { .. }))
+                if param_sorted =>
+            {
+                (None, None, Some(error))
+            }
+            matched => {
+                let (filter_plan, matched_ids) = matched?;
+                (filter_plan, matched_ids, None)
+            }
+        };
         record_filter_strategy(
             "filter_strategy",
             filter_plan.as_ref(),
@@ -1448,11 +1639,7 @@ impl MongoBackend {
         // The resource id is already the last key of that order, so a final
         // `_id` directive only sets its direction. `_lastUpdated`, `_score`, or
         // `_id` anywhere else are not search-index keys and are refused.
-        if query
-            .sort
-            .iter()
-            .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
-        {
+        if param_sorted {
             let (directives, id_direction) = match query.sort.split_last() {
                 Some((last, rest)) if last.parameter == "_id" => (rest, last.direction),
                 _ => (
@@ -1488,6 +1675,7 @@ impl MongoBackend {
                     &db,
                     tenant_id,
                     matched_ids,
+                    over_cap,
                     directives,
                     id_direction,
                 )
@@ -3312,6 +3500,7 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
+        over_cap: Option<StorageError>,
         directives: &[crate::types::SortDirective],
         id_direction: crate::types::SortDirection,
     ) -> StorageResult<SearchResult> {
@@ -3319,11 +3508,14 @@ impl MongoBackend {
         // collection: that folds in the resource-level predicates (`_id`,
         // `_lastUpdated`) AND makes the set live-only by construction, so a
         // stale search-index row can never occupy a page slot (#1056/#1040).
-        // With no filter at all `allowed` stays `None` and the ordering is
-        // computed over the whole type.
-        let allowed: Option<HashSet<String>> = match matched_ids {
-            Some(set) if set.is_empty() => Some(set),
-            Some(set) => Some(
+        // With no filter at all the ordering is computed over the whole type.
+        // Matches over the id-set cap have no set; they walk the sort index
+        // when it can serve them, and answer the error otherwise (#2588).
+        let candidates = match (over_cap, matched_ids) {
+            (Some(error), _) if !self.walks_param_sort(directives) => return Err(error),
+            (Some(_), _) => SortCandidates::OverCap,
+            (None, Some(set)) if set.is_empty() => SortCandidates::Matched(set),
+            (None, Some(set)) => SortCandidates::Matched(
                 self.resource_level_ids(
                     db,
                     tenant_id,
@@ -3334,8 +3526,8 @@ impl MongoBackend {
                 )
                 .await?,
             ),
-            None if has_resource_level_params(query, missing_support) => Some(
-                self.resource_level_ids(
+            (None, None) if has_resource_level_params(query, missing_support) => match self
+                .resource_level_ids(
                     db,
                     tenant_id,
                     &query.resource_type,
@@ -3343,20 +3535,27 @@ impl MongoBackend {
                     missing_support,
                     None,
                 )
-                .await?,
-            ),
-            None => None,
+                .await
+            {
+                Err(StorageError::Search(SearchError::TooManyResults { .. }))
+                    if self.walks_param_sort(directives) =>
+                {
+                    SortCandidates::OverCap
+                }
+                resolved => SortCandidates::Matched(resolved?),
+            },
+            (None, None) => SortCandidates::Type,
         };
 
         let page_size = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let has_previous = offset > 0;
         let mut total: Option<u64> = None;
-        let mut page_ids: Vec<String> = match allowed.as_ref() {
+        let mut page_ids: Vec<String> = match candidates {
             // No filter at all: these sorts have no cursor, so the offset is
             // the only way to page and it is bounded by the id-set cap
             // (#2285). Only the window is computed, never the whole type.
-            None => {
+            SortCandidates::Type => {
                 let reach = offset.saturating_add(page_size);
                 if reach > result_id_cap() {
                     return Err(StorageError::Search(SearchError::TooManyResults {
@@ -3381,7 +3580,35 @@ impl MongoBackend {
                 )
                 .await?
             }
-            Some(allowed) => {
+            // Bounded by the cap like the unfiltered window. The order does
+            // not change the count, so the total is the unsorted query's,
+            // which a query plan may count without collecting ids.
+            SortCandidates::OverCap => {
+                let reach = offset.saturating_add(page_size);
+                if reach > result_id_cap() {
+                    return Err(StorageError::Search(SearchError::TooManyResults {
+                        count: reach,
+                        max: result_id_cap(),
+                    }));
+                }
+                if query.wants_total() {
+                    let mut unsorted = query.clone();
+                    unsorted.sort.clear();
+                    total = Some(self.count_standard(tenant, &unsorted).await?);
+                }
+                self.param_sorted_filtered_window(
+                    db,
+                    tenant_id,
+                    query,
+                    missing_support,
+                    &directives[0],
+                    id_direction,
+                    offset,
+                    page_size + 1,
+                )
+                .await?
+            }
+            SortCandidates::Matched(allowed) => {
                 // Nothing can match: skip the ordering aggregation entirely.
                 let ordered: Vec<String> = if allowed.is_empty() {
                     Vec::new()
@@ -3392,7 +3619,7 @@ impl MongoBackend {
                         &query.resource_type,
                         directives,
                         id_direction,
-                        allowed,
+                        &allowed,
                     )
                     .await?
                 };
@@ -3860,6 +4087,324 @@ impl MongoBackend {
         Ok(unkeyed.into_iter().skip(skip).take(take).collect())
     }
 
+    /// Reference `:identifier` (#1408) names its targets by their identifier,
+    /// which a filter document cannot join on: each such parameter of `normal`
+    /// is resolved to its complete filter here, once, keyed by its position.
+    /// `None` when one has no target at all, which empties the search
+    /// (parameters are ANDed).
+    async fn identifier_filters(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        normal: &[&SearchParameter],
+    ) -> StorageResult<Option<HashMap<usize, Document>>> {
+        let mut filters = HashMap::new();
+        for (i, param) in normal.iter().enumerate() {
+            if param.param_type == SearchParamType::Reference
+                && matches!(param.modifier, Some(SearchModifier::Identifier))
+            {
+                match self
+                    .resolve_reference_identifier(search_index, tenant_id, resource_type, param)
+                    .await?
+                {
+                    Some(filter) => filters.insert(i, filter),
+                    None => return Ok(None),
+                };
+            }
+        }
+        Ok(Some(filters))
+    }
+
+    /// Whether a parameter sort whose matches exceed the id-set cap can walk
+    /// its sort index: a single search-parameter key, an index that orders
+    /// its rows, and the value indexes built (#2588).
+    fn walks_param_sort(&self, directives: &[crate::types::SortDirective]) -> bool {
+        self.search_indexes_ready()
+            && matches!(directives, [directive]
+                if value_index_led_by(sort_value_field(directive)).is_some()
+                    && (sort_value_field(directive) != "value_date"
+                        || directive.direction != crate::types::SortDirection::Descending
+                        || self.date_end_index_ready()))
+    }
+
+    /// One page window of a single-key parameter sort whose matches exceed
+    /// the id-set cap: the ids at positions `offset..offset + take` of the
+    /// order `param_sorted_ids` gives, without collecting the matches
+    /// (#2588). The sort parameter's rows are read in key order, so the first
+    /// row read for a resource holds its key. Membership is checked in
+    /// bounded batches; equal-key winners retain only the requested prefix
+    /// in id order. Matches without a key follow in id order. `take` includes
+    /// the extra match for `has_next`, beyond the caller's capped page reach.
+    #[allow(clippy::too_many_arguments)]
+    async fn param_sorted_filtered_window(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        directive: &crate::types::SortDirective,
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
+
+        let resource_type = query.resource_type.as_str();
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let (normal, missing, not_params) = split_parameters(query);
+        let Some(identifier_filters) = self
+            .identifier_filters(&search_index, tenant_id, resource_type, &normal)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let checks = SearchChecks {
+            normal,
+            missing,
+            not_params,
+            identifier_filters,
+        };
+
+        let wanted = offset.saturating_add(take);
+        let mut streams = self
+            .sort_row_streams(&search_index, tenant_id, resource_type, directive)
+            .await?;
+        // Every resource a row was read for, matching or not: its first row
+        // held its key, so its later rows are skipped.
+        let mut keyed: HashSet<String> = HashSet::new();
+        let mut window = ParamSortWindow::new(wanted, id_direction);
+        let mut complete = false;
+        while !complete {
+            let mut batch = Vec::with_capacity(CANDIDATE_BATCH_SIZE);
+            while batch.len() < CANDIDATE_BATCH_SIZE {
+                match next_sort_row(&mut streams, directive.direction).await? {
+                    Some((id, key)) => {
+                        if keyed.insert(id.clone()) {
+                            batch.push((id, key));
+                        }
+                    }
+                    None => {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let ids = batch.iter().map(|(id, _)| id.clone()).collect();
+            let passing: HashSet<String> = self
+                .matching_in_order(
+                    db,
+                    &search_index,
+                    tenant_id,
+                    query,
+                    missing_support,
+                    &checks,
+                    ids,
+                )
+                .await?
+                .into_iter()
+                .collect();
+            for (id, key) in batch {
+                let matches = passing.contains(&id);
+                if window.push(id, key, matches) {
+                    return Ok(window
+                        .finish()
+                        .into_iter()
+                        .skip(offset)
+                        .take(take)
+                        .collect());
+                }
+            }
+        }
+        let mut window = window.finish();
+        if window.len() == wanted {
+            return Ok(window.into_iter().skip(offset).take(take).collect());
+        }
+
+        let mut cursor = db
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .projection(doc! { "_id": 0, "id": 1 })
+            .sort(doc! { "id": match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            } })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+            .batch_size(CANDIDATE_BATCH_SIZE as u32)
+            .await
+            .or_query_error("Failed to open the unkeyed resource cursor")?;
+        loop {
+            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let docs_read = batch.len();
+            let unkeyed: Vec<String> = batch
+                .iter()
+                .filter_map(|doc| doc.get_str("id").ok())
+                .filter(|id| !keyed.contains(*id))
+                .map(ToString::to_string)
+                .collect();
+            if !unkeyed.is_empty() {
+                let remaining = wanted - window.len();
+                window.extend(
+                    self.matching_in_order(
+                        db,
+                        &search_index,
+                        tenant_id,
+                        query,
+                        missing_support,
+                        &checks,
+                        unkeyed,
+                    )
+                    .await?
+                    .into_iter()
+                    .take(remaining),
+                );
+            }
+            if window.len() >= wanted || docs_read < CANDIDATE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(window.into_iter().skip(offset).take(take).collect())
+    }
+
+    /// The ids of `ids` that satisfy the search, in the order given: its
+    /// search-index conditions, then its resource-level ones and liveness.
+    #[allow(clippy::too_many_arguments)]
+    async fn matching_in_order(
+        &self,
+        db: &mongodb::Database,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        checks: &SearchChecks<'_>,
+        ids: Vec<String>,
+    ) -> StorageResult<Vec<String>> {
+        // Both keyed and keyless callers bound ids before any `$in` is built.
+        debug_assert!(ids.len() <= CANDIDATE_BATCH_SIZE);
+        let candidates = self
+            .retain_matching_candidates(
+                db,
+                search_index,
+                tenant_id,
+                &query.resource_type,
+                &checks.normal,
+                &checks.identifier_filters,
+                &checks.missing,
+                &checks.not_params,
+                missing_support,
+                query.compartment.as_ref(),
+                None,
+                ids.iter().cloned().collect(),
+            )
+            .await?;
+        // `build_resource_filter` refuses an id set over the cap, which a
+        // lowered test cap puts below one batch.
+        let candidates: Vec<String> = candidates.into_iter().collect();
+        let mut passing = HashSet::new();
+        for chunk in candidates.chunks(result_id_cap().max(1)) {
+            let chunk: HashSet<String> = chunk.iter().cloned().collect();
+            passing.extend(
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    missing_support,
+                    Some(&chunk),
+                )
+                .await?,
+            );
+        }
+        Ok(ids.into_iter().filter(|id| passing.contains(id)).collect())
+    }
+
+    /// The cursors that read a single sort key's rows in key order, each
+    /// hinted onto the index that orders them. A descending date sorts by the
+    /// end of each range (`sort_key_expression`): rows with an end come from
+    /// `idx_search_date_end`, and rows written before #1391, which have none
+    /// and sort by their start, from the null-end keys of the same index.
+    async fn sort_row_streams(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+    ) -> StorageResult<Vec<SortRowStream>> {
+        use crate::types::SortDirection;
+
+        let order = match directive.direction {
+            SortDirection::Ascending => 1,
+            SortDirection::Descending => -1,
+        };
+        let value_field = sort_value_field(directive);
+        let rows = |value_field: &str| {
+            doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "param_name": &directive.parameter,
+                value_field: { "$exists": true, "$ne": Bson::Null },
+            }
+        };
+        let plans: Vec<(Document, Document, &'static str, &'static str)> =
+            if value_field == "value_date" && directive.direction == SortDirection::Descending {
+                let mut ended = rows(value_field);
+                ended.insert(VALUE_DATE_END, doc! { "$ne": Bson::Null });
+                let mut open = rows(value_field);
+                open.insert(VALUE_DATE_END, Bson::Null);
+                vec![
+                    (
+                        ended,
+                        doc! { VALUE_DATE_END: order },
+                        SEARCH_DATE_END_INDEX,
+                        VALUE_DATE_END,
+                    ),
+                    (
+                        open,
+                        doc! { VALUE_DATE_END: order, "value_date": order },
+                        SEARCH_DATE_END_INDEX,
+                        "value_date",
+                    ),
+                ]
+            } else {
+                let index = value_index_led_by(value_field).ok_or_else(|| {
+                    internal_error(format!("no search_index index is led by {value_field}"))
+                })?;
+                vec![(
+                    rows(value_field),
+                    doc! { value_field: order },
+                    index,
+                    value_field,
+                )]
+            };
+        let mut streams = Vec::with_capacity(plans.len());
+        for (filter, sort, index, key_field) in plans {
+            let cursor = search_index
+                .find(filter)
+                .search_deadline()?
+                .projection(doc! { "_id": 0, "resource_id": 1, key_field: 1 })
+                .sort(sort)
+                .hint(Hint::Name(index.to_owned()))
+                .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                .await
+                .or_query_error("Failed to open a sort-key cursor")?;
+            streams.push(SortRowStream {
+                cursor,
+                key_field,
+                buffered: VecDeque::new(),
+                exhausted: false,
+            });
+        }
+        Ok(streams)
+    }
+
     async fn matching_resource_ids(
         &self,
         db: &mongodb::Database,
@@ -3889,20 +4434,7 @@ impl MongoBackend {
         )
         .await?;
 
-        let mut normal: Vec<&SearchParameter> = Vec::new();
-        let mut missing: Vec<&SearchParameter> = Vec::new();
-        let mut not_params: Vec<&SearchParameter> = Vec::new();
-
-        for param in &query.parameters {
-            if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
-                continue;
-            }
-            match &param.modifier {
-                Some(SearchModifier::Missing) => missing.push(param),
-                Some(SearchModifier::Not) => not_params.push(param),
-                _ => normal.push(param),
-            }
-        }
+        let (normal, missing, not_params) = split_parameters(query);
 
         // A compartment that matches nothing makes the overall AND certainly
         // match nothing, exactly like an empty `_id` seed below, and is answered
@@ -4052,24 +4584,12 @@ impl MongoBackend {
                 .await;
         }
 
-        // Reference `:identifier` (#1408) names its targets by their
-        // identifier, which a filter document cannot join on: each such
-        // parameter is resolved to its complete filter here, once, and no
-        // target at all empties the search (parameters are ANDed).
-        let mut identifier_filters: HashMap<usize, Document> = HashMap::new();
-        for (i, param) in normal.iter().enumerate() {
-            if param.param_type == SearchParamType::Reference
-                && matches!(param.modifier, Some(SearchModifier::Identifier))
-            {
-                match self
-                    .resolve_reference_identifier(&search_index, tenant_id, resource_type, param)
-                    .await?
-                {
-                    Some(filter) => identifier_filters.insert(i, filter),
-                    None => return Ok(Some(HashSet::new())),
-                };
-            }
-        }
+        let Some(identifier_filters) = self
+            .identifier_filters(&search_index, tenant_id, resource_type, &normal)
+            .await?
+        else {
+            return Ok(Some(HashSet::new()));
+        };
         let normal_predicate = |i: usize| -> StorageResult<(Document, PredicateAccess)> {
             let filter = match identifier_filters.get(&i) {
                 Some(filter) => filter.clone(),

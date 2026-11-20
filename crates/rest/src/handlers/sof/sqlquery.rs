@@ -52,6 +52,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
@@ -99,6 +100,7 @@ pub struct SqlQueryRunQuery {
 /// `filters` carries the request's `patient`, `group` and `_since` and narrows
 /// every dependency ViewDefinition. `_limit` is not in it and still caps only
 /// the final rows (applied after SQL, unchanged).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -107,6 +109,7 @@ pub(super) async fn run_library_subject<S>(
     headers: &HeaderMap,
     library_json: Value,
     filters: ViewFilters,
+    principal: Option<&Principal>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -202,6 +205,13 @@ where
 
     super::graph::check_max_nodes(&plan, max_vds)?;
 
+    // Every leaf ViewDefinition in the plan reads the resource type it names.
+    super::authz::check_read_scopes(
+        principal,
+        "$sql-run",
+        super::authz::plan_resource_types(&plan),
+    )?;
+
     // Bind Library.parameter values from the supplied `parameters` Parameters.
     let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())
         .map_err(sqlquery_err_to_rest)?;
@@ -213,6 +223,7 @@ where
         max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
         max_rows: state.config().sof_sqlquery_max_rows,
         timeout_secs: state.config().sof_sqlquery_timeout_secs,
+        bound_materialization: true,
     };
     let materialized = std::sync::atomic::AtomicUsize::new(0);
     let executed = super::graph::execute_plan_counting(
@@ -582,9 +593,10 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                  HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
             ),
         },
-        SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
-            message: format!("query exceeded {secs}s timeout"),
-        },
+        // The query's own SQL, a SQL View's, or the materialization of a
+        // dependency ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS: a 504 with code
+        // `timeout`, as a cancelled CRUD statement answers, not a 422 (#2577).
+        SqlQueryError::Timeout { secs } => RestError::SqlQueryTimeout { secs },
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
@@ -674,6 +686,33 @@ mod tests {
                 .headers()
                 .contains_key(axum::http::header::RETRY_AFTER),
             "a 503 must carry Retry-After"
+        );
+    }
+
+    /// #2577: a query that ran out of HFS_SOF_SQLQUERY_TIMEOUT_SECS — its own
+    /// SQL, a SQL View's, or a dependency's materialization — is a 504 with an
+    /// OperationOutcome code of `timeout` naming the budget, not a 422 and not
+    /// a 500; and no `Retry-After`, since a prompt retry would only repeat the
+    /// same too-slow query.
+    #[test]
+    fn a_timeout_is_a_504_with_code_timeout() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 });
+        assert!(
+            matches!(rest, RestError::SqlQueryTimeout { secs: 30 }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+        assert!(message.contains("30-second"), "names the budget: {message}");
+
+        let response = sqlquery_err_to_rest(SqlQueryError::Timeout { secs: 30 }).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            !response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a cancelled query is not retried by waiting"
         );
     }
 

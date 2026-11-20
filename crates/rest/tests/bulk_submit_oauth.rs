@@ -3,21 +3,24 @@
 //! Stands up a real ephemeral mock IdP (SMART discovery + token endpoint) and
 //! verifies that [`JwtClientCredentialsTokenProvider`] discovers the token
 //! endpoint, exchanges a `private_key_jwt` client assertion for an access token,
-//! and caches it (a second request is served from cache).
+//! and caches it (a second request is served from cache); and that the token
+//! only ever travels to the token endpoint's origin or to an origin listed in
+//! `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
     routing::{get, post},
 };
-use helios_persistence::core::FileTokenProvider;
-use std::time::Duration;
-
-use helios_rest::bulk_submit_oauth::{ClientTimeouts, JwtClientCredentialsTokenProvider};
+use helios_persistence::core::{FileTokenError, FileTokenProvider};
+use helios_rest::bulk_submit_oauth::{
+    ClientTimeouts, JwtClientCredentialsTokenProvider, TrustedProviders,
+};
 use serde_json::json;
 
 // Test-only PKCS#8 P-384 private key (ES384). Not used anywhere else.
@@ -71,11 +74,12 @@ async fn test_outbound_client_credentials_discovery_and_cache() {
         .expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
 
-    let t1 = provider.token(&discovery, "system/*.rs").await;
-    assert_eq!(t1.as_deref(), Some("tok-abc"));
+    let file = format!("{base}/bulk/Patient.ndjson");
+    let t1 = provider.token(&discovery, "system/*.rs", &file).await;
+    assert_eq!(t1.as_deref(), Ok("tok-abc"));
 
-    let t2 = provider.token(&discovery, "system/*.rs").await;
-    assert_eq!(t2.as_deref(), Some("tok-abc"));
+    let t2 = provider.token(&discovery, "system/*.rs", &file).await;
+    assert_eq!(t2.as_deref(), Ok("tok-abc"));
 
     // The second call is served from cache → token endpoint hit exactly once.
     assert_eq!(token_hits.load(Ordering::SeqCst), 1);
@@ -127,7 +131,233 @@ async fn test_outbound_discovery_failure_returns_none() {
         JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384").unwrap();
     // Unreachable metadata URL → no token.
     let discovery = vec!["http://127.0.0.1:1/.well-known/smart-configuration".to_string()];
-    assert!(provider.token(&discovery, "system/*.rs").await.is_none());
+    let err = provider
+        .token(
+            &discovery,
+            "system/*.rs",
+            "http://127.0.0.1:1/manifest.json",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, FileTokenError::Unavailable(ref reason) if reason.contains("metadata GET")),
+        "{err}"
+    );
+}
+
+// ---- destination policy --------------------------------------------------
+
+/// A mock IdP whose metadata names `token_endpoint` (its own `/token` when
+/// `None`). Returns its origin and the metadata/token hit counters.
+async fn spawn_idp(token_endpoint: Option<String>) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let metadata_hits = Arc::new(AtomicUsize::new(0));
+    let token_hits = Arc::new(AtomicUsize::new(0));
+    let endpoint = token_endpoint.unwrap_or_else(|| format!("{base}/token"));
+    let app = Router::new()
+        .route(
+            "/.well-known/smart-configuration",
+            get({
+                let hits = metadata_hits.clone();
+                move || {
+                    let endpoint = endpoint.clone();
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    async move { Json(json!({ "token_endpoint": endpoint })) }
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post({
+                let hits = token_hits.clone();
+                move || {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    async move { Json(json!({ "access_token": "tok", "expires_in": 300 })) }
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (base, metadata_hits, token_hits)
+}
+
+/// An origin nobody listens on, distinct from every mock IdP by its port.
+async fn other_origin() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    format!("http://{}", listener.local_addr().unwrap())
+}
+
+fn provider(trusted: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
+    JwtClientCredentialsTokenProvider::new_with_trusted_providers(
+        "client-1",
+        TEST_ES384_PKCS8,
+        "ES384",
+        TrustedProviders::parse(trusted).expect("test origins parse"),
+    )
+    .expect("parse ES384 key")
+}
+
+#[tokio::test]
+async fn token_travels_to_the_token_endpoints_origin() {
+    let (idp, _, token_hits) = spawn_idp(None).await;
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let token = provider(&[])
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{idp}/bulk/manifest.json"),
+        )
+        .await;
+    assert_eq!(token.as_deref(), Ok("tok"));
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn token_is_withheld_from_a_destination_on_another_origin() {
+    let (idp, metadata_hits, token_hits) = spawn_idp(None).await;
+    let elsewhere = other_origin().await;
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let err = provider(&[])
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{elsewhere}/bulk/manifest.json"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FileTokenError::UntrustedDestination {
+            destination: elsewhere.clone(),
+            token_origin: idp.clone(),
+        }
+    );
+    assert!(err.to_string().contains(&elsewhere), "{err}");
+    // Discovery ran, but no client assertion was spent on a token nobody may receive.
+    assert_eq!(metadata_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_trusted_provider_origin_may_receive_the_token() {
+    let (idp, _, token_hits) = spawn_idp(None).await;
+    let files = other_origin().await;
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let provider = provider(&[&idp, &files]);
+
+    let token = provider
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{files}/bulk/Patient.ndjson"),
+        )
+        .await;
+    assert_eq!(token.as_deref(), Ok("tok"));
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+    // The list extends the destinations; it does not drop the endpoint's own origin.
+    let token = provider
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{idp}/bulk/manifest.json"),
+        )
+        .await;
+    assert_eq!(token.as_deref(), Ok("tok"));
+
+    // And an origin outside it is still refused.
+    let stranger = other_origin().await;
+    let err = provider
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{stranger}/bulk/Patient.ndjson"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, FileTokenError::UntrustedDestination { .. }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_list_refuses_an_unlisted_metadata_url_before_discovery() {
+    let (idp, metadata_hits, token_hits) = spawn_idp(None).await;
+    let trusted = other_origin().await;
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let err = provider(&[&trusted])
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{trusted}/bulk/manifest.json"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FileTokenError::UntrustedProvider {
+            origin: idp.clone()
+        }
+    );
+    assert!(
+        err.to_string()
+            .contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"),
+        "{err}"
+    );
+    assert_eq!(metadata_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_configured_list_refuses_an_unlisted_token_endpoint() {
+    // The listed metadata host hands discovery to a token endpoint outside the list.
+    let (real_idp, _, real_token_hits) = spawn_idp(None).await;
+    let (front, front_metadata_hits, _) = spawn_idp(Some(format!("{real_idp}/token"))).await;
+    let discovery = vec![format!("{front}/.well-known/smart-configuration")];
+    let err = provider(&[&front])
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{front}/bulk/manifest.json"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FileTokenError::UntrustedProvider {
+            origin: real_idp.clone()
+        }
+    );
+    assert_eq!(front_metadata_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_metadata_document_cannot_redirect_a_token_to_its_own_host() {
+    // The attack: metadata on the submitter's host names a token endpoint
+    // where HFS is a registered client, and the manifest lives on that host.
+    let (real_idp, _, real_token_hits) = spawn_idp(None).await;
+    let (attacker, _, _) = spawn_idp(Some(format!("{real_idp}/token"))).await;
+    let discovery = vec![format!("{attacker}/.well-known/smart-configuration")];
+    let err = provider(&[])
+        .token(
+            &discovery,
+            "system/*.rs",
+            &format!("{attacker}/bulk/manifest.json"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FileTokenError::UntrustedDestination {
+            destination: attacker.clone(),
+            token_origin: real_idp.clone(),
+        }
+    );
+    assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
 }
 
 // ---- bounds on what the provider sends back -------------------------------
@@ -156,13 +386,22 @@ async fn a_huge_expires_in_is_bounded_not_a_panic() {
     let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
         .expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
+    let destination = format!("{base}/file.ndjson");
     assert_eq!(
-        provider.token(&discovery, "system/*.rs").await.as_deref(),
+        provider
+            .token(&discovery, "system/*.rs", &destination)
+            .await
+            .ok()
+            .as_deref(),
         Some("tok-max")
     );
     // And it is cached like any other token.
     assert_eq!(
-        provider.token(&discovery, "system/*.rs").await.as_deref(),
+        provider
+            .token(&discovery, "system/*.rs", &destination)
+            .await
+            .ok()
+            .as_deref(),
         Some("tok-max")
     );
 }
@@ -195,11 +434,11 @@ async fn a_provider_that_never_answers_is_given_up_on() {
     let started = std::time::Instant::now();
     let token = tokio::time::timeout(
         Duration::from_secs(10),
-        provider.token(&discovery, "system/*.rs"),
+        provider.token(&discovery, "system/*.rs", &format!("{base}/file.ndjson")),
     )
     .await
     .expect("the request is bounded by the client timeouts, not by this test");
-    assert!(token.is_none());
+    assert!(token.is_err());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "gave up after {:?}",

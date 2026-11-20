@@ -5,6 +5,9 @@
 //! Fetches the remote Bulk Export Manifest and its NDJSON files, applying
 //! provider-supplied request headers, `gzip`, and — when files require an access
 //! token — a read-scoped bearer obtained via an optional [`FileTokenProvider`].
+//! Every request URL is handed to the provider as the token's destination, so
+//! the provider's origin policy decides whether a bearer travels there at all;
+//! a refusal fails the request with the provider's reason.
 //!
 //! NDJSON bodies are streamed to the ingestion engine rather than buffered, so a
 //! manifest referencing multi-gigabyte files costs a fixed amount of memory per
@@ -446,14 +449,12 @@ impl FileRequest {
                     "{shown} requires an access token but no outbound auth is configured"
                 )));
             };
-            let Some(token) = provider
-                .token(&self.oauth_metadata_urls, &self.outbound_scope)
+            let token = provider
+                .token(&self.oauth_metadata_urls, &self.outbound_scope, &self.url)
                 .await
-            else {
-                return Err(HttpSubmitInputFetcher::err(format!(
-                    "{shown} requires an access token but none could be obtained"
-                )));
-            };
+                .map_err(|e| {
+                    HttpSubmitInputFetcher::err(format!("{shown} requires an access token: {e}"))
+                })?;
             rb = rb.bearer_auth(token);
         }
         // Provider-supplied headers take precedence (applied last).
@@ -1021,11 +1022,15 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             let Some(provider) = &self.token_provider else {
                 return Ok(None);
             };
-            let Some(token) = provider
-                .token(oauth_metadata_urls, &self.outbound_scope)
+            let token = match provider
+                .token(oauth_metadata_urls, &self.outbound_scope, url)
                 .await
-            else {
-                return Ok(None);
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!(url = %redact_url(url), %e, "skipping the size probe: no access token");
+                    return Ok(None);
+                }
             };
             rb = rb.bearer_auth(token);
         }
@@ -1055,6 +1060,7 @@ mod tests {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::Engine;
+    use helios_persistence::core::FileTokenError;
     use serde_json::json;
 
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
@@ -1121,6 +1127,111 @@ mod tests {
             .await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("no outbound auth is configured"));
+    }
+
+    /// A token source that records the destination it was asked for and
+    /// answers with a fixed verdict.
+    struct RecordingProvider {
+        destinations: std::sync::Mutex<Vec<String>>,
+        verdict: Result<String, FileTokenError>,
+    }
+
+    #[async_trait]
+    impl FileTokenProvider for RecordingProvider {
+        async fn token(
+            &self,
+            _oauth_metadata_urls: &[String],
+            _scope: &str,
+            destination: &str,
+        ) -> Result<String, FileTokenError> {
+            self.destinations
+                .lock()
+                .unwrap()
+                .push(destination.to_string());
+            self.verdict.clone()
+        }
+    }
+
+    fn fetcher_with(
+        verdict: Result<String, FileTokenError>,
+    ) -> (HttpSubmitInputFetcher, Arc<RecordingProvider>) {
+        let provider = Arc::new(RecordingProvider {
+            destinations: std::sync::Mutex::new(Vec::new()),
+            verdict,
+        });
+        let fetcher = HttpSubmitInputFetcher::new(
+            Some(provider.clone() as Arc<dyn FileTokenProvider>),
+            "system/*.rs".to_string(),
+        );
+        (fetcher, provider)
+    }
+
+    #[tokio::test]
+    async fn test_build_get_asks_the_provider_for_the_request_url() {
+        let (fetcher, provider) = fetcher_with(Ok("tok".to_string()));
+        let rb = fetcher
+            .build_get(
+                "http://files.example.org/file.ndjson?sig=SECRET",
+                &[],
+                true,
+                &["http://idp.example.org/.well-known/smart-configuration".to_string()],
+            )
+            .await
+            .expect("a bearer is attached");
+        let request = rb.build().unwrap();
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(
+            *provider.destinations.lock().unwrap(),
+            vec!["http://files.example.org/file.ndjson?sig=SECRET".to_string()],
+            "the provider sees the full request URL, not a redacted copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_get_fails_with_the_providers_reason_and_a_redacted_url() {
+        let (fetcher, _) = fetcher_with(Err(FileTokenError::UntrustedDestination {
+            destination: "http://files.example.org".to_string(),
+            token_origin: "http://idp.example.org".to_string(),
+        }));
+        let err = fetcher
+            .build_get(
+                "http://files.example.org/file.ndjson?sig=SECRET",
+                &[],
+                true,
+                &["http://idp.example.org/.well-known/smart-configuration".to_string()],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the token is withheld from http://files.example.org"),
+            "{err}"
+        );
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_file_size_without_a_token_is_best_effort() {
+        let (fetcher, provider) =
+            fetcher_with(Err(FileTokenError::Unavailable("down".to_string())));
+        let size = fetcher
+            .file_size(
+                "http://127.0.0.1:1/file.ndjson",
+                &[],
+                true,
+                &["http://127.0.0.1:1/.well-known/smart-configuration".to_string()],
+            )
+            .await
+            .expect("a refused token is not a fetch error");
+        assert_eq!(size, None);
+        assert_eq!(
+            *provider.destinations.lock().unwrap(),
+            vec!["http://127.0.0.1:1/file.ndjson".to_string()]
+        );
     }
 
     #[tokio::test]

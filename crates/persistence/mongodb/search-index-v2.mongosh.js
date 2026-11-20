@@ -61,6 +61,22 @@ db.runCommand({
         "tenant_id": 1,
         "resource_type": 1,
         "param_name": 1,
+        "value_date_end": 1,
+        "value_date": 1,
+        "resource_id": 1
+      },
+      "name": "idx_search_date_end",
+      "partialFilterExpression": {
+        "value_date": {
+          "$exists": true
+        }
+      }
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "resource_type": 1,
+        "param_name": 1,
         "value_number": 1,
         "resource_id": 1
       },

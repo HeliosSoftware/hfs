@@ -547,6 +547,126 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
     assert_eq!(included_ids(&r.json()), ["p1", "pr1"]);
 }
 
+pub async fn compartment_search_includes_outside_the_compartment_are_dropped(server: &TestServer) {
+    // The matches of a compartment search are confined by the path, but an
+    // include follows references wherever they lead: o3's performer is a
+    // Practitioner, which is in no patient's compartment (#2618).
+    let path = "/Patient/p1/Observation?_id=o3&_include=Observation:performer&_include=Observation:subject";
+    let r = get(server, P1_READ, path).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["o3"]);
+    assert_eq!(included_ids(&bundle), ["p1"], "{bundle}");
+
+    // Unconfined, the same search includes the Practitioner, on every backend:
+    // the compartment search resolves includes as a type-level search does.
+    let r = get(server, SYSTEM, path).await;
+    assert_eq!(included_ids(&r.json()), ["p1", "pr1"], "{}", r.text());
+
+    // A cohort the launch patient belongs to holds other patients.
+    let r = put(
+        server,
+        SYSTEM,
+        "/Group/g1",
+        json!({"resourceType": "Group", "id": "g1", "type": "person", "actual": true,
+            "member": [{"entity": {"reference": "Patient/p1"}},
+                       {"entity": {"reference": "Patient/p2"}}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed g1: {}", r.text());
+    let path = "/Patient/p1/Group?_include=Group:member";
+    let r = get(server, P1_READ, path).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["g1"]);
+    assert_eq!(included_ids(&bundle), ["p1"], "{bundle}");
+    let r = get(server, SYSTEM, path).await;
+    assert_eq!(included_ids(&r.json()), ["p1", "p2"], "{}", r.text());
+}
+
+pub async fn compartment_search_does_not_return_linked_patients(server: &TestServer) {
+    // The Patient compartment lists Patient through `link`: p3 is another
+    // patient whose `link` names p1, so the path's compartment filter alone
+    // would match p3.
+    let r = put(
+        server,
+        SYSTEM,
+        "/Patient/p3",
+        json!({"resourceType": "Patient", "id": "p3", "name": [{"family": "Three"}],
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed p3: {}", r.text());
+
+    let r = get(server, P1_READ, "/Patient/p1/Patient").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+    let r = get(server, P1_READ, "/Patient/p1/Patient?_id=p3").await;
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+
+    let r = get(server, P1_READ, "/Patient/p1/*").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_eq!(ids(&r.json()), ["o1", "o3"], "{}", r.text());
+
+    // Unconfined callers keep the compartment definition's answer.
+    let r = get(server, SYSTEM, "/Patient/p1/Patient").await;
+    assert_eq!(ids(&r.json()), ["p3"], "{}", r.text());
+    let r = get(server, SYSTEM, "/Patient/p1/*").await;
+    assert_eq!(ids(&r.json()), ["o1", "o3", "p3"], "{}", r.text());
+}
+
+/// For a backend whose include resolution is capped at one resource per
+/// directive (MongoDB's `max_included_resources`, #1061): the truncation
+/// warning reaches a `patient/` client, from a type-level and from a
+/// compartment search, rather than being dropped with the includes outside the
+/// compartment. g1's `member` include reaches two patients, so it truncates.
+pub async fn truncated_includes_are_reported_under_a_patient_scope(server: &TestServer) {
+    let r = put(
+        server,
+        SYSTEM,
+        "/Group/g1",
+        json!({"resourceType": "Group", "id": "g1", "type": "person", "actual": true,
+            "member": [{"entity": {"reference": "Patient/p1"}},
+                       {"entity": {"reference": "Patient/p2"}}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed g1: {}", r.text());
+    for path in [
+        "/Group?_include=Group:member",
+        "/Patient/p1/Group?_include=Group:member",
+    ] {
+        for token in [P1_READ, SYSTEM] {
+            let r = get(server, token, path).await;
+            assert_eq!(r.status_code(), StatusCode::OK, "{path}: {}", r.text());
+            let bundle: Value = r.json();
+            let outcomes: Vec<&Value> = bundle["entry"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["search"]["mode"] == "outcome")
+                .collect();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|e| e["resource"]["issue"][0]["code"] == "incomplete"),
+                "{token} {path}: no truncation warning\n{bundle}"
+            );
+            // The marker is reported as an outcome, never as an include.
+            assert!(
+                included_ids(&bundle).len() <= 1,
+                "{token} {path}: more includes than the cap\n{bundle}"
+            );
+            assert!(
+                bundle["entry"].as_array().into_iter().flatten().all(|e| {
+                    e["search"]["mode"] != "include"
+                        || e["resource"]["resourceType"] != "OperationOutcome"
+                }),
+                "{token} {path}: truncation marker returned as an include\n{bundle}"
+            );
+        }
+    }
+}
+
 pub async fn types_outside_the_patient_compartment_are_not_reachable(server: &TestServer) {
     assert_forbidden(&get(server, P1_READ, "/Practitioner/pr1").await, "read");
     assert_forbidden(&get(server, P1_READ, "/Practitioner").await, "search");
@@ -1167,7 +1287,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, compartment_search_includes_outside_the_compartment_are_dropped, compartment_search_does_not_return_linked_patients, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(

@@ -114,7 +114,9 @@ gated on their own operation scope — `system/purge` and `system/reindex` — a
 precedent. A token that may soft-delete a Patient must not thereby be able to
 destroy it irrecoverably, and a token that may write a resource must not be able
 to rebuild the whole tenant's search index. As with `system/bulk-submit`, a
-`system/*.<perm>` wildcard also grants them.
+`system/*` wildcard also grants them, but only when it carries the permission
+bit the operation implies: `d` for `$purge`, `u` for `$reindex`, `c` for
+`$bulk-submit`. A read-only `system/*.rs` grants none of them.
 
 **`$purge`** permanently deletes a resource and all of its versions. This is not
 the FHIR `delete` interaction: an ordinary `DELETE` is a *soft* delete that
@@ -270,6 +272,17 @@ patient is `403`, and a token whose `patient` claim is missing or unusable is
 refused rather than widened. A `user/` or `system/` grant is not confined, and
 for it an unusable `patient` value still falls back to walking every patient.
 See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
+
+Within that boundary the result is narrowed per resource type, as SMART grants
+are: the walk searches only the compartment member types the token may search
+and resolves only the supporting resource types it may read. A `user/Patient.rs
+user/Observation.rs` token gets the patient, its observations and nothing else,
+and the bundle carries an `information` OperationOutcome entry naming the
+omitted types. An explicit `_type` naming a member type the token may not
+search is `403`. Wildcard grants (`patient/*.rs`, `user/*.rs`, `system/*.rs`)
+are not narrowed. A `patient/` grant covers only the launch patient's
+compartment, so a token that pairs `user/Patient.rs` with `patient/` grants
+gets another patient's `$everything` without the types those grants cover.
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -488,6 +501,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, a file-retrieval token is sent only to the origin of the token endpoint that issued it. Set, the `oauthMetadataUrl`, the token endpoint it names and every URL the token is sent to must be listed origins (the token endpoint's own origin always qualifies as a destination). An entry with a path, query or fragment fails startup. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 ##### `$bulk-submit` indexing mode per storage backend
@@ -521,6 +535,14 @@ Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` code default (the benchma
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
 `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+
+The `oauthMetadataUrl`, the `manifestUrl` and the file URLs all come from the
+submitter, so the token never leaves for a host the submitter chose: it is
+attached only to a request whose origin is the token endpoint's own, or one
+listed in `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`. Any other request fails with a
+manifest-level error that names the origin to list. A provider whose files live
+on a different host from its authorization server (presigned object storage, a
+separate FHIR server) therefore needs its origins listed.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
@@ -626,9 +648,9 @@ which subject failed without parsing the message.
 |----------|---------|-------------|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
-| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized in full before the query's `WHERE` runs, so narrow it with a ViewDefinition `where`, or raise this limit. |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized before the query's `WHERE` runs; a plain `column = literal` / `<>` / `IS [NOT] NULL` filter of a single-table query on a typed top-level column is pushed into the view first, so only the rows it keeps count. Otherwise narrow the view with its own `where`, or raise this limit. |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs: the subject's SQL, each SQL View's SQL, and the materialization of each ViewDefinition it depends on. On PostgreSQL the view's statement runs under this budget (`SET LOCAL statement_timeout` on its own transaction), so `HFS_PG_STATEMENT_TIMEOUT_MS` does not cut it short. A query that runs out of it answers `504` with an OperationOutcome code of `timeout`. A `$sql-export` job bounds each statement the same way but not the read of a dependency as a whole, and a job that runs out of the limit fails with `504` / `timeout`. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup, and `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |

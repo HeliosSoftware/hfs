@@ -59,7 +59,7 @@ jobs:
         rust: [beta, nightly]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
       - name: Install Rust toolchain
@@ -85,7 +85,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
       # Read from the manifest so the check can never drift from the claim.
@@ -132,7 +132,7 @@ jobs:
       actions: read
     steps:
       - name: Open, update or close the ci-toolchain issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RESULTS: ${{ needs.test-rust.result }} ${{ needs.msrv.result }}
         with:
@@ -221,7 +221,7 @@ jobs:
       MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           # Into its own directory, never the shared runner checkout. A sparse
           # checkout there deletes every file outside .github/actions, and the

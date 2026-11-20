@@ -42,6 +42,7 @@ use helios_persistence::core::{
     HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
     SearchProvider, SystemHistoryProvider,
 };
+use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::types::{PageCursor, PageInfo, PaginationMode};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -895,15 +896,22 @@ where
 /// # Response
 ///
 /// - `200 OK` with OperationOutcome indicating number of versions deleted
+/// - `403 Forbidden` under a `patient/` scope when the resource is not in the
+///   launch patient's compartment
 /// - `404 Not Found` if the resource doesn't exist
 /// - `501 Not Implemented` if the backend doesn't support this operation
 pub async fn delete_instance_history_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + InstanceHistoryProvider + Send + Sync,
+    S: ResourceStorage
+        + InstanceHistoryProvider
+        + helios_persistence::core::SearchProvider
+        + Send
+        + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -911,6 +919,8 @@ where
         tenant = %tenant.tenant_id(),
         "Processing delete instance history request"
     );
+
+    assert_history_in_compartment(&state, &tenant, &compartment, &resource_type, &id).await?;
 
     let deleted_count = state
         .storage()
@@ -956,6 +966,8 @@ where
 /// # Response
 ///
 /// - `204 No Content` on successful deletion
+/// - `403 Forbidden` under a `patient/` scope when the resource is not in the
+///   launch patient's compartment
 /// - `404 Not Found` if the resource or version doesn't exist
 /// - `400 Bad Request` if attempting to delete the current version
 /// - `501 Not Implemented` if the backend doesn't support this operation
@@ -963,9 +975,14 @@ pub async fn delete_version_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id, version_id)): Path<(String, String, String)>,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + InstanceHistoryProvider + Send + Sync,
+    S: ResourceStorage
+        + InstanceHistoryProvider
+        + helios_persistence::core::SearchProvider
+        + Send
+        + Sync,
 {
     debug!(
         resource_type = %resource_type,
@@ -974,6 +991,8 @@ where
         tenant = %tenant.tenant_id(),
         "Processing delete version request"
     );
+
+    assert_history_in_compartment(&state, &tenant, &compartment, &resource_type, &id).await?;
 
     state
         .storage()
@@ -992,6 +1011,46 @@ where
     );
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// A `patient/` scope erases history inside the launch patient's compartment
+/// only (#1618), judged on the current payload as `DELETE [type]/[id]` judges
+/// it. A resource that is absent falls through to the backend's `404`; one
+/// that is deleted has no payload to judge, so a confined caller is refused.
+/// An unconfined caller reads nothing here.
+async fn assert_history_in_compartment<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    resource_type: &str,
+    id: &str,
+) -> RestResult<()>
+where
+    S: ResourceStorage + helios_persistence::core::SearchProvider + Send + Sync,
+{
+    if !compartment.is_confined() {
+        return Ok(());
+    }
+    let current = match state
+        .storage()
+        .read(tenant.context(), resource_type, id)
+        .await
+    {
+        Ok(Some(current)) => current,
+        Ok(None) => return Ok(()),
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+            return Err(compartment.outside_compartment(format!(
+                "delete history of this {resource_type} is not permitted: the token's patient/ scope is confined to the launch patient's compartment and a deleted resource cannot be judged a member"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        current.fhir_version(),
+        current.content(),
+        "delete history",
+    )
 }
 
 #[cfg(test)]

@@ -21,8 +21,11 @@ use crate::extractors::{
     FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_for_version,
     unknown_search_params,
 };
-use crate::handlers::search::append_ignored_params_outcome;
+use crate::handlers::search::{
+    append_ignored_params_outcome, append_truncation_outcomes, finish_includes,
+};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::state::AppState;
 
 /// Handler for compartment search.
@@ -42,11 +45,23 @@ use crate::state::AppState;
 /// # Response
 ///
 /// Returns a Bundle of type "searchset" containing matching resources.
+///
+/// `_include` and `_revinclude` are resolved as in a type-level search, on
+/// every backend.
+///
+/// Under a compartment-confined grant the matches are confined by the path
+/// (the authorization middleware admits only the launch patient's own
+/// compartment), with one exception the handler closes: the Patient
+/// compartment lists Patient through `link`, so a Patient target is pinned to
+/// the launch patient's id. An `_include` or `_revinclude` follows references
+/// wherever they lead, so the included resources are filtered to the
+/// compartment's members as a type-level search filters them.
 pub async fn compartment_search_handler<S>(
     State(state): State<AppState<S>>,
     Path((compartment_type, compartment_id, target_type)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -73,6 +88,7 @@ where
             compartment_id,
             tenant,
             version,
+            compartment,
             pairs,
             strict,
         )
@@ -143,6 +159,7 @@ where
         params: ref_params.iter().map(|s| s.to_string()).collect(),
         reference: compartment_ref,
     });
+    compartment.confine_compartment_query(&compartment_type, &compartment_id, &mut query)?;
 
     // Clamp page size to the configured default/maximum.
     let count = query
@@ -155,7 +172,7 @@ where
     let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
 
     // Execute the search
-    let result = state
+    let mut result = state
         .storage()
         .search(tenant.context(), &query)
         .await
@@ -163,6 +180,12 @@ where
             tracing::warn!(error = %e, "Compartment search failed");
             RestError::from(e)
         })?;
+
+    // Resolve the includes the backend did not (only MongoDB resolves them
+    // inline), confine them to the patient compartment, and take out the
+    // #1061 truncation markers, re-emitted below as warnings.
+    let truncation_messages =
+        finish_includes(&state, &tenant, &compartment, &query.includes, &mut result).await?;
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(&tenant);
@@ -196,6 +219,7 @@ where
     if !ignored_params.is_empty() {
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
+    append_truncation_outcomes(&mut bundle_json, &truncation_messages);
 
     Ok((StatusCode::OK, Json(bundle_json)).into_response())
 }
@@ -219,12 +243,14 @@ where
 /// effective page size (`_count`, clamped to the server maximum) and no
 /// `next`/`previous` links are emitted. `_count` therefore acts as an overall
 /// ceiling across all member types.
+#[allow(clippy::too_many_arguments)]
 async fn compartment_search_all<S>(
     state: AppState<S>,
     compartment_type: String,
     compartment_id: String,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     pairs: Vec<(String, String)>,
     strict: bool,
 ) -> RestResult<Response>
@@ -308,6 +334,7 @@ where
     // is not a resource type of this FHIR version — and is answered with the
     // `400` a typed compartment search gives, not an empty bundle (#1366).
     let mut first_build_error: Option<RestError> = None;
+    let mut confine_error: Option<RestError> = None;
     let queries: Vec<helios_persistence::types::SearchQuery> = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
@@ -344,6 +371,17 @@ where
                     params: ref_params.iter().map(|s| s.to_string()).collect(),
                     reference: compartment_ref.clone(),
                 });
+                // Under a patient/ scope the Patient member type is pinned to
+                // the launch patient: the compartment lists other patients
+                // through `link`.
+                if let Err(e) = compartment.confine_compartment_query(
+                    &compartment_type,
+                    &compartment_id,
+                    &mut query,
+                ) {
+                    confine_error.get_or_insert(e);
+                    return None;
+                }
                 // Cross-type paging is unsupported; cap each type at the overall
                 // ceiling and drop any client cursor/offset.
                 query.count = Some(count as u32);
@@ -354,6 +392,9 @@ where
             .collect()
     };
 
+    if let Some(e) = confine_error {
+        return Err(e);
+    }
     if queries.is_empty() {
         if let Some(e) = first_build_error {
             return Err(e);

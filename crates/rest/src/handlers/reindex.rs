@@ -87,6 +87,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_auth::Principal;
+use helios_auth::scope::SmartPermissions;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::search::{ReindexError, ReindexOperation, ReindexRequest};
 use serde_json::json;
@@ -128,13 +129,17 @@ fn batch_size_param(size: u64) -> u32 {
         .clamp(1, MAX_REINDEX_PAGE_SIZE)
 }
 
-/// Enforces the `system/reindex` operation scope. Auth disabled → allowed.
+/// Enforces the `system/reindex` operation scope, or a system wildcard that
+/// carries the update bit. Auth disabled → allowed.
 fn check_reindex_scope(principal: Option<&Principal>) -> RestResult<()> {
     if let Some(p) = principal
-        && !p.scopes.grants_operation(REINDEX_SCOPE)
+        && !p
+            .scopes
+            .grants_operation(REINDEX_SCOPE, SmartPermissions::UPDATE)
     {
         return Err(RestError::Forbidden {
-            message: "the `system/reindex` scope is required".to_string(),
+            message: "the `system/reindex` scope (or a `system/*` scope with `u`) is required"
+                .to_string(),
         });
     }
     Ok(())
@@ -421,6 +426,15 @@ mod tests {
     fn test_system_wildcard_grants_reindex() {
         let p = principal("system/*.crud");
         assert!(check_reindex_scope(Some(&p)).is_ok());
+    }
+
+    /// A read-only system wildcard must not rebuild the tenant's search index.
+    #[test]
+    fn test_read_only_system_wildcard_does_not_grant_reindex() {
+        for scopes in ["system/*.r", "system/*.rs", "system/*.crds", "user/*.cruds"] {
+            let p = principal(scopes);
+            assert!(check_reindex_scope(Some(&p)).is_err(), "{scopes}");
+        }
     }
 
     #[test]

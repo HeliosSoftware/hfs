@@ -1588,6 +1588,31 @@ html.js .needs-js {
   color: var(--text);
 }
 
+/* HTS browse-page filter strip (#2609): several search fields plus Reset in
+   one card. Fields shrink to share the row (`min-width: 0` on both the
+   label and the input — a flex item's default minimum is its min-content
+   width, and an <input>'s intrinsic width is ~20ch), and once each field
+   reaches ~160px the row wraps instead of overflowing the card. Scoped as
+   a modifier so the single-search `.toolbar`s in crates/ui are untouched. */
+.toolbar--filters {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.toolbar--filters .toolbar__search {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.toolbar--filters .toolbar__search input {
+  min-width: 0;
+  width: 100%;
+}
+
+.toolbar--filters > .btn {
+  flex: 0 0 auto;
+}
+
 /* Add-tenant disclosure */
 .addbox {
   position: relative;
@@ -3174,6 +3199,11 @@ details.json-fold[open] > summary .icon {
 /* HTS browsers: bound Name column so long computer-friendly names
    (`hl7.terminology.r4.CodeSystem-*`) don't crowd Title. */
 .data-table .col-name { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Canonical URL cells (#2609). `.url` breaks anywhere, which drops the
+   column's min-content to one glyph, so auto table layout starves it to a
+   one-character strip whenever Title wants the room. Give it a floor; the
+   surrounding `.table-wrap` scrolls if the table then outgrows the card. */
+.data-table .col-url { min-width: 18ch; }
 /* HTS ConceptMap stacked source/target cell (Phase-5 §7.5 Gate 1):
    two vertically-stacked lines with a monospace `S:` / `T:` prefix
    so the mapping direction stays scannable in-row. */
