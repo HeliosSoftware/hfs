@@ -3,14 +3,25 @@
 //! Tracks connected WebSocket clients per subscription. The subscriptions
 //! crate uses this to broadcast notifications, while the REST crate uses
 //! it to register new connections from the WebSocket upgrade handler.
+//!
+//! Each client has a bounded queue of [`CLIENT_QUEUE_CAPACITY`]
+//! notifications. A client that stops reading its socket stops draining the
+//! queue; once the queue is full the client is dropped rather than letting
+//! every further matching write retain another bundle in the process until
+//! the socket closes. The client reconnects and replays through `$events`.
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+/// Notifications a bound client may have waiting before it counts as not
+/// draining and is dropped.
+pub const CLIENT_QUEUE_CAPACITY: usize = 256;
+
 /// Sender half given to a connected WebSocket client.
-pub type WsClientSender = mpsc::UnboundedSender<serde_json::Value>;
+pub type WsClientSender = mpsc::Sender<serde_json::Value>;
 
 /// Manages connected WebSocket clients for all active subscriptions.
 pub struct WebSocketManager {
@@ -31,12 +42,14 @@ impl WebSocketManager {
     ///
     /// Returns `(client_id, receiver)`. The caller (WebSocket handler) reads
     /// notifications from the receiver and forwards them over the socket.
+    /// The receiver ends (`None`) when the subscription is deregistered or
+    /// the client let [`CLIENT_QUEUE_CAPACITY`] notifications pile up.
     pub fn register_client(
         &self,
         tenant_id: &str,
         subscription_id: &str,
-    ) -> (String, mpsc::UnboundedReceiver<serde_json::Value>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> (String, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel(CLIENT_QUEUE_CAPACITY);
         let client_id = Uuid::new_v4().to_string();
 
         self.clients
@@ -77,8 +90,10 @@ impl WebSocketManager {
 
     /// Broadcasts a notification to all connected clients for a subscription.
     ///
-    /// Automatically prunes disconnected clients (closed channels).
-    /// Returns the number of clients that received the message.
+    /// Automatically prunes disconnected clients (closed channels) and drops
+    /// a client whose queue is full, so one client that stopped reading
+    /// cannot retain a copy of every later notification. Returns the number
+    /// of clients that received the message.
     pub fn send_to_subscription(
         &self,
         tenant_id: &str,
@@ -94,22 +109,35 @@ impl WebSocketManager {
         let mut delivered = 0;
         let initial_count = entry.len();
 
-        // Send to all clients, removing those with closed channels.
-        entry.retain(|(client_id, sender)| {
-            if sender.send(notification.clone()).is_ok() {
-                delivered += 1;
-                true
-            } else {
-                debug!(client_id = %client_id, "Pruning disconnected WebSocket client");
-                false
-            }
-        });
+        // Send to all clients, removing those with closed or full channels.
+        entry.retain(
+            |(client_id, sender)| match sender.try_send(notification.clone()) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(TrySendError::Full(_)) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id,
+                        client_id = %client_id,
+                        queued = CLIENT_QUEUE_CAPACITY,
+                        "WebSocket client is not draining its notifications; dropping it"
+                    );
+                    false
+                }
+                Err(TrySendError::Closed(_)) => {
+                    debug!(client_id = %client_id, "Pruning disconnected WebSocket client");
+                    false
+                }
+            },
+        );
 
         let pruned = initial_count - entry.len();
         if pruned > 0 {
             warn!(
                 tenant_id,
-                subscription_id, pruned, "Pruned disconnected WebSocket clients"
+                subscription_id, pruned, "Pruned disconnected or lagging WebSocket clients"
             );
         }
 
@@ -231,6 +259,39 @@ mod tests {
 
         // Receiver should return None (channel closed).
         assert!(rx1.recv().await.is_none());
+    }
+
+    /// A client that stopped reading keeps its queued notifications until the
+    /// queue is full, then is dropped: nothing more is retained for it, and
+    /// the handler sees the channel end after the queued ones.
+    #[tokio::test]
+    async fn test_a_client_that_stops_draining_is_dropped_once_its_queue_is_full() {
+        let mgr = WebSocketManager::new();
+        let (_stalled, mut stalled_rx) = mgr.register_client("t1", "sub-1");
+        let (_draining, mut draining_rx) = mgr.register_client("t1", "sub-1");
+
+        for i in 0..CLIENT_QUEUE_CAPACITY {
+            let n = json!({"type": "event-notification", "n": i});
+            assert_eq!(mgr.send_to_subscription("t1", "sub-1", &n), 2, "{i}");
+            assert_eq!(draining_rx.recv().await.unwrap(), n);
+        }
+        assert_eq!(mgr.client_count("t1", "sub-1"), 2);
+
+        let overflow = json!({"type": "event-notification", "n": "overflow"});
+        assert_eq!(
+            mgr.send_to_subscription("t1", "sub-1", &overflow),
+            1,
+            "only the draining client receives the one past the capacity"
+        );
+        assert_eq!(mgr.client_count("t1", "sub-1"), 1);
+        assert_eq!(draining_rx.recv().await.unwrap(), overflow);
+
+        let mut queued = 0;
+        while let Some(n) = stalled_rx.recv().await {
+            assert_ne!(n, overflow, "nothing was queued past the capacity");
+            queued += 1;
+        }
+        assert_eq!(queued, CLIENT_QUEUE_CAPACITY);
     }
 
     #[test]
