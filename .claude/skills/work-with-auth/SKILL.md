@@ -64,14 +64,16 @@ what gets checked. `crates/auth/tests/bearer_token_reuse.rs` pins this behavior.
 ## Named operation scopes
 
 Some operations are gated on a named scope of their own rather than on resource
-permissions, via `ScopeSet::grants_operation(name)` — which matches a literal
-`system/{name}` **or** any `system/*.<perm>` wildcard:
+permissions, via `ScopeSet::grants_operation(name, wildcard_permission)` — which
+matches a literal `system/{name}` **or** a `system/*.<perm>` wildcard whose
+bits include the one the operation implies (a read-only `system/*.rs` grants
+none of them):
 
-| Scope | Grants |
-|---|---|
-| `system/bulk-submit` | `$bulk-submit` ingestion |
-| `system/purge` | `$purge` — permanent, irreversible deletion of a resource and its history |
-| `system/reindex` | `$reindex` — rebuilding a tenant's entire search index |
+| Scope | Wildcard bit | Grants |
+|---|---|---|
+| `system/bulk-submit` | `c` | `$bulk-submit` ingestion |
+| `system/purge` | `d` | `$purge` — permanent, irreversible deletion of a resource and its history |
+| `system/reindex` | `u` | `$reindex` — rebuilding a tenant's entire search index |
 
 These deliberately do **not** fall out of ordinary resource scopes: a token that
 may soft-delete a Patient (`system/Patient.d`) must not thereby be able to
