@@ -787,6 +787,15 @@ pub struct BulkSubmitConfig {
     /// `Range` request, in seconds (#1127). Set with
     /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
     pub fetch_read_timeout_secs: u64,
+    /// Ceiling, in decoded bytes, on a Bulk Export manifest the worker
+    /// fetches; the manifest is read whole. Set with
+    /// `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`.
+    pub max_manifest_bytes: u64,
+    /// Ceiling, in decoded bytes, on a JWE-encrypted input file; encrypted
+    /// files are read whole, since the authentication tag trails the
+    /// ciphertext. Unencrypted NDJSON streams and has no ceiling. Set with
+    /// `HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES`.
+    pub max_encrypted_file_bytes: u64,
     /// Leave an existing resource untouched when a submitted resource is
     /// identical to it (ignoring `meta.versionId`/`meta.lastUpdated`), so
     /// replaying a manifest writes no new versions (#1127). Off by default.
@@ -885,6 +894,8 @@ impl fmt::Debug for BulkSubmitConfig {
             batch_size,
             batch_writers,
             fetch_read_timeout_secs,
+            max_manifest_bytes,
+            max_encrypted_file_bytes,
             skip_unchanged,
             index_queue,
             index_concurrency,
@@ -926,6 +937,8 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("batch_size", batch_size)
             .field("batch_writers", batch_writers)
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("max_manifest_bytes", max_manifest_bytes)
+            .field("max_encrypted_file_bytes", max_encrypted_file_bytes)
             .field("skip_unchanged", skip_unchanged)
             .field("index_queue", index_queue)
             .field("index_concurrency", index_concurrency)
@@ -975,6 +988,8 @@ impl Default for BulkSubmitConfig {
             batch_size: 1000,
             batch_writers: 4,
             fetch_read_timeout_secs: 60,
+            max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
+            max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
             skip_unchanged: false,
             index_queue: 16,
             index_concurrency: 4,
@@ -1139,6 +1154,11 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
             ),
+            max_manifest_bytes: env_u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
+            max_encrypted_file_bytes: env_u64(
+                "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
+                d.max_encrypted_file_bytes,
+            ),
             skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
             index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
             index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
@@ -1246,6 +1266,12 @@ impl BulkSubmitConfig {
         }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.max_manifest_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES must be > 0".to_string());
+        }
+        if self.max_encrypted_file_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES must be > 0".to_string());
         }
         if self.index_queue == 0 {
             errors.push("HFS_BULK_SUBMIT_INDEX_QUEUE must be >= 1".to_string());
