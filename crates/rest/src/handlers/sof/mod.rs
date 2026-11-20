@@ -9,6 +9,7 @@
 //!
 //! [`subject`] owns the naming and resolution shared by both.
 
+pub(crate) mod authz;
 pub mod capability;
 pub mod export;
 pub(crate) mod graph;

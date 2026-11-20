@@ -142,12 +142,13 @@ impl ScopeSet {
 
     /// Returns true if the token grants the named system-level *operation* scope.
     ///
-    /// Matches the literal raw scope `system/{name}` (e.g. `system/bulk-submit`)
-    /// or any system-level wildcard scope (`system/*.<perms>`), which is treated
-    /// as granting all operations.
-    pub fn grants_operation(&self, name: &str) -> bool {
+    /// Matches the literal raw scope `system/{name}` (e.g. `system/bulk-submit`),
+    /// or a system-level wildcard scope (`system/*.<perms>`) whose permission
+    /// bits include `wildcard_permission`: the bit the operation implies, so a
+    /// read-only `system/*.rs` does not stand in for a destructive operation.
+    pub fn grants_operation(&self, name: &str, wildcard_permission: SmartPermissions) -> bool {
         let target = format!("system/{name}");
-        self.raw.iter().any(|s| s == &target) || self.has_system_wildcard()
+        self.raw.iter().any(|s| s == &target) || self.has_system_scope(wildcard_permission)
     }
 }
 
@@ -205,8 +206,8 @@ mod tests {
         let set = ScopeSet::parse("openid system/bulk-submit profile");
         // Operation scope is dropped from parsed resource scopes but retained raw.
         assert!(set.is_empty());
-        assert!(set.grants_operation("bulk-submit"));
-        assert!(!set.grants_operation("export"));
+        assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
+        assert!(!set.grants_operation("export", SmartPermissions::CREATE));
         assert!(!set.has_system_wildcard());
     }
 
@@ -214,8 +215,39 @@ mod tests {
     fn test_grants_operation_via_wildcard() {
         let set = ScopeSet::parse("system/*.cruds");
         assert!(set.has_system_wildcard());
-        // A system wildcard is treated as granting any operation.
-        assert!(set.grants_operation("bulk-submit"));
+        // A system wildcard carrying the implied bit grants the operation.
+        assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
+        assert!(set.grants_operation("purge", SmartPermissions::DELETE));
+    }
+
+    /// The wildcard shortcut is tied to the permission bit the operation
+    /// implies: a read-only system wildcard is not a licence to purge,
+    /// reindex or ingest.
+    #[test]
+    fn test_read_only_wildcard_does_not_grant_write_operations() {
+        for scopes in ["system/*.r", "system/*.rs", "system/*.s"] {
+            let set = ScopeSet::parse(scopes);
+            assert!(set.has_system_wildcard(), "{scopes}");
+            assert!(
+                !set.grants_operation("purge", SmartPermissions::DELETE),
+                "{scopes}"
+            );
+            assert!(
+                !set.grants_operation("reindex", SmartPermissions::UPDATE),
+                "{scopes}"
+            );
+            assert!(
+                !set.grants_operation("bulk-submit", SmartPermissions::CREATE),
+                "{scopes}"
+            );
+        }
+        // The bit decides, not the number of bits.
+        let set = ScopeSet::parse("system/*.d");
+        assert!(set.grants_operation("purge", SmartPermissions::DELETE));
+        assert!(!set.grants_operation("reindex", SmartPermissions::UPDATE));
+        // A user-context wildcard is not a system scope at all.
+        let set = ScopeSet::parse("user/*.cruds");
+        assert!(!set.grants_operation("purge", SmartPermissions::DELETE));
     }
 
     #[test]
@@ -224,7 +256,7 @@ mod tests {
             "system/bulk-submit".to_string(),
             "system/Patient.rs".to_string(),
         ]);
-        assert!(set.grants_operation("bulk-submit"));
+        assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
         assert!(set.is_permitted("Patient", SmartPermissions::READ));
         assert!(!set.has_system_wildcard());
     }

@@ -1531,8 +1531,9 @@ mod sof_sqlquery_tests {
     /// A dependency with more rows than `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`
     /// fails with a 422 that names the dependency, the cap and the setting,
     /// even when the query's own WHERE would have narrowed it to one row. The
-    /// message must not suggest a WHERE/LIMIT clause: the dependency is
-    /// materialized in full before the query's WHERE runs.
+    /// message must not suggest a WHERE/LIMIT clause: a filter the query
+    /// cannot push into the view (here, one under a function) runs only after
+    /// the dependency is materialized in full.
     #[tokio::test]
     async fn dependency_over_the_source_row_cap_returns_422_naming_dependency_and_setting() {
         let mut config = ServerConfig::for_testing();
@@ -1544,7 +1545,7 @@ mod sof_sqlquery_tests {
         let vd_url = seed_patient_view(&backend).await;
 
         let lib = library_with_canonical_vd(
-            "SELECT patient_id FROM t WHERE patient_id = 'p1'",
+            "SELECT patient_id FROM t WHERE lower(patient_id) = 'p1'",
             &vd_url,
             "t",
             vec![],
@@ -1572,6 +1573,57 @@ mod sof_sqlquery_tests {
             !diagnostics.contains("add a WHERE/LIMIT clause"),
             "{diagnostics}"
         );
+    }
+
+    /// #2574: a plain filter of the query's WHERE on a typed column of its one
+    /// dependency is pushed into the view as a `where`, so the store yields
+    /// only the rows the SQL can keep. Five patients over a cap of three: the
+    /// same query that is a 422 under `lower(patient_id)` runs under
+    /// `patient_id = 'p1'`, and a boolean, a `<>` and an `IS NOT NULL` push
+    /// the same way. The SQL still runs its own WHERE over what arrives, so
+    /// the rows are those of the unpushed query.
+    #[tokio::test]
+    async fn a_filter_the_query_can_push_into_the_view_keeps_it_under_the_cap() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", i % 2 == 0).await;
+        }
+        seed_patient(&backend, "p5", "O'Hara", false).await;
+        let vd_url = seed_patient_view(&backend).await;
+
+        for (sql, expected) in [
+            (
+                "SELECT patient_id FROM t WHERE patient_id = 'p1'",
+                vec!["p1"],
+            ),
+            (
+                "SELECT patient_id FROM t AS v WHERE v.active = false AND v.family <> 'Smith'",
+                vec!["p5"],
+            ),
+            (
+                "SELECT patient_id FROM t WHERE 'O''Hara' = family AND family IS NOT NULL",
+                vec!["p5"],
+            ),
+            (
+                "SELECT patient_id FROM t WHERE active = true AND patient_id <> 'p0' ORDER BY 1",
+                vec!["p2", "p4"],
+            ),
+        ] {
+            let lib = library_with_canonical_vd(sql, &vd_url, "t", vec![]);
+            let response = post_inline_json(&server, lib).await;
+            response.assert_status(StatusCode::OK);
+            let rows: Value = response.json();
+            let mut ids: Vec<String> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["patient_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "{sql}");
+        }
     }
 
     /// The cap is inclusive: a dependency of exactly the cap's size runs.

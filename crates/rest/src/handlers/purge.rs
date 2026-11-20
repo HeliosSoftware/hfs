@@ -38,6 +38,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_auth::Principal;
+use helios_auth::scope::SmartPermissions;
 use helios_persistence::core::storage::audit::record_purge_event;
 use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
 use helios_persistence::error::{ResourceError, StorageError};
@@ -63,13 +64,17 @@ fn purge_unavailable() -> RestError {
     }
 }
 
-/// Enforces the `system/purge` operation scope. Auth disabled → allowed.
+/// Enforces the `system/purge` operation scope, or a system wildcard that
+/// carries the delete bit. Auth disabled → allowed.
 fn check_purge_scope(principal: Option<&Principal>) -> RestResult<()> {
     if let Some(p) = principal
-        && !p.scopes.grants_operation(PURGE_SCOPE)
+        && !p
+            .scopes
+            .grants_operation(PURGE_SCOPE, SmartPermissions::DELETE)
     {
         return Err(RestError::Forbidden {
-            message: "the `system/purge` scope is required".to_string(),
+            message: "the `system/purge` scope (or a `system/*` scope with `d`) is required"
+                .to_string(),
         });
     }
     Ok(())
@@ -313,12 +318,22 @@ mod tests {
         assert!(check_purge_scope(Some(&p)).is_ok());
     }
 
-    /// Consistent with `system/bulk-submit`: a system-level wildcard is treated
-    /// as granting every operation scope.
+    /// Consistent with `system/bulk-submit`: a system-level wildcard carrying
+    /// the delete bit grants the operation scope.
     #[test]
     fn test_system_wildcard_grants_purge() {
         let p = principal("system/*.crud");
         assert!(check_purge_scope(Some(&p)).is_ok());
+    }
+
+    /// The read-only backend client the identity-provider guide provisions
+    /// (`system/*.rs`) must not be able to erase anything.
+    #[test]
+    fn test_read_only_system_wildcard_does_not_grant_purge() {
+        for scopes in ["system/*.r", "system/*.rs", "system/*.cru", "user/*.cruds"] {
+            let p = principal(scopes);
+            assert!(check_purge_scope(Some(&p)).is_err(), "{scopes}");
+        }
     }
 
     /// With auth disabled there is no principal and no scope to check, matching

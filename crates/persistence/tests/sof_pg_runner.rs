@@ -2691,6 +2691,100 @@ mod export_paging {
         }
     }
 
+    /// #2577: a SQL query's statement budget governs the view's statement on
+    /// PostgreSQL. It lifts a shorter session `statement_timeout` (the pool's
+    /// `HFS_PG_STATEMENT_TIMEOUT_MS`) and cuts a longer one; a statement the
+    /// server stops at either ends the view as `SofError::Timeout`, not as a
+    /// backend fault; and the session value is untouched afterwards.
+    #[tokio::test]
+    async fn statement_budget_governs_the_view_statement() {
+        use helios_persistence::core::sof_runner::SofError;
+        use std::time::Duration;
+
+        const ROWS: i32 = 300_000;
+        let fx = start().await;
+        let tenant = tenant();
+        fx.observer
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated)
+                 SELECT $1, 'Observation', md5(g::text) || g::text, '1',
+                        jsonb_build_object('resourceType','Observation','id',md5(g::text) || g::text,'status','final'),
+                        now()
+                 FROM generate_series(1, $2::int) g",
+                &[&tenant.tenant_id().as_str(), &ROWS],
+            )
+            .await
+            .expect("seed observations");
+        // Connections the pool opens from here on carry a session timeout no
+        // read of the type fits in; the observer, already connected, does not.
+        fx.observer
+            .batch_execute("ALTER ROLE postgres SET statement_timeout = '50ms'")
+            .await
+            .expect("set the session statement timeout");
+        let view = json!({"resourceType":"ViewDefinition","resource":"Observation",
+            "select":[{"column":[{"path":"id","name":"id"},{"path":"status","name":"status"}]}]});
+
+        async fn read(
+            runner: &dyn SofRunner,
+            tenant: &TenantContext,
+            view: &Value,
+        ) -> (usize, Option<SofError>) {
+            let mut stream = match runner
+                .run_view(tenant, view.clone(), ViewFilters::default())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => return (0, Some(e)),
+            };
+            let mut rows = 0usize;
+            while let Some(row) = stream.next().await {
+                match row {
+                    Ok(_) => rows += 1,
+                    Err(e) => return (rows, Some(e)),
+                }
+            }
+            (rows, None)
+        }
+
+        // No budget: the session timeout stops the statement, and it is
+        // reported as a timeout.
+        let unbudgeted = PgInDbRunner::new(fx.pool.clone());
+        let (_, failure) = read(&unbudgeted, &tenant, &view).await;
+        assert!(
+            matches!(failure, Some(SofError::Timeout(_))),
+            "the session statement timeout must end the view as a timeout, got {failure:?}"
+        );
+
+        // A budget above the session timeout lifts it for the view's statement.
+        let generous = SofRunner::with_statement_timeout(&unbudgeted, Duration::from_secs(60))
+            .expect("the PostgreSQL runner takes a statement budget");
+        let (rows, failure) = read(generous.as_ref(), &tenant, &view).await;
+        assert!(
+            failure.is_none(),
+            "a 60 s budget must outlive the read: {failure:?}"
+        );
+        assert_eq!(rows, ROWS as usize);
+
+        // A budget below the session timeout cuts the statement at the budget.
+        let tight = SofRunner::with_statement_timeout(&unbudgeted, Duration::from_millis(1))
+            .expect("the PostgreSQL runner takes a statement budget");
+        let (_, failure) = read(tight.as_ref(), &tenant, &view).await;
+        assert!(
+            matches!(failure, Some(SofError::Timeout(_))),
+            "a 1 ms budget must end the view as a timeout, got {failure:?}"
+        );
+
+        // The budget was local to each view's transaction: the pool's
+        // connections still carry the session value.
+        let client = fx.pool.get().await.expect("pool connection");
+        let session: String = client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("show statement_timeout")
+            .get(0);
+        assert_eq!(session, "50ms", "the budget leaked into the session");
+    }
+
     fn tenant() -> TenantContext {
         TenantContext::new(
             TenantId::new(format!("sof_pg_export_{}", uuid::Uuid::new_v4().simple())),

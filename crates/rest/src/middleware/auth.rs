@@ -372,6 +372,7 @@ fn patient_compartment_path_check(
     };
     let is_control = |s: &str| s.starts_with('_') || s.starts_with('$');
     match segments.as_slice() {
+        ["_history"] => refuse("system-level history"),
         // Type-level: search and create confine themselves; conditional
         // update/patch/delete resolve their target by criteria the handler
         // cannot vouch for.
@@ -589,7 +590,19 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         return None;
     }
 
-    // System-level paths
+    // System history spans every resource type, so it is a Read on the
+    // all-resource type `*`: only a wildcard-type scope (`user/*.r`,
+    // `system/*.r`) grants it, and a `patient/` wildcard is refused by
+    // `patient_compartment_path_check` because the handler cannot confine it.
+    if first == "_history" && segments.len() == 1 {
+        return Some(("*".to_string(), FhirOperation::Read));
+    }
+
+    // Other system-level paths. The ones that read or change data authorize
+    // themselves in their handlers: `$export` and `$bulk-submit` check their
+    // own scopes, `$reindex` the `system/reindex` operation scope, and
+    // `$sql-run` / `$sql-export` require a Search grant on every resource
+    // type the resolved subject reads (`handlers::sof::authz`).
     if first.starts_with('_') || first.starts_with('$') || first == "metadata" || first == "health"
     {
         return None;
@@ -608,11 +621,9 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     // batch and $export already use.
     //
     // This MUST stay an explicit allowlist. Returning None for *any* $-suffixed
-    // path would silently remove the only authorization check from every
-    // SQL-on-FHIR operation ($sql-run, $sql-run, and their
-    // -export variants) and the subscription operations — none of which run a
-    // handler-level scope check. That would let any authenticated token execute
-    // arbitrary ViewDefinitions and SQL.
+    // path would silently remove the only authorization check from the
+    // type- and instance-level operations that run no handler-level scope
+    // check of their own (the subscription operations among them).
     if segments
         .iter()
         .skip(1)
@@ -879,7 +890,20 @@ mod tests {
 
     #[test]
     fn test_extract_operation_system_history() {
-        assert!(extract_operation("/_history", "GET").is_none());
+        assert_eq!(
+            extract_operation("/_history", "GET"),
+            Some(("*".to_string(), FhirOperation::Read)),
+            "system history spans every type, so only an all-resource read grant may reach it"
+        );
+        assert_eq!(
+            extract_operation_for_routing("/acme/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
+    }
+
+    #[test]
+    fn test_patient_wildcard_cannot_reach_system_history() {
+        assert!(patient_compartment_path_check("/_history", "GET", "p1").is_err());
     }
 
     #[test]
@@ -1137,17 +1161,24 @@ mod tests {
     }
 
     #[test]
-    fn test_url_routing_system_paths_none() {
+    fn test_url_routing_system_paths() {
         // `metadata` and `_history` are reserved first segments (never stripped as
-        // tenants), so they fall through to raw classification → system-level None.
+        // tenants), so they fall through to raw classification: `metadata` is
+        // unclassified, system history is a Read on every resource type.
         assert!(extract_operation_for_routing("/metadata", "GET", true).is_none());
-        assert!(extract_operation_for_routing("/_history", "GET", true).is_none());
+        assert_eq!(
+            extract_operation_for_routing("/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
     }
 
     #[test]
-    fn test_url_routing_tenant_system_history_none() {
-        // GET /{tenant}/_history strips to /_history → system-level, no per-type authz.
-        assert!(extract_operation_for_routing("/acme/_history", "GET", true).is_none());
+    fn test_url_routing_tenant_system_history() {
+        // GET /{tenant}/_history strips to /_history → a Read on every resource type.
+        assert_eq!(
+            extract_operation_for_routing("/acme/_history", "GET", true),
+            Some(("*".to_string(), FhirOperation::Read))
+        );
     }
 
     #[test]
@@ -1241,30 +1272,21 @@ mod tests {
         assert!(extract_operation_for_routing("/acme/Patient/$purge", "POST", true).is_none());
     }
 
-    /// Guards a security regression: the SQL-on-FHIR handlers do NOT run their
-    /// own scope check, so the middleware's classification is the *only* thing
-    /// authorizing them. A blanket "any $-suffixed path returns None" rule —
-    /// which is what the first attempt at $purge/$reindex shipped — would let
-    /// any authenticated token execute arbitrary ViewDefinitions and SQL.
+    /// The SQL-on-FHIR operations are mounted at the system level only
+    /// (`/$sql-run`, `/$sql-export`), where this classifier cannot name the
+    /// resource types a request reads; their handlers check a Search grant on
+    /// every type the resolved subject names instead
+    /// (`handlers::sof::authz`, covered by
+    /// `tests/system_level_operation_scopes.rs`). Type- and instance-level
+    /// operations without a handler-level check stay classified here.
     ///
     /// If you are here because you added an entry to HANDLER_AUTHORIZED_OPS and
     /// this failed: that endpoint's handler must enforce a scope itself.
     #[test]
-    fn test_sof_and_subscription_ops_still_require_scope() {
-        assert_eq!(
-            extract_operation("/ViewDefinition/$sql-run", "POST"),
-            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
-            "SQL-on-FHIR run must still be scope-checked by the middleware"
-        );
-        assert_eq!(
-            extract_operation("/Library/$sql-run", "POST"),
-            Some(("Library".to_string(), FhirOperation::Create)),
-            "SQL query run must still be scope-checked by the middleware"
-        );
-        assert_eq!(
-            extract_operation("/ViewDefinition/123/$sql-export", "POST"),
-            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
-        );
+    fn test_sof_ops_are_handler_authorized_and_subscription_ops_still_require_scope() {
+        assert!(extract_operation("/$sql-run", "POST").is_none());
+        assert!(extract_operation("/$sql-run", "GET").is_none());
+        assert!(extract_operation("/$sql-export", "POST").is_none());
         assert!(
             extract_operation("/Subscription/123/$status", "GET").is_some(),
             "subscription operations must still be scope-checked"
