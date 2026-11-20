@@ -72,7 +72,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.build-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -110,7 +110,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -145,7 +145,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -180,7 +180,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -215,7 +215,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.integration-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 

@@ -3453,13 +3453,21 @@ async fn build_bulk_submit(
     // When a client_id + private key are configured, protected-file fetches use
     // a read-scoped `client_credentials` token; otherwise they surface a recorded
     // manifest-level error.
-    let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> =
-        match (cfg.client_id.as_deref(), cfg.private_key.as_deref()) {
-            (Some(client_id), Some(pem)) => {
-                match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new(
+    let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
+        cfg.client_id.as_deref(),
+        cfg.private_key.as_deref(),
+    ) {
+        (Some(client_id), Some(pem)) => {
+            let trusted =
+                helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
+                    .map_err(|e| {
+                        anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}")
+                    })?;
+            match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new_with_trusted_providers(
                     client_id,
                     pem,
                     &cfg.signing_alg,
+                    trusted,
                 ) {
                     Some(p) => Some(p),
                     None => anyhow::bail!(
@@ -3467,9 +3475,9 @@ async fn build_bulk_submit(
                         cfg.signing_alg
                     ),
                 }
-            }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
     // Private keys for JWE `fileEncryptionKey` material addressed to HFS
     // asymmetrically (ECDH-ES*, P-256/P-384). `dir` and the A*KW families use the
     // symmetric key the provider supplies and need no configuration.
