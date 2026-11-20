@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::DecodingKey;
@@ -30,6 +31,10 @@ pub struct JwksCache {
     last_attempt: Arc<RwLock<Instant>>,
     /// Held for the duration of a lookup-triggered fetch.
     refresh_gate: Mutex<()>,
+    /// Bumped when a lookup-triggered fetch ends, however it ends (success,
+    /// failure, or the request that ran it being dropped). A lookup that saw
+    /// it change while waiting on `refresh_gate` rides on that fetch.
+    fetches_ended: AtomicU64,
     min_refresh_interval: Duration,
 }
 
@@ -47,6 +52,7 @@ impl JwksCache {
                 Instant::now() - Duration::from_secs(min_refresh_interval_secs + 1),
             )),
             refresh_gate: Mutex::new(()),
+            fetches_ended: AtomicU64::new(0),
             min_refresh_interval: Duration::from_secs(min_refresh_interval_secs),
         }
     }
@@ -85,19 +91,32 @@ impl JwksCache {
         })
     }
 
-    /// Attempt a refresh, respecting the rate limit and a fetch in flight.
+    /// Attempt a refresh: join a fetch in flight, else respect the interval.
+    ///
+    /// The gate is taken before the interval check. `last_attempt` is armed
+    /// when a fetch starts, so checking it first would turn away the lookups
+    /// that arrive mid-fetch, including legitimate tokens naming a key the
+    /// identity provider just rotated in; waiting instead lets them read the
+    /// keys that fetch brings back. Comparing `fetches_ended` rather than the
+    /// clock also coalesces concurrent lookups when the interval is zero.
     async fn try_refresh(&self) -> Result<(), AuthError> {
+        let seen = self.fetches_ended.load(Ordering::Acquire);
+        let _flight = self.refresh_gate.lock().await;
+        if self.fetches_ended.load(Ordering::Acquire) != seen {
+            debug!("JWKS fetch finished while waiting, reading its keys");
+            return Ok(());
+        }
         if self.attempted_within_interval().await {
             debug!("JWKS refresh rate-limited, skipping");
             return Ok(());
         }
-        let _flight = self.refresh_gate.lock().await;
-        // A lookup that waited here rides on the fetch that just finished,
-        // whether it succeeded or failed.
-        if self.attempted_within_interval().await {
-            debug!("JWKS refresh just attempted by another lookup, skipping");
-            return Ok(());
+        struct Ended<'a>(&'a AtomicU64);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
         }
+        let _ended = Ended(&self.fetches_ended);
         self.refresh().await
     }
 

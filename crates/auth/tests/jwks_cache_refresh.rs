@@ -29,12 +29,16 @@ fn jwks_body() -> serde_json::Value {
     })
 }
 
+/// Counts only requests for the JWKS path, so a stray local probe of the
+/// mock server's port doesn't count as a fetch.
 async fn fetches(server: &MockServer) -> usize {
     server
         .received_requests()
         .await
         .expect("request recording is on")
-        .len()
+        .iter()
+        .filter(|request| request.url.path() == "/jwks")
+        .count()
 }
 
 #[tokio::test]
@@ -155,5 +159,94 @@ async fn a_failed_fetch_arms_the_interval() {
     assert!(
         cache.get_key(KID).await.is_ok(),
         "the keys from the last good fetch are still served"
+    );
+}
+
+/// The identity provider rotates to a new key and a burst of tokens naming it
+/// arrives once the interval has lapsed: one fetch serves them all, and the
+/// lookups that arrive while it is in flight wait for it rather than being
+/// turned away with `UnknownKid`.
+#[tokio::test]
+async fn lookups_during_a_fetch_wait_for_its_keys() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let mut rotated = jwks_body();
+    rotated["keys"][0]["kid"] = json!("rotated");
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(rotated)
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let cache = Arc::new(JwksCache::new(&format!("{}/jwks", server.uri()), 1));
+    cache.initial_fetch().await.expect("initial fetch");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Staggered so most lookups arrive after the fetch has started.
+    let lookups: Vec<_> = (0..20u64)
+        .map(|i| {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(i * 10)).await;
+                cache.get_key("rotated").await
+            })
+        })
+        .collect();
+    for lookup in lookups {
+        let outcome = lookup.await.expect("lookup task");
+        assert!(
+            outcome.is_ok(),
+            "the rotated key resolves: {:?}",
+            outcome.err()
+        );
+    }
+    assert_eq!(
+        fetches(&server).await,
+        2,
+        "one fetch served the whole burst"
+    );
+}
+
+/// A zero interval still lets concurrent unknown-kid lookups share a fetch.
+#[tokio::test]
+async fn a_zero_interval_still_coalesces_concurrent_lookups() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(jwks_body())
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let cache = Arc::new(JwksCache::new(&format!("{}/jwks", server.uri()), 0));
+    cache.initial_fetch().await.expect("initial fetch");
+
+    let lookups: Vec<_> = (0..50)
+        .map(|_| {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.get_key("unknown").await })
+        })
+        .collect();
+    for lookup in lookups {
+        let outcome = lookup.await.expect("lookup task").err();
+        assert!(
+            matches!(outcome, Some(AuthError::UnknownKid { .. })),
+            "{outcome:?}"
+        );
+    }
+    let burst = fetches(&server).await - 1;
+    assert!(
+        burst <= 2,
+        "fifty concurrent lookups cost {burst} fetches, not one each"
     );
 }
