@@ -326,6 +326,17 @@ tokio::task_local! {
     static RESULT_ID_CAP_OVERRIDE: usize;
 }
 
+/// The rows of one equal-key group an unfiltered sort walk reads before it
+/// gives the sort back to the grouped aggregate (#2601). The walk reads a whole
+/// group to order it by id, and a parameter with few distinct values (a
+/// `status`, a `gender`) has groups of hundreds of thousands of rows, which it
+/// reads at about 25 microseconds a resource against the aggregate's 2.6
+/// microseconds a row over the whole parameter (1,000,000 rows, mongo:9.0.8).
+/// The limit covers ties of several thousand rows, such as dates at day
+/// resolution, and bounds the work wasted on a sort that falls back to 16
+/// batches of rows, however deep its offset.
+const UNFILTERED_WALK_TIE_ROWS: usize = 16 * CANDIDATE_BATCH_SIZE;
+
 /// The id-set cap in force: `MAX_RESULT_ID_SET`, or a lower value a test
 /// installed with `with_result_id_cap` for the duration of one future.
 fn result_id_cap() -> usize {
@@ -3569,8 +3580,8 @@ impl MongoBackend {
                             .await?,
                     );
                 }
-                let walked = if self.walks_unfiltered_date_desc(directives) {
-                    self.unfiltered_date_desc_walk(
+                let walked = if self.walks_unfiltered_param_sort(directives) {
+                    self.unfiltered_param_sort_walk(
                         db,
                         tenant_id,
                         query,
@@ -4182,27 +4193,39 @@ impl MongoBackend {
             id_direction,
             offset,
             take,
+            None,
         )
-        .await
+        .await?
+        .ok_or_else(|| internal_error("a sort walk without a tie limit gave up".to_owned()))
     }
 
-    /// Whether an unfiltered sort can walk `idx_search_date_end` instead of
-    /// grouping every row of the parameter: a single descending `value_date`
-    /// key, with the value indexes built (#2601).
-    fn walks_unfiltered_date_desc(&self, directives: &[crate::types::SortDirective]) -> bool {
-        self.search_indexes_ready()
-            && self.date_end_index_ready()
+    /// Whether an unfiltered sort can walk its value index instead of
+    /// grouping every row of the parameter (#2601): the single-key sorts
+    /// `walks_param_sort` serves past the cap, on a parameter with a typed
+    /// value field. Every such sort has the same equivalence with the grouped
+    /// answer: a resource's first row in key order holds its `$min` (ascending)
+    /// or `$max` (descending) key, a descending date reading the range end
+    /// with null ends falling back to the start; rows without a key add no
+    /// resource, and resources with none follow in id order; ties break by id
+    /// in `id_direction`; deleted resources fail the liveness check. Types are
+    /// not special-cased: strings, tokens (by code), numbers, quantities
+    /// (by `value_quantity_value`), references and URIs all sort by the one
+    /// scalar field the grouped `$min`/`$max` reads. A parameter whose type is
+    /// unknown (the `value_string` fallback) keeps the grouped path.
+    fn walks_unfiltered_param_sort(&self, directives: &[crate::types::SortDirective]) -> bool {
+        self.walks_param_sort(directives)
             && matches!(directives, [directive]
-                if sort_value_field(directive) == "value_date"
-                    && directive.direction == crate::types::SortDirection::Descending)
+                if directive.param_type.and_then(value_field_for).is_some())
     }
 
-    /// The window of an unfiltered descending date sort, read in end order
-    /// from `idx_search_date_end` and cut after `offset + take` live ids.
-    /// `None` when that index was rejected (dropped after the readiness
-    /// check): the caller then groups the rows as before.
+    /// The window of an unfiltered single-key sort, read in key order from
+    /// the sort's value index and cut after `offset + take` live ids. `None`
+    /// when that index was rejected (dropped after the readiness check) or the
+    /// walk met an equal-key group longer than `UNFILTERED_WALK_TIE_ROWS`, as
+    /// a parameter with few distinct values has: the caller then groups the
+    /// rows as before.
     #[allow(clippy::too_many_arguments)]
-    async fn unfiltered_date_desc_walk(
+    async fn unfiltered_param_sort_walk(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
@@ -4219,8 +4242,8 @@ impl MongoBackend {
             .await?
         else {
             tracing::warn!(
-                index = SEARCH_DATE_END_INDEX,
-                "date end index rejected for the unfiltered date sort; grouping the rows"
+                parameter = %directive.parameter,
+                "sort index rejected for the unfiltered parameter sort; grouping the rows"
             );
             return Ok(None);
         };
@@ -4234,9 +4257,9 @@ impl MongoBackend {
             id_direction,
             offset,
             take,
+            Some(UNFILTERED_WALK_TIE_ROWS),
         )
         .await
-        .map(Some)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4251,7 +4274,8 @@ impl MongoBackend {
         id_direction: crate::types::SortDirection,
         offset: usize,
         take: usize,
-    ) -> StorageResult<Vec<String>> {
+        tie_limit: Option<usize>,
+    ) -> StorageResult<Option<Vec<String>>> {
         use crate::types::SortDirection;
 
         let resource_type = query.resource_type.as_str();
@@ -4261,7 +4285,7 @@ impl MongoBackend {
             .identifier_filters(&search_index, tenant_id, resource_type, &normal)
             .await?
         else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let checks = SearchChecks {
             normal,
@@ -4271,6 +4295,11 @@ impl MongoBackend {
         };
 
         let wanted = offset.saturating_add(take);
+        // With `tie_limit`, the most rows of one equal key the walk reads
+        // before it answers `None`; without it the walk reads as many as the
+        // window needs.
+        let mut tie_rows = 0usize;
+        let mut tie_key: Option<Bson> = None;
         // Every resource a row was read for, matching or not: its first row
         // held its key, so its later rows are skipped.
         let mut keyed: HashSet<String> = HashSet::new();
@@ -4281,6 +4310,20 @@ impl MongoBackend {
             while batch.len() < CANDIDATE_BATCH_SIZE {
                 match next_sort_row(&mut streams, directive.direction).await? {
                     Some((id, key)) => {
+                        if let Some(limit) = tie_limit {
+                            if tie_key
+                                .as_ref()
+                                .is_some_and(|previous| compare_sort_keys(previous, &key).is_eq())
+                            {
+                                tie_rows += 1;
+                                if tie_rows > limit {
+                                    return Ok(None);
+                                }
+                            } else {
+                                tie_rows = 1;
+                                tie_key = Some(key.clone());
+                            }
+                        }
                         if keyed.insert(id.clone()) {
                             batch.push((id, key));
                         }
@@ -4311,18 +4354,20 @@ impl MongoBackend {
             for (id, key) in batch {
                 let matches = passing.contains(&id);
                 if window.push(id, key, matches) {
-                    return Ok(window
-                        .finish()
-                        .into_iter()
-                        .skip(offset)
-                        .take(take)
-                        .collect());
+                    return Ok(Some(
+                        window
+                            .finish()
+                            .into_iter()
+                            .skip(offset)
+                            .take(take)
+                            .collect(),
+                    ));
                 }
             }
         }
         let mut window = window.finish();
         if window.len() == wanted {
-            return Ok(window.into_iter().skip(offset).take(take).collect());
+            return Ok(Some(window.into_iter().skip(offset).take(take).collect()));
         }
 
         let mut cursor = db
@@ -4372,7 +4417,7 @@ impl MongoBackend {
                 break;
             }
         }
-        Ok(window.into_iter().skip(offset).take(take).collect())
+        Ok(Some(window.into_iter().skip(offset).take(take).collect()))
     }
 
     /// The ids of `ids` that satisfy the search, in the order given: its

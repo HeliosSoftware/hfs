@@ -5,7 +5,8 @@
 //! index and gives the page the collected path gives.
 
 use super::super::super::{
-    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, with_result_id_cap,
+    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, UNFILTERED_WALK_TIE_ROWS,
+    with_result_id_cap,
 };
 use super::*;
 use crate::error::StorageError;
@@ -211,28 +212,37 @@ fn paged(sort: SortDirective, count: u32, offset: u32) -> SearchQuery {
 
 #[tokio::test]
 async fn unfiltered_param_sort_first_page_reads_a_bounded_window() {
-    let rows = CANDIDATE_BATCH_SIZE * 2;
+    // The walk reads one 512-row batch of the index and of `resources`, so the
+    // type must be several batches long for a bounded read to show. The keys
+    // are all different, descending with the id: an equal-key group is read
+    // whole (see the fallback test below).
+    let rows = CANDIDATE_BATCH_SIZE * 8;
     let Some(fixture) = Fixture::new("sort-bounded-read", rows).await else {
         return;
     };
-    let query = paged(status_sort(""), 10, 0);
+    let keys: Vec<Document> = (0..rows)
+        .map(|number| {
+            doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+            "resource_id":format!("r{number:05}"), "param_name":"family",
+            "value_string":format!("u{:05}", rows - number) }
+        })
+        .collect();
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .insert_many(keys)
+        .await
+        .unwrap();
+    let query = paged(sort_by("family", SearchParamType::String), 10, 0);
     restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
     let result = with_result_id_cap(CAP, fixture.backend.search(&fixture.tenant, &query))
         .await
         .unwrap();
     fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-    // `final` sorts before `preliminary`; ties break by id.
-    let expected: Vec<String> = sorted(
-        fixture
-            .rows
-            .iter()
-            .filter(|row| !row.deleted && row.status == "final")
-            .map(|row| row.id.clone())
-            .collect(),
-    )
-    .into_iter()
-    .take(10)
-    .collect();
+    let expected: Vec<String> = (rows - 10..rows)
+        .rev()
+        .map(|number| format!("r{number:05}"))
+        .collect();
     assert_eq!(page_ids(&result), expected);
     assert!(result.resources.page_info.has_next);
     let returned = documents_returned(&fixture.db).await;
@@ -240,6 +250,38 @@ async fn unfiltered_param_sort_first_page_reads_a_bounded_window() {
         returned < (rows / 2) as i64,
         "read {returned} documents for a page of 10 in a type of {rows}"
     );
+    fixture.close().await;
+}
+
+/// A parameter with few distinct values has equal-key groups far larger than
+/// the window, which the walk would read whole: past
+/// `UNFILTERED_WALK_TIE_ROWS` it hands the sort to the grouped aggregate.
+#[tokio::test]
+async fn unfiltered_param_sort_on_a_huge_tie_group_falls_back_to_the_grouped_aggregate() {
+    let rows = 2 * UNFILTERED_WALK_TIE_ROWS;
+    let Some(fixture) = Fixture::new("sort-tie-budget", rows).await else {
+        return;
+    };
+    let grouped = grouped_backend(&fixture);
+    // 3 in 4 are `preliminary`, so the descending head is a tie of 3/4 of the
+    // type, past the budget; the ascending head, `final`, is 1/4 and within
+    // it. The page is ordered by id inside the tie either way.
+    for (spec, groups) in [("-status", true), ("status", false)] {
+        let query = paged(sort_by(spec, SearchParamType::Token), 10, 0);
+        restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
+        let walked = answer(&fixture.backend, &fixture, &query).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            groups,
+            "_sort={spec}: the grouped aggregate runs past the tie limit only"
+        );
+        assert_eq!(
+            walked,
+            answer(&grouped, &fixture, &query).await,
+            "_sort={spec}"
+        );
+    }
     fixture.close().await;
 }
 
@@ -1288,4 +1330,351 @@ async fn unfiltered_descending_date_sort_falls_back_when_the_index_is_dropped_ho
     assert_eq!(page_ids(&result), page_ids(&expected));
     assert_eq!(result.total, expected.total);
     fixture.close().await;
+}
+
+// #2601: every typed single-key unfiltered sort walks its value index
+// instead of grouping every row of the parameter, ascending and descending.
+
+/// The sorts the walk serves, with the type the server resolves them to.
+fn walked_sorts() -> Vec<(&'static str, SearchParamType)> {
+    vec![
+        ("date", SearchParamType::Date),
+        ("status", SearchParamType::Token),
+        ("value-quantity", SearchParamType::Quantity),
+        ("family", SearchParamType::String),
+        ("probability", SearchParamType::Number),
+        ("focus", SearchParamType::Reference),
+        ("url", SearchParamType::Uri),
+    ]
+}
+
+/// Adds the rows `walked_sorts` need beyond `add_sort_rows`: a string, a
+/// number, a reference and a uri, each with many equal keys, a second value
+/// on some resources (the first in key order must win) and none on others.
+async fn add_typed_sort_rows(fixture: &Fixture) {
+    let mut rows = Vec::new();
+    for (number, row) in fixture.rows.iter().enumerate() {
+        let bucket = (number * 7) % 23;
+        let mut push = |name: &str, field: &str, value: Bson| {
+            rows.push(
+                doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                "resource_id":&row.id, "param_name":name, field:value },
+            );
+        };
+        if number % 5 != 2 {
+            push(
+                "family",
+                "value_string",
+                Bson::String(format!("f{bucket:02}")),
+            );
+            push("probability", "value_number", {
+                if number % 2 == 0 {
+                    Bson::Int32(bucket as i32)
+                } else {
+                    Bson::Double(bucket as f64 + 0.25)
+                }
+            });
+            push(
+                "focus",
+                "value_reference",
+                Bson::String(format!("Patient/p{bucket:02}")),
+            );
+            push(
+                "url",
+                "value_uri",
+                Bson::String(format!("urn:u:{bucket:02}")),
+            );
+        }
+        if number % 6 == 0 {
+            let other = (number * 11) % 29;
+            push(
+                "family",
+                "value_string",
+                Bson::String(format!("f{other:02}")),
+            );
+            push(
+                "probability",
+                "value_number",
+                Bson::Double(other as f64 + 0.5),
+            );
+            push(
+                "focus",
+                "value_reference",
+                Bson::String(format!("Patient/p{other:02}")),
+            );
+            push(
+                "url",
+                "value_uri",
+                Bson::String(format!("urn:u:{other:02}")),
+            );
+            // A second `status` value in key order on top of the fixture's.
+            push(
+                "status",
+                "value_token_code",
+                Bson::String(format!("s{other:02}")),
+            );
+        }
+    }
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .insert_many(rows)
+        .await
+        .unwrap();
+}
+
+/// A backend on the fixture's database that never verified its indexes, so
+/// every parameter sort groups the rows (the oracle of the walk).
+fn grouped_backend(fixture: &Fixture) -> MongoBackend {
+    let mut config = fixture.backend.config().clone();
+    config.index_build = IndexBuildMode::Off;
+    let backend = MongoBackend::new(config).unwrap();
+    assert!(!backend.search_indexes_ready());
+    backend
+}
+
+fn unfiltered_sort(spec: &str, param_type: SearchParamType, offset: u32) -> SearchQuery {
+    let mut query = paged(sort_by(spec, param_type), 10, offset);
+    query.total = Some(TotalMode::Accurate);
+    query
+}
+
+/// What a search answered: its page, `has_next` and total.
+async fn answer(
+    backend: &MongoBackend,
+    fixture: &Fixture,
+    query: &SearchQuery,
+) -> (Vec<String>, bool, Option<u64>) {
+    let result = with_result_id_cap(WIDE, backend.search(&fixture.tenant, query))
+        .await
+        .unwrap();
+    (
+        page_ids(&result),
+        result.resources.page_info.has_next,
+        result.total,
+    )
+}
+
+fn both_directions() -> Vec<(String, SearchParamType)> {
+    walked_sorts()
+        .into_iter()
+        .flat_map(|(name, param_type)| {
+            [
+                (name.to_owned(), param_type),
+                (format!("-{name}"), param_type),
+            ]
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn unfiltered_param_sorts_walk_and_match_the_grouped_pages() {
+    let Some(mut fixture) = Fixture::new("sort-unfiltered-walk-parity", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    add_typed_sort_rows(&fixture).await;
+    // Stale index rows of deleted resources must not take page slots.
+    fixture.mark_deleted(1, 20).await;
+    let grouped = grouped_backend(&fixture);
+    for (spec, param_type) in both_directions() {
+        for offset in [0u32, 10, 40, 200] {
+            let query = unfiltered_sort(&spec, param_type, offset);
+            let label = format!("_sort={spec} offset {offset}");
+            let walked = answer(&fixture.backend, &fixture, &query).await;
+            let expected = answer(&grouped, &fixture, &query).await;
+            assert_eq!(walked.0, expected.0, "{label}: page");
+            assert_eq!(walked.1, expected.1, "{label}: has_next");
+            assert_eq!(walked.2, expected.2, "{label}: total");
+        }
+    }
+    fixture.close().await;
+}
+
+/// Pages around the end of the keyed prefix and of the live set agree, with
+/// and without a total, for every walked sort.
+#[tokio::test]
+async fn unfiltered_param_sorts_match_at_the_keyed_keyless_boundary() {
+    let Some(mut fixture) = Fixture::new("sort-unfiltered-walk-boundary", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    add_typed_sort_rows(&fixture).await;
+    fixture.mark_deleted(1, 20).await;
+    let live_ids: HashSet<String> = fixture
+        .rows
+        .iter()
+        .filter(|row| !row.deleted)
+        .map(|row| row.id.clone())
+        .collect();
+    let live = live_ids.len();
+    let grouped = grouped_backend(&fixture);
+    for (spec, param_type) in both_directions() {
+        let name = spec.trim_start_matches('-');
+        let keyed: HashSet<String> = fixture
+            .db
+            .collection::<Document>("search_index")
+            .distinct("resource_id", doc! { "param_name": name })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|id| id.as_str().map(ToOwned::to_owned))
+            .filter(|id| live_ids.contains(id))
+            .collect();
+        let keyed = keyed.len();
+        // `status` is on every resource: it has no keyless tail, its keyed
+        // prefix ends where the live set does.
+        assert!(
+            keyed < live || name == "status",
+            "_sort={spec}: the fixture needs a keyless tail"
+        );
+        let mut offsets = vec![live - 10, live - 9, live, live + 1];
+        if keyed < live {
+            offsets.extend([keyed - 10, keyed - 9, keyed - 1, keyed, keyed + 1]);
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        for total in [TotalMode::None, TotalMode::Accurate] {
+            for &offset in &offsets {
+                let mut query = unfiltered_sort(&spec, param_type, offset as u32);
+                query.total = Some(total);
+                let label = format!("_sort={spec} offset {offset} total {total:?}");
+                let walked = answer(&fixture.backend, &fixture, &query).await;
+                let expected = answer(&grouped, &fixture, &query).await;
+                assert_eq!(walked.0, expected.0, "{label}: page");
+                assert_eq!(walked.1, expected.1, "{label}: has_next");
+                assert_eq!(walked.2, expected.2, "{label}: total");
+                assert_eq!(
+                    walked.1,
+                    offset + walked.0.len() < live,
+                    "{label}: has_next against the live count"
+                );
+            }
+        }
+    }
+    fixture.close().await;
+}
+
+async fn sort_key_group_commands(db: &mongodb::Database) -> Vec<Document> {
+    collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "command.pipeline.$group.key0": { "$exists": true } })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// No sort-key `$group` runs for a walked sort, and its value index is
+/// hinted; the grouped backend is the positive control for the `$group`.
+#[tokio::test]
+async fn unfiltered_param_sorts_do_not_group_the_parameter() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-walk-no-group", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    add_typed_sort_rows(&fixture).await;
+    let grouped = grouped_backend(&fixture);
+    for (spec, param_type) in both_directions() {
+        let query = unfiltered_sort(&spec, param_type, 0);
+        let directive = sort_by(&spec, param_type);
+        // A descending date walks the end index, the rest the value index.
+        let index = if spec == "-date" {
+            SEARCH_DATE_END_INDEX
+        } else {
+            crate::backends::mongodb::search_index_catalog::value_index_led_by(
+                super::super::super::sort_value_field(&directive),
+            )
+            .unwrap()
+        };
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        with_result_id_cap(WIDE, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert!(hinted(&fixture.db, index).await, "_sort={spec}: {index}");
+        let found = sort_key_group_commands(&fixture.db).await;
+        assert!(
+            found.is_empty(),
+            "_sort={spec}: the sort-key $group ran for the walk: {found:?}"
+        );
+
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        with_result_id_cap(WIDE, grouped.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            "_sort={spec}: the sort-key $group must run on the grouped path"
+        );
+    }
+    fixture.close().await;
+}
+
+/// A sort whose parameter type is unknown (the `value_string` fallback) and a
+/// sort on two keys keep the grouped aggregate.
+#[tokio::test]
+async fn unfiltered_param_sorts_without_a_typed_single_key_stay_grouped() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-walk-untyped", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    let untyped = paged(SortDirective::parse("date"), 10, 0);
+    let two_keys = paged(sort_by("date", SearchParamType::Date), 10, 0)
+        .with_sort(sort_by("status", SearchParamType::Token));
+    for (label, query) in [("untyped", untyped), ("two keys", two_keys)] {
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        with_result_id_cap(WIDE, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            "{label}: the grouped aggregate must run"
+        );
+    }
+    fixture.close().await;
+}
+
+/// The running backend still believes the index is built when it is dropped:
+/// the sort answers from the grouped aggregate instead of failing.
+#[tokio::test]
+async fn unfiltered_param_sorts_fall_back_when_their_index_is_dropped_hot() {
+    for (spec, param_type) in [
+        ("date", SearchParamType::Date),
+        ("-status", SearchParamType::Token),
+        ("family", SearchParamType::String),
+        ("-value-quantity", SearchParamType::Quantity),
+    ] {
+        let Some(fixture) = Fixture::new("sort-unfiltered-walk-hot-drop", 300).await else {
+            return;
+        };
+        add_sort_rows(&fixture).await;
+        add_typed_sort_rows(&fixture).await;
+        let directive = sort_by(spec, param_type);
+        let index = crate::backends::mongodb::search_index_catalog::value_index_led_by(
+            super::super::super::sort_value_field(&directive),
+        )
+        .unwrap();
+        let query = unfiltered_sort(spec, param_type, 10);
+        let expected = answer(&fixture.backend, &fixture, &query).await;
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .drop_index(index)
+            .await
+            .unwrap();
+        assert!(fixture.backend.search_indexes_ready());
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let result = answer(&fixture.backend, &fixture, &query).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(result, expected, "_sort={spec}: the dropped index {index}");
+        assert!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            "_sort={spec}: the grouped aggregate must answer"
+        );
+        fixture.close().await;
+    }
 }

@@ -405,7 +405,7 @@ Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) u
 
 For standard searches without `:missing` or `:not` siblings, the planner picks, for each value, the non-`ne` component its bounded probe finds smallest (when every arm exceeds 10,000 rows, the saturated arms are recounted at doubling limits up to 100,000; the first one when none of those finishes). That arm only discovers candidates: bounded candidate ids, pages in resource order, or batches in id order, as for any other parameter. Every batch is then checked against all components within the same `composite_group`, through finds hinted onto `idx_search_composite` and bounded to the batch's ids. These planned composite searches do not collect every matching id and do not stop at 300,000 matches (#1896). Totals stay exact, so `_total=accurate` and counts still read every match. Some composite searches keep the earlier candidate collector and its 300,000-id cap: those with a `:missing` or `:not` sibling, a `_sort` on a search parameter, or a positive `_id` condition (literal, or resolved from a chain, `_has` or `_list`), and pages that no bounded plan serves. The last are broad pages, whose discovery arm is too wide for candidate ids, that sort by anything other than none, `_lastUpdated`, `_lastUpdated,_id` or a single `_id` (for example `_sort=_id,_lastUpdated`), and broad pages before the search indexes report ready that are neither a count nor sorted by `_id` alone. The collector drives from the component filter with the lowest probe count and pair-checks 512-id batches through the same hinted finds. A resource-order page whose first batches match rarely can still ask the collector for its id set, as for any parameter; when that set is over the cap, the page resumes the scan instead of returning 422. A `_sort=_id` composite page groups the discovery arm's rows on the server before its first batch, so its server-side cost follows the size of that arm. Positive reference `:identifier` (resolved to its targets first) and compartment membership are planned as plain filters, and a compartment can drive. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite and PostgreSQL unfolded composite rows now retain these per-type slots too (SQLite schema 38, PostgreSQL schema 48), so repeated-type ordinary and contained SQL searches preserve positions. PostgreSQL ordinary Denormalized searches retain folded rows with at most two Token or Number components and one of each other family; shapes beyond that remain unsupported for ordinary or `_contained=both` searches and cannot be repaired by reindexing. Its Legacy reader accepts slotted unfolded rows and valid transitional folded Token/Number rows. Contained SQL searches use unfolded rows in either layout.
 
-Bounded complement and unfiltered sort (#2285): a `:not` or `:missing=true` search with no positive parameter, with or without a compartment, no longer loads every live id of the type. It walks a cursor in 512-id batches (live resources, or compartment rows checked for liveness), filters each batch with the same `:missing`, `:not` and compartment checks, and stops as soon as more than 300,000 ids match. Past that cap, a search with a query plan falls back to the plan; one without a plan answers 422. Memory is bounded by the cap plus one batch whatever the size of the type; time is still proportional to the type when the complement is small, and is bounded by `HFS_MONGODB_SEARCH_TIMEOUT_MS`. A `_sort` by a search parameter with no filter asks the server for only the first `offset + _count + 1` ids (resources without a sort key come after those that have one, in id order) and answers 422 when `offset + _count` exceeds 300,000. These sorts issue no page cursor, so `_offset` is the only way to page; add a filter to reach deeper. `_total` is counted only when requested. No index is added or changed, so write cost and storage are unchanged.
+Bounded complement and unfiltered sort (#2285): a `:not` or `:missing=true` search with no positive parameter, with or without a compartment, no longer loads every live id of the type. It walks a cursor in 512-id batches (live resources, or compartment rows checked for liveness), filters each batch with the same `:missing`, `:not` and compartment checks, and stops as soon as more than 300,000 ids match. Past that cap, a search with a query plan falls back to the plan; one without a plan answers 422. Memory is bounded by the cap plus one batch whatever the size of the type; time is still proportional to the type when the complement is small, and is bounded by `HFS_MONGODB_SEARCH_TIMEOUT_MS`. A `_sort` by a typed search parameter with no filter walks the sort's value index (see [Sorting past 300,000 matches](#sorting-past-300000-matches-generation-7)); otherwise it asks the server for only the first `offset + _count + 1` ids (resources without a sort key come after those that have one, in id order) and answers 422 when `offset + _count` exceeds 300,000. These sorts issue no page cursor, so `_offset` is the only way to page; add a filter to reach deeper. `_total` is counted only when requested. No index is added or changed, so write cost and storage are unchanged.
 
 SQL's legacy guard is conservative for positional matching of the parameter: any ambiguous unfolded row in the tenant/type/parameter and requested top-level or contained scope causes a named 400 asking for `$reindex`, even for a value with no matches or count zero. Ordinary composite `:missing=true|false` is presence-only and bypasses SQL positional shape checks and legacy-slot probes; contained `:missing` remains unsupported. MongoDB's guard below is value-dependent. SQL startup builds sparse legacy-probe indexes; PostgreSQL's ordinary family-aware probes are created only when initializing Legacy, while its contained probe exists in both layouts. These builds can lengthen the first startup after upgrading. See [SQL composite upgrade recovery](../README.md#sql-composite-slots-and-upgrade-recovery).
 
@@ -435,14 +435,44 @@ and the range end for a descending date). If collection exceeds 300,000
 matches, the supported single-key sorts instead walk the sort parameter's
 value index (#2588). A descending date uses `idx_search_date_end`.
 
-An unfiltered descending date sort (`_sort=-date` with no other parameter)
-skips the collection step entirely when `idx_search_date_end` is built (#2601).
-It runs the same walk with no filters and stops after `offset + _count + 1`
-live ids, instead of grouping every row of the parameter with `$max` and
-sorting the result. Ids, tie order, missing-value placement, `has_next` and
-the total are the same as the grouped path, which still serves the request
-when the index is missing, still building, or dropped while running. Ascending
-date sorts and other parameter types are not changed.
+An unfiltered sort by one typed search parameter (`_sort=<param>` or
+`_sort=-<param>` with no other parameter) skips the collection step entirely
+when the parameter's value index is built (#2601). It runs the same walk with
+no filters and stops after `offset + _count + 1` live ids, instead of grouping
+every row of the parameter with `$min`/`$max` and sorting the result. Ids, tie
+order, missing-value placement, `has_next` and the total are the same as the
+grouped path, which still serves the request when the index is missing, still
+building, or dropped while running.
+
+The walk serves both directions of every type with a value field: date
+(ascending by start through `idx_search_date_v3`, descending by end through
+`idx_search_date_end`, once the full build is done), string, token (by code),
+number, quantity (by `value_quantity_value`), reference and uri. They are
+equivalent to the grouped answer for one reason: the first row of a resource in
+key order holds its `$min` (ascending) or `$max` (descending), so the walk keeps
+each resource at its first row and ignores its later ones, however many values
+it has.
+
+No offset guard is needed: on 1,000,000 rows the walk is cheaper than the grouped
+path at every offset up to the cap, though it makes more round trips (one
+liveness batch per 512 keyed rows). Page 1 of an ascending date sort dropped
+from about 2.6 s to 10 ms, an offset of 100,000 from 10.4 s to 2.2 s, and an
+offset of 290,000 from 19.2 s to 8.1 s (mongo:9.0.8, dates at second resolution).
+
+The walk does have a guard on the equal-key groups it reads whole. A parameter
+with few distinct values (`status`, `gender`) has a group of hundreds of
+thousands of rows at the head of the order, which the walk reads at about 25
+microseconds per resource, against about 2.6 microseconds per row for the grouped
+aggregate over the whole parameter. The unfiltered walk therefore stops at the
+first group of more than `UNFILTERED_WALK_TIE_ROWS` (8,192) rows and hands the
+request to the grouped aggregate, which answers with the same page. Ties of a few
+thousand rows, such as dates at day resolution, stay on the walk. The abandoned
+walk costs about 0.2 to 0.4 s at offset 0 and about 0.7 s at offset 100,000 on top of the
+2 to 8 s of the aggregate (1,000,000 rows, `status` of three values).
+
+These keep the grouped path: a sort whose parameter type is unknown
+(the `value_string` fallback), composite and special parameters, and sorts on
+more than one key.
 
 The walk reads rows in value order. The first row for a resource supplies
 its sort key; later rows for that resource are ignored. Membership and
@@ -471,7 +501,8 @@ Existing value-index plans remain usable while the new date-end index is
 built, provided their actual index definitions and required maintenance
 are verified. The new descending-date walk, the unfiltered `-date` walk and the `idx_search_date_end` hint of `gt`, `ge` and `ne` date filters wait for the full
 build: until then those filters keep the `idx_search_date_v3` hint and the
-unfiltered `-date` sort keeps the grouped path. If the walk's required
+unfiltered `-date` sort keeps the grouped path (the other unfiltered sorts need
+only their existing value index). If the walk's required
 indexes are unavailable, an over-cap sort keeps the 422 response. Other
 within-cap searches keep their existing execution path.
 
