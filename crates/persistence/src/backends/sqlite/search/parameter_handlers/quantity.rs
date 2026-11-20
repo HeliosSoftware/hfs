@@ -56,7 +56,7 @@ impl QuantityHandler {
                 &format!("{table}value_quantity_value"),
                 &format!("{table}value_quantity_high"),
                 &predicate,
-                |v| Some(v),
+                Some,
                 param_num,
             )
             .expect("the identity mapping never fails");
