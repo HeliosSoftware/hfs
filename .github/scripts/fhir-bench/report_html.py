@@ -46,17 +46,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LEG_FILES = ("runner-info.txt", "import.json", "crud.json", "search.json", "sql-run.json", "insert.json",
              "prewarm.json", "host-contention.txt", "bulk-import.txt")
 
-# v8 colours of the six known legs (validated with the dataviz palette validator).
+# Colours of the six known legs, the single source for the HTML report (it reads them from D.palette): six separate
+# hues, each +Elasticsearch leg with its own hue (not a tint of its database), chosen for contrast against each theme's
+# surface and for min pairwise deltaE2000 also under protan/deutan simulation. The report adds a marker shape per leg.
 PAL_KNOWN = {
-    "dark": {"postgres": "#236bcf", "sqlite": "#008622", "mongodb": "#9348b1",
-             "postgres-elasticsearch": "#4a91f8", "sqlite-elasticsearch": "#3fac4a",
-             "mongodb-elasticsearch": "#b96dd8"},
-    "light": {"postgres": "#1a52a1", "sqlite": "#036819", "mongodb": "#723789",
-              "postgres-elasticsearch": "#4780d2", "sqlite-elasticsearch": "#419547",
-              "mongodb-elasticsearch": "#9f63b9"}}
-# Hues for any other backend, cycled in the order of the sorted backend names.
-PAL_EXTRA = {"dark": ["#c9a227", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
-             "light": ["#8a6d00", "#a63a6e", "#16757c", "#a8501a", "#5b6785", "#4a7a1c"]}
+    "dark": {"postgres": "#6cb6ff", "sqlite": "#2f9226", "mongodb": "#8f5aec",
+             "postgres-elasticsearch": "#e3c94a", "sqlite-elasticsearch": "#e8829b",
+             "mongodb-elasticsearch": "#6ff5e4"},
+    "light": {"postgres": "#0a35cc", "sqlite": "#2b5f0c", "mongodb": "#8a7bff",
+              "postgres-elasticsearch": "#9a9100", "sqlite-elasticsearch": "#8a1550",
+              "mongodb-elasticsearch": "#2a9488"}}
+# Hues for any other backend, cycled in the order of the sorted backend names (kept away from the six above).
+PAL_EXTRA = {"dark": ["#756657", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
+             "light": ["#8a6d00", "#d94b78", "#16757c", "#a8501a", "#5b6785", "#6b725f"]}
 KNOWN_BASES = ("postgres", "sqlite", "mongodb")
 
 
@@ -685,6 +687,39 @@ def load_history(trend_dir):
     return out
 
 
+# ── branch trend (Compare branches): other branches' runs, from branch_data.py --out-dir ──
+BRANCH_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+")  # release tags never appear here (they have the version trend)
+
+
+def load_branch_manifest(branch_dir):
+    """{run id: {"branch", "date", "number"}} of branch_data.py's branches.json, or {}."""
+    try:
+        with open(os.path.join(branch_dir, "branches.json"), encoding="utf-8") as fh:
+            m = json.load(fh)
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def branch_trends(leg, history, manifest, run, cur_branch, trend_max=TREND_MAX):
+    """{branch: [points oldest first]} of `leg` in other branches' runs: the branch comes from the manifest, else
+    the point; the current run, the current branch and release tags are skipped; at most trend_max - 1 points (the
+    newest) per branch; only branches with at least one point for this leg."""
+    by = {}
+    for name, doc in history:
+        pt = history_point(leg, name, doc)
+        if pt is None or str(pt["run"]) == str(run):
+            continue
+        meta = manifest.get(str(pt["run"])) or manifest.get(str(name)) or {}
+        br = meta.get("branch") or pt.get("branch") or doc.get("ref") or ""
+        if not br or br == cur_branch or BRANCH_TAG_RE.match(br):
+            continue
+        pt["branch"] = br
+        by.setdefault(br, []).append(pt)
+    keep = max(1, trend_max - 1)
+    return {b: sorted(p, key=run_key)[-keep:] for b, p in sorted(by.items())}
+
+
 REF_METRICS = ("search", "crud", "insert", "sql-run", "sql_rows", "import",
                "bulk.rps", "bulk.total", "bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
 MODE_METRICS = ("bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
@@ -805,7 +840,7 @@ def _hex_mix(a, b, t):
 
 
 def palette(order):
-    """{theme: {leg: hex}}: v8 colours for the six known legs, a stable cycle for any other backend;
+    """{theme: {leg: hex}}: PAL_KNOWN for the six known legs, a stable cycle for any other backend;
     the +Elasticsearch variant of an unknown backend is a lighter tint of its base colour."""
     bases = sorted({l[:-len("-elasticsearch")] if l.endswith("-elasticsearch") else l for l in order}
                    - set(KNOWN_BASES))
@@ -869,6 +904,12 @@ def build_data(a):
         pt = trend_point(l, dict(legs[l], run=run, ref=a.branch or legs[l]["ref"]))
         legs[l]["point"] = pt
         legs[l]["prev"], legs[l]["trend"], legs[l]["prev_by"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
+    bdir = getattr(a, "branch_trend_dir", None)
+    bhistory, bmanifest = (load_history(bdir), load_branch_manifest(bdir)) if bdir else ([], {})
+    cur_branch = a.branch or first.get("ref") or ""
+    for l in order:
+        legs[l]["trend_branches"] = branch_trends(l, bhistory, bmanifest, run, cur_branch,
+                                                  getattr(a, "trend_max", TREND_MAX))
     version = a.branch if version_key(a.branch) else None
     vhistory = load_history(getattr(a, "version_dir", None)) if version else []
     for l in order:
@@ -944,6 +985,8 @@ def main(argv=None):
     ap.add_argument("--dump-json")
     ap.add_argument("--trend-dir")
     ap.add_argument("--trend-max", type=int, default=TREND_MAX, help="most runs (including this one) charted per leg")
+    ap.add_argument("--branch-trend-dir", help="<run id>/report-data.json and branches.json of other branches' runs "
+                    "(branch_data.py --out-dir), for Compare branches in the trend")
     ap.add_argument("--version-dir", help="<run id>/report-data.json of earlier release-tag runs (history.py "
                     "--version-dir); read only when --branch is a release tag vX.Y.Z")
     ap.add_argument("--version-max", type=int, default=VERSION_MAX,
@@ -960,7 +1003,8 @@ def main(argv=None):
         a = argparse.Namespace(run_dir="", run_id="", repo="", branch="", sha="", out="fhir-bench-report.html",
                                dump_json=None, trend_dir=None, no_shapes=True, headline_leg=None,
                                docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None,
-                               trend_max=TREND_MAX, version_dir=None, version_max=VERSION_MAX)
+                               trend_max=TREND_MAX, version_dir=None, version_max=VERSION_MAX,
+                               branch_trend_dir=None)
     text, data, size_legs = None, None, 0
     try:
         data = build_data(a)
@@ -973,7 +1017,8 @@ def main(argv=None):
         try:
             dump = dict(data) if data else {"run": a.run_id, "legs": {}, "order": []}
             dump.pop("timing_view", None)
-            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "vtrend", "prev", "prev_by")}
+            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "vtrend", "prev", "prev_by",
+                                                                         "trend_branches")}
                             for l, lg in dump["legs"].items()}
             with open(a.dump_json, "w", encoding="utf-8") as fh:
                 json.dump(dump, fh, ensure_ascii=False, separators=(",", ":"))

@@ -96,7 +96,7 @@ class SyntheticRun(unittest.TestCase):
         for leg in self.data["order"]:
             self.assertIn(leg, self.html)
         pal = self.data["palette"]["dark"]
-        self.assertEqual(pal["sqlite"], "#008622")  # v8 colour kept
+        self.assertEqual(pal["sqlite"], "#2f9226")  # PAL_KNOWN, the single source of the leg colours
         self.assertEqual(len(set(pal.values())), 3)
 
     def test_sql_run_section(self):
@@ -382,9 +382,108 @@ class LegacyTrend(unittest.TestCase):
         t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
         fn = t[t.index("function trendPanel"):t.index("const trendOf")]
         self.assertIn('idxSeries = key==="bulk" || key==="bulk_index"', fn)
-        self.assertIn('!bad(T[i-1])&&!bad(T[i])', fn)
+        # the join goes to the nearest earlier point with a value, still never to or from a bad point
+        self.assertIn('sameMode(s.P[j],p)&&!bad(s.P[j])&&!bad(p)', fn)
         self.assertIn('fill="var(--surface)" stroke="${col}"', fn)
         self.assertIn('m += "‡"', fn)
+
+    def test_trend_join_skips_gaps_dotted_and_never_over_a_bad_point(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        fn = t[t.index("function trendPanel"):t.index("const trendOf")]
+        self.assertIn("if(!p || (!ok(s.v[i]) && !bad(p))) continue;", fn)  # a bad point is never skipped over
+        self.assertIn("j = i;", fn)
+        self.assertIn("if(!s.br || s.P[k]) gap = true;", fn)
+        self.assertIn("${gap?gapDash:ld}", fn)
+        self.assertIn('gapDash = \' stroke-dasharray="1 5"', fn)
+
+    def test_six_distinct_leg_colours_per_theme_and_clear_pressed_state(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        sys.path.insert(0, HERE)
+        import report_html  # PAL_KNOWN is the single source; the template only reads D.palette
+        legs = ("postgres", "postgres-elasticsearch", "sqlite", "sqlite-elasticsearch", "mongodb", "mongodb-elasticsearch")
+        for theme in ("dark", "light"):
+            cols = report_html.PAL_KNOWN[theme]
+            self.assertEqual(sorted(cols), sorted(legs), theme)
+            self.assertFalse(set(report_html.PAL_EXTRA[theme]) & set(cols.values()), theme)
+            self.assertEqual(len(set(cols.values())), 6, theme)
+            br = re.search(r"const BRPAL = \{.*?%s:\[([^\]]*)\]" % theme, t).group(1)
+            self.assertFalse(set(re.findall(r"#[0-9a-f]{6}", br)) & set(cols.values()), theme)
+        self.assertIn("const LEGPAL = {dark: Object.assign({}, (D.palette||{}).dark), light: Object.assign({}, (D.palette||{}).light)};", t)
+        self.assertNotIn("LEGPAL_FIX", t)
+        self.assertIn("function onOf(", t)
+        self.assertIn('r.setProperty("--on-leg-"+l, onColor(legCol(l)))', t)
+        css = t[t.index("<style>"):t.index("</style>")]
+        self.assertIn('.seg button[aria-pressed]::before{content:"✓"', css)
+        self.assertIn("visibility:hidden}", css)  # the check's space is always reserved
+        self.assertIn('.seg button[aria-pressed="true"]{background:var(--c,var(--accent))', css)
+        self.assertIn('.seg button[aria-pressed="false"]{background:transparent;border-color:var(--border);color:var(--muted)}', css)
+        self.assertIn('.seg button[aria-pressed="false"] .dot{background:transparent', css)
+        self.assertIn(".seg button:focus-visible", css)
+        self.assertEqual(t.count("--on:var(--on-leg-${esc(l)})"), 2)
+
+    def test_pinned_leg_colours_shapes_y_axis_and_zoom_dialog(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        pinned = {"dark": {"postgres": "#6cb6ff", "postgres-elasticsearch": "#e3c94a", "sqlite": "#2f9226",
+                           "sqlite-elasticsearch": "#e8829b", "mongodb": "#8f5aec", "mongodb-elasticsearch": "#6ff5e4"},
+                  "light": {"postgres": "#0a35cc", "postgres-elasticsearch": "#9a9100", "sqlite": "#2b5f0c",
+                            "sqlite-elasticsearch": "#8a1550", "mongodb": "#8a7bff", "mongodb-elasticsearch": "#2a9488"}}
+        sys.path.insert(0, HERE)
+        import report_html
+        br = t[t.index("const BRPAL = {"):].split("\n", 1)[0]
+        for theme, cols in pinned.items():
+            self.assertEqual(report_html.PAL_KNOWN[theme], cols, theme)
+        self.assertFalse(set(re.findall(r"#[0-9a-f]{6}", br)) & {c for v in pinned.values() for c in v.values()})
+        self.assertEqual(len(set(re.findall(r"#[0-9a-f]{6}", br))), 8)
+        mk = t[t.index("function marker("):t.index("const dash = ")]
+        for shape in ('"circle"', '"diamond"', '"square"', '"cross"', '"triangle"', '"triangle-down"'):
+            self.assertIn(shape, t[t.index("const LEG_SHAPE"):t.index("function marker(")])
+        for shape in ('sh==="diamond"', 'sh==="square"', 'sh==="triangle"', 'sh==="triangle-down"', 'sh==="cross"', "<circle"):
+            self.assertIn(shape, mk)
+        self.assertIn("function niceStep(", t)
+        self.assertIn("function axisFmt(", t)
+        fn = t[t.index("function trendPanel"):t.index("const trendOf")]
+        self.assertIn("const fit = sel.yfit && (sel.cmp || big);", fn)
+        self.assertIn("niceStep(hi-lo, nInt)", fn)
+        self.assertIn("axisFmt(v, ys)", fn)
+        self.assertIn("el.dataset.big", fn)
+        self.assertIn('data-yfit="1" aria-pressed="${sel.yfit}"', t)
+        # † ‡ stay painted on the point when its value label is not shown
+        self.assertIn('else if(m) b += txt(x, y-9, m,', fn)
+        self.assertIn('<dialog id="zoomDlg"', t)
+        self.assertIn("showModal()", t)
+        self.assertIn('data-xp="${prefix}-${k}"', t)
+        self.assertIn('aria-label="Enlarge chart: ${esc(t)}"', t)
+        self.assertIn("if(e.target===dlg) dlg.close();", t)
+        self.assertIn('if($("zoomDlg").open) $("zoomDlg").close();', t)
+
+    def test_trend_date_labels_thinned_from_the_last(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        fn = t[t.index("function trendPanel"):t.index("const trendOf")]
+        self.assertIn("dk = Math.max(1, Math.ceil(50/step)), dlab = !byVersion && (N-1-i)%dk===0;", fn)
+        self.assertIn("if(dlab || vlab) b += txt(", fn)
+
+    def test_template_layout_nav_and_multi_leg_trend(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        body = t[t.index("<body>"):t.index("<script>\n\"use strict\"")]
+        self.assertLess(body.index('id="results"'), body.index('<section id="trend-section">'))
+        self.assertLess(body.index('<section id="trend-section">'), body.index('<section id="detail">'))
+        trend = body[body.index('<section id="trend-section">'):body.index('<section id="detail">')]
+        for i in ("trendTitle", "segTrend", "trendNote", "trend", "trendCtx", "trendHost"):
+            self.assertIn('id="%s"' % i, trend)
+        nav = body[body.index('<nav class="toc"'):body.index("</nav>")]
+        targets = re.findall(r'href="#([^"]+)"', nav)
+        for i in ("summary-section", "validity-section", "results", "headTitle", "thrTitle", "latTitle",
+                  "trend-section", "detail", "timelineTitle", "bulkTitle", "batchTitle", "batchLatTitle",
+                  "impcmpTitle", "sqlBlock", "shapeBlock", "data", "healthTitle", "countsTitle", "glossary"):
+            self.assertIn(i, targets)
+        for i in targets:
+            self.assertEqual(body.count('id="%s"' % i), 1, i)
+        self.assertEqual(t.count('<nav class="toc"'), 1)
+        self.assertIn("function segMulti(", t)
+        self.assertIn('segMulti("segTrend","trend"', t)
+        self.assertIn("trend: FIRST ? [FIRST] : []", t)
+        self.assertIn("IntersectionObserver", t)
+        self.assertIn("function syncToc(", t)
 
     def test_trend_point_carries_index_mode(self):
         pt = self.R.trend_point("sqlite", self.leg(self.bulk(index_inline=True, index_status="inline")))
@@ -585,6 +684,45 @@ class LegacyTrend(unittest.TestCase):
         d2["legs"]["sqlite"]["point"].pop("markers")
         _, tr, _ = self.R.leg_trend("sqlite", cur, [(n2, d2)], "30")
         self.assertIs([t for t in tr if t["run"] == "28"][0]["index_inline"], True)
+
+    def test_branch_trend_dir_feeds_trend_branches_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            cur, hist, bdir = os.path.join(t, "cur"), os.path.join(t, "hist"), os.path.join(t, "branches")
+            make_leg(cur, "sqlite", False)
+            self.hist(hist, "20", "report-data.json", self.pt("20"))
+            branch_of = {"30": "main", "31": "main", "32": "fix/y", "33": "feature/x", "34": "v0.2.9", "35": None}
+            for rid, br in branch_of.items():
+                p = self.pt(rid)
+                p["branch"] = br or "from-point"
+                self.hist(bdir, rid, "report-data.json", p)
+            for i in range(40, 49):  # more than trend_max - 1 points of one branch
+                p = self.pt(str(i))
+                p["date"] = "2026-11-%02dT10:00:00Z" % (i - 30)
+                self.hist(bdir, str(i), "report-data.json", p)
+            with open(os.path.join(bdir, "branches.json"), "w", encoding="utf-8") as fh:
+                json.dump({rid: {"branch": br} for rid, br in branch_of.items() if br}, fh)
+            out, dump = os.path.join(t, "o.html"), os.path.join(t, "d.json")
+            base = ["--run-dir", cur, "--run-id", "777", "--branch", "feature/x", "--trend-dir", hist, "--no-shapes"]
+            r = run(base + ["--out", out, "--dump-json", dump, "--branch-trend-dir", bdir, "--trend-max", "4"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            html = open(out, encoding="utf-8").read()
+            data = json.loads(html.split("const D = ", 1)[1].split(";\n", 1)[0])
+            tb = data["legs"]["sqlite"]["trend_branches"]
+            self.assertEqual(sorted(tb), ["fix/y", "from-point", "main"])  # no current branch, no tag
+            self.assertEqual([p["run"] for p in tb["main"]], ["46", "47", "48"])  # newest trend_max - 1
+            self.assertEqual([p["run"] for p in tb["fix/y"]], ["32"])
+            self.assertNotIn("trend_branches", json.load(open(dump))["legs"]["sqlite"])
+            # the branch trend itself does not change
+            r = run(base + ["--out", os.path.join(t, "p.html"), "--trend-max", "4"])
+            plain = json.loads(open(os.path.join(t, "p.html"), encoding="utf-8").read().split("const D = ", 1)[1].split(";\n", 1)[0])
+            for k in ("trend", "prev", "prev_by"):
+                self.assertEqual(data["legs"]["sqlite"][k], plain["legs"]["sqlite"][k], k)
+            self.assertEqual(plain["legs"]["sqlite"]["trend_branches"], {})
+
+    def test_template_branch_chips_start_off_except_main_and_current(self):
+        tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        self.assertIn('if(b!=="main" && b!==D.ref) sel.brOff.add(b);', tpl)
+        self.assertIn("L[leg].trend_branches", tpl)
 
     def test_template_uses_per_metric_reference_and_legend(self):
         tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()

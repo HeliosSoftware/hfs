@@ -3,10 +3,8 @@
 # Are mongod's tcmalloc per-CPU caches starved? A cheap, read-only check
 # for the mongodb / mongodb-elasticsearch legs.
 #
-# Why: MongoDB 8.0+ ships tcmalloc-google with per-CPU caches (the
-# official mongo:8.x / 9.x images set GLIBC_TUNABLES=glibc.pthread.rseq=0
-# so that tcmalloc, not glibc, owns rseq). mongod sizes those caches from
-# the container's memory limit; with NO limit (cgroup v2 memory.max =
+# Why: MongoDB 8.0+ ships tcmalloc-google with per-CPU caches. mongod
+# sizes those caches from the container's memory limit; with NO limit (cgroup v2 memory.max =
 # "max") it computes a per-CPU size of 0 (SERVER-109273,
 # https://jira.mongodb.org/browse/SERVER-109273), and every malloc/free
 # then goes through tcmalloc's central lock. Reads under concurrency get

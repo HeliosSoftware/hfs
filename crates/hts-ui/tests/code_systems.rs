@@ -346,7 +346,7 @@ async fn browser_renders_v2_top_strip_shell() {
         r#"<body class="app-shell">"#,
         r#"class="content content--app""#,
         r#"class="card table-card""#,
-        r#"class="toolbar""#,
+        r#"class="toolbar toolbar--filters""#,
         r#"class="toolbar__search""#,
         r#"class="facets facets--bare""#,
         r#"class="facet-label""#,

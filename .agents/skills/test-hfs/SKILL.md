@@ -65,6 +65,7 @@ MSYS_NO_PATHCONV=1 docker run -d --name mongodb-tests-tmpfs \
     -p 127.0.0.1:27019:27017 --tmpfs /data/db --ulimit nofile=64000:64000 \
     -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760 mongo:9.0.8 mongod --bind_ip_all --wiredTigerCacheSizeGB 0.25 \
     --setParameter enableTestCommands=1 --replSet rs0 --oplogSize 128 \
+    --setParameter internalQueryGlobalProfilingLockDeadlineMs=10000 \
     --setParameter minSnapshotHistoryWindowInSeconds=5
 for _ in $(seq 60); do
     docker exec mongodb-tests-tmpfs mongosh --quiet --eval 'db.hello()' \
