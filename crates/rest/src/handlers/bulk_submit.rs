@@ -20,6 +20,7 @@ use axum::{
     response::Response,
 };
 use helios_auth::Principal;
+use helios_auth::scope::SmartPermissions;
 use helios_persistence::TenantContext;
 use helios_persistence::core::{
     DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
@@ -200,24 +201,38 @@ fn resolve_visible_submit_artifacts<'a>(
     Ok(resolved_files)
 }
 
-/// Enforces the `system/bulk-submit` operation scope when auth is enabled.
+/// Enforces the `system/bulk-submit` operation scope, or a system wildcard
+/// that carries the create bit, when auth is enabled.
 fn check_submit_scope(principal: Option<&Principal>) -> RestResult<()> {
     if let Some(p) = principal {
-        if !p.scopes.grants_operation(SUBMIT_SCOPE) {
+        if !p
+            .scopes
+            .grants_operation(SUBMIT_SCOPE, SmartPermissions::CREATE)
+        {
             return Err(RestError::Forbidden {
-                message: "the `system/bulk-submit` scope is required".to_string(),
+                message:
+                    "the `system/bulk-submit` scope (or a `system/*` scope with `c`) is required"
+                        .to_string(),
             });
         }
     }
     Ok(())
 }
 
-/// Ownership check for status / cancel / file surfaces: the principal must own the
-/// submission (subject match) or hold a system wildcard scope. Auth-disabled → allowed.
-fn owns_submission(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
+/// Ownership check for status / cancel / file surfaces: the principal must own
+/// the submission (subject match) or hold a system wildcard scope carrying the
+/// bit the surface implies (`r` to look, `d` to cancel). Auth-disabled → allowed.
+fn owns_submission(
+    principal: Option<&Principal>,
+    owner_subject: Option<&str>,
+    wildcard_permission: SmartPermissions,
+) -> bool {
     match principal {
         None => true,
-        Some(p) => owner_subject == Some(p.subject.as_str()) || p.scopes.has_system_wildcard(),
+        Some(p) => {
+            owner_subject == Some(p.subject.as_str())
+                || p.scopes.has_system_scope(wildcard_permission)
+        }
     }
 }
 
@@ -885,7 +900,11 @@ where
             resource_type: "bulk-submit-status".to_string(),
             id: token.clone(),
         })?;
-    if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+    if !owns_submission(
+        principal.as_ref(),
+        target.owner_subject.as_deref(),
+        SmartPermissions::READ,
+    ) {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-status".to_string(),
             id: token.clone(),
@@ -1286,7 +1305,11 @@ where
             resource_type: "bulk-submit-status".to_string(),
             id: token.clone(),
         })?;
-    if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+    if !owns_submission(
+        principal.as_ref(),
+        target.owner_subject.as_deref(),
+        SmartPermissions::DELETE,
+    ) {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-status".to_string(),
             id: token.clone(),
@@ -1356,7 +1379,11 @@ where
             resource_type: "bulk-submit-file".to_string(),
             id: format!("{token}/{part}"),
         })?;
-    if !owns_submission(principal.as_ref(), target.owner_subject.as_deref()) {
+    if !owns_submission(
+        principal.as_ref(),
+        target.owner_subject.as_deref(),
+        SmartPermissions::READ,
+    ) {
         return Err(RestError::NotFound {
             resource_type: "bulk-submit-file".to_string(),
             id: format!("{token}/{part}"),
@@ -1859,24 +1886,43 @@ mod tests {
         // Explicit operation scope → allowed.
         let p = principal_with("system/bulk-submit", "c1");
         assert!(check_submit_scope(Some(&p)).is_ok());
-        // System wildcard → allowed.
+        // System wildcard with the create bit → allowed.
         let p = principal_with("system/*.cruds", "c1");
         assert!(check_submit_scope(Some(&p)).is_ok());
+        // A read-only system wildcard does not ingest.
+        for scopes in ["system/*.rs", "system/*.ruds", "user/*.cruds"] {
+            let p = principal_with(scopes, "c1");
+            assert!(
+                matches!(
+                    check_submit_scope(Some(&p)),
+                    Err(RestError::Forbidden { .. })
+                ),
+                "{scopes}"
+            );
+        }
     }
 
     #[test]
     fn test_ownership_check() {
+        use SmartPermissions as P;
         // Auth disabled → owned.
-        assert!(owns_submission(None, Some("owner")));
-        // Matching subject → owned.
+        assert!(owns_submission(None, Some("owner"), P::READ));
+        // Matching subject → owned, whatever the surface.
         let p = principal_with("system/bulk-submit", "owner");
-        assert!(owns_submission(Some(&p), Some("owner")));
-        // Wildcard scope bypasses ownership.
+        assert!(owns_submission(Some(&p), Some("owner"), P::READ));
+        assert!(owns_submission(Some(&p), Some("owner"), P::DELETE));
+        // A system wildcard bypasses ownership for the surfaces its bits cover.
         let p = principal_with("system/*.rs", "someone-else");
-        assert!(owns_submission(Some(&p), Some("owner")));
+        assert!(owns_submission(Some(&p), Some("owner"), P::READ));
+        assert!(!owns_submission(Some(&p), Some("owner"), P::DELETE));
+        let p = principal_with("system/*.cruds", "someone-else");
+        assert!(owns_submission(Some(&p), Some("owner"), P::DELETE));
         // Mismatched subject without wildcard → not owned.
         let p = principal_with("system/bulk-submit", "someone-else");
-        assert!(!owns_submission(Some(&p), Some("owner")));
+        assert!(!owns_submission(Some(&p), Some("owner"), P::READ));
+        // A user-context wildcard is not a system scope.
+        let p = principal_with("user/*.cruds", "someone-else");
+        assert!(!owns_submission(Some(&p), Some("owner"), P::READ));
     }
 
     #[test]

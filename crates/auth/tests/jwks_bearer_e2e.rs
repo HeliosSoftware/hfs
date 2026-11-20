@@ -273,7 +273,11 @@ async fn entra_client_credentials_roles_grant_scopes() {
             .scopes
             .is_permitted("Patient", SmartPermissions::CREATE)
     );
-    assert!(principal.scopes.grants_operation("bulk-submit"));
+    assert!(
+        principal
+            .scopes
+            .grants_operation("bulk-submit", SmartPermissions::CREATE)
+    );
 }
 
 #[tokio::test]

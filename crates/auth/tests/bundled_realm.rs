@@ -19,7 +19,7 @@
 //! The mutation tests below edit copies of the realm to prove the check
 //! fails when either half is broken.
 
-use helios_auth::ScopeSet;
+use helios_auth::{ScopeSet, SmartPermissions};
 use serde_json::Value;
 
 const REALM_JSON: &str = include_str!("../../../docker/keycloak/realm.json");
@@ -46,7 +46,9 @@ fn check_realm(realm: &Value) -> Result<(), String> {
         .iter()
         .filter_map(|s| s.as_str().map(str::to_owned))
         .collect();
-    if !ScopeSet::parse_array(&default_scopes).grants_operation(SUBMIT_OPERATION) {
+    if !ScopeSet::parse_array(&default_scopes)
+        .grants_operation(SUBMIT_OPERATION, SmartPermissions::CREATE)
+    {
         return Err(format!(
             "`{WEB_CLIENT_ID}` default scopes {default_scopes:?} do not grant `{SUBMIT_OPERATION}`"
         ));
