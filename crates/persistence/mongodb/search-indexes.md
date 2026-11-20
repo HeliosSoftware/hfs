@@ -3,7 +3,8 @@
 HFS keeps two kinds of index on the `search_index` collection.
 
 - **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
-- **Generation 6** is the current generation. It is generation 5 plus one partial index, `idx_search_composite_tuple_qty`, over the `tuple_code` of token+quantity composite rows; see [Token+quantity composites (generation 6)](#tokenquantity-composites-generation-6). It is built in the same background `createIndexes` as the others.
+- **Generation 7** is the current generation. It is generation 6 plus one partial index, `idx_search_date_end` on `(tenant_id, resource_type, param_name, value_date_end, value_date, resource_id)`, partial on `value_date` like `idx_search_date_v3`. It orders date rows by the end of their range, which is the order of a descending date sort; see [Sorting past 300,000 matches](#sorting-past-300000-matches-generation-7). It is built in the same background `createIndexes` as the others.
+- **Generation 6** (the base of generation 7) is generation 5 plus one partial index, `idx_search_composite_tuple_qty`, over the `tuple_code` of token+quantity composite rows; see [Token+quantity composites (generation 6)](#tokenquantity-composites-generation-6). It is built in the same background `createIndexes` as the others.
 - **Generation 5** (the base of generation 6) is generation 4 plus one partial index, `idx_search_reference_target_v2` on `(tenant_id, resource_type, param_name, value_reference_target, resource_id)`, which holds only rows that carry `value_reference_target` (absolute `http(s)` references, #2394). It is built in the same background `createIndexes` as the others; see "Reference normalization (generation 5)" below.
 - **Generation 4** (the base of generation 5) is nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
 
@@ -23,7 +24,7 @@ Rows written before #1391 have no `value_date_end`. They never match the prefixe
 |---|---|
 | `background` (default) | Boot returns immediately. The build runs in the background and is logged at `info` when it starts and finishes. |
 | `inline` | Boot waits for the build. Use for tests, developer databases and small deployments. |
-| `off` | Nothing is built or dropped. Each missing generation-2 index is logged at `warn`. Each generation-1 index still present once generation 2 is complete is also logged at `warn`, naming the `dropIndex` command to remove it. Use when you pre-build in a maintenance window. |
+| `off` | No indexes are built or dropped. Each missing or still-building current-generation index is logged at `warn`; either condition reports `Skipped` and records no generation. Superseded indexes are also logged at `warn`, naming the `dropIndex` command to remove them. Use when you pre-build in a maintenance window. Readiness is checked at startup only: restart HFS after the pre-build finishes to enable the newly available indexes. |
 
 ## Upgrading a large deployment
 
@@ -63,7 +64,7 @@ To rerun the backfill, use `reference-normalize-rollback.mongosh.js`; see [Cross
 When MongoDB runs with search offloaded to Elasticsearch, every search goes to Elasticsearch and `search_index` and `search_index_contained` stay empty (offloaded writes only `$unset` the `missing_params` fields). Nothing reads the indexes below, so in this mode HFS neither builds them nor requires them:
 
 - the inline `search_index` indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) and the `search_index_contained` indexes, which are not created at boot;
-- the eleven generation-6 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
+- the twelve generation-7 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
 - `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`.
 
 Readiness requires only the `resources` indexes (`idx_resources_identity`, `idx_resources_type_scan`). A node whose `search_index` indexes are missing or dropped stays ready. The standalone MongoDB backend is unchanged: it still builds and requires all of them, because `:missing` and standard search read them.
@@ -101,6 +102,13 @@ A binary from before generation 6 runs without a script: it ignores `idx_search_
     mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/composite-tuple-rollback.mongosh.js
 
 It deletes the `composite_tuple_code_v2` markers first, then drops `idx_search_composite_tuple_qty`, then lowers a recorded generation 6 to 5. It leaves `tuple_code` on the rows: an older build ignores it, and the newer build rebuilds the index and takes the tuple path again only after the activating `$reindex`.
+
+A binary from before generation 7 needs no script: it ignores `idx_search_date_end` and records its own generation at boot. To remove the index, in `mongosh` against the HFS database:
+
+    db.search_index.dropIndex("idx_search_date_end")
+    db.schema_version.updateOne({ _id: "schema_version", "search_indexes.generation": 7 }, { $set: { "search_indexes.generation": NumberInt(6) } })
+
+Going back to generation 5, run these before `composite-tuple-rollback.mongosh.js`, which lowers only a recorded generation 6.
 
 The first four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift. `composite-tuple-rollback.mongosh.js` is hand-written; a unit test checks that the index and marker names it uses match the code.
 
@@ -419,6 +427,47 @@ Use the tenant-wide route even when the repeated-type parameter belongs to `Obse
 
 An arity mismatch — a value with fewer or more `$`-separated parts than the parameter declares (e.g. `code-value-quantity=8302-2`, one part for a two-component parameter) — is a 400 (`InvalidComposite`) on every backend, naming the received and expected part counts (#1236).
 
+## Sorting past 300,000 matches (generation 7)
+
+A filtered `_sort` by one search parameter first collects matching ids and
+orders them (`$min` of each resource's values ascending, `$max` descending,
+and the range end for a descending date). If collection exceeds 300,000
+matches, the supported single-key sorts instead walk the sort parameter's
+value index (#2588). A descending date uses `idx_search_date_end`.
+
+The walk reads rows in value order. The first row for a resource supplies
+its sort key; later rows for that resource are ignored. Membership and
+resource-level conditions are checked in batches of at most 512 candidates.
+Equal keys retain only the matching ids needed for `offset + _count + 1`,
+ordered by the requested id tie-breaker. The extra match determines
+`has_next`. Matches without a sort value follow in id order, read from
+`resources`. Page order agrees with the collected path.
+
+The amount scanned depends on where matches occur in sort order, repeated
+values, and equal-key groups. A small page can still require reading the
+whole sort range: overall selectivity alone does not bound that work.
+The walk also follows the initial collection attempt, which has already
+passed the match cap. Its retained page and membership batches are bounded,
+but the set used to recognize previously seen resource ids grows with the
+number of distinct keyed resources scanned. The configured search deadline
+can stop new work; it is not a memory limit.
+
+The path answers 422 when `offset + _count` exceeds 300,000, as the
+unfiltered sort does. Multiple sort keys keep the collected path and its
+cap. `_total` uses the same search without its sort; when that count also
+requires the capped collector, the request still answers 422. This
+includes a FHIR-version-restricted accurate total over the cap.
+
+Existing value-index plans remain usable while the new date-end index is
+built, provided their actual index definitions and required maintenance
+are verified. Only the new descending-date walk waits for the full build.
+If its required indexes are unavailable, an over-cap sort keeps the 422
+response. Within-cap searches keep their existing execution path.
+
+Date rows written before #1391 have no `value_date_end`. They are null-end
+keys of `idx_search_date_end` and sort by their start, as on the collected
+path.
+
 ## Token+quantity composites (generation 6)
 
 A token+quantity composite (`code-value-quantity`, `combo-code-value-quantity`, `component-code-value-quantity`) normally discovers candidates through one component and pair-checks the other within the same `composite_group` (see [Composite parameters](#composite-parameters)). Generation 6 lets `code=X AND value>N` be one covered range scan instead:
@@ -450,14 +499,14 @@ The planner also needs the recorded generation to be 6 or more, the value indexe
 To check a tenant, in `mongosh` against the HFS database:
 
 ```javascript
-db.schema_version.findOne({ _id: "schema_version" }).search_indexes.generation  // 6
+db.schema_version.findOne({ _id: "schema_version" }).search_indexes.generation  // 7
 db.search_layout.find({ tenant_id: "<tenant>" })
 ```
 
 ### Deployment order
 
 1. Deploy the new binary to every instance.
-2. Wait until `search_indexes.generation` reads 6 (the background build is done).
+2. Wait until `search_indexes.generation` reads 6 or more (the background build is done; this build records 7).
 3. Make sure no instance of an older binary is running against the database.
 4. Run `$reindex` for each tenant, or `POST /Observation/$reindex` (and the other types with token+quantity composites).
 

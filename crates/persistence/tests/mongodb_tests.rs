@@ -337,19 +337,6 @@ mod shared_mongo {
     use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
 
-    /// How long a profiler write may wait for its lock, as a `--setParameter`.
-    ///
-    /// MongoDB 9.0 gives a profiler write 1 ms
-    /// (`internalQueryGlobalProfilingLockDeadlineMs`) and then abandons it with
-    /// warning 20703 (`LockTimeout`): on a loaded host the operation runs but
-    /// leaves no `system.profile` entry, and a test asserting on the entry
-    /// fails (`history_index_plans` saw a reader with 0 profiler entries).
-    /// Past `internalProfilingMaxAbandonedWritesPerSecondPerDb` abandoned
-    /// writes, mongod also turns profiling off for the database. Earlier
-    /// servers waited without a deadline; 5 s restores that for any wait a
-    /// test run can have, and still ends a stuck write.
-    const PROFILER_LOCK_DEADLINE: &str = "internalQueryGlobalProfilingLockDeadlineMs=5000";
-
     struct SharedMongo {
         connection_string: String,
         /// Kept alive for the duration of the test binary; the
@@ -447,8 +434,7 @@ mod shared_mongo {
     /// this returns. The container is removed when the first element is dropped.
     ///
     /// The command is `mongod --bind_ip_all --wiredTigerCacheSizeGB <wt_cache_gb>
-    /// --replSet rs0 --setParameter <PROFILER_LOCK_DEADLINE>` followed by
-    /// `extra_flags`, in that order. Callers pass
+    /// --replSet rs0` followed by `extra_flags`, in that order. Callers pass
     /// `--oplogSize` there too: without it mongod sizes the oplog from the free
     /// disk.
     ///
@@ -466,8 +452,9 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            // As in `shared()`: keep mongod 9.0 from dropping profiler entries.
             "--setParameter",
-            PROFILER_LOCK_DEADLINE,
+            "internalQueryGlobalProfilingLockDeadlineMs=10000",
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
@@ -546,6 +533,12 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            // mongod 9.0 gives each profiler write 1 ms to get its
+                            // lock and silently drops the entry when it cannot;
+                            // the plan tests then read an empty system.profile
+                            // (#2636).
+                            "--setParameter",
+                            "internalQueryGlobalProfilingLockDeadlineMs=10000",
                             "--replSet",
                             "rs0",
                             "--oplogSize",
@@ -561,10 +554,6 @@ mod shared_mongo {
                             // such a read needs a longer window.
                             "--setParameter",
                             "minSnapshotHistoryWindowInSeconds=5",
-                            // The profiler tests read `system.profile`; see
-                            // `PROFILER_LOCK_DEADLINE`.
-                            "--setParameter",
-                            PROFILER_LOCK_DEADLINE,
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
@@ -19581,8 +19570,10 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
 /// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
-const CURRENT_BACKGROUND_NAMES: [&str; 11] = [
+/// Generation 7: `idx_search_date_end` (descending date sorts, #2588).
+const CURRENT_BACKGROUND_NAMES: [&str; 12] = [
     "idx_search_composite_tuple_qty",
+    "idx_search_date_end",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
@@ -19724,7 +19715,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(7)
     );
 }
 
@@ -19849,7 +19840,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(7)
     );
 }
 
@@ -19937,7 +19928,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(6));
+    assert_eq!(si.get_i32("generation"), Ok(7));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.

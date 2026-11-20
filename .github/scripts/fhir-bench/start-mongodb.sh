@@ -43,10 +43,9 @@
 #
 # Two settings for every image other than mongo:7.x (#2605):
 #   -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=10485760
-#                            the official mongo:8.x / 9.x images start
-#                            mongod with GLIBC_TUNABLES=glibc.pthread.rseq=0
-#                            (tcmalloc per-CPU caches). This container has
-#                            no memory limit (no --memory: the shared
+#                            mongod 8.x / 9.x size tcmalloc's per-CPU
+#                            caches from the container's memory limit.
+#                            This container has no memory limit (no --memory: the shared
 #                            host's page cache is the point), so mongod
 #                            sizes those caches at 0 and every malloc/free
 #                            takes tcmalloc's central lock (SERVER-109273,
@@ -54,8 +53,9 @@
 #                            search -31% and sql-run -65% against 7.0.48.
 #                            The variable gives the caches a real size and
 #                            keeps MongoDB's per-CPU mode (no startup
-#                            warning); `-e GLIBC_TUNABLES=` (set empty) is
-#                            the measured fallback.
+#                            warning); `-e GLIBC_TUNABLES=` (set empty) only
+#                            works around it by moving tcmalloc to
+#                            per-thread caches (measured fallback).
 #   --wiredTigerCollectionConfigString / --wiredTigerIndexConfigString
 #     memory_page_max=16MB   8.3 and 9.0 stalled the import for 60 s or more
 #                            with default pages; 16 MB pages removed the

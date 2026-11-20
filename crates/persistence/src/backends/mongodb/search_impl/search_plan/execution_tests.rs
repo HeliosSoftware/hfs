@@ -32,18 +32,6 @@ mod shared_mongo {
     use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
 
-    /// How long a profiler write may wait for its lock, as a `--setParameter`.
-    ///
-    /// MongoDB 9.0 gives a profiler write 1 ms
-    /// (`internalQueryGlobalProfilingLockDeadlineMs`) and then abandons it with
-    /// warning 20703 (`LockTimeout`): on a loaded host the operation runs but
-    /// leaves no `system.profile` entry, and a test asserting on the entry
-    /// fails. Past `internalProfilingMaxAbandonedWritesPerSecondPerDb`
-    /// abandoned writes, mongod also turns profiling off for the database.
-    /// Earlier servers waited without a deadline; 5 s restores that for any
-    /// wait a test run can have, and still ends a stuck write.
-    const PROFILER_LOCK_DEADLINE: &str = "internalQueryGlobalProfilingLockDeadlineMs=5000";
-
     struct SharedMongo {
         connection_string: String,
         /// Never dropped; the `container_cleanup` exit hook removes it.
@@ -136,10 +124,13 @@ mod shared_mongo {
                     "--bind_ip_all",
                     "--setParameter",
                     "enableTestCommands=1",
-                    // The profiler tests read `system.profile`; see
-                    // `PROFILER_LOCK_DEADLINE`.
+                    // mongod 9.0 gives each profiler write 1 ms to get its
+                    // lock and silently drops the entry when it cannot
+                    // (`serverStatus().profiler.totalAbandonedWrites`). Under
+                    // the parallel fixtures that lost up to a third of the
+                    // entries the plan tests assert on (#2636).
                     "--setParameter",
-                    PROFILER_LOCK_DEADLINE,
+                    "internalQueryGlobalProfilingLockDeadlineMs=10000",
                     "--wiredTigerCacheSizeGB",
                     "0.25",
                 ]),
