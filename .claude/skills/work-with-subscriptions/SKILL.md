@@ -27,6 +27,7 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 | `HFS_SUBSCRIPTIONS_ENABLED` | Master switch for the subscriptions engine |
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | Enable the messaging channel |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | Allow rest-hook delivery to private/loopback URLs (opt-in) |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | Receivers (`host` or `host:port`, comma-separated) that may be sent `HFS_OUTBOUND_BEARER_TOKEN` on messaging deliveries; unset means none |
 | `HFS_BASE_URL` | Base URL used in notification links |
 | `HFS_SUBSCRIPTION_PERSIST_STATUS` | Write server-driven status transitions back into the stored `Subscription` (default `true`) |
 | `HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS` | Per-write timeout for that write-back (default `5000`) |

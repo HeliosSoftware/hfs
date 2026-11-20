@@ -215,6 +215,7 @@ The FHIR Messaging channel is disabled by default and is enabled only when `HFS_
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel. |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers. |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow delivery to private or loopback endpoint hosts; intended for local development and CI only. |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | *(none)* | Comma-separated receivers (`host` or `host:port`) that may be sent the server's outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the Subscription supplies no `Authorization` header. Unset means no receiver gets it; the credential travels only over HTTPS unless private endpoints are allowed. |
 
 ## Enabling in HFS
 

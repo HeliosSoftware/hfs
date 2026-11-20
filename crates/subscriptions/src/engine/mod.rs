@@ -145,7 +145,11 @@ impl SubscriptionEngine {
                 channel =
                     channel.with_source_endpoint_resolver(Arc::clone(&public_base_url_for_tenant));
             }
-            Arc::new(channel.with_private_endpoints_allowed(settings.allow_private_endpoints))
+            Arc::new(
+                channel
+                    .with_private_endpoints_allowed(settings.allow_private_endpoints)
+                    .with_credential_hosts(&settings.credential_hosts),
+            )
         });
 
         let status_write_slots = Arc::new(Semaphore::new(config.status_write_concurrency.max(1)));
@@ -1380,6 +1384,7 @@ mod tests {
             messaging: Some(crate::config::MessagingSettings {
                 source_endpoint: "https://fallback.example/fhir".to_string(),
                 allow_private_endpoints: false,
+                credential_hosts: Vec::new(),
             }),
             ..Default::default()
         };

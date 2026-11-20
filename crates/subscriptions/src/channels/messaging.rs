@@ -13,9 +13,13 @@
 //! 2. **SSRF guard** — receiver endpoints whose host is a literal loopback /
 //!    private / link-local / unspecified IP are rejected by default. Operators
 //!    set `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` for local development.
-//! 3. **Outbound auth** — when `HFS_OUTBOUND_BEARER_TOKEN` is configured, an
-//!    `Authorization: Bearer <token>` header is attached to every outgoing
-//!    request. Subscription-supplied `Authorization` headers take precedence.
+//! 3. **Outbound auth** — the server's outbound credential
+//!    (`HFS_OUTBOUND_BEARER_TOKEN`) is attached only to requests for a host
+//!    named in `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS`, and only over
+//!    HTTPS unless private endpoints are allowed. The endpoint is written by
+//!    whoever can write a Subscription, so without that list no receiver gets
+//!    the credential. Subscription-supplied `Authorization` headers are
+//!    forwarded to any endpoint and take precedence.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -44,6 +48,42 @@ pub struct MessagingChannel {
     /// When `true`, dispatch to private/loopback IPs is allowed. Default
     /// `false`; tests and local dev opt in.
     private_endpoints_allowed: bool,
+    /// Receivers that may be sent the server's outbound credential. Empty
+    /// by default, so no endpoint gets it.
+    credential_hosts: Vec<CredentialHost>,
+}
+
+/// One `host` or `host:port` entry of the credential host list, lowercased.
+/// An entry without a port matches the endpoint on any port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialHost {
+    host: String,
+    port: Option<u16>,
+}
+
+impl CredentialHost {
+    fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        let url = Url::parse(&format!("https://{entry}")).ok()?;
+        if url.path() != "/" || url.query().is_some() || url.username() != "" {
+            return None;
+        }
+        Some(Self {
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: url.port(),
+        })
+    }
+
+    fn matches(&self, url: &Url) -> bool {
+        url.host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+            && self
+                .port
+                .is_none_or(|port| url.port_or_known_default() == Some(port))
+    }
 }
 
 impl MessagingChannel {
@@ -61,6 +101,7 @@ impl MessagingChannel {
             source_endpoint,
             source_endpoint_resolver: None,
             private_endpoints_allowed: false,
+            credential_hosts: Vec::new(),
         }
     }
 
@@ -81,6 +122,43 @@ impl MessagingChannel {
     pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
         self.private_endpoints_allowed = allowed;
         self
+    }
+
+    /// Name the receivers (`host` or `host:port`, one per entry) that may be
+    /// sent the server's outbound credential. Entries that are not a bare
+    /// host are logged and skipped.
+    pub fn with_credential_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.credential_hosts = hosts
+            .into_iter()
+            .filter_map(|entry| {
+                let parsed = CredentialHost::parse(entry.as_ref());
+                if parsed.is_none() {
+                    warn!(
+                        entry = entry.as_ref(),
+                        "HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS entry is not a host or host:port; skipped"
+                    );
+                }
+                parsed
+            })
+            .collect();
+        self
+    }
+
+    /// Whether the server's outbound credential may travel to `endpoint`: the
+    /// host is on the credential host list and the scheme is HTTPS, or the
+    /// channel allows private endpoints (local development and CI).
+    fn credential_destination(&self, endpoint: &str) -> bool {
+        let Ok(url) = Url::parse(endpoint) else {
+            return false;
+        };
+        if url.scheme() != "https" && !self.private_endpoints_allowed {
+            return false;
+        }
+        self.credential_hosts.iter().any(|h| h.matches(&url))
     }
 
     fn source_endpoint_for(&self, tenant_id: &str) -> String {
@@ -145,7 +223,15 @@ impl MessagingChannel {
         }
 
         if !subscription_supplies_auth {
-            request = self.auth_provider.authorize(request, endpoint).await?;
+            if self.credential_destination(endpoint) {
+                request = self.auth_provider.authorize(request, endpoint).await?;
+            } else {
+                debug!(
+                    subscription_id = %subscription.id,
+                    endpoint = %redact_url(endpoint),
+                    "endpoint is not a credential host; sending without the server credential"
+                );
+            }
         }
 
         debug!(
@@ -322,6 +408,15 @@ mod tests {
         .with_private_endpoints_allowed(true)
     }
 
+    async fn received_authorization(server: &MockServer) -> Option<String> {
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "one request expected");
+        received[0]
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
     #[test]
     fn default_source_endpoint_resolves_per_tenant_but_explicit_stays_fixed() {
         let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
@@ -437,12 +532,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_bearer_attached_when_subscription_does_not_supply_one() {
+    async fn outbound_bearer_attached_for_a_credential_host_when_subscription_does_not_supply_one()
+    {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/x"))
             .and(header("Authorization", "Bearer outbound-token"))
             .and(header("Content-Type", "application/fhir+json"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let channel = channel_with_bearer("outbound-token")
+            .with_credential_hosts([server.address().to_string()]);
+        let sub = test_subscription(&format!("{}/x", server.uri()), PayloadContent::IdOnly);
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+        assert!(matches!(result, DispatchResult::Success));
+    }
+
+    /// The endpoint is whatever the Subscription writer put there; without a
+    /// credential host list the server credential goes nowhere.
+    #[tokio::test]
+    async fn outbound_bearer_withheld_without_a_credential_host_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
@@ -453,7 +570,72 @@ mod tests {
             .dispatch(&sub, &handshake_bundle(&sub))
             .await
             .unwrap();
-        assert!(matches!(result, DispatchResult::Success));
+        assert!(matches!(result, DispatchResult::Success), "{result:?}");
+        assert_eq!(received_authorization(&server).await, None);
+    }
+
+    #[tokio::test]
+    async fn outbound_bearer_withheld_from_a_host_outside_the_credential_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let channel = channel_with_bearer("outbound-token")
+            .with_credential_hosts(["receiver.example.org", "127.0.0.1:1"]);
+        let sub = test_subscription(&format!("{}/x", server.uri()), PayloadContent::IdOnly);
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+        assert!(matches!(result, DispatchResult::Success), "{result:?}");
+        assert_eq!(received_authorization(&server).await, None);
+    }
+
+    #[test]
+    fn credential_destination_requires_a_listed_host_over_https() {
+        let channel = MessagingChannel::new(SOURCE.to_string(), Arc::new(NoOpOutboundAuthProvider))
+            .with_credential_hosts([
+                "Receiver.Example.org",
+                "other.example.org:8443",
+                "",
+                "bad/entry",
+            ]);
+        assert_eq!(
+            channel.credential_hosts,
+            vec![
+                CredentialHost {
+                    host: "receiver.example.org".to_string(),
+                    port: None
+                },
+                CredentialHost {
+                    host: "other.example.org".to_string(),
+                    port: Some(8443)
+                },
+            ]
+        );
+
+        assert!(
+            channel.credential_destination("https://receiver.example.org/fhir/$process-message")
+        );
+        assert!(channel.credential_destination("https://RECEIVER.example.org:8443/x"));
+        assert!(channel.credential_destination("https://other.example.org:8443/x"));
+        assert!(
+            !channel.credential_destination("https://other.example.org/x"),
+            "port must match"
+        );
+        assert!(!channel.credential_destination("https://receiver.example.org.evil.test/x"));
+        assert!(!channel.credential_destination("https://evil.test/x?host=receiver.example.org"));
+        assert!(
+            !channel.credential_destination("http://receiver.example.org/x"),
+            "cleartext"
+        );
+        assert!(!channel.credential_destination("not a url"));
+
+        let dev = channel.with_private_endpoints_allowed(true);
+        assert!(dev.credential_destination("http://receiver.example.org/x"));
     }
 
     #[tokio::test]

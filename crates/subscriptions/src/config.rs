@@ -116,6 +116,14 @@ pub struct MessagingSettings {
     /// Default `false` (SSRF guard on). Set
     /// `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` to opt in.
     pub allow_private_endpoints: bool,
+
+    /// Receivers (`host` or `host:port`) that may be sent the server's
+    /// outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the
+    /// Subscription supplies no `Authorization` header of its own. Empty by
+    /// default: the endpoint is chosen by whoever writes the Subscription, so
+    /// no receiver gets the credential until the operator names it here
+    /// (`HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS`).
+    pub credential_hosts: Vec<String>,
 }
 
 impl Default for SubscriptionConfig {

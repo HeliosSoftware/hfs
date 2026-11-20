@@ -881,9 +881,19 @@ where
                 supported.push("email".to_string());
                 info!("Email subscription channel ENABLED");
             }
-            if messaging.is_some() {
+            if let Some(settings) = &messaging {
                 supported.push("message".to_string());
                 info!("FHIR Messaging subscription channel ENABLED");
+                if settings.credential_hosts.is_empty() {
+                    info!(
+                        "FHIR Messaging deliveries carry no server credential; name the receivers that may get HFS_OUTBOUND_BEARER_TOKEN in HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS"
+                    );
+                } else {
+                    info!(
+                        hosts = ?settings.credential_hosts,
+                        "FHIR Messaging deliveries to these receivers carry the server credential"
+                    );
+                }
             }
             let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
             let sub_config = helios_subscriptions::SubscriptionConfig {
@@ -1450,10 +1460,21 @@ fn build_messaging_settings_from_env(
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
         .unwrap_or(false);
 
+    let credential_hosts = std::env::var("HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some((
         MessagingSettings {
             source_endpoint,
             allow_private_endpoints,
+            credential_hosts,
         },
         source_endpoint_is_explicit,
     ))
