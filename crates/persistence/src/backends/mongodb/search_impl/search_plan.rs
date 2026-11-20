@@ -575,13 +575,14 @@ impl SearchFilterPlan {
         };
         let hint = index_filter.as_ref().and_then(IndexPredicate::hint);
         let (collection, mut pipeline) = if let Some(predicate) = index_filter {
-            let filter = predicate.filter;
             // Reject IDs outside the page before sorting and fetching resources.
             // In particular, previous-page scans must not look up every ID on
             // the far side of the cursor before reaching the requested page.
+            // `bounded_filter` keeps an unhinted date `$or` at the root so
+            // each arm is still planned separately.
             let filter = match index_cursor_filter {
-                Some(boundary) => doc! { "$and": [filter, boundary] },
-                None => filter,
+                Some(boundary) => predicate.bounded_filter(boundary),
+                None => predicate.filter,
             };
             let mut pipeline = vec![
                 doc! { "$match": filter },
@@ -5283,9 +5284,11 @@ mod index_intersection_tests {
     }
 
     #[test]
-    fn resource_lookup_keeps_its_date_hint_and_cursor_bound() {
-        let predicate = date_predicate("ge2024-11-01");
+    fn resource_lookup_bounds_each_arm_of_an_unhinted_date_or_and_wraps_the_rest() {
         let boundary = doc! { "resource_id": { "$lt": "next" } };
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        let plain: IndexPredicate = doc! { "param_name": "patient" }.into();
         for resource_filter in [
             doc! { "is_deleted": false },
             doc! { "is_deleted": false, "$or": [
@@ -5293,22 +5296,51 @@ mod index_intersection_tests {
                 { "missing_params": { "$exists": false } },
             ] },
         ] {
-            let plan = SearchFilterPlan::ResourceLookups {
-                index_filter: Some(predicate.clone()),
-                stages: Vec::new(),
-            }
-            .pipeline(
-                resource_filter,
-                Some(doc! { "id": -1 }),
-                Some(boundary.clone()),
-            )
-            .unwrap();
+            let lookup = |predicate: &IndexPredicate| {
+                SearchFilterPlan::ResourceLookups {
+                    index_filter: Some(predicate.clone()),
+                    stages: Vec::new(),
+                }
+                .pipeline(
+                    resource_filter.clone(),
+                    Some(doc! { "id": -1 }),
+                    Some(boundary.clone()),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                lookup(&plain).stages[0],
+                doc! { "$match": { "$and": [plain.filter.clone(), boundary.clone()] } }
+            );
+            // Unhinted `ge` (end index ready): the frontier goes in every arm
+            // and the `$or` stays at the root.
+            let ge = date_predicate("ge2024-11-01");
+            let plan = lookup(&ge);
             assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
             assert_eq!(plan.hint, None);
             assert_eq!(
                 plan.stages[0],
-                doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+                doc! { "$match": ge.bounded_filter(boundary.clone()) }
             );
+            assert!(
+                plan.stages[0]
+                    .get_document("$match")
+                    .unwrap()
+                    .contains_key("$or")
+            );
+            // Hinted predicates keep their hint and wrap the whole filter.
+            for (predicate, hint) in [
+                (date_predicate("gt2024-11-01"), end.clone()),
+                (date_predicate_with("ge2024-11-01", false), v3.clone()),
+                (date_predicate("le2024-11-01"), v3.clone()),
+            ] {
+                let plan = lookup(&predicate);
+                assert_eq!(plan.hint, hint);
+                assert_eq!(
+                    plan.stages[0],
+                    doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+                );
+            }
         }
     }
 

@@ -139,163 +139,191 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
         .await
         .unwrap();
 
-    for total in [TotalMode::None, TotalMode::Accurate] {
-        let mut query = SearchQuery::new("Observation")
-            .with_parameter(date_parameter("eq2025"))
-            .with_parameter(date_parameter("lt2025-07-01"))
-            .with_sort(SortDirective::parse("_lastUpdated"))
-            .with_count(20);
-        query.total = Some(total);
-        profile_start(&fixture.db).await;
-        let first = fixture
-            .backend
-            .search(&fixture.tenant, &query)
-            .await
-            .unwrap();
-        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-        assert_eq!(result_ids(&first), expected[..20]);
-        assert_eq!(
-            first.total,
-            (total == TotalMode::Accurate).then_some(expected.len() as u64)
-        );
-        let next_query = query
-            .clone()
-            .with_cursor(first.resources.page_info.next_cursor.unwrap());
-        let next = fixture
-            .backend
-            .search(&fixture.tenant, &next_query)
-            .await
-            .unwrap();
-        assert_eq!(result_ids(&next), expected[20..40]);
-        let previous_query = query
-            .clone()
-            .with_cursor(next.resources.page_info.previous_cursor.unwrap());
-        let previous = fixture
-            .backend
-            .search(&fixture.tenant, &previous_query)
-            .await
-            .unwrap();
-        assert_eq!(result_ids(&previous), expected[..20]);
-        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let mut without_end = None;
+    for case in DateCase::ALL {
+        let backend = backend_for_case(case, &fixture, &mut without_end).await;
+        for total in [TotalMode::None, TotalMode::Accurate] {
+            let mut query = SearchQuery::new("Observation")
+                .with_parameter(date_parameter(case.raw()))
+                .with_parameter(date_parameter("lt2025-07-01"))
+                .with_sort(SortDirective::parse("_lastUpdated"))
+                .with_count(20);
+            query.total = Some(total);
+            profile_start(&fixture.db).await;
+            let first = backend.search(&fixture.tenant, &query).await.unwrap();
+            fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+            assert_eq!(result_ids(&first), expected[..20]);
+            assert_eq!(
+                first.total,
+                (total == TotalMode::Accurate).then_some(expected.len() as u64)
+            );
+            let next_query = query
+                .clone()
+                .with_cursor(first.resources.page_info.next_cursor.unwrap());
+            let next = backend.search(&fixture.tenant, &next_query).await.unwrap();
+            assert_eq!(result_ids(&next), expected[20..40]);
+            let previous_query = query
+                .clone()
+                .with_cursor(next.resources.page_info.previous_cursor.unwrap());
+            let previous = backend
+                .search(&fixture.tenant, &previous_query)
+                .await
+                .unwrap();
+            assert_eq!(result_ids(&previous), expected[..20]);
+            fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+            if !case.v3_hinted() {
+                // `ge` over a ready end index leaves its `$or` arms to the
+                // planner, so no command carries the v3 hint to check.
+                continue;
+            }
 
-        let probes = profile_rows(
-            &fixture.db,
-            doc! {
-                "command.aggregate": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
-            },
-        )
-        .await;
-        assert!(
-            !probes.is_empty(),
-            "date probes must keep their access path"
-        );
-        let drivers = profile_rows(
-            &fixture.db,
-            doc! {
-                "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
-            },
-        )
-        .await;
-        assert!(
-            !drivers.is_empty(),
-            "the sparse fallback must open a hinted date driver"
-        );
-        let resources_namespace = format!("{}.resources", fixture.db.name());
-        let operations = profile_rows(
-            &fixture.db,
-            doc! { "$or": [
-                { "command.aggregate": "search_index", "command.hint": SEARCH_COMPOSITE_INDEX },
-                { "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX },
-                { "ns": &resources_namespace, "op": "query" },
-            ] },
-        )
-        .await;
-        let mut legacy_membership = false;
-        let mut legacy_page_fetched = false;
-        let mut saw_legacy_batch = false;
-        let mut membership_count = 0;
-        for check in operations {
-            let command = check.get_document("command").unwrap();
-            if command.get_str("find") == Ok("search_index") {
-                legacy_membership = true;
-                continue;
-            }
-            // The large final ID filter makes MongoDB replace the whole
-            // command with `$truncated`. Namespace and operation survive, so
-            // they mark the page fetch without parsing truncated command text.
-            if check.get_str("ns") == Ok(resources_namespace.as_str())
-                && check.get_str("op") == Ok("query")
-            {
-                legacy_page_fetched |= legacy_membership;
-                legacy_membership = false;
-                continue;
-            }
-            membership_count += 1;
-            let ids = candidate_ids(command);
-            let limit = if legacy_membership {
-                CANDIDATE_BATCH_SIZE
-            } else {
-                // Ordered continuation and the separate exact count use the
-                // larger bounded batches; the ID-set collector still uses 512.
-                COUNT_CANDIDATE_BATCH_ROWS
-            };
+            let probes = profile_rows(
+                &fixture.db,
+                doc! {
+                    "command.aggregate": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
+                },
+            )
+            .await;
             assert!(
-                !ids.is_empty() && ids.len() <= limit,
-                "total={total:?}, candidate count={}, limit={limit}",
-                ids.len()
+                !probes.is_empty(),
+                "date probes must keep their access path"
             );
-            saw_legacy_batch |= legacy_membership && ids.len() == CANDIDATE_BATCH_SIZE;
-            let keys = numeric(&check, "keysExamined");
+            let drivers = profile_rows(
+                &fixture.db,
+                doc! {
+                    "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
+                },
+            )
+            .await;
             assert!(
-                keys <= 4 * ids.len() as i64 + 10,
-                "membership must seek candidate IDs: {check:?}"
+                !drivers.is_empty(),
+                "the sparse fallback must open a hinted date driver"
             );
-        }
-        assert!(
-            legacy_page_fetched,
-            "the legacy collector must reach its page fetch"
-        );
-        assert!(
-            !legacy_membership,
-            "the legacy membership phase must be closed"
-        );
-        assert!(
-            membership_count > 0,
-            "the other date bound must check candidates"
-        );
-        assert!(
-            saw_legacy_batch,
-            "the fallback must check a full 512-ID batch"
-        );
-        assert!(
-            profile_rows(&fixture.db, doc! { "command.distinct": "search_index" })
+            let resources_namespace = format!("{}.resources", fixture.db.name());
+            let operations = profile_rows(
+                &fixture.db,
+                doc! { "$or": [
+                    { "command.aggregate": "search_index", "command.hint": SEARCH_COMPOSITE_INDEX },
+                    { "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX },
+                    { "ns": &resources_namespace, "op": "query" },
+                ] },
+            )
+            .await;
+            let mut legacy_membership = false;
+            let mut legacy_page_fetched = false;
+            let mut saw_legacy_batch = false;
+            let mut membership_count = 0;
+            for check in operations {
+                let command = check.get_document("command").unwrap();
+                if command.get_str("find") == Ok("search_index") {
+                    legacy_membership = true;
+                    continue;
+                }
+                // The large final ID filter makes MongoDB replace the whole
+                // command with `$truncated`. Namespace and operation survive, so
+                // they mark the page fetch without parsing truncated command text.
+                if check.get_str("ns") == Ok(resources_namespace.as_str())
+                    && check.get_str("op") == Ok("query")
+                {
+                    legacy_page_fetched |= legacy_membership;
+                    legacy_membership = false;
+                    continue;
+                }
+                membership_count += 1;
+                let ids = candidate_ids(command);
+                let limit = if legacy_membership {
+                    CANDIDATE_BATCH_SIZE
+                } else {
+                    // Ordered continuation and the separate exact count use the
+                    // larger bounded batches; the ID-set collector still uses 512.
+                    COUNT_CANDIDATE_BATCH_ROWS
+                };
+                assert!(
+                    !ids.is_empty() && ids.len() <= limit,
+                    "total={total:?}, candidate count={}, limit={limit}",
+                    ids.len()
+                );
+                saw_legacy_batch |= legacy_membership && ids.len() == CANDIDATE_BATCH_SIZE;
+                let keys = numeric(&check, "keysExamined");
+                assert!(
+                    keys <= 4 * ids.len() as i64 + 10,
+                    "membership must seek candidate IDs: {check:?}"
+                );
+            }
+            assert!(
+                legacy_page_fetched,
+                "the legacy collector must reach its page fetch"
+            );
+            assert!(
+                !legacy_membership,
+                "the legacy membership phase must be closed"
+            );
+            assert!(
+                membership_count > 0,
+                "the other date bound must check candidates"
+            );
+            assert!(
+                saw_legacy_batch,
+                "the fallback must check a full 512-ID batch"
+            );
+            assert!(
+                profile_rows(&fixture.db, doc! { "command.distinct": "search_index" })
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                profile_rows(
+                    &fixture.db,
+                    doc! {
+                        "command.hint": { "$exists": false },
+                        "$or": [
+                            { "command.find": "search_index" },
+                            { "command.aggregate": "search_index" },
+                        ],
+                    }
+                )
                 .await
                 .is_empty()
+            );
+            assert!(
+                !profile_rows(
+                    &fixture.db,
+                    doc! {
+                        "command.find": "resources", "command.hint": RESOURCES_TYPE_SCAN_INDEX,
+                    }
+                )
+                .await
+                .is_empty(),
+                "the first resource batch must actually be sampled"
+            );
+        }
+        // The ID-ordered control keeps the existing batched plan.
+        let mut control = SearchQuery::new("Observation")
+            .with_parameter(date_parameter(case.raw()))
+            .with_parameter(date_parameter("lt2025-07-01"))
+            .with_sort(SortDirective::parse("_id"))
+            .with_count(20);
+        control.total = Some(TotalMode::None);
+        profile_start(&fixture.db).await;
+        let result = backend.search(&fixture.tenant, &control).await.unwrap();
+        assert_eq!(
+            result_ids(&result),
+            fixture.rows[1..21]
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
         );
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
         assert!(
             profile_rows(
                 &fixture.db,
                 doc! {
-                    "command.hint": { "$exists": false },
-                    "$or": [
-                        { "command.find": "search_index" },
-                        { "command.aggregate": "search_index" },
-                    ],
-                }
-            )
-            .await
-            .is_empty()
-        );
-        assert!(
-            !profile_rows(
-                &fixture.db,
-                doc! {
-                    "command.find": "resources", "command.hint": RESOURCES_TYPE_SCAN_INDEX,
+                    "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
                 }
             )
             .await
             .is_empty(),
-            "the first resource batch must actually be sampled"
+            "_id control must not enter the legacy driver"
         );
     }
     // An empty ordered prefix stops once even an optimistic match rate cannot
@@ -376,47 +404,25 @@ async fn sparse_positive_date_pages_preserve_discovery_and_membership_access() {
         "{:?}",
         checks[0]
     );
-    // The ID-ordered control keeps the existing batched plan.
-    let mut control = SearchQuery::new("Observation")
-        .with_parameter(date_parameter("eq2025"))
-        .with_parameter(date_parameter("lt2025-07-01"))
-        .with_sort(SortDirective::parse("_id"))
-        .with_count(20);
-    control.total = Some(TotalMode::None);
-    profile_start(&fixture.db).await;
-    let result = fixture
-        .backend
-        .search(&fixture.tenant, &control)
-        .await
-        .unwrap();
-    assert_eq!(
-        result_ids(&result),
-        fixture.rows[1..21]
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<Vec<_>>()
-    );
-    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-    assert!(
-        profile_rows(
-            &fixture.db,
-            doc! {
-                "command.find": "search_index", "command.hint": SEARCH_DATE_RANGE_INDEX,
-            }
-        )
-        .await
-        .is_empty(),
-        "_id control must not enter the legacy driver"
-    );
     fixture.close().await;
 }
 
 #[tokio::test]
 async fn legacy_date_discovery_retries_only_a_missing_date_index() {
-    let Some(fixture) = Fixture::new("legacy-date-fallback", 700).await else {
+    for case in DateCase::ALL {
+        date_discovery_retry_case(case).await;
+    }
+}
+
+/// A hinted date driver retries once without the hint when `idx_search_date_v3`
+/// is gone. `ge` over a ready end index is unhinted and never needs a retry.
+async fn date_discovery_retry_case(case: DateCase) {
+    let Some(fixture) = Fixture::new(&format!("legacy-date-fallback-{case:?}"), 700).await else {
         return;
     };
     add_dates(&fixture, 600).await;
+    let mut without_end = None;
+    let backend = backend_for_case(case, &fixture, &mut without_end).await;
     let expected: HashSet<_> = fixture.rows[..600]
         .iter()
         .map(|row| row.id.clone())
@@ -427,12 +433,12 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
         .map(|row| SearchValue::eq(&row.id))
         .collect();
     let queries = [
-        SearchQuery::new("Observation").with_parameter(date_parameter("eq2025")),
+        SearchQuery::new("Observation").with_parameter(date_parameter(case.raw())),
         SearchQuery::new("Observation")
-            .with_parameter(date_parameter("eq2025"))
+            .with_parameter(date_parameter(case.raw()))
             .with_parameter(date_parameter("lt2025-07-01")),
         SearchQuery::new("Observation")
-            .with_parameter(date_parameter("eq2025"))
+            .with_parameter(date_parameter(case.raw()))
             .with_parameter(seed),
     ];
     for dropped in [false, true] {
@@ -446,8 +452,7 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
         }
         profile_start(&fixture.db).await;
         for query in &queries {
-            let actual = fixture
-                .backend
+            let actual = backend
                 .matching_resource_ids(
                     &fixture.db,
                     PLAN_TENANT,
@@ -457,7 +462,7 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(actual, Some(expected.clone()));
+            assert_eq!(actual, Some(expected.clone()), "{case:?} dropped={dropped}");
         }
         fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
         let rejected = profile_rows(
@@ -469,23 +474,39 @@ async fn legacy_date_discovery_retries_only_a_missing_date_index() {
             "command.hint": { "$exists": false },
             "$or": [{ "command.find": "search_index" }, { "command.aggregate": "search_index" }],
         }).await;
-        assert_eq!(!rejected.is_empty(), dropped);
-        assert_eq!(!unhinted.is_empty(), dropped);
+        if case.v3_hinted() {
+            assert_eq!(!rejected.is_empty(), dropped, "{case:?}");
+            assert_eq!(!unhinted.is_empty(), dropped, "{case:?}");
+        }
+        // `ge` over a ready end index is unhinted when alone, but a pair or an
+        // ID seed wraps it in a root `$and`, which keeps the v3 hint (and so
+        // the retry); the answers above are what must hold for it.
     }
     fixture.close().await;
 }
 
 #[tokio::test]
 async fn legacy_discovery_errors_and_required_membership_index_errors_propagate() {
-    let Some(fixture) = Fixture::new("legacy-discovery-errors", 16).await else {
+    for case in DateCase::ALL {
+        discovery_error_case(case).await;
+    }
+}
+
+async fn discovery_error_case(case: DateCase) {
+    let Some(fixture) = Fixture::new(&format!("legacy-discovery-errors-{case:?}"), 16).await else {
         return;
     };
     add_dates(&fixture, 12).await;
-    let single = SearchQuery::new("Observation").with_parameter(date_parameter("eq2025"));
+    let mut without_end = None;
+    let backend = backend_for_case(case, &fixture, &mut without_end).await;
+    let single = SearchQuery::new("Observation").with_parameter(date_parameter(case.raw()));
     let pair = single
         .clone()
         .with_parameter(date_parameter("lt2025-07-01"));
-    let Some(session) = fixture.failpoints("legacy-discovery-errors").await else {
+    let Some(session) = fixture
+        .failpoints(&format!("legacy-discovery-errors-{case:?}"))
+        .await
+    else {
         fixture.close().await;
         return;
     };
@@ -493,8 +514,7 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
         let before = fixture
             .arm_error(&session, command, doc! { "times": 1 }, 50)
             .await;
-        let result = fixture
-            .backend
+        let result = backend
             .matching_resource_ids(
                 &fixture.db,
                 PLAN_TENANT,
@@ -518,8 +538,7 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
         .await
         .unwrap();
     profile_start(&fixture.db).await;
-    let error = fixture
-        .backend
+    let error = backend
         .matching_resource_ids(
             &fixture.db,
             PLAN_TENANT,
@@ -539,17 +558,20 @@ async fn legacy_discovery_errors_and_required_membership_index_errors_propagate(
     assert_eq!(profile_rows(&fixture.db, doc! {
         "command.aggregate": "search_index", "command.hint": SEARCH_COMPOSITE_INDEX, "errCode": 2,
     }).await.len(), 1);
-    assert!(
-        profile_rows(
-            &fixture.db,
-            doc! {
-                "command.find": "search_index", "command.hint": { "$exists": false },
-            }
-        )
-        .await
-        .is_empty(),
-        "required identity access must not retry unhinted"
-    );
+    if case.v3_hinted() {
+        // A `ge` over a ready end index runs its date driver unhinted by design.
+        assert!(
+            profile_rows(
+                &fixture.db,
+                doc! {
+                    "command.find": "search_index", "command.hint": { "$exists": false },
+                }
+            )
+            .await
+            .is_empty(),
+            "required identity access must not retry unhinted"
+        );
+    }
     fixture.close().await;
 }
 

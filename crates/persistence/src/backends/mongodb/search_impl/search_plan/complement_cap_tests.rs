@@ -1139,6 +1139,122 @@ async fn unfiltered_descending_date_sort_does_not_group_the_parameter() {
     fixture.close().await;
 }
 
+/// The unfiltered `-date` answer with the walk (`idx_search_date_end` present)
+/// and with the grouped aggregate (it is missing) agree page by page at the
+/// edges of the keyed prefix and of the live set, with and without a total.
+#[tokio::test]
+async fn unfiltered_descending_date_sort_matches_at_the_keyed_keyless_boundary() {
+    let Some(mut fixture) = Fixture::new("sort-unfiltered-date-boundary", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    fixture.mark_deleted(1, 20).await;
+    // Resources with a date row come first; the rest follow in id order.
+    let live = fixture.rows.iter().filter(|row| !row.deleted).count();
+    let keyed = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(number, row)| !row.deleted && (number % 7 != 3 || number % 4 == 1))
+        .count();
+    assert!(keyed < live, "the fixture needs a keyless tail");
+    let mut offsets = vec![
+        keyed - 10,
+        keyed - 9,
+        keyed - 1,
+        keyed,
+        keyed + 1,
+        live - 10,
+        live - 9,
+        live,
+        live + 1,
+    ];
+    offsets.sort_unstable();
+    offsets.dedup();
+    let query = |offset: usize, total: TotalMode| {
+        let mut query = paged(sort_by("-date", SearchParamType::Date), 10, offset as u32);
+        query.total = Some(total);
+        query
+    };
+    let mut walked = Vec::new();
+    for total in [TotalMode::None, TotalMode::Accurate] {
+        for &offset in &offsets {
+            let result = with_result_id_cap(
+                WIDE,
+                fixture
+                    .backend
+                    .search(&fixture.tenant, &query(offset, total)),
+            )
+            .await
+            .unwrap();
+            walked.push((
+                (offset, total),
+                page_ids(&result),
+                result.resources.page_info.has_next,
+                result.total,
+            ));
+        }
+    }
+    let grouped_backend = boot_without_date_end(&fixture).await;
+    for ((offset, total), ids, has_next, count) in walked {
+        let result = with_result_id_cap(
+            WIDE,
+            grouped_backend.search(&fixture.tenant, &query(offset, total)),
+        )
+        .await
+        .unwrap();
+        let label = format!("offset {offset} total {total:?}");
+        assert_eq!(ids, page_ids(&result), "{label}: page");
+        assert_eq!(
+            has_next, result.resources.page_info.has_next,
+            "{label}: has_next"
+        );
+        assert_eq!(count, result.total, "{label}: total");
+        assert_eq!(
+            has_next,
+            offset + ids.len() < live,
+            "{label}: has_next against the live count"
+        );
+    }
+    fixture.close().await;
+}
+
+/// With `idx_search_date_end` missing the unfiltered `-date` sort never
+/// hints it and the grouped aggregate (the old path) runs: the positive control for the
+/// `$group.key0` check of the walk.
+#[tokio::test]
+async fn unfiltered_descending_date_sort_groups_the_parameter_without_the_end_index() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-date-grouped", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    let backend = boot_without_date_end(&fixture).await;
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    with_result_id_cap(
+        WIDE,
+        backend.search(&fixture.tenant, &unfiltered_desc_date(0)),
+    )
+    .await
+    .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert!(!hinted(&fixture.db, SEARCH_DATE_END_INDEX).await);
+    let grouped = collect_documents(
+        fixture
+            .db
+            .collection::<Document>("system.profile")
+            .find(doc! { "command.pipeline.$group.key0": { "$exists": true } })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !grouped.is_empty(),
+        "the sort-key $group must run on the grouped path"
+    );
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn unfiltered_descending_date_sort_falls_back_when_the_index_is_dropped_hot() {
     let Some(fixture) = Fixture::new("sort-unfiltered-date-hot-drop", 300).await else {

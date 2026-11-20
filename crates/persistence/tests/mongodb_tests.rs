@@ -20310,9 +20310,11 @@ async fn mongodb_integration_date_range_search_is_a_covered_date_scan() {
         ("gt2016-01-10", 10, &["idx_search_date_end"][..]),
         ("2016-01-10", 1, &["idx_search_date_v3"][..]),
         ("eb2016-01-10", 9, &["idx_search_date_v3"][..]),
-        // A root `$or` runs unhinted: each arm picks either date index.
+        // `le` is start-bounded: its root `$or` stays hinted to the v3 index.
+        ("le2016-01-10", 10, &["idx_search_date_v3"][..]),
+        // `ge` and `ne` (and a comma list holding one) run unhinted: the
+        // planner picks either date index for each arm.
         ("ge2016-01-10", 11, &DATE_INDEXES[..]),
-        ("le2016-01-10", 10, &DATE_INDEXES[..]),
         ("ne2016-01-10", 19, &DATE_INDEXES[..]),
         ("ge2016-01-19,lt2016-01-03", 4, &DATE_INDEXES[..]),
     ] {

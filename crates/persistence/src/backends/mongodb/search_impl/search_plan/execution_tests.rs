@@ -23,6 +23,70 @@ mod composite_plan_tests;
 #[path = "complement_cap_tests.rs"]
 mod complement_cap_tests;
 
+/// The date predicates the date-hint tests run, by the index access they take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DateCase {
+    /// `eq` is start-bounded: always hinted to `idx_search_date_v3`.
+    Eq,
+    /// `ge` with `idx_search_date_end` ready: a root `$or` left unhinted.
+    GeWithDateEnd,
+    /// `ge` with `idx_search_date_end` not ready: back on `idx_search_date_v3`.
+    GeWithoutDateEnd,
+}
+
+impl DateCase {
+    /// In this order: the last case drops `idx_search_date_end` for good.
+    const ALL: [Self; 3] = [Self::Eq, Self::GeWithDateEnd, Self::GeWithoutDateEnd];
+
+    fn raw(self) -> &'static str {
+        match self {
+            Self::Eq => "eq2025",
+            Self::GeWithDateEnd | Self::GeWithoutDateEnd => "ge2025-01-01",
+        }
+    }
+
+    /// Whether date discovery is hinted to `idx_search_date_v3`.
+    fn v3_hinted(self) -> bool {
+        self != Self::GeWithDateEnd
+    }
+}
+
+/// The backend a case searches with. `cases` must run in [`DateCase::ALL`]
+/// order: the last case swaps in a backend booted without the end index.
+async fn backend_for_case<'a>(
+    case: DateCase,
+    fixture: &'a Fixture,
+    without_end: &'a mut Option<MongoBackend>,
+) -> &'a MongoBackend {
+    if case == DateCase::GeWithoutDateEnd {
+        if without_end.is_none() {
+            *without_end = Some(backend_without_date_end(fixture).await);
+        }
+        return without_end.as_ref().unwrap();
+    }
+    assert!(fixture.backend.date_end_index_ready());
+    &fixture.backend
+}
+
+/// A second backend on the fixture's database after `idx_search_date_end`
+/// is dropped and automatic builds are off: the node upgraded before the
+/// index exists. Run after the indexed answers were taken.
+async fn backend_without_date_end(fixture: &Fixture) -> MongoBackend {
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .drop_index(SEARCH_DATE_END_INDEX)
+        .await
+        .unwrap();
+    let mut config = fixture.backend.config().clone();
+    config.index_build = IndexBuildMode::Off;
+    let backend = MongoBackend::new(config).unwrap();
+    backend.init_schema().await.unwrap();
+    backend.wait_for_search_index_build().await;
+    assert!(!backend.date_end_index_ready());
+    backend
+}
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -1837,9 +1901,17 @@ async fn a_rejected_identity_hint_never_falls_back() {
 /// A node that still hints `idx_search_date_v3` after a newer node dropped it
 /// (rolling upgrade) answers date searches by running the rejected command
 /// again unhinted; with the index present no date command runs unhinted.
+/// `ge` over a ready end index is unhinted: nothing is rejected, and the
+/// arms plan around the dropped index.
 #[tokio::test]
 async fn date_searches_survive_a_dropped_hinted_index() {
-    let Some(fixture) = Fixture::new("dropped-date-index", 64).await else {
+    for case in DateCase::ALL {
+        dropped_hinted_index_case(case).await;
+    }
+}
+
+async fn dropped_hinted_index_case(case: DateCase) {
+    let Some(fixture) = Fixture::new(&format!("dropped-date-index-{case:?}"), 64).await else {
         return;
     };
     let index = fixture.db.collection::<Document>("search_index");
@@ -1858,6 +1930,8 @@ async fn date_searches_survive_a_dropped_hinted_index() {
         })
         .collect();
     index.insert_many(dated).await.unwrap();
+    let mut without_end = None;
+    let backend = backend_for_case(case, &fixture, &mut without_end).await;
     let expected: Vec<String> = fixture.rows[32..]
         .iter()
         .map(|row| row.id.clone())
@@ -1865,7 +1939,7 @@ async fn date_searches_survive_a_dropped_hinted_index() {
     let mut query = SearchQuery::new("Observation")
         .with_count(50)
         .with_sort(SortDirective::parse("_id"))
-        .with_parameter(date_parameter("eq2025"));
+        .with_parameter(date_parameter(case.raw()));
     query.total = Some(TotalMode::Accurate);
     let ids = |result: &crate::core::SearchResult| {
         result
@@ -1889,34 +1963,35 @@ async fn date_searches_survive_a_dropped_hinted_index() {
     let rejected = doc! { "command.hint": SEARCH_DATE_RANGE_INDEX, "errCode": 2 };
 
     fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
-    let present = fixture
-        .backend
-        .search(&fixture.tenant, &query)
-        .await
-        .unwrap();
-    assert_eq!(ids(&present), expected);
-    assert_eq!(present.total, Some(32));
-    assert!(profile.count_documents(hinted.clone()).await.unwrap() > 0);
+    let present = backend.search(&fixture.tenant, &query).await.unwrap();
+    assert_eq!(ids(&present), expected, "{case:?}");
+    assert_eq!(present.total, Some(32), "{case:?}");
     assert_eq!(
-        profile
-            .count_documents(unhinted_date.clone())
-            .await
-            .unwrap(),
-        0
+        profile.count_documents(rejected.clone()).await.unwrap(),
+        0,
+        "{case:?}"
     );
-    assert_eq!(profile.count_documents(rejected.clone()).await.unwrap(), 0);
+    if case.v3_hinted() {
+        assert!(profile.count_documents(hinted.clone()).await.unwrap() > 0);
+        assert_eq!(
+            profile
+                .count_documents(unhinted_date.clone())
+                .await
+                .unwrap(),
+            0,
+            "{case:?}"
+        );
+    }
 
     index.drop_index(SEARCH_DATE_RANGE_INDEX).await.unwrap();
-    let dropped = fixture
-        .backend
-        .search(&fixture.tenant, &query)
-        .await
-        .unwrap();
+    let dropped = backend.search(&fixture.tenant, &query).await.unwrap();
     fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-    assert_eq!(ids(&dropped), expected);
-    assert_eq!(dropped.total, Some(32));
-    assert!(profile.count_documents(rejected).await.unwrap() > 0);
-    assert!(profile.count_documents(unhinted_date).await.unwrap() > 0);
+    assert_eq!(ids(&dropped), expected, "{case:?}");
+    assert_eq!(dropped.total, Some(32), "{case:?}");
+    if case.v3_hinted() {
+        assert!(profile.count_documents(rejected).await.unwrap() > 0);
+        assert!(profile.count_documents(unhinted_date).await.unwrap() > 0);
+    }
     fixture.close().await;
 }
 
@@ -2442,23 +2517,38 @@ mod date_end_filter_tests {
             .collect()
     }
 
-    /// A second backend on the fixture's database after `idx_search_date_end`
-    /// is dropped and automatic builds are off: the node upgraded before the
-    /// index exists. Run after the indexed answers were taken.
-    async fn backend_without_date_end(fixture: &Fixture) -> MongoBackend {
-        fixture
-            .db
-            .collection::<Document>("search_index")
-            .drop_index(SEARCH_DATE_END_INDEX)
+    /// The ids of the second page of ten, in the order served.
+    async fn page_two(backend: &MongoBackend, tenant: &TenantContext, raw: &str) -> Vec<String> {
+        ids(&backend
+            .search(tenant, &date_query(raw, 10, 10))
             .await
-            .unwrap();
-        let mut config = fixture.backend.config().clone();
-        config.index_build = IndexBuildMode::Off;
-        let backend = MongoBackend::new(config).unwrap();
-        backend.init_schema().await.unwrap();
-        backend.wait_for_search_index_build().await;
-        assert!(!backend.date_end_index_ready());
-        backend
+            .unwrap())
+    }
+
+    /// Every id the date search serves by following `next` cursors, `count`
+    /// to a page, with whether each page said it had a next one.
+    async fn cursor_pages(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+        raw: &str,
+        count: u32,
+    ) -> Vec<(Vec<String>, bool)> {
+        let first = SearchQuery::new("Observation")
+            .with_count(count)
+            .with_parameter(date_parameter(raw));
+        let mut pages = Vec::new();
+        let mut query = first.clone();
+        loop {
+            let result = backend.search(tenant, &query).await.unwrap();
+            let has_next = result.resources.page_info.has_next;
+            let next = result.resources.page_info.next_cursor.clone();
+            pages.push((ids(&result), has_next));
+            assert!(pages.len() < 200, "{raw}: cursor paging did not terminate");
+            match next.filter(|_| has_next) {
+                Some(cursor) => query = first.clone().with_cursor(cursor),
+                None => return pages,
+            }
+        }
     }
 
     const PREFIXES: [&str; 3] = ["gt2020-03-01", "ge2020-03-01", "ne2020-03-01"];
@@ -2505,7 +2595,10 @@ mod date_end_filter_tests {
         add_date_rows(&fixture).await;
         let mut expected = Vec::new();
         for raw in PREFIXES {
-            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+            expected.push((
+                full_answer(&fixture.backend, &fixture.tenant, raw).await,
+                page_two(&fixture.backend, &fixture.tenant, raw).await,
+            ));
         }
         fixture
             .db
@@ -2515,15 +2608,15 @@ mod date_end_filter_tests {
             .unwrap();
         // The running backend still believes the index is built.
         assert!(fixture.backend.date_end_index_ready());
-        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
-            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
-            assert_eq!(answer, expected, "{raw}");
-            let page = fixture
-                .backend
-                .search(&fixture.tenant, &date_query(raw, 10, 10))
-                .await
-                .unwrap();
-            assert_eq!(page.resources.items.len(), 10, "{raw}: page 2");
+        for (raw, (answer, page)) in PREFIXES.into_iter().zip(expected) {
+            assert_eq!(
+                full_answer(&fixture.backend, &fixture.tenant, raw).await,
+                answer,
+                "{raw}"
+            );
+            let after = page_two(&fixture.backend, &fixture.tenant, raw).await;
+            assert_eq!(after.len(), 10, "{raw}: page 2");
+            assert_eq!(after, page, "{raw}: page 2 ids");
         }
         fixture.close().await;
     }
@@ -2536,7 +2629,10 @@ mod date_end_filter_tests {
         add_date_rows(&fixture).await;
         let mut expected = Vec::new();
         for raw in PREFIXES {
-            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+            expected.push((
+                full_answer(&fixture.backend, &fixture.tenant, raw).await,
+                page_two(&fixture.backend, &fixture.tenant, raw).await,
+            ));
         }
         fixture
             .db
@@ -2545,15 +2641,135 @@ mod date_end_filter_tests {
             .await
             .unwrap();
         // The root $or of ge/ne is unhinted, so each arm picks what is left.
-        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
-            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
-            assert_eq!(answer, expected, "{raw}");
-            let page = fixture
+        for (raw, (answer, page)) in PREFIXES.into_iter().zip(expected) {
+            assert_eq!(
+                full_answer(&fixture.backend, &fixture.tenant, raw).await,
+                answer,
+                "{raw}"
+            );
+            let after = page_two(&fixture.backend, &fixture.tenant, raw).await;
+            assert_eq!(after.len(), 10, "{raw}: page 2");
+            assert_eq!(after, page, "{raw}: page 2 ids");
+        }
+        fixture.close().await;
+    }
+
+    /// `ge` and `gt` walked page by page with `next` cursors, 7 to a page,
+    /// serve every match once, in the order of the full answer, and only the
+    /// last page says it has no next one.
+    #[tokio::test]
+    async fn ge_and_gt_cursor_pages_cover_the_full_answer() {
+        let Some(fixture) = Fixture::new("date-end-cursor-pages", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        let mut expected = Vec::new();
+        for raw in ["ge2020-03-01", "gt2020-03-01"] {
+            let full = fixture
                 .backend
-                .search(&fixture.tenant, &date_query(raw, 10, 10))
+                .search(
+                    &fixture.tenant,
+                    &SearchQuery::new("Observation")
+                        .with_count(1_000)
+                        .with_parameter(date_parameter(raw)),
+                )
                 .await
                 .unwrap();
-            assert_eq!(page.resources.items.len(), 10, "{raw}: page 2");
+            let full = ids(&full);
+            assert!(full.len() > 21, "{raw} must span several pages");
+            expected.push((raw, full));
+        }
+        // Indexed first: the second pass drops the end index for good.
+        let mut plain = None;
+        for label in ["indexed", "without"] {
+            let backend = if label == "indexed" {
+                &fixture.backend
+            } else {
+                plain.insert(backend_without_date_end(&fixture).await)
+            };
+            for (raw, full) in &expected {
+                let pages = cursor_pages(backend, &fixture.tenant, raw, 7).await;
+                let served: Vec<String> = pages
+                    .iter()
+                    .flat_map(|(page, _)| page.iter().cloned())
+                    .collect();
+                assert_eq!(&served, full, "{label} {raw}: concatenated pages");
+                let last = pages.len() - 1;
+                for (number, (page, has_next)) in pages.iter().enumerate() {
+                    assert_eq!(*has_next, number != last, "{label} {raw}: page {number}");
+                    assert!(page.len() <= 7, "{label} {raw}: page {number}");
+                }
+            }
+        }
+        fixture.close().await;
+    }
+
+    /// With `idx_search_date_end` missing, every date command still hints
+    /// `idx_search_date_v3` and `gt`, `ge` and `ne` answer from the grouped
+    /// aggregate over it, as before the end index existed.
+    #[tokio::test]
+    async fn gt_ge_ne_keep_the_v3_hint_while_the_end_index_is_missing() {
+        let Some(fixture) = Fixture::new("date-end-not-ready-hints", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        let mut expected = Vec::new();
+        for raw in PREFIXES {
+            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+        }
+        let plain = backend_without_date_end(&fixture).await;
+        let on_index = |extra: Document| {
+            let mut filter = doc! { "$or": [
+                { "command.aggregate": "search_index" },
+                { "command.find": "search_index" },
+            ] };
+            filter.extend(extra);
+            filter
+        };
+        let profile = fixture.db.collection::<Document>("system.profile");
+        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
+            for offset in [0u32, 10] {
+                restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+                let page = plain
+                    .search(&fixture.tenant, &date_query(raw, 1_000, offset))
+                    .await
+                    .unwrap();
+                fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+                if offset == 0 {
+                    assert_eq!(
+                        (ids(&page).into_iter().collect::<BTreeSet<_>>(), page.total),
+                        expected,
+                        "{raw}"
+                    );
+                }
+                let count = |filter: Document| {
+                    let profile = profile.clone();
+                    async move { profile.count_documents(filter).await.unwrap() }
+                };
+                assert!(
+                    count(on_index(doc! { "command.hint": SEARCH_DATE_RANGE_INDEX })).await > 0,
+                    "{raw}@{offset}: no command hinted idx_search_date_v3"
+                );
+                assert_eq!(
+                    count(on_index(doc! { "command.hint": SEARCH_DATE_END_INDEX })).await,
+                    0,
+                    "{raw}@{offset}: hinted the missing end index"
+                );
+                assert_eq!(
+                    count(on_index(doc! { "command.hint": { "$exists": false } })).await,
+                    0,
+                    "{raw}@{offset}: a date command ran unhinted"
+                );
+                assert!(
+                    count(doc! {
+                        "command.aggregate": "search_index",
+                        "command.pipeline.$group": { "$exists": true },
+                    })
+                    .await
+                        > 0,
+                    "{raw}@{offset}: the grouped aggregate did not run"
+                );
+            }
         }
         fixture.close().await;
     }

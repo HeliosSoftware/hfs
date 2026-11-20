@@ -2445,10 +2445,18 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
 
 #[tokio::test]
 async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
-    let Some(data) = TimestampFixture::new("complement-date-metadata").await else {
+    for case in DateCase::ALL {
+        complement_date_case(case).await;
+    }
+}
+
+async fn complement_date_case(case: DateCase) {
+    let Some(data) = TimestampFixture::new(&format!("complement-date-metadata-{case:?}")).await
+    else {
         return;
     };
-    let backend = &data.fixture.backend;
+    let mut without_end = None;
+    let backend = backend_for_case(case, &data.fixture, &mut without_end).await;
     let db = &data.fixture.db;
     trust_missing_metadata(backend, db).await;
     let start = DateTime::from_millis(1_767_225_600_000);
@@ -2462,7 +2470,10 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
         .unwrap();
     let mut date = parameter("date", "2026-01-01");
     date.param_type = SearchParamType::Date;
-    date.values[0].prefix = SearchPrefix::Eq;
+    date.values[0].prefix = match case {
+        DateCase::Eq => SearchPrefix::Eq,
+        DateCase::GeWithDateEnd | DateCase::GeWithoutDateEnd => SearchPrefix::Ge,
+    };
     let mut excluded = parameter("code", "right");
     excluded.modifier = Some(SearchModifier::Not);
     let mut query = SearchQuery::new("Observation")
@@ -2484,10 +2495,11 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
         .probe_key
         .clone()
         .expect("date must have a scoped cache key");
-    assert_eq!(
-        metadata.hint(),
-        Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-    );
+    // `ge` over a ready end index leaves its `$or` arms to the planner.
+    let expected_hint = case
+        .v3_hinted()
+        .then(|| Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+    assert_eq!(metadata.hint(), expected_hint, "{case:?}");
     backend
         .probe_cache
         .insert(key.clone(), ProbeEstimate::AtLeast(MAX_CANDIDATE_ROWS + 1));
