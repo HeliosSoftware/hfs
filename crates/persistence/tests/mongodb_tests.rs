@@ -337,6 +337,19 @@ mod shared_mongo {
     use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
 
+    /// How long a profiler write may wait for its lock, as a `--setParameter`.
+    ///
+    /// MongoDB 9.0 gives a profiler write 1 ms
+    /// (`internalQueryGlobalProfilingLockDeadlineMs`) and then abandons it with
+    /// warning 20703 (`LockTimeout`): on a loaded host the operation runs but
+    /// leaves no `system.profile` entry, and a test asserting on the entry
+    /// fails (`history_index_plans` saw a reader with 0 profiler entries).
+    /// Past `internalProfilingMaxAbandonedWritesPerSecondPerDb` abandoned
+    /// writes, mongod also turns profiling off for the database. Earlier
+    /// servers waited without a deadline; 5 s restores that for any wait a
+    /// test run can have, and still ends a stuck write.
+    const PROFILER_LOCK_DEADLINE: &str = "internalQueryGlobalProfilingLockDeadlineMs=5000";
+
     struct SharedMongo {
         connection_string: String,
         /// Kept alive for the duration of the test binary; the
@@ -434,7 +447,8 @@ mod shared_mongo {
     /// this returns. The container is removed when the first element is dropped.
     ///
     /// The command is `mongod --bind_ip_all --wiredTigerCacheSizeGB <wt_cache_gb>
-    /// --replSet rs0` followed by `extra_flags`, in that order. Callers pass
+    /// --replSet rs0 --setParameter <PROFILER_LOCK_DEADLINE>` followed by
+    /// `extra_flags`, in that order. Callers pass
     /// `--oplogSize` there too: without it mongod sizes the oplog from the free
     /// disk.
     ///
@@ -452,6 +466,8 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            "--setParameter",
+            PROFILER_LOCK_DEADLINE,
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
@@ -545,6 +561,10 @@ mod shared_mongo {
                             // such a read needs a longer window.
                             "--setParameter",
                             "minSnapshotHistoryWindowInSeconds=5",
+                            // The profiler tests read `system.profile`; see
+                            // `PROFILER_LOCK_DEADLINE`.
+                            "--setParameter",
+                            PROFILER_LOCK_DEADLINE,
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
@@ -8602,7 +8622,8 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
 /// rather than a type-wide `distinct`.
 #[tokio::test]
 async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
-    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+    // The plan guard below needs the bounded plan, which a timed-out probe changes.
+    let Some(backend) = create_backend_with_stable_probes("param_sort_bounded").await else {
         eprintln!(
             "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
         );
