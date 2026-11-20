@@ -35548,6 +35548,49 @@ mod postgres_integration {
             .await;
     }
 
+    /// #2602: `gt`/`ge`/`eb` filter on `value_quantity_high`, so a selective
+    /// one must be served by `idx_search_quantity_high`, not a scan.
+    #[tokio::test]
+    async fn postgres_integration_quantity_high_index_serves_upper_bound_prefixes() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("quantity-high-explain");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+             SELECT $1, 'Condition', 'qh-' || series, '1',
+                    jsonb_build_object('resourceType', 'Condition', 'id', 'qh-' || series),
+                    '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 40000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_high, last_updated)
+             SELECT $1, 'Condition', 'qh-' || series, 'onset-age',
+                    series % 1000, series % 1000, '2020-01-01T00:00:00Z'
+             FROM generate_series(1, 40000) series",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        for predicate in ["value_quantity_high > 990", "value_quantity_high < 10"] {
+            let sql = format!(
+                "EXPLAIN (FORMAT JSON) SELECT resource_id FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Condition' AND param_name = 'onset-age'
+                 AND value_quantity_value IS NOT NULL AND {predicate}"
+            );
+            let plan: serde_json::Value =
+                client.query_one(&sql, &[&tenant_id]).await.unwrap().get(0);
+            let text = plan.to_string();
+            assert!(
+                text.contains("idx_search_quantity_high"),
+                "{predicate}: expected idx_search_quantity_high: {text}"
+            );
+        }
+    }
+
     /// #2602: a `Range` was not indexed for quantity parameters. It is one
     /// closed `[value_quantity_value, value_quantity_high]` interval now.
     #[tokio::test]
