@@ -366,6 +366,98 @@ pub(super) fn quantity_high_backfill_update() -> Vec<Document> {
     vec![doc! { "$set": { "value_quantity_high": "$value_quantity_value" } }]
 }
 
+/// Rows rewritten per `update_many` by the `value_quantity_high` backfill.
+const QUANTITY_HIGH_BACKFILL_BATCH: usize = 10_000;
+
+/// Attempts per batch before the backfill gives up and returns the error.
+const QUANTITY_HIGH_BACKFILL_ATTEMPTS: u32 = 4;
+
+/// Backfills `value_quantity_high = value_quantity_value` (#2602) in `_id`
+/// order, `batch_size` rows at a time, logging progress per batch. A failed
+/// batch is retried with a growing pause before the error is returned.
+/// Idempotent: a row that has a high no longer matches the filter, so a
+/// second run modifies nothing and a stored high is never overwritten.
+/// Returns the number of rows modified.
+pub(super) async fn backfill_quantity_high_batched(
+    database: &Database,
+    batch_size: usize,
+) -> StorageResult<u64> {
+    let mut total = 0u64;
+    for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
+        let coll = database.collection::<Document>(collection);
+        let mut last_id: Option<Bson> = None;
+        loop {
+            let mut attempt = 0u32;
+            let step = loop {
+                attempt += 1;
+                match backfill_quantity_high_batch(&coll, last_id.as_ref(), batch_size).await {
+                    Ok(step) => break step,
+                    Err(e) if attempt < QUANTITY_HIGH_BACKFILL_ATTEMPTS => {
+                        tracing::warn!(
+                            collection,
+                            attempt,
+                            error = %e,
+                            "quantity high backfill batch failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            200 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let Some((upper, modified)) = step else {
+                break;
+            };
+            total += modified;
+            last_id = Some(upper);
+            tracing::info!(
+                collection,
+                rows_so_far = total,
+                "quantity high backfill progress"
+            );
+        }
+    }
+    Ok(total)
+}
+
+/// One batch: the next `batch_size` unfilled quantity rows after `after`, in
+/// `_id` order. `None` when there are none left; otherwise the batch's last
+/// `_id` and the rows modified.
+async fn backfill_quantity_high_batch(
+    coll: &mongodb::Collection<Document>,
+    after: Option<&Bson>,
+    batch_size: usize,
+) -> StorageResult<Option<(Bson, u64)>> {
+    use futures::stream::TryStreamExt;
+
+    let mut filter = quantity_high_backfill_filter();
+    if let Some(after) = after {
+        filter.insert("_id", doc! { "$gt": after.clone() });
+    }
+    let ids: Vec<Bson> = coll
+        .find(filter)
+        .sort(doc! { "_id": 1 })
+        .limit(batch_size as i64)
+        .projection(doc! { "_id": 1 })
+        .await?
+        .map_ok(|d| d.get("_id").cloned().unwrap_or(Bson::Null))
+        .try_collect()
+        .await?;
+    let (Some(first), Some(last)) = (ids.first().cloned(), ids.last().cloned()) else {
+        return Ok(None);
+    };
+    // The batch is the next matching rows in `_id` order, so the range holds
+    // exactly them; the filter keeps a concurrently written row out.
+    let mut update_filter = quantity_high_backfill_filter();
+    update_filter.insert("_id", doc! { "$gte": first, "$lte": last.clone() });
+    let result = coll
+        .update_many(update_filter, quantity_high_backfill_update())
+        .await?;
+    Ok(Some((last, result.modified_count)))
+}
+
 pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
@@ -651,18 +743,7 @@ impl SearchIndexBuilder {
     /// One-time backfill of `value_quantity_high` (#2602) over `search_index`
     /// and `search_index_contained`. Returns the number of rows rewritten.
     async fn backfill_quantity_high(&self) -> StorageResult<u64> {
-        let mut total = 0u64;
-        for collection in [SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION] {
-            let coll = self.database.collection::<Document>(collection);
-            let result = coll
-                .update_many(
-                    quantity_high_backfill_filter(),
-                    quantity_high_backfill_update(),
-                )
-                .await?;
-            total += result.modified_count;
-        }
-        Ok(total)
+        backfill_quantity_high_batched(&self.database, QUANTITY_HIGH_BACKFILL_BATCH).await
     }
 
     async fn record_if_needed(&self) -> StorageResult<()> {
@@ -1971,5 +2052,126 @@ mod quantity_range_tests {
             ..Inspection::default()
         };
         assert!(existing.existing_indexes_ready());
+    }
+}
+
+/// `backfill_quantity_high_batched` against a real server (skipped without
+/// `HFS_TEST_MONGODB_URL`, see `tuple_marker_record_tests`), with a small
+/// batch so several batches run.
+#[cfg(test)]
+mod quantity_high_backfill_tests {
+    use super::tuple_marker_record_tests::scratch_database;
+    use super::*;
+    use futures::stream::TryStreamExt;
+
+    const BATCH: usize = 7;
+
+    async fn fetch(database: &Database, collection: &str, id: i32) -> Document {
+        database
+            .collection::<Document>(collection)
+            .find_one(doc! { "_id": id })
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// 30 old quantity rows in each collection (several batches), plus a row
+    /// of another type, a row that already has a high, and a row with no
+    /// `value_quantity_value`.
+    async fn seed(database: &Database) {
+        for (collection, base) in [
+            (SEARCH_INDEX_COLLECTION, 0),
+            (SEARCH_INDEX_CONTAINED_COLLECTION, 1000),
+        ] {
+            let coll = database.collection::<Document>(collection);
+            let mut rows: Vec<Document> = (0..30)
+                .map(|i| doc! { "_id": base + i, "value_quantity_value": f64::from(i) + 0.5 })
+                .collect();
+            rows.push(doc! { "_id": base + 100, "value_string": "abc" });
+            rows.push(
+                doc! { "_id": base + 101, "value_quantity_value": 1.0, "value_quantity_high": 9.0 },
+            );
+            rows.push(doc! { "_id": base + 102, "value_quantity_unit": "mg" });
+            coll.insert_many(rows).await.unwrap();
+        }
+    }
+
+    async fn assert_untouched_rows(database: &Database, collection: &str, base: i32) {
+        let other = fetch(database, collection, base + 100).await;
+        assert!(!other.contains_key("value_quantity_high"), "{other:?}");
+        let kept = fetch(database, collection, base + 101).await;
+        assert_eq!(kept.get_f64("value_quantity_high").unwrap(), 9.0);
+        // No `value_quantity_value` field: not a quantity row, left alone.
+        let no_value = fetch(database, collection, base + 102).await;
+        assert!(
+            !no_value.contains_key("value_quantity_high"),
+            "{no_value:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_every_old_row_in_batches_and_is_idempotent() {
+        let Some(database) = scratch_database("quantity_high_backfill").await else {
+            return;
+        };
+        seed(&database).await;
+
+        let first = backfill_quantity_high_batched(&database, BATCH).await;
+        let second = backfill_quantity_high_batched(&database, BATCH).await;
+        let mut checks = Vec::new();
+        for (collection, base) in [
+            (SEARCH_INDEX_COLLECTION, 0),
+            (SEARCH_INDEX_CONTAINED_COLLECTION, 1000),
+        ] {
+            let rows: Vec<Document> = database
+                .collection::<Document>(collection)
+                .find(doc! { "_id": { "$gte": base, "$lt": base + 30 } })
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            checks.push((collection, base, rows));
+        }
+        let outcome = (first, second);
+        for (collection, base, rows) in &checks {
+            assert_eq!(rows.len(), 30);
+            for row in rows {
+                assert_eq!(
+                    row.get_f64("value_quantity_high").unwrap(),
+                    row.get_f64("value_quantity_value").unwrap(),
+                    "{collection}: {row:?}"
+                );
+            }
+            assert_untouched_rows(&database, collection, *base).await;
+        }
+        database.drop().await.unwrap();
+        assert_eq!(outcome.0.unwrap(), 60, "both collections, every old row");
+        assert_eq!(outcome.1.unwrap(), 0, "a second run modifies nothing");
+    }
+
+    #[tokio::test]
+    async fn backfill_on_rows_without_a_quantity_value_modifies_nothing() {
+        let Some(database) = scratch_database("quantity_high_backfill_none").await else {
+            return;
+        };
+        database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .insert_many(vec![
+                doc! { "_id": 1, "value_string": "a" },
+                doc! { "_id": 2, "value_quantity_unit": "mg" },
+            ])
+            .await
+            .unwrap();
+
+        let modified = backfill_quantity_high_batched(&database, BATCH).await;
+        let rows = database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .count_documents(doc! { "value_quantity_high": { "$exists": true } })
+            .await
+            .unwrap();
+        database.drop().await.unwrap();
+        assert_eq!(modified.unwrap(), 0);
+        assert_eq!(rows, 0);
     }
 }

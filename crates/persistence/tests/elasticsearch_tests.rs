@@ -2084,6 +2084,80 @@ mod es_integration {
             .await;
     }
 
+    /// #2602: a document indexed before schema version 4 has no
+    /// `quantity.high`, so the descending sort mis-ordered it. The startup
+    /// backfill gives it `high = value`, idempotently.
+    #[tokio::test]
+    async fn es_quantity_high_backfill_fixes_descending_sort() {
+        use elasticsearch::UpdateByQueryParts;
+        use elasticsearch::http::transport::Transport;
+        use helios_persistence::backends::elasticsearch::backfill_quantity_high;
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchQuery, SortDirection, SortDirective,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("qty-high-backfill");
+        for (id, value) in [("q-old-hi", 500), ("q-new", 50), ("q-old-lo", 5)] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                        "status": "final",
+                        "valueQuantity": {"value": value, "unit": "mg",
+                            "system": "http://unitsofmeasure.org", "code": "mg"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let index = backend.index_name("qty-high-backfill", "Observation");
+        let es = shared_es().await;
+        let raw = elasticsearch::Elasticsearch::new(
+            Transport::single_node(&format!("http://{}:{}", es.host, es.port)).expect("transport"),
+        );
+
+        // Make two documents look indexed before v4: no `high` on any entry.
+        let strip = raw
+            .update_by_query(UpdateByQueryParts::Index(&[&index]))
+            .refresh(true)
+            .body(json!({
+                "query": {"terms": {"resource_id": ["q-old-hi", "q-old-lo"]}},
+                "script": {"lang": "painless", "source":
+                    "for (def e : ctx._source.search_params.quantity) { e.remove('high'); e.remove('canonical_high'); }"}
+            }))
+            .send()
+            .await
+            .expect("strip request");
+        let stripped: serde_json::Value = strip.json().await.expect("strip body");
+        assert_eq!(stripped["updated"], 2, "stripped: {stripped}");
+
+        let updated = backfill_quantity_high(&backend, &[&index], true).await;
+        assert_eq!(updated, Some(2), "only the two old documents are rewritten");
+        // Idempotent: nothing is left to do.
+        assert_eq!(
+            backfill_quantity_high(&backend, &[&index], true).await,
+            Some(0)
+        );
+
+        let query = SearchQuery::new("Observation")
+            .with_count(10)
+            .with_sort(SortDirective {
+                parameter: "value-quantity".to_string(),
+                direction: SortDirection::Descending,
+                param_type: Some(SearchParamType::Quantity),
+            });
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec!["q-old-hi", "q-new", "q-old-lo"]);
+    }
+
     /// #1606: a missing value came first on a descending sort. It comes last
     /// both ways now, and a `Previous` page still mirrors a `Next` one.
     #[tokio::test]

@@ -3,10 +3,12 @@
 //! Defines the index structure for FHIR resources in Elasticsearch.
 //! Uses nested objects for search parameters to ensure correct multi-value matching.
 
+use elasticsearch::UpdateByQueryParts;
 use elasticsearch::indices::{
     IndicesCreateParts, IndicesExistsParts, IndicesGetMappingParts, IndicesGetSettingsParts,
     IndicesPutMappingParts, IndicesPutSettingsParts, IndicesPutTemplateParts, IndicesStatsParts,
 };
+use elasticsearch::params::Conflicts;
 use serde_json::{Value, json};
 
 use crate::error::{BackendError, StorageResult};
@@ -954,11 +956,184 @@ fn warn_reference_reindex_needed(indices: &[String]) {
     );
 }
 
-/// Warns, once, that the documents of `indices` were indexed before #2602
-/// (schema version `4`): a quantity parameter selecting a `Range` (`onset-age`,
-/// `abatement-age`, `context-quantity`) produced no row for them, so such a
-/// `Range` is not found until `$reindex` indexes it again. `Quantity` and `Age`
-/// values are unaffected.
+/// Painless script that gives every nested `search_params.quantity` entry
+/// lacking `high` the upper bound of a point, `high = value` and
+/// `canonical_high = canonical_value` (#2602). Idempotent: an entry that has
+/// `high` is left alone, and a document with nothing to change is a no-op.
+const QUANTITY_HIGH_BACKFILL_SCRIPT: &str = "\
+def sp = ctx._source.search_params; \
+if (sp == null || sp.quantity == null) { ctx.op = 'noop'; return; } \
+List items = sp.quantity instanceof List ? sp.quantity : [sp.quantity]; \
+boolean changed = false; \
+for (def e : items) { \
+  if (e == null || e.high != null) { continue; } \
+  if (e.value != null) { e.high = e.value; changed = true; } \
+  if (e.canonical_high == null && e.canonical_value != null) { \
+    e.canonical_high = e.canonical_value; changed = true; } \
+} \
+if (!changed) { ctx.op = 'noop'; }";
+
+/// The `_update_by_query` body selecting documents that hold a nested quantity
+/// entry with a `value` and no `high`.
+fn quantity_high_backfill_body() -> Value {
+    json!({
+        "query": {
+            "nested": {
+                "path": "search_params.quantity",
+                "query": { "bool": {
+                    "filter": [{ "exists": { "field": "search_params.quantity.value" } }],
+                    "must_not": [{ "exists": { "field": "search_params.quantity.high" } }]
+                }}
+            }
+        },
+        "script": { "lang": "painless", "source": QUANTITY_HIGH_BACKFILL_SCRIPT }
+    })
+}
+
+/// Backfills `high = value` and `canonical_high = canonical_value` on the
+/// nested quantity entries of documents indexed before schema version `4`
+/// (#2602), with an `_update_by_query` over `indices` (index names or globs).
+///
+/// With `wait` the call returns after the update with the number of documents
+/// changed. Without it the update runs as a server-side task, a background
+/// poller logs its progress and the final count, and `None` comes back at
+/// once. Never fails: every problem is logged as a warning and yields `None`;
+/// version conflicts are skipped (`conflicts=proceed`), and running it again
+/// finishes what they left.
+pub async fn backfill_quantity_high(
+    backend: &ElasticsearchBackend,
+    indices: &[&str],
+    wait: bool,
+) -> Option<u64> {
+    if indices.is_empty() {
+        return None;
+    }
+    let response = backend
+        .client()
+        .update_by_query(UpdateByQueryParts::Index(indices))
+        .conflicts(Conflicts::Proceed)
+        .refresh(true)
+        .wait_for_completion(wait)
+        .allow_no_indices(true)
+        .body(quantity_high_backfill_body())
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not start the Elasticsearch quantity `high` backfill");
+            return None;
+        }
+    };
+    let status = response.status_code();
+    let body = response.json::<Value>().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            status = status.as_u16(),
+            response = %body,
+            "the Elasticsearch quantity `high` backfill was rejected; run `$reindex` to index \
+             the quantity upper bound of documents indexed before #2602"
+        );
+        return None;
+    }
+    if wait {
+        report_backfill(&body);
+        return body.get("updated").and_then(Value::as_u64);
+    }
+    match body.get("task").and_then(Value::as_str) {
+        Some(task) => {
+            tracing::info!(task, "started the Elasticsearch quantity `high` backfill");
+            let client = backend.client().clone();
+            let task = task.to_string();
+            tokio::spawn(async move { poll_backfill_task(&client, &task).await });
+        }
+        None => report_backfill(&body),
+    }
+    None
+}
+
+/// Logs the outcome of a finished backfill response (or task `response`).
+fn report_backfill(body: &Value) {
+    let count = |key: &str| body.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let failures = body
+        .get("failures")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if failures > 0 {
+        tracing::warn!(
+            updated = count("updated"),
+            version_conflicts = count("version_conflicts"),
+            failures,
+            "the Elasticsearch quantity `high` backfill finished with failures; restart to \
+             retry it, or run `$reindex`"
+        );
+    } else {
+        tracing::info!(
+            updated = count("updated"),
+            version_conflicts = count("version_conflicts"),
+            "backfilled `high` on Elasticsearch quantity entries"
+        );
+    }
+}
+
+/// Follows the backfill task `task` until it completes (bounded to an hour),
+/// logging progress. Failures to read the task are warnings only.
+async fn poll_backfill_task(client: &elasticsearch::Elasticsearch, task: &str) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    const MAX_POLLS: u32 = 720;
+    for _ in 0..MAX_POLLS {
+        tokio::time::sleep(INTERVAL).await;
+        let response = client
+            .send(
+                elasticsearch::http::Method::Get,
+                &format!("/_tasks/{task}"),
+                elasticsearch::http::headers::HeaderMap::new(),
+                None::<&()>,
+                None::<&[u8]>,
+                None,
+            )
+            .await;
+        let body = match response {
+            Ok(response) if response.status_code().is_success() => {
+                response.json::<Value>().await.unwrap_or(Value::Null)
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    task,
+                    status = response.status_code().as_u16(),
+                    "could not read the Elasticsearch quantity `high` backfill task"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(task, error = %e, "could not read the Elasticsearch quantity `high` backfill task");
+                return;
+            }
+        };
+        if body.get("completed").and_then(Value::as_bool) == Some(true) {
+            if let Some(error) = body.get("error") {
+                tracing::warn!(task, error = %error, "the Elasticsearch quantity `high` backfill failed");
+            } else {
+                report_backfill(body.get("response").unwrap_or(&Value::Null));
+            }
+            return;
+        }
+        if let Some(status) = body.pointer("/task/status") {
+            tracing::info!(task, status = %status, "Elasticsearch quantity `high` backfill in progress");
+        }
+    }
+    tracing::warn!(
+        task,
+        "the Elasticsearch quantity `high` backfill is still running; no longer following it"
+    );
+}
+
+/// Notes, once, that the documents of `indices` were indexed before #2602
+/// (schema version `4`) and have been backfilled with `high = value`
+/// ([`backfill_quantity_high`]): `Quantity` and `Age` values behave as before
+/// and sort correctly, but a quantity parameter selecting a `Range`
+/// (`onset-age`, `abatement-age`, `context-quantity`) produced no row for
+/// them, so such a `Range` is not found until `$reindex` indexes it again.
 fn warn_quantity_reindex_needed(indices: &[String]) {
     if indices.is_empty() {
         return;
@@ -969,9 +1144,10 @@ fn warn_quantity_reindex_needed(indices: &[String]) {
         sample = indices[..indices.len().min(SAMPLE)].join(", "),
         schema_version = SCHEMA_VERSION,
         "Elasticsearch indices holding documents indexed before #2602 were upgraded to a \
-         mapping with `search_params.quantity.high`, but a Range stored in those documents \
-         was never indexed, so it will not match quantity searches (onset-age, \
-         abatement-age, context-quantity) until `$reindex` is run"
+         mapping with `search_params.quantity.high`, and their Quantity and Age entries \
+         are being backfilled with it, but a Range stored in those documents was never \
+         indexed, so it will not match quantity searches (onset-age, abatement-age, \
+         context-quantity) until `$reindex` is run"
     );
 }
 
@@ -1069,7 +1245,12 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         .collect();
     if !predating_qty.is_empty() {
         let counts = document_counts(backend, &predating_qty).await;
-        warn_quantity_reindex_needed(&indices_holding_documents(&predating_qty, &counts));
+        let holding = indices_holding_documents(&predating_qty, &counts);
+        if !holding.is_empty() {
+            let names: Vec<&str> = holding.iter().map(String::as_str).collect();
+            backfill_quantity_high(backend, &names, false).await;
+        }
+        warn_quantity_reindex_needed(&holding);
     }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
@@ -1129,6 +1310,8 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
                 warn_reference_reindex_needed(&holding);
             }
             if predates_qty {
+                let names: Vec<&str> = holding.iter().map(String::as_str).collect();
+                backfill_quantity_high(backend, &names, false).await;
                 warn_quantity_reindex_needed(&holding);
             }
         }

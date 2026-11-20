@@ -216,7 +216,12 @@ pub fn canonical_range(low: f64, high: f64, canonicalize: impl Fn(f64) -> f64) -
             canonicalize(v)
         }
     };
-    (conv(low), conv(high))
+    let (low, high) = (conv(low), conv(high));
+    debug_assert!(
+        low <= high,
+        "canonical_range: unit conversion reversed the interval ({low} > {high})"
+    );
+    (low, high)
 }
 
 #[cfg(test)]
@@ -459,6 +464,13 @@ mod tests {
         // open low: (-∞, 10]
         assert!(p(SearchPrefix::Lt, -1000.0).matches(QUANTITY_OPEN_LOW, 10.0));
         assert!(p(SearchPrefix::Eb, 20.0).matches(QUANTITY_OPEN_LOW, 10.0));
+    }
+
+    #[test]
+    fn canonical_range_converts_to_an_ordered_pair() {
+        let (l, h) = canonical_range(1.0, 3.0, |v| v * 1000.0);
+        assert_eq!((l, h), (1000.0, 3000.0));
+        assert!(l <= h);
     }
 
     #[test]

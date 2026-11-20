@@ -818,7 +818,8 @@ impl IndexRow {
             value_number_2: row.value_number_2,
             value_quantity_value: row.value_quantity_value,
             // A composite component is a point (a `Range` with `low != high`
-            // is dropped before this), so its high end is its value.
+            // is dropped before this; one with `low == high` is a point), so
+            // its high end is its value.
             value_quantity_high: row.value_quantity_value,
             value_quantity_unit: row.value_quantity_unit.clone(),
             value_quantity_system: row.value_quantity_system.clone(),

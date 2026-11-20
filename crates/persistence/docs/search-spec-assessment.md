@@ -255,9 +255,14 @@ Ordered roughly by impact:
    the prefixes compare against the interval the way date prefixes do for a `Period`: `eq` when the
    search range contains it, `gt`/`ge` on `high`, `lt`/`le` on `low`, `sa` on `low`, `eb` on `high`,
    `ap` on overlap with `[v-m, v+m]`. All four backends store a high bound with an index leading
-   with it. `Range` values stored before the change need `POST /$reindex`. Known limits: composite
-   parameters index only point quantities (a `Range` with `low != high` is skipped in a composite
-   row), and an ascending sort uses `low` so a range with no `low` sorts first.
+   with it. Elasticsearch backfills `high = value` on old quantity entries at startup, so `Quantity`/`Age`
+   need no reindex; only stored `Range` values need `POST /$reindex`. An older instance must not keep
+   writing after the backfill: its rows have no `high` and miss `eq`/`gt`/`ge`/`eb`/`ap`. SQLite
+   `_filter` evaluates quantity comparisons against the interval and supports `onset-age`,
+   `abatement-age` and `context-quantity`. Known limits: composite token+quantity parameters index
+   only `Quantity`/`Age` points and `Range` values with `low == high` (a `Range` with `low != high`,
+   including an open side, is skipped in a composite row), and an ascending sort uses `low` so a
+   range with no `low` sorts first.
 8. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
    value/unit (`value_quantity_canonical_value`/`_unit`) computed via
    `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.

@@ -685,7 +685,7 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
-**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high` and `quantity.canonical_high` (schema version 4), added in place. Quantity documents indexed earlier keep matching as before, but `Range` values (`onset-age`, `abatement-age`, `context-quantity`) were never indexed, so run `POST /$reindex` once to make them searchable; the startup log warns once per affected index. See [Quantity prefix semantics](#sqlite-search-implementation).
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high` and `quantity.canonical_high` (schema version 4), added in place. At startup the backend backfills `high = value` (and `canonical_high = canonical_value`) on the quantity entries already in the index, so `Quantity` and `Age` values keep matching and sort correctly with no `$reindex`. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored earlier were never indexed, so run `POST /$reindex` once to make them searchable. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version warning under [Rolling back from #2602](#rolling-back-from-2602).
 
 ```bash
 # Build with Elasticsearch support
@@ -831,7 +831,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with PostgreSQL and Elasticsearch support
@@ -1821,7 +1821,7 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with MongoDB and Elasticsearch support
@@ -1867,7 +1867,7 @@ S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (inge
 
 **Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
 
-**Upgrading from a build before #2394 or #2602:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with S3 and Elasticsearch support
@@ -2985,16 +2985,66 @@ So `onset-age=45` does not match an `onsetRange` of 40 to 50 years (the
 search range does not contain the whole interval), while `gt45`, `lt45`,
 `ge45`, `le45` and `ap45` all do. Sorting ascending
 uses the low bound and descending the high bound, so a range with no `low`
-sorts first. Composite parameters still index only point quantities: a `Range`
-component with `low != high` is not indexed in a composite row.
+sorts first. Composite token+quantity parameters index only `Quantity`/`Age`
+points and `Range` values with `low == high`; a `Range` with `low != high`
+(including one with an open side) is skipped in a composite row.
+
+On SQLite, `_filter` evaluates quantity comparisons against the same interval
+and supports `onset-age`, `abatement-age` and `context-quantity`.
 
 **Upgrading from a build before #2602.** Each backend gains a high bound on the
-quantity row (SQLite and PostgreSQL migrate and backfill `high = value`;
-MongoDB backfills once at startup under search index generation 8;
-Elasticsearch adds `quantity.high` / `quantity.canonical_high`, schema
-version 4). Existing `Quantity` and `Age` values keep working unchanged, but
-`Range` values stored earlier were never indexed, so they are searchable only
-after you run `POST /$reindex` once.
+quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill
+`high = value`; MongoDB backfills at startup under search index generation 8, in
+batches by `_id` with progress logging; Elasticsearch adds
+`quantity.high` / `quantity.canonical_high`, schema version 4, and backfills
+`high = value` on old quantity entries at startup, so `Quantity` and `Age`
+match and sort correctly without `$reindex`). Existing `Quantity` and `Age`
+values keep working unchanged, but `Range` values stored earlier were never
+indexed, so they are searchable only after you run `POST /$reindex` once.
+
+**Mixed versions during the upgrade.** No older (pre-#2602) instance may keep
+writing after the backfill. A row written by an older build after the backfill
+has no high bound and does not match `eq`, `gt`, `ge`, `eb` or `ap`. The MongoDB
+backfill runs once per recorded generation, and PostgreSQL's runs inside
+migration v56, so neither covers a later write by an old instance. Stop the old
+instances before (or at) the upgrade. If one wrote after the backfill, re-run
+the backfill (MongoDB: lower the recorded generation, see
+[Rolling back from #2602](#rolling-back-from-2602)) or run `POST /$reindex`.
+
+#### Rolling back from #2602
+
+SQLite (schema 49) and PostgreSQL (schema 56) refuse to start an older binary
+on an upgraded database, so a rollback needs the schema lowered by hand first.
+Take a backup and stop every HFS instance before running any of this.
+
+SQLite (`DROP COLUMN` needs SQLite 3.35 or later and a column no index uses, so
+drop the indexes first; both columns exist only on `search_index`):
+
+```sql
+DROP INDEX IF EXISTS idx_search_quantity_high;
+DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+UPDATE schema_version SET version = 48;
+```
+
+PostgreSQL (`DROP INDEX CONCURRENTLY` cannot run inside a transaction block;
+the columns exist only on `search_index`):
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+UPDATE schema_version SET version = 55;
+```
+
+MongoDB: run `mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/quantity-high-rollback.mongosh.js`
+with `HFS_MONGODB_DATABASE` exported (see [Downgrading](mongodb/search-indexes.md#downgrading)).
+**Warning:** an older binary reads a `Range`'s low as a plain point value, and
+an open-low `Range` stores `f64::MIN`. Before running the old binary, delete the
+`Range` rows (`db.search_index.deleteMany({ value_quantity_high: { $exists: true }, $expr: { $ne: ["$value_quantity_high", "$value_quantity_value"] } })`,
+and the same on `search_index_contained`), or run `$reindex` on the old binary.
 
 **Date prefix semantics (range targets, #1391):**
 

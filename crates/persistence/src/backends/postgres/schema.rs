@@ -7893,6 +7893,155 @@ mod postgres_integration_migrations {
     }
 
     #[tokio::test]
+    async fn postgres_integration_v55_to_v56_backfills_quantity_high() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v56_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute(
+                "DROP INDEX idx_search_quantity_high;
+                 DROP INDEX idx_search_quantity_canonical_high;
+                 ALTER TABLE search_index
+                     DROP COLUMN value_quantity_high,
+                     DROP COLUMN value_quantity_canonical_high;",
+            )
+            .await
+            .expect("take v56 back out of the fixture");
+        force_schema_version(&client, 55).await.unwrap();
+        for (id, value, canonical) in [("q0", 5.0_f64, 5000.0_f64), ("q1", -2.5, -2.5)] {
+            client
+                .execute(
+                    "INSERT INTO search_index
+                     (tenant_id, resource_type, resource_id, param_name,
+                      value_quantity_value, value_quantity_canonical_value,
+                      value_quantity_canonical_unit)
+                     VALUES ('t', 'Observation', $1, 'value-quantity', $2, $3, 'g')",
+                    &[&id, &value, &canonical],
+                )
+                .await
+                .expect("seed a pre-v56 quantity row");
+        }
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ('t', 'Patient', 'p0', 'family', 'Smith')",
+                &[],
+            )
+            .await
+            .expect("seed a non-quantity row");
+        // A failed CONCURRENTLY build leaves an INVALID index of the same name
+        // (and the half-added column that build ran against).
+        client
+            .batch_execute(
+                "ALTER TABLE search_index ADD COLUMN value_quantity_high DOUBLE PRECISION;
+                 CREATE INDEX idx_search_quantity_high ON search_index (value_quantity_high);
+                 UPDATE pg_index SET indisvalid = false
+                  WHERE indexrelid = 'idx_search_quantity_high'::regclass;",
+            )
+            .await
+            .expect("stage an invalid leftover index");
+        let stale_oid: u32 = index_oid(&client, "idx_search_quantity_high").await;
+
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v55 to v56");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 56);
+
+        async fn assert_state(client: &deadpool_postgres::Client) {
+            {
+                for (id, value, canonical) in [("q0", 5.0_f64, 5000.0_f64), ("q1", -2.5, -2.5)] {
+                    let row = client
+                        .query_one(
+                            "SELECT value_quantity_value, value_quantity_high,
+                                    value_quantity_canonical_value,
+                                    value_quantity_canonical_high
+                             FROM search_index WHERE tenant_id = 't' AND resource_id = $1",
+                            &[&id],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(row.get::<_, Option<f64>>(1), Some(value), "{id} high");
+                    assert_eq!(
+                        row.get::<_, Option<f64>>(3),
+                        Some(canonical),
+                        "{id} canonical"
+                    );
+                }
+                let row = client
+                    .query_one(
+                        "SELECT value_quantity_high, value_quantity_canonical_high
+                         FROM search_index WHERE tenant_id = 't' AND resource_id = 'p0'",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(row.get::<_, Option<f64>>(0), None);
+                assert_eq!(row.get::<_, Option<f64>>(1), None);
+                for name in [
+                    "idx_search_quantity_high",
+                    "idx_search_quantity_canonical_high",
+                ] {
+                    let valid: bool = client
+                        .query_one(
+                            "SELECT i.indisvalid AND i.indisready FROM pg_index i
+                             JOIN pg_class c ON c.oid = i.indexrelid
+                             WHERE c.relname = $1 AND c.relnamespace = current_schema()::regnamespace",
+                            &[&name],
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("{name} must exist: {e}"))
+                        .get(0);
+                    assert!(valid, "{name} must be valid");
+                }
+            }
+        }
+        assert_state(&client).await;
+        assert_ne!(
+            index_oid(&client, "idx_search_quantity_high").await,
+            stale_oid,
+            "the invalid leftover must have been dropped and rebuilt"
+        );
+
+        // A row written with NULL high before the sweep (an old instance) is
+        // filled by a replay, and a replay changes nothing else.
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name,
+                  value_quantity_value, value_quantity_canonical_value,
+                  value_quantity_canonical_unit)
+                 VALUES ('t', 'Observation', 'q2', 'value-quantity', 7.0, 7.0, 'g')",
+                &[],
+            )
+            .await
+            .unwrap();
+        force_schema_version(&client, 55).await.unwrap();
+        initialize_schema(&mut client).await.expect("replay v56");
+        let row = client
+            .query_one(
+                "SELECT value_quantity_high, value_quantity_canonical_high
+                 FROM search_index WHERE resource_id = 'q2'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, Option<f64>>(0), Some(7.0));
+        assert_eq!(row.get::<_, Option<f64>>(1), Some(7.0));
+        assert_state(&client).await;
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
     async fn postgres_integration_v41_to_v42_builds_valid_idempotent_index() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
         let pg = shared_pg().await;
