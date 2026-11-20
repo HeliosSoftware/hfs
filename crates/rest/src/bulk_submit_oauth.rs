@@ -39,6 +39,9 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProviders(Vec<String>);
 
+/// Redirect hops followed, as reqwest's default policy allows.
+const MAX_REDIRECTS: usize = 10;
+
 impl TrustedProviders {
     /// Parses one origin per entry. An entry must be an absolute URL with a
     /// host and nothing after it: a path, query or fragment is refused rather
@@ -84,6 +87,30 @@ impl TrustedProviders {
     /// origin (an opaque scheme) is never permitted by a configured list.
     pub fn permits_url(&self, url: &str) -> bool {
         self.is_empty() || origin_of(url).is_some_and(|origin| self.contains(&origin))
+    }
+
+    /// The redirect policy of a client that sends `$bulk-submit` requests:
+    /// with a list configured a hop is followed only to a listed origin,
+    /// otherwise reqwest's default policy applies. Both the file fetcher and
+    /// the OAuth client use it, so neither the manifest and file GETs nor the
+    /// metadata GET and the token POST (whose body is the signed client
+    /// assertion) leave the listed origins by way of a redirect.
+    pub(crate) fn redirect_policy(&self) -> reqwest::redirect::Policy {
+        if self.is_empty() {
+            return reqwest::redirect::Policy::default();
+        }
+        let trusted = self.clone();
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if trusted.permits_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.error(
+                    "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
+                )
+            }
+        })
     }
 
     /// With a list configured, refuses an origin outside it.
@@ -153,7 +180,12 @@ impl JwtClientCredentialsTokenProvider {
         let kid = derive_public_jwk(private_key_pem, signing_alg)
             .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
         Some(Arc::new(Self {
-            client: reqwest::Client::new(),
+            // `Client::new()` panics the same way when the TLS backend
+            // cannot start.
+            client: reqwest::Client::builder()
+                .redirect(trusted_providers.redirect_policy())
+                .build()
+                .expect("failed to build the bulk-submit OAuth client"),
             client_id: client_id.to_string(),
             signing_alg: alg,
             encoding_key: key,

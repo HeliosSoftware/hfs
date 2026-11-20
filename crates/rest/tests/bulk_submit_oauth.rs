@@ -356,3 +356,97 @@ async fn a_metadata_document_cannot_redirect_a_token_to_its_own_host() {
     );
     assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
 }
+
+/// With a list configured, a listed origin cannot hand the metadata GET or
+/// the token POST, whose body is the signed client assertion, to an unlisted
+/// origin by redirecting it.
+#[tokio::test]
+async fn a_configured_list_confines_the_oauth_clients_redirects() {
+    use axum::http::{StatusCode, header};
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unlisted = format!("http://{}", listener.local_addr().unwrap());
+    let unlisted_app = Router::new()
+        .route(
+            "/meta",
+            get({
+                let seen = seen.clone();
+                move || {
+                    seen.lock().unwrap().push("GET /meta".to_string());
+                    let token_endpoint = "http://unused.example/token";
+                    async move { Json(json!({ "token_endpoint": token_endpoint })) }
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post({
+                let seen = seen.clone();
+                move |body: String| {
+                    seen.lock().unwrap().push(format!("POST /token {body}"));
+                    async move { Json(json!({ "access_token": "elsewhere", "expires_in": 300 })) }
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, unlisted_app).await.unwrap();
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listed = format!("http://{}", listener.local_addr().unwrap());
+    let listed_app = Router::new()
+        .route(
+            "/.well-known/smart-configuration",
+            get({
+                let token_endpoint = format!("{listed}/token");
+                move || async move { Json(json!({ "token_endpoint": token_endpoint })) }
+            }),
+        )
+        .route(
+            "/token",
+            post({
+                let to = format!("{unlisted}/token");
+                move || async move { (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, to)]) }
+            }),
+        )
+        .route(
+            "/redirecting-metadata",
+            get({
+                let to = format!("{unlisted}/meta");
+                move || async move { (StatusCode::FOUND, [(header::LOCATION, to)]) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, listed_app).await.unwrap();
+    });
+
+    let provider = provider(&[&listed]);
+    let destination = format!("{listed}/bulk/file.ndjson");
+
+    let err = provider
+        .token(
+            &[format!("{listed}/redirecting-metadata")],
+            "system/*.rs",
+            &destination,
+        )
+        .await
+        .expect_err("the metadata redirect is not followed");
+    assert!(matches!(err, FileTokenError::Unavailable(_)), "{err:?}");
+
+    let err = provider
+        .token(
+            &[format!("{listed}/.well-known/smart-configuration")],
+            "system/*.rs",
+            &destination,
+        )
+        .await
+        .expect_err("the token redirect is not followed");
+    assert!(matches!(err, FileTokenError::Unavailable(_)), "{err:?}");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Vec::<String>::new(),
+        "the unlisted origin received nothing"
+    );
+}

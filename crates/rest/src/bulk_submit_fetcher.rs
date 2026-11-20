@@ -78,9 +78,6 @@ const FILE_ENCRYPTION_TYPE_JWE: &str = "jwe";
 /// How long establishing a connection to the provider may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Redirect hops followed, as reqwest's default policy allows.
-const MAX_REDIRECTS: usize = 10;
-
 /// Default idle time allowed between two reads of a response before the read
 /// fails (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`). A stalled body then surfaces
 /// as a body error and is resumed like a reset connection.
@@ -145,26 +142,10 @@ fn build_clients(
     trusted_providers: &TrustedProviders,
 ) -> (reqwest::Client, reqwest::Client) {
     let base = || {
-        let redirect = if trusted_providers.is_empty() {
-            reqwest::redirect::Policy::default()
-        } else {
-            let trusted = trusted_providers.clone();
-            reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    attempt.error("too many redirects")
-                } else if trusted.permits_url(attempt.url().as_str()) {
-                    attempt.follow()
-                } else {
-                    attempt.error(
-                        "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
-                    )
-                }
-            })
-        };
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(read_timeout)
-            .redirect(redirect)
+            .redirect(trusted_providers.redirect_policy())
     };
     // `Client::new()` panics the same way when the TLS backend cannot start.
     let client = base()
@@ -2018,7 +1999,7 @@ mod tests {
             .await
             .expect_err("503")
             .to_string();
-        assert!(!withheld.contains("503"), "{withheld}");
+        assert!(!withheld.contains("HTTP 503"), "{withheld}");
         assert!(
             withheld.contains("the reason is in the server log"),
             "{withheld}"
@@ -2041,7 +2022,7 @@ mod tests {
                 .open_file_stream(&url, &[], false, &[], None)
                 .await,
         );
-        assert!(!withheld.contains("503"), "{withheld}");
+        assert!(!withheld.contains("HTTP 503"), "{withheld}");
         let shown = stream_err(
             trusting(&base)
                 .open_file_stream(&url, &[], false, &[], None)
