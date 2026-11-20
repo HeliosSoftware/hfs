@@ -452,6 +452,9 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            // As in `shared()`: keep mongod 9.0 from dropping profiler entries.
+            "--setParameter",
+            "internalQueryGlobalProfilingLockDeadlineMs=10000",
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
@@ -530,6 +533,12 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            // mongod 9.0 gives each profiler write 1 ms to get its
+                            // lock and silently drops the entry when it cannot;
+                            // the plan tests then read an empty system.profile
+                            // (#2636).
+                            "--setParameter",
+                            "internalQueryGlobalProfilingLockDeadlineMs=10000",
                             "--replSet",
                             "rs0",
                             "--oplogSize",
