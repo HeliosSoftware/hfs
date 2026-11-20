@@ -1175,6 +1175,7 @@ impl From<r2d2::Error> for StorageError {
 }
 
 /// Client text for a backend connection that could not be obtained.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 const CONNECTION_FAILED_TEXT: &str = "the database could not be reached; retry the request";
 
 /// Client text for a SQLite database that is busy or locked.
@@ -1187,6 +1188,7 @@ const POSTGRES_UNAVAILABLE_TEXT: &str =
     "the database is not accepting connections; retry the request";
 
 /// `"{context}: {text}"`, or `text` alone when there is no context.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn with_context(context: &str, text: &str) -> String {
     if context.is_empty() {
         text.to_string()
@@ -1201,6 +1203,7 @@ fn with_context(context: &str, text: &str) -> String {
 /// database that is the file path. The client learns that the database could
 /// not be reached and that the request is retryable, which is what the 503
 /// is for.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn connection_failed(
     backend_name: &str,
     detail: &dyn std::fmt::Display,
@@ -1846,6 +1849,7 @@ mod tests {
     /// A pool-acquire failure carries the last connect error, which for a
     /// file-backed SQLite database is the file path; none of it reaches the
     /// client.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     fn test_connection_failed_leaves_the_detail_to_the_log() {
         let detail =
