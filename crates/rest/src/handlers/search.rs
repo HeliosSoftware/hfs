@@ -18,7 +18,7 @@ use axum::{
 };
 use helios_persistence::core::{
     IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
-    is_include_truncation_marker, resolve_includes_iterate_continuation,
+    SearchResult, is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
 use helios_persistence::error::{SearchError, StorageError};
@@ -690,69 +690,13 @@ where
             RestError::from(e)
         })?;
 
-    // Resolve _include/_revinclude for backends whose search() does not
-    // populate includes inline (SQLite, Postgres, Elasticsearch): the Full
-    // pass runs the whole backend-agnostic resolver
-    // (`core::resolve_includes_iterative`). MongoDB is the only backend that
-    // resolves inline, and it does so by calling that same common resolver
-    // itself, bounded by the `HFS_MONGODB_MAX_INCLUDED_RESOURCES` directive
-    // (#1061) — but only for hop 1 (#1063). When a directive also carries
-    // `:iterate`, the Continuation pass picks up from whatever MongoDB
-    // already returned, without re-resolving hop 1.
-    // `backend_resolved` treats an `included` holding only a truncation
-    // marker (#1061) as "nothing real resolved", so a backend reply that
-    // truncated to zero real resources still takes the Full path rather than
-    // iterating from a frontier containing the marker.
-    match iterative_pass(&query.includes, backend_resolved(&result.included)) {
-        IterativePass::None => {}
-        IterativePass::Full => {
-            let included = resolve_includes_iterative(
-                state.storage(),
-                tenant.context(),
-                &result.resources.items,
-                &query.includes,
-            )
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Include resolution failed");
-                RestError::from(e)
-            })?;
-            result.included = included;
-        }
-        IterativePass::Continuation => {
-            let continuation = resolve_includes_iterate_continuation(
-                state.storage(),
-                tenant.context(),
-                &result.resources.items,
-                &query.includes,
-                &result.included,
-            )
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Include iterate continuation failed");
-                RestError::from(e)
-            })?;
-            result.included.extend(continuation);
-        }
-    }
-
-    // An include follows references wherever they lead; under a compartment-
-    // confined grant only the launch patient's resources may come back (#1618).
-    compartment.retain_members(
-        || state.storage().search_param_registry(tenant.context()),
-        &mut result.included,
-    );
-
-    // Drain any include-truncation marker(s) (#1061) out of `included` before
-    // counting or building the bundle. The marker is control-plane
-    // information about the search, not an included resource, and
-    // `_elements`/`_summary` subsetting (via `apply_subsetting`, which runs
-    // over every entry's resource including this one) could otherwise strip
-    // or mangle an `OperationOutcome` embedded as an ordinary `include` entry
-    // — so the diagnostics are re-emitted through `append_warning_outcome`
-    // below, AFTER subsetting, the same way ignored-parameter and sort
-    // warnings already are.
-    let truncation_messages = drain_truncation_markers(&mut result.included);
+    // Resolve the includes the backend did not, confine them to the patient
+    // compartment, and take the #1061 truncation markers out of `included`.
+    // The markers' diagnostics are re-emitted through
+    // `append_warning_outcome_with_code` below, AFTER subsetting, the same
+    // way ignored-parameter and sort warnings are.
+    let truncation_messages =
+        finish_includes(state, tenant, compartment, &query.includes, &mut result).await?;
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(tenant);
@@ -822,16 +766,97 @@ where
         // #1061: include/revinclude resolution truncated at the configured
         // resource cap. Emitted here (post-subsetting) rather than by leaving
         // the marker in `included`, so `_elements`/`_summary` cannot strip it.
-        for message in &truncation_messages {
-            append_warning_outcome_with_code(
-                &mut bundle_json,
-                crate::responses::operation_outcome::IssueType::Incomplete,
-                message,
-            );
-        }
+        append_truncation_outcomes(&mut bundle_json, &truncation_messages);
     }
 
     Ok(bundle_json)
+}
+
+/// Completes the `_include` / `_revinclude` side of a search result, for the
+/// type-level and the compartment search alike, and returns the diagnostics of
+/// any #1061 include-truncation markers it removed.
+///
+/// 1. Resolves what the backend's `search()` did not. SQLite, PostgreSQL and
+///    Elasticsearch resolve no includes inline: the Full pass runs the whole
+///    backend-agnostic resolver (`core::resolve_includes_iterative`). MongoDB
+///    resolves hop 1 inline through that same resolver, bounded by
+///    `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (#1061), and only hop 1 (#1063);
+///    when a directive carries `:iterate`, the Continuation pass picks up from
+///    what MongoDB returned without re-resolving hop 1. `backend_resolved`
+///    treats an `included` holding only a truncation marker as "nothing real
+///    resolved", so a reply truncated to zero real resources still takes the
+///    Full path rather than iterating from a frontier containing the marker.
+/// 2. Drains the truncation markers. The marker is control-plane information
+///    about the search, not an included resource: left in `included`,
+///    `_elements`/`_summary` subsetting could strip or mangle it, and the
+///    compartment confinement below would drop it as a non-member, so a
+///    `patient/` client would get a cut-short include list with no warning.
+///    The caller re-emits the returned messages as `incomplete` warnings.
+/// 3. Confines the includes to the patient compartment. An include follows
+///    references wherever they lead; under a compartment-confined grant only
+///    the launch patient's resources may come back (#1618, #2618). A no-op for
+///    an unconfined request.
+pub(crate) async fn finish_includes<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    includes: &[IncludeDirective],
+    result: &mut SearchResult,
+) -> RestResult<Vec<String>>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    match iterative_pass(includes, backend_resolved(&result.included)) {
+        IterativePass::None => {}
+        IterativePass::Full => {
+            let included = resolve_includes_iterative(
+                state.storage(),
+                tenant.context(),
+                &result.resources.items,
+                includes,
+            )
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Include resolution failed");
+                RestError::from(e)
+            })?;
+            result.included = included;
+        }
+        IterativePass::Continuation => {
+            let continuation = resolve_includes_iterate_continuation(
+                state.storage(),
+                tenant.context(),
+                &result.resources.items,
+                includes,
+                &result.included,
+            )
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Include iterate continuation failed");
+                RestError::from(e)
+            })?;
+            result.included.extend(continuation);
+        }
+    }
+    let truncation_messages = drain_truncation_markers(&mut result.included);
+    compartment.retain_members(
+        || state.storage().search_param_registry(tenant.context()),
+        &mut result.included,
+    );
+    Ok(truncation_messages)
+}
+
+/// Appends one `incomplete` warning per #1061 include-truncation message to
+/// the searchset. Call it after subsetting, so `_elements`/`_summary` cannot
+/// strip the outcome.
+pub(crate) fn append_truncation_outcomes(bundle_json: &mut serde_json::Value, messages: &[String]) {
+    for message in messages {
+        append_warning_outcome_with_code(
+            bundle_json,
+            crate::responses::operation_outcome::IssueType::Incomplete,
+            message,
+        );
+    }
 }
 
 /// Decision made once `search()` returns, about whether (and how) to resolve
