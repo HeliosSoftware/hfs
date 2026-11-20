@@ -14,6 +14,7 @@ pub mod library;
 pub mod output;
 pub mod params;
 pub mod projection;
+pub mod pushdown;
 pub mod scan;
 pub mod terminology;
 
@@ -23,6 +24,7 @@ pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlque
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
 pub use projection::{project_view_definition, referenced_identifiers};
+pub use pushdown::{Predicate, push_down_view_definition, pushable_predicates};
 pub use scan::{
     Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
 };
