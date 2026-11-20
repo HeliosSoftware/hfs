@@ -8611,7 +8611,8 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
 /// rather than a type-wide `distinct`.
 #[tokio::test]
 async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
-    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+    // The plan guard below needs the bounded plan, which a timed-out probe changes.
+    let Some(backend) = create_backend_with_stable_probes("param_sort_bounded").await else {
         eprintln!(
             "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
         );
