@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::DecodingKey;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use super::fetcher::JwksFetcher;
@@ -14,12 +14,22 @@ use crate::error::AuthError;
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// Caches JWKS keys with Cache-Control awareness and background refresh.
+///
+/// An unknown `kid` triggers at most one fetch per `min_refresh_interval`,
+/// whatever the outcome: the interval counts from the attempt, not from the
+/// last success, and lookups that arrive while a fetch is in flight wait for
+/// it instead of starting their own. The `kid` comes from an unverified
+/// bearer, so otherwise every such request would cost the identity provider
+/// one fetch.
 pub struct JwksCache {
     keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
     jwks_url: String,
     fetcher: JwksFetcher,
     expires_at: Arc<RwLock<Instant>>,
-    last_refresh: Arc<RwLock<Instant>>,
+    /// When a fetch was last started, by a lookup or by the background task.
+    last_attempt: Arc<RwLock<Instant>>,
+    /// Held for the duration of a lookup-triggered fetch.
+    refresh_gate: Mutex<()>,
     min_refresh_interval: Duration,
 }
 
@@ -33,9 +43,10 @@ impl JwksCache {
             jwks_url: jwks_url.to_string(),
             fetcher: JwksFetcher::new(),
             expires_at: Arc::new(RwLock::new(Instant::now())),
-            last_refresh: Arc::new(RwLock::new(
+            last_attempt: Arc::new(RwLock::new(
                 Instant::now() - Duration::from_secs(min_refresh_interval_secs + 1),
             )),
+            refresh_gate: Mutex::new(()),
             min_refresh_interval: Duration::from_secs(min_refresh_interval_secs),
         }
     }
@@ -74,21 +85,35 @@ impl JwksCache {
         })
     }
 
-    /// Attempt a refresh, respecting the rate limit.
+    /// Attempt a refresh, respecting the rate limit and a fetch in flight.
     async fn try_refresh(&self) -> Result<(), AuthError> {
-        let now = Instant::now();
-        {
-            let last = self.last_refresh.read().await;
-            if now.duration_since(*last) < self.min_refresh_interval {
-                debug!("JWKS refresh rate-limited, skipping");
-                return Ok(());
-            }
+        if self.attempted_within_interval().await {
+            debug!("JWKS refresh rate-limited, skipping");
+            return Ok(());
+        }
+        let _flight = self.refresh_gate.lock().await;
+        // A lookup that waited here rides on the fetch that just finished,
+        // whether it succeeded or failed.
+        if self.attempted_within_interval().await {
+            debug!("JWKS refresh just attempted by another lookup, skipping");
+            return Ok(());
         }
         self.refresh().await
     }
 
-    /// Fetch keys from the JWKS endpoint and update the cache.
+    async fn attempted_within_interval(&self) -> bool {
+        let last = self.last_attempt.read().await;
+        Instant::now().duration_since(*last) < self.min_refresh_interval
+    }
+
+    /// Fetch keys from the JWKS endpoint and update the cache. The attempt
+    /// arms the refresh interval before its outcome is known, so a failing
+    /// identity provider is asked again no sooner than a healthy one.
     async fn refresh(&self) -> Result<(), AuthError> {
+        {
+            let mut last = self.last_attempt.write().await;
+            *last = Instant::now();
+        }
         let response = self.fetcher.fetch(&self.jwks_url).await?;
 
         let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
@@ -101,10 +126,6 @@ impl JwksCache {
             let mut expires = self.expires_at.write().await;
             *expires = Instant::now() + ttl;
         }
-        {
-            let mut last = self.last_refresh.write().await;
-            *last = Instant::now();
-        }
 
         info!(ttl_secs = ttl.as_secs(), "JWKS cache refreshed");
         Ok(())
@@ -114,7 +135,7 @@ impl JwksCache {
     fn spawn_background_refresh(&self) {
         let keys = Arc::clone(&self.keys);
         let expires_at = Arc::clone(&self.expires_at);
-        let last_refresh = Arc::clone(&self.last_refresh);
+        let last_attempt = Arc::clone(&self.last_attempt);
         let url = self.jwks_url.clone();
         let fetcher = self.fetcher.clone();
         let min_interval = self.min_refresh_interval;
@@ -137,6 +158,10 @@ impl JwksCache {
                 tokio::time::sleep(sleep_duration).await;
 
                 debug!(url = %redact_url(&url), "Background JWKS refresh triggered");
+                {
+                    let mut l = last_attempt.write().await;
+                    *l = Instant::now();
+                }
                 match fetcher.fetch(&url).await {
                     Ok(response) => {
                         let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
@@ -147,10 +172,6 @@ impl JwksCache {
                         {
                             let mut e = expires_at.write().await;
                             *e = Instant::now() + ttl;
-                        }
-                        {
-                            let mut l = last_refresh.write().await;
-                            *l = Instant::now();
                         }
                         info!(ttl_secs = ttl.as_secs(), "Background JWKS refresh complete");
                     }

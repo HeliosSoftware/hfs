@@ -397,7 +397,7 @@ refuses to start without them. The browser login is off unless
 | `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | Claim read as the SMART launch encounter. Okta tokens need not carry it. |
 | `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | Claim read as the SMART `fhirUser`. Okta tokens need not carry it. |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Comma-separated signing algorithms HFS accepts. |
-| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS refreshes. |
+| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS fetches triggered by a token with an unknown `kid`, counted from the attempt whether it succeeded or failed. |
 | `HFS_SMART_TOKEN_ENDPOINT` | *(unset)* | Token endpoint advertised in the SMART discovery document, which omits `token_endpoint` when this is unset. The login discovers it from the issuer when unset. |
 | `HFS_SMART_AUTHORIZE_ENDPOINT` | *(unset)* | Authorization endpoint. When set, the SMART discovery document advertises it plus `code` and `authorization_code`. The login discovers it from the issuer when unset. |
 | `HFS_SMART_JWKS_URL` | *(unset)* | JWKS URI advertised in the SMART discovery document. Falls back to `HFS_AUTH_JWKS_URL`. |
