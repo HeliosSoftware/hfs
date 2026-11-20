@@ -906,7 +906,10 @@ impl MongoBackend {
         {
             return Ok(None);
         }
-        let mut filter = quantity.filter;
+        // A composite quantity row is a point (a `Range` is skipped there, #2602),
+        // so its upper bound equals its value; compare on the value so the tuple
+        // index `(tuple_code, value_quantity_value)` serves the range.
+        let mut filter = point_quantity_filter(quantity.filter);
         filter.insert(super::super::composite_search::TUPLE_CODE_FIELD, code);
         let mut predicate =
             self.planning_predicate(db, tenant_id, resource_type, parameter, filter, true);
@@ -5319,3 +5322,60 @@ mod index_intersection_tests {
 
 #[cfg(test)]
 mod execution_tests;
+
+/// Rewrites a quantity interval filter (#2602) for rows that are points:
+/// every condition on `value_quantity_high` moves onto `value_quantity_value`,
+/// merging with the conditions already there, in the filter and in each arm of
+/// its `$or`/`$and`.
+fn point_quantity_filter(mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
+    use mongodb::bson::Bson;
+    for key in ["$or", "$and"] {
+        if let Ok(arms) = filter.get_array_mut(key) {
+            for arm in arms.iter_mut() {
+                if let Bson::Document(d) = arm {
+                    *d = point_quantity_filter(std::mem::take(d));
+                }
+            }
+        }
+    }
+    if let Some(Bson::Document(high)) = filter.remove("value_quantity_high") {
+        match filter.get_document_mut("value_quantity_value") {
+            Ok(low) => low.extend(high),
+            Err(_) => {
+                filter.insert("value_quantity_value", high);
+            }
+        }
+    }
+    filter
+}
+
+#[cfg(test)]
+mod point_quantity_filter_tests {
+    use super::point_quantity_filter;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn high_conditions_move_onto_the_value_and_merge() {
+        let f = point_quantity_filter(doc! { "value_quantity_high": { "$gt": 160.0 } });
+        assert_eq!(f, doc! { "value_quantity_value": { "$gt": 160.0 } });
+        let f = point_quantity_filter(doc! {
+            "value_quantity_value": { "$gte": 1.0 },
+            "value_quantity_high": { "$lt": 2.0 },
+        });
+        assert_eq!(
+            f,
+            doc! { "value_quantity_value": { "$gte": 1.0, "$lt": 2.0 } }
+        );
+        let f = point_quantity_filter(doc! { "$or": [
+            { "value_quantity_high": { "$lt": 1.0 } },
+            { "value_quantity_value": { "$gt": 3.0 } },
+        ]});
+        assert_eq!(
+            f,
+            doc! { "$or": [
+                { "value_quantity_value": { "$lt": 1.0 } },
+                { "value_quantity_value": { "$gt": 3.0 } },
+            ]}
+        );
+    }
+}

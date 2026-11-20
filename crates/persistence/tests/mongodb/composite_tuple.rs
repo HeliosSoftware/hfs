@@ -343,7 +343,7 @@ async fn mongodb_a_real_reindex_stamps_the_rows_and_enables_the_tuple_path() {
 }
 
 /// A generation-6 database keeps its markers when this binary records
-/// generation 7 (#2588): generation 6 already writes `tuple_code`, so the
+/// the current generation (7 in #2588, 8 in #2602): generation 6 already writes `tuple_code`, so the
 /// upgrade needs no activating `$reindex`.
 #[tokio::test]
 async fn mongodb_generation_7_over_generation_6_keeps_the_markers() {
@@ -375,7 +375,7 @@ async fn mongodb_generation_7_over_generation_6_keeps_the_markers() {
         .unwrap()
         .get_i32("generation")
         .unwrap();
-    assert_eq!(generation, 7);
+    assert_eq!(generation, 8);
     assert!(tuple_path_used(&upgraded, &tenant).await);
 }
 
@@ -613,7 +613,7 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         .unwrap()
         .get_i32("generation")
         .unwrap();
-    assert_eq!(generation, 7);
+    assert_eq!(generation, 8);
     assert!(!tuple_path_used(&returned, &first).await);
     assert_eq!(
         found(&returned, &first, "8302-2$gt160").await,
@@ -1366,7 +1366,7 @@ async fn upgrade_from(earlier: EarlierBuild) {
     let booted = Arc::new(build_backend(config).await.expect("upgrade boot"));
     booted.wait_for_search_index_build().await;
     let record = recorded_search_indexes(&db).await;
-    assert_eq!(record.get_i32("generation"), Ok(7), "{earlier:?}: {record}");
+    assert_eq!(record.get_i32("generation"), Ok(8), "{earlier:?}: {record}");
     assert_eq!(
         record.get_bool("references_normalized"),
         Ok(true),
