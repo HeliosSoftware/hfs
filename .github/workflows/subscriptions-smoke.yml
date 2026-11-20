@@ -76,7 +76,7 @@ jobs:
         include: ${{ fromJSON(needs.matrix-setup.outputs.build-matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -123,7 +123,7 @@ jobs:
       HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS: "true"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8
