@@ -15,6 +15,7 @@ use axum::{
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use tracing::debug;
 
+use crate::chain_access::ChainAccess;
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::parse_query_pairs;
 use crate::extractors::{
@@ -56,12 +57,14 @@ use crate::state::AppState;
 /// the launch patient's id. An `_include` or `_revinclude` follows references
 /// wherever they lead, so the included resources are filtered to the
 /// compartment's members as a type-level search filters them.
+#[allow(clippy::too_many_arguments)]
 pub async fn compartment_search_handler<S>(
     State(state): State<AppState<S>>,
     Path((compartment_type, compartment_id, target_type)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     compartment: PatientCompartment,
+    chains: ChainAccess,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -89,6 +92,7 @@ where
             tenant,
             version,
             compartment,
+            chains,
             pairs,
             strict,
         )
@@ -169,7 +173,7 @@ where
         .min(state.max_page_size());
     query.count = Some(count as u32);
 
-    let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
+    let query = resolve_out_of_band(&state, &tenant, &chains, query, fhir_version).await?;
 
     // Execute the search
     let mut result = state
@@ -251,6 +255,7 @@ async fn compartment_search_all<S>(
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     compartment: PatientCompartment,
+    chains: ChainAccess,
     pairs: Vec<(String, String)>,
     strict: bool,
 ) -> RestResult<Response>
@@ -414,7 +419,7 @@ where
         if collected.len() >= count {
             break;
         }
-        let query = &resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
+        let query = &resolve_out_of_band(&state, &tenant, &chains, query, fhir_version).await?;
         match state.storage().search(tenant.context(), query).await {
             Ok(result) => collected.extend(result.resources.items),
             Err(e) => {
@@ -478,13 +483,15 @@ where
 /// - `_contained=true|both` needs a backend that indexes contained resources
 ///   (501 otherwise), and cannot be combined with `_list`, `_has` or a chained
 ///   parameter, which select top-level resources (400, as in the type search).
-/// - `_list`, `_has` and chained parameters are resolved into an `_id` filter.
+/// - `_list`, `_has` and chained parameters are resolved into an `_id` filter,
+///   each hop judged against the token ([`ChainAccess`], #2501).
 ///   Unlike the type search this passes no terminology expander: a
 ///   terminology-backed modifier on a chain's terminal parameter is refused by
 ///   the resolver rather than expanded.
 async fn resolve_out_of_band<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    chains: &ChainAccess,
     query: helios_persistence::types::SearchQuery,
     fhir_version: helios_fhir::FhirVersion,
 ) -> RestResult<helios_persistence::types::SearchQuery>
@@ -510,9 +517,23 @@ where
         fhir_version,
     )
     .await?;
-    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-        .await
-        .map_err(RestError::from)
+    // Every hop of a chain or `_has` is judged against the token, as the
+    // type search judges it (#2501).
+    let hop_guard = chains.guard(fhir_version);
+    let options = helios_persistence::search::ChainResolveOptions {
+        hop_guard: hop_guard
+            .as_ref()
+            .map(|g| g as &dyn helios_persistence::search::ChainHopGuard),
+        ..Default::default()
+    };
+    helios_persistence::search::resolve_chains_with(
+        state.storage(),
+        tenant.context(),
+        &query,
+        options,
+    )
+    .await
+    .map_err(RestError::from)
 }
 
 /// Checks criteria that require no storage reads, including for wildcard pages

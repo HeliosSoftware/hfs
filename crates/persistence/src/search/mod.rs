@@ -98,8 +98,8 @@ pub mod writer;
 
 // Re-export main types
 pub use chain_resolver::{
-    ChainResolveOptions, TerminologyExpander, TerminologyExpansion, query_has_chains,
-    resolve_chains, resolve_chains_with,
+    ChainHopGuard, ChainResolveOptions, TerminologyExpander, TerminologyExpansion,
+    query_has_chains, resolve_chains, resolve_chains_with,
 };
 pub use composite_value::validate_composite_values;
 pub use conditional::{

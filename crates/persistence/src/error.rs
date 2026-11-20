@@ -358,6 +358,15 @@ pub enum SearchError {
         max: usize,
     },
 
+    /// A chained or `_has` search reaches a resource type the caller may not
+    /// search, so the whole search is refused (#2501). Raised by the
+    /// caller's [`ChainHopGuard`](crate::search::ChainHopGuard).
+    #[error("{message}")]
+    ChainHopRefused {
+        /// Why the hop is refused, for the client.
+        message: String,
+    },
+
     /// Invalid cursor for pagination.
     #[error("invalid pagination cursor: {cursor}")]
     InvalidCursor {

@@ -34,6 +34,7 @@ use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
+use crate::chain_access::ChainAccess;
 use crate::error::{RestError, RestResult, create_operation_outcome};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::{
@@ -975,6 +976,7 @@ where
                     state,
                     &tenant,
                     &deferred.compartment,
+                    &ChainAccess::for_principal(principal),
                     deferred.target,
                     prefer.is_strict(),
                     entry.if_none_match.as_deref(),
@@ -1465,6 +1467,7 @@ where
                 state,
                 tenant,
                 &compartment,
+                &ChainAccess::for_principal(principal),
                 get_target.expect("GET entries are classified above"),
                 strict,
                 if_none_match,
@@ -3216,6 +3219,7 @@ async fn execute_get_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     target: GetEntryTarget,
     strict: bool,
     if_none_match: Option<&str>,
@@ -3238,6 +3242,7 @@ where
                 state,
                 tenant,
                 compartment,
+                chains,
                 &resource_type,
                 pairs,
                 false,

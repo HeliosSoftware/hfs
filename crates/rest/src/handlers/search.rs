@@ -32,6 +32,7 @@ use tracing::{debug, warn};
 
 use helios_fhir::FhirVersion;
 
+use crate::chain_access::ChainAccess;
 use crate::error::{RestError, RestResult};
 use crate::extractors::query_pairs::{last_value, parse_query_pairs};
 use crate::extractors::{
@@ -61,6 +62,7 @@ pub async fn search_get_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     compartment: PatientCompartment,
+    chains: ChainAccess,
     req_headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
@@ -83,6 +85,7 @@ where
         &state,
         tenant,
         &compartment,
+        &chains,
         &resource_type,
         pairs,
         negotiated.format,
@@ -106,6 +109,7 @@ pub async fn search_post_handler<S>(
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     compartment: PatientCompartment,
+    chains: ChainAccess,
     req_headers: HeaderMap,
     RawForm(form): RawForm,
 ) -> RestResult<Response>
@@ -128,6 +132,7 @@ where
         &state,
         tenant,
         &compartment,
+        &chains,
         &resource_type,
         pairs,
         negotiated.format,
@@ -272,6 +277,7 @@ async fn execute_search<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     format: FhirFormat,
@@ -285,6 +291,7 @@ where
         state,
         &tenant,
         compartment,
+        chains,
         resource_type,
         pairs,
         strict,
@@ -302,11 +309,15 @@ where
 ///
 /// Under a compartment-confined grant (`patient/` scope, #1618) `compartment`
 /// filters the query to the launch patient's compartment and drops included
-/// resources outside it; see [`PatientCompartment`].
+/// resources outside it; see [`PatientCompartment`]. `chains` judges every
+/// hop of a chained or `_has` parameter against the token (#2501); see
+/// [`ChainAccess`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_search_bundle<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     resource_type: &str,
     pairs: Vec<(String, String)>,
     strict: bool,
@@ -648,8 +659,12 @@ where
         let expander = state
             .terminology_server_url()
             .map(|ts_url| ChainTerminologyExpander { ts_url });
+        let hop_guard = chains.guard(fhir_version);
         let options = helios_persistence::search::ChainResolveOptions {
             terminology: expander.as_ref().map(|e| e as &dyn TerminologyExpander),
+            hop_guard: hop_guard
+                .as_ref()
+                .map(|g| g as &dyn helios_persistence::search::ChainHopGuard),
         };
         helios_persistence::search::resolve_chains_with(
             state.storage(),
