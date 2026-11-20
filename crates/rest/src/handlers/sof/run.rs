@@ -536,7 +536,7 @@ where
     // request forfeits streaming — the base64 `Binary` wrapper needs the
     // whole payload — so it falls through to the buffered path.
     if matches!(content_type, ContentType::NdJson) && !wants_envelope {
-        return Ok(streaming_ndjson_response(stream, runner_label));
+        return streaming_ndjson_response(stream, runner_label).await;
     }
 
     // Streaming path for parquet and arrow: the schema is fixed from the
@@ -1068,10 +1068,30 @@ async fn send_ndjson_chunk(
 /// they arrive from the runner. Each row is serialised once and pushed
 /// through an mpsc channel into the response body, so the full result set
 /// never has to be buffered server-side.
-fn streaming_ndjson_response(
+///
+/// The first item is read before anything is sent, so a view that fails
+/// before its first row (a statement the store cancelled at its time limit, a
+/// store that is unavailable) still answers a real error status instead of a
+/// `200` with an aborted body (#2577). Past the first row the `200` is
+/// committed and a row error aborts the chunked body.
+async fn streaming_ndjson_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
     runner_label: Option<&str>,
-) -> Response {
+) -> Result<Response, RestError> {
+    let first = {
+        use futures::StreamExt as _;
+        match stream.next().await {
+            Some(Err(e)) => {
+                warn!(error = %e, "row error before the response started");
+                return Err(map_sof_error_to_rest(e));
+            }
+            first => first,
+        }
+    };
+    let mut stream = {
+        use futures::StreamExt as _;
+        futures::stream::iter(first).chain(stream)
+    };
     // Each message is a ~64 KiB chunk, so a small depth bounds what a slow
     // client can make the server buffer (about 4 x 64 KiB).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(
@@ -1141,7 +1161,11 @@ fn streaming_ndjson_response(
         send_ndjson_chunk(&tx, &mut pending).await;
     });
 
-    channel_body_response(rx, "application/x-ndjson", runner_label)
+    Ok(channel_body_response(
+        rx,
+        "application/x-ndjson",
+        runner_label,
+    ))
 }
 
 /// Streams a `RowStream` through `encoder` as csv, a pretty-printed json array
@@ -1764,6 +1788,10 @@ pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
         SofError::Cancelled => RestError::InternalError {
             message: "View execution was cancelled".to_string(),
         },
+        // The store stopped a statement of the view at its time limit: a 504
+        // with code `timeout`, as a cancelled CRUD statement answers, with
+        // advice about the view (#2577).
+        SofError::Timeout(message) => RestError::ViewTimeout { message },
         // A declared-column misfit surfaced by a runner's columnar builder.
         SofError::Backend(ref msg) if declared_misfit_detail(msg).is_some() => {
             RestError::UnprocessableEntity {
@@ -1796,7 +1824,9 @@ mod tests {
     #[tokio::test]
     async fn streaming_ndjson_aborts_on_row_error() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
-        let response = streaming_ndjson_response(stream, Some("test-runner"));
+        let response = streaming_ndjson_response(stream, Some("test-runner"))
+            .await
+            .expect("the first row is good, so the response starts");
         assert_eq!(response.status(), StatusCode::OK);
         // A mid-stream error must abort the chunked body, not end it cleanly:
         // collecting an aborted body fails.
@@ -1807,15 +1837,50 @@ mod tests {
         );
     }
 
+    /// #2577: a view that fails before its first row answers a real error
+    /// status on the ndjson path too — a statement the store cancelled at its
+    /// time limit is a 504 `timeout` with advice about the view — and a view
+    /// with no rows is still an empty 200.
+    #[tokio::test]
+    async fn streaming_ndjson_answers_an_error_before_the_first_row_with_its_status() {
+        let stream = row_stream(vec![Err(SofError::Timeout(
+            "ERROR (SQLSTATE 57014): canceling statement due to statement timeout".to_string(),
+        ))]);
+        let err = streaming_ndjson_response(stream, None)
+            .await
+            .expect_err("nothing was sent yet, so the error keeps its status");
+        assert!(matches!(err, RestError::ViewTimeout { .. }), "got {err:?}");
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+        assert!(message.contains("ViewDefinition"), "advice: {message}");
+        assert!(
+            !message.contains("57014") && !message.contains("search parameters"),
+            "no backend text, no search advice: {message}"
+        );
+
+        let empty = streaming_ndjson_response(row_stream(vec![]), None)
+            .await
+            .expect("an empty view is a 200");
+        assert_eq!(empty.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(empty.into_body(), usize::MAX)
+            .await
+            .expect("an empty body collects");
+        assert!(bytes.is_empty());
+    }
+
     #[tokio::test]
     async fn streaming_ndjson_flushes_pending_rows_when_next_row_is_not_ready() {
         let (row_tx, row_rx) = tokio::sync::mpsc::channel::<Result<Value, SofError>>(4);
         let stream: RowStream = Box::pin(futures::stream::unfold(row_rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         }));
-        let response = streaming_ndjson_response(stream, None);
-        let mut body = response.into_body().into_data_stream();
+        // The response starts once the first item is known.
         row_tx.send(Ok(json!({ "a": 1 }))).await.unwrap();
+        let response = streaming_ndjson_response(stream, None)
+            .await
+            .expect("the first row is good, so the response starts");
+        let mut body = response.into_body().into_data_stream();
         // The producer is idle, so the first row must arrive without waiting
         // for the chunk to fill or the stream to end.
         let first = tokio::time::timeout(
@@ -2215,7 +2280,9 @@ mod tests {
     #[tokio::test]
     async fn streaming_ndjson_completes_on_clean_stream() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
-        let response = streaming_ndjson_response(stream, Some("test-runner"));
+        let response = streaming_ndjson_response(stream, Some("test-runner"))
+            .await
+            .expect("a clean stream starts");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("a clean stream should produce a collectable body");
@@ -2484,7 +2551,9 @@ mod tests {
         let expected: String = (0..20_000)
             .map(|i| format!("{}\n", json!({ "id": format!("p{i}"), "n": i })))
             .collect();
-        let response = streaming_ndjson_response(row_stream(rows), Some("test-runner"));
+        let response = streaming_ndjson_response(row_stream(rows), Some("test-runner"))
+            .await
+            .expect("the first row is good, so the response starts");
         let mut body = response.into_body();
         let (mut bytes, mut frames) = (Vec::new(), 0usize);
         while let Some(frame) = body.frame().await {
@@ -2502,7 +2571,9 @@ mod tests {
     async fn streaming_ndjson_delivers_rows_before_a_row_error() {
         use http_body_util::BodyExt as _;
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
-        let response = streaming_ndjson_response(stream, None);
+        let response = streaming_ndjson_response(stream, None)
+            .await
+            .expect("the first row is good, so the response starts");
         let mut body = response.into_body();
         let first = body.frame().await.expect("a frame").expect("data first");
         assert_eq!(first.data_ref().unwrap().as_ref(), b"{\"a\":1}\n");
