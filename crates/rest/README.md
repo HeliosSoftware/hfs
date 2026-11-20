@@ -295,7 +295,7 @@ The server is configured via environment variables:
 | `HFS_DATABASE_URL` | - | Database connection string |
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
-| `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+| `HFS_AUTH_TENANT_CLAIM` | tenant_id | JWT claim carrying the tenant id (read by `helios-auth`) |
 
 ### Batch entry concurrency
 

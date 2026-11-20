@@ -284,7 +284,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_DEFAULT_TENANT` | `default` | Default tenant ID for requests without an `X-Tenant-ID` header |
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
-| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled (see [crates/auth/README.md](crates/auth/README.md#tenant-resolution)) |
 
 **Terminology**
 
