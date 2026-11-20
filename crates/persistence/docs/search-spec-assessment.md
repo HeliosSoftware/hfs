@@ -255,9 +255,11 @@ Ordered roughly by impact:
    the prefixes compare against the interval the way date prefixes do for a `Period`: `eq` when the
    search range contains it, `gt`/`ge` on `high`, `lt`/`le` on `low`, `sa` on `low`, `eb` on `high`,
    `ap` on overlap with `[v-m, v+m]`. All four backends store a high bound with an index leading
-   with it. Elasticsearch backfills `high = value` on old quantity entries at startup, so `Quantity`/`Age`
-   need no reindex; only stored `Range` values need `POST /$reindex`. An older instance must not keep
-   writing after the backfill: its rows have no `high` and miss `eq`/`gt`/`ge`/`eb`/`ap`. SQLite
+   with it. Elasticsearch rewrites nothing: `Quantity`/`Age` need no reindex (filters fall back to `value`
+   for an entry without `high`, and sorts read `value`), a `Range` with `low != high` adds one sort-only
+   nested entry (`sort_name`, upper bound as `value`, no `name`) for descending sorts, and only `Range`
+   values stored before the upgrade need `POST /<type>/$reindex`. On the other backends an older instance
+   must not keep writing after the backfill: its rows have no `high` and miss `eq`/`gt`/`ge`/`eb`/`ap`. SQLite
    `_filter` evaluates quantity comparisons against the interval and supports `onset-age`,
    `abatement-age` and `context-quantity`. Known limits: composite token+quantity parameters index
    only `Quantity`/`Age` points and `Range` values with `low == high` (a `Range` with `low != high`,

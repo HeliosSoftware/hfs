@@ -455,6 +455,217 @@ async fn a_descending_date_sort_works_on_an_index_not_yet_reconciled() {
     assert_eq!(mapping_version_meta(&index).await, Some(1));
 }
 
+/// A `Condition` with `onset`, keyed `onset-age` in the quantity index.
+async fn create_condition(backend: &ElasticsearchBackend, id: &str, onset: (&str, Value)) {
+    let mut resource = json!({
+        "resourceType": "Condition",
+        "id": id,
+        "subject": { "reference": "Patient/p1" }
+    });
+    resource[onset.0] = onset.1;
+    backend
+        .create(&tenant(), "Condition", resource, FhirVersion::default())
+        .await
+        .expect("create condition");
+}
+
+fn age(value: f64) -> Value {
+    json!({ "value": value, "unit": "a", "system": "http://unitsofmeasure.org", "code": "a" })
+}
+
+fn onset_age_sort(direction: helios_persistence::types::SortDirection) -> SearchQuery {
+    SearchQuery::new("Condition").with_count(20).with_sort(
+        helios_persistence::types::SortDirective {
+            parameter: "onset-age".to_string(),
+            direction,
+            param_type: Some(SearchParamType::Quantity),
+        },
+    )
+}
+
+async fn sorted_ids(backend: &ElasticsearchBackend, query: &SearchQuery) -> Vec<String> {
+    backend
+        .search(&tenant(), query)
+        .await
+        .unwrap_or_else(|e| panic!("sort must not fail: {e:?}"))
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+fn onset_age_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Condition").with_parameter(SearchParameter {
+        name: "onset-age".to_string(),
+        param_type: SearchParamType::Quantity,
+        values: vec![SearchValue::parse(value)],
+        ..Default::default()
+    })
+}
+
+/// #2602: a version-3 index holding quantity documents with no `high` and no
+/// `sort_name` keeps sorting right with nothing rewritten. Both directions read
+/// `value`; a descending one also selects the sort-only entry a new `Range`
+/// adds. The sort must not fail on the unreconciled index (a `term` on the
+/// unmapped `sort_name` matches nothing), must interleave legacy points with
+/// new documents once reconciled, and every prefix still finds a legacy point.
+#[tokio::test]
+async fn quantity_sort_interleaves_legacy_documents_without_a_rewrite() {
+    use helios_persistence::types::SortDirection::{Ascending, Descending};
+
+    // The current Condition mapping without the #2602 fields, marked version 3.
+    let template_prefix = new_prefix();
+    let template = started_backend_on(&template_prefix).await;
+    create_condition(&template, "seed", ("onsetAge", age(1.0))).await;
+    let template_index = template.index_name("reconcile", "Condition");
+    let mut mapping = mapping_of(&template_index).await;
+    let quantity =
+        &mut mapping["properties"]["search_params"]["properties"]["quantity"]["properties"];
+    for field in ["high", "canonical_high", "sort_name"] {
+        assert!(
+            quantity.as_object_mut().unwrap().remove(field).is_some(),
+            "{field}"
+        );
+    }
+    mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 3 });
+    let hits: Value = raw_client()
+        .await
+        .search(SearchParts::Index(&[&template_index]))
+        .body(json!({ "query": { "term": { "resource_id": "seed" } } }))
+        .send()
+        .await
+        .expect("find seed")
+        .json()
+        .await
+        .expect("seed json");
+    let seed = hits["hits"]["hits"][0]["_source"].clone();
+    assert!(seed.is_object(), "{hits}");
+
+    let prefix = new_prefix();
+    // Not initialized: the index is never reconciled until a write.
+    let backend = backend_on(&prefix).await;
+    let index = backend.index_name("reconcile", "Condition");
+    let client = raw_client().await;
+    let response = client
+        .indices()
+        .create(elasticsearch::indices::IndicesCreateParts::Index(&index))
+        .body(json!({
+            "settings": {
+                "number_of_replicas": 0,
+                "analysis": { "normalizer": { "lowercase_normalizer": {
+                    "type": "custom", "filter": ["lowercase"]
+                } } }
+            },
+            "mappings": mapping
+        }))
+        .send()
+        .await
+        .expect("create a version-3 index");
+    assert!(response.status_code().is_success(), "create failed");
+
+    // Legacy documents: one quantity entry, no `high`, `canonical_high` or
+    // `sort_name`, as a version-3 build wrote them.
+    for (id, value) in [("l-5", 5.0), ("l-100", 100.0), ("l-500", 500.0)] {
+        let mut doc = seed.clone();
+        doc["resource_id"] = json!(id);
+        doc["content"]["id"] = json!(id);
+        let entry = &mut doc["search_params"]["quantity"][0];
+        assert_eq!(entry["name"], "onset-age", "{seed}");
+        entry["value"] = json!(value);
+        // 1 year = canonical value of the seed; scale it with the value.
+        let canonical = entry["canonical_value"].as_f64().expect("canonical");
+        entry["canonical_value"] = json!(canonical * value);
+        let entry = entry.as_object_mut().unwrap();
+        for field in ["high", "canonical_high", "sort_name"] {
+            entry.remove(field);
+        }
+        let response = client
+            .index(IndexParts::IndexId(&index, &format!("Condition_{id}")))
+            .refresh(elasticsearch::params::Refresh::WaitFor)
+            .body(doc)
+            .send()
+            .await
+            .expect("index legacy document");
+        assert!(response.status_code().is_success(), "{id}");
+    }
+    assert_eq!(mapping_version_meta(&index).await, Some(3));
+
+    // Not yet reconciled: neither `high` nor `sort_name` is mapped.
+    assert_eq!(
+        sorted_ids(&backend, &onset_age_sort(Descending)).await,
+        ["l-500", "l-100", "l-5"]
+    );
+    assert_eq!(
+        sorted_ids(&backend, &onset_age_sort(Ascending)).await,
+        ["l-5", "l-100", "l-500"]
+    );
+    assert_eq!(mapping_version_meta(&index).await, Some(3));
+
+    // New documents through the backend reconcile the index (no rewrite).
+    create_condition(&backend, "n-age", ("onsetAge", age(50.0))).await;
+    create_condition(
+        &backend,
+        "n-range",
+        (
+            "onsetRange",
+            json!({ "low": age(10.0), "high": age(300.0) }),
+        ),
+    )
+    .await;
+    assert_eq!(mapping_version_meta(&index).await, Some(SCHEMA_VERSION));
+    let mapping = mapping_of(&index).await;
+    assert_eq!(
+        mapping["properties"]["search_params"]["properties"]["quantity"]["properties"]["sort_name"]
+            ["type"],
+        "keyword"
+    );
+    // Only the three legacy documents and the Range's sort-only entry lack
+    // `high`: no legacy document was rewritten.
+    let legacy: Value = client
+        .count(elasticsearch::CountParts::Index(&[&index]))
+        .body(json!({ "query": { "nested": {
+            "path": "search_params.quantity",
+            "query": { "bool": {
+                "filter": [{ "exists": { "field": "search_params.quantity.value" } }],
+                "must_not": [{ "exists": { "field": "search_params.quantity.high" } }]
+            } }
+        } } }))
+        .send()
+        .await
+        .expect("count legacy")
+        .json()
+        .await
+        .expect("count json");
+    assert_eq!(legacy["count"], 4, "{legacy}");
+
+    assert_eq!(
+        sorted_ids(&backend, &onset_age_sort(Descending)).await,
+        ["l-500", "n-range", "l-100", "n-age", "l-5"]
+    );
+    assert_eq!(
+        sorted_ids(&backend, &onset_age_sort(Ascending)).await,
+        ["l-5", "n-range", "n-age", "l-100", "l-500"]
+    );
+
+    // Every prefix still finds the legacy points (filters fall back to `value`
+    // for an entry without `high`).
+    for (value, found, absent) in [
+        ("eq100", "l-100", ""),
+        ("ge100", "l-100", ""),
+        ("le100", "l-100", ""),
+        ("gt100", "l-500", "l-100"),
+        ("lt100", "l-5", "l-100"),
+        ("ne100", "l-500", "l-100"),
+        ("sa100", "l-500", "l-100"),
+        ("eb100", "l-5", "l-100"),
+    ] {
+        let ids = found_ids(&backend, &onset_age_query(value)).await;
+        assert!(ids.iter().any(|i| i == found), "{value}: {ids:?}");
+        assert!(!ids.iter().any(|i| i == absent), "{value}: {ids:?}");
+    }
+}
+
 /// The `hfs_schema_version` in an index's mapping `_meta`, if any.
 async fn mapping_version_meta(index: &str) -> Option<u64> {
     mapping_of(index).await["_meta"][SCHEMA_VERSION_META_KEY].as_u64()

@@ -621,14 +621,10 @@ impl<'a> EsQueryBuilder<'a> {
                         }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
-                        // A quantity is an interval `[value, high]` (#2602),
-                        // sorted like a date: an ascending sort orders by the
-                        // lower bound, a descending one by the upper bound.
-                        Some(SearchParamType::Quantity)
-                            if matches!(directive.direction, SortDirection::Descending) =>
-                        {
-                            ("quantity", "search_params.quantity.high")
-                        }
+                        // A quantity is an interval `[value, high]` (#2602).
+                        // Both directions sort on `value`: a Range also
+                        // indexes its upper bound as a sort-only entry (see
+                        // `sort_name`), which only a descending sort selects.
                         Some(SearchParamType::Quantity) => {
                             ("quantity", "search_params.quantity.value")
                         }
@@ -660,14 +656,29 @@ impl<'a> EsQueryBuilder<'a> {
                     } else {
                         "_last"
                     };
+                    let mut nested_filter =
+                        json!({ "term": { format!("search_params.{group}.name"): name } });
+                    // A descending quantity sort also selects the sort-only
+                    // entry holding a Range's upper bound. It has no `name`,
+                    // so no filter sees it; a term on `sort_name` matches
+                    // nothing in an index that does not map the field yet.
+                    if group == "quantity"
+                        && matches!(directive.direction, SortDirection::Descending)
+                    {
+                        nested_filter = json!({ "bool": {
+                            "should": [
+                                nested_filter,
+                                { "term": { "search_params.quantity.sort_name": name } }
+                            ],
+                            "minimum_should_match": 1
+                        }});
+                    }
                     let mut clause = json!({
                         "order": order,
                         "mode": mode,
                         "nested": {
                             "path": format!("search_params.{group}"),
-                            "filter": {
-                                "term": { format!("search_params.{group}.name"): name }
-                            }
+                            "filter": nested_filter
                         },
                         "missing": missing
                     });
@@ -681,13 +692,6 @@ impl<'a> EsQueryBuilder<'a> {
                     // its type.
                     if field == "search_params.date.end" {
                         clause["unmapped_type"] = json!("date");
-                    }
-                    // Same for `search_params.quantity.high` (schema version 4,
-                    // #2602). A document indexed before it has no `high`, so a
-                    // descending sort puts it after those that have one; the
-                    // `$reindex` the upgrade asks for fixes that.
-                    if field == "search_params.quantity.high" {
-                        clause["unmapped_type"] = json!("double");
                     }
                     sort_clauses.push(json!({ field: clause }));
                 }
@@ -1368,6 +1372,54 @@ mod tests {
             !sort["search_params.date.end"].is_null(),
             "a Previous cursor keeps the sort key, got {sort}"
         );
+    }
+
+    /// #2602: a quantity sorts on `value` in both directions; only the
+    /// descending one also selects the sort-only entry holding a Range's
+    /// upper bound, and it keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_quantity_sort_reads_value_in_both_directions() {
+        let builder =
+            EsQueryBuilder::new("acme", "Observation", "hfs_acme_observation".to_string());
+        for (direction, order, mode) in [
+            (SortDirection::Ascending, "asc", "min"),
+            (SortDirection::Descending, "desc", "max"),
+        ] {
+            let descending = matches!(direction, SortDirection::Descending);
+            let query = SearchQuery::new("Observation").with_sort(SortDirective {
+                parameter: "value-quantity".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Quantity),
+            });
+            let sort = &builder.build(&query).unwrap().body["sort"][0];
+            let clause = &sort["search_params.quantity.value"];
+            assert!(!clause.is_null(), "quantity sorts on value, got {sort}");
+            assert!(sort["search_params.quantity.high"].is_null());
+            assert_eq!(clause["order"], order);
+            assert_eq!(clause["mode"], mode);
+            assert_eq!(clause["missing"], "_last");
+            assert_eq!(clause["nested"]["path"], "search_params.quantity");
+            let filter = &clause["nested"]["filter"];
+            if descending {
+                let should = filter["bool"]["should"].as_array().unwrap();
+                assert_eq!(should.len(), 2);
+                assert_eq!(
+                    should[0]["term"]["search_params.quantity.name"],
+                    "value-quantity"
+                );
+                assert_eq!(
+                    should[1]["term"]["search_params.quantity.sort_name"],
+                    "value-quantity"
+                );
+                assert_eq!(filter["bool"]["minimum_should_match"], 1);
+            } else {
+                assert_eq!(
+                    filter["term"]["search_params.quantity.name"],
+                    "value-quantity"
+                );
+                assert!(filter["bool"].is_null());
+            }
+        }
     }
 
     #[test]

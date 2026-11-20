@@ -568,6 +568,8 @@ pub(crate) fn build_es_document(
     let mut date_params: Vec<Value> = Vec::new();
     let mut number_params: Vec<Value> = Vec::new();
     let mut quantity_params: Vec<Value> = Vec::new();
+    // Sort-only quantity entries (see `sort_name`), appended after the others.
+    let mut quantity_sort_params: Vec<Value> = Vec::new();
     let mut reference_params: Vec<Value> = Vec::new();
     let mut uri_params: Vec<Value> = Vec::new();
     // Composite instances, keyed by (param name, group) so all components of one
@@ -686,6 +688,16 @@ pub(crate) fn build_es_document(
                     qty["canonical_unit"] = json!(cu);
                 }
                 quantity_params.push(qty);
+                // A Range also indexes its upper bound as an extra entry with
+                // no `name`, so no filter or `:missing` selects it, tagged
+                // with `sort_name` instead: a descending sort takes the
+                // maximum `value` over both entries (a point adds nothing).
+                if high_value != *value {
+                    quantity_sort_params.push(json!({
+                        "sort_name": ev.param_name,
+                        "value": high_value,
+                    }));
+                }
             }
             IndexValue::Reference {
                 reference,
@@ -721,6 +733,7 @@ pub(crate) fn build_es_document(
     }
 
     let composite_params: Vec<Value> = composite_groups.into_values().collect();
+    quantity_params.extend(quantity_sort_params);
 
     json!({
         "resource_type": resource_type,
@@ -3833,6 +3846,73 @@ mod tests {
             Some(crate::search::QUANTITY_OPEN_LOW)
         );
         assert!(rows[3]["canonical_high"].as_f64().unwrap().is_finite());
+    }
+
+    /// #2602: a Range with a high bound apart from its low one adds exactly one
+    /// sort-only entry (the high bound as `value`, tagged `sort_name`, no
+    /// `name`); a point adds none, and an open high side uses the sentinel.
+    #[test]
+    fn document_adds_a_sort_only_entry_for_a_range() {
+        use crate::search::converters::QuantityHigh;
+        let qty = |value: f64, high: QuantityHigh| {
+            let value = IndexValue::Quantity {
+                value,
+                unit: Some("a".into()),
+                system: Some("http://unitsofmeasure.org".into()),
+                code: Some("a".into()),
+                high,
+            };
+            ExtractedValue::new(
+                "onset-age",
+                "http://hl7.org/fhir/SearchParameter/Condition-onset-age",
+                value.param_type(),
+                value,
+            )
+        };
+        let rows_for = |values: Vec<ExtractedValue>| {
+            let doc = build_es_document(
+                "t1",
+                "Condition",
+                "c1",
+                "1",
+                test_instant(),
+                &json!({ "resourceType": "Condition", "id": "c1" }),
+                FhirVersion::default(),
+                &values,
+            );
+            doc["search_params"]["quantity"].as_array().unwrap().clone()
+        };
+        let sort_only = |rows: &[serde_json::Value]| -> Vec<serde_json::Value> {
+            rows.iter()
+                .filter(|r| r.get("name").is_none())
+                .cloned()
+                .collect()
+        };
+
+        let rows = rows_for(vec![qty(45.0, QuantityHigh::Point)]);
+        assert_eq!(rows.len(), 1);
+        assert!(sort_only(&rows).is_empty());
+
+        // A degenerate Range (low == high) is a point too.
+        let rows = rows_for(vec![qty(45.0, QuantityHigh::At(45.0))]);
+        assert!(sort_only(&rows).is_empty());
+
+        let rows = rows_for(vec![qty(40.0, QuantityHigh::At(50.0))]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "onset-age");
+        let extra = sort_only(&rows);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0]["sort_name"], "onset-age");
+        assert_eq!(extra[0]["value"].as_f64(), Some(50.0));
+        assert_eq!(extra[0].as_object().unwrap().len(), 2);
+
+        let rows = rows_for(vec![qty(60.0, QuantityHigh::Open)]);
+        let extra = sort_only(&rows);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(
+            extra[0]["value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
     }
 
     /// #1391: a `Period` indexes as one range, its open ends at the edges of

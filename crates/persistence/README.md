@@ -685,7 +685,7 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
-**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high` and `quantity.canonical_high` (schema version 4), added in place. At startup the backend backfills `high = value` (and `canonical_high = canonical_value`) on the quantity entries already in the index, so `Quantity` and `Age` values keep matching and sort correctly with no `$reindex`. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored earlier were never indexed, so run `POST /$reindex` once to make them searchable. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version warning under [Rolling back from #2602](#rolling-back-from-2602).
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high`, `quantity.canonical_high` and `quantity.sort_name` (schema version 4), added in place; no document is rewritten. `Quantity` and `Age` need nothing: filters fall back to `value` for an entry without `high`, and every quantity sort reads `value`. A `Range` with `low != high` also indexes a second, sort-only nested entry (`sort_name` and its upper bound as `value`, no `name`, so no filter or `:missing` sees it) that a descending sort selects. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored before the upgrade were never indexed, so run `POST /<type>/$reindex` (per tenant) once to make them searchable and sortable by their upper bound. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version warning under [Rolling back from #2602](#rolling-back-from-2602).
 
 ```bash
 # Build with Elasticsearch support
@@ -3004,14 +3004,19 @@ and supports `onset-age`, `abatement-age` and `context-quantity`.
 quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill
 `high = value`; MongoDB backfills at startup under search index generation 8, in
 batches by `_id` with progress logging; Elasticsearch adds
-`quantity.high` / `quantity.canonical_high`, schema version 4, and backfills
-`high = value` on old quantity entries at startup, so `Quantity` and `Age`
-match and sort correctly without `$reindex`). Existing `Quantity` and `Age`
+`quantity.high` / `quantity.canonical_high` / `quantity.sort_name`, schema
+version 4, rewriting no document: `Quantity` and `Age` match and sort correctly
+without `$reindex`, since filters fall back to `value` and sorts read it).
+Existing `Quantity` and `Age`
 values keep working unchanged, but `Range` values stored earlier were never
 indexed, so they are searchable only after you run `POST /$reindex` once.
 
-**Mixed versions during the upgrade.** No older (pre-#2602) instance may keep
-writing after the backfill. A row written by an older build after the backfill
+**Mixed versions during the upgrade.** (Elasticsearch needs no backfill: an
+older instance writing after the upgrade indexes no `Range` at all, and its
+`Quantity`/`Age` entries without `high` still match through the `value`
+fallback and sort by `value`; a `Range` stored by a build that lacks the
+sort-only entry sorts by its low bound until `$reindex`.) For the other
+backends, no older (pre-#2602) instance may keep writing after the backfill. A row written by an older build after the backfill
 has no high bound and does not match `eq`, `gt`, `ge`, `eb` or `ap`. The MongoDB
 backfill runs once per recorded generation, and PostgreSQL's runs inside
 migration v56, so neither covers a later write by an old instance. Stop the old
