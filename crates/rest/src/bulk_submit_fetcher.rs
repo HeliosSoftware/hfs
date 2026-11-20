@@ -9,6 +9,19 @@
 //! the provider's origin policy decides whether a bearer travels there at all;
 //! a refusal fails the request with the provider's reason.
 //!
+//! # Destinations
+//!
+//! Every URL the fetcher requests comes from the submitter: the `manifestUrl`
+//! and `oauthMetadataUrl` of the kick-off, and the output URLs of the manifest
+//! fetched there. With `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` set, a request is
+//! sent only to a listed origin, redirects included, and the failure messages
+//! the submitter reads in the manifest's `error` artifact carry the HTTP
+//! status or transport error. Unset, any origin is accepted, as a Data
+//! Provider on the same host needs, and those messages say only that the
+//! fetch failed: the status or transport detail of a request HFS made on the
+//! submitter's behalf goes to the log at `warn`, so `$bulk-submit` cannot be
+//! used to map what the network around HFS answers.
+//!
 //! NDJSON bodies are streamed to the ingestion engine rather than buffered, so a
 //! manifest referencing multi-gigabyte files costs a fixed amount of memory per
 //! concurrent fetch. The one exception is `fileEncryptionKey` (JWE) files, whose
@@ -46,13 +59,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use helios_persistence::core::bulk_submit_input::{error_chain, redact_url};
-use helios_persistence::core::{FileTokenProvider, RemoteManifest, SubmitInputFetcher};
+use helios_persistence::core::{
+    FileTokenError, FileTokenProvider, RemoteManifest, SubmitInputFetcher,
+};
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
 use reqwest::header::{self, HeaderMap};
 use serde_json::Value;
 use tokio::io::AsyncBufRead;
 use tokio_util::io::StreamReader;
 
+use crate::bulk_submit_oauth::TrustedProviders;
 use crate::jwe::{self, DecryptionKeys, PrivateKey};
 
 /// The default `fileEncryptionKey.coding` code (submit spec: "If omitted,
@@ -61,6 +77,9 @@ const FILE_ENCRYPTION_TYPE_JWE: &str = "jwe";
 
 /// How long establishing a connection to the provider may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Redirect hops followed, as reqwest's default policy allows.
+const MAX_REDIRECTS: usize = 10;
 
 /// Default idle time allowed between two reads of a response before the read
 /// fails (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`). A stalled body then surfaces
@@ -113,14 +132,39 @@ pub struct HttpSubmitInputFetcher {
     /// addresses HFS asymmetrically — `RSA-OAEP*` / `ECDH-ES*`.
     decryption_keys: Vec<PrivateKey>,
     retry: RetryPolicy,
+    read_timeout: Duration,
+    /// The origins the fetcher may request at all; empty permits every origin.
+    trusted_providers: TrustedProviders,
 }
 
 /// Builds the decoding and the non-decoding client with the same timeouts.
-fn build_clients(read_timeout: Duration) -> (reqwest::Client, reqwest::Client) {
+/// With trusted providers listed, a redirect is followed only to a listed
+/// origin; otherwise reqwest's default policy applies.
+fn build_clients(
+    read_timeout: Duration,
+    trusted_providers: &TrustedProviders,
+) -> (reqwest::Client, reqwest::Client) {
     let base = || {
+        let redirect = if trusted_providers.is_empty() {
+            reqwest::redirect::Policy::default()
+        } else {
+            let trusted = trusted_providers.clone();
+            reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    attempt.error("too many redirects")
+                } else if trusted.permits_url(attempt.url().as_str()) {
+                    attempt.follow()
+                } else {
+                    attempt.error(
+                        "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
+                    )
+                }
+            })
+        };
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(read_timeout)
+            .redirect(redirect)
     };
     // `Client::new()` panics the same way when the TLS backend cannot start.
     let client = base()
@@ -136,7 +180,8 @@ fn build_clients(read_timeout: Duration) -> (reqwest::Client, reqwest::Client) {
 impl HttpSubmitInputFetcher {
     /// Creates a fetcher with the given optional outbound token provider and scope.
     pub fn new(token_provider: Option<Arc<dyn FileTokenProvider>>, outbound_scope: String) -> Self {
-        let (client, stream_client) = build_clients(DEFAULT_FETCH_READ_TIMEOUT);
+        let trusted_providers = TrustedProviders::default();
+        let (client, stream_client) = build_clients(DEFAULT_FETCH_READ_TIMEOUT, &trusted_providers);
         Self {
             client,
             stream_client,
@@ -144,6 +189,8 @@ impl HttpSubmitInputFetcher {
             outbound_scope,
             decryption_keys: Vec::new(),
             retry: RetryPolicy::default(),
+            read_timeout: DEFAULT_FETCH_READ_TIMEOUT,
+            trusted_providers,
         }
     }
 
@@ -151,10 +198,15 @@ impl HttpSubmitInputFetcher {
     /// (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`); the default is
     /// [`DEFAULT_FETCH_READ_TIMEOUT`].
     pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
-        let (client, stream_client) = build_clients(read_timeout);
+        self.read_timeout = read_timeout;
+        self.rebuild_clients();
+        self
+    }
+
+    fn rebuild_clients(&mut self) {
+        let (client, stream_client) = build_clients(self.read_timeout, &self.trusted_providers);
         self.client = client;
         self.stream_client = stream_client;
-        self
     }
 
     /// Shortens the retry schedule so tests do not sleep for seconds.
@@ -172,6 +224,38 @@ impl HttpSubmitInputFetcher {
     pub fn with_decryption_keys(mut self, keys: Vec<PrivateKey>) -> Self {
         self.decryption_keys = keys;
         self
+    }
+
+    /// Confines every request, redirects included, to the listed origins
+    /// (`HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`), and lets the failure messages
+    /// the submitter reads carry the HTTP status or transport error, which
+    /// without a list stay in the log.
+    pub fn with_trusted_providers(mut self, trusted_providers: TrustedProviders) -> Self {
+        self.trusted_providers = trusted_providers;
+        self.rebuild_clients();
+        self
+    }
+
+    /// Whether the submitter may read the status or transport detail of a
+    /// failed request: only when the operator chose the origins.
+    fn detail_to_submitter(&self) -> bool {
+        !self.trusted_providers.is_empty()
+    }
+
+    /// Refuses a URL outside the trusted providers before any request is sent.
+    fn check_source(&self, url: &str) -> StorageResult<()> {
+        if self.trusted_providers.permits_url(url) {
+            return Ok(());
+        }
+        Err(Self::err(format!(
+            "{} is not at a trusted Data Provider origin; list it in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
+            redact_url(url)
+        )))
+    }
+
+    /// The error for a request that failed, worded for the submitter.
+    fn failure(&self, shown: &str, detail: String) -> StorageError {
+        Self::err(submitter_text(self.detail_to_submitter(), shown, detail))
     }
 
     /// Everything needed to (re-)issue the GET for one input file, owned so a
@@ -193,6 +277,7 @@ impl HttpSubmitInputFetcher {
             request_headers: request_headers.to_vec(),
             with_token,
             oauth_metadata_urls: oauth_metadata_urls.to_vec(),
+            detail_to_submitter: self.detail_to_submitter(),
         }
     }
 
@@ -329,7 +414,7 @@ impl HttpSubmitInputFetcher {
                 // The first GET failing to connect is final, as for a streamed
                 // file; only a transfer that already started is retried.
                 Err(Retry::Transient(message)) if retries == 0 => {
-                    return Err(Self::err(message));
+                    return Err(self.failure(shown, message));
                 }
                 Err(Retry::Transient(message)) => message,
                 // A server error on a re-fetch is as transient as the break was.
@@ -337,10 +422,10 @@ impl HttpSubmitInputFetcher {
                     format!("file GET {shown} returned HTTP {} on retry", resp.status())
                 }
                 Ok(resp) if !resp.status().is_success() => {
-                    return Err(Self::err(format!(
-                        "file GET {shown} returned HTTP {}",
-                        resp.status()
-                    )));
+                    return Err(self.failure(
+                        shown,
+                        format!("file GET {shown} returned HTTP {}", resp.status()),
+                    ));
                 }
                 Ok(resp) => match resp.bytes().await {
                     Ok(bytes) => return Ok(bytes.to_vec()),
@@ -369,6 +454,21 @@ impl HttpSubmitInputFetcher {
             tokio::time::sleep(self.retry.delay(retries)).await;
         }
     }
+}
+
+/// The text of a failed request for the manifest's `error` artifact: the
+/// detail itself when the operator listed the Data Provider origins, otherwise
+/// a fixed sentence, with the detail logged at `warn`.
+fn submitter_text(detail_to_submitter: bool, shown: &str, detail: String) -> String {
+    if detail_to_submitter {
+        return detail;
+    }
+    tracing::warn!(
+        url = %shown,
+        error = %detail,
+        "bulk-submit request failed; without HFS_BULK_SUBMIT_TRUSTED_PROVIDERS the detail stays in the log"
+    );
+    format!("fetching {shown} failed; the reason is in the server log")
 }
 
 /// Interprets raw key material as an AES key.
@@ -425,6 +525,8 @@ struct FileRequest {
     request_headers: Vec<(String, String)>,
     with_token: bool,
     oauth_metadata_urls: Vec<String>,
+    /// See [`HttpSubmitInputFetcher::detail_to_submitter`].
+    detail_to_submitter: bool,
 }
 
 impl FileRequest {
@@ -453,7 +555,18 @@ impl FileRequest {
                 .token(&self.oauth_metadata_urls, &self.outbound_scope, &self.url)
                 .await
                 .map_err(|e| {
-                    HttpSubmitInputFetcher::err(format!("{shown} requires an access token: {e}"))
+                    let detail = format!("{shown} requires an access token: {e}");
+                    // A refusal by the origin policy names what to list; a
+                    // discovery or token failure can carry the status of a
+                    // request to the submitter's metadata URL.
+                    let text = match e {
+                        FileTokenError::Unavailable(_) => {
+                            submitter_text(self.detail_to_submitter, shown, detail)
+                        }
+                        FileTokenError::UntrustedProvider { .. }
+                        | FileTokenError::UntrustedDestination { .. } => detail,
+                    };
+                    HttpSubmitInputFetcher::err(text)
                 })?;
             rb = rb.bearer_auth(token);
         }
@@ -886,24 +999,32 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         // The manifest itself may be protected; attempt with a token when one is
         // configured, falling back to anonymous when not.
         let with_token = self.token_provider.is_some() && !oauth_metadata_urls.is_empty();
+        self.check_source(url)?;
         let shown = redact_url(url);
         let rb = self
             .build_get(url, request_headers, with_token, oauth_metadata_urls)
             .await?;
-        let resp = rb
-            .send()
-            .await
-            .map_err(|e| Self::err(format!("manifest GET {shown} failed: {}", error_chain(&e))))?;
+        let resp = rb.send().await.map_err(|e| {
+            self.failure(
+                &shown,
+                format!("manifest GET {shown} failed: {}", error_chain(&e)),
+            )
+        })?;
         if !resp.status().is_success() {
-            return Err(Self::err(format!(
-                "manifest GET {shown} returned HTTP {}",
-                resp.status()
-            )));
+            return Err(self.failure(
+                &shown,
+                format!("manifest GET {shown} returned HTTP {}", resp.status()),
+            ));
         }
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| Self::err(format!("reading manifest {shown}: {}", error_chain(&e))))?
+            .map_err(|e| {
+                self.failure(
+                    &shown,
+                    format!("reading manifest {shown}: {}", error_chain(&e)),
+                )
+            })?
             .to_vec();
 
         // The spec has the provider encrypt the manifest as well as the files.
@@ -940,6 +1061,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         oauth_metadata_urls: &[String],
         encryption_key: Option<&Value>,
     ) -> StorageResult<(Box<dyn AsyncBufRead + Send + Unpin>, Option<u64>)> {
+        self.check_source(url)?;
         // Resolve the key before the fetch so a misconfigured submission fails
         // without pulling the file body.
         let keys = self.resolve_keys(encryption_key)?;
@@ -975,13 +1097,14 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         );
         let shown = request.shown_url.clone();
         let resp = request.send(ACCEPT_GZIP, &[]).await.map_err(|e| match e {
-            Retry::Transient(message) | Retry::Fatal(message) => Self::err(message),
+            Retry::Transient(message) => self.failure(&shown, message),
+            Retry::Fatal(message) => Self::err(message),
         })?;
         if !resp.status().is_success() {
-            return Err(Self::err(format!(
-                "file GET {shown} returned HTTP {}",
-                resp.status()
-            )));
+            return Err(self.failure(
+                &shown,
+                format!("file GET {shown} returned HTTP {}", resp.status()),
+            ));
         }
         let encoding = body_encoding(resp.headers())
             .map_err(|e| Self::err(format!("file GET {shown}: {e}")))?;
@@ -1014,6 +1137,11 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         requires_access_token: bool,
         oauth_metadata_urls: &[String],
     ) -> StorageResult<Option<u64>> {
+        if !self.trusted_providers.permits_url(url) {
+            // The GET that follows refuses the URL with the reason; the probe
+            // is best-effort and says nothing.
+            return Ok(None);
+        }
         // Identity encoding on purpose: a gzip Content-Length would be the
         // compressed size, and the ingestion counts decompressed bytes. The
         // non-decoding client sends no `Accept-Encoding` of its own.
@@ -1060,7 +1188,6 @@ mod tests {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::Engine;
-    use helios_persistence::core::FileTokenError;
     use serde_json::json;
 
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
@@ -1800,6 +1927,127 @@ mod tests {
             !err.contains("secret123"),
             "the signature must not leak: {err}"
         );
+    }
+
+    /// The error text of a refused or failed `open_file_stream`; the reader
+    /// in the `Ok` arm has no `Debug`, so `expect_err` cannot be used.
+    fn stream_err(
+        result: StorageResult<(Box<dyn AsyncBufRead + Send + Unpin>, Option<u64>)>,
+    ) -> String {
+        match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected the file stream to be refused"),
+        }
+    }
+
+    fn trusting(base_url: &str) -> HttpSubmitInputFetcher {
+        fetcher().with_trusted_providers(TrustedProviders::parse([base_url]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_a_url_outside_the_trusted_providers_is_refused_before_any_request() {
+        let (base, requests) = scripted_server(vec![Scripted::ok(b"{}")]).await;
+        let fetcher = fetcher()
+            .with_trusted_providers(TrustedProviders::parse(["https://provider.example"]).unwrap());
+
+        let err = fetcher
+            .fetch_manifest(
+                &format!("{base}/manifest.json?sig=secret123"),
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect_err("an unlisted origin is refused")
+            .to_string();
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+        assert!(!err.contains("secret123"), "{err}");
+
+        let err = stream_err(
+            fetcher
+                .open_file_stream(&format!("{base}/file.ndjson"), &[], false, &[], None)
+                .await,
+        );
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+        assert_eq!(
+            fetcher
+                .file_size(&format!("{base}/file.ndjson"), &[], false, &[])
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(requests.lock().unwrap().is_empty(), "no request was sent");
+    }
+
+    #[tokio::test]
+    async fn test_a_redirect_to_an_untrusted_origin_is_not_followed() {
+        let (elsewhere, elsewhere_requests) = scripted_server(vec![Scripted::ok(b"{}")]).await;
+        let redirect = Scripted {
+            status: "302 Found",
+            headers: vec![format!("Location: {elsewhere}/manifest.json")],
+            body: Vec::new(),
+            cut_after: None,
+        };
+        let (base, _) = scripted_server(vec![redirect]).await;
+
+        let err = trusting(&base)
+            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .await
+            .expect_err("the redirect is not followed")
+            .to_string();
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+        assert!(
+            elsewhere_requests.lock().unwrap().is_empty(),
+            "the unlisted origin was never contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_status_of_a_failed_fetch_reaches_the_submitter_only_with_trusted_providers() {
+        let unavailable = || Scripted {
+            status: "503 Service Unavailable",
+            headers: Vec::new(),
+            body: Vec::new(),
+            cut_after: None,
+        };
+        let (base, _) = scripted_server(vec![unavailable()]).await;
+        let url = format!("{base}/manifest.json?sig=secret123");
+
+        let withheld = fetcher()
+            .fetch_manifest(&url, &[], &[], None)
+            .await
+            .expect_err("503")
+            .to_string();
+        assert!(!withheld.contains("503"), "{withheld}");
+        assert!(
+            withheld.contains("the reason is in the server log"),
+            "{withheld}"
+        );
+        assert!(withheld.contains("[redacted]"), "{withheld}");
+        assert!(!withheld.contains("secret123"), "{withheld}");
+
+        let shown = trusting(&base)
+            .fetch_manifest(&url, &[], &[], None)
+            .await
+            .expect_err("503")
+            .to_string();
+        assert!(shown.contains("HTTP 503"), "{shown}");
+        assert!(!shown.contains("secret123"), "{shown}");
+
+        let (base, _) = scripted_server(vec![unavailable()]).await;
+        let url = format!("{base}/file.ndjson");
+        let withheld = stream_err(
+            fetcher()
+                .open_file_stream(&url, &[], false, &[], None)
+                .await,
+        );
+        assert!(!withheld.contains("503"), "{withheld}");
+        let shown = stream_err(
+            trusting(&base)
+                .open_file_stream(&url, &[], false, &[], None)
+                .await,
+        );
+        assert!(shown.contains("HTTP 503"), "{shown}");
     }
 
     #[test]

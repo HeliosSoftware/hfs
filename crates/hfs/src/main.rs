@@ -3452,21 +3452,26 @@ async fn build_bulk_submit(
     // When a client_id + private key are configured, protected-file fetches use
     // a read-scoped `client_credentials` token; otherwise they surface a recorded
     // manifest-level error.
+    // Where $bulk-submit may fetch from at all, and where its file token may
+    // go (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS); empty permits every origin.
+    let trusted_providers =
+        helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?;
+    if trusted_providers.is_empty() {
+        tracing::info!(
+            "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+        );
+    }
     let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
         cfg.client_id.as_deref(),
         cfg.private_key.as_deref(),
     ) {
         (Some(client_id), Some(pem)) => {
-            let trusted =
-                helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
-                    .map_err(|e| {
-                        anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}")
-                    })?;
             match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new_with_trusted_providers(
                     client_id,
                     pem,
                     &cfg.signing_alg,
-                    trusted,
+                    trusted_providers.clone(),
                 ) {
                     Some(p) => Some(p),
                     None => anyhow::bail!(
@@ -3491,7 +3496,8 @@ async fn build_bulk_submit(
             cfg.outbound_scope.clone(),
         )
         .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
-        .with_decryption_keys(decryption_keys),
+        .with_decryption_keys(decryption_keys)
+        .with_trusted_providers(trusted_providers),
     );
 
     // SQLite serialises writers, so a fan-out queues batch writes behind one

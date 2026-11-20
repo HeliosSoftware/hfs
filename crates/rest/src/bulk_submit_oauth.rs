@@ -28,11 +28,14 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 /// Origins (`scheme://host[:port]`) the operator trusts as bulk-submit Data
-/// Providers: where HFS presents its client assertion, and where a token
-/// obtained there may be sent. Parsed from `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
+/// Providers: the only origins `$bulk-submit` fetches from at all (the
+/// `manifestUrl`, the `oauthMetadataUrl`, every manifest output URL and
+/// every redirect), where HFS presents its client assertion, and where a
+/// token obtained there may be sent. Parsed from
+/// `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
 ///
-/// Empty (the default) confines a token to the origin of the token endpoint
-/// that issued it and leaves discovery unconstrained.
+/// Empty (the default) lets the submitter name any origin and confines a
+/// token to the origin of the token endpoint that issued it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProviders(Vec<String>);
 
@@ -71,8 +74,16 @@ impl TrustedProviders {
         self.0.is_empty()
     }
 
-    fn contains(&self, origin: &str) -> bool {
+    /// Whether `origin` is listed.
+    pub fn contains(&self, origin: &str) -> bool {
         self.0.iter().any(|o| o == origin)
+    }
+
+    /// Whether `$bulk-submit` may send a request to `url`: anywhere when no
+    /// origin is listed, otherwise only to a listed origin. A URL without an
+    /// origin (an opaque scheme) is never permitted by a configured list.
+    pub fn permits_url(&self, url: &str) -> bool {
+        self.is_empty() || origin_of(url).is_some_and(|origin| self.contains(&origin))
     }
 
     /// With a list configured, refuses an origin outside it.
@@ -90,7 +101,7 @@ impl TrustedProviders {
 /// The `scheme://host[:port]` of an absolute URL, or `None` when it has no
 /// host (an opaque origin such as `data:`), the form every comparison here
 /// is made on.
-fn origin_of(url: &str) -> Option<String> {
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let origin = reqwest::Url::parse(url).ok()?.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
