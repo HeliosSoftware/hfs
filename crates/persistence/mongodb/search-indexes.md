@@ -12,7 +12,7 @@ Why: a generation-1 value index carried one entry for every row of the collectio
 
 ## Date ranges (generation 4)
 
-Since #1391 a date row stores the range it denotes, `[value_date, value_date_end)`, and a date search bounds either end (`gt` and `ge` bound `value_date_end`, for example). `idx_search_date_v3` carries `value_date_end` between `value_date` and `resource_id` so those searches stay covered; it is still partial on `value_date` existing. It replaces generation 2's `idx_search_date_v2`, which HFS drops once every generation-4 index is ready (under the same mode rules as the generation-1 drop). Until then date searches keep using `idx_search_date_v2`, fetching documents to check `value_date_end`. Every prefix is a covered scan of `idx_search_date_v3` (`docsExamined: 0`). The prefixes with two alternatives (`ge`, `le`, `ne`), and a comma list of date values, are sent as an `$or` at the top of the filter with every arm repeating the tenant, resource type and parameter name; nested under those shared conditions MongoDB 5.0 reads the documents instead of scanning the index.
+Since #1391 a date row stores the range it denotes, `[value_date, value_date_end)`, and a date search bounds either end (`gt` and `ge` bound `value_date_end`, for example). `idx_search_date_v3` carries `value_date_end` between `value_date` and `resource_id` so those searches stay covered; it is still partial on `value_date` existing. It replaces generation 2's `idx_search_date_v2`, which HFS drops once every generation-4 index is ready (under the same mode rules as the generation-1 drop). Until then date searches keep using `idx_search_date_v2`, fetching documents to check `value_date_end`. Every prefix is a covered scan (`docsExamined: 0`). Since #2601, once `idx_search_date_end` is built, a single-arm filter bounded only on the range end (`gt`) is hinted to `idx_search_date_end`, where `value_date_end > x` is a seek on its leading key instead of a scan of every key of the parameter in `idx_search_date_v3`. The prefixes that mix an end-bounded arm with a start-bounded one (`ge`, `ne`, and a comma list of values) are sent as a root `$or` with no hint, so MongoDB plans each arm: the end-bounded arm uses `idx_search_date_end` and the start-bounded arm uses `idx_search_date_v3`. A paged search repeats the cursor boundary inside each arm so the `$or` stays at the root. `eq`, `lt`, `le`, `sa`, `eb` and `ap` keep the `idx_search_date_v3` hint. While `idx_search_date_end` is missing or still building, every query keeps the previous hint, and a hint the server rejects (index dropped while running) is retried without a hint. The prefixes with two alternatives (`ge`, `le`, `ne`), and a comma list of date values, are sent as an `$or` at the top of the filter with every arm repeating the tenant, resource type and parameter name; nested under those shared conditions MongoDB 5.0 reads the documents instead of scanning the index.
 
 ### Upgrading: reindex the date rows
 
@@ -434,6 +434,15 @@ orders them (`$min` of each resource's values ascending, `$max` descending,
 and the range end for a descending date). If collection exceeds 300,000
 matches, the supported single-key sorts instead walk the sort parameter's
 value index (#2588). A descending date uses `idx_search_date_end`.
+
+An unfiltered descending date sort (`_sort=-date` with no other parameter)
+skips the collection step entirely when `idx_search_date_end` is built (#2601).
+It runs the same walk with no filters and stops after `offset + _count + 1`
+live ids, instead of grouping every row of the parameter with `$max` and
+sorting the result. Ids, tie order, missing-value placement, `has_next` and
+the total are the same as the grouped path, which still serves the request
+when the index is missing, still building, or dropped while running. Ascending
+date sorts and other parameter types are not changed.
 
 The walk reads rows in value order. The first row for a resource supplies
 its sort key; later rows for that resource are ignored. Membership and

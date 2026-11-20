@@ -2528,6 +2528,36 @@ mod date_end_filter_tests {
         fixture.close().await;
     }
 
+    #[tokio::test]
+    async fn ge_ne_gt_survive_a_dropped_date_v3_index() {
+        let Some(fixture) = Fixture::new("date-end-v3-dropped", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        let mut expected = Vec::new();
+        for raw in PREFIXES {
+            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+        }
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .drop_index(SEARCH_DATE_RANGE_INDEX)
+            .await
+            .unwrap();
+        // The root $or of ge/ne is unhinted, so each arm picks what is left.
+        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
+            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
+            assert_eq!(answer, expected, "{raw}");
+            let page = fixture
+                .backend
+                .search(&fixture.tenant, &date_query(raw, 10, 10))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 10, "{raw}: page 2");
+        }
+        fixture.close().await;
+    }
+
     /// Every index scan in an explain output, wherever the stage nests.
     fn index_scans(plan: &Bson, out: &mut Vec<Document>) {
         match plan {
