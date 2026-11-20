@@ -452,6 +452,9 @@ mod shared_mongo {
             wt_cache_gb,
             "--replSet",
             "rs0",
+            // As in `shared()`: keep mongod 9.0 from dropping profiler entries.
+            "--setParameter",
+            "internalQueryGlobalProfilingLockDeadlineMs=10000",
         ]
         .into_iter()
         .chain(extra_flags.iter().copied());
@@ -530,6 +533,12 @@ mod shared_mongo {
                             // is only registered when test commands are enabled.
                             "--setParameter",
                             "enableTestCommands=1",
+                            // mongod 9.0 gives each profiler write 1 ms to get its
+                            // lock and silently drops the entry when it cannot;
+                            // the plan tests then read an empty system.profile
+                            // (#2636).
+                            "--setParameter",
+                            "internalQueryGlobalProfilingLockDeadlineMs=10000",
                             "--replSet",
                             "rs0",
                             "--oplogSize",
@@ -19560,8 +19569,10 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
 /// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
-const CURRENT_BACKGROUND_NAMES: [&str; 11] = [
+/// Generation 7: `idx_search_date_end` (descending date sorts, #2588).
+const CURRENT_BACKGROUND_NAMES: [&str; 12] = [
     "idx_search_composite_tuple_qty",
+    "idx_search_date_end",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
@@ -19703,7 +19714,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(7)
     );
 }
 
@@ -19828,7 +19839,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(6)
+        Ok(7)
     );
 }
 
@@ -19916,7 +19927,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(6));
+    assert_eq!(si.get_i32("generation"), Ok(7));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.

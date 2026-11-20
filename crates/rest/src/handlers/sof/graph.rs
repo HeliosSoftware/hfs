@@ -44,7 +44,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
@@ -52,7 +52,7 @@ use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
     BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
     TableSchema, TerminologyKind, TerminologyRelation, project_view_definition,
-    referenced_identifiers,
+    push_down_view_definition, pushable_predicates, referenced_identifiers,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -738,8 +738,17 @@ pub(crate) struct ExecLimits {
     /// v2 PR #353.
     pub max_rows: usize,
     /// SQL execution timeout in seconds, applied per statement (each
-    /// interior SQLView's own SQL, and the subject's).
+    /// interior SQLView's own SQL, and the subject's), and the budget the
+    /// runner is asked to bound each of a dependency's statements with
+    /// ([`SofRunner::with_statement_timeout`]).
     pub timeout_secs: u64,
+    /// Whether materializing a leaf dependency is also bounded as a whole by
+    /// `timeout_secs`. `$sql-run` answers one request and sets it, so a
+    /// dependency ends at the budget whatever the runner. A `$sql-export` job
+    /// does not: it runs in the background and reads a dependency in pages,
+    /// each its own bounded statement, so a dependency that takes longer in
+    /// total than one statement may is exactly what the job is for (#2577).
+    pub bound_materialization: bool,
 }
 
 /// Materializes every node in `plan`, then executes `subject_sql` against
@@ -813,6 +822,20 @@ pub(crate) async fn execute_plan_counting(
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
     let referenced = referenced_columns(plan, subject_sql);
+    // One budget for every statement of the query, the materialization of
+    // each dependency included; a runner that executes views as backend
+    // statements runs them under it too (#2577).
+    let budget = Duration::from_secs(limits.timeout_secs);
+    let leaf_runner: Arc<dyn SofRunner> = runner
+        .with_statement_timeout(budget)
+        .unwrap_or_else(|| Arc::clone(runner));
+    // A filter of the subject's SQL can be pushed into a dependency only when
+    // the subject is the sole reader of it (#2574): an interior SQL View
+    // reads its dependencies in full.
+    let subject_only = !plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node, PlanNode::SqlView { .. }));
 
     for node in &plan.nodes {
         match node {
@@ -841,13 +864,62 @@ pub(crate) async fn execute_plan_counting(
                     },
                     None => (view, declared),
                 };
+                // #2574: yield only the rows the subject's WHERE can keep, when
+                // the subject is one plain SELECT over this one dependency and
+                // reads it under one label; the SQL still runs its whole WHERE.
+                let pushed = subject_only
+                    .then(|| labels_by_target.get(internal_name))
+                    .flatten()
+                    .and_then(|labels| match labels.as_slice() {
+                        [label] => pushable_predicates(subject_sql, label),
+                        _ => None,
+                    })
+                    .and_then(|predicates| push_down_view_definition(view, &predicates));
+                let view = pushed.as_ref().unwrap_or(view);
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();
-                let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
-                {
-                    Ok(s) => s,
-                    Err(SofError::Unavailable(message)) => {
+                // The engine sees row errors as bare strings; this keeps the
+                // first one the store reported as unavailable or as a cancelled
+                // statement, so the engine's `SourceStream` can be turned back
+                // into a 503 (#2048) or a 504 (#2577) below.
+                let failure: Arc<OnceLock<SourceFailure>> = Arc::new(OnceLock::new());
+                // The engine reads the rows on a blocking thread; dropping
+                // `stop_tx` ends the stream there, so giving up on the
+                // dependency below also releases that thread.
+                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+                let materialize = async {
+                    let row_stream = leaf_runner
+                        .run_view(tenant, view.clone(), filters.clone())
+                        .await
+                        .map_err(MaterializeFailure::Start)?;
+                    let row_stream =
+                        adapt_row_stream(row_stream, Arc::clone(&failure)).take_until(stop_rx);
+                    engine
+                        .insert_rows(
+                            internal_name,
+                            &schema,
+                            Box::pin(row_stream),
+                            limits.max_source_rows_per_vd,
+                        )
+                        .await
+                        .map_err(MaterializeFailure::Rows)
+                };
+                // For `$sql-run`, materializing a dependency runs under the
+                // same budget as each SQL statement of the query, whatever the
+                // runner: a runner that executes statements also has the store
+                // stop them at this budget (`with_statement_timeout`), so the
+                // statement ends on the server too, not only here (#2577). An
+                // export job leaves the whole unbounded and relies on the
+                // runner's per-statement budget (`bound_materialization`).
+                let outcome = if limits.bound_materialization {
+                    tokio::time::timeout(budget, materialize).await
+                } else {
+                    Ok(materialize.await)
+                };
+                let (returned_engine, inserted) = match outcome {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(MaterializeFailure::Start(SofError::Unavailable(message)))) => {
                         warn!(
                             table = %internal_name,
                             view = %view_label,
@@ -856,7 +928,19 @@ pub(crate) async fn execute_plan_counting(
                         );
                         return Err(SqlQueryError::SourceUnavailable(message));
                     }
-                    Err(e) => {
+                    Ok(Err(MaterializeFailure::Start(SofError::Timeout(message)))) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %message,
+                            secs = limits.timeout_secs,
+                            "SQL query dependency statement stopped at its time limit"
+                        );
+                        return Err(SqlQueryError::Timeout {
+                            secs: limits.timeout_secs,
+                        });
+                    }
+                    Ok(Err(MaterializeFailure::Start(e))) => {
                         warn!(
                             table = %internal_name,
                             view = %view_label,
@@ -867,23 +951,7 @@ pub(crate) async fn execute_plan_counting(
                             "dependency failed to materialize: {e}"
                         )));
                     }
-                };
-                // The engine sees row errors as bare strings; this keeps the
-                // first one the store reported as unavailable, so the engine's
-                // `SourceStream` can be turned back into a 503 below (#2048).
-                let unavailable = Arc::new(OnceLock::new());
-                let row_stream = adapt_row_stream(row_stream, Arc::clone(&unavailable));
-                let (returned_engine, inserted) = match engine
-                    .insert_rows(
-                        internal_name,
-                        &schema,
-                        Box::pin(row_stream),
-                        limits.max_source_rows_per_vd,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
+                    Ok(Err(MaterializeFailure::Rows(e))) => {
                         // The engine's bare row-cap error names neither the
                         // dependency nor the setting; name both (#1473).
                         let e = match e {
@@ -904,9 +972,24 @@ pub(crate) async fn execute_plan_counting(
                                 }
                             }
                             // The row stream stopped on a store that reported
-                            // itself unavailable: transient, not a server bug.
-                            SqlQueryError::SourceStream(text) => match unavailable.get() {
-                                Some(message) => SqlQueryError::SourceUnavailable(message.clone()),
+                            // itself unavailable (transient, not a server bug)
+                            // or that cancelled the statement at its budget.
+                            SqlQueryError::SourceStream(text) => match failure.get() {
+                                Some(SourceFailure::Unavailable(message)) => {
+                                    SqlQueryError::SourceUnavailable(message.clone())
+                                }
+                                Some(SourceFailure::Timeout(message)) => {
+                                    warn!(
+                                        table = %internal_name,
+                                        view = %view_label,
+                                        error = %message,
+                                        secs = limits.timeout_secs,
+                                        "SQL query dependency statement stopped at its time limit"
+                                    );
+                                    SqlQueryError::Timeout {
+                                        secs: limits.timeout_secs,
+                                    }
+                                }
                                 None => SqlQueryError::SourceStream(text),
                             },
                             other => other,
@@ -919,6 +1002,19 @@ pub(crate) async fn execute_plan_counting(
                         );
                         return Err(e);
                     }
+                    Err(_elapsed) => {
+                        drop(stop_tx);
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            secs = limits.timeout_secs,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "SQL query dependency outlived the statement budget"
+                        );
+                        return Err(SqlQueryError::Timeout {
+                            secs: limits.timeout_secs,
+                        });
+                    }
                 };
                 engine = returned_engine;
                 materialized.fetch_add(inserted, Ordering::Relaxed);
@@ -929,6 +1025,7 @@ pub(crate) async fn execute_plan_counting(
                     rows = inserted,
                     columns = schema.columns.len(),
                     projected = projected.is_some(),
+                    pushed = pushed.is_some(),
                     elapsed_ms,
                     "materialized SQL query dependency"
                 );
@@ -1224,25 +1321,49 @@ async fn run_select_with_timeout(
     }
 }
 
+/// How a dependency's row stream failed, when the kind matters to the answer:
+/// the store was unavailable (503, #2048) or it stopped the view's statement
+/// at its time limit (504, #2577). Any other row error is a server fault.
+#[derive(Debug, Clone)]
+enum SourceFailure {
+    Unavailable(String),
+    Timeout(String),
+}
+
+/// Where materializing a leaf dependency failed: starting its view
+/// (`run_view`) or loading its rows into the engine.
+#[derive(Debug)]
+enum MaterializeFailure {
+    Start(SofError),
+    Rows(SqlQueryError),
+}
+
 /// Converts a `RowStream<Result<Value, SofError>>` into a
 /// `Stream<Item = Result<Value, String>>` for the engine (it doesn't know the
 /// persistence crate's error type).
 ///
-/// The conversion loses the error's kind, so the first [`SofError::Unavailable`]
-/// the stream yields is also recorded in `unavailable`: the caller reads it
-/// after the engine fails with `SourceStream`, to tell a store outage from a
-/// server fault (#2048). The engine stops at the first row error, so that
-/// error is the one it reports.
+/// The conversion loses the error's kind, so the first
+/// [`SofError::Unavailable`] or [`SofError::Timeout`] the stream yields is
+/// also recorded in `failure`: the caller reads it after the engine fails
+/// with `SourceStream`, to tell a store outage or a cancelled statement from
+/// a server fault. The engine stops at the first row error, so that error is
+/// the one it reports.
 fn adapt_row_stream(
     stream: RowStream,
-    unavailable: Arc<OnceLock<String>>,
+    failure: Arc<OnceLock<SourceFailure>>,
 ) -> impl Stream<Item = Result<Value, String>> + Send {
     use futures::StreamExt;
     stream.map(move |r| {
         r.map_err(|e| {
-            if let SofError::Unavailable(message) = &e {
-                // Only the first is kept: a later `set` finds the slot full.
-                let _ = unavailable.set(message.clone());
+            // Only the first is kept: a later `set` finds the slot full.
+            match &e {
+                SofError::Unavailable(message) => {
+                    let _ = failure.set(SourceFailure::Unavailable(message.clone()));
+                }
+                SofError::Timeout(message) => {
+                    let _ = failure.set(SourceFailure::Timeout(message.clone()));
+                }
+                _ => {}
             }
             e.to_string()
         })
@@ -2007,6 +2128,7 @@ mod tests {
             max_source_rows_per_vd,
             max_rows,
             timeout_secs: 5,
+            bound_materialization: true,
         }
     }
 
@@ -2250,6 +2372,11 @@ mod tests {
         StorageMidStream,
         /// `run_view` itself returns `SofError::Backend` (a server fault).
         BackendAtStart,
+        /// `run_view` itself returns `SofError::Timeout` (the store stopped
+        /// the view's statement at its time limit).
+        TimeoutAtStart,
+        /// One good row, then a `Timeout` row error.
+        TimeoutMidStream,
     }
 
     /// A `SofRunner` whose store fails the way `failure` says.
@@ -2258,6 +2385,8 @@ mod tests {
     }
 
     const UNAVAILABLE_TEXT: &str = "failed to read object body after 3 attempts: connection reset";
+    const TIMEOUT_TEXT: &str =
+        "row error: ERROR (SQLSTATE 57014): canceling statement due to statement timeout";
 
     #[async_trait]
     impl SofRunner for FailingStoreRunner {
@@ -2281,6 +2410,13 @@ mod tests {
                 StoreFailure::StorageMidStream => vec![
                     Ok(json!({"id": "p0"})),
                     Err(SofError::Storage("bucket unreachable".to_string())),
+                ],
+                StoreFailure::TimeoutAtStart => {
+                    return Err(SofError::Timeout(TIMEOUT_TEXT.to_string()));
+                }
+                StoreFailure::TimeoutMidStream => vec![
+                    Ok(json!({"id": "p0"})),
+                    Err(SofError::Timeout(TIMEOUT_TEXT.to_string())),
                 ],
             };
             Ok(Box::pin(futures::stream::iter(rows)))
@@ -2351,6 +2487,309 @@ mod tests {
                 sqlquery_err_to_rest(err).client_response().0,
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             );
+        }
+    }
+
+    /// #2577: a store that stops the view's statement at its time limit keeps
+    /// that fact through the plan, whether it fails when the dependency starts
+    /// or partway through its rows: the run answers 504 with code `timeout`,
+    /// not 500, and names the configured budget.
+    #[tokio::test]
+    async fn a_statement_the_store_cancelled_is_a_504() {
+        for failure in [StoreFailure::TimeoutAtStart, StoreFailure::TimeoutMidStream] {
+            let err = run_plan_over_failing_store(failure).await;
+            assert!(
+                matches!(err, SqlQueryError::Timeout { secs: 5 }),
+                "expected Timeout at the plan's 5 s budget, got {err:?}"
+            );
+            let (status, code, message) = sqlquery_err_to_rest(err).client_response();
+            assert_eq!(status, axum::http::StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(code, "timeout");
+            assert!(message.contains("5-second"), "names the budget: {message}");
+        }
+    }
+
+    /// A `SofRunner` that records the statement budget it was given and
+    /// yields one row per view.
+    struct BudgetRecordingRunner {
+        budget: Arc<std::sync::Mutex<Option<Duration>>>,
+    }
+
+    #[async_trait]
+    impl SofRunner for BudgetRecordingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                json!({"id": "p0"}),
+            )])))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "budget-recording-test-runner"
+        }
+
+        fn with_statement_timeout(&self, budget: Duration) -> Option<Arc<dyn SofRunner>> {
+            *self.budget.lock().unwrap() = Some(budget);
+            Some(Arc::new(BudgetRecordingRunner {
+                budget: Arc::clone(&self.budget),
+            }))
+        }
+    }
+
+    /// #2577: the plan asks the runner for a clone bounded by the query's
+    /// timeout before it materializes any dependency, so a runner that executes
+    /// views as backend statements runs them under that budget.
+    #[tokio::test]
+    async fn dependencies_are_materialized_by_a_runner_bounded_by_the_query_timeout() {
+        let budget = Arc::new(std::sync::Mutex::new(None));
+        let runner: Arc<dyn SofRunner> = Arc::new(BudgetRecordingRunner {
+            budget: Arc::clone(&budget),
+        });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let (result, _) = execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            ExecLimits {
+                max_source_rows_per_vd: 1000,
+                max_rows: 1000,
+                timeout_secs: 7,
+                bound_materialization: true,
+            },
+        )
+        .await
+        .expect("the plan runs");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(*budget.lock().unwrap(), Some(Duration::from_secs(7)));
+    }
+
+    /// A `SofRunner` that keeps the last ViewDefinition it was asked to run
+    /// and yields one row.
+    struct ViewRecordingRunner {
+        seen: Arc<std::sync::Mutex<Option<Value>>>,
+    }
+
+    #[async_trait]
+    impl SofRunner for ViewRecordingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            *self.seen.lock().unwrap() = Some(view_definition);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                json!({"id": "o1", "status": "final"}),
+            )])))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "view-recording-test-runner"
+        }
+    }
+
+    fn typed_observation_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition", "resource": "Observation",
+            "name": "obs_flat", "url": "http://example.org/obs_flat",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "status", "path": "status", "type": "code"}
+            ]}]
+        })
+    }
+
+    async fn view_seen_for(subject_edges: Vec<Edge>, subject_sql: &str) -> Value {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let runner: Arc<dyn SofRunner> = Arc::new(ViewRecordingRunner {
+            seen: Arc::clone(&seen),
+        });
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = GraphPlan {
+            nodes: vec![PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: typed_observation_view(),
+            }],
+            subject_edges,
+        };
+        execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            subject_sql,
+            &[],
+            limits(1000, 1000),
+        )
+        .await
+        .expect("the plan runs");
+        let seen = seen.lock().unwrap().clone();
+        seen.expect("the runner was asked for the view")
+    }
+
+    /// #2574: a plain filter of the subject's WHERE on a typed column of its
+    /// one dependency reaches the runner as a `where` of the view.
+    #[tokio::test]
+    async fn a_plain_where_filter_is_pushed_into_the_dependency_view() {
+        let seen = view_seen_for(
+            vec![edge("obs", "__sof_node_0")],
+            "SELECT id FROM obs o WHERE o.status = 'final' AND id IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            seen["where"],
+            json!([{"path": "(status) = 'final'"}, {"path": "(id).exists()"}])
+        );
+    }
+
+    /// A dependency read under two labels, or by a query that is not one
+    /// plain SELECT over it, is run as declared: the filter stays in the SQL.
+    #[tokio::test]
+    async fn a_filter_is_not_pushed_when_the_dependency_has_two_labels_or_the_sql_is_not_plain() {
+        let two_labels = view_seen_for(
+            vec![edge("a", "__sof_node_0"), edge("b", "__sof_node_0")],
+            "SELECT a.id FROM a WHERE a.status = 'final'",
+        )
+        .await;
+        assert!(two_labels.get("where").is_none(), "{two_labels}");
+
+        let joined = view_seen_for(
+            vec![edge("obs", "__sof_node_0")],
+            "SELECT x.id FROM obs x JOIN obs y ON x.id = y.id WHERE x.status = 'final'",
+        )
+        .await;
+        assert!(joined.get("where").is_none(), "{joined}");
+    }
+
+    /// A `SofRunner` whose view never yields a row nor ends.
+    struct StalledStoreRunner;
+
+    #[async_trait]
+    impl SofRunner for StalledStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "stalled-store-test-runner"
+        }
+    }
+
+    /// #2577: materializing a dependency is bounded by the query's timeout
+    /// whatever the runner, so a store that never answers ends the run as a
+    /// timeout at the budget instead of holding the request open.
+    #[tokio::test]
+    async fn a_dependency_that_outlives_the_budget_is_a_timeout() {
+        let runner: Arc<dyn SofRunner> = Arc::new(StalledStoreRunner);
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let started = std::time::Instant::now();
+        let err = execute_plan(
+            InMemorySqlEngine::open().expect("open engine"),
+            &runner,
+            &tenant,
+            &ViewFilters::default(),
+            &plan,
+            "SELECT * FROM obs",
+            &[],
+            ExecLimits {
+                max_source_rows_per_vd: 1000,
+                max_rows: 1000,
+                timeout_secs: 1,
+                bound_materialization: true,
+            },
+        )
+        .await
+        .err()
+        .expect("a stalled store must not hold the plan open");
+        assert!(
+            matches!(err, SqlQueryError::Timeout { secs: 1 }),
+            "got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the budget, not the test harness, ended the run"
+        );
+    }
+
+    /// A `SofRunner` whose view yields its one row only after `delay`.
+    struct SlowStoreRunner {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl SofRunner for SlowStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let delay = self.delay;
+            Ok(Box::pin(futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(json!({"id": "p0"}))
+            })))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "slow-store-test-runner"
+        }
+    }
+
+    /// #2577: an export job (`bound_materialization: false`) reads a
+    /// dependency for as long as it takes; only its statements are bounded,
+    /// by the runner. The same slow dependency ends a `$sql-run` at the
+    /// budget.
+    #[tokio::test]
+    async fn an_export_dependency_may_outlive_the_statement_budget() {
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        for bound_materialization in [false, true] {
+            let runner: Arc<dyn SofRunner> = Arc::new(SlowStoreRunner {
+                delay: Duration::from_millis(1500),
+            });
+            let outcome = execute_plan(
+                InMemorySqlEngine::open().expect("open engine"),
+                &runner,
+                &tenant,
+                &ViewFilters::default(),
+                &plan,
+                "SELECT * FROM obs",
+                &[],
+                ExecLimits {
+                    max_source_rows_per_vd: 1000,
+                    max_rows: 1000,
+                    timeout_secs: 1,
+                    bound_materialization,
+                },
+            )
+            .await;
+            if bound_materialization {
+                let err = outcome.err().expect("a $sql-run ends at the budget");
+                assert!(
+                    matches!(err, SqlQueryError::Timeout { secs: 1 }),
+                    "got {err:?}"
+                );
+            } else {
+                let (result, _) = outcome.expect("an export reads the dependency through");
+                assert_eq!(result.rows.len(), 1);
+            }
         }
     }
 

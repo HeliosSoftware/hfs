@@ -248,8 +248,9 @@ pub enum ExportError {
     /// Output serialization (NDJSON/CSV) failed.
     #[error("serialization error: {0}")]
     Serialization(String),
-    /// The request's own fault — a documented limit or a subject the runner
-    /// refuses — with the status and issue code `$sql-run` answers it with.
+    /// The request's own fault — a documented limit (the query's time limit
+    /// included: `504` / `timeout`) or a subject the runner refuses — with the
+    /// status and issue code `$sql-run` answers it with.
     #[error("{message}")]
     Client {
         /// The HTTP status the result endpoint answers with.

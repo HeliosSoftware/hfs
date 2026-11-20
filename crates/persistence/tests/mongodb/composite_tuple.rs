@@ -341,6 +341,228 @@ async fn mongodb_a_real_reindex_stamps_the_rows_and_enables_the_tuple_path() {
     );
 }
 
+/// A generation-6 database keeps its markers when this binary records
+/// generation 7 (#2588): generation 6 already writes `tuple_code`, so the
+/// upgrade needs no activating `$reindex`.
+#[tokio::test]
+async fn mongodb_generation_7_over_generation_6_keeps_the_markers() {
+    let Some(backend) = create_backend_with_full_registry("composite_tuple_gen7").await else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("composite-tuple-gen7");
+    seed(&backend, &tenant).await;
+    reindex(&backend, &tenant, ReindexRequest::default()).await;
+    let before = markers(&backend).await;
+    assert!(!before.is_empty());
+
+    set_recorded_generation(&backend, 6).await;
+    let upgraded = build_backend(backend.config().clone())
+        .await
+        .expect("upgrade boot");
+    upgraded.wait_for_search_index_build().await;
+    assert_eq!(markers(&upgraded).await, before);
+    let generation = raw_db(&upgraded)
+        .await
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap()
+        .get_document("search_indexes")
+        .unwrap()
+        .get_i32("generation")
+        .unwrap();
+    assert_eq!(generation, 7);
+    assert!(tuple_path_used(&upgraded, &tenant).await);
+}
+
+/// Clone one real stored resource and its composite rows beyond the planner's
+/// 10,000-row probe bound, under a tenant with no tuple-completeness marker.
+/// This exercises the resource-batch plan without a 300,000-resource fixture.
+async fn seed_broad_upgrade_page(
+    db: &mongodb::Database,
+    source_tenant: &TenantContext,
+    target_tenant: &TenantContext,
+) {
+    let resources = db.collection::<Document>("resources");
+    let index = db.collection::<Document>("search_index");
+    let template = resources
+        .find_one(doc! {
+            "tenant_id": source_tenant.tenant_id().as_str(),
+            "resource_type": "Observation", "id": "h-30",
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let rows = index
+        .find(doc! {
+            "tenant_id": source_tenant.tenant_id().as_str(),
+            "resource_type": "Observation", "resource_id": "h-30",
+            "param_name": "code-value-quantity",
+        })
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+    let mut resource_batch = Vec::new();
+    let mut index_batch = Vec::new();
+    for number in 0..10_001 {
+        let id = format!("broad-{number:05}");
+        let mut resource = template.clone();
+        resource.remove("_id");
+        resource.insert("tenant_id", target_tenant.tenant_id().as_str());
+        resource.insert("id", id.as_str());
+        resource.insert(
+            "last_updated",
+            mongodb::bson::DateTime::from_millis(1_704_067_200_000 + number),
+        );
+        resource
+            .get_document_mut("data")
+            .unwrap()
+            .insert("id", id.as_str());
+        resource_batch.push(resource);
+        for row in &rows {
+            let mut row = row.clone();
+            row.remove("_id");
+            row.insert("tenant_id", target_tenant.tenant_id().as_str());
+            row.insert("resource_id", id.as_str());
+            index_batch.push(row);
+        }
+        if resource_batch.len() == 1_000 || number == 10_000 {
+            resources
+                .insert_many(std::mem::take(&mut resource_batch))
+                .await
+                .unwrap();
+            index
+                .insert_many(std::mem::take(&mut index_batch))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// A real generation-6-only database keeps its existing plans while date-end
+/// is missing in off mode or its build fails on a conflicting specification.
+/// The recorded generation remains 6; readiness comes from actual indexes.
+#[tokio::test]
+async fn mongodb_generation_6_plans_survive_an_unavailable_date_end_index() {
+    let Some(backend) = create_backend_with_stable_probes("composite_tuple_gen6_ready").await
+    else {
+        eprintln!("Skipping composite_tuple (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let backend = Arc::new(backend);
+    let tenant = create_tenant("composite-tuple-gen6-ready");
+    let broad = create_tenant("composite-tuple-gen6-broad");
+    seed(&backend, &tenant).await;
+    reindex(&backend, &tenant, ReindexRequest::default()).await;
+    let before = markers(&backend).await;
+    assert!(!before.is_empty());
+    let db = raw_db(&backend).await;
+    seed_broad_upgrade_page(&db, &tenant, &broad).await;
+    let index = db.collection::<Document>("search_index");
+    index.drop_index("idx_search_date_end").await.unwrap();
+    set_recorded_generation(&backend, 6).await;
+    assert!(
+        !index
+            .list_index_names()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "idx_search_date_end")
+    );
+
+    for failed_build in [false, true] {
+        if failed_build {
+            index
+                .create_index(
+                    mongodb::IndexModel::builder()
+                        .keys(doc! { "deliberately_wrong": 1 })
+                        .options(
+                            mongodb::options::IndexOptions::builder()
+                                .name("idx_search_date_end".to_string())
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut config = backend.config().clone();
+        config.index_build = if failed_build {
+            IndexBuildMode::Background
+        } else {
+            IndexBuildMode::Off
+        };
+        // Do not use build_backend: that helper forces Inline and waits for
+        // the complete build, hiding the upgrade boundary under test.
+        let upgraded = MongoBackend::new(config).unwrap();
+        upgraded.initialize().await.unwrap();
+        // Existing plans work before the build outcome is awaited. The
+        // builder may already have inspected by now, so this does not prove
+        // boot priming; `existing_readiness_prime_tests` covers that.
+        assert!(tuple_path_used(&upgraded, &tenant).await);
+        let outcome = upgraded.wait_for_search_index_build().await.unwrap();
+        if failed_build {
+            assert!(
+                matches!(outcome, BuildOutcome::Failed { .. }),
+                "{outcome:?}"
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                BuildOutcome::Skipped {
+                    missing: vec!["idx_search_date_end".to_string()]
+                }
+            );
+        }
+        assert!(tuple_path_used(&upgraded, &tenant).await);
+        assert_eq!(markers(&upgraded).await, before);
+        let generation = db
+            .collection::<Document>("schema_version")
+            .find_one(doc! { "_id": "schema_version" })
+            .await
+            .unwrap()
+            .unwrap()
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation")
+            .unwrap();
+        assert_eq!(generation, 6);
+
+        let mut query = code_value_quantity_query("8302-2$gt160")
+            .with_sort(SortDirective::parse("-_lastUpdated"))
+            .with_count(10);
+        query.total = Some(TotalMode::None);
+        let (result, operations) = profiled(&db, upgraded.search(&broad, &query)).await;
+        let result = result.unwrap();
+        let ids: Vec<_> = result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        let expected: Vec<_> = (9_991..10_001)
+            .rev()
+            .map(|number| format!("broad-{number:05}"))
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(result.resources.page_info.has_next);
+        assert!(
+            operations.iter().any(|operation| {
+                let command = command_of(operation);
+                command.get_str("find") == Ok("resources")
+                    && command.get_str("hint") == Ok("idx_resources_type_scan")
+            }),
+            "the broad timestamp page must keep the resource-batch plan"
+        );
+    }
+}
+
 /// I1: after a rollback (an older binary records its own, lower generation and
 /// writes rows without `tuple_code`) a running instance stops trusting the
 /// markers, and the next boot's builder deletes them, so the rollback's rows
@@ -390,7 +612,7 @@ async fn mongodb_a_rollback_invalidates_the_markers() {
         .unwrap()
         .get_i32("generation")
         .unwrap();
-    assert_eq!(generation, 6);
+    assert_eq!(generation, 7);
     assert!(!tuple_path_used(&returned, &first).await);
     assert_eq!(
         found(&returned, &first, "8302-2$gt160").await,
@@ -1143,7 +1365,7 @@ async fn upgrade_from(earlier: EarlierBuild) {
     let booted = Arc::new(build_backend(config).await.expect("upgrade boot"));
     booted.wait_for_search_index_build().await;
     let record = recorded_search_indexes(&db).await;
-    assert_eq!(record.get_i32("generation"), Ok(6), "{earlier:?}: {record}");
+    assert_eq!(record.get_i32("generation"), Ok(7), "{earlier:?}: {record}");
     assert_eq!(
         record.get_bool("references_normalized"),
         Ok(true),

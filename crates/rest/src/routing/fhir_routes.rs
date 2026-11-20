@@ -7,6 +7,7 @@ use axum::{
     Router,
     body::Body,
     extract::Request,
+    http::{HeaderValue, header},
     routing::{delete, get, head, patch, post, put},
 };
 use helios_fhir::FhirVersion;
@@ -15,6 +16,7 @@ use helios_persistence::core::{
     RevincludeProvider, SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceExt;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::config::TenantRoutingMode;
 use crate::handlers;
@@ -244,7 +246,25 @@ where
             state.clone(),
             reject_unknown_resource_type::<S>,
         ))
+        .layer(no_heuristic_caching())
         .with_state(state)
+}
+
+/// `Cache-Control: no-cache` on every FHIR response that does not set its own.
+///
+/// Without it a response carrying `Last-Modified` and no `Cache-Control` is
+/// subject to heuristic freshness (RFC 9111 §4.2.2): a browser may answer a
+/// later read from its cache for a share of the time since the resource last
+/// changed, so a client reads an old version back after its own update and
+/// its next `If-Match` fails with 412 (#2598). `no-cache` keeps the stored
+/// copy usable only after revalidation, which `If-None-Match` / `If-Modified-
+/// Since` answer with 304. Handlers that already choose a stricter policy
+/// (`no-store` on `/_readiness`, `private, no-store` on export downloads) keep it.
+fn no_heuristic_caching() -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::if_not_present(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    )
 }
 
 /// Creates the core FHIR router with all endpoints.
@@ -598,6 +618,7 @@ where
         .route("/health", get(handlers::health_handler::<S>))
         .route("/metadata", get(handlers::capabilities_handler::<S>))
         .route("/{resource_type}/{id}", get(handlers::read_handler::<S>))
+        .layer(no_heuristic_caching())
         .with_state(state)
 }
 

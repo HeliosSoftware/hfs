@@ -26,6 +26,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -114,6 +115,15 @@ pub enum SofError {
     /// (#2048).
     #[error("storage unavailable: {0}")]
     Unavailable(String),
+
+    /// The store stopped a statement of this view at its time limit: the
+    /// budget given by [`SofRunner::with_statement_timeout`], or the
+    /// backend's own statement timeout. The store is healthy and the
+    /// statement was deliberately cancelled, so the handler layer maps this
+    /// variant to `504 Gateway Timeout` with an OperationOutcome code of
+    /// `timeout`, as it does a cancelled CRUD statement (#2577).
+    #[error("statement timed out: {0}")]
+    Timeout(String),
 
     /// A backend-level SQL or driver error.
     #[error("backend error: {0}")]
@@ -483,6 +493,21 @@ pub trait SofRunner: Send + Sync {
     /// bytewise id order (not `(last_updated, id)`) without a single snapshot
     /// across pages.
     fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// A runner whose every statement is bounded by `budget`, or `None` when
+    /// this runner has no statement-level deadline to set.
+    ///
+    /// A SQL query (`$sql-run`, `$sql-export`) materializes each ViewDefinition
+    /// it depends on in full before its own SQL runs, under one configured
+    /// time limit. A runner that executes views as backend statements runs
+    /// them under that same limit here, so the budget does not stop short at
+    /// the backend's general statement timeout, and a statement it does stop
+    /// ends as [`SofError::Timeout`] (#2577). The PostgreSQL runner sets the
+    /// budget as `SET LOCAL statement_timeout` on the transaction each view
+    /// reads in; the pool's `HFS_PG_STATEMENT_TIMEOUT_MS` is untouched.
+    fn with_statement_timeout(&self, _budget: Duration) -> Option<Arc<dyn SofRunner>> {
         None
     }
 }

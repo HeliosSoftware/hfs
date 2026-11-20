@@ -124,6 +124,13 @@ mod shared_mongo {
                     "--bind_ip_all",
                     "--setParameter",
                     "enableTestCommands=1",
+                    // mongod 9.0 gives each profiler write 1 ms to get its
+                    // lock and silently drops the entry when it cannot
+                    // (`serverStatus().profiler.totalAbandonedWrites`). Under
+                    // the parallel fixtures that lost up to a third of the
+                    // entries the plan tests assert on (#2636).
+                    "--setParameter",
+                    "internalQueryGlobalProfilingLockDeadlineMs=10000",
                     "--wiredTigerCacheSizeGB",
                     "0.25",
                 ]),

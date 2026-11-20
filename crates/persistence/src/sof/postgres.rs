@@ -16,6 +16,7 @@
 //! of a silent end of stream.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use deadpool_postgres::Pool;
 use futures::{FutureExt as _, StreamExt as _};
@@ -23,6 +24,7 @@ use helios_fhir::FhirVersion;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
 use serde_json::{Map, Value};
+use tokio_postgres::GenericClient;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
@@ -52,6 +54,10 @@ pub struct PgInDbRunner {
     /// `Some(n)`: read the view in keyset pages of `n` resources over
     /// `id COLLATE "C"` (export mode). `None`: one statement (preview, run).
     export_page_size: Option<usize>,
+    /// `Some(budget)`: every statement of a view runs in a transaction with
+    /// `SET LOCAL statement_timeout` at this budget, in place of the pool's
+    /// session value (see [`SofRunner::with_statement_timeout`]).
+    statement_timeout: Option<Duration>,
 }
 
 impl PgInDbRunner {
@@ -63,7 +69,17 @@ impl PgInDbRunner {
             pool,
             fhir_version: FhirVersion::default_enabled(),
             export_page_size: None,
+            statement_timeout: None,
         }
+    }
+
+    /// Returns a runner that runs every statement of a view under `budget`
+    /// (`SET LOCAL statement_timeout`, at least 1 ms) instead of the pool's
+    /// session statement timeout. A statement the server stops at that budget
+    /// ends the view as [`SofError::Timeout`].
+    pub fn with_statement_timeout(mut self, budget: Duration) -> Self {
+        self.statement_timeout = Some(budget);
+        self
     }
 
     /// Returns a runner that consults the given FHIR version's field-type
@@ -97,6 +113,18 @@ impl SofRunner for PgInDbRunner {
             pool: self.pool.clone(),
             fhir_version: self.fhir_version,
             export_page_size: Some(self.export_page_size.unwrap_or(EXPORT_PAGE_RESOURCES)),
+            statement_timeout: self.statement_timeout,
+        }))
+    }
+
+    /// The same runner (same pool, FHIR version and paging) with every view
+    /// statement bounded by `budget`; see [`PgInDbRunner::with_statement_timeout`].
+    fn with_statement_timeout(&self, budget: Duration) -> Option<Arc<dyn SofRunner>> {
+        Some(Arc::new(PgInDbRunner {
+            pool: self.pool.clone(),
+            fhir_version: self.fhir_version,
+            export_page_size: self.export_page_size,
+            statement_timeout: Some(budget),
         }))
     }
 
@@ -155,11 +183,13 @@ impl SofRunner for PgInDbRunner {
         let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
         let page_size = self.export_page_size;
+        let budget = self.statement_timeout;
         let producer = tokio::spawn(async move {
             match page_size {
                 Some(page_size) => {
                     stream_pg_pages(
                         pool,
+                        budget,
                         compiled.sql,
                         params,
                         compiled.columns,
@@ -173,6 +203,7 @@ impl SofRunner for PgInDbRunner {
                 None => {
                     stream_pg_rows(
                         pool,
+                        budget,
                         compiled.sql,
                         params,
                         compiled.columns,
@@ -236,12 +267,14 @@ impl SofRunner for PgInDbRunner {
             .map(PgParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
+        let budget = self.statement_timeout;
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<RecordBatch, SofError>>(BATCH_CHANNEL_BUFFER);
         let guard_tx = tx.clone();
         let producer = tokio::spawn(async move {
             stream_pg_batches(
                 pool,
+                budget,
                 compiled.sql,
                 params,
                 compiled.columns,
@@ -353,8 +386,10 @@ impl PgParam {
 // Async fetch loop
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_rows(
     pool: Pool,
+    budget: Option<Duration>,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
@@ -363,14 +398,66 @@ async fn stream_pg_rows(
     tx: RowBatchSender,
 ) {
     let mut batcher = RowBatcher::new(tx);
-    match stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &mut batcher).await {
+    match stream_pg_rows_inner(
+        pool,
+        budget,
+        sql,
+        params,
+        columns,
+        decodes,
+        limit,
+        &mut batcher,
+    )
+    .await
+    {
         Ok(()) => batcher.finish().await,
         Err(e) => batcher.error(e).await,
     }
 }
 
+/// Acquires a pooled connection for one view read.
+async fn acquire(pool: &Pool) -> Result<deadpool_postgres::Object, SofError> {
+    pool.get()
+        .await
+        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))
+}
+
+/// Opens the transaction a budgeted view reads in, with `statement_timeout`
+/// set locally to `budget` (at least 1 ms: `0` would lift the limit). The
+/// pool's session value is untouched, so it applies again once the
+/// transaction ends.
+async fn begin_with_statement_timeout(
+    client: &mut tokio_postgres::Client,
+    budget: Duration,
+) -> Result<tokio_postgres::Transaction<'_>, SofError> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_statement_error("failed to begin view transaction", &e, e.to_string()))?;
+    let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+    tx.batch_execute(&format!("SET LOCAL statement_timeout = {ms}"))
+        .await
+        .map_err(|e| pg_statement_error("failed to set statement budget", &e, e.to_string()))?;
+    Ok(tx)
+}
+
+/// Classifies a driver error from a view statement under `context`: a
+/// statement PostgreSQL cancelled at its time limit (SQLSTATE `57014`, the
+/// view's budget or the session `statement_timeout`) is a
+/// [`SofError::Timeout`]; anything else is a [`SofError::Backend`]. `text` is
+/// the error as the caller renders it.
+fn pg_statement_error(context: &str, e: &tokio_postgres::Error, text: String) -> SofError {
+    if e.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) {
+        SofError::Timeout(text)
+    } else {
+        SofError::Backend(format!("{context}: {text}"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_pg_rows_inner(
     pool: Pool,
+    budget: Option<Duration>,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
@@ -378,19 +465,35 @@ async fn stream_pg_rows_inner(
     limit: Option<usize>,
     batcher: &mut RowBatcher,
 ) -> Result<(), SofError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
+    let mut client = acquire(&pool).await?;
+    match budget {
+        Some(budget) => {
+            let tx = begin_with_statement_timeout(&mut client, budget).await?;
+            let result = fetch_rows(&tx, &sql, params, &columns, &decodes, limit, batcher).await;
+            let _ = tx.rollback().await;
+            result
+        }
+        None => fetch_rows(&**client, &sql, params, &columns, &decodes, limit, batcher).await,
+    }
+}
 
+async fn fetch_rows<C: GenericClient>(
+    exec: &C,
+    sql: &str,
+    params: Vec<PgParam>,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+    limit: Option<usize>,
+    batcher: &mut RowBatcher,
+) -> Result<(), SofError> {
     if std::env::var("PG_SOF_DEBUG_ALL").is_ok() {
         eprintln!("[PG_SOF_DEBUG_ALL] preparing\n--- SQL ---\n{sql}\n---");
     }
-    let stmt = client.prepare(&sql).await.map_err(|e| {
+    let stmt = exec.prepare(sql).await.map_err(|e| {
         if std::env::var("PG_SOF_DEBUG").is_ok() {
             eprintln!("[PG_SOF_DEBUG] prepare failed: {e}\n--- SQL ---\n{sql}\n---");
         }
-        SofError::Backend(format!("failed to prepare SQL: {e}"))
+        pg_statement_error("failed to prepare SQL", &e, e.to_string())
     })?;
 
     // Build boxed params for query_raw; these are 'static + Send
@@ -404,14 +507,14 @@ async fn stream_pg_rows_inner(
         .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    let raw = client
+    let raw = exec
         .query_raw(&stmt, param_refs.iter().copied())
         .await
         .map_err(|e| {
             if std::env::var("PG_SOF_DEBUG").is_ok() {
                 eprintln!("[PG_SOF_DEBUG] query failed: {e}\n--- SQL ---\n{sql}\n---");
             }
-            SofError::Backend(format!("query execution failed: {e}"))
+            pg_statement_error("query execution failed", &e, e.to_string())
         })?;
 
     // params no longer needed after query_raw returns (data sent to DB)
@@ -442,7 +545,7 @@ async fn stream_pg_rows_inner(
                     }
                 }
                 count += 1;
-                match row_to_json(&pg_row, &columns, &decodes) {
+                match row_to_json(&pg_row, columns, decodes) {
                     Ok(row) => {
                         if !batcher.push(row).await {
                             break; // receiver dropped
@@ -459,10 +562,11 @@ async fn stream_pg_rows_inner(
                     eprintln!("[PG_SOF_DEBUG] row error: {e}\n--- SQL ---\n{sql}\n---");
                 }
                 batcher
-                    .error(SofError::Backend(format!(
-                        "row error: {}",
-                        pg_row_error_text(&e, &columns, &decodes)
-                    )))
+                    .error(pg_statement_error(
+                        "row error",
+                        &e,
+                        pg_row_error_text(&e, columns, decodes),
+                    ))
                     .await;
                 break;
             }
@@ -572,6 +676,7 @@ fn export_bound_sql() -> &'static str {
 #[allow(clippy::too_many_arguments)]
 async fn stream_pg_pages(
     pool: Pool,
+    budget: Option<Duration>,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
@@ -583,6 +688,7 @@ async fn stream_pg_pages(
     let mut batcher = RowBatcher::new(tx);
     match stream_pg_pages_inner(
         pool,
+        budget,
         sql,
         params,
         columns,
@@ -606,6 +712,38 @@ async fn stream_pg_pages(
 #[allow(clippy::too_many_arguments)]
 async fn stream_pg_pages_inner(
     pool: Pool,
+    budget: Option<Duration>,
+    sql: String,
+    params: Vec<PgParam>,
+    columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
+    limit: Option<usize>,
+    page_size: usize,
+    batcher: &mut RowBatcher,
+) -> Result<(), SofError> {
+    let mut client = acquire(&pool).await?;
+    match budget {
+        Some(budget) => {
+            let tx = begin_with_statement_timeout(&mut client, budget).await?;
+            let result = fetch_pages(
+                &tx, sql, params, columns, decodes, limit, page_size, batcher,
+            )
+            .await;
+            let _ = tx.rollback().await;
+            result
+        }
+        None => {
+            fetch_pages(
+                &**client, sql, params, columns, decodes, limit, page_size, batcher,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_pages<C: GenericClient>(
+    exec: &C,
     sql: String,
     mut params: Vec<PgParam>,
     columns: Vec<String>,
@@ -631,18 +769,14 @@ async fn stream_pg_pages_inner(
         return Ok(());
     }
 
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
-    let bound_stmt = client
+    let bound_stmt = exec
         .prepare(export_bound_sql())
         .await
-        .map_err(|e| SofError::Backend(format!("failed to prepare SQL: {}", pg_error_text(&e))))?;
-    let page_stmt = client
+        .map_err(|e| pg_statement_error("failed to prepare SQL", &e, pg_error_text(&e)))?;
+    let page_stmt = exec
         .prepare(&sql)
         .await
-        .map_err(|e| SofError::Backend(format!("failed to prepare SQL: {}", pg_error_text(&e))))?;
+        .map_err(|e| pg_statement_error("failed to prepare SQL", &e, pg_error_text(&e)))?;
     let page_limit = i64::try_from(page_size).unwrap_or(i64::MAX);
 
     let mut after = String::new();
@@ -655,10 +789,10 @@ async fn stream_pg_pages_inner(
         let bound_params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
             [&tenant, &resource_type, &after, &page_limit];
         let bound = tokio::select! {
-            r = client.query_opt(&bound_stmt, &bound_params) => r,
+            r = exec.query_opt(&bound_stmt, &bound_params) => r,
             _ = batcher.closed() => return Ok(()),
         }
-        .map_err(|e| SofError::Backend(format!("page bound error: {}", pg_error_text(&e))))?;
+        .map_err(|e| pg_statement_error("page bound error", &e, pg_error_text(&e)))?;
         let Some(bound) = bound else { break };
         let through: String = bound
             .try_get(0)
@@ -672,17 +806,14 @@ async fn stream_pg_pages_inner(
             .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
         let rows = tokio::select! {
-            r = client.query(&page_stmt, &param_refs) => r,
+            r = exec.query(&page_stmt, &param_refs) => r,
             _ = batcher.closed() => return Ok(()),
         }
         .map_err(|e| {
             if std::env::var("PG_SOF_DEBUG").is_ok() {
                 eprintln!("[PG_SOF_DEBUG] page error: {e}\n--- SQL ---\n{sql}\n---");
             }
-            SofError::Backend(format!(
-                "row error: {}",
-                pg_row_error_text(&e, &columns, &decodes)
-            ))
+            pg_statement_error("row error", &e, pg_row_error_text(&e, &columns, &decodes))
         })?;
         drop(param_refs);
         drop(boxed);
@@ -724,6 +855,7 @@ async fn stream_pg_pages_inner(
 #[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches(
     pool: Pool,
+    budget: Option<Duration>,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
@@ -732,8 +864,10 @@ async fn stream_pg_batches(
     limit: Option<usize>,
     tx: BatchSender,
 ) {
-    if let Err(e) =
-        stream_pg_batches_inner(pool, sql, params, columns, decodes, &declared, limit, &tx).await
+    if let Err(e) = stream_pg_batches_inner(
+        pool, budget, sql, params, columns, decodes, &declared, limit, &tx,
+    )
+    .await
     {
         let _ = tx.send(Err(e)).await;
     }
@@ -742,6 +876,7 @@ async fn stream_pg_batches(
 #[allow(clippy::too_many_arguments)]
 async fn stream_pg_batches_inner(
     pool: Pool,
+    budget: Option<Duration>,
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
@@ -750,23 +885,48 @@ async fn stream_pg_batches_inner(
     limit: Option<usize>,
     tx: &BatchSender,
 ) -> Result<(), SofError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
-    let stmt = client
+    let mut client = acquire(&pool).await?;
+    match budget {
+        Some(budget) => {
+            let pg_tx = begin_with_statement_timeout(&mut client, budget).await?;
+            let result =
+                fetch_batches(&pg_tx, sql, params, columns, decodes, declared, limit, tx).await;
+            let _ = pg_tx.rollback().await;
+            result
+        }
+        None => {
+            fetch_batches(
+                &**client, sql, params, columns, decodes, declared, limit, tx,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_batches<C: GenericClient>(
+    exec: &C,
+    sql: String,
+    params: Vec<PgParam>,
+    columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
+    declared: &[DeclaredColumn],
+    limit: Option<usize>,
+    tx: &BatchSender,
+) -> Result<(), SofError> {
+    let stmt = exec
         .prepare(&sql)
         .await
-        .map_err(|e| SofError::Backend(format!("failed to prepare SQL: {e}")))?;
+        .map_err(|e| pg_statement_error("failed to prepare SQL", &e, e.to_string()))?;
     let boxed = box_params(params);
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = boxed
         .iter()
         .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
-    let raw = client
+    let raw = exec
         .query_raw(&stmt, param_refs.iter().copied())
         .await
-        .map_err(|e| SofError::Backend(format!("query execution failed: {e}")))?;
+        .map_err(|e| pg_statement_error("query execution failed", &e, e.to_string()))?;
     drop(param_refs);
     drop(boxed);
     futures::pin_mut!(raw);
@@ -789,10 +949,11 @@ async fn stream_pg_batches_inner(
             Ok(r) => r,
             Err(e) => {
                 let _ = tx
-                    .send(Err(SofError::Backend(format!(
-                        "row error: {}",
-                        pg_row_error_text(&e, &columns, &decodes)
-                    ))))
+                    .send(Err(pg_statement_error(
+                        "row error",
+                        &e,
+                        pg_row_error_text(&e, &columns, &decodes),
+                    )))
                     .await;
                 completed = false;
                 break;
