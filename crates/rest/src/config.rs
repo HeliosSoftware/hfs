@@ -836,6 +836,10 @@ pub struct BulkSubmitConfig {
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
+    /// Origins (`scheme://host[:port]`) trusted as Data Providers: where the
+    /// client assertion may be presented and where a token obtained there may
+    /// be sent. Empty confines each token to its token endpoint's origin.
+    pub trusted_providers: Vec<String>,
     /// `Retry-After` (seconds) advertised on an in-progress status poll once
     /// ingestion is under way.
     pub retry_after_secs: u64,
@@ -896,6 +900,7 @@ impl fmt::Debug for BulkSubmitConfig {
             signing_alg,
             decryption_key,
             outbound_scope,
+            trusted_providers,
             retry_after_secs,
             pre_ingest_retry_after_secs,
             manifest_page_size,
@@ -939,6 +944,7 @@ impl fmt::Debug for BulkSubmitConfig {
                 &decryption_key.as_ref().map(|_| "[redacted]"),
             )
             .field("outbound_scope", outbound_scope)
+            .field("trusted_providers", trusted_providers)
             .field("retry_after_secs", retry_after_secs)
             .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
             .field("manifest_page_size", manifest_page_size)
@@ -984,6 +990,7 @@ impl Default for BulkSubmitConfig {
             signing_alg: "ES384".to_string(),
             decryption_key: None,
             outbound_scope: "system/*.rs".to_string(),
+            trusted_providers: Vec::new(),
             retry_after_secs: 120,
             pre_ingest_retry_after_secs: 10,
             manifest_page_size: 1000,
@@ -1159,6 +1166,15 @@ impl BulkSubmitConfig {
                 .filter(|s| !s.trim().is_empty()),
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
+            trusted_providers: std::env::var("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or(d.trusted_providers),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
             pre_ingest_retry_after_secs: env_u64(
                 "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",
@@ -1266,6 +1282,9 @@ impl BulkSubmitConfig {
             if let Err(e) = crate::jwe::load_private_keys(material) {
                 errors.push(format!("HFS_BULK_SUBMIT_DECRYPTION_KEY is invalid: {e}"));
             }
+        }
+        if let Err(e) = crate::bulk_submit_oauth::TrustedProviders::parse(&self.trusted_providers) {
+            errors.push(format!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"));
         }
         if errors.is_empty() {
             Ok(())
@@ -3968,6 +3987,33 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("SIGNING_ALG")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_trusted_providers_must_be_origins() {
+        let cfg = BulkSubmitConfig {
+            trusted_providers: vec![
+                "https://auth.example.org".to_string(),
+                "https://files.example.org/bulk".to_string(),
+            ],
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS")
+                    && e.contains("https://files.example.org/bulk")),
+            "{errs:?}"
+        );
+
+        let cfg = BulkSubmitConfig {
+            trusted_providers: vec![
+                "https://auth.example.org".to_string(),
+                "https://files.example.org:8443".to_string(),
+            ],
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

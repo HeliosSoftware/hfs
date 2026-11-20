@@ -282,9 +282,10 @@ async fn the_served_key_verifies_the_assertion_the_provider_sends() {
         .token(
             &[format!("{idp_base}/.well-known/smart-configuration")],
             "system/*.rs",
+            &format!("{idp_base}/bulk/manifest.json"),
         )
         .await;
-    assert_eq!(token.as_deref(), Some("tok"));
+    assert_eq!(token.as_deref(), Ok("tok"));
     let assertion = seen
         .lock()
         .unwrap()
