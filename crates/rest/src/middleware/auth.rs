@@ -742,6 +742,8 @@ mod tests {
             ("/Observation/o1", "DELETE"),
             ("/Observation/o1/_history", "GET"),
             ("/Observation/o1/_history/3", "GET"),
+            ("/Observation/o1/_history", "DELETE"),
+            ("/Observation/o1/_history/3", "DELETE"),
             ("/Patient/p1/Observation", "GET"),
             ("/Patient/p1/*", "GET"),
             ("/Patient/p1/$everything", "GET"),
