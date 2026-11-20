@@ -513,6 +513,11 @@ pub struct QueryBuilder {
     /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
     /// to prepare against a missing one (a bulk rebuild drops them).
     composite_rewrite: bool,
+    /// The tenant's search-parameter registry, when the caller has one.
+    /// `_filter` reads it to classify a parameter by its registered type
+    /// (any Quantity parameter, custom ones included); without it `_filter`
+    /// falls back to the spec's quantity parameter names.
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 }
 
 impl QueryBuilder {
@@ -524,7 +529,20 @@ impl QueryBuilder {
             param_offset: 0,
             skip_base_params: false,
             composite_rewrite: false,
+            registry: None,
         }
+    }
+
+    /// Gives the builder the search-parameter registry, so `_filter` resolves
+    /// every registered Quantity parameter (custom ones too) to the interval
+    /// quantity path instead of relying on a fixed name list. The registry is
+    /// only read, under a short read lock, when a `_filter` is built.
+    pub fn with_registry(
+        mut self,
+        registry: std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+    ) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Builds a token+quantity composite as the code-first pairing, which
@@ -1612,6 +1630,9 @@ impl QueryBuilder {
                 Ok(expr) => {
                     // Generate SQL from the parsed expression
                     let mut generator = FilterSqlGenerator::new(current_offset);
+                    if let Some(registry) = &self.registry {
+                        generator = generator.with_registry(&registry.read(), &self.resource_type);
+                    }
                     let sql = generator.generate(&expr);
                     current_offset += sql.params.len();
                     conditions.push(sql);
@@ -1846,6 +1867,43 @@ fn positive_membership_subquery(condition: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_filter` resolves a registered Quantity parameter that is not in the
+    /// generator's name list through the registry the builder carries.
+    #[test]
+    fn filter_uses_the_registry_for_custom_quantity_parameters() {
+        use crate::search::registry::{
+            SearchParamType as RegType, SearchParameterDefinition, SearchParameterRegistry,
+        };
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(
+            SearchParameterDefinition::new(
+                "http://example.org/sp/my-qty",
+                "my-qty",
+                RegType::Quantity,
+                "Observation.value",
+            )
+            .with_base(["Observation"]),
+        )
+        .unwrap();
+        let registry = std::sync::Arc::new(parking_lot::RwLock::new(reg));
+        let filter = SearchValue::eq("my-qty gt 45");
+        let sql_of = |b: &QueryBuilder| b.build_filter_condition(&[filter.clone()], 2).unwrap().sql;
+
+        let with = sql_of(&QueryBuilder::new("t", "Observation").with_registry(registry.clone()));
+        let without = sql_of(&QueryBuilder::new("t", "Observation"));
+        assert!(
+            with.contains("value_quantity_high"),
+            "a registered quantity parameter takes the interval path: {with}"
+        );
+        assert!(
+            !without.contains("value_quantity_high"),
+            "no registry, no custom quantity classification: {without}"
+        );
+        // A registry that does not know the parameter keeps the fallback.
+        let other = sql_of(&QueryBuilder::new("t", "Patient").with_registry(registry));
+        assert!(!other.contains("value_quantity_high"), "{other}");
+    }
 
     #[test]
     fn exists_form_only_for_one_plain_parameter_select() {

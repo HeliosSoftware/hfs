@@ -217,8 +217,9 @@ pub fn canonical_range(low: f64, high: f64, canonicalize: impl Fn(f64) -> f64) -
         }
     };
     let (low, high) = (conv(low), conv(high));
+    // A NaN bound (a malformed stored value) is not an ordering violation.
     debug_assert!(
-        low <= high,
+        low.is_nan() || high.is_nan() || low <= high,
         "canonical_range: unit conversion reversed the interval ({low} > {high})"
     );
     (low, high)
@@ -471,6 +472,19 @@ mod tests {
         let (l, h) = canonical_range(1.0, 3.0, |v| v * 1000.0);
         assert_eq!((l, h), (1000.0, 3000.0));
         assert!(l <= h);
+    }
+
+    #[test]
+    fn canonical_range_tolerates_nan_bounds() {
+        let (l, h) = canonical_range(f64::NAN, 3.0, |v| v * 2.0);
+        assert!(l.is_nan());
+        assert_eq!(h, 6.0);
+        let (l, h) = canonical_range(1.0, f64::NAN, |v| v * 2.0);
+        assert_eq!(l, 2.0);
+        assert!(h.is_nan());
+        let (l, h) = canonical_range(f64::NAN, f64::NAN, |v| v);
+        assert!(l.is_nan() && h.is_nan());
+        assert_eq!(canonical_range(1.0, 2.0, |v| v + 1.0), (2.0, 3.0));
     }
 
     #[test]

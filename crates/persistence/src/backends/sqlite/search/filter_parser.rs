@@ -470,8 +470,11 @@ impl FilterSqlGenerator {
 
     /// Resolves parameter types from the search-parameter registry for
     /// `resource_type`, so a quantity-typed parameter (`onset-age`,
-    /// `abatement-age`, `context-quantity`, custom ones) reads the quantity
-    /// columns without being named in a hard-coded list (#2602).
+    /// `abatement-age`, `context-quantity`, `component-value-quantity`, custom
+    /// ones) reads the quantity columns without being named in a hard-coded
+    /// list (#2602). `QueryBuilder::build_filter_condition` calls this with the
+    /// tenant's registry whenever the builder carries one; the name list is
+    /// only the fallback for callers that pass none.
     pub fn with_registry(
         mut self,
         registry: &crate::search::registry::SearchParameterRegistry,

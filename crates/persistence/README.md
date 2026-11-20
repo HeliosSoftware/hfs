@@ -2998,7 +2998,10 @@ points and `Range` values with `low == high`; a `Range` with `low != high`
 (including one with an open side) is skipped in a composite row.
 
 On SQLite, `_filter` evaluates quantity comparisons against the same interval
-and supports `onset-age`, `abatement-age` and `context-quantity`.
+and resolves every Quantity-typed parameter from the search-parameter registry
+(`onset-age`, `abatement-age`, `context-quantity`, `component-value-quantity`,
+custom ones); a builder without a registry falls back to the spec's quantity
+names.
 
 **Upgrading from a build before #2602.** Each backend gains a high bound on the
 quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill

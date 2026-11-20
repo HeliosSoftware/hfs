@@ -5564,6 +5564,63 @@ mod cross_tenant_search_isolation {
         );
     }
 
+    /// `_filter` classifies a parameter by its registered type, so a standard
+    /// Quantity parameter outside the old hard-coded name list
+    /// (`component-value-quantity`, `combo-value-quantity`) takes the
+    /// quantity path against the stored interval columns.
+    #[tokio::test]
+    async fn filter_search_resolves_registered_quantity_parameters() {
+        let backend = create_backend();
+        let tenant = create_tenant("filter-registry-qty");
+        let ucum = "http://unitsofmeasure.org";
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "obs-qty", "status": "final",
+                    "code": {"text": "panel"},
+                    "component": [{
+                        "code": {"text": "c"},
+                        "valueQuantity": {"value": 7, "unit": "mg", "system": ucum, "code": "mg"}
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let filter = |expr: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "_filter".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(expr)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for param in ["component-value-quantity", "combo-value-quantity"] {
+            assert_eq!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} gt 5"))).await,
+                vec!["obs-qty".to_string()],
+                "{param} gt 5 must match 7"
+            );
+            assert!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} gt 9")))
+                    .await
+                    .is_empty(),
+                "{param} gt 9 must not match 7"
+            );
+            assert!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} lt 5")))
+                    .await
+                    .is_empty(),
+                "{param} lt 5 must not match 7"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reference_identifier_search_does_not_leak_across_tenants() {
         let backend = create_backend();
