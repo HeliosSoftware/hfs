@@ -453,11 +453,18 @@ key order holds its `$min` (ascending) or `$max` (descending), so the walk keeps
 each resource at its first row and ignores its later ones, however many values
 it has.
 
-No offset guard is needed: on 1,000,000 rows the walk is cheaper than the grouped
-path at every offset up to the cap, though it makes more round trips (one
-liveness batch per 512 keyed rows). Page 1 of an ascending date sort dropped
-from about 2.6 s to 10 ms, an offset of 100,000 from 10.4 s to 2.2 s, and an
-offset of 290,000 from 19.2 s to 8.1 s (mongo:9.0.8, dates at second resolution).
+The walk serves only windows of up to `UNFILTERED_WALK_MAX_WINDOW` (50,000)
+live ids, that is `offset + _count + 1 <= 50,000`. It pages 101 documents at a
+time, so its cost grows with the offset, while the grouped aggregate is flat.
+On 689,080 Observations (`_sort=-date`, mongo:9.0.8, 10 VUs) the walk takes
+page 1 from 1.8 s to 9 ms and an offset of 10,000 from 2.05 s to 149 ms, but at
+an offset of 100,000 it is slower than the grouped path (3.5 s against 4.4 s,
++24%) and at 290,000 about twice as slow (6.6 s against 13.8 s). The crossover
+lies between 50,000 and 100,000, so a request above the window is answered by
+the grouped aggregate exactly as before the walk existed. The limit is
+independent of the 300,000-row id cap, which still answers 422 past it.
+The filtered walk over the cap (#2588) has no grouped alternative and is not
+limited by this window.
 
 The walk does have a guard on the equal-key groups it reads whole. A parameter
 with few distinct values (`status`, `gender`) has a group of hundreds of

@@ -5,8 +5,9 @@
 //! index and gives the page the collected path gives.
 
 use super::super::super::{
-    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, UNFILTERED_WALK_TIE_ROWS,
-    with_result_id_cap,
+    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, UNFILTERED_WALK_MAX_WINDOW,
+    UNFILTERED_WALK_TIE_ROWS, unfiltered_walk_applies, with_result_id_cap,
+    with_unfiltered_walk_max_window,
 };
 use super::*;
 use crate::error::StorageError;
@@ -1677,4 +1678,42 @@ async fn unfiltered_param_sorts_fall_back_when_their_index_is_dropped_hot() {
         );
         fixture.close().await;
     }
+}
+
+// #2601: the unfiltered walk serves only windows up to
+// `UNFILTERED_WALK_MAX_WINDOW`; deeper pages keep the grouped aggregate.
+
+#[test]
+fn unfiltered_walk_window_boundary() {
+    let max = UNFILTERED_WALK_MAX_WINDOW;
+    assert_eq!(max, 50_000);
+    // The walk reads offset + page_size + 1 live ids.
+    assert!(unfiltered_walk_applies(0, 20, max));
+    assert!(unfiltered_walk_applies(max - 21, 20, max));
+    assert!(!unfiltered_walk_applies(max - 20, 20, max));
+    assert!(!unfiltered_walk_applies(100_000, 20, max));
+    assert!(!unfiltered_walk_applies(usize::MAX, 20, max));
+}
+
+#[tokio::test]
+async fn unfiltered_walk_and_grouped_answers_match_across_the_window_gate() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-window-gate", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    const GATE: usize = 100;
+    let grouped = grouped_backend(&fixture);
+    // page 10: window = offset + 11; 89 + 11 = 100 walks, 90 + 11 = 101 groups.
+    for (offset, walks) in [(0u32, true), (89, true), (90, false), (200, false)] {
+        let query = unfiltered_sort("-date", SearchParamType::Date, offset);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let got =
+            with_unfiltered_walk_max_window(GATE, answer(&fixture.backend, &fixture, &query)).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let grouped_ran = !sort_key_group_commands(&fixture.db).await.is_empty();
+        assert_eq!(grouped_ran, !walks, "offset {offset}: sort-key $group");
+        let expected = answer(&grouped, &fixture, &query).await;
+        assert_eq!(got, expected, "offset {offset}: page, has_next, total");
+    }
+    fixture.close().await;
 }

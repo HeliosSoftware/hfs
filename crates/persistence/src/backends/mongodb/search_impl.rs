@@ -337,6 +337,48 @@ tokio::task_local! {
 /// batches of rows, however deep its offset.
 const UNFILTERED_WALK_TIE_ROWS: usize = 16 * CANDIDATE_BATCH_SIZE;
 
+/// The most live ids (`offset + _count + 1`) the unfiltered sort walk reads
+/// before the grouped aggregate answers instead (#2601). The walk pages 101
+/// documents at a time, so its cost grows with the offset, while the grouped
+/// `top_param_sorted_ids` path is flat. Measured on 689,080 Observations
+/// (`_sort=-date`, mongo:9.0.8, 10 VUs): offset 0 1.8 s -> 9 ms, offset 10,000
+/// 2.05 s -> 149 ms, but offset 100,000 3.5 s -> 4.4 s (+24%) and offset
+/// 290,000 6.6 s -> 13.8 s (about 2.1x). The crossover lies between 50,000
+/// and 100,000; above this window the request keeps the grouped path. The
+/// filtered over-cap walk (#2588) has no grouped alternative and is not gated.
+const UNFILTERED_WALK_MAX_WINDOW: usize = 50_000;
+
+#[cfg(test)]
+tokio::task_local! {
+    static UNFILTERED_WALK_WINDOW_OVERRIDE: usize;
+}
+
+/// The window limit in force: `UNFILTERED_WALK_MAX_WINDOW`, or a lower value
+/// a test installed with `with_unfiltered_walk_max_window`.
+fn unfiltered_walk_max_window() -> usize {
+    #[cfg(test)]
+    if let Ok(max) = UNFILTERED_WALK_WINDOW_OVERRIDE.try_with(|max| *max) {
+        return max;
+    }
+    UNFILTERED_WALK_MAX_WINDOW
+}
+
+/// Runs `future` with the walk window limit set to `max`.
+#[cfg(test)]
+async fn with_unfiltered_walk_max_window<F: std::future::Future>(
+    max: usize,
+    future: F,
+) -> F::Output {
+    UNFILTERED_WALK_WINDOW_OVERRIDE.scope(max, future).await
+}
+
+/// Whether the unfiltered sort walk may serve a page: the live ids it would
+/// read, `offset + page_size + 1`, fit in `max_window`. Independent of the
+/// result id cap, which is checked before.
+fn unfiltered_walk_applies(offset: usize, page_size: usize, max_window: usize) -> bool {
+    offset.saturating_add(page_size).saturating_add(1) <= max_window
+}
+
 /// The id-set cap in force: `MAX_RESULT_ID_SET`, or a lower value a test
 /// installed with `with_result_id_cap` for the duration of one future.
 fn result_id_cap() -> usize {
@@ -3580,21 +3622,24 @@ impl MongoBackend {
                             .await?,
                     );
                 }
-                let walked = if self.walks_unfiltered_param_sort(directives) {
-                    self.unfiltered_param_sort_walk(
-                        db,
-                        tenant_id,
-                        query,
-                        missing_support,
-                        &directives[0],
-                        id_direction,
-                        offset,
-                        page_size + 1,
-                    )
-                    .await?
-                } else {
-                    None
-                };
+                let walked =
+                    if unfiltered_walk_applies(offset, page_size, unfiltered_walk_max_window())
+                        && self.walks_unfiltered_param_sort(directives)
+                    {
+                        self.unfiltered_param_sort_walk(
+                            db,
+                            tenant_id,
+                            query,
+                            missing_support,
+                            &directives[0],
+                            id_direction,
+                            offset,
+                            page_size + 1,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
                 match walked {
                     Some(ids) => ids,
                     None => {
