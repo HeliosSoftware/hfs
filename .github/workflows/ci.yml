@@ -1239,7 +1239,9 @@ jobs:
         with:
           repository: FHIR/fhir-test-cases
           path: fhir-test-cases
-          ref: master
+          # Last commit the released validator can deserialize; bump together
+          # with a validator release that parses the large-exponent decimals.
+          ref: 2cfcc672d39fe85dcf358106969cf63e185fd926
 
       - name: Extract and Setup FhirPath Validator
         uses: actions/github-script@v9
