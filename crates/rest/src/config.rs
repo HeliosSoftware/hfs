@@ -30,7 +30,7 @@
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
-//! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
+//! | `HFS_AUTH_TENANT_CLAIM` | tenant_id | JWT claim carrying the tenant id when authentication is enabled (read by `helios-auth`) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
 //! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
 //! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
@@ -234,8 +234,6 @@ pub struct MultitenancyConfig {
     pub routing_mode: TenantRoutingMode,
     /// If true, error when URL path and header specify different tenants.
     pub strict_validation: bool,
-    /// JWT claim name containing tenant ID (for future JWT-based tenant resolution).
-    pub jwt_tenant_claim: String,
     /// If true, only tenants provisioned through the admin API are valid: a
     /// request resolving to a tenant absent from the registry is rejected rather
     /// than implicitly created. The default (`"default"`) tenant is
@@ -252,10 +250,25 @@ impl Default for MultitenancyConfig {
         Self {
             routing_mode: TenantRoutingMode::HeaderOnly,
             strict_validation: false,
-            jwt_tenant_claim: "tenant_id".to_string(),
             require_provisioned_tenant: false,
         }
     }
+}
+
+/// The startup error for a set `HFS_JWT_TENANT_CLAIM`.
+///
+/// The variable was read into a field nothing consumed; the claim the bearer
+/// provider reads is `HFS_AUTH_TENANT_CLAIM`. A deployment that named its
+/// claim through the dead variable kept reading `tenant_id`, so every token
+/// without that exact claim was served from the default tenant, silently.
+/// Refusing to start is the only answer that cannot be missed.
+pub(crate) fn dead_tenant_claim_variable(value: Option<std::ffi::OsString>) -> Option<String> {
+    value.map(|_| {
+        "HFS_JWT_TENANT_CLAIM is set but is not read by any component; the JWT tenant claim is \
+         configured with HFS_AUTH_TENANT_CLAIM (default tenant_id). Set that and unset \
+         HFS_JWT_TENANT_CLAIM."
+            .to_string()
+    })
 }
 
 impl MultitenancyConfig {
@@ -270,9 +283,6 @@ impl MultitenancyConfig {
             .map(|s| s.to_lowercase() == "true" || s == "1")
             .unwrap_or(false);
 
-        let jwt_tenant_claim =
-            std::env::var("HFS_JWT_TENANT_CLAIM").unwrap_or_else(|_| "tenant_id".to_string());
-
         let require_provisioned_tenant = std::env::var("HFS_TENANT_REQUIRE_PROVISIONED")
             .map(|s| s.to_lowercase() == "true" || s == "1")
             .unwrap_or(false);
@@ -280,7 +290,6 @@ impl MultitenancyConfig {
         Self {
             routing_mode,
             strict_validation,
-            jwt_tenant_claim,
             require_provisioned_tenant,
         }
     }
@@ -2429,6 +2438,10 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        if let Some(error) = dead_tenant_claim_variable(std::env::var_os("HFS_JWT_TENANT_CLAIM")) {
+            errors.push(error);
+        }
+
         if self.port == 0 {
             errors.push("Port cannot be 0".to_string());
         }
@@ -3212,7 +3225,17 @@ mod tests {
         let config = MultitenancyConfig::default();
         assert_eq!(config.routing_mode, TenantRoutingMode::HeaderOnly);
         assert!(!config.strict_validation);
-        assert_eq!(config.jwt_tenant_claim, "tenant_id");
+    }
+
+    /// `HFS_JWT_TENANT_CLAIM` never reached the bearer provider; a deployment
+    /// that set it to name its claim kept reading `tenant_id`, and every token
+    /// without that claim landed in the default tenant. Refused at startup.
+    #[test]
+    fn a_set_dead_tenant_claim_variable_is_a_startup_error() {
+        assert_eq!(dead_tenant_claim_variable(None), None);
+        let error = dead_tenant_claim_variable(Some("org".into())).expect("refused");
+        assert!(error.contains("HFS_JWT_TENANT_CLAIM"), "{error}");
+        assert!(error.contains("HFS_AUTH_TENANT_CLAIM"), "{error}");
     }
 
     // ── validate() – max_body_size == 0 ───────────────────────────
@@ -3821,12 +3844,10 @@ mod tests {
         let config = MultitenancyConfig {
             routing_mode: TenantRoutingMode::UrlPath,
             strict_validation: true,
-            jwt_tenant_claim: "custom_claim".to_string(),
             ..Default::default()
         };
         assert_eq!(config.routing_mode, TenantRoutingMode::UrlPath);
         assert!(config.strict_validation);
-        assert_eq!(config.jwt_tenant_claim, "custom_claim");
     }
 
     #[test]

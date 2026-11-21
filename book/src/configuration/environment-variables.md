@@ -88,7 +88,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_DEFAULT_TENANT` | `default` | Default tenant ID |
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | Routing mode: `header_only`, `url_path`, `both` |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
-| `HFS_JWT_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant (future use) |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled |
 
 ## Behavior
 

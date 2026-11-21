@@ -1916,6 +1916,7 @@ async fn init_auth_with_audit(
         jwks_url = %redact_url(jwks_url),
         issuer = ?auth_config.expected_issuer,
         audience = ?auth_config.expected_audience,
+        tenant_claim = %auth_config.tenant_claim,
         "Authentication ENABLED"
     );
 

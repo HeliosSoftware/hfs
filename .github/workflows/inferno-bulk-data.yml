@@ -48,7 +48,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout HFS
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -90,7 +90,7 @@ jobs:
           echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
 
       - name: Checkout bulk-data-test-kit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: HeliosSoftware/bulk-data-test-kit
           ref: ${{ github.event.inputs.kit_ref }}
@@ -209,7 +209,7 @@ jobs:
       INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
     steps:
       - name: Checkout HFS
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download HFS binary
         uses: actions/download-artifact@v8

@@ -293,7 +293,7 @@ jobs:
       # action", which sparse-checks-out into the shared root because that
       # job owns no cache worth protecting there — this one does).
       - name: Check out benchmark scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: .fhir-bench-setup
           persist-credentials: false
@@ -395,7 +395,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -480,12 +480,12 @@ jobs:
 
     steps:
       - name: Checkout HFS
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
       - name: Checkout benchmark harness
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.BENCHMARK_REPO }}
           ref: ${{ env.BENCHMARK_REF }}
@@ -2343,7 +2343,7 @@ jobs:
     steps:
       - name: Check out benchmark scripts
         continue-on-error: true
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts/fhir-bench/

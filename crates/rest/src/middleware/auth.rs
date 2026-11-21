@@ -405,8 +405,10 @@ fn patient_compartment_path_check(
 /// These surface data spanning every tenant — the full tenant roster and sizes,
 /// server-wide traffic — so, unlike the per-tenant console endpoints, they must
 /// not be reachable by ordinary user- or patient-context tokens. This layer
-/// requires a **system-context, all-resource** scope (`system/*.r`); anything
-/// less is rejected `403`.
+/// requires a **system-context, all-resource** scope carrying the permission
+/// bit the request's method implies (see [`admin_tier_permission`]): `system/*.r`
+/// to look, `system/*.c` to register a tenant, `system/*.d` to deregister or
+/// purge one. Anything less is rejected `403`.
 ///
 /// Consistent with [`authz_middleware`], if no [`Principal`] is present (auth
 /// disabled server-wide, or an exempt path) the request passes through, so this
@@ -423,17 +425,20 @@ pub async fn admin_authz_middleware(
     };
 
     let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let (permission, letter) = admin_tier_permission(&method);
 
-    if principal.scopes.has_system_scope(SmartPermissions::READ) {
+    if principal.scopes.has_system_scope(permission) {
         debug!(
             sub = %principal.subject(),
+            method = %method,
             path = %path,
             "Console admin authorization granted"
         );
         let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
             .action(AuditAction::Execute)
             .outcome("0")
-            .outcome_desc(format!("Granted: console admin access to {path}"))
+            .outcome_desc(format!("Granted: console admin access to {method} {path}"))
             .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
@@ -441,19 +446,37 @@ pub async fn admin_authz_middleware(
     } else {
         warn!(
             sub = %principal.subject(),
+            method = %method,
             path = %path,
-            "Console admin authorization denied: system-level scope required"
+            "Console admin authorization denied: system-level scope with `{letter}` required"
         );
         let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
             .action(AuditAction::Execute)
             .outcome("8")
             .outcome_desc(format!(
-                "Forbidden: console admin access to {path} requires a system-level scope"
+                "Forbidden: console admin access to {method} {path} requires a system-level scope with `{letter}`"
             ))
             .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
-        forbidden_response("This endpoint requires a system-level scope (system/*.read)")
+        forbidden_response(&format!(
+            "This endpoint requires a system-level scope with the `{letter}` permission (system/*.{letter})"
+        ))
+    }
+}
+
+/// The `system/*` permission bit the admin tier demands for a method, with
+/// its SMART letter for the refusal: `r` to look (GET, HEAD, OPTIONS), `c` to
+/// register (POST), `u` to change (PUT, PATCH), `d` to deregister or purge
+/// (DELETE). No admin route mounts any other method; one that appeared would
+/// be held to the delete bit rather than admitted on a read.
+fn admin_tier_permission(method: &axum::http::Method) -> (SmartPermissions, &'static str) {
+    use axum::http::Method;
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => (SmartPermissions::READ, "r"),
+        Method::POST => (SmartPermissions::CREATE, "c"),
+        Method::PUT | Method::PATCH => (SmartPermissions::UPDATE, "u"),
+        _ => (SmartPermissions::DELETE, "d"),
     }
 }
 
@@ -753,6 +776,8 @@ mod tests {
             ("/Observation/o1", "DELETE"),
             ("/Observation/o1/_history", "GET"),
             ("/Observation/o1/_history/3", "GET"),
+            ("/Observation/o1/_history", "DELETE"),
+            ("/Observation/o1/_history/3", "DELETE"),
             ("/Patient/p1/Observation", "GET"),
             ("/Patient/p1/*", "GET"),
             ("/Patient/p1/$everything", "GET"),
@@ -881,6 +906,41 @@ mod tests {
     #[test]
     fn test_patient_wildcard_cannot_reach_system_history() {
         assert!(patient_compartment_path_check("/_history", "GET", "p1").is_err());
+    }
+
+    #[test]
+    fn test_admin_tier_permission_follows_the_method() {
+        use axum::http::Method;
+        assert_eq!(
+            admin_tier_permission(&Method::GET).0,
+            SmartPermissions::READ
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::HEAD).0,
+            SmartPermissions::READ
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::POST).0,
+            SmartPermissions::CREATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::PUT).0,
+            SmartPermissions::UPDATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::PATCH).0,
+            SmartPermissions::UPDATE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::DELETE).0,
+            SmartPermissions::DELETE
+        );
+        assert_eq!(
+            admin_tier_permission(&Method::TRACE).0,
+            SmartPermissions::DELETE
+        );
+        assert_eq!(admin_tier_permission(&Method::POST).1, "c");
+        assert_eq!(admin_tier_permission(&Method::DELETE).1, "d");
     }
 
     #[test]
