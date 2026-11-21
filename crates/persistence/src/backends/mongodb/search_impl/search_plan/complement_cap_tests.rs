@@ -5,9 +5,10 @@
 //! index and gives the page the collected path gives.
 
 use super::super::super::{
-    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, UNFILTERED_WALK_MAX_WINDOW,
-    UNFILTERED_WALK_TIE_ROWS, unfiltered_walk_applies, with_result_id_cap,
-    with_unfiltered_walk_max_window,
+    CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, SORT_ID_CHUNK,
+    UNFILTERED_WALK_MIN_BATCH, UNFILTERED_WALK_TIE_PROBE_ROWS, UNFILTERED_WALK_TIE_ROWS,
+    unfiltered_walk_batch, unfiltered_walk_cursor_batch, unfiltered_walk_tie_allowance,
+    with_result_id_cap,
 };
 use super::*;
 use crate::error::StorageError;
@@ -251,12 +252,37 @@ async fn unfiltered_param_sort_first_page_reads_a_bounded_window() {
         returned < (rows / 2) as i64,
         "read {returned} documents for a page of 10 in a type of {rows}"
     );
+    // Page 1 checks the liveness of about the window's ids, not of a fixed
+    // batch of 512 (#2601).
+    let largest = resource_memberships(&fixture.db).await;
+    assert!(
+        largest > 0 && largest <= unfiltered_walk_batch(11),
+        "page 1 checked {largest} ids at once for a window of 11"
+    );
     fixture.close().await;
 }
 
+/// The largest `$in` of any profiled command on `resources`.
+async fn resource_memberships(db: &mongodb::Database) -> usize {
+    collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "ns": format!("{}.resources", db.name()) })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .iter()
+    .filter_map(|operation| operation.get_document("command").ok())
+    .map(|command| largest_membership(&Bson::Document(command.clone())))
+    .max()
+    .unwrap_or(0)
+}
+
 /// A parameter with few distinct values has equal-key groups far larger than
-/// the window, which the walk would read whole: past
-/// `UNFILTERED_WALK_TIE_ROWS` it hands the sort to the grouped aggregate.
+/// the window, which the walk would read whole: when one cannot be finished
+/// within `unfiltered_walk_tie_allowance` it hands the sort to the grouped
+/// aggregate.
 #[tokio::test]
 async fn unfiltered_param_sort_on_a_huge_tie_group_falls_back_to_the_grouped_aggregate() {
     let rows = 2 * UNFILTERED_WALK_TIE_ROWS;
@@ -1680,40 +1706,285 @@ async fn unfiltered_param_sorts_fall_back_when_their_index_is_dropped_hot() {
     }
 }
 
-// #2601: the unfiltered walk serves only windows up to
-// `UNFILTERED_WALK_MAX_WINDOW`; deeper pages keep the grouped aggregate.
+// #2601: the walk's batches follow the window, and an equal-key group is
+// counted once instead of being walked until a fixed limit.
 
 #[test]
-fn unfiltered_walk_window_boundary() {
-    let max = UNFILTERED_WALK_MAX_WINDOW;
-    assert_eq!(max, 50_000);
-    // The walk reads offset + page_size + 1 live ids.
-    assert!(unfiltered_walk_applies(0, 20, max));
-    assert!(unfiltered_walk_applies(max - 21, 20, max));
-    assert!(!unfiltered_walk_applies(max - 20, 20, max));
-    assert!(!unfiltered_walk_applies(100_000, 20, max));
-    assert!(!unfiltered_walk_applies(usize::MAX, 20, max));
+fn unfiltered_walk_batches_follow_the_window() {
+    // Page 1 of 10 (11 ids with the has-next one) or of 20 checks 32 ids.
+    assert_eq!(unfiltered_walk_batch(11), UNFILTERED_WALK_MIN_BATCH);
+    assert_eq!(unfiltered_walk_batch(21), 32);
+    assert!(unfiltered_walk_batch(21) < CANDIDATE_BATCH_SIZE);
+    // Deeper: what is needed plus a sixteenth for stale rows.
+    assert_eq!(unfiltered_walk_batch(1_000), 1_063);
+    assert_eq!(unfiltered_walk_batch(9_000), 9_563);
+    // Never more ids than one liveness command takes.
+    assert_eq!(unfiltered_walk_batch(100_021), SORT_ID_CHUNK);
+    assert_eq!(unfiltered_walk_batch(usize::MAX), SORT_ID_CHUNK);
+    // The sort-key cursor: 128 rows for page 1, 2,048 at most.
+    assert_eq!(unfiltered_walk_cursor_batch(21), 128);
+    assert_eq!(unfiltered_walk_cursor_batch(1_000), 1_063);
+    assert_eq!(unfiltered_walk_cursor_batch(290_021), 2_048);
 }
 
+#[test]
+fn unfiltered_walk_tie_allowance_covers_the_window_and_one_more_budget() {
+    // Page 1 in the group: the rows read, plus 8,192 to close it.
+    assert_eq!(
+        unfiltered_walk_tie_allowance(UNFILTERED_WALK_TIE_PROBE_ROWS, 0, 11),
+        UNFILTERED_WALK_TIE_PROBE_ROWS + UNFILTERED_WALK_TIE_ROWS
+    );
+    // A deep window: what it still lacks, plus the window itself when that
+    // is larger than 8,192 (`_sort=code&_offset=30000`).
+    assert_eq!(unfiltered_walk_tie_allowance(512, 4_000, 30_021), 34_533);
+    assert_eq!(
+        unfiltered_walk_tie_allowance(usize::MAX, 1, 1),
+        usize::MAX,
+        "saturates"
+    );
+}
+
+/// The profiler entries of the sort-key cursors of `parameter`: every sorted
+/// `find` hinted onto `index` and its `getMore`s, but not the null-end stream
+/// of a descending date (`value_date_end: null`), which fetches by design.
+async fn sort_key_cursor_entries(
+    db: &mongodb::Database,
+    index: &str,
+    parameter: &str,
+) -> Vec<Document> {
+    let rows = collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "ns": format!("{}.search_index", db.name()) })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let streams = |row: &Document| {
+        row.get_document("command").is_ok_and(|command| {
+            command.contains_key("find")
+                && command.contains_key("sort")
+                && command.get_str("hint") == Ok(index)
+                && command.get_document("filter").is_ok_and(|filter| {
+                    filter.get_str("param_name") == Ok(parameter)
+                        && filter.get("value_date_end") != Some(&Bson::Null)
+                })
+        })
+    };
+    let cursors: HashSet<i64> = rows
+        .iter()
+        .filter(|row| streams(row))
+        .filter_map(|row| row.get_i64("cursorid").ok())
+        .collect();
+    rows.into_iter()
+        .filter(|row| {
+            streams(row)
+                || (row.get_str("op") == Ok("getmore")
+                    && row
+                        .get_i64("cursorid")
+                        .is_ok_and(|cursor| cursors.contains(&cursor)))
+        })
+        .collect()
+}
+
+fn profiled(entry: &Document, field: &str) -> i64 {
+    entry
+        .get_i64(field)
+        .or_else(|_| entry.get_i32(field).map(i64::from))
+        .unwrap_or(0)
+}
+
+/// The sort-key cursors are covered index scans: they examine index keys and
+/// no document, for every walked type in both directions, unfiltered (with
+/// `getMore`s: a deep page) and filtered over the cap (#2588), which opens
+/// the same streams. `$exists: true` made every row a fetch (#2601).
 #[tokio::test]
-async fn unfiltered_walk_and_grouped_answers_match_across_the_window_gate() {
-    let Some(fixture) = Fixture::new("sort-unfiltered-window-gate", 300).await else {
+async fn sort_key_cursors_examine_no_documents() {
+    let Some(mut fixture) = Fixture::new("sort-walk-covered", 300).await else {
         return;
     };
     add_sort_rows(&fixture).await;
-    const GATE: usize = 100;
-    let grouped = grouped_backend(&fixture);
-    // page 10: window = offset + 11; 89 + 11 = 100 walks, 90 + 11 = 101 groups.
-    for (offset, walks) in [(0u32, true), (89, true), (90, false), (200, false)] {
-        let query = unfiltered_sort("-date", SearchParamType::Date, offset);
+    add_typed_sort_rows(&fixture).await;
+    fixture.mark_deleted(1, 20).await;
+    let index_of = |spec: &str, param_type: SearchParamType| {
+        if spec == "-date" {
+            SEARCH_DATE_END_INDEX
+        } else {
+            crate::backends::mongodb::search_index_catalog::value_index_led_by(
+                super::super::super::sort_value_field(&sort_by(spec, param_type)),
+            )
+            .unwrap()
+        }
+    };
+    let mut cases: Vec<(String, SearchQuery, usize)> = both_directions()
+        .into_iter()
+        .map(|(spec, param_type)| {
+            let label = format!("unfiltered _sort={spec}");
+            (label, unfiltered_sort(&spec, param_type, 200), WIDE)
+        })
+        .collect();
+    for (spec, param_type) in [
+        ("date", SearchParamType::Date),
+        ("-date", SearchParamType::Date),
+        ("-status", SearchParamType::Token),
+        ("value-quantity", SearchParamType::Quantity),
+    ] {
+        let mut query = filtered(
+            vec![parameter("code", "base")],
+            sort_by(spec, param_type),
+            40,
+        );
+        query.total = Some(TotalMode::None);
+        cases.push((format!("over-cap _sort={spec}"), query, CAP));
+    }
+    for (label, query, cap) in cases {
+        let directive = &query.sort[0];
+        let param_type = directive.param_type.unwrap();
+        let spec = match directive.direction {
+            crate::types::SortDirection::Ascending => directive.parameter.clone(),
+            crate::types::SortDirection::Descending => format!("-{}", directive.parameter),
+        };
+        let index = index_of(&spec, param_type);
         restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
-        let got =
-            with_unfiltered_walk_max_window(GATE, answer(&fixture.backend, &fixture, &query)).await;
+        with_result_id_cap(cap, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
         fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-        let grouped_ran = !sort_key_group_commands(&fixture.db).await.is_empty();
-        assert_eq!(grouped_ran, !walks, "offset {offset}: sort-key $group");
-        let expected = answer(&grouped, &fixture, &query).await;
-        assert_eq!(got, expected, "offset {offset}: page, has_next, total");
+        let entries = sort_key_cursor_entries(&fixture.db, index, &directive.parameter).await;
+        assert!(!entries.is_empty(), "{label}: no cursor hinted {index}");
+        let keys: i64 = entries.iter().map(|e| profiled(e, "keysExamined")).sum();
+        let docs: i64 = entries.iter().map(|e| profiled(e, "docsExamined")).sum();
+        assert!(keys > 0, "{label}: the cursor examined no key");
+        assert_eq!(docs, 0, "{label}: the sort-key cursor fetched: {entries:?}");
+    }
+    fixture.close().await;
+}
+
+/// `count` resources: the first `tied` (in id order) carry `method` = `m`,
+/// the others a key of their own, `n<number>`, so an ascending sort opens
+/// with a group of `tied` rows and a descending one ends with it.
+async fn add_tied_method_rows(fixture: &Fixture, tied: usize) {
+    let rows: Vec<Document> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(number, row)| {
+            let value = if number < tied {
+                "m".to_owned()
+            } else {
+                format!("n{number:05}")
+            };
+            index_row(&row.id, "method", &value)
+        })
+        .collect();
+    for chunk in rows.chunks(5_000) {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(chunk.to_vec())
+            .await
+            .unwrap();
+    }
+}
+
+/// An equal-key group longer than `UNFILTERED_WALK_TIE_ROWS` that the window
+/// needs is counted once and walked to its end (#2601): the old guard gave up
+/// at 8,192 rows and threw the walk away (`_sort=code&_offset=30000` was
+/// 2.3 times slower than grouping). The answer is the grouped one, and no
+/// sort-key `$group` runs.
+#[tokio::test]
+async fn unfiltered_param_sort_finishes_a_long_tie_the_window_needs() {
+    const TIED: usize = UNFILTERED_WALK_TIE_ROWS + 2_000;
+    let rows = TIED + 2_000;
+    let Some(mut fixture) = Fixture::new("sort-tie-finished", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    fixture.mark_deleted(100, 140).await;
+    let grouped = grouped_backend(&fixture);
+    let cap = rows * 2;
+    // Ascending the group is the head, descending it follows 2,000 distinct
+    // keys; either way the window ends deep inside it.
+    for (spec, offset) in [("method", 6_000u32), ("-method", 6_000), ("method", 9_000)] {
+        let query = unfiltered_sort(spec, SearchParamType::Token, offset);
+        let label = format!("_sort={spec} offset {offset}");
+        restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
+        let walked = with_result_id_cap(cap, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let found = sort_key_group_commands(&fixture.db).await;
+        assert!(found.is_empty(), "{label}: the walk gave up: {found:?}");
+        let expected = with_result_id_cap(cap, grouped.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&walked), page_ids(&expected), "{label}: page");
+        assert_eq!(page_ids(&walked).len(), 10, "{label}: page size");
+        assert_eq!(
+            walked.resources.page_info.has_next, expected.resources.page_info.has_next,
+            "{label}: has_next"
+        );
+        assert_eq!(walked.total, expected.total, "{label}: total");
+    }
+    fixture.close().await;
+}
+
+/// A group the walk cannot finish within its allowance hands the sort to the
+/// grouped aggregate after one count, also when the walk reaches it after a
+/// prefix of other keys; a window that closes before the group never enters
+/// it. The answers are the grouped ones either way.
+#[tokio::test]
+async fn unfiltered_param_sort_gives_up_on_a_tie_past_its_allowance() {
+    const TIED: usize = UNFILTERED_WALK_TIE_ROWS + 2_000;
+    let rows = TIED + 2_000;
+    let Some(fixture) = Fixture::new("sort-tie-past-allowance", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    let grouped = grouped_backend(&fixture);
+    let cap = rows * 2;
+    // Ascending, page 1 is inside the group. Descending, the 2,000 distinct
+    // keys of live resources come first: a window of 1,991 ids ends before
+    // the group, one of 2,001 needs its first id in id order, and so all of
+    // it.
+    for (spec, offset, groups) in [
+        ("method", 0u32, true),
+        ("-method", 1_980, false),
+        ("-method", 1_990, true),
+    ] {
+        let query = unfiltered_sort(spec, SearchParamType::Token, offset);
+        let label = format!("_sort={spec} offset {offset}");
+        restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
+        let walked = with_result_id_cap(cap, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            groups,
+            "{label}: the grouped aggregate runs only for a group past the allowance"
+        );
+        if groups {
+            // Given up after at most a probe's worth of the group, not 8,192 rows.
+            let read: i64 = sort_key_cursor_entries(&fixture.db, "idx_search_token_v2", "method")
+                .await
+                .iter()
+                .map(|entry| profiled(entry, "nreturned"))
+                .sum();
+            assert!(
+                read < (offset as usize + 2 * UNFILTERED_WALK_TIE_PROBE_ROWS) as i64 + 4_096,
+                "{label}: the walk read {read} sort-key rows before giving up"
+            );
+        }
+        let expected = with_result_id_cap(cap, grouped.search(&fixture.tenant, &query))
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&walked), page_ids(&expected), "{label}: page");
+        assert_eq!(
+            walked.resources.page_info.has_next, expected.resources.page_info.has_next,
+            "{label}: has_next"
+        );
+        assert_eq!(walked.total, expected.total, "{label}: total");
     }
     fixture.close().await;
 }

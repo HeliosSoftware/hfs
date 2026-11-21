@@ -326,57 +326,56 @@ tokio::task_local! {
     static RESULT_ID_CAP_OVERRIDE: usize;
 }
 
-/// The rows of one equal-key group an unfiltered sort walk reads before it
-/// gives the sort back to the grouped aggregate (#2601). The walk reads a whole
-/// group to order it by id, and a parameter with few distinct values (a
-/// `status`, a `gender`) has groups of hundreds of thousands of rows, which it
-/// reads at about 25 microseconds a resource against the aggregate's 2.6
-/// microseconds a row over the whole parameter (1,000,000 rows, mongo:9.0.8).
-/// The limit covers ties of several thousand rows, such as dates at day
-/// resolution, and bounds the work wasted on a sort that falls back to 16
-/// batches of rows, however deep its offset.
+/// Rows of one equal-key group, beyond what the window still lacks, that an
+/// unfiltered sort walk reads to finish the group it is in (#2601). The walk
+/// reads a whole group to order it by id, and a parameter with few distinct
+/// values (a `status`, a `gender`) has groups of hundreds of thousands of rows.
+/// When a group reaches `UNFILTERED_WALK_TIE_PROBE_ROWS` rows the walk counts
+/// it once (`sort_key_rows_exceed`); if more than the window's lack plus
+/// `max(UNFILTERED_WALK_TIE_ROWS, offset + _count + 1)` of its rows remain,
+/// grouping is cheaper and the grouped aggregate answers. Finishing costs at
+/// most about 5.6 microseconds a row, below the 8.6 microseconds a window row
+/// the grouped path pays (689,080 Observations, mongo:9.0.8).
 const UNFILTERED_WALK_TIE_ROWS: usize = 16 * CANDIDATE_BATCH_SIZE;
 
-/// The most live ids (`offset + _count + 1`) the unfiltered sort walk reads
-/// before the grouped aggregate answers instead (#2601). The walk pages 101
-/// documents at a time, so its cost grows with the offset, while the grouped
-/// `top_param_sorted_ids` path is flat. Measured on 689,080 Observations
-/// (`_sort=-date`, mongo:9.0.8, 10 VUs): offset 0 1.8 s -> 9 ms, offset 10,000
-/// 2.05 s -> 149 ms, but offset 100,000 3.5 s -> 4.4 s (+24%) and offset
-/// 290,000 6.6 s -> 13.8 s (about 2.1x). The crossover lies between 50,000
-/// and 100,000; above this window the request keeps the grouped path. The
-/// filtered over-cap walk (#2588) has no grouped alternative and is not gated.
-const UNFILTERED_WALK_MAX_WINDOW: usize = 50_000;
+/// Rows of one equal key after which the unfiltered walk asks the server how
+/// long the group is: one bounded, covered count (#2601).
+const UNFILTERED_WALK_TIE_PROBE_ROWS: usize = CANDIDATE_BATCH_SIZE;
 
-#[cfg(test)]
-tokio::task_local! {
-    static UNFILTERED_WALK_WINDOW_OVERRIDE: usize;
+/// Fewest ids the unfiltered walk checks for liveness at a time (#2601).
+const UNFILTERED_WALK_MIN_BATCH: usize = 32;
+
+/// Bounds of the unfiltered walk's sort-key cursor batch (#2601): from 128
+/// to 2,048 rows per round trip the covered scan costs the same per row
+/// (1.35-1.37 microseconds); below 128 it is about 30% dearer.
+const UNFILTERED_WALK_MIN_CURSOR_BATCH: usize = 128;
+const UNFILTERED_WALK_MAX_CURSOR_BATCH: usize = 2_048;
+
+/// Ids the unfiltered walk reads and checks for liveness in its next batch
+/// when the window still lacks `need` live ids: about what it needs, plus a
+/// sixteenth for stale rows, so page 1 checks 32 ids rather than 512 (#2601).
+fn unfiltered_walk_batch(need: usize) -> usize {
+    need.saturating_add(need / 16)
+        .saturating_add(1)
+        .clamp(UNFILTERED_WALK_MIN_BATCH, SORT_ID_CHUNK)
 }
 
-/// The window limit in force: `UNFILTERED_WALK_MAX_WINDOW`, or a lower value
-/// a test installed with `with_unfiltered_walk_max_window`.
-fn unfiltered_walk_max_window() -> usize {
-    #[cfg(test)]
-    if let Ok(max) = UNFILTERED_WALK_WINDOW_OVERRIDE.try_with(|max| *max) {
-        return max;
-    }
-    UNFILTERED_WALK_MAX_WINDOW
+/// The sort-key cursor batch of an unfiltered walk for a window of `wanted`
+/// live ids: its first batch, within the cursor bounds.
+fn unfiltered_walk_cursor_batch(wanted: usize) -> usize {
+    unfiltered_walk_batch(wanted).clamp(
+        UNFILTERED_WALK_MIN_CURSOR_BATCH,
+        UNFILTERED_WALK_MAX_CURSOR_BATCH,
+    )
 }
 
-/// Runs `future` with the walk window limit set to `max`.
-#[cfg(test)]
-async fn with_unfiltered_walk_max_window<F: std::future::Future>(
-    max: usize,
-    future: F,
-) -> F::Output {
-    UNFILTERED_WALK_WINDOW_OVERRIDE.scope(max, future).await
-}
-
-/// Whether the unfiltered sort walk may serve a page: the live ids it would
-/// read, `offset + page_size + 1`, fit in `max_window`. Independent of the
-/// result id cap, which is checked before.
-fn unfiltered_walk_applies(offset: usize, page_size: usize, max_window: usize) -> bool {
-    offset.saturating_add(page_size).saturating_add(1) <= max_window
+/// The most rows an equal-key group may have for the unfiltered walk to finish
+/// it: the `tie_rows` already read, the `lacking` rows the window still needs,
+/// and `max(UNFILTERED_WALK_TIE_ROWS, wanted)` to close the group (#2601).
+fn unfiltered_walk_tie_allowance(tie_rows: usize, lacking: usize, wanted: usize) -> usize {
+    tie_rows
+        .saturating_add(lacking)
+        .saturating_add(UNFILTERED_WALK_TIE_ROWS.max(wanted))
 }
 
 /// The id-set cap in force: `MAX_RESULT_ID_SET`, or a lower value a test
@@ -439,6 +438,8 @@ struct SearchChecks<'q> {
 struct SortRowStream {
     cursor: Cursor<Document>,
     key_field: &'static str,
+    /// Rows per batch: the cursor's `batchSize`.
+    batch: usize,
     buffered: VecDeque<(String, Bson)>,
     exhausted: bool,
 }
@@ -448,8 +449,8 @@ impl SortRowStream {
     async fn fill(&mut self) -> StorageResult<()> {
         let key_field = self.key_field;
         while self.buffered.is_empty() && !self.exhausted {
-            let batch = read_cursor_batch(&mut self.cursor, CANDIDATE_BATCH_SIZE).await?;
-            self.exhausted = batch.len() < CANDIDATE_BATCH_SIZE;
+            let batch = read_cursor_batch(&mut self.cursor, self.batch).await?;
+            self.exhausted = batch.len() < self.batch;
             self.buffered.extend(batch.into_iter().filter_map(|row| {
                 let id = row.get_str("resource_id").ok()?.to_string();
                 let key = row
@@ -548,6 +549,11 @@ impl ParamSortWindow {
             self.tied.insert(id);
         }
         false
+    }
+
+    /// Ids held so far: completed keys and the retained part of the open tie.
+    fn held(&self) -> usize {
+        self.ordered.len() + self.tied.len()
     }
 
     fn finish_key(&mut self) {
@@ -3622,24 +3628,25 @@ impl MongoBackend {
                             .await?,
                     );
                 }
-                let walked =
-                    if unfiltered_walk_applies(offset, page_size, unfiltered_walk_max_window())
-                        && self.walks_unfiltered_param_sort(directives)
-                    {
-                        self.unfiltered_param_sort_walk(
-                            db,
-                            tenant_id,
-                            query,
-                            missing_support,
-                            &directives[0],
-                            id_direction,
-                            offset,
-                            page_size + 1,
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
+                // The covered walk is cheaper than grouping at every offset
+                // the cap allows (#2601); it answers `None`, and the grouped
+                // aggregate the page, when an equal-key group is too long to
+                // finish or its index was dropped while running.
+                let walked = if self.walks_unfiltered_param_sort(directives) {
+                    self.unfiltered_param_sort_walk(
+                        db,
+                        tenant_id,
+                        query,
+                        missing_support,
+                        &directives[0],
+                        id_direction,
+                        offset,
+                        page_size + 1,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 match walked {
                     Some(ids) => ids,
                     None => {
@@ -4238,10 +4245,10 @@ impl MongoBackend {
             id_direction,
             offset,
             take,
-            None,
+            false,
         )
         .await?
-        .ok_or_else(|| internal_error("a sort walk without a tie limit gave up".to_owned()))
+        .ok_or_else(|| internal_error("a filtered sort walk gave up".to_owned()))
     }
 
     /// Whether an unfiltered sort can walk its value index instead of
@@ -4264,11 +4271,11 @@ impl MongoBackend {
     }
 
     /// The window of an unfiltered single-key sort, read in key order from
-    /// the sort's value index and cut after `offset + take` live ids. `None`
-    /// when that index was rejected (dropped after the readiness check) or the
-    /// walk met an equal-key group longer than `UNFILTERED_WALK_TIE_ROWS`, as
-    /// a parameter with few distinct values has: the caller then groups the
-    /// rows as before.
+    /// the sort's value index (a covered scan) and cut after `offset + take`
+    /// live ids. `None` when that index was rejected (dropped after the
+    /// readiness check) or the walk met an equal-key group it cannot finish
+    /// within `unfiltered_walk_tie_allowance`, as a parameter with few
+    /// distinct values has: the caller then groups the rows as before.
     #[allow(clippy::too_many_arguments)]
     async fn unfiltered_param_sort_walk(
         &self,
@@ -4283,7 +4290,13 @@ impl MongoBackend {
     ) -> StorageResult<Option<Vec<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let Some(streams) = self
-            .open_sort_row_streams(&search_index, tenant_id, &query.resource_type, directive)
+            .open_sort_row_streams(
+                &search_index,
+                tenant_id,
+                &query.resource_type,
+                directive,
+                unfiltered_walk_cursor_batch(offset.saturating_add(take)),
+            )
             .await?
         else {
             tracing::warn!(
@@ -4302,7 +4315,7 @@ impl MongoBackend {
             id_direction,
             offset,
             take,
-            Some(UNFILTERED_WALK_TIE_ROWS),
+            true,
         )
         .await
     }
@@ -4319,7 +4332,7 @@ impl MongoBackend {
         id_direction: crate::types::SortDirection,
         offset: usize,
         take: usize,
-        tie_limit: Option<usize>,
+        unfiltered: bool,
     ) -> StorageResult<Option<Vec<String>>> {
         use crate::types::SortDirection;
 
@@ -4340,37 +4353,67 @@ impl MongoBackend {
         };
 
         let wanted = offset.saturating_add(take);
-        // With `tie_limit`, the most rows of one equal key the walk reads
-        // before it answers `None`; without it the walk reads as many as the
-        // window needs.
+        // The filtered walk (#2588) checks search-index membership 512 ids at
+        // a time. The unfiltered walk (#2601) only checks liveness: its
+        // batches follow what the window still needs, from 32 ids for page 1
+        // up to `SORT_ID_CHUNK`, and it gives up on an equal-key group it
+        // cannot finish (`sort_key_rows_exceed`); the filtered walk never does.
+        let mut target = if unfiltered {
+            unfiltered_walk_batch(wanted)
+        } else {
+            CANDIDATE_BATCH_SIZE
+        };
+        // The current equal-key group of the unfiltered walk: its key, the
+        // rows read of it, and whether it was counted and can be finished.
         let mut tie_rows = 0usize;
         let mut tie_key: Option<Bson> = None;
+        let mut tie_counted = false;
         // Every resource a row was read for, matching or not: its first row
         // held its key, so its later rows are skipped.
         let mut keyed: HashSet<String> = HashSet::new();
         let mut window = ParamSortWindow::new(wanted, id_direction);
         let mut complete = false;
         while !complete {
-            let mut batch = Vec::with_capacity(CANDIDATE_BATCH_SIZE);
-            while batch.len() < CANDIDATE_BATCH_SIZE {
+            // Live ids the window still lacks.
+            let need = wanted - window.held();
+            let mut batch: Vec<(String, Bson)> = Vec::with_capacity(target);
+            while batch.len() < target {
                 match next_sort_row(&mut streams, directive.direction).await? {
                     Some((id, key)) => {
-                        if let Some(limit) = tie_limit {
+                        if unfiltered {
                             if tie_key
                                 .as_ref()
                                 .is_some_and(|previous| compare_sort_keys(previous, &key).is_eq())
                             {
                                 tie_rows += 1;
-                                if tie_rows > limit {
-                                    return Ok(None);
-                                }
                             } else {
                                 tie_rows = 1;
                                 tie_key = Some(key.clone());
+                                tie_counted = false;
                             }
                         }
                         if keyed.insert(id.clone()) {
+                            // Once the batch holds what the window lacks, a
+                            // resource with a new key closes the window: stop
+                            // there, so the walk never enters the group that
+                            // follows it.
+                            let closes = unfiltered
+                                && batch.len() >= need
+                                && batch
+                                    .last()
+                                    .map(|(_, previous)| previous)
+                                    .or(window.key.as_ref())
+                                    .is_some_and(|previous| {
+                                        compare_sort_keys(previous, &key).is_ne()
+                                    });
                             batch.push((id, key));
+                            if closes {
+                                break;
+                            }
+                        }
+                        if unfiltered && !tie_counted && tie_rows >= UNFILTERED_WALK_TIE_PROBE_ROWS
+                        {
+                            break;
                         }
                     }
                     None => {
@@ -4379,8 +4422,37 @@ impl MongoBackend {
                     }
                 }
             }
+            if unfiltered
+                && !complete
+                && !tie_counted
+                && tie_rows >= UNFILTERED_WALK_TIE_PROBE_ROWS
+                && let Some(key) = tie_key.as_ref()
+            {
+                let allowed = unfiltered_walk_tie_allowance(
+                    tie_rows,
+                    need.saturating_sub(batch.len()),
+                    wanted,
+                );
+                if self
+                    .sort_key_rows_exceed(
+                        &search_index,
+                        tenant_id,
+                        resource_type,
+                        directive,
+                        key,
+                        allowed,
+                    )
+                    .await?
+                {
+                    return Ok(None);
+                }
+                tie_counted = true;
+            }
             if batch.is_empty() {
-                break;
+                if complete {
+                    break;
+                }
+                continue;
             }
             let ids = batch.iter().map(|(id, _)| id.clone()).collect();
             let passing: HashSet<String> = self
@@ -4396,6 +4468,7 @@ impl MongoBackend {
                 .await?
                 .into_iter()
                 .collect();
+            let (held, read) = (window.held(), batch.len());
             for (id, key) in batch {
                 let matches = passing.contains(&id);
                 if window.push(id, key, matches) {
@@ -4408,6 +4481,20 @@ impl MongoBackend {
                             .collect(),
                     ));
                 }
+            }
+            if unfiltered {
+                // A full window waits for its open tie to close, and a batch
+                // that gave the window less than half its ids met repeated
+                // resources or stale rows: read twice as far each time
+                // instead of 32 ids at a time. Otherwise size the next batch
+                // to what the window still lacks.
+                let need = wanted - window.held();
+                target = if need == 0 || (window.held() - held) * 2 < read {
+                    target.saturating_mul(2)
+                } else {
+                    unfiltered_walk_batch(need)
+                }
+                .clamp(UNFILTERED_WALK_MIN_BATCH, SORT_ID_CHUNK);
             }
         }
         let mut window = window.finish();
@@ -4478,8 +4565,17 @@ impl MongoBackend {
         checks: &SearchChecks<'_>,
         ids: Vec<String>,
     ) -> StorageResult<Vec<String>> {
-        // Both keyed and keyless callers bound ids before any `$in` is built.
-        debug_assert!(ids.len() <= CANDIDATE_BATCH_SIZE);
+        // Both keyed and keyless callers bound ids before any `$in` is built:
+        // `CANDIDATE_BATCH_SIZE` for a search with conditions, `SORT_ID_CHUNK`
+        // for the unfiltered walk, which only checks liveness.
+        debug_assert!(
+            ids.len() <= CANDIDATE_BATCH_SIZE
+                || (ids.len() <= SORT_ID_CHUNK
+                    && checks.normal.is_empty()
+                    && checks.missing.is_empty()
+                    && checks.not_params.is_empty()
+                    && query.compartment.is_none())
+        );
         let candidates = self
             .retain_matching_candidates(
                 db,
@@ -4529,24 +4625,44 @@ impl MongoBackend {
         resource_type: &str,
         directive: &crate::types::SortDirective,
     ) -> StorageResult<Vec<SortRowStream>> {
-        self.open_sort_row_streams(search_index, tenant_id, resource_type, directive)
-            .await?
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "the sort index for {} is missing",
-                    directive.parameter
-                ))
-            })
+        self.open_sort_row_streams(
+            search_index,
+            tenant_id,
+            resource_type,
+            directive,
+            CANDIDATE_BATCH_SIZE,
+        )
+        .await?
+        .ok_or_else(|| {
+            internal_error(format!(
+                "the sort index for {} is missing",
+                directive.parameter
+            ))
+        })
     }
 
     /// [`Self::sort_row_streams`], answering `None` when a hinted index does
-    /// not exist rather than failing.
+    /// not exist rather than failing. Each cursor reads `batch` rows per round
+    /// trip.
+    ///
+    /// The rows are selected with `<value_field>: {$ne: null}` alone (#2601).
+    /// It excludes a missing field as well as a null one and proves the
+    /// partial index's `$exists: true`, and it can be answered from the index
+    /// key, so the scan is covered (`PROJECTION_COVERED`, no document
+    /// examined). `$exists: true` cannot be answered from a key and made every
+    /// row a fetch of its `search_index` document: on 689,080 Observations,
+    /// 100,021 rows of `-date` took 4.5-9 s fetched and 45-55 ms covered. The
+    /// null-end stream of a descending date (rows written before #1391, with
+    /// no `value_date_end`) still fetches: `value_date_end: null` cannot be
+    /// told from a missing end by the key. It is empty once the date rows
+    /// are reindexed.
     async fn open_sort_row_streams(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
         directive: &crate::types::SortDirective,
+        batch: usize,
     ) -> StorageResult<Option<Vec<SortRowStream>>> {
         use crate::types::SortDirection;
 
@@ -4560,7 +4676,7 @@ impl MongoBackend {
                 "tenant_id": tenant_id,
                 "resource_type": resource_type,
                 "param_name": &directive.parameter,
-                value_field: { "$exists": true, "$ne": Bson::Null },
+                value_field: { "$ne": Bson::Null },
             }
         };
         let plans: Vec<(Document, Document, &'static str, &'static str)> =
@@ -4602,7 +4718,7 @@ impl MongoBackend {
                 .projection(doc! { "_id": 0, "resource_id": 1, key_field: 1 })
                 .sort(sort)
                 .hint(Hint::Name(index.to_owned()))
-                .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                .batch_size(u32::try_from(batch).unwrap_or(u32::MAX))
                 .await;
             let cursor = match opened {
                 Err(error) if search_access::hint_rejected(&error) => return Ok(None),
@@ -4611,11 +4727,61 @@ impl MongoBackend {
             streams.push(SortRowStream {
                 cursor,
                 key_field,
+                batch,
                 buffered: VecDeque::new(),
                 exhausted: false,
             });
         }
         Ok(Some(streams))
+    }
+
+    /// Whether more than `allowed` rows of the sort parameter carry `key`:
+    /// one covered count on the index the walk reads, bounded at `allowed + 1`
+    /// keys (#2601; 0.13 microseconds a key). A descending date counts the
+    /// rows whose range ends at `key`; rows without an end that start at
+    /// `key` tie with them but are not counted, so the answer is a lower
+    /// bound there, which can only let the walk finish a group, never change
+    /// the page. An index dropped while running counts as too long: the
+    /// grouped aggregate answers.
+    async fn sort_key_rows_exceed(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+        key: &Bson,
+        allowed: usize,
+    ) -> StorageResult<bool> {
+        let value_field = sort_value_field(directive);
+        let mut filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "param_name": &directive.parameter,
+        };
+        let index = if value_field == "value_date"
+            && directive.direction == crate::types::SortDirection::Descending
+        {
+            filter.insert(value_field, doc! { "$ne": Bson::Null });
+            filter.insert(VALUE_DATE_END, key.clone());
+            SEARCH_DATE_END_INDEX
+        } else {
+            filter.insert(value_field, key.clone());
+            value_index_led_by(value_field).ok_or_else(|| {
+                internal_error(format!("no search_index index is led by {value_field}"))
+            })?
+        };
+        let counted = search_index
+            .count_documents(filter)
+            .search_deadline()?
+            .hint(Hint::Name(index.to_owned()))
+            .limit(allowed as u64 + 1)
+            .await;
+        match counted {
+            Err(error) if search_access::hint_rejected(&error) => Ok(true),
+            counted => Ok(
+                counted.or_query_error("Failed to count an equal-key sort group")? > allowed as u64,
+            ),
+        }
     }
 
     async fn matching_resource_ids(

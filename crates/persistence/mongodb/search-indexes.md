@@ -453,29 +453,47 @@ key order holds its `$min` (ascending) or `$max` (descending), so the walk keeps
 each resource at its first row and ignores its later ones, however many values
 it has.
 
-The walk serves only windows of up to `UNFILTERED_WALK_MAX_WINDOW` (50,000)
-live ids, that is `offset + _count + 1 <= 50,000`. It pages 101 documents at a
-time, so its cost grows with the offset, while the grouped aggregate is flat.
-On 689,080 Observations (`_sort=-date`, mongo:9.0.8, 10 VUs) the walk takes
-page 1 from 1.8 s to 9 ms and an offset of 10,000 from 2.05 s to 149 ms, but at
-an offset of 100,000 it is slower than the grouped path (3.5 s against 4.4 s,
-+24%) and at 290,000 about twice as slow (6.6 s against 13.8 s). The crossover
-lies between 50,000 and 100,000, so a request above the window is answered by
-the grouped aggregate exactly as before the walk existed. The limit is
-independent of the 300,000-row id cap, which still answers 422 past it.
-The filtered walk over the cap (#2588) has no grouped alternative and is not
-limited by this window.
+The walk reads its rows from a covered index scan: the row filter is
+`<value field>: {$ne: null}` alone, which the index key answers, so the sort-key
+cursors examine index keys and no document (`docsExamined: 0`). An earlier form
+added `$exists: true`, which an index key cannot answer, and so fetched the
+`search_index` document of every row it passed; on 689,080 Observations that
+made 100,021 rows of `-date` cost 4.5 to 9 s instead of 45 to 55 ms, and turned
+the WiredTiger cache over 2.5 times per deep request. The filtered walk over the
+cap (#2588) opens the same cursors and is covered the same way.
 
-The walk does have a guard on the equal-key groups it reads whole. A parameter
-with few distinct values (`status`, `gender`) has a group of hundreds of
-thousands of rows at the head of the order, which the walk reads at about 25
-microseconds per resource, against about 2.6 microseconds per row for the grouped
-aggregate over the whole parameter. The unfiltered walk therefore stops at the
-first group of more than `UNFILTERED_WALK_TIE_ROWS` (8,192) rows and hands the
-request to the grouped aggregate, which answers with the same page. Ties of a few
-thousand rows, such as dates at day resolution, stay on the walk. The abandoned
-walk costs about 0.2 to 0.4 s at offset 0 and about 0.7 s at offset 100,000 on top of the
-2 to 8 s of the aggregate (1,000,000 rows, `status` of three values).
+There is no limit on the offset other than the 300,000-row id cap, which still
+answers 422 past it: the covered walk is cheaper than the grouped aggregate at
+every offset up to it. Single-request server and driver time on 689,080 real
+Observations (`_sort=-date`, mongo:9.0.8, one request at a time, a replay of
+both code paths): offset 100,000 651 ms against 1,854 ms grouped, offset
+290,000 1,944 ms against 3,619 ms. Page 1 takes a few milliseconds against
+about 0.9 s grouped.
+
+The walk sizes its batches to the window. The first batch reads and checks the
+liveness of about `offset + _count + 1` ids (`unfiltered_walk_batch`: the
+window, a sixteenth more for stale rows, at least 32, at most 10,000), so page
+1 of a small type checks 32 ids, not 512; later batches follow what the window
+still lacks, and double while the window waits for an open tie or a batch
+yields less than half its ids. The sort-key cursor reads 128 to 2,048 rows per
+round trip, by the same window. Once the window holds what it needs, the walk
+stops at the first row of a new key, so it never enters the group that follows
+the page.
+
+The walk does have a guard on the equal-key groups it reads whole, to order
+them by id. A parameter with few distinct values (`status`, `gender`) has a
+group of hundreds of thousands of rows. When a group reaches 512 rows the walk
+counts it once, with a covered count bounded just above what it may read
+(`sort_key_rows_exceed`, about 0.13 microseconds a key). If more of its rows
+remain than the window still lacks plus `max(UNFILTERED_WALK_TIE_ROWS,
+offset + _count + 1)` (`UNFILTERED_WALK_TIE_ROWS` is 8,192), grouping is
+cheaper and the grouped aggregate answers with the same page, after at most
+512 rows of the group and one count. Otherwise the walk finishes the group,
+however long, so a deep window inside a long group (`_sort=code&_offset=30000`,
+`_sort=subject&_offset=10000` on the same data) is walked instead of abandoned
+after 8,192 rows with the walk thrown away. For a descending date the count
+sees only the rows with a range end, a lower bound of the group: it can let the
+walk finish a group, never change the page.
 
 These keep the grouped path: a sort whose parameter type is unknown
 (the `value_string` fallback), composite and special parameters, and sorts on
@@ -483,7 +501,9 @@ more than one key.
 
 The walk reads rows in value order. The first row for a resource supplies
 its sort key; later rows for that resource are ignored. Membership and
-resource-level conditions are checked in batches of at most 512 candidates.
+resource-level conditions are checked in batches of at most 512 candidates
+(the unfiltered walk, which only checks liveness, sizes its batches to the
+window as described above).
 Equal keys retain only the matching ids needed for `offset + _count + 1`,
 ordered by the requested id tie-breaker. The extra match determines
 `has_next`. Matches without a sort value follow in id order, read from
@@ -515,7 +535,13 @@ within-cap searches keep their existing execution path.
 
 Date rows written before #1391 have no `value_date_end`. They are null-end
 keys of `idx_search_date_end` and sort by their start, as on the collected
-path.
+path. A descending date walk reads them through a second cursor
+(`value_date_end: null`), merged with the first by key. That cursor is not
+covered: a null in the index key does not tell a null end from a missing one,
+so the server fetches each such row. It examines one key and no document once
+the date rows are reindexed; on a database that still holds many such rows, a
+deep unfiltered `-date` page fetches each of them, as every walk did before
+the cursors were covered.
 
 ## Token+quantity composites (generation 6)
 
