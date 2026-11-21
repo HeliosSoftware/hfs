@@ -411,6 +411,8 @@ After a successful bind message, the server sends a handshake notification bundl
 
 The WebSocket protocol is **unidirectional** (server → client) after binding. Additional bind messages on the same connection are rejected; close frames trigger graceful cleanup.
 
+**Deadlines and queueing:** a connection that sends no bind message within 10 seconds is closed (`1008 bind-timeout`). Each bound client has a queue of 256 notifications; a client that stops reading its socket is given 30 seconds to accept a frame and is dropped once its queue is full, so a stalled client retains no further notifications in the server. It reconnects with a new binding token and replays missed events through `$events`.
+
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 
 **Subscription deletion:** Deleting the `Subscription` resource closes all connected WebSocket clients for that subscription.
@@ -543,5 +545,5 @@ A Kafka-backed architecture addresses most of the single-instance and performanc
 - Batch and transaction bundle entries do not emit subscription events — only direct CRUD handlers (create, update, delete, patch) do
 - [`eventTrigger`](https://hl7.org/fhir/subscriptiontopic.html) is not supported — only `resourceTrigger` (create, update, delete) is implemented
 - The engine is in-memory only and single-instance — subscriptions and topics are not shared across cluster nodes or reloaded from storage on restart (see [Clustering](#clustering) above)
-- WebSocket notifications are best-effort — if no clients are connected when an event fires the notification is silently dropped; there is no replay or queueing for late-connecting clients
+- WebSocket notifications are best-effort — if no clients are connected when an event fires the notification is silently dropped; there is no replay or queueing for late-connecting clients, and a connected client that stops reading is dropped once 256 notifications are queued for it
 - Email and FHIR messaging channels are not yet implemented (planned for subsequent phases)

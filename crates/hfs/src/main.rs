@@ -1801,11 +1801,13 @@ fn mount_ui(
     // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
     // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
     // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
-    // configured from HFS_UI_* client credentials. The `$sql-export`
-    // self-calls (#833) are the exception: they already carry the
-    // browser's own `Authorization` when it sent one (the `Caller` seam
-    // in `crates/ui/src/conformance.rs`), falling back to this service
-    // token only when the request had none.
+    // configured from HFS_UI_* client credentials. Only those conformance
+    // reads (and `/metadata`) may use this token: every other UI self-call —
+    // tenant data, ViewDefinitions and SQL Libraries, `$sql-run`,
+    // `$sql-export`, `$export`, the Patient/Group lookups — carries the
+    // browser's own credential or the signed-in session's bearer, and none
+    // at all when the request brought neither (#2692), so an anonymous
+    // visitor never acts with this token's authority.
     let self_base_url = format!("http://127.0.0.1:{}", config.port);
     let outbound_auth = AuthConfig::from_env().outbound_provider();
     let patient_name_search = patient_name_search_support(
@@ -3453,21 +3455,26 @@ async fn build_bulk_submit(
     // When a client_id + private key are configured, protected-file fetches use
     // a read-scoped `client_credentials` token; otherwise they surface a recorded
     // manifest-level error.
+    // Where $bulk-submit may fetch from at all, and where its file token may
+    // go (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS); empty permits every origin.
+    let trusted_providers =
+        helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?;
+    if trusted_providers.is_empty() {
+        tracing::info!(
+            "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+        );
+    }
     let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
         cfg.client_id.as_deref(),
         cfg.private_key.as_deref(),
     ) {
         (Some(client_id), Some(pem)) => {
-            let trusted =
-                helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
-                    .map_err(|e| {
-                        anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}")
-                    })?;
             match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new_with_trusted_providers(
                     client_id,
                     pem,
                     &cfg.signing_alg,
-                    trusted,
+                    trusted_providers.clone(),
                 ) {
                     Some(p) => Some(p),
                     None => anyhow::bail!(
@@ -3493,7 +3500,8 @@ async fn build_bulk_submit(
         )
         .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
         .with_decryption_keys(decryption_keys)
-        .with_body_limits(cfg.max_manifest_bytes, cfg.max_encrypted_file_bytes),
+        .with_body_limits(cfg.max_manifest_bytes, cfg.max_encrypted_file_bytes)
+        .with_trusted_providers(trusted_providers),
     );
 
     // SQLite serialises writers, so a fan-out queues batch writes behind one

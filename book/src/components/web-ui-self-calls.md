@@ -16,6 +16,17 @@ authentication is enabled.
 | **Static bearer** | `HFS_AUTH_ENABLED=true` + `HFS_OUTBOUND_BEARER_TOKEN=<token>` | The self-call attaches the provisioned token. The token must be valid against the server's own validation config (`HFS_AUTH_JWKS_URL`, `HFS_AUTH_ISSUER`, `HFS_AUTH_AUDIENCE`) and carry the read scopes `system/SearchParameter.rs system/CompartmentDefinition.rs`. |
 | **IdP-issued** | As above, with the token minted by your identity provider (e.g. a Keycloak service-account client) | Same as static bearer — the operator obtains a token via `client_credentials` and provisions it. Note the token's lifetime: when it expires the self-call starts failing and the pages degrade until a fresh token is provisioned. |
 
+The service token is used **only** for these conformance reads (and
+`GET /metadata`). Every other server-side call the UI makes — running a
+ViewDefinition or SQL query, saving one, listing them, SQL Export, Bulk
+Export, the Patient and Group pickers, Import — carries the browser's own
+`Authorization` header or the signed-in session's token, and nothing when
+the visitor brought neither. With authentication on and no browser sign-in
+(`HFS_UI_LOGIN_CLIENT_ID` unset), an anonymous visitor therefore sees those
+pages fail with `401` rather than act with the service token's authority.
+Granting the token more than the two read scopes above widens nothing the UI
+does, so don't.
+
 Leave the token's **tenant claim unset** for service tokens: the tenant claim
 is authoritative when present, and the self-call scopes each request with
 `X-Tenant-ID` so every tenant's conformance view stays reachable. A token
