@@ -539,6 +539,19 @@ impl fmt::Display for RestError {
 impl std::error::Error for RestError {}
 
 impl RestError {
+    /// Converts a storage error for a read of a deleted resource, honoring the
+    /// `HFS_RETURN_GONE` switch: with the flag off, [`ResourceError::Gone`]
+    /// becomes [`RestError::NotFound`] so a deleted resource answers exactly as
+    /// one that never existed; every other error converts as usual.
+    pub fn gone_as_configured(err: StorageError, return_gone: bool) -> Self {
+        match err {
+            StorageError::Resource(ResourceError::Gone {
+                resource_type, id, ..
+            }) if !return_gone => RestError::NotFound { resource_type, id },
+            other => other.into(),
+        }
+    }
+
     /// Computes the client-facing `(status, issue code, message)` triple for
     /// this error.
     ///

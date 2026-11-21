@@ -3286,7 +3286,7 @@ where
                     resource_type: resource_type.clone(),
                     id: id.clone(),
                 }),
-                Err(e) => entry_storage_failure(e),
+                Err(e) => entry_failure(RestError::gone_as_configured(e, state.return_gone())),
             }
         }
         GetEntryTarget::Vread {
