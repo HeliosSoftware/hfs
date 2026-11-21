@@ -1,6 +1,6 @@
 //! Quantity parameter SQL handler.
 
-use crate::search::FhirQuantityValue;
+use crate::search::{FhirQuantityValue, QuantityBound};
 use crate::types::{SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -140,7 +140,9 @@ impl QuantityHandler {
     /// canonicalization for the canonical ones); `None` from `map` aborts.
     /// A point (`high = low`) behaves exactly as the old single-column
     /// comparison; `gt`/`ge`/`eb`/`eq`/`ne` constrain the upper end, which
-    /// the `idx_search_quantity_high` indexes lead with.
+    /// the `idx_search_quantity_high` indexes lead with. `ap` is two groups
+    /// ORed here (see [`Self::interval_groups`]); a standalone `ap` search
+    /// reads them as separate selects instead ([`Self::build_alternatives`]).
     fn build_interval_condition(
         low_col: &str,
         high_col: &str,
@@ -148,31 +150,8 @@ impl QuantityHandler {
         map: impl Fn(f64) -> Option<f64>,
         param_num: usize,
     ) -> Option<SqlFragment> {
-        use crate::search::{Cmp, QuantityBound};
-        let op = |cmp: Cmp| match cmp {
-            Cmp::Lt => "<",
-            Cmp::Le => "<=",
-            Cmp::Gt => ">",
-            Cmp::Ge => ">=",
-        };
-        let mut params = Vec::new();
-        let mut groups = Vec::new();
-        for group in &predicate.any_of {
-            let mut terms = Vec::new();
-            for bound in group {
-                let (col, cmp, v) = match *bound {
-                    QuantityBound::Low(cmp, v) => (low_col, cmp, v),
-                    QuantityBound::High(cmp, v) => (high_col, cmp, v),
-                };
-                params.push(SqlParam::float(map(v)?));
-                terms.push(format!(
-                    "{col} {} ?{}",
-                    op(cmp),
-                    param_num + params.len() - 1
-                ));
-            }
-            groups.push(terms.join(" AND "));
-        }
+        let (mut groups, params) =
+            Self::interval_groups(low_col, high_col, predicate, map, param_num)?;
         let sql = if groups.len() == 1 {
             groups.remove(0)
         } else {
@@ -186,6 +165,139 @@ impl QuantityHandler {
             )
         };
         Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// One SQL conjunction per group of `predicate`, and the values they
+    /// bind, numbered from `param_num`. A predicate with a
+    /// [`QuantityBound::RangeOnly`] marker (`ap`) binds one placeholder per
+    /// distinct value, so its groups can be read as separate selects, or
+    /// merged into one condition, over the same parameter list. The marker is
+    /// the Range-only test `high > low`, spelled exactly as the partial
+    /// indexes `idx_search_quantity_range` /
+    /// `idx_search_quantity_canonical_range` say it, which is what lets the
+    /// planner use them.
+    fn interval_groups(
+        low_col: &str,
+        high_col: &str,
+        predicate: &crate::search::QuantityIntervalPredicate,
+        map: impl Fn(f64) -> Option<f64>,
+        param_num: usize,
+    ) -> Option<(Vec<String>, Vec<SqlParam>)> {
+        use crate::search::Cmp;
+        let op = |cmp: Cmp| match cmp {
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        };
+        let share = predicate
+            .any_of
+            .iter()
+            .flatten()
+            .any(|b| matches!(b, QuantityBound::RangeOnly));
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        let mut groups = Vec::new();
+        for group in &predicate.any_of {
+            let mut terms = Vec::new();
+            for bound in group {
+                let (col, cmp, v) = match *bound {
+                    QuantityBound::Low(cmp, v) => (low_col, cmp, v),
+                    QuantityBound::High(cmp, v) => (high_col, cmp, v),
+                    QuantityBound::RangeOnly => {
+                        terms.push(format!("{high_col} > {low_col}"));
+                        continue;
+                    }
+                };
+                let v = map(v)?;
+                let placeholder = match seen.iter().find(|(bits, _)| share && *bits == v.to_bits())
+                {
+                    Some(&(_, n)) => n,
+                    None => {
+                        params.push(SqlParam::float(v));
+                        seen.push((v.to_bits(), param_num + params.len() - 1));
+                        param_num + params.len() - 1
+                    }
+                };
+                terms.push(format!("{col} {} ?{placeholder}", op(cmp)));
+            }
+            groups.push(terms.join(" AND "));
+        }
+        Some((groups, params))
+    }
+
+    /// The groups of a standalone `ap` search as separate conditions, each
+    /// with the stored unit/system tests (and, for a convertible UCUM code,
+    /// the canonical twins): `a ≤ L ≤ b` on the value index, and the Ranges
+    /// that start below the window and reach it, on the Range-only index.
+    /// They share one numbered parameter list, laid out as in
+    /// [`Self::build_sql_for`]. `None` for any other prefix or a value that
+    /// does not parse, which keep the single condition. The caller reads one
+    /// `SELECT` per condition, `UNION ALL`-ed: ORed, SQLite plans a
+    /// multi-index OR that costs more than both reads together.
+    pub(crate) fn build_alternatives(
+        value: &SearchValue,
+        param_offset: usize,
+    ) -> Option<(Vec<String>, Vec<SqlParam>)> {
+        if value.prefix != SearchPrefix::Ap {
+            return None;
+        }
+        let quantity = FhirQuantityValue::parse(&value.value).ok()?;
+        let (num_str, num_value) = (quantity.number.text(), quantity.number.value);
+        let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
+        let param_num = param_offset + 1;
+        let predicate =
+            crate::search::quantity_interval_predicate(value.prefix, num_value, num_str);
+        let (groups, mut params) = Self::interval_groups(
+            "value_quantity_value",
+            "value_quantity_high",
+            &predicate,
+            Some,
+            param_num,
+        )?;
+        let mut extra = Vec::new();
+        if let Some(sys) = system {
+            params.push(SqlParam::string(sys));
+            extra.push(format!(
+                "value_quantity_system = ?{}",
+                param_num + params.len() - 1
+            ));
+        }
+        if let Some(c) = code {
+            params.push(SqlParam::string(c));
+            extra.push(format!(
+                "value_quantity_unit = ?{}",
+                param_num + params.len() - 1
+            ));
+        }
+        let with_extra = |group: &str, extra: &[String]| {
+            std::iter::once(group.to_string())
+                .chain(extra.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let mut arms: Vec<String> = groups.iter().map(|g| with_extra(g, &extra)).collect();
+        if let Some(c) = code {
+            use helios_fhirpath::ucum::canonicalize_quantity as canon;
+            if let Some((_, unit)) = canon(num_value, c)
+                && let Some((canon_groups, canon_params)) = Self::interval_groups(
+                    "value_quantity_canonical_value",
+                    "value_quantity_canonical_high",
+                    &predicate,
+                    |bound| canon(bound, c).map(|(v, _)| v),
+                    param_num + params.len(),
+                )
+            {
+                params.extend(canon_params);
+                params.push(SqlParam::string(&unit));
+                let unit_test = format!(
+                    "value_quantity_canonical_unit = ?{}",
+                    param_num + params.len() - 1
+                );
+                arms.extend(canon_groups.iter().map(|g| format!("{g} AND {unit_test}")));
+            }
+        }
+        Some((arms, params))
     }
 
     /// Builds the numeric comparison part of the condition against `column`.
@@ -347,27 +459,49 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Ap, "100");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        // The shared window (#1390): [90, 110] around 100, as an interval
-        // overlap: `low <= 110 AND high >= 90`.
-        assert!(
-            frag.sql.contains("value_quantity_value <= ?1"),
-            "{}",
-            frag.sql
-        );
-        assert!(
-            frag.sql.contains("value_quantity_high >= ?2"),
-            "{}",
-            frag.sql
+        // The shared window (#1390): [90, 110] around 100, as the exact split
+        // of the interval overlap `low <= 110 AND high >= 90` (#2602): the
+        // points and every row starting inside the window, or the Ranges
+        // that start below it and reach it. One placeholder per distinct
+        // value.
+        assert_eq!(
+            frag.sql,
+            "((value_quantity_value >= ?1 AND value_quantity_value <= ?2) OR \
+             (value_quantity_value < ?1 AND value_quantity_high >= ?1 AND \
+             value_quantity_high > value_quantity_value))"
         );
         assert!(
             matches!(
                 frag.params.as_slice(),
-                [SqlParam::Float(hi), SqlParam::Float(lo), ..]
+                [SqlParam::Float(lo), SqlParam::Float(hi)]
                     if (lo - 90.0).abs() < 1e-9 && (hi - 110.0).abs() < 1e-9
             ),
             "{:?}",
             frag.params
         );
+    }
+
+    /// The standalone `ap` search reads the two groups as separate selects.
+    #[test]
+    fn ap_alternatives_share_one_parameter_list() {
+        let value = SearchValue::new(SearchPrefix::Ap, "100|http://unitsofmeasure.org|mg");
+        let (arms, params) = QuantityHandler::build_alternatives(&value, 2).unwrap();
+        assert_eq!(
+            arms,
+            vec![
+                "value_quantity_value >= ?3 AND value_quantity_value <= ?4 AND value_quantity_system = ?5 AND value_quantity_unit = ?6",
+                "value_quantity_value < ?3 AND value_quantity_high >= ?3 AND value_quantity_high > value_quantity_value AND value_quantity_system = ?5 AND value_quantity_unit = ?6",
+                "value_quantity_canonical_value >= ?7 AND value_quantity_canonical_value <= ?8 AND value_quantity_canonical_unit = ?9",
+                "value_quantity_canonical_value < ?7 AND value_quantity_canonical_high >= ?7 AND value_quantity_canonical_high > value_quantity_canonical_value AND value_quantity_canonical_unit = ?9",
+            ]
+        );
+        assert_eq!(params.len(), 7);
+        // Other prefixes keep the single condition.
+        for prefix in [SearchPrefix::Eq, SearchPrefix::Ge, SearchPrefix::Ne] {
+            assert!(
+                QuantityHandler::build_alternatives(&SearchValue::new(prefix, "100"), 0).is_none()
+            );
+        }
     }
 
     /// Defence in depth behind `validate_numeric_values` (#1340): a number

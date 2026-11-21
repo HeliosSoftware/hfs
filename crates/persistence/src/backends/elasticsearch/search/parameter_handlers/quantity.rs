@@ -36,6 +36,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
         interval_condition(
             "search_params.quantity.value",
             "search_params.quantity.high",
+            "search_params.quantity.range_high",
             prefix,
             number,
             Some,
@@ -57,6 +58,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
         let range = interval_condition(
             "search_params.quantity.canonical_value",
             "search_params.quantity.canonical_high",
+            "search_params.quantity.canonical_range_high",
             prefix,
             number,
             canon,
@@ -100,20 +102,43 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
 /// `low_field` for a document that has no `high_field`: one indexed before
 /// schema version 4 holds only points, so its `Quantity` and `Age` rows keep
 /// their results until `$reindex` (a point's high end is its value).
+///
+/// `ap` is the exception: it is `a ≤ L ≤ b` (the value alone, which finds every
+/// point, a document without `high` included) or a Range that starts below
+/// the window and reaches it. Only a proper Range has `range_high_field`, so
+/// the second arm reads that sparse field, with no fallback, and requires it
+/// to exist.
 fn interval_condition(
     low_field: &str,
     high_field: &str,
+    range_high_field: &str,
     prefix: SearchPrefix,
     number: &FhirNumberValue,
     map: impl Fn(f64) -> Option<f64>,
 ) -> Option<Value> {
     let predicate = number.interval_predicate(prefix);
     let mut groups = Vec::with_capacity(predicate.any_of.len());
+    let split = predicate
+        .any_of
+        .iter()
+        .flatten()
+        .any(|b| matches!(b, QuantityBound::RangeOnly));
     for group in &predicate.any_of {
         let mut clauses = Vec::with_capacity(group.len());
+        // The `ap` window on the value: one range with both ends.
+        let mut value_range = serde_json::Map::new();
+        let in_range_only_group = group.contains(&QuantityBound::RangeOnly);
         for bound in group {
             clauses.push(match *bound {
+                QuantityBound::Low(cmp, v) if split && !in_range_only_group => {
+                    value_range.insert(cmp_op(cmp).to_string(), json!(map(v)?));
+                    continue;
+                }
                 QuantityBound::Low(cmp, v) => range_on(low_field, cmp, map(v)?),
+                QuantityBound::High(cmp, v) if in_range_only_group => {
+                    range_on(range_high_field, cmp, map(v)?)
+                }
+                QuantityBound::RangeOnly => json!({ "exists": { "field": range_high_field } }),
                 QuantityBound::High(cmp, v) => {
                     let bound = map(v)?;
                     json!({
@@ -131,6 +156,12 @@ fn interval_condition(
                 }
             });
         }
+        if !value_range.is_empty() {
+            clauses.insert(
+                0,
+                json!({ "range": { low_field: Value::Object(value_range) } }),
+            );
+        }
         groups.push(if clauses.len() == 1 {
             clauses.remove(0)
         } else {
@@ -146,13 +177,17 @@ fn interval_condition(
 
 /// `{"range": {field: {op: bound}}}` for a comparison operator.
 fn range_on(field: &str, cmp: Cmp, bound: f64) -> Value {
-    let op = match cmp {
+    json!({ "range": { field: { cmp_op(cmp): bound } } })
+}
+
+/// The Elasticsearch `range` operator of a comparison.
+fn cmp_op(cmp: Cmp) -> &'static str {
+    match cmp {
         Cmp::Lt => "lt",
         Cmp::Le => "lte",
         Cmp::Gt => "gt",
         Cmp::Ge => "gte",
-    };
-    json!({ "range": { field: { op: bound } } })
+    }
 }
 
 #[cfg(test)]
@@ -280,14 +315,16 @@ mod tests {
     }
 
     /// `ap` is the shared window (#1390) against the interval: `L ≤ v+m ∧
-    /// H ≥ v−m`, on the raw and the canonical columns.
+    /// H ≥ v−m`, as the value window or a Range reaching it (#2602), on the
+    /// raw and the canonical columns.
     #[test]
     fn ap_uses_the_shared_approximate_window() {
         let clause = build_clause("value-quantity", "5.4", SearchPrefix::Ap).unwrap();
         let low = find_range(&clause, "search_params.quantity.value")
             .expect("low-end range clause must be present");
         assert!((low["lte"].as_f64().unwrap() - 5.94).abs() < 1e-9);
-        let high = find_high_range(&clause, "search_params.quantity.high")
+        assert!((low["gte"].as_f64().unwrap() - 4.86).abs() < 1e-9);
+        let high = find_range(&clause, "search_params.quantity.range_high")
             .expect("high-end range clause must be present");
         assert!((high["gte"].as_f64().unwrap() - 4.86).abs() < 1e-9);
 
@@ -305,7 +342,8 @@ mod tests {
         let low = find_range(&clause, "search_params.quantity.canonical_value")
             .expect("canonical low-end clause must be present");
         assert!((low["lte"].as_f64().unwrap() - canon(5.94)).abs() < 1e-12);
-        let high = find_high_range(&clause, "search_params.quantity.canonical_high")
+        assert!((low["gte"].as_f64().unwrap() - canon(4.86)).abs() < 1e-12);
+        let high = find_range(&clause, "search_params.quantity.canonical_range_high")
             .expect("canonical high-end clause must be present");
         assert!((high["gte"].as_f64().unwrap() - canon(4.86)).abs() < 1e-12);
     }
@@ -382,6 +420,49 @@ mod tests {
         assert!(
             s.contains(r#""search_params.quantity.system":"http://example.org""#),
             "{s}"
+        );
+    }
+
+    /// #2602: `ap` is the window on `value` (every point) or a Range that
+    /// starts below it and reaches it, read from the sparse `range_high`.
+    #[test]
+    fn ap_is_the_value_window_or_a_range_reaching_it() {
+        let clause = build_clause("value-quantity", "100", SearchPrefix::Ap).unwrap();
+        let raw = &clause["nested"]["query"]["bool"]["must"][1];
+        assert_eq!(
+            raw,
+            &json!({ "bool": { "should": [
+                { "range": { "search_params.quantity.value": { "gte": 90.0, "lte": 110.0 } } },
+                { "bool": { "must": [
+                    { "range": { "search_params.quantity.value": { "lt": 90.0 } } },
+                    { "range": { "search_params.quantity.range_high": { "gte": 90.0 } } },
+                    { "exists": { "field": "search_params.quantity.range_high" } }
+                ] } }
+            ], "minimum_should_match": 1 } })
+        );
+        // Neither arm reads `high`, so no fallback to `value` is needed.
+        let text = serde_json::to_string(&clause).unwrap();
+        assert!(!text.contains("quantity.high"), "{text}");
+    }
+
+    #[test]
+    fn ap_canonical_arm_uses_the_canonical_fields() {
+        let clause = build_clause(
+            "value-quantity",
+            "100|http://unitsofmeasure.org|mg",
+            SearchPrefix::Ap,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&clause).unwrap();
+        assert!(
+            text.contains("search_params.quantity.canonical_range_high"),
+            "{text}"
+        );
+        assert!(!text.contains("quantity.canonical_high"), "{text}");
+        let canonical = &clause["nested"]["query"]["bool"]["should"][1]["bool"]["must"][1];
+        assert_eq!(
+            canonical["bool"]["should"][1]["bool"]["must"][2],
+            json!({ "exists": { "field": "search_params.quantity.canonical_range_high" } })
         );
     }
 }

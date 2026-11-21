@@ -686,6 +686,14 @@ pub(crate) fn build_es_document(
                     qty["canonical_value"] = json!(cv);
                     qty["canonical_high"] = json!(ch);
                     qty["canonical_unit"] = json!(cu);
+                    if ch != cv {
+                        qty["canonical_range_high"] = json!(ch);
+                    }
+                }
+                // Only a proper Range carries `range_high`: `ap` reads the
+                // Ranges through it and the points through `value`.
+                if high_value != *value {
+                    qty["range_high"] = json!(high_value);
                 }
                 quantity_params.push(qty);
                 // A Range also indexes its upper bound as an extra entry with
@@ -3846,6 +3854,25 @@ mod tests {
             Some(crate::search::QUANTITY_OPEN_LOW)
         );
         assert!(rows[3]["canonical_high"].as_f64().unwrap().is_finite());
+        // Only a proper Range carries `range_high` / `canonical_range_high`.
+        assert!(rows[0].get("range_high").is_none());
+        assert!(rows[0].get("canonical_range_high").is_none());
+        assert_eq!(rows[1]["range_high"].as_f64(), Some(50.0));
+        assert_eq!(
+            rows[2]["range_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[2]["canonical_range_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(rows[3]["range_high"].as_f64(), Some(10.0));
+        assert!(
+            rows[3]["canonical_range_high"]
+                .as_f64()
+                .unwrap()
+                .is_finite()
+        );
     }
 
     /// #2602: a Range with a high bound apart from its low one adds exactly one

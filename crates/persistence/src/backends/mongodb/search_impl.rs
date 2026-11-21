@@ -32,8 +32,8 @@ use super::deferred_index::SEARCH_ROWS_PENDING_FIELD;
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
-    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
-    SEARCH_DATE_END_INDEX, SEARCH_QUANTITY_HIGH_INDEX, value_index_led_by,
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, QUANTITY_RANGE_HIGH_FIELD,
+    SEARCH_COMPOSITE_INDEX, SEARCH_DATE_END_INDEX, SEARCH_QUANTITY_HIGH_INDEX, value_index_led_by,
 };
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
@@ -256,17 +256,27 @@ fn build_date_range_filter_doc(value: &SearchValue, param: &str) -> StorageResul
 /// A value filter is either one conjunction or `{ "$or": [conjunction, ..] }`
 /// (see [`build_date_range_filter_doc`]); comma-separated values are OR'd, so
 /// the union of all arms is the same set of rows as the nested form matched.
+///
+/// A quantity filter (#2602) is the same shape plus sibling conditions on the
+/// system and code; those sit beside the `$or`, so they join every arm of it.
 fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> Document {
     let mut arms: Vec<Bson> = Vec::new();
-    for value_filter in value_filters {
-        let alternatives = match value_filter.get_array("$or") {
-            Ok(alternatives) if value_filter.len() == 1 => alternatives.clone(),
-            _ => vec![Bson::Document(value_filter)],
+    for mut value_filter in value_filters {
+        let alternatives = match value_filter.remove("$or") {
+            Some(Bson::Array(alternatives)) => alternatives,
+            _ => Vec::new(),
         };
+        if alternatives.is_empty() {
+            let mut arm = scope.clone();
+            arm.extend(value_filter);
+            arms.push(Bson::Document(arm));
+            continue;
+        }
         for alternative in alternatives {
             if let Bson::Document(conditions) = alternative {
                 let mut arm = scope.clone();
                 arm.extend(conditions);
+                arm.extend(value_filter.clone());
                 arms.push(Bson::Document(arm));
             }
         }
@@ -280,7 +290,10 @@ fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> D
 fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
     filter.remove("tenant_id");
     filter.remove("resource_type");
-    if param_type != SearchParamType::Date {
+    if !matches!(
+        param_type,
+        SearchParamType::Date | SearchParamType::Quantity
+    ) {
         return;
     }
     if let Ok(arms) = filter.get_array_mut("$or") {
@@ -5410,8 +5423,12 @@ impl MongoBackend {
         // reading the documents, not as a covered scan; an `$or` at the top,
         // every arm carrying the scope itself, plans one index scan per arm.
         // The alternatives and their OR are unchanged; only where they sit.
-        if param.param_type == SearchParamType::Date
-            && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+        // #2602: a quantity is an interval, so `ap` and `ne` are alternatives
+        // of their own, and the same placement lets each arm seek its index.
+        if matches!(
+            param.param_type,
+            SearchParamType::Date | SearchParamType::Quantity
+        ) && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
         {
             return Ok(scoped_date_alternatives(&filter, value_filters));
         }
@@ -6521,10 +6538,23 @@ impl MongoBackend {
         use crate::search::{Cmp, QuantityBound};
         let group_doc = |group: &[QuantityBound]| {
             let mut doc = Document::new();
+            let high_field = if group.contains(&QuantityBound::RangeOnly) {
+                QUANTITY_RANGE_HIGH_FIELD
+            } else {
+                VALUE_QUANTITY_HIGH
+            };
             for bound in group {
                 let (field, cmp, v) = match *bound {
                     QuantityBound::Low(c, v) => ("value_quantity_value", c, v),
-                    QuantityBound::High(c, v) => (VALUE_QUANTITY_HIGH, c, v),
+                    QuantityBound::High(c, v) => (high_field, c, v),
+                    // A proper Range (low < high) is the one that carries the
+                    // sparse `value_quantity_range_high`, so the shared
+                    // predicate's `[Low(Lt,a), High(Ge,a), RangeOnly]` group
+                    // is `value < a AND range_high >= a`: its `High` bound
+                    // moves to that field (a `$gte` also implies it exists,
+                    // which is `RangeOnly`) and serves
+                    // `idx_search_quantity_range` with no hint.
+                    QuantityBound::RangeOnly => continue,
                 };
                 let op = match cmp {
                     Cmp::Lt => "$lt",
@@ -7822,20 +7852,71 @@ mod date_filter_tests {
         assert_eq!(low("lt45"), doc! { "$lt": 45.0 });
         assert_eq!(low("le45"), doc! { "$lte": 45.0 });
         assert_eq!(low("sa45"), doc! { "$gt": 45.0 });
-        // `ap`: the interval overlaps the approximation window.
+        // `ap`: a point in the window, or a proper Range that starts below it
+        // and reaches it; the second arm is on the sparse range-high field.
         let ap = filter("ap45");
-        assert!(
-            ap.get_document("value_quantity_value")
-                .unwrap()
-                .contains_key("$lte")
+        let arms = ap.get_array("$or").unwrap();
+        assert_eq!(arms.len(), 2);
+        let (lo, hi) = crate::search::FhirNumberValue::parse("45")
+            .unwrap()
+            .approx_range();
+        assert_eq!(
+            arms[0].as_document().unwrap(),
+            &doc! { "value_quantity_value": { "$gte": lo, "$lte": hi } }
         );
-        assert!(
-            ap.get_document("value_quantity_high")
-                .unwrap()
-                .contains_key("$gte")
+        assert_eq!(
+            arms[1].as_document().unwrap(),
+            &doc! {
+                "value_quantity_value": { "$lt": lo },
+                "value_quantity_range_high": { "$gte": lo },
+            }
         );
         let ne = filter("ne45");
         assert_eq!(ne.get_array("$or").unwrap().len(), 2);
+    }
+
+    /// #2602: `ap` reaches the index as a top-level `$or` whose arms each repeat
+    /// the scope and the system/code, so each arm seeks its own index: the
+    /// point window `idx_search_quantity_v2`, the Range-only arm
+    /// `idx_search_quantity_range` (with no hint).
+    #[test]
+    fn ap_is_a_scoped_top_level_or_with_the_range_arm_on_the_sparse_field() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "onset-age".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse("ap45|http://unitsofmeasure.org|a")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend
+            .build_search_index_filter("t1", "Condition", &param)
+            .unwrap();
+        assert_eq!(filter.keys().collect::<Vec<_>>(), vec!["$or"], "{filter:?}");
+        let (lo, hi) = crate::search::FhirNumberValue::parse("45")
+            .unwrap()
+            .approx_range();
+        let scope = |arm: Document| {
+            let mut full = doc! {
+                "tenant_id": "t1", "resource_type": "Condition", "param_name": "onset-age",
+            };
+            full.extend(arm);
+            full.insert("value_quantity_system", "http://unitsofmeasure.org");
+            full.insert("value_quantity_unit", "a");
+            Bson::Document(full)
+        };
+        assert_eq!(
+            filter.get_array("$or").unwrap(),
+            &vec![
+                scope(doc! { "value_quantity_value": { "$gte": lo, "$lte": hi } }),
+                scope(doc! {
+                    "value_quantity_value": { "$lt": lo },
+                    "value_quantity_range_high": { "$gte": lo },
+                }),
+            ]
+        );
     }
 
     /// A Range (low 40, high 50) is found by the filter the way the shared
@@ -7845,10 +7926,13 @@ mod date_filter_tests {
         let eval = |doc: &Document, low: f64, high: f64| -> bool {
             let group = |d: &Document| {
                 d.iter().all(|(field, cond)| {
-                    let stored = if field == "value_quantity_high" {
-                        high
-                    } else {
-                        low
+                    let stored = match field.as_str() {
+                        "value_quantity_high" => high,
+                        // Sparse: present only on a proper Range, and a
+                        // condition on an absent field matches nothing.
+                        "value_quantity_range_high" if low < high => high,
+                        "value_quantity_range_high" => return false,
+                        _ => low,
                     };
                     cond.as_document().unwrap().iter().all(|(op, v)| {
                         let v = v.as_f64().unwrap();

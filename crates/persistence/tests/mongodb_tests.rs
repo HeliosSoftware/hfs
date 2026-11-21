@@ -19587,14 +19587,16 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
 /// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
 /// Generation 7: `idx_search_date_end` (descending date sorts, #2588).
-/// Generation 8: `idx_search_quantity_high` (quantity `Range` intervals, #2602).
-const CURRENT_BACKGROUND_NAMES: [&str; 13] = [
+/// Generation 8: `idx_search_quantity_high` and `idx_search_quantity_range`
+/// (quantity `Range` intervals, #2602).
+const CURRENT_BACKGROUND_NAMES: [&str; 14] = [
     "idx_search_composite_tuple_qty",
     "idx_search_date_end",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_high",
+    "idx_search_quantity_range",
     "idx_search_quantity_v2",
     "idx_search_reference_target_v2",
     "idx_search_reference_v2",

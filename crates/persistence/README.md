@@ -685,7 +685,7 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
-**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high`, `quantity.canonical_high` and `quantity.sort_name` (schema version 4), added in place; no document is rewritten. `Quantity` and `Age` need nothing: filters fall back to `value` for an entry without `high`, and every quantity sort reads `value`. A `Range` with `low != high` also indexes a second, sort-only nested entry (`sort_name` and its upper bound as `value`, no `name`, so no filter or `:missing` sees it) that a descending sort selects. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored before the upgrade were never indexed, so run `POST /<type>/$reindex` (per tenant) once to make them searchable and sortable by their upper bound. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version warning under [Rolling back from #2602](#rolling-back-from-2602).
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high`, `quantity.canonical_high` and `quantity.sort_name` (schema version 4), added in place; no document is rewritten. `Quantity` and `Age` need nothing: filters fall back to `value` for an entry without `high`, and every quantity sort reads `value`. A `Range` with `low != high` also indexes a second, sort-only nested entry (`sort_name` and its upper bound as `value`, no `name`, so no filter or `:missing` sees it) that a descending sort selects. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored before the upgrade were never indexed, so run `POST /<type>/$reindex` (per tenant) once to make them searchable and sortable by their upper bound. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version notes under "Mixed versions during the upgrade" and [Rolling back from #2602](#rolling-back-from-2602).
 
 ```bash
 # Build with Elasticsearch support
@@ -3014,18 +3014,42 @@ Existing `Quantity` and `Age`
 values keep working unchanged, but `Range` values stored earlier were never
 indexed, so they are searchable only after you run `POST /$reindex` once.
 
-**Mixed versions during the upgrade.** (Elasticsearch needs no backfill: an
-older instance writing after the upgrade indexes no `Range` at all, and its
-`Quantity`/`Age` entries without `high` still match through the `value`
-fallback and sort by `value`; a `Range` stored by a build that lacks the
-sort-only entry sorts by its low bound until `$reindex`.) For the other
-backends, no older (pre-#2602) instance may keep writing after the backfill. A row written by an older build after the backfill
-has no high bound and does not match `eq`, `gt`, `ge`, `eb` or `ap`. The MongoDB
-backfill runs once per recorded generation, and PostgreSQL's runs inside
-migration v56, so neither covers a later write by an old instance. Stop the old
-instances before (or at) the upgrade. If one wrote after the backfill, re-run
-the backfill (MongoDB: lower the recorded generation, see
-[Rolling back from #2602](#rolling-back-from-2602)) or run `POST /$reindex`.
+**Mixed versions during the upgrade.** A pre-#2602 instance writes quantity
+rows without an upper bound. On SQLite, PostgreSQL and MongoDB such a row does
+not match `eq`, `gt`, `ge`, `eb` or `ap`, matches `ne` only below the searched
+range, and counts as missing in a descending sort. Per backend:
+
+- **PostgreSQL.** Migration v56 installs, when it upgrades an existing database,
+  a temporary `BEFORE INSERT` trigger,
+  `trg_search_index_quantity_high` (function `hfs_search_index_quantity_high`),
+  that fills `value_quantity_high` (and the canonical one) when an old writer
+  leaves it `NULL`. Its `WHEN` clause means current builds never run it
+  (measured: no cost for current writers; +10-50% on inserts only from an old
+  writer), so a rolling update is safe. A database created by a build that already has
+  v56 has no older writer and gets no trigger and no function. The trigger is temporary: a later
+  migration (v57: `DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index; DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();`)
+  removes it, no earlier than the second release after the one that ships
+  #2602 and only once the upgrade notes forbid skipping that release. Until
+  then, skipping the #2602 release in a rolling update is unsupported.
+  Planned removal: trigger `trg_search_index_quantity_high` (see migration v57 note) — tracked in the follow-up task.
+  To check, `SELECT count(*) FROM search_index WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL`
+  returns 0 once healed.
+- **MongoDB.** The schema version is now 18, so a pre-#2602 binary (schema 17)
+  refuses to start against an upgraded database (a binary already running is
+  not stopped). Every startup of a current build looks for quantity rows
+  without `value_quantity_high` and repairs them in batches, logging a warning
+  with the number of rows healed; a non-zero count means an old writer was
+  active. Rows written by an old instance after the last current instance
+  started are repaired at the next startup, so after stopping the last old
+  instance, restart one current instance. For the effect of
+  `HFS_MONGODB_INDEX_BUILD=off` on the repair, see the index build setting in
+  [search-indexes.md](mongodb/search-indexes.md#hfs_mongodb_index_build).
+  The same `count` check, as `countDocuments({ value_quantity_value: { $exists: true }, value_quantity_high: { $exists: false } })`, returns 0 once healed.
+- **SQLite.** One process per file; an older build is refused by the schema
+  version (49). Never run two builds against one file.
+- **Elasticsearch.** Nothing to do: filters fall back to `value` for a
+  document without `high`, and sorts read `value`. A `Range` stored by a build
+  that lacks the sort-only entry sorts by its low bound until `$reindex`.
 
 #### Rolling back from #2602
 
@@ -3048,15 +3072,27 @@ PostgreSQL (`DROP INDEX CONCURRENTLY` cannot run inside a transaction block;
 the columns exist only on `search_index`):
 
 ```sql
+DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
 DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_high;
 DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_range;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_range;
 ALTER TABLE search_index DROP COLUMN value_quantity_high;
 ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+-- v56 rebuilt idx_search_quantity_recent with value_quantity_high in its
+-- payload, so DROP COLUMN above dropped it; restore the v20 definition.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_quantity_recent
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_quantity_value, value_quantity_unit)
+  WHERE value_quantity_value IS NOT NULL;
 UPDATE schema_version SET version = 55;
 ```
 
 MongoDB: run `mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/quantity-high-rollback.mongosh.js`
 with `HFS_MONGODB_DATABASE` exported (see [Downgrading](mongodb/search-indexes.md#downgrading)).
+The script also lowers the recorded schema version from 18 back to 17, so an
+older binary then runs again.
 **Warning:** an older binary reads a `Range`'s low as a plain point value, and
 an open-low `Range` stores `f64::MIN`. Before running the old binary, delete the
 `Range` rows (`db.search_index.deleteMany({ value_quantity_high: { $exists: true }, $expr: { $ne: ["$value_quantity_high", "$value_quantity_value"] } })`,

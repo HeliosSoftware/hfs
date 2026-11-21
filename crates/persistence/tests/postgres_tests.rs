@@ -6318,8 +6318,9 @@ mod postgres_integration {
             .execute(
                 "UPDATE search_index SET value_quantity_high = value_quantity_value,
              value_quantity_canonical_high = value_quantity_canonical_value
-             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
-                &[],
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
             )
             .await
             .unwrap();
@@ -6750,8 +6751,9 @@ mod postgres_integration {
             .execute(
                 "UPDATE search_index SET value_quantity_high = value_quantity_value,
              value_quantity_canonical_high = value_quantity_canonical_value
-             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
-                &[],
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
             )
             .await
             .unwrap();
@@ -6887,6 +6889,168 @@ mod postgres_integration {
             "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
         );
         assert_eq!(result.resources.items[0].id(), "obs-mass-pg");
+    }
+
+    /// An instance older than #2602 keeps writing after the v56 backfill and
+    /// inserts quantity rows with `value_quantity_high` NULL. The temporary
+    /// trigger fills it, so `eq`/`gt`/`ap` and `_sort` still see those rows.
+    #[tokio::test]
+    async fn postgres_integration_old_writer_quantity_rows_are_filled_by_trigger() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+        };
+
+        // A database the ladder creates has no trigger. The trigger protects an
+        // UPGRADE from a pre-#2602 build, so own a database, take v56 back out of
+        // it (as that build left it) and migrate again, which is the path that
+        // installs the trigger. Dropping the columns drops the indexes built on
+        // them; the old newest-first index is put back as that build had it.
+        let backend = hfs1407_backend(false).await;
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high' AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 0, "a fresh database has no trigger");
+            client
+                .batch_execute(
+                    "DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+                     DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+                     DROP INDEX IF EXISTS idx_search_quantity_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_range;
+                     DROP INDEX IF EXISTS idx_search_quantity_canonical_range;
+                     ALTER TABLE search_index
+                         DROP COLUMN value_quantity_high,
+                         DROP COLUMN value_quantity_canonical_high;
+                     DROP INDEX IF EXISTS idx_search_quantity_recent;
+                     CREATE INDEX idx_search_quantity_recent
+                         ON search_index (tenant_id, resource_type, param_name,
+                                          last_updated DESC, resource_id ASC)
+                         INCLUDE (value_quantity_value, value_quantity_unit)
+                         WHERE value_quantity_value IS NOT NULL;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version (version) VALUES (55);",
+                )
+                .await
+                .expect("take v56 back out of the database");
+        }
+        backend
+            .init_schema()
+            .await
+            .expect("migrate v55 to v56 as an upgrade");
+        {
+            let client = backend.get_client().await.unwrap();
+            let triggers: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_trigger
+                     WHERE tgname = 'trg_search_index_quantity_high'
+                       AND tgrelid = 'search_index'::regclass AND NOT tgisinternal",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(triggers, 1, "the upgrade installs the trigger exactly once");
+        }
+        let tenant = create_tenant("old-writer-quantity");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for (id, value) in [("ow-10", 10), ("ow-20", 20), ("ow-30", 30)] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                        "valueQuantity": { "value": value, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Re-insert each quantity row the way an old build does: the same
+        // columns, but no upper bound.
+        let client = backend.get_client().await.unwrap();
+        let moved = client
+            .execute(
+                "WITH d AS (
+                     DELETE FROM search_index
+                     WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                     RETURNING *)
+                 INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+                 SELECT tenant_id, resource_type, resource_id, param_name,
+                     value_quantity_value, value_quantity_unit, value_quantity_system,
+                     value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+                 FROM d",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved, 3);
+        let unfilled: i64 = client
+            .query_one(
+                "SELECT count(*) FROM search_index
+                 WHERE tenant_id = $1 AND param_name = 'value-quantity'
+                   AND (value_quantity_high IS DISTINCT FROM value_quantity_value
+                        OR value_quantity_canonical_high IS DISTINCT FROM value_quantity_canonical_value)",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(unfilled, 0, "the trigger must fill high at insert");
+        drop(client);
+
+        let find = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::parse(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for (value, expected) in [
+            ("gt15", vec!["ow-20", "ow-30"]),
+            ("20", vec!["ow-20"]),
+            ("ap20", vec!["ow-20"]),
+        ] {
+            let result = backend.search(&tenant, &find(value)).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "value-quantity={value}");
+        }
+        let sorted =
+            SearchQuery::new("Observation").with_sort(SortDirective::parse("-value-quantity"));
+        let ids: Vec<String> = backend
+            .search(&tenant, &sorted)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, ["ow-30", "ow-20", "ow-10"]);
     }
 
     #[tokio::test]
@@ -9076,8 +9240,9 @@ mod postgres_integration {
             .execute(
                 "UPDATE search_index SET value_quantity_high = value_quantity_value,
              value_quantity_canonical_high = value_quantity_canonical_value
-             WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL",
-                &[],
+             WHERE tenant_id = $1 AND value_quantity_value IS NOT NULL
+               AND value_quantity_high IS NULL",
+                &[&tenant_id],
             )
             .await
             .unwrap();
@@ -9402,9 +9567,10 @@ mod postgres_integration {
              CASE WHEN n <= 165 THEN 'Patient/anchor' ELSE 'Patient/decoy-' || n%12 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         client.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value) \
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value, value_quantity_high) \
              SELECT $1, 'Observation', 'plan-' || n, 'code-value-quantity', 0, 'http://loinc.org', \
              CASE WHEN n <= 3 OR n > 165 THEN '8302-2' ELSE '1234' END, \
+             CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END, \
              CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END \
              FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
         // Real Observation writes also index these seven parameter names;
@@ -35552,6 +35718,13 @@ mod postgres_integration {
     /// one must be served by `idx_search_quantity_high`, not a scan.
     #[tokio::test]
     async fn postgres_integration_quantity_high_index_serves_upper_bound_prefixes() {
+        use helios_persistence::backends::postgres::search::query_builder::{
+            PostgresQueryBuilder, SqlParam,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
         let backend = create_backend().await;
         let tenant = create_tenant("quantity-high-explain");
         let tenant_id = tenant.tenant_id().as_str();
@@ -35575,18 +35748,39 @@ mod postgres_integration {
             .await
             .unwrap();
         client.batch_execute("ANALYZE search_index").await.unwrap();
-        for predicate in ["value_quantity_high > 990", "value_quantity_high < 10"] {
+        // The predicate is the one the builder really emits for the search, not
+        // a hand-written one: whatever it adds or omits is what must be served.
+        for (prefix, value) in [(SearchPrefix::Gt, "990"), (SearchPrefix::Eb, "10")] {
+            let query = SearchQuery::new("Condition").with_parameter(SearchParameter {
+                name: "onset-age".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect("the query builds")
+                .expect("a condition");
+            let mut predicate = PostgresQueryBuilder::single_index_predicate(&fragment.sql)
+                .expect("a lone membership test")
+                .to_string();
+            for (i, param) in fragment.params.iter().enumerate().rev() {
+                let SqlParam::Float(v) = param else {
+                    panic!("unexpected bind {param:?}");
+                };
+                predicate = predicate.replace(&format!("${}", i + 3), &format!("({v:?}::float8)"));
+            }
             let sql = format!(
                 "EXPLAIN (FORMAT JSON) SELECT resource_id FROM search_index
-                 WHERE tenant_id = $1 AND resource_type = 'Condition' AND param_name = 'onset-age'
-                 AND value_quantity_value IS NOT NULL AND {predicate}"
+                 WHERE tenant_id = $1 AND resource_type = 'Condition' AND {predicate}"
             );
             let plan: serde_json::Value =
                 client.query_one(&sql, &[&tenant_id]).await.unwrap().get(0);
             let text = plan.to_string();
             assert!(
                 text.contains("idx_search_quantity_high"),
-                "{predicate}: expected idx_search_quantity_high: {text}"
+                "{prefix:?}: expected idx_search_quantity_high: {text}\n{sql}"
             );
         }
     }

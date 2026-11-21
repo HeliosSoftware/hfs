@@ -83,7 +83,10 @@ use super::backend::ElasticsearchBackend;
 ///   Documents indexed before it have no `high`, and the quantity search
 ///   falls back to `value` for them, so `Quantity` and `Age` results do not
 ///   change; a stored `Range` produced no row at all and is not found until a
-///   `$reindex`. Also `.sort_name`: a Range with `low != high` adds a second,
+///   `$reindex`. Also `.range_high` and `.canonical_range_high`, written only
+///   on a Range (`high != value`), which `ap` reads for the Ranges that start
+///   below its window; a point or a pre-upgrade document is found by `value`
+///   alone. Also `.sort_name`: a Range with `low != high` adds a second,
 ///   sort-only entry (`sort_name` and its upper bound as `value`, no `name`)
 ///   that a descending sort reads, so every sort reads `value` and no
 ///   document is rewritten on upgrade.
@@ -243,6 +246,12 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 // sentinel, ES cannot store ±Inf).
                                 "value": { "type": "double" },
                                 "high": { "type": "double" },
+                                // Only on a proper Range (`high != value`): its
+                                // upper end again, in a field no point has, so
+                                // `ap` reads the Ranges alone (`range_high` for
+                                // the raw unit, `canonical_range_high` for the
+                                // UCUM-canonical one).
+                                "range_high": { "type": "double" },
                                 // Sort-only entries (no `name`, so no filter or
                                 // `:missing` ever selects one): a Range's upper
                                 // bound as an extra `value`, tagged with the
@@ -255,6 +264,7 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 // for unit-equivalent quantity search (g ⇄ mg).
                                 "canonical_value": { "type": "double" },
                                 "canonical_high": { "type": "double" },
+                                "canonical_range_high": { "type": "double" },
                                 "canonical_unit": { "type": "keyword" }
                             }
                         },
@@ -1579,6 +1589,8 @@ mod tests {
             ["properties"];
         assert_eq!(quantity["high"]["type"], "double");
         assert_eq!(quantity["canonical_high"]["type"], "double");
+        assert_eq!(quantity["range_high"]["type"], "double");
+        assert_eq!(quantity["canonical_range_high"]["type"], "double");
         assert_eq!(quantity["sort_name"]["type"], "keyword");
     }
 

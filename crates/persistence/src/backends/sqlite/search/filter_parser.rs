@@ -1011,21 +1011,24 @@ mod date_filter_tests {
     }
 
     /// #1503, #2602: `ap` on a quantity column is the shared closed window,
-    /// matched against the stored interval (overlap; a point is `BETWEEN`).
+    /// matched against the stored interval (overlap, as the exact two-group split).
     #[test]
     fn filter_quantity_ap_is_the_shared_window() {
         let frag = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("value-quantity ap 100").unwrap());
         assert!(
-            frag.sql
-                .contains("value_quantity_value <= ?2 AND value_quantity_high >= ?3"),
+            frag.sql.contains(
+                "(value_quantity_value >= ?2 AND value_quantity_value <= ?3) OR \
+                 (value_quantity_value < ?2 AND value_quantity_high >= ?2 AND \
+                 value_quantity_high > value_quantity_value)"
+            ),
             "{}",
             frag.sql
         );
         assert!(!frag.sql.contains("LIKE"), "{}", frag.sql);
         assert_eq!(frag.params.len(), 2);
-        assert!(matches!(frag.params[0], SqlParam::Float(v) if (v - 110.0).abs() < 1e-9));
-        assert!(matches!(frag.params[1], SqlParam::Float(v) if (v - 90.0).abs() < 1e-9));
+        assert!(matches!(frag.params[0], SqlParam::Float(v) if (v - 90.0).abs() < 1e-9));
+        assert!(matches!(frag.params[1], SqlParam::Float(v) if (v - 110.0).abs() < 1e-9));
     }
 
     #[test]
@@ -1034,8 +1037,11 @@ mod date_filter_tests {
             .generate(&FilterParser::parse("age ap 5 and name eq Smith").unwrap());
         assert_eq!(frag.params.len(), 3);
         assert!(
-            frag.sql
-                .contains("value_quantity_value <= ?2 AND value_quantity_high >= ?3"),
+            frag.sql.contains(
+                "(value_quantity_value >= ?2 AND value_quantity_value <= ?3) OR \
+                 (value_quantity_value < ?2 AND value_quantity_high >= ?2 AND \
+                 value_quantity_high > value_quantity_value)"
+            ),
             "{}",
             frag.sql
         );

@@ -32,7 +32,7 @@ pub const SCHEMA_VERSION: i32 = 49;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 20] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 22] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -92,6 +92,14 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 20] = [
     (
         "idx_search_quantity_canonical_high",
         "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical_high ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value) WHERE value_quantity_canonical_high IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_range",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_range ON search_index(tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value, value_quantity_unit, resource_key) WHERE value_quantity_high > value_quantity_value",
+    ),
+    (
+        "idx_search_quantity_canonical_range",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical_range ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value, resource_key) WHERE value_quantity_canonical_high > value_quantity_canonical_value",
     ),
     (
         "idx_search_string_folded",
@@ -180,7 +188,7 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 }
 
 /// The [`SEARCH_VALUE_INDEXES`] entries a bulk index rebuild drops for the
-/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the other nine stay and are
+/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the others stay and are
 /// maintained row by row while it runs.
 ///
 /// Every `CREATE INDEX` at the end of a bulk run is one full scan of
@@ -196,7 +204,10 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 /// `_uri`, `_identifier_type`, `_contained`, the two `_legacy` composite
 /// indexes and `_composite_cov` — are a small share between them, so
 /// maintaining them inline costs seconds and skipping their rebuild saves
-/// nine scans. Startup self-heal ([`ensure_search_value_indexes`]) checks the
+/// nine scans. The two Range-only quantity indexes (`_quantity_range`,
+/// `_quantity_canonical_range`, #2602) are kept too: a partial index over
+/// the few rows with `high > value` costs one cheap scan to build and nothing
+/// to maintain. Startup self-heal ([`ensure_search_value_indexes`]) checks the
 /// full list, so a process that dies inside the window is healed whatever
 /// subset is missing.
 pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 8] = [
@@ -2708,6 +2719,9 @@ fn migrate_v47_to_v48(conn: &Connection) -> StorageResult<()> {
 /// canonical). Rows of a stored `Range` were never indexed and need
 /// `POST /$reindex`. The backfill runs in rowid batches of one transaction
 /// each; the high-leading partial indexes are built afterwards over final data.
+/// The two `_range` indexes hold only proper Ranges (`high > value`), which
+/// no database held before this version, so they need no backfill: `ap` reads
+/// the points from the value index and the Ranges from them.
 fn migrate_v48_to_v49(conn: &Connection) -> StorageResult<()> {
     let columns = table_columns(conn, "search_index")?;
     for column in ["value_quantity_high", "value_quantity_canonical_high"] {
@@ -2756,7 +2770,13 @@ fn migrate_v48_to_v49(conn: &Connection) -> StorageResult<()> {
     }
 
     for (name, sql) in SEARCH_VALUE_INDEXES {
-        if name == "idx_search_quantity_high" || name == "idx_search_quantity_canonical_high" {
+        if matches!(
+            name,
+            "idx_search_quantity_high"
+                | "idx_search_quantity_canonical_high"
+                | "idx_search_quantity_range"
+                | "idx_search_quantity_canonical_range"
+        ) {
             conn.execute(sql, [])
                 .map_err(|e| migration_err(format!("v49 create {name}: {e}")))?;
         }
@@ -4547,7 +4567,7 @@ mod tests {
 
     /// v48 -> v49 adds the quantity upper bound columns, backfills
     /// `high = value` (raw and canonical) for existing quantity rows, leaves
-    /// non-quantity rows NULL, and builds the high-leading indexes (#2602).
+    /// non-quantity rows NULL, and builds the high-leading and Range-only indexes (#2602).
     #[test]
     fn migrate_v48_to_v49_backfills_quantity_high() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4556,6 +4576,10 @@ mod tests {
         conn.execute("DROP INDEX idx_search_quantity_high", [])
             .unwrap();
         conn.execute("DROP INDEX idx_search_quantity_canonical_high", [])
+            .unwrap();
+        conn.execute("DROP INDEX idx_search_quantity_range", [])
+            .unwrap();
+        conn.execute("DROP INDEX idx_search_quantity_canonical_range", [])
             .unwrap();
         conn.execute(
             "ALTER TABLE search_index DROP COLUMN value_quantity_high",
@@ -4603,12 +4627,29 @@ mod tests {
         let index_count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index'
-                   AND name IN ('idx_search_quantity_high', 'idx_search_quantity_canonical_high')",
+                   AND name IN ('idx_search_quantity_high', 'idx_search_quantity_canonical_high',
+                                'idx_search_quantity_range', 'idx_search_quantity_canonical_range')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(index_count, 2);
+        assert_eq!(index_count, 4);
+        // The Range-only indexes hold no row of a database that never indexed
+        // a Range: every migrated row is a point.
+        for index in [
+            "idx_search_quantity_range",
+            "idx_search_quantity_canonical_range",
+        ] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = ?1",
+                    [index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("WHERE value_quantity_"), "{sql}");
+            assert!(sql.contains("_high > value_quantity_"), "{sql}");
+        }
         // A replay is a no-op.
         migrate_v48_to_v49(&conn).unwrap();
     }

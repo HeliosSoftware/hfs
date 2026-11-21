@@ -137,6 +137,18 @@ const ONSET_CASES: &[(&str, &[&str])] = &[
     ("ap45", &["c-age", "c-range"]),
     ("ap5", &["c-high"]),
     ("ap100", &["c-low"]),
+    // ap against the edges of a Range, a Range below or above the window and
+    // the open sides (#2602): `[40, 50]` is reached from either end, and a
+    // window left of it, right of it or in the gap matches none of it.
+    ("ap40", &["c-range"]),
+    ("ap50", &["c-age", "c-range"]),
+    ("ap52", &["c-range"]),
+    ("ap55", &["c-low", "c-range"]),
+    ("ap60", &["c-low"]),
+    ("ap20", &[]),
+    ("ap10", &["c-high"]),
+    ("ap0", &["c-high"]),
+    ("ap1000", &["c-low"]),
 ];
 
 /// `Condition?abatement-age=` value -> the Conditions it must match.
@@ -155,6 +167,14 @@ const ABATEMENT_CASES: &[(&str, &[&str])] = &[
     ("eb40", &["c-abate"]),
     ("eb30", &[]),
     ("ap25", &["c-abate"]),
+    // The window touches the Range from below and from above, spans it, or
+    // misses it on either side.
+    ("ap20", &["c-abate"]),
+    ("ap30", &["c-abate"]),
+    ("ap33", &["c-abate"]),
+    ("ap34", &[]),
+    ("ap15", &[]),
+    ("ap5", &[]),
 ];
 
 /// `ValueSet?context-quantity=` value -> the ValueSets it must match.

@@ -141,6 +141,12 @@ pub enum QuantityBound {
     Low(Cmp, f64),
     /// `H <cmp> bound`, on the upper end (the `high` column).
     High(Cmp, f64),
+    /// The row is a proper `Range`: `L < H`. A marker, not a comparison with
+    /// a bound: a translator adds the Range-only condition so the index (or
+    /// field) that holds only Ranges answers the group. Only the `ap` second
+    /// group carries it, where `L < a <= H` already implies it, so it never
+    /// changes a result.
+    RangeOnly,
 }
 
 /// Prefix semantics of a quantity search against a stored closed interval
@@ -160,6 +166,7 @@ impl QuantityIntervalPredicate {
             group.iter().all(|b| match *b {
                 QuantityBound::Low(c, v) => c.holds(low, v),
                 QuantityBound::High(c, v) => c.holds(high, v),
+                QuantityBound::RangeOnly => low < high,
             })
         })
     }
@@ -170,12 +177,18 @@ impl QuantityIntervalPredicate {
 ///
 /// | prefix | condition on `[L, H]` |
 /// |---|---|
-/// | `eq` | `s ≤ L ∧ H < e` (`[s, e)` = implicit range) |
-/// | `ne` | `L < s ∨ H ≥ e` |
+/// | `eq` | `s ≤ L ∧ H < e` (`[s, e)` = implicit range), plus the implied `L < e ∧ H ≥ s` |
+/// | `ne` | `L < s ∨ H ≥ e` (exact complement of `eq` for `L ≤ H`) |
 /// | `gt` / `ge` | `H > v` / `H ≥ v` |
 /// | `lt` / `le` | `L < v` / `L ≤ v` |
 /// | `sa` / `eb` | `L > v` / `H < v` |
-/// | `ap` | `L ≤ v+m ∧ H ≥ v−m` |
+/// | `ap` | `L ≤ b ∧ H ≥ a`, for the window `[a, b] = [v−m, v+m]`, as two disjoint groups: `a ≤ L ≤ b` ∨ `(L < a ∧ H ≥ a ∧ RangeOnly)` |
+///
+/// The `ap` split is exact: `L ≤ b ∧ H ≥ a ⇔ (a ≤ L ≤ b) ∨ (L < a ∧ H ≥ a ∧
+/// L < H)`. The first group is the two-sided range on the value column, which
+/// finds every point without reading `H`; the second can only match a proper
+/// `Range` (`H ≥ a > L` implies `L < H`), so it runs on an index that holds
+/// only Ranges. The groups are disjoint (`L ≥ a` against `L < a`).
 pub fn quantity_interval_predicate(
     prefix: SearchPrefix,
     value: f64,
@@ -185,7 +198,18 @@ pub fn quantity_interval_predicate(
     let any_of = match prefix {
         SearchPrefix::Eq => {
             let (s, e) = implicit_range(value, num_str);
-            vec![vec![Low(Cmp::Ge, s), High(Cmp::Lt, e)]]
+            // `s <= L` and `H < e` are the whole condition. `L < e` and
+            // `H >= s` follow from them on every stored interval (`L <= H`),
+            // so they never change the result; they give the low column a
+            // two-sided range (`s <= L < e`) and the high column a lower
+            // bound, which the (value, ...) and (high, value, ...) indexes
+            // can seek. A point row would otherwise scan every `L >= s`.
+            vec![vec![
+                Low(Cmp::Ge, s),
+                High(Cmp::Lt, e),
+                Low(Cmp::Lt, e),
+                High(Cmp::Ge, s),
+            ]]
         }
         SearchPrefix::Ne => {
             let (s, e) = implicit_range(value, num_str);
@@ -199,7 +223,14 @@ pub fn quantity_interval_predicate(
         SearchPrefix::Eb => vec![vec![High(Cmp::Lt, value)]],
         SearchPrefix::Ap => {
             let (lo, hi) = approx_range(value, num_str);
-            vec![vec![Low(Cmp::Le, hi), High(Cmp::Ge, lo)]]
+            vec![
+                vec![Low(Cmp::Ge, lo), Low(Cmp::Le, hi)],
+                vec![
+                    Low(Cmp::Lt, lo),
+                    High(Cmp::Ge, lo),
+                    QuantityBound::RangeOnly,
+                ],
+            ]
         }
     };
     QuantityIntervalPredicate { any_of }
@@ -467,6 +498,107 @@ mod tests {
         assert!(p(SearchPrefix::Eb, 20.0).matches(QUANTITY_OPEN_LOW, 10.0));
     }
 
+    /// The `ap` split is the old overlap test: on every valid interval
+    /// (`L <= H`) the two groups match exactly when `L <= b && H >= a`, and
+    /// never both at once.
+    #[test]
+    fn ap_split_equals_the_overlap_test_and_its_groups_are_disjoint() {
+        let mut edges = vec![
+            QUANTITY_OPEN_LOW,
+            QUANTITY_OPEN_HIGH,
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            -1e300,
+            1e300,
+        ];
+        for text in ["45", "5.4", "0", "-2", "100", "1e2", "1e-3", "100.0", "7"] {
+            let v: f64 = text.parse().unwrap();
+            let (a, b) = approx_range(v, text);
+            for x in [v, a, b, v - 1.0, v + 1.0, v * 2.0, v / 2.0] {
+                edges.push(x);
+                edges.push(f64::from_bits(x.to_bits().wrapping_add(1)));
+                edges.push(f64::from_bits(x.to_bits().wrapping_sub(1)));
+            }
+        }
+        edges.retain(|x| !x.is_nan() && x.is_finite());
+        let mut pairs = 0u64;
+        for text in ["45", "5.4", "0", "-2", "100", "1e2", "1e-3", "100.0", "7"] {
+            let v: f64 = text.parse().unwrap();
+            let (a, b) = approx_range(v, text);
+            let pred = quantity_interval_predicate(SearchPrefix::Ap, v, text);
+            assert_eq!(pred.any_of.len(), 2, "{text}");
+            let group_holds = |g: &[QuantityBound], l: f64, h: f64| {
+                g.iter().all(|bound| match *bound {
+                    QuantityBound::Low(c, x) => c.holds(l, x),
+                    QuantityBound::High(c, x) => c.holds(h, x),
+                    QuantityBound::RangeOnly => l < h,
+                })
+            };
+            for &l in &edges {
+                for &h in &edges {
+                    if l > h {
+                        continue; // dropped at indexing
+                    }
+                    pairs += 1;
+                    let overlap = l <= b && h >= a;
+                    assert_eq!(pred.matches(l, h), overlap, "ap {text} [{l}, {h}]");
+                    let g1 = group_holds(&pred.any_of[0], l, h);
+                    let g2 = group_holds(&pred.any_of[1], l, h);
+                    assert!(!(g1 && g2), "groups overlap: ap {text} [{l}, {h}]");
+                    assert_eq!(g1 || g2, overlap, "ap {text} [{l}, {h}]");
+                    // The second group only ever matches a proper Range, and
+                    // the first never needs the high end.
+                    if g2 {
+                        assert!(l < h, "ap {text} [{l}, {h}]");
+                    }
+                    if l == h {
+                        assert_eq!(g1, overlap, "point ap {text} [{l}, {h}]");
+                    }
+                }
+            }
+        }
+        assert!(pairs > 20_000, "{pairs}");
+    }
+
+    #[test]
+    fn range_only_marker_holds_exactly_for_proper_ranges() {
+        let pred = QuantityIntervalPredicate {
+            any_of: vec![vec![QuantityBound::RangeOnly]],
+        };
+        for (l, h) in [
+            (1.0, 2.0),
+            (1.0, 1.0),
+            (QUANTITY_OPEN_LOW, 0.0),
+            (0.0, QUANTITY_OPEN_HIGH),
+            (QUANTITY_OPEN_LOW, QUANTITY_OPEN_HIGH),
+            (-0.0, 0.0),
+            (5.0, f64::from_bits(5.0f64.to_bits() + 1)),
+        ] {
+            assert_eq!(pred.matches(l, h), l < h, "[{l}, {h}]");
+        }
+    }
+
+    /// `ap` on Ranges: edges of the window, a Range below, above, spanning,
+    /// and the open sides.
+    #[test]
+    fn ap_on_ranges() {
+        let ap = quantity_interval_predicate(SearchPrefix::Ap, 100.0, "100"); // [90, 110]
+        assert!(ap.matches(40.0, 90.0)); // touches the low edge
+        assert!(!ap.matches(40.0, 89.999));
+        assert!(ap.matches(110.0, 150.0)); // touches the high edge
+        assert!(!ap.matches(110.001, 150.0));
+        assert!(ap.matches(0.0, 1000.0)); // spans the window
+        assert!(ap.matches(95.0, 100.0)); // inside
+        assert!(!ap.matches(0.0, 10.0) && !ap.matches(200.0, 300.0));
+        assert!(ap.matches(QUANTITY_OPEN_LOW, 95.0));
+        assert!(!ap.matches(QUANTITY_OPEN_LOW, 80.0));
+        assert!(ap.matches(105.0, QUANTITY_OPEN_HIGH));
+        assert!(ap.matches(0.0, QUANTITY_OPEN_HIGH));
+        assert!(!ap.matches(120.0, QUANTITY_OPEN_HIGH));
+        assert!(ap.matches(QUANTITY_OPEN_LOW, QUANTITY_OPEN_HIGH));
+    }
+
     #[test]
     fn canonical_range_converts_to_an_ordered_pair() {
         let (l, h) = canonical_range(1.0, 3.0, |v| v * 1000.0);
@@ -492,5 +624,64 @@ mod tests {
         let (l, h) = canonical_range(QUANTITY_OPEN_LOW, 2.0, |v| v * 1e300);
         assert_eq!(l, QUANTITY_OPEN_LOW);
         assert_eq!(h, 2.0e300);
+    }
+
+    /// `eq` carries two implied bounds (`L < e`, `H >= s`) for index range
+    /// seeks. They must not change any result for a valid interval
+    /// (`L <= H`), and `ne` must be the exact complement of `eq`.
+    #[test]
+    fn eq_implied_bounds_are_redundant_and_ne_is_the_complement() {
+        use QuantityBound::{High, Low};
+        let mut edges = vec![
+            QUANTITY_OPEN_LOW,
+            QUANTITY_OPEN_HIGH,
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+        ];
+        for text in ["45", "5.4", "0", "-2", "100", "1e2", "1e-3", "100.0"] {
+            let v: f64 = text.parse().unwrap();
+            let (s, e) = implicit_range(v, text);
+            for x in [v, s, e, v - 1.0, v + 1.0, v * 2.0, v / 2.0] {
+                edges.push(x);
+                edges.push(f64::from_bits(x.to_bits().wrapping_add(1)));
+                edges.push(f64::from_bits(x.to_bits().wrapping_sub(1)));
+            }
+        }
+        edges.retain(|x| !x.is_nan());
+        for text in ["45", "5.4", "0", "-2", "100", "1e2", "1e-3", "100.0", "7"] {
+            let v: f64 = text.parse().unwrap();
+            let (s, e) = implicit_range(v, text);
+            let eq = quantity_interval_predicate(SearchPrefix::Eq, v, text);
+            let ne = quantity_interval_predicate(SearchPrefix::Ne, v, text);
+            // The implied bounds are present on both columns.
+            let group = &eq.any_of[0];
+            assert!(group.contains(&Low(Cmp::Lt, e)) && group.contains(&High(Cmp::Ge, s)));
+            assert_eq!(
+                ne.any_of,
+                vec![vec![Low(Cmp::Lt, s)], vec![High(Cmp::Ge, e)]]
+            );
+            let mut pairs = 0u32;
+            for &l in &edges {
+                for &h in &edges {
+                    if l > h {
+                        continue; // dropped at indexing
+                    }
+                    pairs += 1;
+                    let bare_eq = s <= l && h < e;
+                    let bare_ne = l < s || h >= e;
+                    assert_eq!(eq.matches(l, h), bare_eq, "eq {text} [{l}, {h}]");
+                    assert_eq!(ne.matches(l, h), bare_ne, "ne {text} [{l}, {h}]");
+                    assert_eq!(
+                        ne.matches(l, h),
+                        !eq.matches(l, h),
+                        "ne!=!eq {text} [{l}, {h}]"
+                    );
+                }
+            }
+            assert!(pairs > 1000, "{pairs}");
+        }
     }
 }

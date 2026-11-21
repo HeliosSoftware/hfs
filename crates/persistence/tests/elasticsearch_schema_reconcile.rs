@@ -522,7 +522,13 @@ async fn quantity_sort_interleaves_legacy_documents_without_a_rewrite() {
     let mut mapping = mapping_of(&template_index).await;
     let quantity =
         &mut mapping["properties"]["search_params"]["properties"]["quantity"]["properties"];
-    for field in ["high", "canonical_high", "sort_name"] {
+    for field in [
+        "high",
+        "canonical_high",
+        "range_high",
+        "canonical_range_high",
+        "sort_name",
+    ] {
         assert!(
             quantity.as_object_mut().unwrap().remove(field).is_some(),
             "{field}"
@@ -577,7 +583,13 @@ async fn quantity_sort_interleaves_legacy_documents_without_a_rewrite() {
         let canonical = entry["canonical_value"].as_f64().expect("canonical");
         entry["canonical_value"] = json!(canonical * value);
         let entry = entry.as_object_mut().unwrap();
-        for field in ["high", "canonical_high", "sort_name"] {
+        for field in [
+            "high",
+            "canonical_high",
+            "range_high",
+            "canonical_range_high",
+            "sort_name",
+        ] {
             entry.remove(field);
         }
         let response = client
@@ -659,6 +671,10 @@ async fn quantity_sort_interleaves_legacy_documents_without_a_rewrite() {
         ("ne100", "l-500", "l-100"),
         ("sa100", "l-500", "l-100"),
         ("eb100", "l-5", "l-100"),
+        // `ap` reads `value` alone for a point, so it needs neither `high`
+        // nor `range_high`.
+        ("ap100", "l-100", "l-5"),
+        ("ap500", "l-500", "l-100"),
     ] {
         let ids = found_ids(&backend, &onset_age_query(value)).await;
         assert!(ids.iter().any(|i| i == found), "{value}: {ids:?}");

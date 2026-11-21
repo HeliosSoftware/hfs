@@ -279,7 +279,19 @@ impl QuantityPredicate {
 ///
 /// Every comparison is strict (`IS NOT NULL` is implied), which is what lets
 /// the partial indexes on `value_quantity_value` / `value_quantity_high` serve
-/// it. A conversion is assumed increasing, as every UCUM unit here is.
+/// it, and `idx_search_quantity_recent` (partial on `value IS NOT NULL OR high
+/// IS NOT NULL`) serve every prefix on the newest-first fast path. A conversion
+/// is assumed increasing, as every UCUM unit here is.
+///
+/// `ap` is two OR-ed groups. The first, `a <= value <= b`, is a two-sided range
+/// on `idx_search_quantity` and finds every point whatever its `high`. The
+/// second, `value < a AND high >= a AND high > value`, can only match a proper
+/// Range; its literal `high > value` conjunct (the `RangeOnly` bound) is what
+/// proves the predicate of the tiny `idx_search_quantity_range` /
+/// `idx_search_quantity_canonical_range` indexes, so the planner ORs the two
+/// indexes in a bitmap (measured: a selective `ap` reads ~100 buffers instead of
+/// walking every point in the window, and a broad one is served by the
+/// recent-first index).
 fn interval_sql(
     predicate: &crate::search::QuantityIntervalPredicate,
     low_col: &str,
@@ -297,6 +309,12 @@ fn interval_sql(
             let (col, cmp, v) = match *bound {
                 QuantityBound::Low(c, v) => (low_col, c, v),
                 QuantityBound::High(c, v) => (high_col, c, v),
+                // Rendered with both columns, verbatim: the planner needs the
+                // exact `high > value` text to match the range indexes' WHERE.
+                QuantityBound::RangeOnly => {
+                    terms.push(format!("{high_col} > {low_col}"));
+                    continue;
+                }
             };
             let Some(v) = map(v) else {
                 *next = start;
@@ -5312,12 +5330,47 @@ mod tests {
             (SearchPrefix::Sa, "value_quantity_value > $3"),
             (
                 SearchPrefix::Ap,
-                "value_quantity_value <= $3 AND value_quantity_high >= $4",
+                "((value_quantity_value >= $3 AND value_quantity_value <= $4) OR \
+                 (value_quantity_value < $5 AND value_quantity_high >= $6 \
+                 AND value_quantity_high > value_quantity_value))",
             ),
         ] {
             let query = SearchQuery::new("Condition").with_parameter(quantity_param(prefix, "45"));
             let frag = accepted(&query, 2).expect("condition");
             assert!(frag.sql.contains(expect), "{prefix:?}: {}", frag.sql);
+        }
+    }
+
+    /// `ap` is two disjoint groups (#2602): every point by a two-sided range on
+    /// the value column, then only proper Ranges by the literal `high > value`
+    /// conjunct the range indexes' partial predicate needs. Bind order is the
+    /// groups' order: `a`, `b`, `a`.
+    #[test]
+    fn quantity_ap_splits_points_from_ranges() {
+        let query =
+            SearchQuery::new("Condition").with_parameter(quantity_param(SearchPrefix::Ap, "45"));
+        let frag = accepted(&query, 2).expect("condition");
+        assert!(
+            frag.sql.contains(
+                "((value_quantity_value >= $3 AND value_quantity_value <= $4) OR \
+                 (value_quantity_value < $5 AND value_quantity_high >= $6 \
+                 AND value_quantity_high > value_quantity_value))"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 4, "{}", frag.sql);
+        // With a unit the canonical branch repeats the shape on its own columns.
+        let with_unit = SearchQuery::new("Condition").with_parameter(quantity_param(
+            SearchPrefix::Ap,
+            "45|http://unitsofmeasure.org|mg",
+        ));
+        let frag = accepted(&with_unit, 2).expect("condition");
+        for needle in [
+            "value_quantity_high > value_quantity_value",
+            "value_quantity_canonical_high > value_quantity_canonical_value",
+        ] {
+            assert!(frag.sql.contains(needle), "{needle}: {}", frag.sql);
         }
     }
 
@@ -7145,15 +7198,17 @@ mod tests {
     #[test]
     fn valid_quantity_forms_still_build() {
         // The number part decides validity; system and code are free text.
+        // `eq` binds its window twice (the implied bounds on the low and high
+        // columns, #2602): four numbers, then the unit and system.
         for (value, binds) in [
-            ("5.4", 2),
-            ("-5.4", 2),
-            ("+5.4", 2),
-            ("1e3", 2),
-            ("1.5E-2", 2),
+            ("5.4", 4),
+            ("-5.4", 4),
+            ("+5.4", 4),
+            ("1e3", 4),
+            ("1.5E-2", 4),
             // Non-convertible unit: raw branch only (value range + unit).
-            ("5.4|a\\|b", 3),
-            ("5.4|http://unitsofmeasure.org|a\\|b", 4),
+            ("5.4|a\\|b", 5),
+            ("5.4|http://unitsofmeasure.org|a\\|b", 6),
         ] {
             let query = SearchQuery::new("Observation")
                 .with_parameter(quantity_param(SearchPrefix::Eq, value));
@@ -7167,7 +7222,7 @@ mod tests {
             .with_parameter(quantity_param(SearchPrefix::Eq, "5.4||a\\|b"));
         let frag = accepted(&query, 2).expect("condition");
         assert!(
-            matches!(frag.params.get(2), Some(SqlParam::Text(unit)) if unit == "a|b"),
+            matches!(frag.params.get(4), Some(SqlParam::Text(unit)) if unit == "a|b"),
             "{:?}",
             frag.params
         );

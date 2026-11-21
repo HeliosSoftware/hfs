@@ -198,9 +198,9 @@ async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult
     if current_version == 0 {
         create_schema_v1(client).await?;
         set_schema_version(client, 1).await?;
-        migrate_schema(client, 1).await?;
+        migrate_schema(client, 1, true).await?;
     } else if current_version < SCHEMA_VERSION {
-        migrate_schema(client, current_version).await?;
+        migrate_schema(client, current_version, false).await?;
     }
 
     Ok(())
@@ -481,9 +481,16 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
 }
 
 /// Run schema migrations from current version to latest.
+///
+/// `fresh` is true only when the version read under the migration lock was 0,
+/// i.e. this ladder is creating the database. Steps that exist to protect data
+/// or writers of an EXISTING database (v56's temporary trigger) skip themselves
+/// on a fresh one. A fresh database interrupted mid-ladder restarts as an
+/// existing one and gets them then, which is the safe direction.
 async fn migrate_schema(
     client: &mut deadpool_postgres::Client,
     from_version: i32,
+    fresh: bool,
 ) -> StorageResult<()> {
     let mut version = from_version;
 
@@ -591,7 +598,7 @@ async fn migrate_schema(
             // build; the common loop stamps the marker after they finish.
             54 => migrate_v54_to_v55(client).await?,
             // Same shape as v55: column, batched backfill, concurrent indexes.
-            55 => migrate_v55_to_v56(client).await?,
+            55 => migrate_v55_to_v56(client, fresh).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -829,6 +836,51 @@ async fn build_reference_target(client: &mut deadpool_postgres::Client) -> Stora
     }
 }
 
+/// Name of the TEMPORARY v56 trigger on `search_index`.
+const QUANTITY_HIGH_TRIGGER: &str = "trg_search_index_quantity_high";
+
+/// Name of the function the TEMPORARY v56 trigger runs.
+const QUANTITY_HIGH_TRIGGER_FUNCTION: &str = "hfs_search_index_quantity_high";
+
+/// TEMPORARY: protects rolling updates from builds older than #2602.
+///
+/// An old instance that keeps writing after the v56 backfill inserts quantity
+/// rows with `value_quantity_high` NULL, and the filters compare on `high` with
+/// no fallback, so such rows would silently stop matching `eq`/`gt`/`ge`/`eb`/
+/// `ap`. This BEFORE INSERT trigger fills `high` (a point: high = value) when it
+/// arrives NULL. Its `WHEN` clause means current writers, which always set
+/// `high`, never invoke the function (zero cost); only an old writer pays
+/// (~+10-50% on those inserts). A Range row (high already set) is untouched.
+///
+/// Created only when v56 UPGRADES an existing database (the ADD COLUMN
+/// transaction). A database the migration ladder creates from scratch has no
+/// older writer, so it gets no trigger and no function.
+///
+/// To be removed by migration v57 (`DROP TRIGGER IF EXISTS
+/// trg_search_index_quantity_high ON search_index; DROP FUNCTION IF EXISTS
+/// hfs_search_index_quantity_high();`) no earlier than the second release after
+/// the one that ships #2602, and only once the upgrade notes forbid skipping
+/// that release.
+///
+/// `DROP` + `CREATE TRIGGER` rather than `CREATE OR REPLACE TRIGGER`, which
+/// needs PostgreSQL 14+; both run in the same transaction so a replay is
+/// race-free and leaves exactly one trigger.
+fn quantity_high_trigger_ddl() -> String {
+    format!(
+        "CREATE OR REPLACE FUNCTION {QUANTITY_HIGH_TRIGGER_FUNCTION}() RETURNS trigger \
+         LANGUAGE plpgsql AS $fn$ \
+         BEGIN \
+           NEW.value_quantity_high := NEW.value_quantity_value; \
+           NEW.value_quantity_canonical_high := COALESCE(NEW.value_quantity_canonical_high, NEW.value_quantity_canonical_value); \
+           RETURN NEW; \
+         END $fn$; \
+         DROP TRIGGER IF EXISTS {QUANTITY_HIGH_TRIGGER} ON search_index; \
+         CREATE TRIGGER {QUANTITY_HIGH_TRIGGER} BEFORE INSERT ON search_index \
+         FOR EACH ROW WHEN (NEW.value_quantity_value IS NOT NULL AND NEW.value_quantity_high IS NULL) \
+         EXECUTE FUNCTION {QUANTITY_HIGH_TRIGGER_FUNCTION}()"
+    )
+}
+
 /// Heap blocks per committed batch of the v56 backfill.
 const QUANTITY_HIGH_BACKFILL_BLOCKS: u64 = 2_000;
 
@@ -836,9 +888,14 @@ const QUANTITY_HIGH_BACKFILL_BLOCKS: u64 = 2_000;
 const QUANTITY_HIGH_SWEEP_ROWS: u64 = 10_000;
 
 /// The v56 indexes that lead with the upper bound of a quantity interval, as
-/// `(name, CREATE INDEX body after the name)`. They serve `gt`/`ge`/`eb` (and the
-/// `high` half of `eq`/`ne`/`ap`) the way `idx_search_date_end` serves dates.
-const QUANTITY_HIGH_INDEXES: [(&str, &str); 2] = [
+/// `(name, CREATE INDEX body after the name)`. The first two serve `gt`/`ge`/`eb`
+/// (and the `high` half of `eq`/`ne`) the way `idx_search_date_end` serves
+/// dates. The last two hold ONLY proper Ranges (`high > value`), which a `Quantity`
+/// or `Age` point never is, so they stay tiny; they answer the second group of
+/// `ap` (`value < a AND high >= a AND high > value`), whose literal
+/// `high > value` conjunct is what proves their predicate. No backfill: a Range
+/// row never existed before #2602.
+const QUANTITY_HIGH_INDEXES: [(&str, &str); 4] = [
     (
         "idx_search_quantity_high",
         "ON search_index (tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value) \
@@ -850,7 +907,42 @@ const QUANTITY_HIGH_INDEXES: [(&str, &str); 2] = [
         "ON search_index (tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value) \
          WHERE value_quantity_canonical_high IS NOT NULL",
     ),
+    (
+        "idx_search_quantity_range",
+        "ON search_index (tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value) \
+         INCLUDE (resource_id, last_updated) \
+         WHERE value_quantity_high > value_quantity_value",
+    ),
+    (
+        "idx_search_quantity_canonical_range",
+        "ON search_index (tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_high, value_quantity_canonical_value) \
+         WHERE value_quantity_canonical_high > value_quantity_canonical_value",
+    ),
 ];
+
+/// The v20 newest-first quantity index, rebuilt by v56 so the fast path
+/// (`Observation?value-quantity=gt100&_count=20`) keeps its early-terminating
+/// scan after #2602.
+///
+/// v20 carried only `value_quantity_value` and was partial on it. After #2602
+/// `gt`/`ge`/`eb` compare `value_quantity_high` alone, `ne` is `value < s OR
+/// high >= e`: none of those implies `value_quantity_value IS NOT NULL`, so the
+/// planner could not use the index and fell to `idx_search_quantity_high` plus a
+/// sort of the whole match set (measured on 350k rows per type: broad `gt`
+/// 0.12 ms -> 211-330 ms, `ne` 0.1 ms -> 430-530 ms). Every prefix's predicate is
+/// strict in at least one of the two columns, so the partial predicate
+/// `value_quantity_value IS NOT NULL OR value_quantity_high IS NOT NULL` is
+/// provable for all of them, and both bounds ride in the payload so the scan
+/// stays index-only. Same key and one more `double` per entry (+10% size, no
+/// extra index to maintain on insert).
+const QUANTITY_RECENT_INDEX: DateIndexSpec = DateIndexSpec {
+    name: "idx_search_quantity_recent",
+    temp_name: "idx_search_quantity_recent_v56_new",
+    create: "(tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+             INCLUDE (value_quantity_value, value_quantity_high, value_quantity_unit)
+             WHERE value_quantity_value IS NOT NULL OR value_quantity_high IS NOT NULL",
+    definition: "USING btree (tenant_id, resource_type, param_name, last_updated DESC, resource_id) INCLUDE (value_quantity_value, value_quantity_high, value_quantity_unit) WHERE ((value_quantity_value IS NOT NULL) OR (value_quantity_high IS NOT NULL))",
+};
 
 /// v55 -> v56: `value_quantity_high` and `value_quantity_canonical_high`, the
 /// upper bound of a quantity interval (#2602).
@@ -863,10 +955,17 @@ const QUANTITY_HIGH_INDEXES: [(&str, &str); 2] = [
 ///
 /// Steps, each safe to repeat, as in v55: add the columns under a `lock_timeout`;
 /// backfill in committed batches of heap blocks selected by `ctid` range; build
-/// the two partial indexes `CONCURRENTLY` (an invalid leftover is dropped
-/// first); sweep rows written meanwhile by an instance that was not yet upgraded.
+/// the four partial indexes `CONCURRENTLY` (an invalid leftover is dropped
+/// first; the two `*_range` ones need no backfill); rebuild
+/// `idx_search_quantity_recent` with the upper bound in its payload
+/// ([`QUANTITY_RECENT_INDEX`]); sweep rows written meanwhile by an instance that
+/// was not yet upgraded. The temporary trigger is created in the first step on
+/// an upgrade only, never on a database the ladder is creating (`fresh`).
 /// `statement_timeout` is disabled for the step and restored.
-async fn migrate_v55_to_v56(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v55_to_v56(
+    client: &mut deadpool_postgres::Client,
+    fresh: bool,
+) -> StorageResult<()> {
     let failed = |what: &str, e: &dyn std::fmt::Display| {
         pg_error(format!("Migration v55->v56 failed ({what}): {e}"))
     };
@@ -879,7 +978,7 @@ async fn migrate_v55_to_v56(client: &mut deadpool_postgres::Client) -> StorageRe
         .batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| failed("disable statement_timeout", &e))?;
-    let result = build_quantity_high(client).await;
+    let result = build_quantity_high(client, fresh).await;
     let restore = client
         .execute(
             "SELECT set_config('statement_timeout', $1, false)",
@@ -899,7 +998,10 @@ async fn migrate_v55_to_v56(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
-async fn build_quantity_high(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+async fn build_quantity_high(
+    client: &mut deadpool_postgres::Client,
+    fresh: bool,
+) -> StorageResult<()> {
     let failed = |what: &str, e: &dyn std::fmt::Display| {
         pg_error(format!("Migration v55->v56 failed ({what}): {e}"))
     };
@@ -916,6 +1018,11 @@ async fn build_quantity_high(client: &mut deadpool_postgres::Client) -> StorageR
                      ADD COLUMN IF NOT EXISTS value_quantity_canonical_high DOUBLE PRECISION",
             )
             .await?;
+            // Only an upgrade has older writers to protect; a database this
+            // ladder is creating has none.
+            if !fresh {
+                tx.batch_execute(&quantity_high_trigger_ddl()).await?;
+            }
             tx.commit().await
         }
         .await;
@@ -999,6 +1106,11 @@ async fn build_quantity_high(client: &mut deadpool_postgres::Client) -> StorageR
             return Err(failed("create index", &e));
         }
     }
+
+    // 3b. The newest-first index, rebuilt with the upper bound in its payload
+    // and a predicate the `high`-only prefixes imply. Built under a temporary
+    // name and swapped in, so the old one serves searches until the new is ready.
+    rebuild_date_index(client, &QUANTITY_RECENT_INDEX, "v55->v56").await?;
 
     // 4. Rows written during the build by a not-yet-upgraded instance.
     let sweep = format!(
@@ -4834,6 +4946,11 @@ async fn rebuild_date_index(
     if date_index_state(client, spec.name, spec.definition).await? == Some(true) {
         return Ok(());
     }
+    // The server's message, which `tokio_postgres::Error`'s `Display` omits.
+    let detail = |e: &tokio_postgres::Error| match e.as_db_error() {
+        Some(db) => format!("{e}: {}", db.message()),
+        None => e.to_string(),
+    };
     // One statement per batch: a multi-statement string is an implicit
     // transaction, which `CONCURRENTLY` rejects.
     if date_index_state(client, spec.temp_name, spec.definition).await? != Some(true) {
@@ -4843,7 +4960,7 @@ async fn rebuild_date_index(
                 spec.temp_name
             ))
             .await
-            .map_err(|e| failed(&e))?;
+            .map_err(|e| failed(&detail(&e)))?;
         let build = client
             .batch_execute(&format!(
                 "CREATE INDEX CONCURRENTLY {} ON search_index {}",
@@ -4862,7 +4979,7 @@ async fn rebuild_date_index(
             {
                 tracing::warn!(%drop_error, "Could not drop the invalid {}", spec.temp_name);
             }
-            return Err(failed(&error));
+            return Err(failed(&detail(&error)));
         }
         if date_index_state(client, spec.temp_name, spec.definition).await? != Some(true) {
             return Err(failed(&format!(
@@ -7892,6 +8009,66 @@ mod postgres_integration_migrations {
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
 
+    /// The temporary quantity trigger protects rolling upgrades; a database
+    /// the ladder creates has no older writer, so it gets neither the trigger
+    /// nor its function (and still gets the v56 columns and indexes).
+    #[tokio::test]
+    async fn postgres_integration_fresh_database_has_no_quantity_high_trigger() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v56_fresh_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize a fresh database");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        let triggers: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_trigger
+                 WHERE tgname = 'trg_search_index_quantity_high' AND NOT tgisinternal",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let functions: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_proc WHERE proname = 'hfs_search_index_quantity_high'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!((triggers, functions), (0, 0), "no trigger, no function");
+        // A restart (the version is current) must not add it either.
+        initialize_schema(&mut client).await.expect("restart");
+        let indexes: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_indexes
+                 WHERE indexname IN ('idx_search_quantity_high', 'idx_search_quantity_recent',
+                                     'idx_search_quantity_range',
+                                     'idx_search_quantity_canonical_range')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(indexes, 4, "the v56 indexes exist on a fresh database");
+        let triggers: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_trigger WHERE tgname = 'trg_search_index_quantity_high'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(triggers, 0);
+    }
+
     #[tokio::test]
     async fn postgres_integration_v55_to_v56_backfills_quantity_high() {
         let _guard = POSTGRES_TEST_LOCK.lock().await;
@@ -7905,13 +8082,25 @@ mod postgres_integration_migrations {
         initialize_schema(&mut client)
             .await
             .expect("initialize current schema fixture");
+        // A fresh database has no trigger; rewinding to v55 and migrating is
+        // the upgrade path, the only one that installs it.
         client
             .batch_execute(
-                "DROP INDEX idx_search_quantity_high;
+                "DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+                 DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+                 DROP INDEX idx_search_quantity_high;
                  DROP INDEX idx_search_quantity_canonical_high;
+                 DROP INDEX idx_search_quantity_range;
+                 DROP INDEX idx_search_quantity_canonical_range;
                  ALTER TABLE search_index
                      DROP COLUMN value_quantity_high,
-                     DROP COLUMN value_quantity_canonical_high;",
+                     DROP COLUMN value_quantity_canonical_high;
+                 DROP INDEX IF EXISTS idx_search_quantity_recent;
+                 CREATE INDEX idx_search_quantity_recent
+                     ON search_index (tenant_id, resource_type, param_name,
+                                      last_updated DESC, resource_id ASC)
+                     INCLUDE (value_quantity_value, value_quantity_unit)
+                     WHERE value_quantity_value IS NOT NULL;",
             )
             .await
             .expect("take v56 back out of the fixture");
@@ -7990,6 +8179,9 @@ mod postgres_integration_migrations {
                 for name in [
                     "idx_search_quantity_high",
                     "idx_search_quantity_canonical_high",
+                    "idx_search_quantity_range",
+                    "idx_search_quantity_canonical_range",
+                    "idx_search_quantity_recent",
                 ] {
                     let valid: bool = client
                         .query_one(
@@ -8010,6 +8202,49 @@ mod postgres_integration_migrations {
             index_oid(&client, "idx_search_quantity_high").await,
             stale_oid,
             "the invalid leftover must have been dropped and rebuilt"
+        );
+        // The newest-first index now carries both bounds and is partial on
+        // either; the Range-only indexes hold only `high > value` rows.
+        for (name, expected) in [
+            (
+                "idx_search_quantity_recent",
+                "INCLUDE (value_quantity_value, value_quantity_high, value_quantity_unit) \
+                 WHERE ((value_quantity_value IS NOT NULL) OR (value_quantity_high IS NOT NULL))",
+            ),
+            (
+                "idx_search_quantity_range",
+                "(tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value) \
+                 INCLUDE (resource_id, last_updated) \
+                 WHERE (value_quantity_high > value_quantity_value)",
+            ),
+            (
+                "idx_search_quantity_canonical_range",
+                "(tenant_id, resource_type, param_name, value_quantity_canonical_unit, \
+                 value_quantity_canonical_high, value_quantity_canonical_value) \
+                 WHERE (value_quantity_canonical_high > value_quantity_canonical_value)",
+            ),
+        ] {
+            let definition: String = client
+                .query_one("SELECT pg_get_indexdef($1::text::regclass)", &[&name])
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                definition.ends_with(expected),
+                "{name}: unexpected definition {definition}"
+            );
+        }
+        assert!(
+            !client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_class
+                      WHERE relname = 'idx_search_quantity_recent_v56_new')",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0),
+            "the temporary index name must not survive the swap"
         );
 
         // A row written with NULL high before the sweep (an old instance) is
@@ -8039,6 +8274,63 @@ mod postgres_integration_migrations {
         assert_eq!(row.get::<_, Option<f64>>(1), Some(7.0));
         assert_state(&client).await;
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+
+        // The temporary trigger: an old build inserts value with NULL high and
+        // the row is filled at once; a Range and a non-quantity row are not.
+        let triggers: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_trigger
+                 WHERE tgname = 'trg_search_index_quantity_high'
+                   AND tgrelid = 'search_index'::regclass AND NOT tgisinternal",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(triggers, 1, "exactly one trigger after a replay");
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name,
+                  value_quantity_value, value_quantity_canonical_value,
+                  value_quantity_canonical_unit)
+                 VALUES ('t', 'Observation', 'old', 'value-quantity', 9.0, 9000.0, 'g');
+                 INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name,
+                  value_quantity_value, value_quantity_high,
+                  value_quantity_canonical_value, value_quantity_canonical_high,
+                  value_quantity_canonical_unit)
+                 VALUES ('t', 'Observation', 'range', 'value-quantity', 1.0, 4.0, 1.0, 4.0, 'g');
+                 INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name,
+                  value_quantity_value, value_quantity_high)
+                 VALUES ('t', 'Observation', 'nocanon', 'value-quantity', 3.0, NULL);
+                 INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ('t', 'Patient', 'p1', 'family', 'Jones');",
+            )
+            .await
+            .unwrap();
+        for (id, expected) in [
+            ("old", (Some(9.0), Some(9000.0))),
+            ("range", (Some(4.0), Some(4.0))),
+            ("nocanon", (Some(3.0), None)),
+            ("p1", (None, None)),
+        ] {
+            let row = client
+                .query_one(
+                    "SELECT value_quantity_high, value_quantity_canonical_high
+                     FROM search_index WHERE tenant_id = 't' AND resource_id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                (row.get::<_, Option<f64>>(0), row.get::<_, Option<f64>>(1)),
+                expected,
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8410,6 +8702,463 @@ mod postgres_integration_migrations {
             !plan.contains("Seq Scan"),
             "a sparse gt must not scan the table: {plan}"
         );
+    }
+
+    /// Writes the binds of a builder predicate into its text, so a test can
+    /// `EXPLAIN` it and compare rows without a parameter vector. Highest
+    /// placeholder first, so `$1` never rewrites the front of `$10`.
+    fn inline_binds(
+        sql: &str,
+        params: &[crate::backends::postgres::search::query_builder::SqlParam],
+    ) -> String {
+        use crate::backends::postgres::search::query_builder::SqlParam;
+        let mut sql = sql.to_string();
+        for (i, param) in params.iter().enumerate().rev() {
+            let literal = match param {
+                SqlParam::Float(v) => format!("({v:?}::float8)"),
+                SqlParam::Text(t) => format!("'{}'", t.replace('\'', "''")),
+                other => panic!("unexpected bind {other:?}"),
+            };
+            sql = sql.replace(&format!("${}", i + 1), &literal);
+        }
+        sql
+    }
+
+    /// `(Node Type, Index Name)` of every node of an `EXPLAIN (FORMAT JSON)`.
+    fn plan_nodes(plan: &serde_json::Value) -> Vec<(String, Option<String>)> {
+        fn walk(node: &serde_json::Value, out: &mut Vec<(String, Option<String>)>) {
+            out.push((
+                node["Node Type"].as_str().unwrap_or_default().to_string(),
+                node["Index Name"].as_str().map(str::to_string),
+            ));
+            if let Some(children) = node["Plans"].as_array() {
+                for child in children {
+                    walk(child, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&plan[0]["Plan"], &mut out);
+        out
+    }
+
+    /// #2602: every quantity prefix must be answerable by the newest-first
+    /// index with no sort. The predicates are the ones the builder emits
+    /// (`gt`/`ge`/`eb` read `value_quantity_high` alone, `ne` is `value < s OR
+    /// high >= e`), so this fails if `idx_search_quantity_recent` stops
+    /// implying them: PostgreSQL then cannot use it and the fast path sorts every
+    /// match (measured 0.12 ms -> 211-330 ms for a broad `gt`). Plans are forced
+    /// (no seq/bitmap scan, no sort) so the answer does not depend on statistics.
+    #[tokio::test]
+    async fn postgres_integration_quantity_recent_index_serves_every_prefix_without_a_sort() {
+        use crate::backends::postgres::search::query_builder::quantity_predicate;
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_qrecent_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_quantity_value,
+                    value_quantity_high, value_quantity_unit, last_updated)
+                 SELECT 'tenant-a', 'Observation', 'q-' || g, 'value-quantity',
+                        (g * 37 % 10000) / 10.0, (g * 37 % 10000) / 10.0, 'mg',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 60000) g;
+                 INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 'tenant-a', 'Observation', 'q-' || g, 'status' || k, 'final',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 60000) g, generate_series(1, 3) k;
+                 ANALYZE search_index;
+                 SET enable_seqscan = off;
+                 SET enable_bitmapscan = off;
+                 SET enable_sort = off;",
+            )
+            .await
+            .expect("seed quantity and token rows");
+
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Gt,
+            SearchPrefix::Ge,
+            SearchPrefix::Lt,
+            SearchPrefix::Le,
+            SearchPrefix::Sa,
+            SearchPrefix::Eb,
+            SearchPrefix::Ap,
+        ] {
+            let mut next = 0;
+            let (predicate, params) =
+                quantity_predicate("", prefix, "500", &mut next).expect("a numeric search value");
+            let predicate = inline_binds(&predicate, &params);
+            let sql = format!(
+                "EXPLAIN (FORMAT JSON)
+                 SELECT DISTINCT resource_id, last_updated FROM search_index
+                  WHERE tenant_id = 'tenant-a' AND resource_type = 'Observation'
+                    AND param_name = 'value-quantity' AND {predicate}
+                  ORDER BY last_updated DESC, resource_id ASC LIMIT 21"
+            );
+            let plan: serde_json::Value = client
+                .query_one(sql.as_str(), &[])
+                .await
+                .unwrap_or_else(|e| panic!("{prefix:?}: {e}: {sql}"))
+                .get(0);
+            let nodes = plan_nodes(&plan);
+            assert!(
+                nodes.iter().any(|(kind, index)| kind == "Index Only Scan"
+                    && index.as_deref() == Some("idx_search_quantity_recent")),
+                "{prefix:?}: expected an Index Only Scan on idx_search_quantity_recent: {nodes:?}\n{sql}"
+            );
+            assert!(
+                nodes.iter().all(|(kind, _)| !kind.contains("Sort")),
+                "{prefix:?}: the newest-first scan must not need a sort: {nodes:?}\n{sql}"
+            );
+        }
+        client
+            .batch_execute("RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort")
+            .await
+            .unwrap();
+    }
+
+    /// #2602 `ap`: a selective one is two index arms — the points by a two-sided
+    /// range on `idx_search_quantity`, the proper Ranges on the tiny
+    /// `idx_search_quantity_range` (its partial predicate is proven by the
+    /// literal `high > value` conjunct) — and never a table scan.
+    #[tokio::test]
+    async fn postgres_integration_quantity_ap_uses_the_value_and_range_indexes() {
+        use crate::backends::postgres::search::query_builder::quantity_predicate;
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_qap_plan_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+        // Mostly points, a few Ranges, plus other parameters so the slice is
+        // a small part of the table. Values 0..1000 in steps of 0.1.
+        client
+            .batch_execute(
+                "INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_quantity_value,
+                    value_quantity_high, value_quantity_unit, value_quantity_canonical_value,
+                    value_quantity_canonical_high, value_quantity_canonical_unit, last_updated)
+                 SELECT 'tenant-a', 'Observation', 'q-' || g, 'value-quantity', v,
+                        CASE WHEN g % 500 = 0 THEN v + 40 ELSE v END, 'mg',
+                        v / 1000, CASE WHEN g % 500 = 0 THEN (v + 40) / 1000 ELSE v / 1000 END, 'g',
+                        now() - (g || ' seconds')::interval
+                   FROM (SELECT g, (g * 37 % 10000) / 10.0 AS v FROM generate_series(1, 100000) g) s;
+                 INSERT INTO search_index
+                   (tenant_id, resource_type, resource_id, param_name, value_token_code, last_updated)
+                 SELECT 'tenant-a', 'Observation', 'q-' || g, 'status' || k, 'final',
+                        now() - (g || ' seconds')::interval
+                   FROM generate_series(1, 100000) g, generate_series(1, 3) k;
+                 ANALYZE search_index;",
+            )
+            .await
+            .expect("seed points, ranges and filler");
+
+        let mut next = 0;
+        // Selective: a 0.1 % window of the values, with a unit so the canonical
+        // arm is built too.
+        let (predicate, params) =
+            quantity_predicate("", SearchPrefix::Ap, "700.0|mg", &mut next).expect("number");
+        let predicate = inline_binds(&predicate, &params);
+        for (shape, tail) in [
+            (
+                "page",
+                "ORDER BY last_updated DESC, resource_id ASC LIMIT 21",
+            ),
+            ("count", ""),
+        ] {
+            let select = if shape == "page" {
+                "SELECT DISTINCT resource_id, last_updated FROM search_index"
+            } else {
+                "SELECT resource_id FROM search_index"
+            };
+            let sql = format!(
+                "EXPLAIN (FORMAT JSON) {select}
+                  WHERE tenant_id = 'tenant-a' AND resource_type = 'Observation'
+                    AND param_name = 'value-quantity' AND {predicate} {tail}"
+            );
+            let plan: serde_json::Value = client.query_one(sql.as_str(), &[]).await.unwrap().get(0);
+            let nodes = plan_nodes(&plan);
+            let indexes: Vec<&str> = nodes.iter().filter_map(|(_, i)| i.as_deref()).collect();
+            assert!(
+                indexes.contains(&"idx_search_quantity"),
+                "{shape}: the point arm must use idx_search_quantity: {nodes:?}\n{sql}"
+            );
+            assert!(
+                indexes.contains(&"idx_search_quantity_range"),
+                "{shape}: the Range arm must use idx_search_quantity_range: {nodes:?}\n{sql}"
+            );
+            assert!(
+                nodes.iter().all(|(kind, _)| kind != "Seq Scan"),
+                "{shape}: no table scan: {nodes:?}\n{sql}"
+            );
+        }
+    }
+
+    /// #2602: the quantity prefixes agree with a brute-force evaluation of the
+    /// stored closed interval over points, Ranges (open sides included), rows
+    /// with only one bound or none (an old writer, a malformed row), and a
+    /// different unit that matches only through its canonical value — whichever
+    /// index the planner is given. Each mode runs in a rolled-back transaction.
+    #[tokio::test]
+    async fn postgres_integration_quantity_prefixes_match_brute_force_on_every_index_set() {
+        use crate::backends::postgres::search::query_builder::quantity_predicate;
+        use crate::search::{
+            Cmp, FhirQuantityValue, QUANTITY_OPEN_HIGH, QUANTITY_OPEN_LOW, QuantityBound,
+            QuantityIntervalPredicate, canonical_range,
+        };
+        use crate::types::SearchPrefix;
+
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_qbrute_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("create the current schema");
+
+        let (open_low, open_high) = (QUANTITY_OPEN_LOW, QUANTITY_OPEN_HIGH);
+        let canon = |x: f64, unit: &str| {
+            helios_fhirpath::ucum::canonicalize_quantity(x, unit)
+                .map(|(v, _)| v)
+                .expect("a UCUM unit")
+        };
+        // (unit, low, high); `None` is a missing bound (an old writer's high, a
+        // high-only row, a row with neither).
+        type Row = (&'static str, Option<f64>, Option<f64>);
+        let rows: Vec<Row> = vec![
+            ("mg", Some(50.0), Some(50.0)),
+            ("mg", Some(94.9), Some(94.9)),
+            ("mg", Some(95.0), Some(95.0)),
+            ("mg", Some(99.95), Some(99.95)),
+            ("mg", Some(100.0), Some(100.0)),
+            ("mg", Some(100.04), Some(100.04)),
+            ("mg", Some(100.5), Some(100.5)),
+            ("mg", Some(105.0), Some(105.0)),
+            ("mg", Some(105.1), Some(105.1)),
+            ("mg", Some(500.0), Some(500.0)),
+            ("g", Some(0.1), Some(0.1)),
+            ("g", Some(0.2), Some(0.2)),
+            ("mg", Some(80.0), Some(120.0)),
+            ("mg", Some(100.0), Some(200.0)),
+            ("mg", Some(120.0), Some(130.0)),
+            ("mg", Some(90.0), Some(99.0)),
+            ("mg", Some(90.0), Some(95.0)),
+            ("mg", Some(0.0), Some(1000.0)),
+            ("g", Some(0.05), Some(0.15)),
+            ("mg", Some(open_low), Some(50.0)),
+            ("mg", Some(open_low), Some(100.0)),
+            ("mg", Some(150.0), Some(open_high)),
+            ("mg", Some(100.0), Some(open_high)),
+            ("mg", Some(open_low), Some(open_high)),
+            ("mg", Some(100.0), None),
+            ("mg", Some(90.0), None),
+            ("mg", None, Some(100.0)),
+            ("mg", None, None),
+        ];
+        for (n, (unit, low, high)) in rows.iter().enumerate() {
+            let canonical = |bound: Option<f64>| bound.map(|b| canon(b, unit));
+            // Open sides are never converted (`canonical_range`).
+            let (clow, chigh) = match (low, high) {
+                (Some(l), Some(h)) => {
+                    let (a, b) = canonical_range(*l, *h, |x| canon(x, unit));
+                    (Some(a), Some(b))
+                }
+                _ => (
+                    low.map(|l| if l == open_low { l } else { canon(l, unit) }),
+                    canonical(*high),
+                ),
+            };
+            let cunit = helios_fhirpath::ucum::canonicalize_quantity(1.0, unit)
+                .map(|(_, u)| u)
+                .unwrap();
+            client
+                .execute(
+                    "INSERT INTO search_index
+                       (tenant_id, resource_type, resource_id, param_name,
+                        value_quantity_value, value_quantity_high, value_quantity_unit,
+                        value_quantity_canonical_value, value_quantity_canonical_high,
+                        value_quantity_canonical_unit, last_updated)
+                     VALUES ('rt', 'Observation', $1, 'value-quantity', $2, $3, $4, $5, $6, $7,
+                             timestamptz '2026-01-01+00' + ($8::int * interval '1 minute'))",
+                    &[
+                        &format!("r{n:02}"),
+                        low,
+                        high,
+                        unit,
+                        &clow,
+                        &chigh,
+                        &cunit,
+                        &((n as i32 * 7) % 29),
+                    ],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("insert row {n}: {e}"));
+        }
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+
+        // `NULL` never satisfies a comparison, whatever the index.
+        fn holds(cmp: Cmp, stored: f64, bound: f64) -> bool {
+            match cmp {
+                Cmp::Lt => stored < bound,
+                Cmp::Le => stored <= bound,
+                Cmp::Gt => stored > bound,
+                Cmp::Ge => stored >= bound,
+            }
+        }
+        fn matches(p: &QuantityIntervalPredicate, low: Option<f64>, high: Option<f64>) -> bool {
+            p.any_of.iter().any(|group| {
+                group.iter().all(|bound| match *bound {
+                    QuantityBound::Low(c, v) => low.is_some_and(|l| holds(c, l, v)),
+                    QuantityBound::High(c, v) => high.is_some_and(|h| holds(c, h, v)),
+                    QuantityBound::RangeOnly => {
+                        matches!((low, high), (Some(l), Some(h)) if l < h)
+                    }
+                })
+            })
+        }
+
+        let modes: [(&str, &str); 4] = [
+            ("default", "BEGIN"),
+            (
+                "recent only",
+                "BEGIN; DROP INDEX idx_search_quantity; DROP INDEX idx_search_quantity_high; \
+                 DROP INDEX idx_search_quantity_range; DROP INDEX idx_search_quantity_canonical; \
+                 DROP INDEX idx_search_quantity_canonical_high; \
+                 DROP INDEX idx_search_quantity_canonical_range; SET LOCAL enable_seqscan = off; \
+                 SET LOCAL enable_bitmapscan = off",
+            ),
+            (
+                "value and range indexes",
+                "BEGIN; DROP INDEX idx_search_quantity_recent; SET LOCAL enable_seqscan = off",
+            ),
+            (
+                "table scan",
+                "BEGIN; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexonlyscan = off",
+            ),
+        ];
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Gt,
+            SearchPrefix::Ge,
+            SearchPrefix::Lt,
+            SearchPrefix::Le,
+            SearchPrefix::Sa,
+            SearchPrefix::Eb,
+            SearchPrefix::Ap,
+        ] {
+            for search in ["100|mg", "100.0|mg", "0.1|g"] {
+                let quantity = FhirQuantityValue::parse(search).expect("a quantity");
+                let code = quantity.code.clone().unwrap();
+                let interval = quantity.number.interval_predicate(prefix);
+                let (_, cunit) =
+                    helios_fhirpath::ucum::canonicalize_quantity(quantity.number.value, &code)
+                        .unwrap();
+                let mapped = QuantityIntervalPredicate {
+                    any_of: interval
+                        .any_of
+                        .iter()
+                        .map(|group| {
+                            group
+                                .iter()
+                                .map(|bound| match *bound {
+                                    QuantityBound::Low(c, v) => {
+                                        QuantityBound::Low(c, canon(v, &code))
+                                    }
+                                    QuantityBound::High(c, v) => {
+                                        QuantityBound::High(c, canon(v, &code))
+                                    }
+                                    QuantityBound::RangeOnly => QuantityBound::RangeOnly,
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                };
+                let mut expected: Vec<String> = Vec::new();
+                for (n, (unit, low, high)) in rows.iter().enumerate() {
+                    let (clow, chigh) = match (low, high) {
+                        (Some(l), Some(h)) => {
+                            let (a, b) = canonical_range(*l, *h, |x| canon(x, unit));
+                            (Some(a), Some(b))
+                        }
+                        _ => (
+                            low.map(|l| if l == open_low { l } else { canon(l, unit) }),
+                            high.map(|h| canon(h, unit)),
+                        ),
+                    };
+                    let row_cunit = helios_fhirpath::ucum::canonicalize_quantity(1.0, unit)
+                        .map(|(_, u)| u)
+                        .unwrap();
+                    let raw = *unit == code && matches(&interval, *low, *high);
+                    let canonical = row_cunit == cunit && matches(&mapped, clow, chigh);
+                    if raw || canonical {
+                        expected.push(format!("r{n:02}"));
+                    }
+                }
+
+                let mut next = 0;
+                let (predicate, params) = quantity_predicate("", prefix, search, &mut next)
+                    .expect("a numeric search value");
+                let predicate = inline_binds(&predicate, &params);
+                for (mode, setup) in modes {
+                    for (shape, sql) in [
+                        (
+                            "ids",
+                            format!(
+                                "SELECT resource_id FROM search_index WHERE tenant_id = 'rt'
+                                   AND resource_type = 'Observation'
+                                   AND param_name = 'value-quantity' AND {predicate}"
+                            ),
+                        ),
+                        (
+                            "page",
+                            format!(
+                                "SELECT DISTINCT resource_id, last_updated FROM search_index
+                                  WHERE tenant_id = 'rt' AND resource_type = 'Observation'
+                                    AND param_name = 'value-quantity' AND {predicate}
+                                  ORDER BY last_updated DESC, resource_id ASC LIMIT 1000"
+                            ),
+                        ),
+                    ] {
+                        client.batch_execute(setup).await.unwrap();
+                        let result = client.query(sql.as_str(), &[]).await;
+                        client.batch_execute("ROLLBACK").await.unwrap();
+                        let mut got: Vec<String> = result
+                            .unwrap_or_else(|e| panic!("{prefix:?} {search} {mode}: {e}\n{sql}"))
+                            .iter()
+                            .map(|r| r.get::<_, String>(0))
+                            .collect();
+                        got.sort();
+                        assert_eq!(
+                            got, expected,
+                            "{prefix:?} {search} via {mode} ({shape})\n{sql}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// v43 backfills the end of every existing date row from its own

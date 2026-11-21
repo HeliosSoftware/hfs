@@ -258,8 +258,7 @@ Ordered roughly by impact:
    with it. Elasticsearch rewrites nothing: `Quantity`/`Age` need no reindex (filters fall back to `value`
    for an entry without `high`, and sorts read `value`), a `Range` with `low != high` adds one sort-only
    nested entry (`sort_name`, upper bound as `value`, no `name`) for descending sorts, and only `Range`
-   values stored before the upgrade need `POST /<type>/$reindex`. On the other backends an older instance
-   must not keep writing after the backfill: its rows have no `high` and miss `eq`/`gt`/`ge`/`eb`/`ap`. SQLite
+   values stored before the upgrade need `POST /<type>/$reindex`. On the other backends a pre-#2602 writer leaves rows without `high` (missing `eq`/`gt`/`ge`/`eb`/`ap`, and `ne` only matches below the range): PostgreSQL covers it with a temporary insert trigger (`trg_search_index_quantity_high`, removed by a later migration), MongoDB refuses to start an old binary (schema 18) and repairs such rows at every startup, SQLite refuses an old build (schema 49). See the README, "Mixed versions during the upgrade". SQLite
    `_filter` evaluates quantity comparisons against the interval and supports `onset-age`,
    `abatement-age` and `context-quantity`. Known limits: composite token+quantity parameters index
    only `Quantity`/`Age` points and `Range` values with `low == high` (a `Range` with `low != high`,

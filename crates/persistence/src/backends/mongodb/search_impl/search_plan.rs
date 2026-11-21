@@ -5326,9 +5326,18 @@ mod execution_tests;
 /// Rewrites a quantity interval filter (#2602) for rows that are points:
 /// every condition on `value_quantity_high` moves onto `value_quantity_value`,
 /// merging with the conditions already there, in the filter and in each arm of
-/// its `$or`/`$and`.
+/// its `$or`/`$and`. An arm that tests the sparse `value_quantity_range_high`
+/// is about proper Ranges (the second group of `ap`) and a point row has none,
+/// so such an `$or` arm is dropped, leaving exactly the point semantics
+/// (`ap` is `value BETWEEN a AND b`).
 fn point_quantity_filter(mut filter: mongodb::bson::Document) -> mongodb::bson::Document {
     use mongodb::bson::Bson;
+    if let Ok(arms) = filter.get_array_mut("$or") {
+        arms.retain(|arm| {
+            !matches!(arm, Bson::Document(d)
+                if d.contains_key(super::super::search_index_catalog::QUANTITY_RANGE_HIGH_FIELD))
+        });
+    }
     for key in ["$or", "$and"] {
         if let Ok(arms) = filter.get_array_mut(key) {
             for arm in arms.iter_mut() {
@@ -5353,6 +5362,23 @@ fn point_quantity_filter(mut filter: mongodb::bson::Document) -> mongodb::bson::
 mod point_quantity_filter_tests {
     use super::point_quantity_filter;
     use mongodb::bson::doc;
+
+    /// `ap` is `[value BETWEEN a AND b]` or `[value < a AND range_high >= a]`;
+    /// the tuple rows are points, so only the first survives, unchanged.
+    #[test]
+    fn ap_keeps_only_the_point_arm() {
+        let f = point_quantity_filter(doc! { "$or": [
+            { "value_quantity_value": { "$gte": 40.0, "$lte": 50.0 } },
+            { "value_quantity_value": { "$lt": 40.0 },
+              "value_quantity_range_high": { "$gte": 40.0 } },
+        ]});
+        assert_eq!(
+            f,
+            doc! { "$or": [
+                { "value_quantity_value": { "$gte": 40.0, "$lte": 50.0 } },
+            ]}
+        );
+    }
 
     #[test]
     fn high_conditions_move_onto_the_value_and_merge() {
