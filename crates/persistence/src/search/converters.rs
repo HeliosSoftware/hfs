@@ -84,6 +84,10 @@ pub enum IndexValue {
         system: Option<String>,
         /// Unit code (e.g., "kg").
         code: Option<String>,
+        /// Upper bound of the interval the row covers (#2602). `value` is
+        /// the lower bound; a `Quantity`/`Age` is a point.
+        #[serde(default)]
+        high: QuantityHigh,
     },
 
     /// Reference to another resource.
@@ -119,7 +123,41 @@ pub enum DateEnd {
     Open,
 }
 
+/// Where the interval of an [`IndexValue::Quantity`] ends (#2602). The lower
+/// bound is the row's `value`; a `Range` without `low` stores
+/// [`super::range::QUANTITY_OPEN_LOW`] there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum QuantityHigh {
+    /// A point value (`Quantity`, `Age`, ...): high equals `value`.
+    #[default]
+    Point,
+    /// The `high` of a `Range`.
+    At(f64),
+    /// A `Range` without `high`: open above.
+    Open,
+}
+
+impl QuantityHigh {
+    /// The stored upper bound for a row whose lower bound is `value`.
+    pub fn resolve(self, value: f64) -> f64 {
+        match self {
+            QuantityHigh::Point => value,
+            QuantityHigh::At(h) => h,
+            QuantityHigh::Open => super::range::QUANTITY_OPEN_HIGH,
+        }
+    }
+}
+
 impl IndexValue {
+    /// The closed interval `(low, high)` an [`IndexValue::Quantity`] covers,
+    /// with open sides as the finite sentinels. `None` for other variants.
+    pub fn indexed_quantity_range(&self) -> Option<(f64, f64)> {
+        match self {
+            IndexValue::Quantity { value, high, .. } => Some((*value, high.resolve(*value))),
+            _ => None,
+        }
+    }
+
     /// Creates a string index value.
     pub fn string(s: impl Into<String>) -> Self {
         IndexValue::String(s.into())
@@ -235,6 +273,7 @@ impl IndexValue {
             unit: unit.clone(),
             system,
             code: unit,
+            high: QuantityHigh::Point,
         }
     }
 
@@ -635,23 +674,73 @@ impl ValueConverter {
     /// Converts a value to quantity type.
     fn convert_to_quantity(
         value: &Value,
-        _param_name: &str,
+        param_name: &str,
     ) -> Result<Vec<IndexValue>, ExtractionError> {
         let mut results = Vec::new();
 
-        if let Value::Object(obj) = value {
-            if let Some(val) = obj.get("value").and_then(|v| v.as_f64()) {
-                let unit = obj.get("unit").and_then(|v| v.as_str()).map(String::from);
-                let system = obj.get("system").and_then(|v| v.as_str()).map(String::from);
-                let code = obj.get("code").and_then(|v| v.as_str()).map(String::from);
+        let Value::Object(obj) = value else {
+            return Ok(results);
+        };
+        let text = |o: &serde_json::Map<String, Value>, k: &str| {
+            o.get(k).and_then(|v| v.as_str()).map(String::from)
+        };
 
-                results.push(IndexValue::Quantity {
-                    value: val,
-                    unit: unit.or_else(|| code.clone()),
-                    system,
-                    code,
-                });
+        if let Some(val) = obj.get("value").and_then(|v| v.as_f64()) {
+            let unit = text(obj, "unit");
+            let system = text(obj, "system");
+            let code = text(obj, "code");
+
+            results.push(IndexValue::Quantity {
+                value: val,
+                unit: unit.or_else(|| code.clone()),
+                system,
+                code,
+                high: QuantityHigh::Point,
+            });
+        } else if obj.contains_key("low") || obj.contains_key("high") {
+            // A Range: the closed interval [low, high]; a missing bound is
+            // open on that side (#2602).
+            let low = obj.get("low").and_then(|v| v.as_object());
+            let high = obj.get("high").and_then(|v| v.as_object());
+            let low_v = low.and_then(|o| o.get("value")).and_then(|v| v.as_f64());
+            let high_v = high.and_then(|o| o.get("value")).and_then(|v| v.as_f64());
+            if low_v.is_none() && high_v.is_none() {
+                return Ok(results);
             }
+            if let (Some(l), Some(h)) = (low_v, high_v) {
+                if l > h {
+                    tracing::warn!(param = param_name, "Range with low > high is not indexed");
+                    return Ok(results);
+                }
+            }
+            // Unit identity comes from the bounds that carry a value.
+            let ident = |o: Option<&serde_json::Map<String, Value>>| {
+                o.map(|o| (text(o, "unit"), text(o, "system"), text(o, "code")))
+            };
+            let (l_id, h_id) = (
+                if low_v.is_some() { ident(low) } else { None },
+                if high_v.is_some() { ident(high) } else { None },
+            );
+            if let (Some(l), Some(h)) = (&l_id, &h_id) {
+                if l.1 != h.1 || l.2 != h.2 {
+                    tracing::warn!(
+                        param = param_name,
+                        "Range whose bounds use different units is not indexed"
+                    );
+                    return Ok(results);
+                }
+            }
+            let (unit, system, code) = l_id.or(h_id).unwrap_or((None, None, None));
+            results.push(IndexValue::Quantity {
+                value: low_v.unwrap_or(super::range::QUANTITY_OPEN_LOW),
+                unit: unit.or_else(|| code.clone()),
+                system,
+                code,
+                high: match high_v {
+                    Some(h) => QuantityHigh::At(h),
+                    None => QuantityHigh::Open,
+                },
+            });
         }
 
         Ok(results)
@@ -1234,6 +1323,68 @@ mod tests {
         );
     }
 
+    fn quantity_rows(v: serde_json::Value) -> Vec<IndexValue> {
+        ValueConverter::convert(&v, SearchParamType::Quantity, "onset-age").unwrap()
+    }
+
+    #[test]
+    fn test_convert_range_is_a_closed_interval() {
+        let rows = quantity_rows(json!({
+            "low": {"value": 40, "unit": "a", "system": "http://unitsofmeasure.org", "code": "a"},
+            "high": {"value": 50, "unit": "a", "system": "http://unitsofmeasure.org", "code": "a"}
+        }));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].indexed_quantity_range(), Some((40.0, 50.0)));
+        match &rows[0] {
+            IndexValue::Quantity { unit, system, .. } => {
+                assert_eq!(unit.as_deref(), Some("a"));
+                assert_eq!(system.as_deref(), Some("http://unitsofmeasure.org"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_convert_open_ranges() {
+        let low_only = quantity_rows(json!({"low": {"value": 60, "unit": "a"}}));
+        assert_eq!(
+            low_only[0].indexed_quantity_range(),
+            Some((60.0, super::super::range::QUANTITY_OPEN_HIGH))
+        );
+        let high_only = quantity_rows(json!({"high": {"value": 10, "unit": "a"}}));
+        assert_eq!(
+            high_only[0].indexed_quantity_range(),
+            Some((super::super::range::QUANTITY_OPEN_LOW, 10.0))
+        );
+        match &high_only[0] {
+            IndexValue::Quantity { unit, .. } => assert_eq!(unit.as_deref(), Some("a")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_convert_range_without_bounds_or_inconsistent_is_skipped() {
+        assert!(quantity_rows(json!({"low": {"unit": "a"}})).is_empty());
+        assert!(
+            quantity_rows(
+                json!({"low": {"value": 5, "code": "a"}, "high": {"value": 1, "code": "a"}})
+            )
+            .is_empty()
+        );
+        assert!(
+            quantity_rows(
+                json!({"low": {"value": 1, "code": "a"}, "high": {"value": 2, "code": "mo"}})
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_quantity_is_a_point() {
+        let rows = quantity_rows(json!({"value": 45, "unit": "a"}));
+        assert_eq!(rows[0].indexed_quantity_range(), Some((45.0, 45.0)));
+    }
+
     #[test]
     fn test_convert_quantity() {
         let value = json!({
@@ -1251,6 +1402,7 @@ mod tests {
             unit,
             system,
             code,
+            ..
         } = &results[0]
         {
             assert!((value - 120.5).abs() < f64::EPSILON);

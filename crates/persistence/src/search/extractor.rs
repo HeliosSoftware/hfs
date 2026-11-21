@@ -172,6 +172,16 @@ impl std::fmt::Display for ExtractionFailure {
     }
 }
 
+/// Whether a composite component value fits a composite row, which stores one
+/// point per component. A quantity `Range` whose high equals its low (an
+/// open side never does) is a point and is kept (#2602).
+fn is_composite_representable(value: &IndexValue) -> bool {
+    match value {
+        IndexValue::Quantity { value, high, .. } => high.resolve(*value) == *value,
+        _ => true,
+    }
+}
+
 /// Removes the composite groups that can never match a composite search.
 ///
 /// A composite search matches only when every component matches, so an
@@ -985,6 +995,15 @@ impl SearchParameterExtractor {
                 for value in values {
                     let converted = ValueConverter::convert(&value, sub_type, &param.code)?;
                     for idx_value in converted {
+                        // Composite rows store one point per component; a
+                        // Range (low != high) cannot be represented (#2602).
+                        if !is_composite_representable(&idx_value) {
+                            tracing::debug!(
+                                param = %param.code,
+                                "Range component of a composite parameter is not indexed"
+                            );
+                            continue;
+                        }
                         results.push(
                             ExtractedValue::new(&param.code, &param.url, sub_type, idx_value)
                                 .with_composite_group(group)
@@ -1737,6 +1756,27 @@ mod tests {
     }
 
     #[test]
+    fn composite_keeps_points_and_degenerate_ranges_only() {
+        use crate::search::QuantityHigh;
+        let q = |value: f64, high: QuantityHigh| IndexValue::Quantity {
+            value,
+            unit: None,
+            system: None,
+            code: None,
+            high,
+        };
+        assert!(is_composite_representable(&q(5.0, QuantityHigh::Point)));
+        assert!(is_composite_representable(&q(5.0, QuantityHigh::At(5.0))));
+        assert!(!is_composite_representable(&q(5.0, QuantityHigh::At(6.0))));
+        assert!(!is_composite_representable(&q(5.0, QuantityHigh::Open)));
+        assert!(!is_composite_representable(&q(
+            crate::search::range::QUANTITY_OPEN_LOW,
+            QuantityHigh::At(5.0)
+        )));
+        assert!(is_composite_representable(&IndexValue::String("x".into())));
+    }
+
+    #[test]
     fn incomplete_composite_groups_are_dropped_and_plain_values_kept() {
         let token = |group: u32, slot: u8, arity: u8| {
             ExtractedValue::new(
@@ -1765,6 +1805,7 @@ mod tests {
                     unit: Some("kg".into()),
                     system: None,
                     code: None,
+                    high: crate::search::QuantityHigh::Point,
                 },
             )
             .with_composite_group(group)

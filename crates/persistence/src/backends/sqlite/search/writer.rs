@@ -115,7 +115,8 @@ impl SqliteSearchIndexWriter {
             value_string_folded,
             resource_key,
             value_date_end, composite_slot, value_date_start,
-            value_reference_target
+            value_reference_target,
+            value_quantity_high, value_quantity_canonical_high
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -128,14 +129,15 @@ impl SqliteSearchIndexWriter {
             ?24,
             ?25,
             ?26, ?27, ?28,
-            ?29
+            ?29,
+            ?30, ?31
         )
         "#
     }
 
-    /// INSERT SQL for a contained index entry: the same 29 base columns as
+    /// INSERT SQL for a contained index entry: the same 31 base columns as
     /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
-    /// `contained_local_id` (`?30..?32`). The base columns' `resource_type` /
+    /// `contained_local_id` (`?32..?34`). The base columns' `resource_type` /
     /// `resource_id` / `resource_key` identify the *container*; `contained_type`
     /// is the nested resource's type. Bind the base params from
     /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
@@ -155,6 +157,7 @@ impl SqliteSearchIndexWriter {
             resource_key,
             value_date_end, composite_slot, value_date_start,
             value_reference_target,
+            value_quantity_high, value_quantity_canonical_high,
             is_contained, contained_type, contained_local_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
@@ -169,7 +172,8 @@ impl SqliteSearchIndexWriter {
             ?25,
             ?26, ?27, ?28,
             ?29,
-            ?30, ?31, ?32
+            ?30, ?31,
+            ?32, ?33, ?34
         )
         "#
     }
@@ -185,7 +189,7 @@ impl SqliteSearchIndexWriter {
     }
 
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
-    /// rows (8 x 29 positional parameters). Bulk indexing executes this once
+    /// rows (8 x 31 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
     pub fn insert_sql_rows8() -> &'static str {
         static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -197,7 +201,7 @@ impl SqliteSearchIndexWriter {
         })
     }
 
-    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 29 = 14,848
+    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 31 = 15,872
     /// parameters, well under SQLite's variable limit.
     pub const MAX_ROWS_PER_INSERT: usize = 512;
 
@@ -225,7 +229,7 @@ impl SqliteSearchIndexWriter {
 
     /// Number of base columns [`Self::insert_sql`] writes, and so the length of
     /// every vector [`Self::to_sql_params`] returns.
-    pub const COLUMNS: usize = 29;
+    pub const COLUMNS: usize = 31;
 
     /// Converts an ExtractedValue to SQL parameters.
     ///
@@ -257,7 +261,51 @@ impl SqliteSearchIndexWriter {
             }
             _ => None,
         }));
+        // `value_quantity_high` / `value_quantity_canonical_high` (#2602): the
+        // upper end of the closed interval a quantity row covers — equal to
+        // the value for a `Quantity`/`Age` — raw and UCUM-canonical.
+        let (high, canonical_high) = Self::quantity_high_params(&extracted.value);
+        params.push(high);
+        params.push(canonical_high);
         params
+    }
+
+    /// The `value_quantity_high` and `value_quantity_canonical_high` params of
+    /// `value`; both NULL unless it is a quantity. The open-side sentinels are
+    /// stored as they are, never UCUM-converted.
+    fn quantity_high_params(value: &IndexValue) -> (SqlValue, SqlValue) {
+        let IndexValue::Quantity {
+            value: low,
+            unit,
+            code,
+            ..
+        } = value
+        else {
+            return (SqlValue::Null, SqlValue::Null);
+        };
+        let Some((_, high)) = value.indexed_quantity_range() else {
+            return (SqlValue::Null, SqlValue::Null);
+        };
+        let canonical_high =
+            Self::canonical_bounds(*low, high, code.as_deref().or(unit.as_deref()))
+                .map(|(_, ch)| ch);
+        (
+            SqlValue::Float(high),
+            canonical_high.map_or(SqlValue::Null, SqlValue::Float),
+        )
+    }
+
+    /// UCUM-canonical `(low, high)` of the interval `[low, high]` in `ucum`
+    /// (the code, else the unit display), or `None` when there is no unit or
+    /// it cannot be canonicalized. The open-side sentinels pass through
+    /// unchanged ([`crate::search::canonical_range`]).
+    fn canonical_bounds(low: f64, high: f64, ucum: Option<&str>) -> Option<(f64, f64)> {
+        let ucum = ucum?;
+        // Probe once so an unconvertible unit yields `None` rather than NaN.
+        helios_fhirpath::ucum::canonicalize_quantity(1.0, ucum)?;
+        Some(crate::search::canonical_range(low, high, |v| {
+            helios_fhirpath::ucum::canonicalize_quantity(v, ucum).map_or(f64::NAN, |(cv, _)| cv)
+        }))
     }
 
     /// Every base column of [`Self::to_sql_params`] up to `resource_key`.
@@ -371,15 +419,17 @@ impl SqliteSearchIndexWriter {
                 unit,
                 system,
                 code,
+                ..
             } => {
                 // Canonicalize using the UCUM code when present, else the unit
                 // display string. Stored alongside the raw value so quantity
                 // search can match equivalent units (e.g. g ⇄ mg).
                 let ucum = code.as_deref().or(unit.as_deref());
                 if let Some(u) = ucum {
-                    if let Some((cv, cu)) = helios_fhirpath::ucum::canonicalize_quantity(*value, u)
-                    {
-                        canonical_value = Some(cv);
+                    if let Some((_, cu)) = helios_fhirpath::ucum::canonicalize_quantity(*value, u) {
+                        // An open-low `Range` keeps its sentinel (#2602).
+                        canonical_value =
+                            Self::canonical_bounds(*value, *value, Some(u)).map(|(cl, _)| cl);
                         canonical_unit = Some(cu);
                     }
                 }
@@ -552,7 +602,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(rows[0].len(), 29);
+        assert_eq!(rows[0].len(), 31);
         assert!(matches!(
             rows[0][SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX],
             SqlValue::Int(1)
@@ -586,7 +636,7 @@ mod tests {
             SqlValue::String("Patient".into()),
             SqlValue::String("local".into()),
         ]);
-        assert_eq!(contained.len(), 32);
+        assert_eq!(contained.len(), 34);
         conn.execute(
             SqliteSearchIndexWriter::insert_contained_sql(),
             rusqlite::params_from_iter(contained.iter().map(bind)),
@@ -825,6 +875,53 @@ mod tests {
     }
 
     #[test]
+    fn quantity_range_writes_high_and_keeps_open_sentinels() {
+        let row = |value: IndexValue| {
+            let extracted = ExtractedValue {
+                param_name: "onset-age".to_string(),
+                param_url: "http://hl7.org/fhir/SearchParameter/Condition-onset-age".to_string(),
+                param_type: SearchParamType::Quantity,
+                value,
+                composite_group: None,
+                composite_slot: None,
+                composite_arity: None,
+            };
+            SqliteSearchIndexWriter::to_sql_params("t", "Condition", "c1", 1, &extracted)
+        };
+        let quantity = |value: f64, high: crate::search::QuantityHigh| IndexValue::Quantity {
+            value,
+            unit: Some("a".to_string()),
+            system: Some("http://unitsofmeasure.org".to_string()),
+            code: Some("a".to_string()),
+            high,
+        };
+        // A point: high = value.
+        let point = row(quantity(45.0, crate::search::QuantityHigh::Point));
+        assert_eq!(point.len(), SqliteSearchIndexWriter::COLUMNS);
+        assert!(matches!(&point[29], SqlValue::Float(f) if *f == 45.0));
+        // A closed range.
+        let range = row(quantity(40.0, crate::search::QuantityHigh::At(50.0)));
+        assert!(matches!(&range[12], SqlValue::Float(f) if *f == 40.0));
+        assert!(matches!(&range[29], SqlValue::Float(f) if *f == 50.0));
+        // Open high: the sentinel is stored as is, raw and canonical.
+        let open = row(quantity(60.0, crate::search::QuantityHigh::Open));
+        assert!(matches!(&open[29], SqlValue::Float(f) if *f == crate::search::QUANTITY_OPEN_HIGH));
+        assert!(matches!(&open[30], SqlValue::Float(f) if *f == crate::search::QUANTITY_OPEN_HIGH));
+        // Open low: the canonical low keeps the sentinel too.
+        let low_open = row(quantity(
+            crate::search::QUANTITY_OPEN_LOW,
+            crate::search::QuantityHigh::At(10.0),
+        ));
+        assert!(
+            matches!(&low_open[21], SqlValue::Float(f) if *f == crate::search::QUANTITY_OPEN_LOW)
+        );
+        // Not a quantity: both NULL.
+        let other = row(IndexValue::Number(1.0));
+        assert!(matches!(&other[29], SqlValue::Null));
+        assert!(matches!(&other[30], SqlValue::Null));
+    }
+
+    #[test]
     fn test_quantity_value_params() {
         let extracted = ExtractedValue {
             param_name: "value-quantity".to_string(),
@@ -835,6 +932,7 @@ mod tests {
                 unit: Some("mg".to_string()),
                 system: Some("http://unitsofmeasure.org".to_string()),
                 code: Some("mg".to_string()),
+                high: crate::search::QuantityHigh::Point,
             },
             composite_group: None,
             composite_slot: None,
