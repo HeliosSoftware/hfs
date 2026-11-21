@@ -587,7 +587,9 @@ When authentication is enabled, the tenant ID is derived **exclusively** from th
 
 With `HFS_TENANT_STRICT_VALIDATION=true`, a non-default header or URL tenant that differs from the claim is refused with `400` instead of being ignored.
 
-If the token does not contain the tenant claim, the `X-Tenant-ID` header and URL tenant are still not trusted: a request naming a tenant other than `HFS_DEFAULT_TENANT` is refused with `403`, and a request naming none is served from `HFS_DEFAULT_TENANT`. In a multi-tenant deployment, make sure every user's token carries the claim named by `HFS_AUTH_TENANT_CLAIM`.
+If the token does not contain the tenant claim (or carries it as `null`), the `X-Tenant-ID` header and URL tenant are still not trusted: a request naming a tenant other than `HFS_DEFAULT_TENANT` is refused with `403`, and a request naming none is served from `HFS_DEFAULT_TENANT`. In a multi-tenant deployment, make sure every user's token carries the claim named by `HFS_AUTH_TENANT_CLAIM`.
+
+A tenant claim that is present with any other JSON type (a number, boolean, array or object) is a validation error and the token is refused with `401`: an integer organisation id from a claim mapper must be emitted as a string.
 
 ## SMART Launch Context
 

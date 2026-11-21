@@ -146,11 +146,21 @@ impl AuthProvider for JwksBearerAuthProvider {
             debug!(sub = %subject, "No scope, scp or roles claim found in token");
         }
 
-        // 9. Extract tenant from configured claim
-        let tenant_id = claims
-            .get(&self.tenant_claim)
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // 9. Extract tenant from configured claim. The claim is the tenant
+        // boundary: a present claim of any other type is refused, since
+        // treating it as absent would bind the caller to the default tenant
+        // (`null` is absent).
+        let tenant_id = match claims.get(&self.tenant_claim) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(tenant)) => Some(tenant.clone()),
+            Some(other) => {
+                return Err(AuthError::ValidationError(format!(
+                    "Tenant claim '{}' must be a string, got {}",
+                    self.tenant_claim,
+                    json_type_name(other)
+                )));
+            }
+        };
 
         // 10. SMART launch context from the configured claims. The claims also
         // stay in `custom_claims` below, where callers found them before.
@@ -191,6 +201,18 @@ impl AuthProvider for JwksBearerAuthProvider {
 
     fn name(&self) -> &str {
         "jwks-bearer"
+    }
+}
+
+/// The JSON type of a claim value, for a refusal that names it.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
