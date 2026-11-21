@@ -132,6 +132,9 @@ const VALUE_DATE_END: &str = "value_date_end";
 /// Upper end of a quantity row's closed interval (#2602); the lower end is
 /// `value_quantity_value`.
 const VALUE_QUANTITY_HIGH: &str = "value_quantity_high";
+/// Lower end of a stored quantity interval, and the field both value-led
+/// quantity indexes are partial on.
+const VALUE_QUANTITY_VALUE: &str = "value_quantity_value";
 
 /// Reads a date search value with the grammar every backend shares.
 ///
@@ -6534,6 +6537,16 @@ impl MongoBackend {
     /// The filter a [`QuantityIntervalPredicate`] makes on the stored interval:
     /// one group is a flat document (one condition per bound, bounds on the
     /// same field merged), several groups an `$or` of such documents.
+    ///
+    /// A group with no bound on the lower end (`gt`, `ge`, `eb`, the upper arm
+    /// of `ne`) also gets `value_quantity_value: {$ne: null}` (#2730).
+    /// `idx_search_quantity_v2` and `idx_search_quantity_high` are partial on
+    /// that field existing, and a condition on `value_quantity_high` alone
+    /// does not imply it, so without the guard the planner may use neither
+    /// and reads every row of the resource type. Every quantity row stores
+    /// its lower end (an open one as a finite sentinel), so the guard never
+    /// changes the result. `$ne: null` rather than `$exists`, as the date
+    /// filter does: the planner accepts it as implying the partial filter.
     fn quantity_interval_filter(predicate: &crate::search::QuantityIntervalPredicate) -> Document {
         use crate::search::{Cmp, QuantityBound};
         let group_doc = |group: &[QuantityBound]| {
@@ -6545,7 +6558,7 @@ impl MongoBackend {
             };
             for bound in group {
                 let (field, cmp, v) = match *bound {
-                    QuantityBound::Low(c, v) => ("value_quantity_value", c, v),
+                    QuantityBound::Low(c, v) => (VALUE_QUANTITY_VALUE, c, v),
                     QuantityBound::High(c, v) => (high_field, c, v),
                     // A proper Range (low < high) is the one that carries the
                     // sparse `value_quantity_range_high`, so the shared
@@ -6570,6 +6583,15 @@ impl MongoBackend {
                         doc.insert(field, doc! { op: v });
                     }
                 }
+            }
+            // Decided from the bounds, not from the built document. A
+            // `RangeOnly` group always has a lower bound and is served by the
+            // range index, which is partial on its own field.
+            let bounds_low = group
+                .iter()
+                .any(|b| matches!(b, QuantityBound::Low(..) | QuantityBound::RangeOnly));
+            if !bounds_low {
+                doc.insert(VALUE_QUANTITY_VALUE, doc! { "$ne": Bson::Null });
             }
             doc
         };
@@ -7950,6 +7972,12 @@ mod date_filter_tests {
                         _ => low,
                     };
                     cond.as_document().unwrap().iter().all(|(op, v)| {
+                        // The partial-index guard: every stored row has its
+                        // lower end, so it holds for all of them.
+                        if op == "$ne" && *v == Bson::Null {
+                            assert_eq!(field, "value_quantity_value");
+                            return true;
+                        }
                         let v = v.as_f64().unwrap();
                         match op.as_str() {
                             "$lt" => stored < v,
@@ -8120,7 +8148,79 @@ mod date_filter_tests {
             filter.get_document("value_quantity_high").unwrap(),
             &doc! { "$gt": 5.4 }
         );
-        assert!(!filter.contains_key("value_quantity_value"));
+        // ... and names the lower end only through the guard that keeps the
+        // partial quantity indexes usable (#2730).
+        assert_eq!(
+            filter.get_document("value_quantity_value").unwrap(),
+            &doc! { "$ne": Bson::Null }
+        );
+    }
+
+    /// #2730: the rendered filter for each prefix. A group with no bound on
+    /// the lower end carries the non-null guard on `value_quantity_value`, so
+    /// the partial quantity indexes stay eligible; a group that bounds the
+    /// lower end does not get it.
+    #[test]
+    fn quantity_filter_guards_groups_without_a_low_bound() {
+        let backend =
+            MongoBackend::new(crate::backends::mongodb::MongoBackendConfig::default()).unwrap();
+        let filter = |raw: &str| {
+            backend
+                .build_quantity_filter("value-quantity", &SearchValue::parse(raw))
+                .unwrap()
+        };
+        let guard = doc! { "$ne": Bson::Null };
+
+        assert_eq!(
+            filter("gt5"),
+            doc! { "value_quantity_high": { "$gt": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        assert_eq!(
+            filter("ge5"),
+            doc! { "value_quantity_high": { "$gte": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        assert_eq!(
+            filter("eb5"),
+            doc! { "value_quantity_high": { "$lt": 5.0 }, "value_quantity_value": guard.clone() }
+        );
+        // `ne`: the low arm is already a bound on the field; only the high
+        // arm needs the guard.
+        assert_eq!(
+            filter("ne5"),
+            doc! { "$or": [
+                { "value_quantity_value": { "$lt": 4.5 } },
+                { "value_quantity_high": { "$gte": 5.5 }, "value_quantity_value": guard.clone() },
+            ]}
+        );
+        // `eq` keeps both ends bounded on both sides, with no guard.
+        assert_eq!(
+            filter("5"),
+            doc! {
+                "value_quantity_value": { "$gte": 4.5, "$lt": 5.5 },
+                "value_quantity_high": { "$lt": 5.5, "$gte": 4.5 },
+            }
+        );
+        // Low-bounded prefixes and both arms of `ap` are unchanged.
+        assert_eq!(
+            filter("lt5"),
+            doc! { "value_quantity_value": { "$lt": 5.0 } }
+        );
+        assert_eq!(
+            filter("le5"),
+            doc! { "value_quantity_value": { "$lte": 5.0 } }
+        );
+        assert_eq!(
+            filter("sa5"),
+            doc! { "value_quantity_value": { "$gt": 5.0 } }
+        );
+        let ap = filter("ap5");
+        for arm in ap.get_array("$or").unwrap() {
+            let low = arm
+                .as_document()
+                .unwrap()
+                .get_document("value_quantity_value");
+            assert!(!low.unwrap().contains_key("$ne"), "{ap:?}");
+        }
     }
 }
 

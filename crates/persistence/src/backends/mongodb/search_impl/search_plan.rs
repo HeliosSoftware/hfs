@@ -5349,7 +5349,15 @@ fn point_quantity_filter(mut filter: mongodb::bson::Document) -> mongodb::bson::
     }
     if let Some(Bson::Document(high)) = filter.remove("value_quantity_high") {
         match filter.get_document_mut("value_quantity_value") {
-            Ok(low) => low.extend(high),
+            Ok(low) => {
+                low.extend(high);
+                // The partial-index guard of a group that bounded only the
+                // high end (#2730) is implied by the comparison that just
+                // moved onto the field.
+                if low.len() > 1 && low.get("$ne") == Some(&Bson::Null) {
+                    low.remove("$ne");
+                }
+            }
             Err(_) => {
                 filter.insert("value_quantity_value", high);
             }
@@ -5392,6 +5400,13 @@ mod point_quantity_filter_tests {
             f,
             doc! { "value_quantity_value": { "$gte": 1.0, "$lt": 2.0 } }
         );
+        // The guard a high-only group carries (#2730) is dropped once the
+        // comparison is on the field itself.
+        let f = point_quantity_filter(doc! {
+            "value_quantity_high": { "$gt": 160.0 },
+            "value_quantity_value": { "$ne": mongodb::bson::Bson::Null },
+        });
+        assert_eq!(f, doc! { "value_quantity_value": { "$gt": 160.0 } });
         let f = point_quantity_filter(doc! { "$or": [
             { "value_quantity_high": { "$lt": 1.0 } },
             { "value_quantity_value": { "$gt": 3.0 } },
