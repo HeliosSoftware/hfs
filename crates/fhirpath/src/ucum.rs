@@ -34,7 +34,7 @@ pub fn canonicalize_quantity(value: f64, unit: &str) -> Option<(f64, String)> {
     if canonical.unit.is_empty() {
         return None;
     }
-    let canonical_value = value * canonical.factor + canonical.offset;
+    let canonical_value = value * canonical.factor.to_f64() + canonical.offset.to_f64();
     Some((canonical_value, canonical.unit))
 }
 
@@ -300,20 +300,6 @@ pub fn is_time_unit(unit: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Known defect of octofhir-ucum 0.5.2 (fixed upstream in 0.6.1 and later):
-    /// its build script divides the units defined as `X/N` twice, so the UCUM
-    /// month (`mo` = `a_j`/12 = 2,629,800 s) canonicalizes to 219,150 s. Remove
-    /// the `ignore` when the dependency is upgraded (tracked as a separate task
-    /// referenced from #2602).
-    #[test]
-    #[ignore = "octofhir-ucum 0.5.2 divides `mo` twice; fixed upstream in >= 0.6.1"]
-    fn canonicalize_quantity_month_is_a_twelfth_of_a_year() {
-        let (month, _) = canonicalize_quantity(1.0, "mo").unwrap();
-        let (year, _) = canonicalize_quantity(1.0, "a").unwrap();
-        assert_eq!(month, 2_629_800.0);
-        assert_eq!(month * 12.0, year);
-    }
-
     #[test]
     fn test_validate_unit() {
         assert!(validate_unit("mg"));
@@ -331,6 +317,74 @@ mod tests {
         assert!(units_are_comparable("d", "wk"));
         assert!(!units_are_comparable("g", "m"));
         assert!(!units_are_comparable("s", "kg"));
+    }
+
+    /// Asserts `canonicalize_quantity(1, unit)` gives `factor` (relative
+    /// tolerance 1e-12) in `canonical_unit`.
+    fn assert_canonical(unit: &str, factor: f64, canonical_unit: &str) {
+        let (value, cu) =
+            canonicalize_quantity(1.0, unit).unwrap_or_else(|| panic!("{unit} must canonicalize"));
+        assert_eq!(cu, canonical_unit, "canonical unit of {unit}");
+        assert!(
+            ((value - factor) / factor).abs() < 1e-12,
+            "1 {unit} canonicalized to {value} {cu}, expected {factor} {canonical_unit}"
+        );
+    }
+
+    /// octofhir-ucum 0.5.2 divided every `X/N` unit definition twice in its
+    /// `build.rs`, so `mo` came out as 219,150 s instead of 2,629,800 s
+    /// (a twelfth of a Julian year). Fixed upstream from 0.6.1.
+    #[test]
+    fn canonicalize_quantity_month_is_a_twelfth_of_a_year() {
+        let (month, _) = canonicalize_quantity(1.0, "mo").unwrap();
+        let (year, _) = canonicalize_quantity(1.0, "a").unwrap();
+        assert_eq!(month, 2_629_800.0);
+        assert_eq!(month * 12.0, year);
+        assert_canonical("mo_j", 2_629_800.0, "s");
+        assert_canonical("/mo", 1.0 / 2_629_800.0, "s-1");
+    }
+
+    /// Canonical factors that 0.5.2 got wrong, checked against the UCUM
+    /// definitions. Mass canonicalizes to `g` (UCUM's base unit), so `g`,
+    /// `mg` and `kg` still share one canonical unit and compare.
+    #[test]
+    fn canonicalize_quantity_matches_ucum_definitions() {
+        assert_canonical("g", 1.0, "g");
+        assert_canonical("mg", 1e-3, "g");
+        assert_canonical("kg", 1e3, "g");
+        assert_canonical("[oz_av]", 28.349_523_125, "g");
+        assert_canonical("L", 1e-3, "m3");
+        assert_canonical("mL", 1e-6, "m3");
+        assert_canonical("dL", 1e-4, "m3");
+        assert_canonical("mg/dL", 10.0, "g.m-3");
+        assert_canonical("%", 0.01, "1");
+        assert_canonical("10*3/uL", 1e12, "m-3");
+        assert_canonical("mol", 6.022_140_76e23, "1");
+        assert_canonical("mmol/L", 6.022_140_76e23, "m-3");
+    }
+
+    /// Commensurable units canonicalize to the same value, so a search for
+    /// `1 L` matches a stored `1000 mL`, and `1 mo` matches `1/12 a`.
+    #[test]
+    fn canonicalize_quantity_equates_commensurable_units() {
+        let canon = |v: f64, u: &str| canonicalize_quantity(v, u).unwrap();
+        for (a, b) in [
+            ((1.0, "L"), (1000.0, "mL")),
+            ((1.0, "g"), (1000.0, "mg")),
+            ((12.0, "mo"), (1.0, "a")),
+            ((100.0, "%"), (1.0, "1")),
+        ] {
+            let (va, ua) = canon(a.0, a.1);
+            let (vb, ub) = canon(b.0, b.1);
+            assert_eq!(ua, ub, "{a:?} vs {b:?}");
+            assert!(((va - vb) / va).abs() < 1e-12, "{a:?}={va} vs {b:?}={vb}");
+        }
+    }
+
+    #[test]
+    fn convert_units_month_to_days() {
+        let days = convert_units(Decimal::ONE, "mo", "d").unwrap();
+        assert_eq!(days, Decimal::from_str("30.4375").unwrap());
     }
 
     #[test]

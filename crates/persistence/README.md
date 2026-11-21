@@ -2950,14 +2950,11 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   the search value as written, and filters on the unit code verbatim, so on
   MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
   stored as `kg`.
-- **Known limitation of the UCUM library (octofhir-ucum 0.5.2).** Units defined
-  as a fraction of another (the month `mo`, `mo_j`, `mo_g`, `deg`, `[ft_us]`
-  and about 140 more) have a wrong canonical factor, so a cross-unit search such
-  as `12|http://unitsofmeasure.org|mo` against `1 a` does not match, and a
-  `Range` such as `1 a`..`20 mo` is dropped as inverted. Searches within one
-  unit, and the units `a`, `wk`, `d`, `h` and `min`, are not affected. It is
-  fixed upstream; the dependency upgrade (and a reindex of the affected
-  canonical values) is a separate task.
+- Cross-unit `Range` values (for example `1 a`..`20 mo`) rely on the UCUM
+  canonical values. They are only correct once the `octofhir-ucum` upgrade
+  described under "Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump" below
+  is in place and the data has been reindexed; before that, a `Range` whose
+  bounds canonicalize wrongly can be dropped as inverted.
 - The eq/ne-vs-comparator precision rule itself (implicit-precision range for
   `eq`/`ne`, exact value for the other comparators) is unified across
   SQLite, PostgreSQL, Elasticsearch, and MongoDB. `ap` (approximately equal)
@@ -3097,6 +3094,21 @@ older binary then runs again.
 an open-low `Range` stores `f64::MIN`. Before running the old binary, delete the
 `Range` rows (`db.search_index.deleteMany({ value_quantity_high: { $exists: true }, $expr: { $ne: ["$value_quantity_high", "$value_quantity_value"] } })`,
 and the same on `search_index_contained`), or run `$reindex` on the old binary.
+
+**Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump:** the UCUM library
+that fills the `*_canonical_value` / `*_canonical_unit` columns (SQLite,
+PostgreSQL) and fields (Elasticsearch) was upgraded. 0.5.2 computed wrong
+canonical factors for many units (`mo` was 219,150 s instead of 2,629,800 s,
+`L` was 1 m³, `%` was 1, plus `mol`, `[oz_av]`, `10*3/uL` and roughly 140
+`X/N`-defined units), and labelled mass as `kg` where 0.9 uses UCUM's base
+unit `g`. Rows indexed by an older build keep the old canonical value and
+unit until they are rewritten, so a cross-unit search (`5|…|mg` against data
+stored as `g`, or any search in months) misses them. Searches in the same
+unit the data was stored in are unaffected, because the raw value/unit branch
+still matches. Run `POST /$reindex` once per tenant after upgrading every
+writer. There is no in-place migration: the SQLite and PostgreSQL rows do not
+keep the UCUM code that canonicalization used, and Elasticsearch documents are
+only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
 
 **Date prefix semantics (range targets, #1391):**
 
