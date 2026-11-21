@@ -8483,7 +8483,7 @@ async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
             let r = backend.search(&tenant, &q).await.unwrap();
             assert_eq!(r.resources.items.len(), 20);
         },
-        "idx_search_uri_v2",
+        &["idx_search_uri_v2"],
     )
     .await;
 }
@@ -20303,7 +20303,7 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
 async fn assert_search_index_ops_are_covered(
     db: &mongodb::Database,
     search: impl std::future::Future<Output = ()>,
-    expected_index_fragment: &str,
+    expected_indexes: &[&str],
 ) {
     use futures::stream::TryStreamExt;
 
@@ -20370,8 +20370,10 @@ async fn assert_search_index_ops_are_covered(
         let mut indexes = Vec::new();
         collect_index_names(winning_plan, &mut indexes);
         assert!(
-            indexes.iter().any(|name| name == expected_index_fragment),
-            "wrong winning index: expected {expected_index_fragment}, got {indexes:?}"
+            indexes
+                .iter()
+                .any(|name| expected_indexes.contains(&name.as_str())),
+            "wrong winning index: expected one of {expected_indexes:?}, got {indexes:?}"
         );
     }
 }
@@ -20379,9 +20381,11 @@ async fn assert_search_index_ops_are_covered(
 /// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
 /// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
 /// (`ge`, `le` and `ne` included) and a comma list must still be a covered
-/// scan on `idx_search_date_v3`, which carries both.
+/// scan. #2601: a search bounded only on the range end (`gt`, and one arm of
+/// `ge`/`ne`) is served by `idx_search_date_end`; the others by
+/// `idx_search_date_v3`. Both carry `value_date`, `value_date_end` and the id.
 #[tokio::test]
-async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
+async fn mongodb_integration_date_range_search_is_a_covered_date_scan() {
     let Some(backend) = create_backend_with_stable_probes("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
@@ -20410,14 +20414,16 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     // have two alternatives, which are sent as an `$or` at the top of the
     // filter so that each arm is a covered scan too. Comma lists ride the
     // same top-level `$or`.
-    for (value, expected) in [
-        ("gt2016-01-10", 10),
-        ("2016-01-10", 1),
-        ("eb2016-01-10", 9),
-        ("ge2016-01-10", 11),
-        ("le2016-01-10", 10),
-        ("ne2016-01-10", 19),
-        ("ge2016-01-19,lt2016-01-03", 4),
+    const DATE_INDEXES: [&str; 2] = ["idx_search_date_v3", "idx_search_date_end"];
+    for (value, expected, expected_indexes) in [
+        ("gt2016-01-10", 10, &["idx_search_date_end"][..]),
+        ("2016-01-10", 1, &["idx_search_date_v3"][..]),
+        ("eb2016-01-10", 9, &["idx_search_date_v3"][..]),
+        // A root `$or` runs unhinted: each arm picks either date index.
+        ("ge2016-01-10", 11, &DATE_INDEXES[..]),
+        ("le2016-01-10", 10, &DATE_INDEXES[..]),
+        ("ne2016-01-10", 19, &DATE_INDEXES[..]),
+        ("ge2016-01-19,lt2016-01-03", 4, &DATE_INDEXES[..]),
     ] {
         let values: Vec<SearchValue> = value.split(',').map(SearchValue::parse).collect();
         let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -20438,7 +20444,7 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
                 let r = backend.search(&tenant, &q).await.unwrap();
                 assert_eq!(r.resources.items.len(), expected, "date={value}");
             },
-            "idx_search_date_v3",
+            expected_indexes,
         )
         .await;
     }
@@ -20672,7 +20678,7 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
             let r = backend.search(&tenant, &q).await.unwrap();
             assert_eq!(r.resources.items.len(), 10);
         },
-        "idx_search_token_v2",
+        &["idx_search_token_v2"],
     )
     .await;
 }
@@ -20724,7 +20730,7 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
             let r = backend.search(&tenant, &q).await.unwrap();
             assert_eq!(r.resources.items.len(), 10);
         },
-        "idx_search_token_v2",
+        &["idx_search_token_v2"],
     )
     .await;
 }
@@ -23840,7 +23846,7 @@ async fn mongodb_selective_reference_search_uses_existing_ordered_index() {
             assert_eq!(result.resources.items.len(), 1);
             assert_eq!(result.resources.items[0].id(), "o19");
         },
-        "idx_search_reference_v2",
+        &["idx_search_reference_v2"],
     )
     .await;
 }

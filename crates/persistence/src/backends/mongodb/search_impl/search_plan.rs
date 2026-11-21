@@ -7,7 +7,7 @@
 use super::super::probe_cache::{OffsetPageDecision, ProbeCache, ProbeEstimate, ProbeKey};
 use super::super::search_deadline::{self, SearchCommand};
 #[cfg(test)]
-use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
+use super::super::search_index_catalog::{SEARCH_DATE_END_INDEX, SEARCH_DATE_RANGE_INDEX};
 use super::collect_documents;
 use super::search_access::{
     CandidateSource, CompositeMembership, IndexAccess, PredicateAccess, aggregate_membership,
@@ -157,8 +157,19 @@ impl From<Document> for IndexPredicate {
 }
 
 impl IndexPredicate {
+    #[cfg(test)]
     fn new(filter: Document, parameter: &SearchParameter, indexes_ready: bool) -> Self {
-        let access = PredicateAccess::new(&filter, parameter, indexes_ready);
+        Self::new_with_date_end(filter, parameter, indexes_ready, false)
+    }
+
+    fn new_with_date_end(
+        filter: Document,
+        parameter: &SearchParameter,
+        indexes_ready: bool,
+        date_end_ready: bool,
+    ) -> Self {
+        let access =
+            PredicateAccess::new_with_date_end(&filter, parameter, indexes_ready, date_end_ready);
         Self {
             filter,
             access,
@@ -170,6 +181,26 @@ impl IndexPredicate {
 
     fn hint(&self) -> Option<Hint> {
         self.access.discovery_hint()
+    }
+
+    /// `filter` bounded by a cursor frontier. A date predicate left unhinted
+    /// over a root `$or` keeps that `$or` at the root, with the frontier in
+    /// every arm, so MongoDB still plans each arm separately (#2601).
+    fn bounded_filter(&self, boundary: Document) -> Document {
+        if self.access.discovery == IndexAccess::DateEndRange
+            && self.hint().is_none()
+            && let Ok(arms) = self.filter.get_array("$or")
+        {
+            let mut bounded = self.filter.clone();
+            bounded.insert(
+                "$or",
+                arms.iter()
+                    .map(|arm| Bson::Document(doc! { "$and": [arm.clone(), boundary.clone()] }))
+                    .collect::<Vec<_>>(),
+            );
+            return bounded;
+        }
+        doc! { "$and": [self.filter.clone(), boundary] }
     }
 
     /// Whether `filter` finds candidates only: membership pairs the
@@ -747,7 +778,12 @@ impl MongoBackend {
         filter: Document,
         indexes_ready: bool,
     ) -> IndexPredicate {
-        let mut predicate = IndexPredicate::new(filter, parameter, indexes_ready);
+        let mut predicate = IndexPredicate::new_with_date_end(
+            filter,
+            parameter,
+            indexes_ready,
+            self.date_end_index_ready(),
+        );
         let registry = self.tenant_registry(tenant_id);
         let definition = registry.read().get_param(resource_type, &parameter.name);
         let definition = definition
@@ -3587,7 +3623,7 @@ impl BatchedIndexPlan {
 
     fn seed_pipeline(&self, boundary: Option<Document>, direction: Option<i32>) -> Vec<Document> {
         let filter = match boundary {
-            Some(boundary) => doc! { "$and": [self.driver.filter.clone(), boundary] },
+            Some(boundary) => self.driver.bounded_filter(boundary),
             None => self.driver.filter.clone(),
         };
         // Group before streaming so duplicate index rows cannot cross batches.
@@ -5172,6 +5208,10 @@ mod index_intersection_tests {
     use super::*;
 
     fn date_predicate(raw: &str) -> IndexPredicate {
+        date_predicate_with(raw, true)
+    }
+
+    fn date_predicate_with(raw: &str, date_end_ready: bool) -> IndexPredicate {
         let parameter = SearchParameter {
             name: "date".to_owned(),
             param_type: SearchParamType::Date,
@@ -5185,7 +5225,7 @@ mod index_intersection_tests {
         filter.extend(
             super::super::build_date_range_filter_doc(&parameter.values[0], "date").unwrap(),
         );
-        IndexPredicate::new(filter, &parameter, true)
+        IndexPredicate::new_with_date_end(filter, &parameter, true, date_end_ready)
     }
 
     #[test]
@@ -5207,10 +5247,8 @@ mod index_intersection_tests {
                 .pipeline(live.clone(), Some(doc! {"id": 1}), None)
                 .unwrap();
             assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
-            assert_eq!(
-                plan.hint,
-                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-            );
+            // A root `$or` mixes end- and start-bounded arms: MongoDB plans each.
+            assert_eq!(plan.hint, None);
             assert_eq!(plan.stages[0], doc! { "$match": ge.filter.clone() });
             assert_eq!(
                 plan.stages[1]
@@ -5266,15 +5304,99 @@ mod index_intersection_tests {
             )
             .unwrap();
             assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
-            assert_eq!(
-                plan.hint,
-                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-            );
+            assert_eq!(plan.hint, None);
             assert_eq!(
                 plan.stages[0],
                 doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
             );
         }
+    }
+
+    #[test]
+    fn not_ready_date_end_index_keeps_the_v3_hint_for_ge() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let ge = date_predicate_with("ge2024-11-01", false);
+        assert_eq!(ge.access.discovery, IndexAccess::DateEndRange);
+        assert_eq!(ge.hint(), v3);
+        let plan = SearchFilterPlan::IndexIntersection(vec![ge.clone()])
+            .pipeline(
+                doc! { "tenant_id": "t", "is_deleted": false },
+                Some(doc! {"id": 1}),
+                None,
+            )
+            .unwrap();
+        assert_eq!(plan.hint, v3);
+        let lookup = SearchFilterPlan::ResourceLookups {
+            index_filter: Some(ge),
+            stages: Vec::new(),
+        }
+        .pipeline(
+            doc! { "is_deleted": false },
+            Some(doc! { "id": -1 }),
+            Some(doc! { "resource_id": { "$lt": "next" } }),
+        )
+        .unwrap();
+        assert_eq!(lookup.hint, v3);
+    }
+
+    #[test]
+    fn date_prefixes_choose_their_discovery_hint() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        // `gt` is a flat filter bounded only on the range end.
+        let gt = date_predicate("gt2024-11-01");
+        assert_eq!(gt.access.discovery, IndexAccess::DateEndRange);
+        assert!(!gt.filter.contains_key("$or"));
+        assert_eq!(gt.hint(), end);
+        assert_eq!(date_predicate_with("gt2024-11-01", false).hint(), v3);
+        // Prefixes with a root `$or` leave the arms to the planner.
+        for raw in ["ge2024-11-01", "ne2024-11-01"] {
+            assert_eq!(date_predicate(raw).hint(), None, "{raw}");
+            assert_eq!(date_predicate_with(raw, false).hint(), v3, "{raw}");
+        }
+        // Start-bounded prefixes keep the v3 hint whatever the end index does.
+        for raw in [
+            "ap2024-11-01",
+            "eq2024-11-01",
+            "lt2024-11-01",
+            "le2024-11-01",
+            "sa2024-11-01",
+            "eb2024-11-01",
+        ] {
+            for ready in [true, false] {
+                let predicate = date_predicate_with(raw, ready);
+                assert_eq!(predicate.access.discovery, IndexAccess::DateRange, "{raw}");
+                assert_eq!(predicate.hint(), v3, "{raw} ready={ready}");
+            }
+        }
+    }
+
+    #[test]
+    fn seed_boundary_stays_inside_each_arm_of_an_unhinted_or() {
+        let boundary = doc! { "resource_id": { "$gt": "cursor" } };
+        let ge = date_predicate("ge2024-11-01");
+        let arms = ge.filter.get_array("$or").unwrap().len();
+        let bounded = ge.bounded_filter(boundary.clone());
+        assert!(!bounded.contains_key("$and"));
+        let bounded_arms = bounded.get_array("$or").unwrap();
+        assert_eq!(bounded_arms.len(), arms);
+        for arm in bounded_arms {
+            assert_eq!(
+                arm.as_document().unwrap().get_array("$and").unwrap().len(),
+                2
+            );
+        }
+        // A hinted predicate wraps the whole filter, as before.
+        let gt = date_predicate("gt2024-11-01");
+        assert_eq!(
+            gt.bounded_filter(boundary.clone()),
+            doc! { "$and": [gt.filter.clone(), boundary.clone()] }
+        );
+        let unready = date_predicate_with("ge2024-11-01", false);
+        assert_eq!(
+            unready.bounded_filter(boundary.clone()),
+            doc! { "$and": [unready.filter.clone(), boundary] }
+        );
     }
 
     #[test]

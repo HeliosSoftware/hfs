@@ -1874,7 +1874,7 @@ async fn date_searches_survive_a_dropped_hinted_index() {
     let mut query = SearchQuery::new("Observation")
         .with_count(50)
         .with_sort(SortDirective::parse("_id"))
-        .with_parameter(date_parameter("ge2025-01-01"));
+        .with_parameter(date_parameter("eq2025"));
     query.total = Some(TotalMode::Accurate);
     let ids = |result: &crate::core::SearchResult| {
         result
@@ -2376,4 +2376,315 @@ async fn missing_metadata_selection_preserves_other_candidate_routes() {
         "no referenced resource has this identifier"
     );
     fixture.close().await;
+}
+
+/// #2601: `gt`, `ge` and `ne` date searches may use `idx_search_date_end`;
+/// results and totals must not depend on it.
+mod date_end_filter_tests {
+    use super::*;
+    use crate::backends::mongodb::search_index_catalog::SEARCH_DATE_END_INDEX;
+    use crate::types::SearchParamType;
+    use mongodb::bson::Bson;
+    use std::collections::BTreeSet;
+
+    const DAY_MS: i64 = 86_400_000;
+    const BASE_MS: i64 = 1_577_836_800_000; // 2020-01-01T00:00:00Z
+
+    fn day(number: i64) -> DateTime {
+        DateTime::from_millis(BASE_MS + number * DAY_MS)
+    }
+
+    /// One date row per live resource, one day wide, a day later per row;
+    /// every 9th row is an open range (no end) and every 5th a second
+    /// occurrence far in the future.
+    async fn add_date_rows(fixture: &Fixture) {
+        let mut rows = Vec::new();
+        for (number, row) in fixture.rows.iter().enumerate() {
+            let number = number as i64;
+            let mut date = doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+            "resource_id":&row.id, "param_name":"date", "value_date":day(number) };
+            if number % 9 != 4 {
+                date.insert("value_date_end", day(number + 1));
+            }
+            rows.push(date);
+            if number % 5 == 1 {
+                rows.push(
+                    doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                    "resource_id":&row.id, "param_name":"date",
+                    "value_date":day(number + 900), "value_date_end":day(number + 901) },
+                );
+            }
+        }
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(rows)
+            .await
+            .unwrap();
+    }
+
+    fn date_parameter(raw: &str) -> SearchParameter {
+        SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse(raw)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn date_query(raw: &str, count: u32, offset: u32) -> SearchQuery {
+        let mut query = SearchQuery::new("Observation").with_count(count);
+        query.parameters = vec![date_parameter(raw)];
+        query.offset = Some(offset);
+        query.total = Some(TotalMode::Accurate);
+        query
+    }
+
+    fn ids(result: &crate::core::SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_owned())
+            .collect()
+    }
+
+    /// A second backend on the fixture's database after `idx_search_date_end`
+    /// is dropped and automatic builds are off: the node upgraded before the
+    /// index exists. Run after the indexed answers were taken.
+    async fn backend_without_date_end(fixture: &Fixture) -> MongoBackend {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .drop_index(SEARCH_DATE_END_INDEX)
+            .await
+            .unwrap();
+        let mut config = fixture.backend.config().clone();
+        config.index_build = IndexBuildMode::Off;
+        let backend = MongoBackend::new(config).unwrap();
+        backend.init_schema().await.unwrap();
+        backend.wait_for_search_index_build().await;
+        assert!(!backend.date_end_index_ready());
+        backend
+    }
+
+    const PREFIXES: [&str; 3] = ["gt2020-03-01", "ge2020-03-01", "ne2020-03-01"];
+
+    async fn full_answer(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+        raw: &str,
+    ) -> (BTreeSet<String>, Option<u64>) {
+        let result = backend
+            .search(tenant, &date_query(raw, 1_000, 0))
+            .await
+            .unwrap();
+        (ids(&result).into_iter().collect(), result.total)
+    }
+
+    #[tokio::test]
+    async fn gt_ge_ne_return_the_same_ids_and_totals_with_and_without_the_index() {
+        let Some(fixture) = Fixture::new("date-end-parity", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        assert!(fixture.backend.date_end_index_ready());
+        let mut indexed = Vec::new();
+        for raw in PREFIXES {
+            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
+            assert!(!answer.0.is_empty(), "{raw} must match something");
+            indexed.push(answer);
+        }
+        let plain = backend_without_date_end(&fixture).await;
+        for (raw, indexed) in PREFIXES.into_iter().zip(indexed) {
+            let without = full_answer(&plain, &fixture.tenant, raw).await;
+            assert_eq!(indexed.0, without.0, "{raw}: ids");
+            assert_eq!(indexed.1, without.1, "{raw}: total");
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_hot_dropped_date_end_index_runs_unhinted_instead_of_failing() {
+        let Some(fixture) = Fixture::new("date-end-hot-drop", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        let mut expected = Vec::new();
+        for raw in PREFIXES {
+            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+        }
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .drop_index(SEARCH_DATE_END_INDEX)
+            .await
+            .unwrap();
+        // The running backend still believes the index is built.
+        assert!(fixture.backend.date_end_index_ready());
+        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
+            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
+            assert_eq!(answer, expected, "{raw}");
+            let page = fixture
+                .backend
+                .search(&fixture.tenant, &date_query(raw, 10, 10))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 10, "{raw}: page 2");
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ge_ne_gt_survive_a_dropped_date_v3_index() {
+        let Some(fixture) = Fixture::new("date-end-v3-dropped", 400).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        let mut expected = Vec::new();
+        for raw in PREFIXES {
+            expected.push(full_answer(&fixture.backend, &fixture.tenant, raw).await);
+        }
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .drop_index(SEARCH_DATE_RANGE_INDEX)
+            .await
+            .unwrap();
+        // The root $or of ge/ne is unhinted, so each arm picks what is left.
+        for (raw, expected) in PREFIXES.into_iter().zip(expected) {
+            let answer = full_answer(&fixture.backend, &fixture.tenant, raw).await;
+            assert_eq!(answer, expected, "{raw}");
+            let page = fixture
+                .backend
+                .search(&fixture.tenant, &date_query(raw, 10, 10))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 10, "{raw}: page 2");
+        }
+        fixture.close().await;
+    }
+
+    /// Every index scan in an explain output, wherever the stage nests.
+    fn index_scans(plan: &Bson, out: &mut Vec<Document>) {
+        match plan {
+            Bson::Document(stage) => {
+                if stage.get_str("stage") == Ok("IXSCAN") {
+                    out.push(stage.clone());
+                }
+                for value in stage.values() {
+                    index_scans(value, out);
+                }
+            }
+            Bson::Array(items) => items.iter().for_each(|item| index_scans(item, out)),
+            _ => {}
+        }
+    }
+
+    fn end_is_bounded(scan: &Document) -> bool {
+        scan.get_document("indexBounds")
+            .ok()
+            .and_then(|bounds| bounds.get_array("value_date_end").ok())
+            .is_some_and(|bounds| {
+                !bounds
+                    .iter()
+                    .any(|bound| bound.as_str() == Some("[MinKey, MaxKey]"))
+            })
+    }
+
+    async fn explain_filter(
+        fixture: &Fixture,
+        filter: Document,
+        hint: Option<&str>,
+    ) -> Vec<Document> {
+        let mut find = doc! { "find":"search_index", "filter":filter };
+        if let Some(hint) = hint {
+            find.insert("hint", hint);
+        }
+        let reply = fixture
+            .db
+            .run_command(doc! { "explain": find, "verbosity": "queryPlanner" })
+            .await
+            .unwrap();
+        let mut scans = Vec::new();
+        index_scans(&Bson::Document(reply), &mut scans);
+        scans
+    }
+
+    fn scoped(raw: &str) -> Document {
+        let scope = doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+        "param_name":"date" };
+        let value = SearchValue::parse(raw);
+        let filter = super::super::super::build_date_range_filter_doc(&value, "date").unwrap();
+        super::super::super::scoped_date_alternatives(&scope, vec![filter])
+    }
+
+    #[tokio::test]
+    async fn gt_ge_ne_plans_bound_value_date_end() {
+        let Some(fixture) = Fixture::new("date-end-explain", 2_000).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        // A late date: the end bound is selective, the start bound is not.
+        for raw in ["gt2025-01-01", "ge2025-01-01", "ne2025-01-01"] {
+            let scans = explain_filter(&fixture, scoped(raw), None).await;
+            assert!(
+                scans.iter().any(|scan| {
+                    scan.get_str("indexName") == Ok(SEARCH_DATE_END_INDEX) && end_is_bounded(scan)
+                }),
+                "{raw}: no idx_search_date_end scan with bounds on value_date_end: {scans:?}"
+            );
+        }
+        // The single-arm `gt` filter hinted to the new index seeks on its end.
+        let mut gt = doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+        "param_name":"date" };
+        gt.extend(
+            super::super::super::build_date_range_filter_doc(
+                &SearchValue::parse("gt2025-01-01"),
+                "date",
+            )
+            .unwrap(),
+        );
+        let scans = explain_filter(&fixture, gt, Some(SEARCH_DATE_END_INDEX)).await;
+        assert!(
+            !scans.is_empty() && scans.iter().all(end_is_bounded),
+            "{scans:?}"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn later_ge_pages_never_scan_the_collection() {
+        let Some(fixture) = Fixture::new("date-end-page-two", 2_000).await else {
+            return;
+        };
+        add_date_rows(&fixture).await;
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        for offset in [0u32, 10, 20] {
+            fixture
+                .backend
+                .search(&fixture.tenant, &date_query("ge2020-02-01", 10, offset))
+                .await
+                .unwrap();
+        }
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let scans = collect_documents(
+            fixture
+                .db
+                .collection::<Document>("system.profile")
+                .find(doc! { "ns": format!("{}.search_index", fixture.db.name()),
+                "planSummary": "COLLSCAN" })
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            scans.is_empty(),
+            "a date search scanned search_index: {scans:?}"
+        );
+        fixture.close().await;
+    }
 }

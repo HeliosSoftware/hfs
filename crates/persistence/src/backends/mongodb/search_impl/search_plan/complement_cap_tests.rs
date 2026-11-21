@@ -1052,3 +1052,124 @@ async fn over_cap_version_filtered_sort_keeps_the_documented_total_boundary() {
     assert_eq!(walked.total, None);
     fixture.close().await;
 }
+
+// #2601: an unfiltered descending date sort walks `idx_search_date_end`
+// instead of grouping every row of the parameter.
+
+fn unfiltered_desc_date(offset: u32) -> SearchQuery {
+    let mut query = paged(sort_by("-date", SearchParamType::Date), 10, offset);
+    query.total = Some(TotalMode::Accurate);
+    query
+}
+
+#[tokio::test]
+async fn unfiltered_descending_date_sort_walk_matches_the_grouped_pages() {
+    let Some(mut fixture) = Fixture::new("sort-unfiltered-date-walk", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    // Stale index rows of deleted resources must not take page slots.
+    fixture.mark_deleted(1, 20).await;
+    let mut walked = Vec::new();
+    for offset in [0u32, 10, 40, 200] {
+        let result = with_result_id_cap(
+            WIDE,
+            fixture
+                .backend
+                .search(&fixture.tenant, &unfiltered_desc_date(offset)),
+        )
+        .await
+        .unwrap();
+        walked.push((
+            page_ids(&result),
+            result.resources.page_info.has_next,
+            result.total,
+        ));
+    }
+    // Same pages without the index: the grouped aggregate answers.
+    let grouped_backend = boot_without_date_end(&fixture).await;
+    for (offset, walked) in [0u32, 10, 40, 200].into_iter().zip(walked) {
+        let result = with_result_id_cap(
+            WIDE,
+            grouped_backend.search(&fixture.tenant, &unfiltered_desc_date(offset)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(walked.0, page_ids(&result), "offset {offset}: page");
+        assert_eq!(
+            walked.1, result.resources.page_info.has_next,
+            "offset {offset}: has_next"
+        );
+        assert_eq!(walked.2, result.total, "offset {offset}: total");
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn unfiltered_descending_date_sort_does_not_group_the_parameter() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-date-no-group", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    with_result_id_cap(
+        WIDE,
+        fixture
+            .backend
+            .search(&fixture.tenant, &unfiltered_desc_date(0)),
+    )
+    .await
+    .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert!(hinted(&fixture.db, SEARCH_DATE_END_INDEX).await);
+    let grouped = collect_documents(
+        fixture
+            .db
+            .collection::<Document>("system.profile")
+            .find(doc! { "command.pipeline.$group.key0": { "$exists": true } })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        grouped.is_empty(),
+        "the sort-key $group ran for the unfiltered walk: {grouped:?}"
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn unfiltered_descending_date_sort_falls_back_when_the_index_is_dropped_hot() {
+    let Some(fixture) = Fixture::new("sort-unfiltered-date-hot-drop", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    let expected = with_result_id_cap(
+        WIDE,
+        fixture
+            .backend
+            .search(&fixture.tenant, &unfiltered_desc_date(0)),
+    )
+    .await
+    .unwrap();
+    // The running backend still believes the index is built.
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .drop_index(SEARCH_DATE_END_INDEX)
+        .await
+        .unwrap();
+    assert!(fixture.backend.date_end_index_ready());
+    let result = with_result_id_cap(
+        WIDE,
+        fixture
+            .backend
+            .search(&fixture.tenant, &unfiltered_desc_date(0)),
+    )
+    .await
+    .expect("a missing date end index must not fail the sort");
+    assert_eq!(page_ids(&result), page_ids(&expected));
+    assert_eq!(result.total, expected.total);
+    fixture.close().await;
+}
