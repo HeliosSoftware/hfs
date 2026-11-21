@@ -2955,6 +2955,21 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - Date parameters are unaffected by this rule and keep their own
   calendar-precision range comparison.
 
+**Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump:** the UCUM library
+that fills the `*_canonical_value` / `*_canonical_unit` columns (SQLite,
+PostgreSQL) and fields (Elasticsearch) was upgraded. 0.5.2 computed wrong
+canonical factors for many units (`mo` was 219,150 s instead of 2,629,800 s,
+`L` was 1 m³, `%` was 1, plus `mol`, `[oz_av]`, `10*3/uL` and roughly 140
+`X/N`-defined units), and labelled mass as `kg` where 0.9 uses UCUM's base
+unit `g`. Rows indexed by an older build keep the old canonical value and
+unit until they are rewritten, so a cross-unit search (`5|…|mg` against data
+stored as `g`, or any search in months) misses them. Searches in the same
+unit the data was stored in are unaffected, because the raw value/unit branch
+still matches. Run `POST /$reindex` once per tenant after upgrading every
+writer. There is no in-place migration: the SQLite and PostgreSQL rows do not
+keep the UCUM code that canonicalization used, and Elasticsearch documents are
+only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
+
 **Date prefix semantics (range targets, #1391):**
 
 - Every indexed date value is a range `[start, end)`. A point value such as
