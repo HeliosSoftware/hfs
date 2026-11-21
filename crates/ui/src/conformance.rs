@@ -31,7 +31,9 @@ tokio::task_local! {
 /// Runs `fut` with `authorization` as the credential of every self-call it
 /// makes, in place of the outbound service credential (#1671): the browser's
 /// own `Authorization`, else the signed-in session's bearer — the order
-/// #1480 set for the export jobs. `None` keeps the service credential.
+/// #1480 set for the export jobs. `None` keeps the service credential for
+/// [`SelfCall::Conformance`] reads only; data calls then carry no credential
+/// (#2692).
 pub async fn with_request_authorization<F: std::future::Future>(
     authorization: Option<String>,
     fut: F,
@@ -41,6 +43,34 @@ pub async fn with_request_authorization<F: std::future::Future>(
 
 fn request_authorization() -> Option<String> {
     REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
+}
+
+/// What a self-call touches, which decides whether it may fall back to the
+/// outbound service credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the
+/// request brought no credential of its own (#2692).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfCall {
+    /// The server's published conformance — `/metadata` and the
+    /// SearchParameter and CompartmentDefinition registries — which the
+    /// conformance pages show every visitor and which is all the service
+    /// credential is documented to need. May fall back to it.
+    Conformance,
+    /// Everything else: tenant data, user-authored ViewDefinitions and SQL
+    /// Libraries, `$sql-run`, writes and `$sql-export`. Carries only the
+    /// caller's own credential — never the server's.
+    Data,
+}
+
+impl SelfCall {
+    /// The class of a [`ConformanceSource::fetch`] of `resource_type`: the
+    /// conformance registries are [`Conformance`](Self::Conformance); a
+    /// listing of ViewDefinitions or Libraries is user data.
+    pub(crate) fn for_fetch(resource_type: &str) -> Self {
+        match resource_type {
+            "SearchParameter" | "CompartmentDefinition" => Self::Conformance,
+            _ => Self::Data,
+        }
+    }
 }
 
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
@@ -511,9 +541,12 @@ impl SqlExportStatus {
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
 ///
-/// The self-call targets a loopback base URL; credentials (a service token when
-/// auth is enabled, nothing when it is not) come from the injected
-/// [`OutboundAuthProvider`](helios_auth::outbound::OutboundAuthProvider).
+/// The self-call targets a loopback base URL. It carries the request's own
+/// credential when one is in scope; without one, only a
+/// [`SelfCall::Conformance`] read falls back to the injected
+/// [`OutboundAuthProvider`](helios_auth::outbound::OutboundAuthProvider)'s
+/// service credential (nothing when auth is off), and every other call goes
+/// out with no credential at all (#2692).
 pub(crate) struct HttpConformanceSource {
     client: reqwest::Client,
     base_url: String,
@@ -548,16 +581,22 @@ impl HttpConformanceSource {
         }
     }
 
-    /// The request's own credential when one is in scope
-    /// ([`with_request_authorization`]), else the outbound service
-    /// credential.
+    /// The credential a self-call carries: the request's own when one is in
+    /// scope ([`with_request_authorization`]); otherwise the outbound service
+    /// credential, but only for a [`SelfCall::Conformance`] read. A
+    /// [`SelfCall::Data`] call made for a caller that brought no credential
+    /// goes out with none, so under authentication the API answers `401`
+    /// instead of acting for an anonymous visitor with the server's own
+    /// authority (#2692).
     async fn credential(
         &self,
         request: reqwest::RequestBuilder,
+        call: SelfCall,
     ) -> Result<reqwest::RequestBuilder, String> {
-        match request_authorization() {
-            Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self
+        match (request_authorization(), call) {
+            (Some(authorization), _) => Ok(request.header("Authorization", authorization)),
+            (None, SelfCall::Data) => Ok(request),
+            (None, SelfCall::Conformance) => self
                 .outbound_auth
                 .authorize(request, &self.base_url)
                 .await
@@ -565,7 +604,8 @@ impl HttpConformanceSource {
         }
     }
 
-    /// A request with the tenant header and outbound auth applied.
+    /// A data request with the tenant header and the caller's credential
+    /// applied ([`SelfCall::Data`]: never the service credential).
     async fn authorized(
         &self,
         request: reqwest::RequestBuilder,
@@ -576,7 +616,7 @@ impl HttpConformanceSource {
         } else {
             request.header("X-Tenant-ID", tenant)
         };
-        self.credential(request).await
+        self.credential(request, SelfCall::Data).await
     }
 
     /// A request with the caller's tenant and credentials applied — the one
@@ -585,9 +625,10 @@ impl HttpConformanceSource {
     ///
     /// `X-Tenant-ID` follows the same rule as [`authorized`](Self::authorized)
     /// (omitted when the tenant is empty). Credentials: `caller.authorization`
-    /// wins when present, forwarded verbatim; otherwise the configured
-    /// [`OutboundAuthProvider`](helios_auth::outbound::OutboundAuthProvider)
-    /// is consulted, exactly as every other self-call in this module does.
+    /// wins when present, forwarded verbatim; otherwise the request's own
+    /// credential in scope, as for any [`SelfCall::Data`] call — never the
+    /// outbound service credential, so an anonymous caller cannot start,
+    /// poll or cancel an export as the server (#2692).
     async fn authorized_for(
         &self,
         request: reqwest::RequestBuilder,
@@ -600,7 +641,7 @@ impl HttpConformanceSource {
         };
         match &caller.authorization {
             Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self.credential(request).await,
+            None => self.credential(request, SelfCall::Data).await,
         }
     }
 
@@ -666,7 +707,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self.credential(request).await?;
+        let request = self.credential(request, SelfCall::Conformance).await?;
         let response = request
             .send()
             .await
@@ -712,7 +753,9 @@ impl ConformanceSource for HttpConformanceSource {
             if !tenant.is_empty() {
                 request = request.header("X-Tenant-ID", tenant);
             }
-            let request = self.credential(request).await?;
+            let request = self
+                .credential(request, SelfCall::for_fetch(resource_type))
+                .await?;
             let response = request
                 .send()
                 .await
@@ -790,7 +833,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self.credential(request).await?;
+        let request = self.credential(request, SelfCall::Data).await?;
         let response = request
             .send()
             .await
@@ -968,7 +1011,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self.credential(request).await?;
+        let request = self.credential(request, SelfCall::Data).await?;
         let response = request
             .send()
             .await
@@ -2511,7 +2554,9 @@ mod tests {
             .expect("202 carries a job id");
         assert_eq!(job, "Bearer user-token::clinic-a");
 
-        // No caller bearer: falls back to the outbound provider's credential.
+        // No caller bearer: nothing — never the outbound provider's
+        // credential (#2692), or an anonymous visitor's export would run
+        // with the server's authority.
         let no_bearer = Caller {
             tenant: "clinic-a".to_string(),
             authorization: None,
@@ -2520,7 +2565,7 @@ mod tests {
             .sql_export_start(&request, &no_bearer)
             .await
             .expect("202 carries a job id");
-        assert_eq!(job, "Bearer service-token::clinic-a");
+        assert_eq!(job, "<none>::clinic-a");
 
         // An empty tenant omits X-Tenant-ID, same rule as every other
         // self-call in this module.
@@ -2536,8 +2581,9 @@ mod tests {
     }
 
     /// #1671: a self-call made inside [`with_request_authorization`] carries
-    /// that credential instead of the outbound service token; outside it, or
-    /// with `None` in scope, the service token applies as before.
+    /// that credential instead of the outbound service token. #2692: without
+    /// one — outside the scope, or with `None` in it — a listing of
+    /// user-authored ViewDefinitions carries nothing, never the service token.
     #[tokio::test]
     async fn listing_self_calls_carry_the_request_credential_when_one_is_in_scope() {
         use axum::http::HeaderMap;
@@ -2572,7 +2618,7 @@ mod tests {
             .search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a")
             .await
             .expect("search succeeds");
-        assert_eq!(sent(page), "Bearer service-token");
+        assert_eq!(sent(page), "<none>");
 
         let page = with_request_authorization(
             Some("Bearer session-token".to_string()),
@@ -2588,7 +2634,145 @@ mod tests {
         )
         .await
         .expect("search succeeds");
-        assert_eq!(sent(page), "Bearer service-token");
+        assert_eq!(sent(page), "<none>");
+    }
+
+    /// #2692: without a request credential, only the conformance reads —
+    /// `/metadata` and the SearchParameter and CompartmentDefinition
+    /// registries — fall back to the outbound service credential. Every
+    /// call that reads or writes tenant data or user-authored artifacts goes
+    /// out bare, whether the call runs outside a request scope or inside one
+    /// with no credential; a request credential, when present, rides on all
+    /// of them.
+    #[tokio::test]
+    async fn only_conformance_reads_fall_back_to_the_service_credential() {
+        use axum::http::{HeaderMap, Method, Uri};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        async fn capture(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+        ) -> axum::Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            seen.lock().unwrap().push(auth);
+            let path = uri.path().trim_start_matches('/');
+            let mut segments = path.split('/');
+            let resource_type = segments.next().unwrap_or_default().to_string();
+            let id = segments.next();
+            axum::Json(match (method, path, id) {
+                (_, "metadata", _) => serde_json::json!({"resourceType": "CapabilityStatement"}),
+                (_, "$sql-run", _) => serde_json::json!([]),
+                (Method::GET, _, None) => {
+                    serde_json::json!({"resourceType": "Bundle", "type": "searchset", "entry": []})
+                }
+                (_, _, id) => serde_json::json!({
+                    "resourceType": resource_type, "id": id.unwrap_or("new"),
+                }),
+            })
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .fallback(capture)
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+            FhirVersion::R4,
+            None,
+        );
+        let last = || {
+            seen.lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("a request was sent")
+        };
+        let vd = serde_json::json!({"resourceType": "ViewDefinition", "resource": "Patient"});
+
+        // Each call, and what it may carry without a request credential.
+        async fn run(source: &HttpConformanceSource, call: usize, vd: &Value) {
+            let v = FhirVersion::R4;
+            let t = "clinic-a";
+            match call {
+                0 => drop(source.metadata(v, t).await.expect("metadata")),
+                1 => drop(source.fetch("SearchParameter", v, t).await.expect("fetch")),
+                2 => drop(
+                    source
+                        .fetch("CompartmentDefinition", v, t)
+                        .await
+                        .expect("fetch"),
+                ),
+                3 => drop(source.fetch("ViewDefinition", v, t).await.expect("fetch")),
+                4 => drop(source.fetch("Library", v, t).await.expect("fetch")),
+                5 => drop(source.sql_run(vd, &[], 10, v, t).await.expect("sql_run")),
+                6 => drop(
+                    source
+                        .search_page("Patient", &[], 10, 0, v, t)
+                        .await
+                        .expect("search"),
+                ),
+                7 => drop(
+                    source
+                        .read_resource("Patient", "p1", v, t)
+                        .await
+                        .expect("read"),
+                ),
+                8 => drop(
+                    source
+                        .resource_exists("Patient", "p1", v, t)
+                        .await
+                        .expect("exists"),
+                ),
+                9 => drop(
+                    source
+                        .save_resource("ViewDefinition", None, vd.clone(), v, t)
+                        .await
+                        .expect("save"),
+                ),
+                _ => unreachable!(),
+            }
+        }
+        let expected_bare = [
+            "Bearer service-token",
+            "Bearer service-token",
+            "Bearer service-token",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+        ];
+        for (call, expected) in expected_bare.iter().enumerate() {
+            run(&source, call, &vd).await;
+            assert_eq!(last(), *expected, "call {call} outside a request scope");
+
+            with_request_authorization(None, run(&source, call, &vd)).await;
+            assert_eq!(last(), *expected, "call {call} with no request credential");
+
+            with_request_authorization(
+                Some("Bearer user-token".to_string()),
+                run(&source, call, &vd),
+            )
+            .await;
+            assert_eq!(
+                last(),
+                "Bearer user-token",
+                "call {call} with a request credential"
+            );
+        }
     }
 
     /// #833: `export_status` maps every self-call outcome to the right

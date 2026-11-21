@@ -1801,11 +1801,13 @@ fn mount_ui(
     // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
     // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
     // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
-    // configured from HFS_UI_* client credentials. The `$sql-export`
-    // self-calls (#833) are the exception: they already carry the
-    // browser's own `Authorization` when it sent one (the `Caller` seam
-    // in `crates/ui/src/conformance.rs`), falling back to this service
-    // token only when the request had none.
+    // configured from HFS_UI_* client credentials. Only those conformance
+    // reads (and `/metadata`) may use this token: every other UI self-call —
+    // tenant data, ViewDefinitions and SQL Libraries, `$sql-run`,
+    // `$sql-export`, `$export`, the Patient/Group lookups — carries the
+    // browser's own credential or the signed-in session's bearer, and none
+    // at all when the request brought neither (#2692), so an anonymous
+    // visitor never acts with this token's authority.
     let self_base_url = format!("http://127.0.0.1:{}", config.port);
     let outbound_auth = AuthConfig::from_env().outbound_provider();
     let patient_name_search = patient_name_search_support(
