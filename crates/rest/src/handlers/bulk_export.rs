@@ -373,6 +373,17 @@ where
         let mut granted: Vec<String> = Vec::new();
         let mut refused_any = false;
         for t in &types_to_check {
+            // A `Patient/$export` without `_type` covers the Patient
+            // compartment only (the worker drops other types from an empty
+            // list); a type outside it is neither granted nor refused here, so
+            // narrowing cannot widen the export to it.
+            if !explicit
+                && matches!(level, ExportLevel::Patient)
+                && t != "Patient"
+                && helios_fhir::get_compartment_params(fhir_version, "Patient", t).is_empty()
+            {
+                continue;
+            }
             match helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read) {
                 Ok(helios_auth::AccessScope::Unrestricted) => granted.push(t.clone()),
                 Ok(helios_auth::AccessScope::PatientCompartment { patient_id }) => {

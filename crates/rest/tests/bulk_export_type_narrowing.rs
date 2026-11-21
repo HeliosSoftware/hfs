@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum_test::TestServer;
 use chrono::Utc;
-use helios_auth::{Principal, ScopeSet};
+use helios_auth::{LaunchContext, Principal, ScopeSet};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -30,6 +30,14 @@ fn tenant() -> TenantContext {
 
 /// A bulk-export server whose every request carries a principal with `scopes`.
 async fn server_for(scopes: &str) -> (TestServer, Arc<SqliteBackend>, Arc<LocalFsOutputStore>) {
+    server_with(scopes, None).await
+}
+
+/// As [`server_for`], with the token's SMART launch patient set.
+async fn server_with(
+    scopes: &str,
+    launch_patient: Option<&str>,
+) -> (TestServer, Arc<SqliteBackend>, Arc<LocalFsOutputStore>) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -72,6 +80,10 @@ async fn server_for(scopes: &str) -> (TestServer, Arc<SqliteBackend>, Arc<LocalF
         jti: None,
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        launch_context: launch_patient.map(|p| LaunchContext {
+            patient: Some(p.to_string()),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(
@@ -125,8 +137,19 @@ async fn exported_types(
     backend: &Arc<SqliteBackend>,
     output: &Arc<LocalFsOutputStore>,
 ) -> Vec<String> {
+    exported_types_at(server, backend, output, "/$export").await
+}
+
+/// Kicks off the export at `path` without `_type` and returns the finished
+/// manifest's output types, sorted.
+async fn exported_types_at(
+    server: &TestServer,
+    backend: &Arc<SqliteBackend>,
+    output: &Arc<LocalFsOutputStore>,
+    path: &str,
+) -> Vec<String> {
     let kickoff = server
-        .get("/$export")
+        .get(path)
         .add_header("x-tenant-id", TENANT)
         .add_header("prefer", "respond-async")
         .await;
@@ -214,6 +237,77 @@ async fn a_named_type_outside_the_grant_is_still_refused() {
         .add_header("x-tenant-id", TENANT)
         .add_header("prefer", "respond-async")
         .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(
+        kickoff.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        kickoff.text()
+    );
+}
+
+/// Seeds a Medication, a type outside the Patient compartment.
+async fn seed_medication(backend: &Arc<SqliteBackend>) {
+    backend
+        .create(
+            &tenant(),
+            "Medication",
+            json!({"resourceType": "Medication", "id": "m1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed Medication");
+}
+
+#[tokio::test]
+async fn a_patient_export_without_type_stays_inside_the_patient_compartment() {
+    // Medication is granted but is not a Patient-compartment type: narrowing
+    // must not turn the grant into a tenant-wide Medication export.
+    let (server, backend, output) = server_for("user/Observation.rs user/Medication.rs").await;
+    seed(&backend).await;
+    seed_medication(&backend).await;
+    assert_eq!(
+        exported_types_at(&server, &backend, &output, "/Patient/$export").await,
+        vec!["Observation".to_string()],
+        "only the granted Patient-compartment types"
+    );
+}
+
+#[tokio::test]
+async fn a_patient_export_without_type_under_a_patient_wildcard_exports_the_compartment() {
+    // `patient/*.rs` grants every type; the types outside the compartment are
+    // not part of a Patient-level export, so they do not refuse the kick-off.
+    let (server, backend, output) = server_with("patient/*.rs", Some("p1")).await;
+    seed(&backend).await;
+    seed_medication(&backend).await;
+    assert_eq!(
+        exported_types_at(&server, &backend, &output, "/Patient/$export").await,
+        vec![
+            "Condition".to_string(),
+            "Observation".to_string(),
+            "Patient".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_patient_export_under_a_per_type_patient_scope_exports_only_that_type() {
+    let (server, backend, output) = server_with("patient/Observation.rs", Some("p1")).await;
+    seed(&backend).await;
+    assert_eq!(
+        exported_types_at(&server, &backend, &output, "/Patient/$export").await,
+        vec!["Observation".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_search_only_grant_does_not_start_an_export() {
+    let (server, backend, _output) = server_for("user/Observation.s").await;
+    seed(&backend).await;
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", TENANT)
+        .add_header("prefer", "respond-async")
         .await;
     assert_eq!(
         kickoff.status_code(),
