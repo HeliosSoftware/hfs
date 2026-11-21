@@ -52,6 +52,7 @@ a startup warning.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size in bytes (128 MiB), applied after decompression; sized for the largest per-patient Synthea Bundle (#1662); such a bundle takes minutes, so raise `HFS_REQUEST_TIMEOUT` too |
+| `HFS_LARGE_BUNDLE_CONCURRENCY` | `2` | Most Bundle requests with bodies of 8 MiB or more admitted at once; further ones wait their turn before being parsed, bounding peak memory under concurrent large transaction imports (#2020). `0` disables the gate. |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
