@@ -3492,7 +3492,8 @@ async fn build_bulk_submit(
             cfg.outbound_scope.clone(),
         )
         .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
-        .with_decryption_keys(decryption_keys),
+        .with_decryption_keys(decryption_keys)
+        .with_body_limits(cfg.max_manifest_bytes, cfg.max_encrypted_file_bytes),
     );
 
     // SQLite serialises writers, so a fan-out queues batch writes behind one
