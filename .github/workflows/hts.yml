@@ -39,7 +39,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -71,7 +71,7 @@ jobs:
     needs: check
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           clean: false
 
@@ -707,7 +707,7 @@ jobs:
       MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           # Into its own directory, never the shared runner checkout. A sparse
           # checkout there deletes every file outside .github/actions, and the

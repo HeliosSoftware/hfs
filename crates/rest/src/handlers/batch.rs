@@ -34,6 +34,7 @@ use helios_persistence::types::{SearchParameter, StoredResource};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
+use crate::chain_access::ChainAccess;
 use crate::error::{RestError, RestResult, create_operation_outcome};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::{
@@ -833,7 +834,16 @@ where
     // `fullUrl`s, which the storage layer resolves during processing. Runs on
     // the write entries only — the deferred GET entries were partitioned out
     // above, and their query strings are searches, not conditional references.
-    resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
+    // Each lookup is judged against the caller's scopes as `GET [type]?query`
+    // would be, before any of them runs.
+    resolve_conditional_references(
+        state,
+        &tenant,
+        fhir_version,
+        principal,
+        &mut indexed_entries,
+    )
+    .await?;
 
     // Empty-element cleanup (#2554) and write-path validation: transactions
     // are atomic, so any invalid write entry rejects the whole bundle before
@@ -966,6 +976,7 @@ where
                     state,
                     &tenant,
                     &deferred.compartment,
+                    &ChainAccess::for_principal(principal),
                     deferred.target,
                     prefer.is_strict(),
                     entry.if_none_match.as_deref(),
@@ -1456,6 +1467,7 @@ where
                 state,
                 tenant,
                 &compartment,
+                &ChainAccess::for_principal(principal),
                 get_target.expect("GET entries are classified above"),
                 strict,
                 if_none_match,
@@ -3207,6 +3219,7 @@ async fn execute_get_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     target: GetEntryTarget,
     strict: bool,
     if_none_match: Option<&str>,
@@ -3229,6 +3242,7 @@ where
                 state,
                 tenant,
                 compartment,
+                chains,
                 &resource_type,
                 pairs,
                 false,
@@ -3466,9 +3480,18 @@ fn status_text(code: &str) -> &'static str {
 /// exactly one match rewrites the reference to `Type/id`, zero or several
 /// fail the bundle (#459). They used to pass through into storage verbatim,
 /// where nothing can search or resolve them.
+///
+/// Each lookup is a search on the referenced type and is authorized as
+/// `GET [type]?query` is: the token needs a search grant on that type, and a
+/// grant confined to the launch patient's compartment confines the lookup.
+/// Every reference is judged before any lookup runs, so a token without the
+/// grant is refused whole and learns nothing about the referenced type — not
+/// whether a match exists, how many, nor its id.
 async fn resolve_conditional_references<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    principal: Option<&Principal>,
     indexed_entries: &mut [(usize, BundleEntry, Option<String>)],
 ) -> RestResult<()>
 where
@@ -3487,6 +3510,28 @@ where
     }
     if conditionals.is_empty() {
         return Ok(());
+    }
+
+    let mut compartments: HashMap<String, PatientCompartment> = HashMap::new();
+    for reference in conditionals.keys() {
+        let (resource_type, _) = reference.split_once('?').expect("collected with a '?'");
+        if compartments.contains_key(resource_type) {
+            continue;
+        }
+        let compartment = match principal {
+            Some(principal) => {
+                let scope =
+                    SmartScopePolicy::check(principal, resource_type, FhirOperation::Search)
+                        .map_err(|_| RestError::Forbidden {
+                            message: format!(
+                                "Insufficient scope for search on {resource_type} (conditional reference '{reference}')"
+                            ),
+                        })?;
+                PatientCompartment::from_access_scope(Some(&scope))
+            }
+            None => PatientCompartment::unconfined(),
+        };
+        compartments.insert(resource_type.to_string(), compartment);
     }
 
     // Each lookup below is a search, and a search reads the index — which
@@ -3540,6 +3585,12 @@ where
                 message: format!("Conditional reference '{reference}' is not a valid search: {e}"),
             })?
         };
+        // Confined before the chains are resolved, as a type search is.
+        let mut query = query;
+        compartments
+            .get(resource_type)
+            .expect("judged above")
+            .confine_query(fhir_version, &mut query)?;
         // `search()` does not read a chain or `_has` (#1389): resolve them
         // into an `_id` filter first, as a type search does.
         let mut query =

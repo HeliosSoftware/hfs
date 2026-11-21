@@ -224,6 +224,7 @@ async fn rest_hook_handshake_and_event_notifications_follow_expected_flow() {
 
     let config = SubscriptionConfig {
         max_retries: 1,
+        allow_private_endpoints: true, // receivers are on loopback
         ..Default::default()
     };
     let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
