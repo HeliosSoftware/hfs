@@ -456,6 +456,13 @@ jobs:
           # of every synchronous write: at the 1s default a 473-entry batch
           # Bundle (entries synced one at a time, 16-wide) ran into the 30s
           # request timeout; 200ms keeps it to a few seconds.
+          #
+          # The 121-entry patient transaction Bundle is the slow write here: 39
+          # resource types each create their index on first write, and the
+          # entries sync one after another. That is ~10s on a quiet Docker
+          # host and 14-30s+ when another workflow shares it, which answered
+          # 408 at the 30s default and failed the load step. 120s leaves room
+          # for a busy host; the plain-database legs keep the default.
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
@@ -463,6 +470,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -485,6 +493,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="$DOCKER_HOST_IP"
@@ -503,6 +512,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -514,6 +524,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_BASE_URL="$HFS_BASE_URL" \
