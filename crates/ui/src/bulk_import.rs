@@ -968,9 +968,9 @@ enum SelfCallCredential {
     BackendServices,
     /// The recipient is this server: the same identity every other page's
     /// self-call carries — the browser's own `Authorization`, else the
-    /// signed-in session's bearer, else the process's outbound service
-    /// credential (#1480). The recipient's `$bulk-submit` then wants
-    /// `system/bulk-submit` on whichever token that is.
+    /// signed-in session's bearer (#1480), else nothing; never the process's
+    /// outbound service credential (#2692). The recipient's `$bulk-submit`
+    /// then wants `system/bulk-submit` on whichever token that is.
     Outbound,
     /// The recipient is another server and the submission has no client of
     /// its own: send nothing rather than leak this server's token.

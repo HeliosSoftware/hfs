@@ -252,7 +252,7 @@ The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
 | `HFS_NL_SEARCH_API_KEY` | Whether NL search is configured vs. showing its setup state |
 | `HFS_NL_SEARCH_MODEL` | Shown in the setup state |
 | `HFS_OUTBOUND_BEARER_TOKEN` | Credentials for the UI's self-call (below) |
-| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560); the Tenants and Import routes, whose handlers act on storage directly, and the Bulk Export routes, whose self-calls would otherwise fall back to `HFS_OUTBOUND_BEARER_TOKEN`, answer `401` with that notice instead of acting for an anonymous caller (#1619) |
+| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560); the Tenants and Import routes, whose handlers act on storage directly, and the Bulk Export routes answer `401` with that notice instead of acting for an anonymous caller (#1619, #2692). Every other self-call made for an anonymous caller carries no credential, so the API answers it `401` (#2692) |
 | `HFS_DEFAULT_TENANT`, `HFS_DEFAULT_FHIR_VERSION` | Defaults for the sidebar selectors |
 
 ### Conformance data comes over HTTP, from the server itself
@@ -263,7 +263,14 @@ storage is the source of truth.
 
 When auth is enabled this self-call needs a valid bearer via
 `HFS_OUTBOUND_BEARER_TOKEN`; without one it is rejected and the conformance pages
-degrade to a warning (`pages/compartments-degraded.html`, covered by
+degrade to a warning. That token is used **only** for these conformance reads
+(`SearchParameter`, `CompartmentDefinition`, `/metadata`) when the request
+brought no credential: every other self-call — tenant data, ViewDefinitions
+and SQL Libraries, `$sql-run`, `$sql-export`, `$export`, the Patient/Group
+lookups, `$bulk-submit` — carries the browser's `Authorization` or the
+signed-in session's bearer, or nothing (`conformance::SelfCall`,
+`bulk_export::forward_credential`, #2692). Never route a new data self-call
+through the service token (`pages/compartments-degraded.html`, covered by
 `e2e/tests/auth/degraded.spec.ts`). A short-lived auto-minted token is the
 planned follow-up (`crates/auth/src/outbound.rs`).
 

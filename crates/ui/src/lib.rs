@@ -188,10 +188,6 @@ struct WebState {
     /// Trusted loopback base used for UI calls back into this HFS process.
     /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
     self_base_url: String,
-    /// Credential for the UI's self-calls that carry no caller identity
-    /// (the Import page's own kick-offs and polls, the Export workspace,
-    /// #1436/#1438): the same provider the conformance source uses.
-    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     /// Runtime capability cache. A standards-compliant 501 from Patient name
     /// search downgrades this process to exact-id lookup only.
     patient_name_search: Arc<AtomicBool>,
@@ -1391,9 +1387,11 @@ struct HistoryDiffFragment {
 /// The SearchParameter and CompartmentDefinition viewers read the server's own
 /// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
 /// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
-/// credentials for that self-call (a service token when auth is enabled, a
-/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
-/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// credentials for those conformance reads when the request brought none (a
+/// service token when auth is enabled, a no-op otherwise). It is never lent
+/// to a self-call that reads or writes tenant data (#2692). `data_dir`
+/// (`HFS_DATA_DIR`) and `fhir_version` are used to seed a newly-provisioned
+/// tenant from the tenant-maintenance page. `tenants`
 /// is the storage handle that page reads and writes; pass `None` to render the
 /// UI without a live registry (the page then reports it as unavailable).
 ///
@@ -1499,7 +1497,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
-        outbound_auth.clone(),
+        outbound_auth,
         fhir_version,
         data_dir.clone(),
     ));
@@ -1519,7 +1517,6 @@ pub fn mount_with_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         self_base_url,
-        outbound_auth,
         patient_name_search,
         write_observer,
     )
@@ -1633,7 +1630,6 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         tenant_path_routing,
         bulk_provider,
         public_base_url,
-        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
         PatientNameSearchSupport::Enabled,
         None,
     )
@@ -1658,7 +1654,6 @@ pub fn mount_with_conformance_source_and_runtime(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
-    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     patient_name_search: PatientNameSearchSupport,
     write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
@@ -1966,7 +1961,6 @@ pub fn mount_with_conformance_source_and_runtime(
         terminology,
         public_base_url,
         self_base_url,
-        outbound_auth,
         patient_name_search: Arc::new(AtomicBool::new(matches!(
             patient_name_search,
             PatientNameSearchSupport::Enabled
@@ -1995,7 +1989,8 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
         // Every self-call a page makes on the user's behalf carries the
         // browser's credential, else the signed-in session's bearer, ahead
-        // of the outbound service credential (#1671).
+        // of the outbound service credential (#1671), which only the
+        // conformance reads may fall back to (#2692).
         .layer(middleware::from_fn_with_state(
             state.clone(),
             scope_request_authorization,
@@ -2069,8 +2064,10 @@ fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
 /// Middleware (#1671): runs the rest of the request with its own credential
 /// in scope for every self-call — the browser's `Authorization`, else the
 /// signed-in session's bearer — so a page never depends on the outbound
-/// service token while its user has a valid session. Assets make no
-/// self-calls and skip the session lookup.
+/// service token while its user has a valid session. Without either, only
+/// the conformance reads fall back to that token; every other self-call goes
+/// out with no credential (#2692). Assets make no self-calls and skip the
+/// session lookup.
 async fn scope_request_authorization(
     State(state): State<WebState>,
     request: axum::extract::Request,
@@ -2085,14 +2082,19 @@ async fn scope_request_authorization(
     conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
-/// The UI routes that would act for an anonymous caller with the server's
-/// own authority: the tenant registry and the bulk-submit store, whose
-/// handlers act on storage themselves rather than through the FHIR API, and
-/// the bulk-export pages, whose self-calls fall back to the outbound service
-/// credential (`HFS_OUTBOUND_BEARER_TOKEN`) when the browser brought none,
-/// so an anonymous visitor could kick off, poll and download a tenant export
-/// as that credential. The other API-backed pages carry the browser's
-/// credential on their self-call and so already answer `401` without one.
+/// The UI routes refused outright to an anonymous caller in the bearer-only
+/// posture. The tenant registry and the bulk-submit store act on storage
+/// themselves rather than through the FHIR API, so nothing downstream would
+/// refuse them. The bulk-export pages exist only to start, poll and download
+/// exports, none of which an anonymous caller can do (#2692): refusing them
+/// here answers with the shell's notice instead of a page of failed jobs.
+///
+/// Every other page reaches data through a self-call, and a self-call made
+/// for a caller that brought no credential carries none — only the
+/// SearchParameter, CompartmentDefinition and `/metadata` reads may fall back
+/// to the outbound service credential (`HFS_OUTBOUND_BEARER_TOKEN`), see
+/// `conformance::SelfCall` and `bulk_export::forward_credential` — so the API
+/// itself answers those `401`.
 fn acts_on_storage_directly(path: &str) -> bool {
     path == "/ui/tenants"
         || path.starts_with("/ui/tenants/")
