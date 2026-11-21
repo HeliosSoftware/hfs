@@ -183,6 +183,8 @@ jobs:
       HFS_PORT: ${{ matrix.hfs_port }}
       INFERNO_PORT: ${{ needs.inferno-stack-up.outputs.port }}
       INFERNO_COMPOSE_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+      # Inferno's rest-hook receiver is on the Docker host's private address.
+      HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS: "true"
       HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS: 5000
       HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS: 5
       HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS: 1000

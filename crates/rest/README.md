@@ -308,7 +308,7 @@ The server is configured via environment variables:
 | `HFS_DATABASE_URL` | - | Database connection string |
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
-| `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+| `HFS_AUTH_TENANT_CLAIM` | tenant_id | JWT claim carrying the tenant id (read by `helios-auth`) |
 
 ### Batch entry concurrency
 
@@ -411,7 +411,8 @@ them, and exposes results through a status manifest.
   (poll / cancel), and `GET /bulk-submit-file/{poll_token}/{part}` (HFS-hosted
   status artifacts). See the [API Endpoints](#api-endpoints) table.
 - **Scope**: every surface requires the `system/bulk-submit` SMART scope when auth is
-  enabled; status, cancel, and file surfaces also enforce submission ownership.
+  enabled; status, cancel and file surfaces, and a kick-off or status kick-off that
+  names an existing submission, also enforce submission ownership.
 - **Poll pacing**: an in-progress poll advertises `Retry-After`
   (`HFS_BULK_SUBMIT_RETRY_AFTER`). While the submission is still pre-ingest — queued,
   reading the remote manifest, sizing or downloading files — the shorter
@@ -485,6 +486,8 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Was `100` before #945. Honoured by the worker since #1127 (before, every run used `100` whatever this said). An older measurement (index-during-ingest on, before the Elasticsearch recipe below) found `1000` slower than `100`. The recipe below, measured later on the same 133,527-resource slice, uses `1000` as part of a combined setting and was the better combination; batch size alone was not isolated again. |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
+| `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES` | `67108864` (64 MiB) | Ceiling, in decoded bytes, on a Bulk Export manifest the worker fetches; the manifest is read whole, and a body that passes the ceiling fails the manifest as soon as it does. |
+| `HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES` | `1073741824` (1 GiB) | Ceiling, in decoded bytes, on a JWE-encrypted input file, which is buffered whole (the authentication tag trails the ciphertext). Unencrypted NDJSON streams and has no ceiling. |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions. |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. |
 | `HFS_BULK_SUBMIT_INDEX_CONCURRENCY` | `4` | Index-during-ingest writer tasks; a resource always goes to the same writer, so its versions are indexed in order. |
@@ -718,12 +721,11 @@ The server supports multiple methods for tenant identification, configurable via
 
 ### Resolution Priority
 
-When multiple sources provide tenant information, they are resolved in this priority order:
+When authentication is enabled, the tenant comes from the JWT claim named by `HFS_AUTH_TENANT_CLAIM` and overrides the URL path and header (see [crates/auth/README.md](../auth/README.md#tenant-resolution)). Without authentication, sources resolve in this priority order:
 
 1. **URL path prefix** (highest) - `/{tenant}/...`
 2. **X-Tenant-ID header**
-3. **JWT token claim** (future)
-4. **Default tenant** (lowest) - from configuration
+3. **Default tenant** (lowest) - from configuration
 
 ### Strict Validation
 

@@ -124,7 +124,9 @@ impl SubscriptionEngine {
             .with_event_history_size(config.event_history_size),
         );
         let evaluator = EventEvaluator::new(Arc::clone(&topic_registry), Arc::clone(&manager));
-        let rest_hook_channel = Arc::new(RestHookChannel::new());
+        let rest_hook_channel = Arc::new(
+            RestHookChannel::new().with_private_endpoints_allowed(config.allow_private_endpoints),
+        );
         let ws_manager = Arc::new(WebSocketManager::new());
         let ws_channel = Arc::new(WebSocketChannel::new(Arc::clone(&ws_manager)));
         let ws_token_manager = Arc::new(WsBindingTokenManager::new(config.ws_token_lifetime_secs));
@@ -145,7 +147,11 @@ impl SubscriptionEngine {
                 channel =
                     channel.with_source_endpoint_resolver(Arc::clone(&public_base_url_for_tenant));
             }
-            Arc::new(channel.with_private_endpoints_allowed(settings.allow_private_endpoints))
+            Arc::new(
+                channel
+                    .with_private_endpoints_allowed(settings.allow_private_endpoints)
+                    .with_credential_hosts(&settings.credential_hosts),
+            )
         });
 
         let status_write_slots = Arc::new(Semaphore::new(config.status_write_concurrency.max(1)));
@@ -1356,6 +1362,7 @@ mod tests {
             max_retries: 2,
             error_threshold: 2,
             off_threshold: 4,
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         SubscriptionEngine::new(config, base_url.to_string())
@@ -1380,7 +1387,9 @@ mod tests {
             messaging: Some(crate::config::MessagingSettings {
                 source_endpoint: "https://fallback.example/fhir".to_string(),
                 allow_private_endpoints: false,
+                credential_hosts: Vec::new(),
             }),
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let resolver: Arc<dyn Fn(&str) -> String + Send + Sync> =
@@ -1765,6 +1774,7 @@ mod tests {
             handshake_max_attempts: 2,
             handshake_retry_initial_delay: std::time::Duration::from_millis(1),
             handshake_retry_max_delay: std::time::Duration::from_millis(1),
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
@@ -1915,6 +1925,7 @@ mod tests {
             max_retries: 1,
             error_threshold: 1,
             off_threshold: 3,
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
