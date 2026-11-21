@@ -648,10 +648,16 @@ fn derive_cek(
                     kek.len()
                 ));
             }
+            let iv = b64(iv)?;
+            if iv.len() != 12 {
+                return Err(format!(
+                    "JWE alg={alg} needs a 12-byte header 'iv', got {}",
+                    iv.len()
+                ));
+            }
             let mut sealed = encrypted_key.to_vec();
             sealed.extend_from_slice(&b64(tag)?);
-            aes_gcm_open(kek, &b64(iv)?, &sealed, &[])
-                .map_err(|_| format!("JWE {alg} key unwrap failed"))
+            aes_gcm_open(kek, &iv, &sealed, &[]).map_err(|_| format!("JWE {alg} key unwrap failed"))
         }
         "ECDH-ES" | "ECDH-ES+A128KW" | "ECDH-ES+A192KW" | "ECDH-ES+A256KW" => {
             let z = ecdh_shared_secret(header, keys)?;
@@ -868,6 +874,11 @@ fn aes_gcm_open(
     use aes_gcm::aes::{Aes128, Aes192, Aes256};
     use aes_gcm::{AesGcm, Nonce};
 
+    // `Nonce::from_slice` panics on any other length; every caller checks,
+    // but the nonce comes off the wire, so refuse here as well.
+    if nonce.len() != 12 {
+        return Err(());
+    }
     let nonce = Nonce::<U12>::from_slice(nonce);
     let payload = Payload { msg: sealed, aad };
     match key.len() {
@@ -1212,6 +1223,56 @@ mod tests {
         );
         let out = decrypt(compact.as_bytes(), &DecryptionKeys::shared(kek)).unwrap();
         assert_eq!(out, plaintext);
+    }
+
+    /// The header `iv` of an `A*GCMKW` key wrap is chosen by whoever built
+    /// the JWE. Any length but 12 is an error, never a panic.
+    #[test]
+    fn gcmkw_with_a_wrong_length_iv_is_an_error() {
+        let kek = vec![0x2bu8; 32];
+        let cek = vec![0x6du8; 32];
+        let kw_iv = [0x09u8; 12];
+        let (wrapped, wrap_tag) = seal_gcm(&kek, &kw_iv, &[], &cek);
+        let iv = [0x33u8; 12];
+        let plaintext = b"payload";
+
+        for bad_iv in [vec![0x09u8; 8], vec![0x09u8; 16], Vec::new()] {
+            let header = format!(
+                r#"{{"alg":"A256GCMKW","enc":"A256GCM","iv":"{}","tag":"{}"}}"#,
+                B64URL.encode(&bad_iv),
+                B64URL.encode(&wrap_tag)
+            );
+            let aad = B64URL.encode(&header);
+            let (ct, tag) = seal_gcm(&cek, &iv, aad.as_bytes(), plaintext);
+            let compact = format!(
+                "{}.{}.{}.{}.{}",
+                aad,
+                B64URL.encode(&wrapped),
+                B64URL.encode(iv),
+                B64URL.encode(&ct),
+                B64URL.encode(&tag)
+            );
+            let err = decrypt(compact.as_bytes(), &DecryptionKeys::shared(kek.clone()))
+                .expect_err("a wrong-length iv is refused");
+            assert!(
+                err.contains("12-byte header 'iv'") && err.contains(&bad_iv.len().to_string()),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn aes_gcm_open_refuses_a_wrong_length_nonce() {
+        let key = [0x11u8; 32];
+        let (ct, tag) = seal_gcm(&key, &[0x22u8; 12], &[], b"x");
+        let mut sealed = ct;
+        sealed.extend_from_slice(&tag);
+        assert_eq!(aes_gcm_open(&key, &[0x22u8; 16], &sealed, &[]), Err(()));
+        assert_eq!(aes_gcm_open(&key, &[], &sealed, &[]), Err(()));
+        assert_eq!(
+            aes_gcm_open(&key, &[0x22u8; 12], &sealed, &[]),
+            Ok(b"x".to_vec())
+        );
     }
 
     #[test]

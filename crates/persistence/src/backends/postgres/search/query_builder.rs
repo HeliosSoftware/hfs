@@ -640,6 +640,25 @@ pub struct KeysetKey {
     /// in either direction (#1606), and the keyset comparison must place it
     /// there too.
     pub nullable: bool,
+    /// Whether the `id` tiebreak runs against the key's direction rather than
+    /// always ascending. Set by `primary_keyset_key` for the `last_updated`
+    /// key only (the default order and `_sort=_lastUpdated`).
+    pub tiebreak_against_key: bool,
+}
+
+impl KeysetKey {
+    /// Whether the `id` tiebreak runs ascending on a forward page (a
+    /// `Previous` page walks the exact mirror).
+    ///
+    /// On `last_updated` the tiebreak runs against the key's direction:
+    /// `idx_resources_search` is `(tenant_id, resource_type, last_updated
+    /// DESC, id ASC) WHERE NOT is_deleted`, which serves `last_updated DESC,
+    /// id ASC` forward and `last_updated ASC, id DESC` backward, while no
+    /// index serves `last_updated ASC, id ASC` (#2603). Every other key keeps
+    /// `id ASC`.
+    pub fn forward_id_ascending(&self) -> bool {
+        !self.tiebreak_against_key || self.direction == crate::types::SortDirection::Descending
+    }
 }
 
 /// Whether a sort directive's expression can be NULL: true for a parameter
@@ -1716,8 +1735,10 @@ impl PostgresQueryBuilder {
     ///
     /// Mirrors the SQLite backend's ordering semantics so the two backends stay
     /// at parity. Multiple directives (e.g. `_sort=_lastUpdated,-_id`) are
-    /// honored in order, with an `id ASC` tie-breaker appended for stable
-    /// pagination when `_id` is not already part of the sort.
+    /// honored in order, with an `id` tie-breaker appended for stable
+    /// pagination when `_id` is not already part of the sort: `id ASC`,
+    /// except `id DESC` under a lone ascending `_lastUpdated` (see
+    /// `KeysetKey::forward_id_ascending`).
     ///
     /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
     /// sortable parameter sorts on its indexed value (see `sort_expression`).
@@ -1751,7 +1772,13 @@ impl PostgresQueryBuilder {
 
         let sorts_by_id = query.sort.iter().any(|s| s.parameter == "_id");
         if !sorts_by_id {
-            clauses.push("id ASC".to_string());
+            // The tiebreak a cursor page uses (`KeysetKey::forward_id_ascending`):
+            // `id DESC` under `_sort=_lastUpdated`, so `idx_resources_search`
+            // serves the first page by a backward scan. A multi-key sort is
+            // never cursor-paged and keeps `id ASC`.
+            let id_ascending = query.sort.len() != 1
+                || Self::primary_keyset_key(query).is_none_or(|k| k.forward_id_ascending());
+            clauses.push(if id_ascending { "id ASC" } else { "id DESC" }.to_string());
         }
 
         format!("ORDER BY {}", clauses.join(", "))
@@ -1842,6 +1869,7 @@ impl PostgresQueryBuilder {
                 direction: crate::types::SortDirection::Descending,
                 kind: SortValueKind::Timestamp,
                 nullable: false,
+                tiebreak_against_key: true,
             }),
             1 => {
                 let directive = &query.sort[0];
@@ -1850,6 +1878,7 @@ impl PostgresQueryBuilder {
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
                     nullable: sort_is_nullable(directive),
+                    tiebreak_against_key: directive.parameter == "_lastUpdated",
                 })
             }
             _ => None,

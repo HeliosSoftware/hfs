@@ -28,7 +28,7 @@ use crate::types::{
 
 use super::SqliteBackend;
 use super::search::{
-    KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
+    DEFAULT_ORDER_BY, KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
     membership_exists_predicate,
 };
 
@@ -348,23 +348,33 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 /// mirror: the reversed order puts missing values first, so from a present
 /// value none of them qualify (a comparison with NULL is never true), and
 /// from a missing one every present value lies before it.
+///
+/// The `id` tiebreak is ascending forward (descending on `Previous`), except
+/// on the `last_updated` key, where it takes that key's direction
+/// ([`KeysetKey::id_follows_direction`]): `idx_resources_reindex`
+/// `(tenant_id, resource_type, last_updated, id)` then serves the order
+/// forward or backward with no temp B-tree (#2603).
 fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
+    let id_desc = k.id_tiebreak_direction() == "DESC";
     if backward {
+        // The mirror of the forward walk: reversed key and tiebreak.
+        let (id_op, id_dir) = if id_desc { (">", "ASC") } else { ("<", "DESC") };
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS ?3 AND id < ?4))")
+            format!("({e} IS NOT NULL OR ({e} IS ?3 AND id {id_op} ?4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} ?3 OR ({e} = ?3 AND id < ?4))")
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id {id_op} ?4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, id DESC"))
+        (condition, format!("{e} {dir}{nulls}, id {id_dir}"))
     } else {
+        let (id_op, id_dir) = if id_desc { ("<", "DESC") } else { (">", "ASC") };
         let condition = if at_missing {
-            format!("({e} IS ?3 AND id > ?4)")
+            format!("({e} IS ?3 AND id {id_op} ?4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -372,11 +382,11 @@ fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (
             } else {
                 String::new()
             };
-            format!("({e} {op} ?3 OR ({e} = ?3 AND id > ?4){or_missing})")
+            format!("({e} {op} ?3 OR ({e} = ?3 AND id {id_op} ?4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, id ASC"))
+        (condition, format!("{e} {dir}{nulls}, id {id_dir}"))
     }
 }
 
@@ -556,9 +566,10 @@ impl SqliteBackend {
             None => "id, version_id, data, last_updated, fhir_version".to_string(),
         };
 
-        // ORDER BY for the first-page / offset paths.
+        // ORDER BY for the first-page / offset paths: the same order the
+        // keyset pages continue (see `keyset_page_clauses`).
         let order_by = if query.sort.is_empty() {
-            "ORDER BY last_updated DESC, id ASC".to_string()
+            DEFAULT_ORDER_BY.to_string()
         } else {
             QueryBuilder::new(tenant_id, resource_type).build_order_by(query)
         };
@@ -579,10 +590,10 @@ impl SqliteBackend {
                                  (SELECT rowid AS rk, last_updated AS lu, id AS rid \
                                   FROM resources INDEXED BY idx_resources_reindex \
                                   WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                                  ORDER BY last_updated DESC, id ASC LIMIT {window}) AS w \
+                                  {DEFAULT_ORDER_BY} LIMIT {window}) AS w \
                                  CROSS JOIN resources ON resources.rowid = w.rk \
                                  WHERE {exists} \
-                                 ORDER BY w.lu DESC, w.rid ASC LIMIT {lim}",
+                                 ORDER BY w.lu DESC, w.rid DESC LIMIT {lim}",
                                 lim = count + 1,
                             )
                         })
@@ -834,7 +845,8 @@ pub(crate) enum FirstPagePlan {
 /// index rows (`SELECT … FROM (<rows> LIMIT 2001)`, a seek that stops early).
 /// Any shape other than one plain parameter membership, and any probe error,
 /// is [`FirstPagePlan::Planner`]: the result of every plan is the same set in
-/// the same `ORDER BY last_updated DESC, id` order, so this only chooses cost.
+/// the same `ORDER BY last_updated DESC, id DESC` order, so this only chooses
+/// cost.
 ///
 /// Only the tests call it; the production path reaches the same plans through
 /// the probe's own keys.
@@ -1011,17 +1023,20 @@ fn search_ids_on_plan(
     let search_params = search_filter
         .map(|fragment| fragment.params)
         .unwrap_or_default();
+    // The same order and forward keyset as a default `search`, whose cursors
+    // these interleave with.
     let cursor_clause = if cursor.is_some() {
-        " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
+        let (condition, _) = keyset_page_clauses(&KeysetKey::default_last_updated(), false, false);
+        format!(" AND {condition}")
     } else {
-        ""
+        String::new()
     };
     let count = query.count.unwrap_or(100) as usize;
     let version_clause = fhir_version_clause(query, "fhir_version");
     let sql = format!(
         "SELECT id, last_updated FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter_clause}{cursor_clause} \
-             ORDER BY last_updated DESC, id ASC LIMIT {}",
+             {DEFAULT_ORDER_BY} LIMIT {}",
         count + 1
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -2168,6 +2183,310 @@ mod tests {
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         assert!(bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok());
+    }
+
+    fn last_updated_key(direction: crate::types::SortDirection) -> KeysetKey {
+        KeysetKey {
+            direction,
+            ..KeysetKey::default_last_updated()
+        }
+    }
+
+    /// #2603: on `last_updated` descending (the default order) the id
+    /// tiebreak is descending too, and `Previous` walks the exact mirror.
+    #[test]
+    fn descending_last_updated_keyset_breaks_ties_by_id_descending() {
+        use crate::types::SortDirection;
+        for key in [
+            KeysetKey::default_last_updated(),
+            last_updated_key(SortDirection::Descending),
+        ] {
+            assert_eq!(
+                keyset_page_clauses(&key, false, false),
+                (
+                    "(last_updated < ?3 OR (last_updated = ?3 AND id < ?4))".to_string(),
+                    "last_updated DESC, id DESC".to_string()
+                )
+            );
+            assert_eq!(
+                keyset_page_clauses(&key, false, true),
+                (
+                    "(last_updated > ?3 OR (last_updated = ?3 AND id > ?4))".to_string(),
+                    "last_updated ASC, id ASC".to_string()
+                )
+            );
+        }
+        // The first page emits the order the cursor pages continue.
+        let (_, order) = keyset_page_clauses(&KeysetKey::default_last_updated(), false, false);
+        assert_eq!(DEFAULT_ORDER_BY, format!("ORDER BY {order}"));
+    }
+
+    /// Ascending `last_updated` keeps `id ASC` forward and its mirror back.
+    #[test]
+    fn ascending_last_updated_keyset_is_unchanged() {
+        let key = last_updated_key(crate::types::SortDirection::Ascending);
+        assert_eq!(
+            keyset_page_clauses(&key, false, false),
+            (
+                "(last_updated > ?3 OR (last_updated = ?3 AND id > ?4))".to_string(),
+                "last_updated ASC, id ASC".to_string()
+            )
+        );
+        assert_eq!(
+            keyset_page_clauses(&key, false, true),
+            (
+                "(last_updated < ?3 OR (last_updated = ?3 AND id < ?4))".to_string(),
+                "last_updated DESC, id DESC".to_string()
+            )
+        );
+    }
+
+    /// #2603: the default and `-_lastUpdated` orders walk
+    /// `idx_resources_reindex` (backward) with no temp B-tree, on the first
+    /// page, a next page and a previous page alike, and the early-exit
+    /// window's inner walk does too.
+    #[tokio::test]
+    async fn descending_last_updated_pages_need_no_temp_btree() {
+        use crate::types::{SortDirection, SortDirective};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 0..6 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let plan_of = |sql: &str| -> Vec<String> {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let assert_walks_the_index = |sql: &str| {
+            let plan = plan_of(sql);
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "{sql}\n{plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_resources_reindex")),
+                "{sql}\n{plan:#?}"
+            );
+        };
+        let page = |query: &SearchQuery| -> (String, SearchResult) {
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let result = backend
+                .search_with_connection_probe(&conn, &tenant, query, None, false)
+                .unwrap();
+            let sql = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id, data"))
+                        .cloned()
+                })
+                .expect("the page statement");
+            (sql, result)
+        };
+
+        let mut descending = SearchQuery::new("Patient");
+        descending.sort = vec![SortDirective {
+            parameter: "_lastUpdated".to_string(),
+            direction: SortDirection::Descending,
+            param_type: None,
+        }];
+        for query in [SearchQuery::new("Patient"), descending] {
+            let mut query = query;
+            query.count = Some(2);
+            let (first_sql, first) = page(&query);
+            assert!(
+                first_sql.contains("last_updated DESC, id DESC"),
+                "{first_sql}"
+            );
+            assert_walks_the_index(&first_sql);
+
+            query.cursor = first.resources.page_info.next_cursor.clone();
+            assert!(query.cursor.is_some());
+            let (next_sql, next) = page(&query);
+            assert!(next_sql.contains("id < '"), "{next_sql}");
+            assert_walks_the_index(&next_sql);
+
+            query.cursor = next.resources.page_info.previous_cursor.clone();
+            assert!(query.cursor.is_some());
+            let (previous_sql, previous) = page(&query);
+            assert!(
+                previous_sql.contains("last_updated ASC, id ASC"),
+                "{previous_sql}"
+            );
+            assert_walks_the_index(&previous_sql);
+            let ids = |r: &SearchResult| -> Vec<String> {
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect()
+            };
+            assert_eq!(ids(&previous), ids(&first));
+        }
+
+        // The window's inner walk, as `search_with_connection_plan` writes it.
+        assert_walks_the_index(&format!(
+            "SELECT rowid AS rk, last_updated AS lu, id AS rid \
+             FROM resources INDEXED BY idx_resources_reindex \
+             WHERE tenant_id = 'test-tenant' AND resource_type = 'Patient' AND is_deleted = 0 \
+             {DEFAULT_ORDER_BY} LIMIT 512"
+        ));
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::empty(),
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
+    }
+
+    /// #2603, the filtered side of the shared tie-order suite: with every
+    /// match on one `last_updated`, a filtered search pages through the ties
+    /// in one order whatever the page size, with the probe on (its
+    /// list-driven first page) or off, and `search_ids` walks the same order.
+    #[tokio::test]
+    async fn filtered_tied_timestamps_page_in_one_order() {
+        use crate::core::SearchProvider;
+        use crate::types::{SearchParamType, SearchPrefix};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in [
+            "t-5", "t-2", "t-9", "t-1", "t-7", "t-3", "t-8", "t-4", "t-6",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "t-0", "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let conn = backend.get_connection().unwrap();
+        conn.execute(
+            "UPDATE resources SET last_updated = '2001-02-03T04:05:06.789012+00:00' \
+             WHERE resource_type = 'Patient'",
+            [],
+        )
+        .unwrap();
+        let query = |count: u32| {
+            let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "active".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::new(SearchPrefix::Eq, "true")],
+                chain: vec![],
+                components: vec![],
+            });
+            query.count = Some(count);
+            query
+        };
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        // Newest first, then `id DESC` among the ties.
+        let expected: Vec<String> = [
+            "t-9", "t-8", "t-7", "t-6", "t-5", "t-4", "t-3", "t-2", "t-1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for probe in [false, true] {
+            let single = backend
+                .search_with_connection_probe(&conn, &tenant, &query(100), None, probe)
+                .unwrap();
+            assert_eq!(ids(&single), expected, "probe={probe}");
+            for count in 1..=4 {
+                let mut walked = Vec::new();
+                let mut q = query(count);
+                loop {
+                    let page = backend
+                        .search_with_connection_probe(&conn, &tenant, &q, None, probe)
+                        .unwrap();
+                    walked.extend(ids(&page));
+                    match page.resources.page_info.next_cursor {
+                        Some(cursor) => q.cursor = Some(cursor),
+                        None => break,
+                    }
+                }
+                assert_eq!(walked, expected, "probe={probe} _count={count}");
+            }
+        }
+        drop(conn);
+
+        // `search_ids` interleaves with `search` cursors: same order.
+        for count in 1..=4 {
+            let mut walked = Vec::new();
+            let mut q = query(count);
+            loop {
+                let page = backend.search_ids(&tenant, &q).await.unwrap();
+                walked.extend(page.items.iter().cloned());
+                match page.page_info.next_cursor {
+                    Some(cursor) => q.cursor = Some(cursor),
+                    None => break,
+                }
+            }
+            assert_eq!(walked, expected, "search_ids _count={count}");
+        }
+    }
+
+    /// Keys other than `last_updated` keep the `id ASC` tiebreak whatever
+    /// their direction.
+    #[test]
+    fn other_keyset_keys_keep_the_ascending_id_tiebreak() {
+        let key = KeysetKey {
+            expr: "x".to_string(),
+            direction: crate::types::SortDirection::Descending,
+            kind: SortValueKind::Text,
+            nullable: true,
+            id_follows_direction: false,
+        };
+        assert_eq!(
+            keyset_page_clauses(&key, false, false),
+            (
+                "(x < ?3 OR (x = ?3 AND id > ?4) OR x IS NULL)".to_string(),
+                "x DESC NULLS LAST, id ASC".to_string()
+            )
+        );
+        assert_eq!(
+            keyset_page_clauses(&key, true, true),
+            (
+                "(x IS NOT NULL OR (x IS ?3 AND id < ?4))".to_string(),
+                "x ASC NULLS FIRST, id DESC".to_string()
+            )
+        );
     }
 
     fn create_test_backend() -> SqliteBackend {
@@ -3514,7 +3833,7 @@ mod tests {
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
              WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-             AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+             AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -3971,7 +4290,7 @@ mod tests {
             let rows_sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                 AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let plan = plan_of(&rows_sql, &params);
@@ -4157,7 +4476,7 @@ mod tests {
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT id FROM resources \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                 AND rowid IN ({}) {DEFAULT_ORDER_BY} LIMIT 101",
                 fragment.sql
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![

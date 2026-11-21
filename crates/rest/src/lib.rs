@@ -152,6 +152,7 @@ pub mod build_info;
 pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
+pub mod chain_access;
 pub mod config;
 mod dashboard;
 pub mod error;
@@ -1059,12 +1060,15 @@ where
 
     // Cross-tenant console metrics (`tenants`, `traffic`) expose data spanning
     // every tenant, so they require an administrative, system-context scope on top
-    // of authentication. `admin_authz_middleware` requires `system/*.r`, rejecting
-    // ordinary user-/patient-context tokens (even wildcard ones) with `403`. As
-    // with the other tiers, when auth is disabled server-wide there is no
-    // Principal and the middleware passes through, keeping dev-mode behaviour.
-    // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
-    // tier as `console/metrics/tenants`: system-context scope + authentication.
+    // of authentication. `admin_authz_middleware` requires a `system/*` scope
+    // carrying the bit the method implies (`r` to look, `c` for POST, `d` for
+    // DELETE), rejecting ordinary user-/patient-context tokens (even wildcard
+    // ones) with `403`. As with the other tiers, when auth is disabled
+    // server-wide there is no Principal and the middleware passes through,
+    // keeping dev-mode behaviour. Tenant-maintenance API (`/admin/tenants`)
+    // rides the same cross-tenant admin tier as `console/metrics/tenants`:
+    // system-context scope + authentication, so registering a tenant needs
+    // `system/*.c` and deregistering or purging one `system/*.d`.
     let admin_console = routing::console_metrics::admin_routes(console_admin_state)
         .merge(routing::admin_tenants::routes(admin_tenants_state));
     let admin_console = if let Some(ref auth) = auth_state {

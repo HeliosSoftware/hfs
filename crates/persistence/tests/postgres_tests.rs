@@ -140,6 +140,10 @@ mod quantity_range_suite;
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic suite for paging through tied `last_updated` (#2603).
+#[path = "search/tiebreak_order_suite.rs"]
+mod tiebreak_order_suite;
+
 /// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
@@ -13281,9 +13285,12 @@ mod postgres_integration {
             .clone()
             .with_sort(SortDirective::parse("_lastUpdated"));
         let asc = backend.search(&tenant, &ascending).await.unwrap();
+        // Three observations share each day; ascending `_lastUpdated` breaks
+        // those ties by `id DESC`, the backward scan of
+        // `idx_resources_search` (#2603).
         assert_eq!(
             page_ids(&asc),
-            vec!["obs-01", "obs-02", "obs-03", "obs-04", "obs-05"]
+            vec!["obs-03", "obs-02", "obs-01", "obs-06", "obs-05"]
         );
         let repeated = explicit.with_parameter(default.parameters[0].clone());
         assert_eq!(
@@ -35808,6 +35815,337 @@ mod postgres_integration {
             true,
         )
         .await;
+    }
+
+    /// #2603: resources sharing one `last_updated` page forward and back with
+    /// no gap or repeat, in the default, ascending and descending orders.
+    #[tokio::test]
+    async fn postgres_integration_tied_timestamps_page_without_gaps() {
+        let backend = create_backend().await;
+        let pin_backend = backend.clone();
+        super::tiebreak_order_suite::tied_timestamps_page_without_gaps(
+            &backend,
+            &unique_base("tiebreak"),
+            async |tenant_id: &str, resource_type: &str| {
+                let client = pin_backend.get_client().await.unwrap();
+                let at = tie_instant();
+                let changed = client
+                    .execute(
+                        "UPDATE resources SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+                assert!(changed > 0, "no {resource_type} rows to pin");
+                client
+                    .execute(
+                        "UPDATE search_index SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = $3",
+                        &[&at, &tenant_id, &resource_type],
+                    )
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+    }
+
+    /// #2603: the shared tie suite walks unfiltered searches only. A filter
+    /// takes other statements: `active=true` sorted descending (or by
+    /// default) picks its page from `search_index` (`resource_id` keyset, the
+    /// index-selected fast path), and ascending filters `resources` through a
+    /// membership subquery. Both must page through a tie with no gap or
+    /// repeat, forward and back, whatever the page size.
+    #[tokio::test]
+    async fn postgres_integration_filtered_tied_timestamps_page_without_gaps() {
+        use helios_persistence::core::{ResourceStorage, SearchProvider};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirection,
+            SortDirective,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tiebreak-filtered");
+        let tenant_id = tenant.tenant_id().as_str();
+        let ids = [
+            "t-5", "t-2", "t-9", "t-1", "t-7", "t-3", "t-8", "t-4", "t-6", "t-0",
+        ];
+        for id in ids {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A non-matching resource on the same instant must stay out.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "t-off", "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = backend.get_client().await.unwrap();
+        for table in ["resources", "search_index"] {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET last_updated = $1 \
+                         WHERE tenant_id = $2 AND resource_type = 'Patient'"
+                    ),
+                    &[&tie_instant(), &tenant_id],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let query = |sort: Option<SortDirection>, count: u32| {
+            let mut q = SearchQuery::new("Patient")
+                .with_count(count)
+                .with_parameter(SearchParameter {
+                    name: "active".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("true")],
+                    chain: vec![],
+                    components: vec![],
+                });
+            if let Some(direction) = sort {
+                q = q.with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction,
+                    param_type: None,
+                });
+            }
+            q
+        };
+        let page = async |q: SearchQuery| {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            let ids = r
+                .resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>();
+            (ids, r.resources.page_info)
+        };
+        let mut expected = ids.map(str::to_string).to_vec();
+        expected.sort();
+        for sort in [
+            None,
+            Some(SortDirection::Ascending),
+            Some(SortDirection::Descending),
+        ] {
+            let (single, _) = page(query(sort, 100)).await;
+            let mut sorted = single.clone();
+            sorted.sort();
+            assert_eq!(sorted, expected, "{sort:?}: one full page");
+            for count in 1..=4 {
+                let mut forward = Vec::new();
+                let (mut ids, mut info) = page(query(sort, count)).await;
+                for _ in 0..=expected.len() {
+                    forward.extend(ids.clone());
+                    match info.next_cursor.clone().filter(|_| info.has_next) {
+                        Some(c) => (ids, info) = page(query(sort, count).with_cursor(c)).await,
+                        None => break,
+                    }
+                }
+                assert_eq!(forward, single, "{sort:?} _count={count}: forward walk");
+                let mut backward = ids;
+                for _ in 0..=expected.len() {
+                    match info.previous_cursor.clone().filter(|_| info.has_previous) {
+                        Some(c) => {
+                            let (mut before, before_info) =
+                                page(query(sort, count).with_cursor(c)).await;
+                            before.extend(backward);
+                            backward = before;
+                            info = before_info;
+                        }
+                        None => break,
+                    }
+                }
+                assert_eq!(backward, forward, "{sort:?} _count={count}: walk back");
+            }
+        }
+    }
+
+    /// #2603: a cursor page of `_sort=_lastUpdated` ordered `last_updated ASC,
+    /// id ASC`, which `idx_resources_search` (`last_updated DESC, id ASC`)
+    /// serves in neither direction, so every page sorted all the rows after
+    /// the cursor. Its tiebreak runs `id DESC` now, the index's backward scan;
+    /// the `Previous` page is the mirror, its forward scan. Neither plan may
+    /// sort (not even an Incremental Sort over `idx_resources_updated`, which
+    /// the planner chose before the redundant `last_updated >=`/`<=` bound),
+    /// and each page reads about one page of index entries however deep the
+    /// cursor is: without the bound the scan filtered every entry before it.
+    #[tokio::test]
+    async fn postgres_integration_ascending_last_updated_cursor_pages_do_not_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CursorDirection, SearchQuery, SortDirection, SortDirective,
+        };
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 4000;
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Keep one session for the cached search statements, so they can be
+        // found and EXPLAINed on it.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("asc-last-updated-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // Pairs of resources share one `last_updated`, so the tiebreak matters.
+        // Another type shares the tenant and the instants, as in any real
+        // tenant: with one type only, `idx_resources_updated` (`tenant_id,
+        // last_updated`) is as selective as `idx_resources_search` and the
+        // planner may take it plus an Incremental Sort of each tie group.
+        for resource_type in ["Patient", "Observation"] {
+            client
+                .execute(
+                    "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                     SELECT $1, $3, 'p-' || lpad(series::text, 5, '0'), '1',
+                            jsonb_build_object('resourceType', $3::text, 'id', 'p-' || lpad(series::text, 5, '0')),
+                            TIMESTAMPTZ '2020-01-01T00:00:00Z' + (series / 2) * INTERVAL '1 second',
+                            FALSE FROM generate_series(1, $2::bigint) series",
+                    &[&tenant_id, &ROWS, &resource_type],
+                )
+                .await
+                .unwrap();
+        }
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        drop(client);
+
+        let ascending = || {
+            SearchQuery::new("Patient")
+                .with_count(20)
+                .with_sort(SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction: SortDirection::Ascending,
+                    param_type: None,
+                })
+        };
+        // The walk the plans are taken from: first page, its next page, and
+        // that page's previous page back.
+        let first = backend.search(&tenant, &ascending()).await.unwrap();
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        // `series / 2` puts p-00001 alone first, then p-00003 before p-00002.
+        assert_eq!(ids(&first)[..3], ["p-00001", "p-00003", "p-00002"]);
+        let next = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(first.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        // The tie p-00020/p-00021 straddles the page boundary.
+        assert_eq!(ids(&first)[19], "p-00021");
+        assert_eq!(ids(&next)[0], "p-00020");
+        let back = backend
+            .search(
+                &tenant,
+                &ascending().with_cursor(next.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&back), ids(&first));
+        // The pool's one free session, which prepared the statements above.
+        let client = backend.get_client().await.unwrap();
+
+        // A cursor deep in the type, so a plan that filters its way to the
+        // cursor instead of seeking it would read thousands of entries.
+        let deep_at = "2020-01-01T00:25:00Z"; // series 3000 and 3001
+        let deep_id = "p-03001";
+        for (direction, order, scan) in [
+            (
+                CursorDirection::Next,
+                "ORDER BY last_updated ASC, id DESC",
+                "Backward",
+            ),
+            (
+                CursorDirection::Previous,
+                "ORDER BY last_updated DESC, id ASC",
+                "Forward",
+            ),
+        ] {
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT id, version_id, data, last_updated%'
+                       AND statement LIKE '%FROM resources%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 4",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached cursor statement: {e}"))
+                .get(0);
+            // The walk prepared this statement; the deep cursor is bound by
+            // hand rather than walking 150 pages to reach it.
+            // `force_custom_plan` is the backend's default plan cache mode
+            // (`PostgresPlanCacheMode`). A generic plan is not asserted: in
+            // this shared, many-tenant test database it estimates
+            // `tenant_id = $1` at a handful of rows and may pick a bitmap scan
+            // and a top-N sort, which says nothing about a real deployment.
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" \
+                         ('{tenant_id}', 'Patient', '{deep_at}', '{deep_id}')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2603] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"].as_str().is_some_and(|t| t.ends_with("Sort"))),
+                "{direction:?}: the page sorted: {plan}"
+            );
+            let scan_node = all
+                .iter()
+                .find(|n| n["Index Name"] == "idx_resources_search")
+                .unwrap_or_else(|| panic!("{direction:?}: idx_resources_search unused: {plan}"));
+            assert_eq!(scan_node["Scan Direction"], scan, "{direction:?}: {plan}");
+            let read = scan_node["Actual Rows"].as_u64().unwrap()
+                + scan_node["Rows Removed by Filter"].as_u64().unwrap_or(0);
+            assert!(
+                read <= 25,
+                "{direction:?}: read {read} index entries for a 20-row page: {plan}"
+            );
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
     }
 
     /// #1711: an untyped meta-parameter sort fell back to `ORDER BY id`.

@@ -59,6 +59,14 @@ fn cursor_value_is_null(cursor: &PageCursor) -> bool {
 /// `last_updated` they would stop the planner from walking its index.
 /// `id_column` is an internal column name: resource pages use `id`, while
 /// index-selected pages use `resource_id` for the identical tie boundary.
+///
+/// The `id` tiebreak runs ascending on a forward page except on an ascending
+/// `last_updated` key, where it runs descending (`KeysetKey::
+/// forward_id_ascending`): `idx_resources_search` is `(tenant_id,
+/// resource_type, last_updated DESC, id ASC)`, so `last_updated ASC, id DESC`
+/// is its backward scan, while `last_updated ASC, id ASC` matched no index
+/// and sorted every remaining row (#2603). `PostgresQueryBuilder::
+/// build_order_by` emits the same tiebreak for the first page.
 fn keyset_page_clauses(
     k: &KeysetKey,
     id_column: &str,
@@ -68,19 +76,23 @@ fn keyset_page_clauses(
     let e = &k.expr;
     let asc = k.direction == crate::types::SortDirection::Ascending;
     let at_missing = k.nullable && cursor_is_null;
-    if backward {
+    // `Previous` mirrors the forward order, tiebreak included.
+    let id_asc = k.forward_id_ascending() != backward;
+    let id_op = if id_asc { ">" } else { "<" };
+    let id_dir = if id_asc { "ASC" } else { "DESC" };
+    let (condition, order) = if backward {
         let condition = if at_missing {
-            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} < $4))")
+            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND {id_column} {id_op} $4))")
         } else {
             let op = if asc { "<" } else { ">" };
-            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} < $4))")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} {id_op} $4))")
         };
         let nulls = if k.nullable { " NULLS FIRST" } else { "" };
         let dir = if asc { "DESC" } else { "ASC" };
-        (condition, format!("{e} {dir}{nulls}, {id_column} DESC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} {id_dir}"))
     } else {
         let condition = if at_missing {
-            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} > $4)")
+            format!("({e} IS NOT DISTINCT FROM $3 AND {id_column} {id_op} $4)")
         } else {
             let op = if asc { ">" } else { "<" };
             let or_missing = if k.nullable {
@@ -88,11 +100,24 @@ fn keyset_page_clauses(
             } else {
                 String::new()
             };
-            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} > $4){or_missing})")
+            format!("({e} {op} $3 OR ({e} = $3 AND {id_column} {id_op} $4){or_missing})")
         };
         let nulls = if k.nullable { " NULLS LAST" } else { "" };
         let dir = if asc { "ASC" } else { "DESC" };
-        (condition, format!("{e} {dir}{nulls}, {id_column} ASC"))
+        (condition, format!("{e} {dir}{nulls}, {id_column} {id_dir}"))
+    };
+    if k.tiebreak_against_key {
+        // A redundant range bound on the key alone. The planner cannot turn
+        // the `OR` above into an index condition, so without it each page
+        // scans `idx_resources_search` from the start of the type and filters
+        // every entry before the cursor (36,022 removed rows on a cursor 36k
+        // deep, or it picks `idx_resources_updated` plus an Incremental Sort);
+        // with it the scan seeks the cursor and removes at most the tie group
+        // already served (#2603). `last_updated` is never NULL here.
+        let seek = if asc != backward { ">=" } else { "<=" };
+        (format!("({e} {seek} $3 AND {condition})"), order)
+    } else {
+        (condition, order)
     }
 }
 
@@ -739,6 +764,15 @@ impl PostgresBackend {
             let backward = cursor
                 .as_ref()
                 .is_some_and(|c| c.direction() == CursorDirection::Previous);
+            // `fast_index_pred` admits only the default order and a lone
+            // descending `_lastUpdated`, whose tiebreak is `id ASC` forward
+            // (#2603), so the hard-coded first-page order and `outer_order`
+            // below agree with `keyset_page_clauses`.
+            debug_assert!(keyset.as_ref().is_some_and(|k| {
+                k.tiebreak_against_key
+                    && k.direction == crate::types::SortDirection::Descending
+                    && k.forward_id_ascending()
+            }));
             let (boundary, order) = if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
                 let (condition, order) =
                     keyset_page_clauses(k, "resource_id", cursor_value_is_null(cursor), backward);
@@ -1057,7 +1091,11 @@ impl SearchProvider for PostgresBackend {
             .map(|fragment| fragment.params)
             .unwrap_or_default();
         let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < $3 OR (last_updated = $3 AND id > $4))"
+            // The leading `last_updated <= $3` is implied by the `OR`; it only
+            // gives the planner a range to seek to on `idx_resources_search`
+            // instead of filtering every row before the cursor (same shape as
+            // the descending keyset in `keyset_page_clauses`).
+            " AND (last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
         } else {
             ""
         };
@@ -1958,6 +1996,7 @@ mod keyset_page_clause_tests {
             direction,
             kind: SortValueKind::Timestamp,
             nullable,
+            tiebreak_against_key: false,
         }
     }
 
@@ -2009,6 +2048,130 @@ mod keyset_page_clause_tests {
         let (previous, order) = keyset_page_clauses(&k, "resource_id", false, true);
         assert_eq!(previous, "(k > $3 OR (k = $3 AND resource_id < $4))");
         assert_eq!(order, "k ASC, resource_id DESC");
+    }
+
+    fn sorted(parameter: &str, direction: SortDirection) -> SearchQuery {
+        let param_type = match parameter {
+            "_lastUpdated" | "birthdate" => Some(crate::types::SearchParamType::Date),
+            _ => Some(crate::types::SearchParamType::Token),
+        };
+        SearchQuery::new("Patient").with_sort(crate::types::SortDirective {
+            parameter: parameter.to_string(),
+            direction,
+            param_type,
+        })
+    }
+
+    fn last_updated(direction: SortDirection) -> KeysetKey {
+        PostgresQueryBuilder::primary_keyset_key(&sorted("_lastUpdated", direction))
+            .expect("one sort key")
+    }
+
+    /// #2603: ascending `last_updated` breaks ties by `id DESC`, the backward
+    /// scan of `idx_resources_search` (`last_updated DESC, id ASC`); its
+    /// `Previous` page is the exact mirror, that index's forward scan.
+    #[test]
+    fn ascending_last_updated_breaks_ties_against_the_key() {
+        let k = last_updated(SortDirection::Ascending);
+        assert!(k.tiebreak_against_key);
+        let (next, order) = keyset_page_clauses(&k, "id", false, false);
+        assert_eq!(
+            next,
+            "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND id < $4)))"
+        );
+        assert_eq!(order, "last_updated ASC, id DESC");
+        let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+        assert_eq!(
+            previous,
+            "(last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
+        );
+        assert_eq!(order, "last_updated DESC, id ASC");
+        // Index-selected pages share the boundary.
+        let (next, order) = keyset_page_clauses(&k, "resource_id", false, false);
+        assert_eq!(
+            next,
+            "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND resource_id < $4)))"
+        );
+        assert_eq!(order, "last_updated ASC, resource_id DESC");
+    }
+
+    /// #2603: descending and default `last_updated` keep `id ASC` forward.
+    #[test]
+    fn descending_last_updated_is_unchanged() {
+        for k in [
+            last_updated(SortDirection::Descending),
+            PostgresQueryBuilder::primary_keyset_key(&SearchQuery::new("Patient"))
+                .expect("default key"),
+        ] {
+            let (next, order) = keyset_page_clauses(&k, "id", false, false);
+            assert_eq!(
+                next,
+                "(last_updated <= $3 AND (last_updated < $3 OR (last_updated = $3 AND id > $4)))"
+            );
+            assert_eq!(order, "last_updated DESC, id ASC");
+            let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+            assert_eq!(
+                previous,
+                "(last_updated >= $3 AND (last_updated > $3 OR (last_updated = $3 AND id < $4)))"
+            );
+            assert_eq!(order, "last_updated ASC, id DESC");
+        }
+    }
+
+    /// #2603: `_id` and nullable keys keep `id ASC` forward in both directions.
+    #[test]
+    fn other_keys_keep_an_ascending_tiebreak() {
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for parameter in ["_id", "birthdate", "gender"] {
+                let k = PostgresQueryBuilder::primary_keyset_key(&sorted(parameter, direction))
+                    .expect("one sort key");
+                assert!(!k.tiebreak_against_key, "{parameter}");
+                let (next, order) = keyset_page_clauses(&k, "id", false, false);
+                assert!(
+                    next.contains("id > $4"),
+                    "{parameter} {direction:?}: {next}"
+                );
+                assert!(
+                    order.ends_with(", id ASC"),
+                    "{parameter} {direction:?}: {order}"
+                );
+                let (previous, order) = keyset_page_clauses(&k, "id", false, true);
+                assert!(
+                    previous.contains("id < $4"),
+                    "{parameter} {direction:?}: {previous}"
+                );
+                assert!(
+                    order.ends_with(", id DESC"),
+                    "{parameter} {direction:?}: {order}"
+                );
+            }
+        }
+    }
+
+    /// The first page (no cursor) is ordered exactly like the cursor pages
+    /// after it, so it is the prefix of the cursor walk.
+    #[test]
+    fn the_first_page_orders_like_the_cursor_pages() {
+        let mut queries = vec![SearchQuery::new("Patient")];
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for parameter in ["_lastUpdated", "birthdate", "gender"] {
+                queries.push(sorted(parameter, direction));
+            }
+        }
+        for query in queries {
+            let k = PostgresQueryBuilder::primary_keyset_key(&query).expect("one sort key");
+            let (_, order) = keyset_page_clauses(&k, "id", false, false);
+            assert_eq!(
+                PostgresQueryBuilder::build_order_by(&query),
+                format!("ORDER BY {order}"),
+                "{:?}",
+                query.sort
+            );
+        }
+        assert_eq!(
+            PostgresQueryBuilder::build_order_by(&sorted("_lastUpdated", SortDirection::Ascending)),
+            "ORDER BY last_updated ASC, id DESC"
+        );
     }
 }
 
