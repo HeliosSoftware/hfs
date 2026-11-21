@@ -44,6 +44,17 @@ pub fn quantity_to_json(value: &Decimal, unit: &str) -> Value {
     }
 }
 
+/// Converts an out-of-range decimal (`1e999999999`) to a JSON number written in
+/// exponent form, never expanded. Falls back to a JSON string when `serde_json`
+/// cannot hold the number (without its `arbitrary_precision` feature).
+pub fn out_of_range_decimal_to_json(value: &helios_fhirpath_support::OutOfRangeDecimal) -> Value {
+    let text = value.to_scientific_string();
+    match serde_json::from_str::<Value>(&text) {
+        Ok(number @ Value::Number(_)) => number,
+        _ => Value::String(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

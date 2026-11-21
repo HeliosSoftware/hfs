@@ -1587,7 +1587,7 @@ async fn timestamp_pages_filter_before_offsets_and_preserve_cursor_totals() {
                 expected.sort_by(|a, b| {
                     data.timestamps[a]
                         .cmp(&data.timestamps[b])
-                        .then_with(|| b.cmp(a))
+                        .then_with(|| a.cmp(b))
                 });
             }
             let mut query = data.query(&conditions);
@@ -1805,7 +1805,7 @@ async fn timestamp_cursor_pages_seek_the_index_and_preserve_late_matches() {
             expected.sort_by(|a, b| {
                 data.timestamps[a]
                     .cmp(&data.timestamps[b])
-                    .then_with(|| b.cmp(a))
+                    .then_with(|| a.cmp(b))
             });
         }
         let mut cursor = None;
@@ -1901,7 +1901,7 @@ async fn ascending_timestamp_cursors_cross_groups_without_skips_or_duplicates() 
     expected.sort_by(|a, b| {
         data.timestamps[a]
             .cmp(&data.timestamps[b])
-            .then_with(|| b.cmp(a))
+            .then_with(|| a.cmp(b))
     });
     // These 129-row pages cross timestamp groups, including groups with ties.
     let query = data
@@ -2179,7 +2179,7 @@ async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
                     expected.sort_by(|a, b| {
                         data.timestamps[a]
                             .cmp(&data.timestamps[b])
-                            .then_with(|| b.cmp(a))
+                            .then_with(|| a.cmp(b))
                     });
                 }
             }
@@ -3022,7 +3022,7 @@ async fn sparse_ordered_pages_cross_fifty_pages_without_collecting_the_full_id_s
             ordered.sort_by(|a, b| {
                 data.timestamps[a]
                     .cmp(&data.timestamps[b])
-                    .then_with(|| b.cmp(a))
+                    .then_with(|| a.cmp(b))
             });
         }
         for mode in [TotalMode::None, TotalMode::Accurate] {

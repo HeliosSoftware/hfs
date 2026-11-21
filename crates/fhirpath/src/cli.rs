@@ -353,10 +353,10 @@ fn set_variable_from_json(
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 EvaluationResult::integer(i)
-            } else if let Some(f) = n.as_f64() {
-                EvaluationResult::decimal(rust_decimal::Decimal::try_from(f).map_err(|e| {
-                    FhirPathError::InvalidInput(format!("Invalid decimal value: {}", e))
-                })?)
+            } else if let Some(d) = EvaluationResult::decimal_from_text(&n.to_string()) {
+                // Parse the number's text, so a value beyond rust_decimal's range
+                // (`1e999999999`) is kept instead of failing through f64 (#2716).
+                d
             } else {
                 return Err(FhirPathError::InvalidInput(format!(
                     "Unsupported number type: {}",
@@ -390,12 +390,10 @@ fn json_value_to_result(value: &Value) -> FhirPathResult<EvaluationResult> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(EvaluationResult::integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(EvaluationResult::decimal(
-                    rust_decimal::Decimal::try_from(f).map_err(|e| {
-                        FhirPathError::InvalidInput(format!("Invalid decimal value: {}", e))
-                    })?,
-                ))
+            } else if let Some(d) = EvaluationResult::decimal_from_text(&n.to_string()) {
+                // Parse the number's text, so a value beyond rust_decimal's range
+                // (`1e999999999`) is kept instead of failing through f64 (#2716).
+                Ok(d)
             } else {
                 Err(FhirPathError::InvalidInput(format!(
                     "Unsupported number type: {}",
@@ -438,6 +436,9 @@ fn evaluation_result_to_json_value(result: &EvaluationResult) -> Value {
         EvaluationResult::Integer(i, _, _) => json!(i),
         EvaluationResult::Integer64(i, _, _) => json!(i),
         EvaluationResult::Decimal(d, _, _) => json!(d),
+        EvaluationResult::OutOfRangeDecimal(d, _, _) => {
+            crate::json_utils::out_of_range_decimal_to_json(d)
+        }
         EvaluationResult::Date(s, _, _) => json!(s),
         EvaluationResult::DateTime(s, _, _) => json!(s),
         EvaluationResult::Time(s, _, _) => json!(s),

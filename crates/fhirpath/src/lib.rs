@@ -286,6 +286,7 @@ mod fhir_type_hierarchy;
 mod functions;
 mod long_conversion;
 mod not_function;
+mod out_of_range;
 mod polymorphic_access;
 mod reference_key_functions;
 mod repeat_all_function;

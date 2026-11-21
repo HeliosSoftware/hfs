@@ -96,7 +96,7 @@ jobs:
             jobs: 2
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -406,7 +406,7 @@ jobs:
             runner: macos-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
 

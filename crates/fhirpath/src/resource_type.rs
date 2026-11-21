@@ -118,7 +118,8 @@ pub fn is_of_type_with_context(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info, _) => {
+        EvaluationResult::Decimal(_, type_info, _)
+        | EvaluationResult::OutOfRangeDecimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),
@@ -370,7 +371,8 @@ pub fn is_of_type_for_of_type(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info, _) => {
+        EvaluationResult::Decimal(_, type_info, _)
+        | EvaluationResult::OutOfRangeDecimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(
                     &Some(type_info.namespace.clone()),
@@ -616,7 +618,8 @@ pub fn is_of_type(
                 )
             }
         }
-        EvaluationResult::Decimal(_, type_info, _) => {
+        EvaluationResult::Decimal(_, type_info, _)
+        | EvaluationResult::OutOfRangeDecimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 check_type_match(
                     &Some(type_info.namespace.clone()),

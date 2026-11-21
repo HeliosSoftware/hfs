@@ -219,9 +219,11 @@ fn check_submit_scope(principal: Option<&Principal>) -> RestResult<()> {
     Ok(())
 }
 
-/// Ownership check for status / cancel / file surfaces: the principal must own
-/// the submission (subject match) or hold a system wildcard scope carrying the
-/// bit the surface implies (`r` to look, `d` to cancel). Auth-disabled → allowed.
+/// Ownership check for the status / cancel / file surfaces and for a kick-off
+/// that names an existing submission: the principal must own the submission
+/// (subject match) or hold a system wildcard scope carrying the bit the surface
+/// implies (`r` to look, `c` to continue, `d` to cancel or stop).
+/// Auth-disabled → allowed.
 fn owns_submission(
     principal: Option<&Principal>,
     owner_subject: Option<&str>,
@@ -233,6 +235,34 @@ fn owns_submission(
             owner_subject == Some(p.subject.as_str())
                 || p.scopes.has_system_scope(wildcard_permission)
         }
+    }
+}
+
+/// The recorded owner of an existing submission. The job store keeps it on the
+/// submission row and exposes it on the poll-token target only, so the token
+/// is ensured (minted once, then reused) and resolved.
+async fn submission_owner(
+    jobs: &std::sync::Arc<dyn helios_persistence::core::BulkSubmitJobStore>,
+    ctx: &TenantContext,
+    sub_id: &SubmissionId,
+) -> RestResult<Option<String>> {
+    let token = jobs
+        .ensure_poll_token(ctx, sub_id)
+        .await
+        .map_err(RestError::from)?;
+    Ok(jobs
+        .resolve_poll_token(&token)
+        .await
+        .map_err(RestError::from)?
+        .and_then(|target| target.owner_subject))
+}
+
+/// The `404` for a submission the principal does not own: the surface does not
+/// confirm that another client's submission exists.
+fn not_owned(sub_id: &SubmissionId) -> RestError {
+    RestError::NotFound {
+        resource_type: "Submission".to_string(),
+        id: sub_id.to_string(),
     }
 }
 
@@ -248,7 +278,14 @@ static POLL_LIMITER: RateLimiter = RateLimiter::new();
 /// and the principal (else the peer address) separates clients sharing it. A
 /// deployment with neither auth nor a recorded peer shares one bucket per
 /// token — the restrictive reading, since polling is what we are limiting.
+///
+/// The token enters the key as its SHA-256, not verbatim: the limiter runs
+/// before the token is resolved, so the segment is whatever the caller put in
+/// the path, up to the URI limit, and it must not size the bucket.
 fn poll_rate_limit_key(token: &str, principal: Option<&Principal>, peer: Option<IpAddr>) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token));
     match principal {
         Some(p) => format!("{token}|sub:{}", p.subject),
         None => match peer {
@@ -581,6 +618,21 @@ where
         .await
         .map_err(RestError::from)?
     {
+        // An existing submission is continued by its owner only: the key is
+        // two client-chosen body values, and everything below (replace,
+        // attach, stop, complete) acts on that submission.
+        // A non-owner's wildcard needs the bit the kick-off implies: `d` to
+        // stop it, as the cancel handler asks; `c` to extend, replace or
+        // complete it, as the operation itself asks.
+        let wildcard_permission = if req.submission_status == "stopped" {
+            SmartPermissions::DELETE
+        } else {
+            SmartPermissions::CREATE
+        };
+        let owner = submission_owner(&jobs, ctx, &sub_id).await?;
+        if !owns_submission(principal.as_ref(), owner.as_deref(), wildcard_permission) {
+            return Err(not_owned(&sub_id));
+        }
         if existing_status.is_terminal() {
             // A status-only kick-off that restates the terminal status the
             // submission already has is not a further submission — it is the
@@ -782,10 +834,11 @@ where
     jobs.get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "Submission".to_string(),
-            id: sub_id.to_string(),
-        })?;
+        .ok_or_else(|| not_owned(&sub_id))?;
+    let owner = submission_owner(&jobs, ctx, &sub_id).await?;
+    if !owns_submission(principal.as_ref(), owner.as_deref(), SmartPermissions::READ) {
+        return Err(not_owned(&sub_id));
+    }
 
     let token = jobs
         .ensure_poll_token(ctx, &sub_id)
@@ -1900,6 +1953,24 @@ mod tests {
                 "{scopes}"
             );
         }
+    }
+
+    /// The poll limiter keys on a digest of the token: the caller's path
+    /// segment, however long, does not size the bucket, and distinct tokens
+    /// still get distinct buckets.
+    #[test]
+    fn poll_rate_limit_key_carries_a_digest_of_the_token_not_the_token() {
+        let peer: Option<IpAddr> = Some("203.0.113.7".parse().unwrap());
+        let short = poll_rate_limit_key("11111111-1111-4111-8111-111111111111", None, peer);
+        let long = poll_rate_limit_key(&"x".repeat(60_000), None, peer);
+        assert_eq!(short.len(), long.len(), "{short} vs {long}");
+        assert!(short.len() < 100, "{short}");
+        assert!(!long.contains("xxxx"));
+        assert_ne!(short, long);
+        assert_ne!(
+            poll_rate_limit_key("11111111-1111-4111-8111-111111111111", None, peer),
+            poll_rate_limit_key("22222222-2222-4222-8222-222222222222", None, peer)
+        );
     }
 
     #[test]
