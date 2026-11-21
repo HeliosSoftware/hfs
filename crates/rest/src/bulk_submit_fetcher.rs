@@ -83,6 +83,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// as a body error and is resumed like a reset connection.
 pub const DEFAULT_FETCH_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Default ceiling on a manifest body, decoded (`HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`).
+pub const DEFAULT_MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default ceiling on a JWE-encrypted file, which is buffered whole, decoded
+/// (`HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES`).
+pub const DEFAULT_MAX_ENCRYPTED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// How many times one file may be re-requested after its transfer broke.
 pub const MAX_BODY_RETRIES: u32 = 3;
 
@@ -132,6 +139,10 @@ pub struct HttpSubmitInputFetcher {
     read_timeout: Duration,
     /// The origins the fetcher may request at all; empty permits every origin.
     trusted_providers: TrustedProviders,
+    /// Ceiling on a manifest body; the manifest is read whole.
+    max_manifest_bytes: u64,
+    /// Ceiling on a JWE file body; encrypted files are read whole.
+    max_encrypted_file_bytes: u64,
 }
 
 /// Builds the decoding and the non-decoding client with the same timeouts.
@@ -172,6 +183,8 @@ impl HttpSubmitInputFetcher {
             retry: RetryPolicy::default(),
             read_timeout: DEFAULT_FETCH_READ_TIMEOUT,
             trusted_providers,
+            max_manifest_bytes: DEFAULT_MAX_MANIFEST_BYTES,
+            max_encrypted_file_bytes: DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
         }
     }
 
@@ -237,6 +250,21 @@ impl HttpSubmitInputFetcher {
     /// The error for a request that failed, worded for the submitter.
     fn failure(&self, shown: &str, detail: String) -> StorageError {
         Self::err(submitter_text(self.detail_to_submitter(), shown, detail))
+    }
+
+    /// Ceilings, in decoded bytes, on the two bodies the fetcher buffers
+    /// whole: the manifest (`HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`) and a
+    /// JWE-encrypted file (`HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES`). A body
+    /// that passes its ceiling fails as soon as it does, not after it has
+    /// been buffered.
+    pub fn with_body_limits(
+        mut self,
+        max_manifest_bytes: u64,
+        max_encrypted_file_bytes: u64,
+    ) -> Self {
+        self.max_manifest_bytes = max_manifest_bytes;
+        self.max_encrypted_file_bytes = max_encrypted_file_bytes;
+        self
     }
 
     /// Everything needed to (re-)issue the GET for one input file, owned so a
@@ -408,9 +436,19 @@ impl HttpSubmitInputFetcher {
                         format!("file GET {shown} returned HTTP {}", resp.status()),
                     ));
                 }
-                Ok(resp) => match resp.bytes().await {
-                    Ok(bytes) => return Ok(bytes.to_vec()),
-                    Err(e) => format!("reading file {shown}: {}", error_chain(&e)),
+                Ok(resp) => match read_capped(
+                    resp,
+                    self.max_encrypted_file_bytes,
+                    "file",
+                    shown,
+                    "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
+                )
+                .await
+                {
+                    Ok(bytes) => return Ok(bytes),
+                    // Re-fetching a file that is too large cannot help.
+                    Err(ReadCapped::TooLarge(message)) => return Err(Self::err(message)),
+                    Err(ReadCapped::Broken(cause)) => cause,
                 },
             };
             if retries >= self.retry.max_retries {
@@ -450,6 +488,49 @@ fn submitter_text(detail_to_submitter: bool, shown: &str, detail: String) -> Str
         "bulk-submit request failed; without HFS_BULK_SUBMIT_TRUSTED_PROVIDERS the detail stays in the log"
     );
     format!("fetching {shown} failed; the reason is in the server log")
+}
+
+/// Why a capped read did not return the whole body.
+enum ReadCapped {
+    /// The body passed its ceiling; re-fetching cannot help.
+    TooLarge(String),
+    /// The transfer broke; the cause, as [`error_chain`] renders it.
+    Broken(String),
+}
+
+/// Collects a response body of at most `limit` decoded bytes, failing as soon
+/// as the ceiling is passed rather than after the whole body has been
+/// buffered. A `Content-Length` above the ceiling fails before any byte is
+/// read; a gzip body has none, so its decoded chunks are counted. `what` names
+/// the body and `setting` the variable that raises its ceiling.
+async fn read_capped(
+    resp: reqwest::Response,
+    limit: u64,
+    what: &str,
+    shown: &str,
+    setting: &str,
+) -> Result<Vec<u8>, ReadCapped> {
+    if let Some(declared) = resp.content_length()
+        && declared > limit
+    {
+        return Err(ReadCapped::TooLarge(format!(
+            "{what} {shown} declares {declared} bytes, above the {limit}-byte ceiling ({setting})"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            ReadCapped::Broken(format!("reading {what} {shown}: {}", error_chain(&e)))
+        })?;
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(ReadCapped::TooLarge(format!(
+                "{what} {shown} exceeds the {limit}-byte ceiling on its decoded body ({setting})"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Interprets raw key material as an AES key.
@@ -997,16 +1078,20 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 format!("manifest GET {shown} returned HTTP {}", resp.status()),
             ));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| {
-                self.failure(
-                    &shown,
-                    format!("reading manifest {shown}: {}", error_chain(&e)),
-                )
-            })?
-            .to_vec();
+        let bytes = read_capped(
+            resp,
+            self.max_manifest_bytes,
+            "manifest",
+            &shown,
+            "HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES",
+        )
+        .await
+        .map_err(|e| match e {
+            // The ceiling is the operator's setting, not something the
+            // network around HFS answered.
+            ReadCapped::TooLarge(message) => Self::err(message),
+            ReadCapped::Broken(message) => self.failure(&shown, message),
+        })?;
 
         // The spec has the provider encrypt the manifest as well as the files.
         // Manifests carry URLs rather than PHI and several providers leave them
@@ -2029,6 +2114,82 @@ mod tests {
                 .await,
         );
         assert!(shown.contains("HTTP 503"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn test_a_manifest_above_the_ceiling_is_refused_by_its_declared_length() {
+        let body = vec![b'x'; 4096];
+        let (base, _) = scripted_server(vec![Scripted::ok(&body)]).await;
+        let err = fetcher()
+            .with_body_limits(1024, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
+            .fetch_manifest(
+                &format!("{base}/manifest.json?sig=secret123"),
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect_err("4096 bytes above a 1024-byte ceiling")
+            .to_string();
+        assert!(err.contains("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES"), "{err}");
+        assert!(err.contains("declares 4096 bytes"), "{err}");
+        assert!(!err.contains("secret123"), "{err}");
+    }
+
+    /// A gzip body has no usable Content-Length and expands while it is
+    /// read; the ceiling counts the decoded bytes and stops the read there.
+    #[tokio::test]
+    async fn test_a_gzip_manifest_is_capped_on_its_decoded_size() {
+        use std::io::Write;
+
+        let full = vec![b'x'; 200_000];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&full).unwrap();
+        let gz = encoder.finish().unwrap();
+        assert!(gz.len() < 50_000, "the wire size is under the ceiling");
+        let (base, _) =
+            scripted_server(vec![Scripted::ok(&gz).header("Content-Encoding: gzip")]).await;
+        let err = fetcher()
+            .with_body_limits(50_000, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
+            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .await
+            .expect_err("200 000 decoded bytes above a 50 000-byte ceiling")
+            .to_string();
+        assert!(err.contains("exceeds the 50000-byte ceiling"), "{err}");
+        assert!(err.contains("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_an_encrypted_file_above_the_ceiling_is_refused_and_not_refetched() {
+        let key = [7u8; 32];
+        let plaintext = ndjson_patients(200);
+        let compact = seal(&key, &plaintext).into_bytes();
+        let enc_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode(key)});
+        let (base, requests) = scripted_server(vec![Scripted::ok(&compact)]).await;
+
+        let fetcher = quick_fetcher().with_body_limits(DEFAULT_MAX_MANIFEST_BYTES, 1024);
+        let err = match fetcher
+            .open_file_stream(
+                &format!("{base}/f.ndjson.jwe"),
+                &[],
+                false,
+                &[],
+                Some(&enc_key),
+            )
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a file above the ceiling opens no stream"),
+        };
+        assert!(
+            err.contains("HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES"),
+            "{err}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a file that is too large is not fetched again"
+        );
     }
 
     #[test]
