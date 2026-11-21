@@ -585,7 +585,9 @@ HFS does not map names, so a granted value must be the SMART scope itself:
 
 When authentication is enabled, the tenant ID is derived **exclusively** from the JWT claim configured by `HFS_AUTH_TENANT_CLAIM` (default: `tenant_id`). The `X-Tenant-ID` header and URL-based tenant routing are ignored for authenticated requests — this prevents tenant impersonation.
 
-If the token does not contain the tenant claim, the server falls back to the standard tenant resolution (header, URL path, or default).
+With `HFS_TENANT_STRICT_VALIDATION=true`, a non-default header or URL tenant that differs from the claim is refused with `400` instead of being ignored.
+
+If the token does not contain the tenant claim, the `X-Tenant-ID` header and URL tenant are still not trusted: a request naming a tenant other than `HFS_DEFAULT_TENANT` is refused with `403`, and a request naming none is served from `HFS_DEFAULT_TENANT`. In a multi-tenant deployment, make sure every user's token carries the claim named by `HFS_AUTH_TENANT_CLAIM`.
 
 ## SMART Launch Context
 
