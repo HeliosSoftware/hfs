@@ -727,6 +727,7 @@ mod tests {
                 per_subscription_queue_capacity: 1,
                 dispatch_concurrency: 1,
                 handshake_concurrency: 1,
+                allow_private_endpoints: true, // receivers are on loopback
                 ..Default::default()
             },
             "http://localhost".into(),

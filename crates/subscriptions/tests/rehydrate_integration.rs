@@ -170,6 +170,7 @@ fn fresh_engine() -> SubscriptionEngine {
             handshake_max_attempts: 1,
             handshake_retry_initial_delay: Duration::from_millis(1),
             handshake_retry_max_delay: Duration::from_millis(1),
+            allow_private_endpoints: true, // receivers are on loopback
             ..SubscriptionConfig::default()
         },
         "http://localhost:8080".to_string(),

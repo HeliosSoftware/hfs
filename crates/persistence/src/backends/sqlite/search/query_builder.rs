@@ -47,7 +47,40 @@ pub struct KeysetKey {
     /// in either direction (#1606), and the keyset comparison must place it
     /// there too.
     pub nullable: bool,
+    /// Whether the `id` tiebreak takes this key's direction instead of always
+    /// ascending: true for `last_updated` only. `idx_resources_reindex`
+    /// `(tenant_id, resource_type, last_updated, id)` serves `(ASC, ASC)`
+    /// forward and `(DESC, DESC)` backward, so `last_updated DESC, id ASC`
+    /// would need a temp B-tree over every tie group (#2603).
+    pub id_follows_direction: bool,
 }
+
+impl KeysetKey {
+    /// The key of a search with no `_sort`: newest first.
+    pub fn default_last_updated() -> Self {
+        Self {
+            expr: "last_updated".to_string(),
+            direction: crate::types::SortDirection::Descending,
+            kind: SortValueKind::Timestamp,
+            nullable: false,
+            id_follows_direction: true,
+        }
+    }
+
+    /// The `id` tiebreak direction (`"ASC"`/`"DESC"`) of a forward page.
+    pub fn id_tiebreak_direction(&self) -> &'static str {
+        if self.id_follows_direction && self.direction == crate::types::SortDirection::Descending {
+            "DESC"
+        } else {
+            "ASC"
+        }
+    }
+}
+
+/// The `ORDER BY` of a search with no `_sort`, first page and cursor pages
+/// alike. The `id` tiebreak follows `last_updated` so that
+/// `idx_resources_reindex` serves it with no temp B-tree (#2603).
+pub const DEFAULT_ORDER_BY: &str = "ORDER BY last_updated DESC, id DESC";
 
 /// Whether a sort directive's expression can be NULL: true for a parameter
 /// sorted on its indexed value, which a resource may not have. `_id`,
@@ -1697,8 +1730,10 @@ impl QueryBuilder {
     /// Builds an ORDER BY clause.
     ///
     /// Supports multiple sort directives (e.g., `_sort=name,-birthdate`).
-    /// Each directive is processed in order, with a tie-breaker (`id ASC`) added
-    /// at the end for stable pagination.
+    /// Each directive is processed in order, with an `id` tie-breaker added
+    /// at the end for stable pagination: `id ASC`, except after a lone
+    /// `_lastUpdated` key, where it takes that key's direction like the
+    /// keyset does (see [`KeysetKey::id_follows_direction`], #2603).
     ///
     /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
     /// sortable parameter sorts on its indexed value (see `sort_expression`).
@@ -1706,7 +1741,7 @@ impl QueryBuilder {
     /// one, ascending or descending (`NULLS LAST`, #1606).
     pub fn build_order_by(&self, query: &SearchQuery) -> String {
         if query.sort.is_empty() {
-            return "ORDER BY last_updated DESC, id ASC".to_string();
+            return DEFAULT_ORDER_BY.to_string();
         }
 
         let mut clauses: Vec<String> = query
@@ -1729,7 +1764,11 @@ impl QueryBuilder {
         // Add tie-breaker for stable pagination if not already sorting by id
         let sorts_by_id = query.sort.iter().any(|s| s.parameter == "_id");
         if !sorts_by_id {
-            clauses.push("id ASC".to_string());
+            // The first page must emit the order its cursor pages continue.
+            let tiebreak = self
+                .primary_keyset_key(query)
+                .map_or("ASC", |k| k.id_tiebreak_direction());
+            clauses.push(format!("id {tiebreak}"));
         }
 
         format!("ORDER BY {}", clauses.join(", "))
@@ -1740,12 +1779,7 @@ impl QueryBuilder {
     /// rather than paged with a possibly-inconsistent keyset).
     pub fn primary_keyset_key(&self, query: &SearchQuery) -> Option<KeysetKey> {
         match query.sort.len() {
-            0 => Some(KeysetKey {
-                expr: "last_updated".to_string(),
-                direction: crate::types::SortDirection::Descending,
-                kind: SortValueKind::Timestamp,
-                nullable: false,
-            }),
+            0 => Some(KeysetKey::default_last_updated()),
             1 => {
                 let directive = &query.sort[0];
                 Some(KeysetKey {
@@ -1753,6 +1787,7 @@ impl QueryBuilder {
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
                     nullable: sort_is_nullable(directive),
+                    id_follows_direction: directive.parameter == "_lastUpdated",
                 })
             }
             _ => None,
@@ -2493,8 +2528,10 @@ mod tests {
         let query = SearchQuery::new("Patient");
 
         let order_by = builder.build_order_by(&query);
-        assert!(order_by.contains("last_updated DESC"));
-        assert!(order_by.contains("id ASC")); // Tie-breaker for stable pagination
+        // The id tiebreak follows `last_updated` (#2603), so
+        // `idx_resources_reindex` serves the order backward.
+        assert_eq!(order_by, "ORDER BY last_updated DESC, id DESC");
+        assert_eq!(order_by, DEFAULT_ORDER_BY);
     }
 
     #[test]
@@ -2535,6 +2572,26 @@ mod tests {
         let order_by = builder.build_order_by(&query);
         // Should have id ASC as tie-breaker since _id is not in sort list
         assert_eq!(order_by, "ORDER BY last_updated ASC, id ASC");
+
+        // `-_lastUpdated`: the tiebreak takes the key's direction (#2603).
+        query.sort[0].direction = SortDirection::Descending;
+        let order_by = builder.build_order_by(&query);
+        assert_eq!(order_by, "ORDER BY last_updated DESC, id DESC");
+
+        // Any other single key keeps `id ASC`.
+        query.sort[0] = SortDirective {
+            parameter: "birthdate".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Date),
+        };
+        let order_by = builder.build_order_by(&query);
+        assert!(order_by.ends_with(" DESC NULLS LAST, id ASC"), "{order_by}");
+        assert!(
+            !builder
+                .primary_keyset_key(&query)
+                .unwrap()
+                .id_follows_direction
+        );
     }
 
     /// #1606: a parameter sort puts a missing value last in both directions;

@@ -157,6 +157,7 @@ fn engine_with_thresholds(
             handshake_retry_max_delay: Duration::from_millis(1),
             error_threshold,
             off_threshold,
+            allow_private_endpoints: true, // receivers are on loopback
             ..SubscriptionConfig::default()
         },
         "http://localhost:8080".to_string(),
@@ -526,6 +527,7 @@ async fn without_a_status_store_storage_is_untouched() {
         SubscriptionConfig {
             max_retries: 0,
             handshake_max_attempts: 1,
+            allow_private_endpoints: true, // receivers are on loopback
             ..SubscriptionConfig::default()
         },
         "http://localhost:8080".to_string(),
@@ -571,6 +573,7 @@ async fn persist_status_false_suppresses_write_back() {
             max_retries: 0,
             handshake_max_attempts: 1,
             persist_status: false,
+            allow_private_endpoints: true, // receivers are on loopback
             ..SubscriptionConfig::default()
         },
         "http://localhost:8080".to_string(),

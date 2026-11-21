@@ -478,17 +478,20 @@ pub fn validate_output(
 // ---------------------------------------------------------------------------
 
 /// Who a request is billed to. An authenticated principal is the strongest
-/// discriminator; without auth the peer address is all we have, and a
-/// deployment with neither shares one bucket per tenant — deliberately the
-/// most restrictive reading, since the operator's LLM credentials are what is
-/// being spent.
+/// discriminator, and its tenant is the validated claim, so the two make the
+/// key. Without auth the peer address is all we have: the tenant is then
+/// whatever the caller wrote in `X-Tenant-ID` or the URL prefix, a fresh one
+/// per request if it likes, so it is left out of the key rather than handing
+/// out a fresh budget per invented tenant. A deployment with neither auth nor
+/// a recorded peer shares one bucket — deliberately the most restrictive
+/// reading, since the operator's LLM credentials are what is being spent.
 fn rate_limit_key(tenant: &str, user: &UserKey, peer: Option<IpAddr>) -> String {
     if !user.is_local() {
         return format!("{tenant}|{}", user.as_str());
     }
     match peer {
-        Some(ip) => format!("{tenant}|ip:{ip}"),
-        None => format!("{tenant}|{}", user.as_str()),
+        Some(ip) => format!("ip:{ip}"),
+        None => user.as_str().to_string(),
     }
 }
 
@@ -705,13 +708,24 @@ mod tests {
         );
         assert_eq!(
             rate_limit_key("acme", &anonymous, Some(addr)),
-            "acme|ip:203.0.113.7",
+            "ip:203.0.113.7",
             "without auth, callers are separated by peer address"
         );
-        // Two tenants never share a bucket.
+        // Two authenticated tenants never share a bucket: the tenant is the
+        // validated claim.
         assert_ne!(
+            rate_limit_key("acme", &authenticated, Some(addr)),
+            rate_limit_key("mercy", &authenticated, Some(addr))
+        );
+        // An anonymous caller's tenant is its own choice, so it does not open
+        // a new bucket: one peer, one budget, whatever header it sends.
+        assert_eq!(
             rate_limit_key("acme", &anonymous, Some(addr)),
             rate_limit_key("mercy", &anonymous, Some(addr))
+        );
+        assert_eq!(
+            rate_limit_key("acme", &anonymous, None),
+            rate_limit_key("mercy", &anonymous, None)
         );
     }
 

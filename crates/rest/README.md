@@ -308,7 +308,7 @@ The server is configured via environment variables:
 | `HFS_DATABASE_URL` | - | Database connection string |
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
-| `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+| `HFS_AUTH_TENANT_CLAIM` | tenant_id | JWT claim carrying the tenant id (read by `helios-auth`) |
 
 ### Batch entry concurrency
 
@@ -718,12 +718,11 @@ The server supports multiple methods for tenant identification, configurable via
 
 ### Resolution Priority
 
-When multiple sources provide tenant information, they are resolved in this priority order:
+When authentication is enabled, the tenant comes from the JWT claim named by `HFS_AUTH_TENANT_CLAIM` and overrides the URL path and header (see [crates/auth/README.md](../auth/README.md#tenant-resolution)). Without authentication, sources resolve in this priority order:
 
 1. **URL path prefix** (highest) - `/{tenant}/...`
 2. **X-Tenant-ID header**
-3. **JWT token claim** (future)
-4. **Default tenant** (lowest) - from configuration
+3. **Default tenant** (lowest) - from configuration
 
 ### Strict Validation
 
