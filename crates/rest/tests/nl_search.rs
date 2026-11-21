@@ -7,13 +7,32 @@
 //! which is where the model's answer is turned into (or refused as) a query;
 //! these drive the HTTP surface around it.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use axum::http::StatusCode;
+use axum::extract::ConnectInfo;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum_test::TestServer;
 use helios_persistence::backends::sqlite::SqliteBackend;
 use helios_rest::ServerConfig;
 use serde_json::{Value, json};
+
+/// Each server in this file answers from its own peer address, as `axum::serve`
+/// with connect info would record it: the limiter is process-global and keys
+/// an anonymous caller on the peer, so without this the tests would share
+/// one budget.
+fn with_own_peer(routes: axum::Router) -> axum::Router {
+    static NEXT_PEER: AtomicU8 = AtomicU8::new(1);
+    let host = NEXT_PEER.fetch_add(1, Ordering::Relaxed);
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, host)), 4321);
+    routes.layer(axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+            request.extensions_mut().insert(ConnectInfo(peer));
+            next.run(request).await
+        },
+    ))
+}
 
 /// A server whose natural-language search is configured as given.
 fn server_with(enabled: bool, api_key: Option<&str>) -> TestServer {
@@ -27,8 +46,10 @@ fn server_with(enabled: bool, api_key: Option<&str>) -> TestServer {
     };
 
     let state = helios_rest::AppState::new(Arc::new(backend), config);
-    TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
-        .expect("create test server")
+    TestServer::new(with_own_peer(
+        helios_rest::routing::fhir_routes::create_routes(state),
+    ))
+    .expect("create test server")
 }
 
 /// The OperationOutcome's first issue code — errors are FHIR, not bare text.
@@ -124,8 +145,8 @@ async fn injection_attempts_are_treated_as_ordinary_input_not_instructions() {
     assert_eq!(response.json::<Value>()["resourceType"], "OperationOutcome");
 }
 
-/// The rate limiter is keyed per tenant, so a second tenant is not throttled
-/// by the first — and the ceiling returns a FHIR-shaped 429.
+/// The ceiling returns a FHIR-shaped 429 — and an anonymous caller is billed
+/// per peer address, so naming another tenant does not open a new budget.
 #[tokio::test]
 async fn exceeding_the_rate_limit_returns_429_and_an_operation_outcome() {
     let backend = SqliteBackend::in_memory().expect("backend");
@@ -135,14 +156,13 @@ async fn exceeding_the_rate_limit_returns_429_and_an_operation_outcome() {
         nl_search_api_key: Some("sk-test".to_string()),
         nl_search_rate_limit: 2,
         nl_search_rate_window_secs: 60,
-        // A distinct tenant per test run keeps the process-global limiter's
-        // buckets from colliding with the other tests in this file.
-        default_tenant: "rate-limit-test".to_string(),
         ..ServerConfig::for_testing()
     };
     let state = helios_rest::AppState::new(Arc::new(backend), config);
-    let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
-        .expect("test server");
+    let server = TestServer::new(with_own_peer(
+        helios_rest::routing::fhir_routes::create_routes(state),
+    ))
+    .expect("test server");
 
     let mut throttled = None;
     for attempt in 0..4 {
@@ -159,4 +179,19 @@ async fn exceeding_the_rate_limit_returns_429_and_an_operation_outcome() {
     let (attempt, response) = throttled.expect("the limiter must cut in within the window");
     assert_eq!(attempt, 2, "two requests allowed, the third throttled");
     assert_eq!(issue_code(&response.json::<Value>()), "throttled");
+
+    let other_tenant = server
+        .post("/$nl-search")
+        .add_header(
+            HeaderName::from_static("x-tenant-id"),
+            HeaderValue::from_static("invented-on-the-spot"),
+        )
+        .json(&json!({"text": "female patients over 65"}))
+        .await;
+    assert_eq!(
+        other_tenant.status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a tenant the anonymous caller names is not a fresh budget: {}",
+        other_tenant.text()
+    );
 }

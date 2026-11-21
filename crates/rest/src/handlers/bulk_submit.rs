@@ -250,7 +250,14 @@ static POLL_LIMITER: RateLimiter = RateLimiter::new();
 /// and the principal (else the peer address) separates clients sharing it. A
 /// deployment with neither auth nor a recorded peer shares one bucket per
 /// token — the restrictive reading, since polling is what we are limiting.
+///
+/// The token enters the key as its SHA-256, not verbatim: the limiter runs
+/// before the token is resolved, so the segment is whatever the caller put in
+/// the path, up to the URI limit, and it must not size the bucket.
 fn poll_rate_limit_key(token: &str, principal: Option<&Principal>, peer: Option<IpAddr>) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token));
     match principal {
         Some(p) => format!("{token}|sub:{}", p.subject),
         None => match peer {
@@ -1970,6 +1977,24 @@ mod tests {
                 "{scopes}"
             );
         }
+    }
+
+    /// The poll limiter keys on a digest of the token: the caller's path
+    /// segment, however long, does not size the bucket, and distinct tokens
+    /// still get distinct buckets.
+    #[test]
+    fn poll_rate_limit_key_carries_a_digest_of_the_token_not_the_token() {
+        let peer: Option<IpAddr> = Some("203.0.113.7".parse().unwrap());
+        let short = poll_rate_limit_key("11111111-1111-4111-8111-111111111111", None, peer);
+        let long = poll_rate_limit_key(&"x".repeat(60_000), None, peer);
+        assert_eq!(short.len(), long.len(), "{short} vs {long}");
+        assert!(short.len() < 100, "{short}");
+        assert!(!long.contains("xxxx"));
+        assert_ne!(short, long);
+        assert_ne!(
+            poll_rate_limit_key("11111111-1111-4111-8111-111111111111", None, peer),
+            poll_rate_limit_key("22222222-2222-4222-8222-222222222222", None, peer)
+        );
     }
 
     #[test]

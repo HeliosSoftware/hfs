@@ -4,6 +4,7 @@ use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchQuery, StoredResource};
 
 use super::cursor::EverythingCursor;
+use super::grants::TypeGrants;
 use super::params::EverythingParams;
 use super::scope::{build_segment_query, build_segments, collect_supporting_refs};
 use crate::error::{RestError, RestResult};
@@ -18,6 +19,9 @@ pub(crate) struct WalkOutput {
     /// found on this page's matches exceeded the resolution cap, so some
     /// were not resolved into `included`.
     pub includes_truncated: bool,
+    /// Supporting resource types referenced by this page's matches that the
+    /// token's scopes do not let the walk read, so they were not resolved.
+    pub omitted_supporting_types: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -126,20 +130,32 @@ where
 }
 
 /// Resolves the supporting resources referenced by `matches`, stopping after
-/// `limit` distinct references. Returns the resolved resources and whether
+/// `limit` distinct references. Returns the resolved resources, whether
 /// truncation occurred (i.e. there were more than `limit` distinct
-/// references).
+/// references the token may read) and the referenced types the token may
+/// not read, which are left unresolved.
 async fn resolve_supporting<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     version: FhirVersion,
     matches: &[StoredResource],
     limit: usize,
-) -> RestResult<(Vec<StoredResource>, bool)>
+    grants: &TypeGrants,
+) -> RestResult<(Vec<StoredResource>, bool, Vec<String>)>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let refs = collect_supporting_refs(version, matches);
+    let mut omitted: Vec<String> = Vec::new();
+    let refs: Vec<(String, String)> = collect_supporting_refs(version, matches)
+        .into_iter()
+        .filter(|(rt, _)| {
+            let permitted = grants.permits_supporting(rt);
+            if !permitted && !omitted.contains(rt) {
+                omitted.push(rt.clone());
+            }
+            permitted
+        })
+        .collect();
     let truncated = refs.len() > limit;
 
     // Group the capped refs by type so each type costs one batched read
@@ -161,9 +177,10 @@ where
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         included.extend(state.storage().read_batch(tenant, &rt, &id_refs).await?);
     }
-    Ok((included, truncated))
+    Ok((included, truncated, omitted))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn walk_patient<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
@@ -172,6 +189,7 @@ pub(crate) async fn walk_patient<S>(
     params: &EverythingParams,
     resume: Option<EverythingCursor>,
     limits: WalkLimits,
+    grants: &TypeGrants,
 ) -> RestResult<WalkOutput>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
@@ -207,17 +225,26 @@ where
         Step::Done => None,
     };
     let ceiling_hit = limits.page.is_none() && next.is_some();
-    let (included, includes_truncated) =
-        resolve_supporting(state, tenant, version, &matches, limits.unpaged_ceiling).await?;
+    let (included, includes_truncated, omitted_supporting_types) = resolve_supporting(
+        state,
+        tenant,
+        version,
+        &matches,
+        limits.unpaged_ceiling,
+        grants,
+    )
+    .await?;
     Ok(WalkOutput {
         matches,
         included,
         next,
         ceiling_hit,
         includes_truncated,
+        omitted_supporting_types,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn walk_all_patients<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
@@ -225,6 +252,7 @@ pub(crate) async fn walk_all_patients<S>(
     params: &EverythingParams,
     resume: Option<EverythingCursor>,
     limits: WalkLimits,
+    grants: &TypeGrants,
 ) -> RestResult<WalkOutput>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
@@ -329,14 +357,22 @@ where
         Some(c)
     };
     let ceiling_hit = limits.page.is_none() && next.is_some();
-    let (included, includes_truncated) =
-        resolve_supporting(state, tenant, version, &matches, limits.unpaged_ceiling).await?;
+    let (included, includes_truncated, omitted_supporting_types) = resolve_supporting(
+        state,
+        tenant,
+        version,
+        &matches,
+        limits.unpaged_ceiling,
+        grants,
+    )
+    .await?;
     Ok(WalkOutput {
         matches,
         included,
         next,
         ceiling_hit,
         includes_truncated,
+        omitted_supporting_types,
     })
 }
 
@@ -417,30 +453,57 @@ mod tests {
 
         // Cap below the number of distinct refs: resolution stops early and
         // truncation is reported.
-        let (included, truncated) = resolve_supporting(
+        let (included, truncated, omitted) = resolve_supporting(
             &state,
             &t,
             FhirVersion::R4,
             std::slice::from_ref(&patient),
             2,
+            &TypeGrants::all(),
         )
         .await
         .unwrap();
         assert_eq!(included.len(), 2, "{included:?}");
         assert!(truncated);
+        assert!(omitted.is_empty());
 
         // Cap at (or above) the number of distinct refs: nothing is
         // truncated.
-        let (included, truncated) = resolve_supporting(
+        let (included, truncated, omitted) = resolve_supporting(
             &state,
             &t,
             FhirVersion::R4,
             std::slice::from_ref(&patient),
             3,
+            &TypeGrants::all(),
         )
         .await
         .unwrap();
         assert_eq!(included.len(), 3, "{included:?}");
         assert!(!truncated);
+        assert!(omitted.is_empty());
+
+        // A token that may not read Practitioner gets none of them, the type
+        // is reported, and the cap counts only what it may read.
+        let principal = helios_auth::Principal {
+            subject: "s".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            scopes: helios_auth::ScopeSet::parse("user/Patient.rs"),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        };
+        let (included, truncated, omitted) = resolve_supporting(
+            &state,
+            &t,
+            FhirVersion::R4,
+            std::slice::from_ref(&patient),
+            2,
+            &TypeGrants::for_principal(Some(&principal)),
+        )
+        .await
+        .unwrap();
+        assert!(included.is_empty(), "{included:?}");
+        assert!(!truncated);
+        assert_eq!(omitted, vec!["Practitioner".to_string()]);
     }
 }

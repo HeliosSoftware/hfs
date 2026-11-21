@@ -183,6 +183,12 @@ fn index_build_mode() -> IndexBuildMode {
 }
 
 async fn create_test_server(_name: &str) -> Option<TestServer> {
+    create_test_server_with(MongoBackendConfig::default()).await
+}
+
+/// `config` supplies every setting but the connection, database, data
+/// directory and index build mode, which are the suite's.
+async fn create_test_server_with(config: MongoBackendConfig) -> Option<TestServer> {
     let mongo = shared_mongo().await?;
     let backend = MongoBackend::new(MongoBackendConfig {
         connection_string: mongo.connection_string.clone(),
@@ -190,7 +196,7 @@ async fn create_test_server(_name: &str) -> Option<TestServer> {
         database_name: format!("pscope_{}", uuid::Uuid::new_v4().simple()),
         data_dir: Some(patient_scope::data_dir()),
         index_build: index_build_mode(),
-        ..Default::default()
+        ..config
     })
     .expect("failed to create MongoBackend");
     backend
@@ -223,6 +229,29 @@ async fn create_test_server(_name: &str) -> Option<TestServer> {
 }
 
 patient_scope_suite!(create_test_server);
+
+/// MongoDB resolves includes inline and caps them per directive (#1061): with
+/// a cap of one, a Group's two members are truncated, and the warning must survive the
+/// compartment filter (it used to be dropped as a non-member under a
+/// `patient/` scope) and the compartment search (which never drained it).
+#[tokio::test]
+async fn truncated_includes_are_reported_under_a_patient_scope() {
+    let _server_log =
+        patient_scope::ServerLog::capture("truncated_includes_are_reported_under_a_patient_scope");
+    let Some(server) = create_test_server_with(MongoBackendConfig {
+        max_included_resources: 1,
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!(
+            "Skipping truncated_includes_are_reported_under_a_patient_scope (requires Docker)"
+        );
+        return;
+    };
+    patient_scope::seed(&server).await;
+    patient_scope::truncated_includes_are_reported_under_a_patient_scope(&server).await;
+}
 
 // --- Reproduction harness for #2045 -------------------------------------------
 

@@ -571,10 +571,7 @@ impl SqliteBackend {
         &self,
     ) -> StorageResult<PooledConnection<SqliteConnectionManager>> {
         self.pool.get().map_err(|e| {
-            crate::error::StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "sqlite".to_string(),
-                message: e.to_string(),
-            })
+            crate::error::StorageError::Backend(crate::error::connection_failed("sqlite", &e))
         })
     }
 
@@ -651,10 +648,7 @@ impl SqliteBackend {
             // helper changes where the work runs, never what a failure looks
             // like to callers.
             let conn = pool.get().map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::ConnectionFailed {
-                    backend_name: "sqlite".to_string(),
-                    message: e.to_string(),
-                })
+                crate::error::StorageError::Backend(crate::error::connection_failed("sqlite", &e))
             });
             tracing::debug!(
                 acquire_ms = started.elapsed().as_millis() as u64,
@@ -807,10 +801,7 @@ impl Backend for SqliteBackend {
         let conn = self
             .pool
             .get()
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend_name: "sqlite".to_string(),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| crate::error::connection_failed("sqlite", &e))?;
         Ok(SqliteConnection(conn))
     }
 

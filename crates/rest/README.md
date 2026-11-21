@@ -273,6 +273,17 @@ refused rather than widened. A `user/` or `system/` grant is not confined, and
 for it an unusable `patient` value still falls back to walking every patient.
 See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
 
+Within that boundary the result is narrowed per resource type, as SMART grants
+are: the walk searches only the compartment member types the token may search
+and resolves only the supporting resource types it may read. A `user/Patient.rs
+user/Observation.rs` token gets the patient, its observations and nothing else,
+and the bundle carries an `information` OperationOutcome entry naming the
+omitted types. An explicit `_type` naming a member type the token may not
+search is `403`. Wildcard grants (`patient/*.rs`, `user/*.rs`, `system/*.rs`)
+are not narrowed. A `patient/` grant covers only the launch patient's
+compartment, so a token that pairs `user/Patient.rs` with `patient/` grants
+gets another patient's `$everything` without the types those grants cover.
+
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
 

@@ -47,6 +47,8 @@ const BAD_CONTEXT: &str = "bad-context-token";
 /// `user/Observation.rs patient/*.rs` with `patient = p1`: Observation is
 /// unrestricted, everything else is confined.
 const MIXED: &str = "mixed-token";
+/// `user/Patient.rs` only: no scope for any other type.
+const PATIENT_ONLY: &str = "patient-only-token";
 
 struct StubProvider;
 
@@ -64,6 +66,7 @@ impl AuthProvider for StubProvider {
             NO_CONTEXT => ("patient/*.rs", None),
             BAD_CONTEXT => ("patient/*.rs", Some("https://ehr.example/fhir/Patient/p1")),
             MIXED => ("user/Observation.rs patient/*.rs", Some("p1")),
+            PATIENT_ONLY => ("user/Patient.rs", None),
             _ => return Err(AuthError::InvalidSignature),
         };
         Ok(Principal {
@@ -545,6 +548,195 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
     )
     .await;
     assert_eq!(included_ids(&r.json()), ["p1", "pr1"]);
+}
+
+pub async fn compartment_search_includes_outside_the_compartment_are_dropped(server: &TestServer) {
+    // The matches of a compartment search are confined by the path, but an
+    // include follows references wherever they lead: o3's performer is a
+    // Practitioner, which is in no patient's compartment (#2618).
+    let path = "/Patient/p1/Observation?_id=o3&_include=Observation:performer&_include=Observation:subject";
+    let r = get(server, P1_READ, path).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["o3"]);
+    assert_eq!(included_ids(&bundle), ["p1"], "{bundle}");
+
+    // Unconfined, the same search includes the Practitioner, on every backend:
+    // the compartment search resolves includes as a type-level search does.
+    let r = get(server, SYSTEM, path).await;
+    assert_eq!(included_ids(&r.json()), ["p1", "pr1"], "{}", r.text());
+
+    // A cohort the launch patient belongs to holds other patients.
+    let r = put(
+        server,
+        SYSTEM,
+        "/Group/g1",
+        json!({"resourceType": "Group", "id": "g1", "type": "person", "actual": true,
+            "member": [{"entity": {"reference": "Patient/p1"}},
+                       {"entity": {"reference": "Patient/p2"}}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed g1: {}", r.text());
+    let path = "/Patient/p1/Group?_include=Group:member";
+    let r = get(server, P1_READ, path).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["g1"]);
+    assert_eq!(included_ids(&bundle), ["p1"], "{bundle}");
+    let r = get(server, SYSTEM, path).await;
+    assert_eq!(included_ids(&r.json()), ["p1", "p2"], "{}", r.text());
+}
+
+pub async fn compartment_search_does_not_return_linked_patients(server: &TestServer) {
+    // The Patient compartment lists Patient through `link`: p3 is another
+    // patient whose `link` names p1, so the path's compartment filter alone
+    // would match p3.
+    let r = put(
+        server,
+        SYSTEM,
+        "/Patient/p3",
+        json!({"resourceType": "Patient", "id": "p3", "name": [{"family": "Three"}],
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed p3: {}", r.text());
+
+    let r = get(server, P1_READ, "/Patient/p1/Patient").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+    let r = get(server, P1_READ, "/Patient/p1/Patient?_id=p3").await;
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+
+    let r = get(server, P1_READ, "/Patient/p1/*").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_eq!(ids(&r.json()), ["o1", "o3"], "{}", r.text());
+
+    // Unconfined callers keep the compartment definition's answer.
+    let r = get(server, SYSTEM, "/Patient/p1/Patient").await;
+    assert_eq!(ids(&r.json()), ["p3"], "{}", r.text());
+    let r = get(server, SYSTEM, "/Patient/p1/*").await;
+    assert_eq!(ids(&r.json()), ["o1", "o3", "p3"], "{}", r.text());
+}
+
+/// For a backend whose include resolution is capped at one resource per
+/// directive (MongoDB's `max_included_resources`, #1061): the truncation
+/// warning reaches a `patient/` client, from a type-level and from a
+/// compartment search, rather than being dropped with the includes outside the
+/// compartment. g1's `member` include reaches two patients, so it truncates.
+pub async fn truncated_includes_are_reported_under_a_patient_scope(server: &TestServer) {
+    let r = put(
+        server,
+        SYSTEM,
+        "/Group/g1",
+        json!({"resourceType": "Group", "id": "g1", "type": "person", "actual": true,
+            "member": [{"entity": {"reference": "Patient/p1"}},
+                       {"entity": {"reference": "Patient/p2"}}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed g1: {}", r.text());
+    for path in [
+        "/Group?_include=Group:member",
+        "/Patient/p1/Group?_include=Group:member",
+    ] {
+        for token in [P1_READ, SYSTEM] {
+            let r = get(server, token, path).await;
+            assert_eq!(r.status_code(), StatusCode::OK, "{path}: {}", r.text());
+            let bundle: Value = r.json();
+            let outcomes: Vec<&Value> = bundle["entry"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["search"]["mode"] == "outcome")
+                .collect();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|e| e["resource"]["issue"][0]["code"] == "incomplete"),
+                "{token} {path}: no truncation warning\n{bundle}"
+            );
+            // The marker is reported as an outcome, never as an include.
+            assert!(
+                included_ids(&bundle).len() <= 1,
+                "{token} {path}: more includes than the cap\n{bundle}"
+            );
+            assert!(
+                bundle["entry"].as_array().into_iter().flatten().all(|e| {
+                    e["search"]["mode"] != "include"
+                        || e["resource"]["resourceType"] != "OperationOutcome"
+                }),
+                "{token} {path}: truncation marker returned as an include\n{bundle}"
+            );
+        }
+    }
+}
+
+pub async fn chained_and_has_hops_are_judged_like_direct_searches(server: &TestServer) {
+    // #2501: p2's Observation names p1 only as its focus. R4's Patient
+    // compartment lists Observation through subject and performer, so it is
+    // not p1's, and a direct confined search does not find it.
+    let r = put(
+        server,
+        SYSTEM,
+        "/Observation/o-leak",
+        json!({"resourceType": "Observation", "id": "o-leak", "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "LEAK-1"}]},
+            "subject": {"reference": "Patient/p2"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    )
+    .await;
+    assert!(r.status_code().is_success(), "seed o-leak: {}", r.text());
+    let r = get(server, P1_READ, "/Observation?code=LEAK-1").await;
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+
+    // The `_has` hop is confined like that direct search: the app no longer
+    // learns, one code per request, what another patient's Observations say.
+    let has = "/Patient?_has:Observation:focus:code=LEAK-1";
+    let r = get(server, P1_READ, has).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert!(ids(&r.json()).is_empty(), "{}", r.text());
+    // Unconfined callers keep the answer.
+    let r = get(server, SYSTEM, has).await;
+    assert_eq!(ids(&r.json()), ["p1"], "{}", r.text());
+    // A token whose Observation grant is `user/` searches Observations
+    // unconfined, so its hop is too; the Patient base stays pinned to p1.
+    let r = get(server, MIXED, has).await;
+    assert_eq!(ids(&r.json()), ["p1"], "{}", r.text());
+
+    // A hop through a type outside the compartment is refused, as a direct
+    // search on it is.
+    for path in [
+        "/Observation?performer:Practitioner._id=pr1",
+        "/Patient/p1/Observation?performer:Practitioner._id=pr1",
+    ] {
+        assert_forbidden(&get(server, P1_READ, path).await, path);
+        let r = get(server, SYSTEM, path).await;
+        assert_eq!(ids(&r.json()), ["o3"], "{path}: {}", r.text());
+    }
+
+    // A hop through a member type still works, confined: `subject` is a
+    // polymorphic reference, and its Patient candidate is pinned to p1.
+    let r = get(server, P1_READ, "/Observation?subject.name=One").await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    assert_eq!(ids(&r.json()), ["o1", "o3"], "{}", r.text());
+
+    // A token with no Observation scope cannot ask about Observations
+    // through a `_has` either.
+    let r = get(
+        server,
+        PATIENT_ONLY,
+        "/Patient?_has:Observation:subject:code=8867-4",
+    )
+    .await;
+    assert_forbidden(&r, "user/Patient.rs _has:Observation");
+    let r = get(server, PATIENT_ONLY, "/Patient?_id=p1").await;
+    assert_eq!(ids(&r.json()), ["p1"], "{}", r.text());
+
+    // A search entry of a batch is judged the same way.
+    let r = post_bundle(server, P1_READ, &get_entries("batch", &[&has[1..]])).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    let searchset = &bundle["entry"][0]["resource"];
+    assert!(ids(searchset).is_empty(), "{bundle}");
 }
 
 pub async fn types_outside_the_patient_compartment_are_not_reachable(server: &TestServer) {
@@ -1167,7 +1359,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, compartment_search_includes_outside_the_compartment_are_dropped, compartment_search_does_not_return_linked_patients, chained_and_has_hops_are_judged_like_direct_searches, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(

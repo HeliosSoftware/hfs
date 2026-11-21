@@ -11,13 +11,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
     routing::{get, post},
 };
 use helios_persistence::core::{FileTokenError, FileTokenProvider};
-use helios_rest::bulk_submit_oauth::{JwtClientCredentialsTokenProvider, TrustedProviders};
+use helios_rest::bulk_submit_oauth::{
+    ClientTimeouts, JwtClientCredentialsTokenProvider, TrustedProviders,
+};
 use serde_json::json;
 
 // Test-only PKCS#8 P-384 private key (ES384). Not used anywhere else.
@@ -355,6 +358,92 @@ async fn a_metadata_document_cannot_redirect_a_token_to_its_own_host() {
         }
     );
     assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
+}
+
+// ---- bounds on what the provider sends back -------------------------------
+
+#[tokio::test]
+async fn a_huge_expires_in_is_bounded_not_a_panic() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let disc_base = base.clone();
+    let app = Router::new()
+        .route(
+            "/.well-known/smart-configuration",
+            get(move || {
+                let disc_base = disc_base.clone();
+                async move { Json(json!({ "token_endpoint": format!("{disc_base}/token") })) }
+            }),
+        )
+        .route(
+            "/token",
+            post(|| async { Json(json!({ "access_token": "tok-max", "expires_in": u64::MAX })) }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
+        .expect("parse ES384 key");
+    let discovery = vec![format!("{base}/.well-known/smart-configuration")];
+    let destination = format!("{base}/file.ndjson");
+    assert_eq!(
+        provider
+            .token(&discovery, "system/*.rs", &destination)
+            .await
+            .ok()
+            .as_deref(),
+        Some("tok-max")
+    );
+    // And it is cached like any other token.
+    assert_eq!(
+        provider
+            .token(&discovery, "system/*.rs", &destination)
+            .await
+            .ok()
+            .as_deref(),
+        Some("tok-max")
+    );
+}
+
+#[tokio::test]
+async fn a_provider_that_never_answers_is_given_up_on() {
+    // Accepts connections and never writes a byte.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+
+    let provider = JwtClientCredentialsTokenProvider::new_with_timeouts(
+        "client-1",
+        TEST_ES384_PKCS8,
+        "ES384",
+        ClientTimeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(1),
+            total: Duration::from_secs(1),
+        },
+    )
+    .expect("parse ES384 key");
+    let discovery = vec![format!("{base}/.well-known/smart-configuration")];
+    let started = std::time::Instant::now();
+    let token = tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.token(&discovery, "system/*.rs", &format!("{base}/file.ndjson")),
+    )
+    .await
+    .expect("the request is bounded by the client timeouts, not by this test");
+    assert!(token.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "gave up after {:?}",
+        started.elapsed()
+    );
 }
 
 /// With a list configured, a listed origin cannot hand the metadata GET or
