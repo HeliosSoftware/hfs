@@ -133,6 +133,15 @@ impl FhirNumberValue {
     pub fn approx_range(&self) -> (f64, f64) {
         super::range::approx_range(self.value, &self.text)
     }
+
+    /// The prefix rules against a stored closed interval (#2602) — see
+    /// [`super::range::quantity_interval_predicate`].
+    pub fn interval_predicate(
+        &self,
+        prefix: crate::types::SearchPrefix,
+    ) -> super::range::QuantityIntervalPredicate {
+        super::range::quantity_interval_predicate(prefix, self.value, &self.text)
+    }
 }
 
 /// A parsed quantity search value.

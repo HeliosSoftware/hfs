@@ -53,7 +53,8 @@ fn composite_quantity(
     value: f64,
 ) -> Document {
     doc! { "tenant_id": tenant, "resource_type": kind, "resource_id": id,
-    "param_name": name, "value_quantity_value": value, "value_quantity_unit": "cm",
+    "param_name": name, "value_quantity_value": value, "value_quantity_high": value,
+    "value_quantity_unit": "cm",
     "value_quantity_system": UCUM, "composite_group": group, "composite_slot": 1_i32 }
 }
 

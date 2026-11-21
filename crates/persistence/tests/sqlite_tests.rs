@@ -21,6 +21,10 @@ mod updated_since;
 #[path = "reindex/clear_interrupted.rs"]
 mod clear_interrupted;
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -5560,6 +5564,63 @@ mod cross_tenant_search_isolation {
         );
     }
 
+    /// `_filter` classifies a parameter by its registered type, so a standard
+    /// Quantity parameter outside the old hard-coded name list
+    /// (`component-value-quantity`, `combo-value-quantity`) takes the
+    /// quantity path against the stored interval columns.
+    #[tokio::test]
+    async fn filter_search_resolves_registered_quantity_parameters() {
+        let backend = create_backend();
+        let tenant = create_tenant("filter-registry-qty");
+        let ucum = "http://unitsofmeasure.org";
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "obs-qty", "status": "final",
+                    "code": {"text": "panel"},
+                    "component": [{
+                        "code": {"text": "c"},
+                        "valueQuantity": {"value": 7, "unit": "mg", "system": ucum, "code": "mg"}
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let filter = |expr: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "_filter".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(expr)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for param in ["component-value-quantity", "combo-value-quantity"] {
+            assert_eq!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} gt 5"))).await,
+                vec!["obs-qty".to_string()],
+                "{param} gt 5 must match 7"
+            );
+            assert!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} gt 9")))
+                    .await
+                    .is_empty(),
+                "{param} gt 9 must not match 7"
+            );
+            assert!(
+                search_ids(&backend, &tenant, &filter(&format!("{param} lt 5")))
+                    .await
+                    .is_empty(),
+                "{param} lt 5 must not match 7"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reference_identifier_search_does_not_leak_across_tenants() {
         let backend = create_backend();
@@ -5889,4 +5950,67 @@ async fn sqlite_reindex_id_range_with_a_write_during_the_run() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     id_range::assert_ranged_run_with_a_write_during_it(backend, registries).await;
+}
+
+/// #2602: a stored `Range` produced no quantity index row before, so it was
+/// never searchable. After the upgrade the existing point rows are backfilled
+/// (`high = value`) and unchanged, and `$reindex` makes the stored `Range`s
+/// searchable.
+#[tokio::test]
+async fn sqlite_quantity_range_becomes_searchable_after_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quantity-range-2602.db");
+    let config = SqliteBackendConfig {
+        data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(&path, config).unwrap();
+    backend.init_schema().unwrap();
+    let tenant = create_tenant("quantity-range-reindex");
+    quantity_range_suite::seed(&backend, &tenant).await;
+
+    // Pre-fix state: no row for any interval that is not a point.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let removed = conn
+        .execute(
+            "DELETE FROM search_index WHERE tenant_id = ?1 \
+             AND param_name IN ('onset-age', 'abatement-age', 'context-quantity') \
+             AND value_quantity_high IS NOT value_quantity_value",
+            rusqlite::params![tenant.tenant_id().as_str()],
+        )
+        .unwrap();
+    assert!(
+        removed >= 5,
+        "expected the Range rows to exist, removed {removed}"
+    );
+
+    let ne1800 = SearchQuery::new("Condition")
+        .with_parameter(SearchParameter {
+            name: "onset-age".to_string(),
+            param_type: SearchParamType::Quantity,
+            values: vec![SearchValue::parse("ne1800")],
+            ..Default::default()
+        })
+        .with_count(100);
+    let ids_of = |r: &helios_persistence::core::SearchResult| {
+        let mut ids: Vec<String> = r
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    // The Quantity/Age row is still there and still searchable.
+    assert_eq!(
+        ids_of(&backend.search(&tenant, &ne1800).await.unwrap()),
+        ["c-age"]
+    );
+
+    let backend = Arc::new(backend);
+    let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+    run_reindex_to_completion(&reindex, &tenant, ReindexRequest::all().clear_existing()).await;
+
+    quantity_range_suite::check_searches(backend.as_ref(), &tenant).await;
 }

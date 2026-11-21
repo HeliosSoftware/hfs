@@ -760,6 +760,23 @@ async fn mongodb_date_period_targets_are_ranges() {
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
 }
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
+/// #2602: a `Range` was not indexed for quantity parameters. It is one
+/// closed `[value_quantity_value, value_quantity_high]` interval now. Needs
+/// the full registry so `Condition.onset-age` and friends extract.
+#[tokio::test]
+async fn mongodb_quantity_range_targets_are_intervals() {
+    let Some(backend) = create_backend_with_full_registry("quantity_range").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range-2602").await;
+}
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
@@ -19679,12 +19696,16 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 5: `idx_search_reference_target_v2` is added (#2394).
 /// Generation 6: `idx_search_composite_tuple_qty` (token+quantity composites).
 /// Generation 7: `idx_search_date_end` (descending date sorts, #2588).
-const CURRENT_BACKGROUND_NAMES: [&str; 12] = [
+/// Generation 8: `idx_search_quantity_high` and `idx_search_quantity_range`
+/// (quantity `Range` intervals, #2602).
+const CURRENT_BACKGROUND_NAMES: [&str; 14] = [
     "idx_search_composite_tuple_qty",
     "idx_search_date_end",
     "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
+    "idx_search_quantity_high",
+    "idx_search_quantity_range",
     "idx_search_quantity_v2",
     "idx_search_reference_target_v2",
     "idx_search_reference_v2",
@@ -19823,7 +19844,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(7)
+        Ok(8)
     );
 }
 
@@ -19948,7 +19969,7 @@ async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_d
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(7)
+        Ok(8)
     );
 }
 
@@ -20036,7 +20057,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(7));
+    assert_eq!(si.get_i32("generation"), Ok(8));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -20442,6 +20463,235 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
         )
         .await;
     }
+}
+
+/// #2730: both value-led quantity indexes are partial on
+/// `value_quantity_value` existing, so a group that bounds only the high end
+/// (`gt`, `ge`, `eb`) carries a non-null guard on it; `eq` states both bounds
+/// on both ends. On a selective fixture, every unhinted quantity command a
+/// search sends must win with an index scan on a quantity index (either one),
+/// and for `eq` that scan bounds one quantity field on both sides. Only the
+/// winning plans are read, never the rejected ones.
+#[tokio::test]
+async fn mongodb_integration_quantity_search_keeps_quantity_index_access() {
+    use futures::stream::TryStreamExt;
+
+    let Some(backend) = create_backend_with_stable_probes("quantity_index_access").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-quantity-index-access");
+    for (id, value) in [("obs-q-0", 0.0), ("obs-q-500", 500.0), ("obs-q-999", 999.0)] {
+        backend
+            .seed_create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "valueQuantity": {
+                        "value": value, "unit": "kg",
+                        "system": "http://unitsofmeasure.org", "code": "kg"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    // 20,000 point rows over 1,000 distinct values, 20 per value, so each
+    // search below matches about 0.1% of the parameter's rows. The synthetic
+    // ids are not live resources: they drop out at the resource fetch.
+    let synthetic: Vec<Document> = (0..20_000_i32)
+        .map(|n| {
+            let value = f64::from(n % 1000);
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-q-{n}"),
+                "param_name": "value-quantity",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-value-quantity",
+                "value_quantity_value": value,
+                "value_quantity_high": value,
+                "value_quantity_unit": "kg",
+                "value_quantity_system": "http://unitsofmeasure.org",
+            }
+        })
+        .collect();
+    db.collection::<Document>("search_index")
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index quantity rows");
+    let build_info = db.run_command(doc! { "buildInfo": 1_i32 }).await.unwrap();
+    let version = build_info.get_str("version").unwrap_or("unknown");
+    eprintln!("quantity index access: MongoDB {version}");
+
+    for (value, expected, two_sided) in [
+        ("gt998", "obs-q-999", false),
+        ("ge999", "obs-q-999", false),
+        ("eb1", "obs-q-0", false),
+        ("eq500", "obs-q-500", true),
+    ] {
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".into(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        // Results first, so a server that refuses profiling still checks them.
+        let ids: Vec<String> = backend
+            .search(&tenant, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, vec![expected.to_string()], "value-quantity={value}");
+
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+            eprintln!("Skipping quantity winning-plan assertions: profiling not permitted");
+            return;
+        }
+        backend.search(&tenant, &q).await.unwrap();
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let ns = format!("{}.search_index", db.name());
+        let ops: Vec<Document> = db
+            .collection::<Document>("system.profile")
+            .find(doc! { "ns": &ns, "op": { "$in": ["query", "command"] } })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut checked = 0;
+        for op in &ops {
+            let command = op
+                .get_document("command")
+                .expect("profile must include command");
+            let explainable = ["find", "aggregate", "distinct"]
+                .into_iter()
+                .any(|name| command.contains_key(name));
+            if !explainable
+                || command.contains_key("hint")
+                || !command.to_string().contains("value_quantity_")
+            {
+                continue;
+            }
+            let explain = db
+                .run_command(doc! {
+                    "explain": command_for_explain(command), "verbosity": "queryPlanner",
+                })
+                .await
+                .expect("explain captured quantity command");
+            for plan in winning_plans(&explain) {
+                let mut scans = Vec::new();
+                plan_ixscans(plan, &mut scans);
+                scans.retain(|scan| {
+                    matches!(
+                        scan.get_str("indexName"),
+                        Ok("idx_search_quantity_v2" | "idx_search_quantity_high")
+                    )
+                });
+                assert!(
+                    !scans.is_empty(),
+                    "{value} (MongoDB {version}): winning plan has no quantity IXSCAN: {plan:?}"
+                );
+                if two_sided {
+                    assert!(
+                        scans.iter().any(|scan| bounds_both_sides(scan)),
+                        "{value} (MongoDB {version}): no quantity field is bounded on both \
+                         sides: {plan:?}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "{value}: no unhinted quantity command on {ns} was profiled: {ops:?}"
+        );
+    }
+}
+
+/// The winning plans of one explain reply: `queryPlanner.winningPlan` of the
+/// command's source (an aggregate's `$cursor` stage, or the reply itself), or
+/// each shard's winning plan on a sharded cluster. Rejected plans are never
+/// read. The slot-based engine nests the plan tree under `queryPlan`.
+fn winning_plans(explain: &Document) -> Vec<&Document> {
+    if let Ok(shards) = explain.get_document("shards") {
+        return shards
+            .values()
+            .filter_map(Bson::as_document)
+            .flat_map(winning_plans)
+            .collect();
+    }
+    let source = explain
+        .get_array("stages")
+        .ok()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find_map(|stage| stage.as_document()?.get_document("$cursor").ok())
+        })
+        .unwrap_or(explain);
+    let winning = source
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .unwrap_or_else(|e| panic!("explain has no winningPlan: {e}: {explain:?}"));
+    let plans: Vec<&Document> = match winning.get_array("shards") {
+        Ok(shards) => shards
+            .iter()
+            .filter_map(|shard| shard.as_document()?.get_document("winningPlan").ok())
+            .collect(),
+        Err(_) => vec![winning],
+    };
+    plans
+        .into_iter()
+        .map(|plan| plan.get_document("queryPlan").unwrap_or(plan))
+        .collect()
+}
+
+/// The `IXSCAN` stages of one winning plan tree, following only its
+/// `inputStage`/`inputStages` children.
+fn plan_ixscans<'a>(plan: &'a Document, out: &mut Vec<&'a Document>) {
+    if plan.get_str("stage") == Ok("IXSCAN") {
+        out.push(plan);
+    }
+    if let Ok(input) = plan.get_document("inputStage") {
+        plan_ixscans(input, out);
+    }
+    if let Ok(inputs) = plan.get_array("inputStages") {
+        for input in inputs.iter().filter_map(Bson::as_document) {
+            plan_ixscans(input, out);
+        }
+    }
+}
+
+/// Whether an `IXSCAN` bounds a quantity field by one interval with two finite
+/// ends, such as `[499.5, 500.5)`.
+fn bounds_both_sides(scan: &Document) -> bool {
+    let Ok(bounds) = scan.get_document("indexBounds") else {
+        return false;
+    };
+    ["value_quantity_value", "value_quantity_high"]
+        .into_iter()
+        .any(|field| {
+            matches!(
+                bounds.get_array(field).map(Vec::as_slice),
+                Ok([Bson::String(interval)])
+                    if !["inf", "MinKey", "MaxKey"].iter().any(|open| interval.contains(open))
+            )
+        })
 }
 
 /// The ids a `date` search returns, sorted; each inner list is one occurrence

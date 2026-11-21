@@ -107,7 +107,8 @@ pub use conditional::{
     parse_conditional_criteria,
 };
 pub use converters::{
-    DateEnd, IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
+    DateEnd, IMPLICIT_TOKEN_SYSTEM, IndexValue, QuantityHigh, ValueConverter,
+    implicit_system_candidates,
 };
 pub use date_value::{
     ApproxMargin, DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision,
@@ -131,7 +132,10 @@ pub use numeric_value::{
     FhirNumberValue, FhirQuantityValue, NumberValueError, NumberValueErrorReason,
     validate_numeric_parameter, validate_numeric_values,
 };
-pub use range::{approx_range, implicit_precision, implicit_range};
+pub use range::{
+    Cmp, QUANTITY_OPEN_HIGH, QUANTITY_OPEN_LOW, QuantityBound, QuantityIntervalPredicate,
+    approx_range, canonical_range, implicit_precision, implicit_range, quantity_interval_predicate,
+};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,

@@ -260,6 +260,7 @@ mod tests {
             unit: Some("mm[Hg]".to_string()),
             system: None,
             code: None,
+            high: crate::search::QuantityHigh::Point,
         }
     }
 
