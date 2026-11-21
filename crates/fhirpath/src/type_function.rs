@@ -77,7 +77,8 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
                 ("System".to_string(), "Integer".to_string())
             }
         }
-        EvaluationResult::Decimal(_, type_info, _) => {
+        EvaluationResult::Decimal(_, type_info, _)
+        | EvaluationResult::OutOfRangeDecimal(_, type_info, _) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())
             } else {

@@ -3178,7 +3178,22 @@ where
                     None => result,
                 };
             }
-            // If PreciseDecimal holds None for value, fall through to check id/extension
+            // Valid decimal text outside rust_decimal's range (`1e999999999`): keep it
+            // as digits and an exponent rather than dropping the value (#2716).
+            if let Some(out_of_range) =
+                helios_fhirpath_support::OutOfRangeDecimal::parse(precise_decimal.original_string())
+            {
+                let result = EvaluationResult::fhir_out_of_range_decimal(out_of_range);
+                // The precision hint is for in-range values; this one keeps its exponent.
+                return match primitive_meta {
+                    Some(meta) => result.with_primitive_element(PrimitiveElement {
+                        decimal_exponent: None,
+                        ..meta
+                    }),
+                    None => result,
+                };
+            }
+            // Otherwise the text was not a decimal: fall through to check id/extension
         }
 
         // If value is None, but id or extension exist, return an Object with those
@@ -3375,5 +3390,31 @@ mod precise_decimal_exponent_tests {
         assert_eq!(exponent("1.5e-3"), None);
         assert_eq!(exponent("950"), None);
         assert_eq!(exponent("9.5"), None);
+    }
+
+    #[test]
+    fn out_of_range_decimal_keeps_its_value_for_fhirpath() {
+        use super::{DecimalElement, EvaluationResult, IntoEvaluationResult};
+
+        // rust_decimal cannot hold 1e999999999; the element still yields a value.
+        // (`String` stands in for the extension type, which this test never uses.)
+        for text in ["1e999999999", "1e-999999999"] {
+            let element: DecimalElement<String> =
+                serde_json::from_str(text).expect("decimal parses");
+            assert!(element.value.as_ref().unwrap().value().is_none());
+            match element.to_evaluation_result() {
+                EvaluationResult::OutOfRangeDecimal(d, Some(type_info), None) => {
+                    assert_eq!(
+                        d.to_scientific_string(),
+                        text.replace('e', "E+").replace("+-", "-")
+                    );
+                    assert_eq!(
+                        (type_info.namespace.as_str(), type_info.name.as_str()),
+                        ("FHIR", "decimal")
+                    );
+                }
+                other => panic!("{text}: expected OutOfRangeDecimal, got {other:?}"),
+            }
+        }
     }
 }
