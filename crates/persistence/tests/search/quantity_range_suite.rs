@@ -900,7 +900,7 @@ where
     // resource with any entry of the code, not just one without it.
     let mut not_age = query("ValueSet", "context-type", SearchParamType::Token, "age");
     not_age.parameters[0].modifier = Some(SearchModifier::Not);
-    not_age.parameters[0].values = vec![SearchValue::eq(&format!("{USE_CONTEXT_TYPE}|age"))];
+    not_age.parameters[0].values = vec![SearchValue::eq(format!("{USE_CONTEXT_TYPE}|age"))];
     let not_age = matched(backend, &x, &not_age).await;
     assert!(
         !not_age.contains("vs-multi")

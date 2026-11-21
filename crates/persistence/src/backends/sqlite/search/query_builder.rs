@@ -1990,7 +1990,11 @@ mod tests {
         .unwrap();
         let registry = std::sync::Arc::new(parking_lot::RwLock::new(reg));
         let filter = SearchValue::eq("my-qty gt 45");
-        let sql_of = |b: &QueryBuilder| b.build_filter_condition(&[filter.clone()], 2).unwrap().sql;
+        let sql_of = |b: &QueryBuilder| {
+            b.build_filter_condition(std::slice::from_ref(&filter), 2)
+                .unwrap()
+                .sql
+        };
 
         let with = sql_of(&QueryBuilder::new("t", "Observation").with_registry(registry.clone()));
         let without = sql_of(&QueryBuilder::new("t", "Observation"));
