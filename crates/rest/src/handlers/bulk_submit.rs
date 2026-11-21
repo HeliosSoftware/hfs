@@ -22,6 +22,7 @@ use axum::{
 use helios_auth::Principal;
 use helios_auth::scope::SmartPermissions;
 use helios_persistence::TenantContext;
+use helios_persistence::core::bulk_submit_input::redact_url;
 use helios_persistence::core::{
     DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
     ManifestPhase, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus, SubmitFileRow,
@@ -30,6 +31,7 @@ use helios_persistence::core::{
 use serde_json::{Value, json};
 
 use super::bulk_common::{first_value, parse_query_pairs};
+use crate::bulk_submit_oauth::TrustedProviders;
 use crate::config::BulkSubmitConfig;
 use crate::error::{RestError, RestResult};
 use crate::extractors::{PeerIp, TenantExtractor};
@@ -326,6 +328,33 @@ fn check_poll_rate_limit(
         })
 }
 
+/// Refuses a kick-off whose `manifestUrl` or `oauthMetadataUrl` is outside
+/// the trusted Data Provider origins (`HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`)
+/// before anything is stored: the worker would refuse the fetch anyway, and
+/// the submitter learns it now rather than from a failed manifest. With no
+/// list configured every origin is accepted.
+fn check_sources(req: &SubmitRequest, cfg: &BulkSubmitConfig) -> RestResult<()> {
+    let trusted = TrustedProviders::parse(&cfg.trusted_providers).unwrap_or_default();
+    let named = req
+        .manifest_url
+        .iter()
+        .map(|url| ("manifestUrl", url))
+        .chain(
+            req.oauth_metadata_urls
+                .iter()
+                .map(|url| ("oauthMetadataUrl", url)),
+        );
+    for (parameter, url) in named {
+        if !trusted.permits_url(url) {
+            return Err(bad_request(format!(
+                "`{parameter}` {} is not at a trusted Data Provider origin (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS)",
+                redact_url(url)
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Parameters parsing
 // ---------------------------------------------------------------------------
@@ -606,6 +635,7 @@ where
     let body: Value = serde_json::from_slice(&bytes)
         .map_err(|e| bad_request(format!("invalid Parameters JSON: {e}")))?;
     let req = parse_submit_request(&body)?;
+    check_sources(&req, cfg)?;
 
     validate_import_directives(&req.import_directives, strict)?;
 
@@ -1701,6 +1731,46 @@ mod tests {
             param("submissionId", "valueString", json!("s")),
         ]});
         assert!(parse_submit_request(&body).is_err());
+    }
+
+    #[test]
+    fn test_check_sources_confines_the_kickoff_urls_to_the_trusted_providers() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+                {"name": "submissionId", "valueString": "s1"},
+                {"name": "manifestUrl", "valueUrl": "https://provider.example/manifest.json?sig=secret123"},
+                {"name": "fhirBaseUrl", "valueUrl": "https://provider.example/fhir"},
+                {"name": "oauthMetadataUrl", "valueUrl": "https://auth.example/.well-known/smart-configuration"}
+            ]
+        });
+        let req = parse_submit_request(&body).expect("valid");
+        let refusal = |trusted: &[&str]| {
+            let cfg = BulkSubmitConfig {
+                trusted_providers: trusted.iter().map(|s| s.to_string()).collect(),
+                ..BulkSubmitConfig::default()
+            };
+            match check_sources(&req, &cfg) {
+                Ok(()) => None,
+                Err(RestError::BadRequest { message }) => Some(message),
+                Err(other) => panic!("expected a 400, got {other:?}"),
+            }
+        };
+
+        assert_eq!(refusal(&[]), None, "no list permits every origin");
+        assert_eq!(
+            refusal(&["https://provider.example", "https://auth.example"]),
+            None
+        );
+
+        let err = refusal(&["https://provider.example"]).expect("the metadata origin is unlisted");
+        assert!(err.contains("oauthMetadataUrl"), "{err}");
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+
+        let err = refusal(&["https://auth.example"]).expect("the manifest origin is unlisted");
+        assert!(err.contains("manifestUrl"), "{err}");
+        assert!(!err.contains("secret123"), "{err}");
     }
 
     #[test]
