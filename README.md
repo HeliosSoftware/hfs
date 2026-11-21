@@ -445,7 +445,9 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_SUBSCRIPTIONS_ENABLED` | `false` | Enable the subscription engine when HFS is built with the `subscriptions` feature |
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
-| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow rest-hook and FHIR Messaging deliveries to endpoints that are, or resolve to, private or loopback addresses; intended for local development and CI only. Redirects are never followed |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | *(none)* | Comma-separated receivers (`host` or `host:port`) that may be sent the server credential on FHIR Messaging deliveries; unset means no receiver gets it |
+| `HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN` | *(none)* | Bearer token sent to the listed messaging receivers; unset falls back to `HFS_OUTBOUND_BEARER_TOKEN`, the credential the server's own self-calls use |
 | `HFS_SUBSCRIPTION_REHYDRATE` | `true` | Reload stored `Subscription`/`SubscriptionTopic` resources into the engine at startup, so subscriptions keep delivering across a restart |
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions during rehydration |
 | `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `GET Subscription/{id}/$events` (in memory, lost on restart); `0` disables the history |

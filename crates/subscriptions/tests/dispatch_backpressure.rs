@@ -108,6 +108,7 @@ fn limits() -> SubscriptionConfig {
         retry_max_delay: Duration::from_millis(20),
         error_threshold: 1_000,
         off_threshold: 1_000,
+        allow_private_endpoints: true, // receivers are on loopback
         ..SubscriptionConfig::default()
     }
 }

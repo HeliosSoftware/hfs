@@ -105,6 +105,7 @@ async fn server(version: FhirVersion, events: usize, history: usize) -> (TestSer
     let engine = Arc::new(SubscriptionEngine::new(
         SubscriptionConfig {
             event_history_size: history,
+            allow_private_endpoints: true, // receivers are on loopback
             ..Default::default()
         },
         BASE_URL.to_string(),
