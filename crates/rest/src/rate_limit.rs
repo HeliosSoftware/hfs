@@ -11,8 +11,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Keys are unbounded in principle (one bucket per peer address), so a
-/// limiter's map is pruned of inactive buckets once it grows past this.
+/// Keys are unbounded in principle (one bucket per peer address, or per poll
+/// token), so a limiter's map is pruned of inactive buckets once it grows
+/// past this. After a prune the threshold is twice the surviving population
+/// (never below this), so the scan is amortised over the growth that
+/// triggers it rather than paid on every call once the map is large.
 const PRUNE_AT: usize = 10_000;
 
 /// Which ceiling a rejected request hit.
@@ -35,11 +38,19 @@ pub(crate) struct RateLimited {
 }
 
 /// Per-key state: the request instants inside the current window, plus the
-/// running count for the current UTC day.
+/// running count for the current UTC day. The count is kept only under a
+/// daily ceiling; a window-only bucket has nothing to remember once its
+/// window has lapsed, and is pruned then.
 struct RateState {
     window: VecDeque<Instant>,
     day: u64,
     day_count: u32,
+}
+
+/// The bucket map and the size past which the next prune runs.
+struct Buckets {
+    map: HashMap<String, RateState>,
+    prune_at: usize,
 }
 
 /// A sliding-window rate limiter with an optional per-day ceiling.
@@ -48,15 +59,19 @@ struct RateState {
 /// ```ignore
 /// static POLL_LIMITER: RateLimiter = RateLimiter::new();
 /// ```
+///
+/// A key is what the caller passes: a surface whose key carries caller-chosen
+/// text (a path segment, a header) bounds it first, by hashing or by format,
+/// since every distinct key is a bucket until it is pruned.
 pub(crate) struct RateLimiter {
-    map: OnceLock<Mutex<HashMap<String, RateState>>>,
+    buckets: OnceLock<Mutex<Buckets>>,
 }
 
 impl RateLimiter {
     /// Creates an empty limiter. `const` so it can back a `static`.
     pub(crate) const fn new() -> Self {
         Self {
-            map: OnceLock::new(),
+            buckets: OnceLock::new(),
         }
     }
 
@@ -71,30 +86,48 @@ impl RateLimiter {
         window: Duration,
         daily_limit: u32,
     ) -> Result<(), RateLimited> {
-        let mut map = self
-            .map
-            .get_or_init(|| Mutex::new(HashMap::new()))
+        self.admit(key, limit, window, Some(daily_limit))
+    }
+
+    fn admit(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+        daily_limit: Option<u32>,
+    ) -> Result<(), RateLimited> {
+        let mut buckets = self
+            .buckets
+            .get_or_init(|| {
+                Mutex::new(Buckets {
+                    map: HashMap::new(),
+                    prune_at: PRUNE_AT,
+                })
+            })
             .lock()
             .expect("rate limiter lock");
         let now = Instant::now();
         let today = current_day();
 
-        if map.len() > PRUNE_AT {
-            map.retain(|_, state| {
-                state.day == today
-                    && (state.day_count > 0
-                        || state
-                            .window
-                            .back()
-                            .is_some_and(|t| now.duration_since(*t) <= window))
+        if buckets.map.len() > buckets.prune_at {
+            buckets.map.retain(|_, state| {
+                state
+                    .window
+                    .back()
+                    .is_some_and(|t| now.duration_since(*t) <= window)
+                    || (state.day == today && state.day_count > 0)
             });
+            buckets.prune_at = buckets.map.len().saturating_mul(2).max(PRUNE_AT);
         }
 
-        let state = map.entry(key.to_string()).or_insert_with(|| RateState {
-            window: VecDeque::new(),
-            day: today,
-            day_count: 0,
-        });
+        let state = buckets
+            .map
+            .entry(key.to_string())
+            .or_insert_with(|| RateState {
+                window: VecDeque::new(),
+                day: today,
+                day_count: 0,
+            });
 
         if state.day != today {
             state.day = today;
@@ -108,7 +141,7 @@ impl RateLimiter {
             state.window.pop_front();
         }
 
-        if state.day_count >= daily_limit {
+        if daily_limit.is_some_and(|daily_limit| state.day_count >= daily_limit) {
             return Err(RateLimited {
                 kind: LimitKind::Daily,
                 retry_after_secs: secs_until_utc_midnight(),
@@ -127,7 +160,9 @@ impl RateLimiter {
         }
 
         state.window.push_back(now);
-        state.day_count += 1;
+        if daily_limit.is_some() {
+            state.day_count += 1;
+        }
         Ok(())
     }
 
@@ -138,7 +173,21 @@ impl RateLimiter {
         limit: u32,
         window: Duration,
     ) -> Result<(), RateLimited> {
-        self.check(key, limit, window, u32::MAX)
+        self.admit(key, limit, window, None)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets
+            .get()
+            .map_or(0, |b| b.lock().expect("rate limiter lock").map.len())
+    }
+
+    #[cfg(test)]
+    fn prune_threshold(&self) -> usize {
+        self.buckets
+            .get()
+            .map_or(PRUNE_AT, |b| b.lock().expect("rate limiter lock").prune_at)
     }
 }
 
@@ -269,6 +318,73 @@ mod tests {
             second.unwrap_err().retry_after_secs <= first.unwrap_err().retry_after_secs,
             "a rejected request must not be counted"
         );
+    }
+
+    /// Past the prune threshold, a window-only bucket whose window has lapsed
+    /// is dropped: an unknown poll token or a one-off peer does not hold its
+    /// bucket until the UTC day ends.
+    #[test]
+    fn window_only_buckets_are_dropped_once_their_window_lapses() {
+        let limiter = RateLimiter::new();
+        let window = Duration::from_millis(1);
+        for i in 0..=PRUNE_AT {
+            limiter
+                .check_window(&format!("k{i}"), 1, window)
+                .expect("first request for a fresh key");
+        }
+        assert_eq!(limiter.len(), PRUNE_AT + 1);
+        std::thread::sleep(Duration::from_millis(20));
+
+        limiter
+            .check_window("trigger", 1, window)
+            .expect("the triggering request");
+        assert_eq!(limiter.len(), 1, "only the triggering bucket survives");
+    }
+
+    /// A bucket under a daily ceiling keeps its count for the day, so the
+    /// ceiling cannot be reset by growing the map past the threshold.
+    #[test]
+    fn daily_buckets_survive_the_prune_within_the_day() {
+        let limiter = RateLimiter::new();
+        let window = Duration::from_millis(1);
+        limiter
+            .check("spent", 100, window, 1)
+            .expect("the one request of the day");
+        for i in 0..=PRUNE_AT {
+            limiter
+                .check(&format!("k{i}"), 100, window, 100)
+                .expect("first request for a fresh key");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        limiter
+            .check("trigger", 100, window, 100)
+            .expect("the triggering request");
+        assert_eq!(limiter.len(), PRUNE_AT + 3, "every daily bucket survives");
+        let err = limiter
+            .check("spent", 100, window, 1)
+            .expect_err("the daily ceiling still holds");
+        assert_eq!(err.kind, LimitKind::Daily);
+    }
+
+    /// After a prune the threshold follows the surviving population, so a
+    /// map that legitimately holds more than `PRUNE_AT` live buckets is not
+    /// scanned on every call.
+    #[test]
+    fn the_prune_threshold_grows_with_the_surviving_population() {
+        let limiter = RateLimiter::new();
+        let window = Duration::from_secs(60);
+        for i in 0..=PRUNE_AT {
+            limiter
+                .check_window(&format!("k{i}"), 1, window)
+                .expect("first request for a fresh key");
+        }
+        assert_eq!(limiter.prune_threshold(), PRUNE_AT);
+        limiter
+            .check_window("trigger", 1, window)
+            .expect("the triggering request");
+        assert_eq!(limiter.len(), PRUNE_AT + 2, "nothing had lapsed");
+        assert_eq!(limiter.prune_threshold(), 2 * (PRUNE_AT + 1));
     }
 
     #[test]

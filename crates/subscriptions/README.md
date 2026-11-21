@@ -214,7 +214,19 @@ The FHIR Messaging channel is disabled by default and is enabled only when `HFS_
 |----------|---------|-------------|
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel. |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers. |
-| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow delivery to private or loopback endpoint hosts; intended for local development and CI only. |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow rest-hook and FHIR Messaging delivery to endpoints that are, or resolve to, private, loopback, link-local or shared (`100.64.0.0/10`) addresses; intended for local development and CI only. Applies to both channels. |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | *(none)* | Comma-separated receivers (`host` or `host:port`) that may be sent the server's outbound credential when the Subscription supplies no `Authorization` header. An entry without a port matches any port; wildcards are not supported. Unset means no receiver gets it; the credential travels only over HTTPS unless private endpoints are allowed. |
+| `HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN` | *(none)* | Bearer token sent to the listed receivers. Unset falls back to `HFS_OUTBOUND_BEARER_TOKEN`, which is also the credential the server's own self-calls use and one HFS itself may accept; set this to give receivers a separate one. |
+
+### Endpoint safety
+
+A Subscription's endpoint is written by whoever can write the resource, so rest-hook and FHIR Messaging deliveries follow the same egress rules:
+
+- An endpoint whose host is a literal private, loopback, link-local, shared or unspecified address is refused with a permanent error.
+- A DNS name is checked when it is resolved: if it resolves only to such addresses (`localhost`, an internal record) the delivery is refused, and the connection is made to the address that was checked.
+- Redirects are never followed. A `3xx` answer is a permanent delivery error, so the Subscription's headers are not re-sent to a host the endpoint did not name. Register the final URL.
+
+`HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` lifts the first two rules for local development and CI. Deliveries made through an HTTP proxy are resolved by the proxy and are outside these checks.
 
 ## Enabling in HFS
 

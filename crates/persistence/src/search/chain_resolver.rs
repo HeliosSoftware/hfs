@@ -58,6 +58,30 @@ pub trait TerminologyExpander: Send + Sync {
     async fn expand(&self, modifier: &SearchModifier, value: &str) -> TerminologyExpansion;
 }
 
+/// Judges each search a chained or `_has` search runs on a resource type
+/// other than its base, as a direct search on that type would be judged
+/// (#2501).
+///
+/// The base query of a search is authorized and confined by the caller before
+/// the resolver runs. Every hop, though, is a search the resolver builds from
+/// scratch: without a guard it runs over the whole tenant, so a chain could
+/// select the caller's resources by data the caller may not read, one value
+/// per request. The REST layer's guard checks the hop's type against the
+/// token's scopes and confines it to the launch patient's compartment under a
+/// `patient/` scope.
+pub trait ChainHopGuard: Send + Sync {
+    /// Called with every hop query before it runs; `query.resource_type` is
+    /// the hop's type. Narrow `query` to what the caller may see (a
+    /// compartment filter, an `_id` pin), or refuse it with
+    /// [`SearchError::ChainHopRefused`].
+    ///
+    /// Where an untyped, polymorphic hop has several candidate types
+    /// (`Observation?subject.name=…` reaches Patient, Group, Device and
+    /// Location), a refused type contributes nothing and the search is refused
+    /// only when every candidate is; a typed hop has one candidate.
+    fn confine_hop(&self, query: &mut SearchQuery) -> StorageResult<()>;
+}
+
 /// What the caller can do for the resolver.
 #[derive(Clone, Copy, Default)]
 pub struct ChainResolveOptions<'a> {
@@ -72,13 +96,67 @@ pub struct ChainResolveOptions<'a> {
     /// no backend can answer it, and the terminal search would otherwise match
     /// literally or not at all (#1317).
     pub terminology: Option<&'a dyn TerminologyExpander>,
+
+    /// The caller's judge of every hop query ([`ChainHopGuard`]). `None` — the
+    /// default — runs every hop over the whole tenant, which is right only for
+    /// a caller with access to all of it.
+    pub hop_guard: Option<&'a dyn ChainHopGuard>,
 }
 
 impl std::fmt::Debug for ChainResolveOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChainResolveOptions")
             .field("terminology", &self.terminology.is_some())
+            .field("hop_guard", &self.hop_guard.is_some())
             .finish()
+    }
+}
+
+impl ChainResolveOptions<'_> {
+    /// Runs the guard, if any, on one hop query.
+    fn confine_hop(&self, query: &mut SearchQuery) -> StorageResult<()> {
+        match self.hop_guard {
+            Some(guard) => guard.confine_hop(query),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs the guard on one query per candidate type of a hop, keeping the
+    /// admitted ones. A refused candidate contributes nothing; when every
+    /// candidate is refused, so is the search, with the first refusal.
+    fn confine_candidates(
+        &self,
+        queries: Vec<(String, SearchQuery)>,
+    ) -> StorageResult<Vec<(String, SearchQuery)>> {
+        if self.hop_guard.is_none() || queries.is_empty() {
+            return Ok(queries);
+        }
+        let mut admitted = Vec::with_capacity(queries.len());
+        let mut first_refusal = None;
+        for (resource_type, mut query) in queries {
+            match self.confine_hop(&mut query) {
+                Ok(()) => admitted.push((resource_type, query)),
+                Err(e) => {
+                    first_refusal.get_or_insert(e);
+                }
+            }
+        }
+        match (admitted.is_empty(), first_refusal) {
+            (true, Some(e)) => Err(e),
+            _ => Ok(admitted),
+        }
+    }
+
+    /// Whether the guard leaves a search on `resource_type` as it is, so a
+    /// provider's native reverse-chain path (which runs the hop itself) may
+    /// stand in for the iterative resolver. Refused types are an error.
+    fn leaves_unchanged(&self, resource_type: &str) -> StorageResult<bool> {
+        if self.hop_guard.is_none() {
+            return Ok(true);
+        }
+        let mut probe = SearchQuery::new(resource_type);
+        self.confine_hop(&mut probe)?;
+        Ok(probe.parameters.is_empty() && probe.compartment.is_none())
     }
 }
 
@@ -124,6 +202,7 @@ where
     if query.reverse_chains.len() == 1
         && query.reverse_chains[0].nested.is_none()
         && query.parameters.iter().all(|param| param.chain.is_empty())
+        && options.leaves_unchanged(&query.reverse_chains[0].source_type)?
         && storage.supports_native_reverse_chains(tenant, query)
     {
         // Only a plain terminal may bypass iterative resolution. Reuse its
@@ -550,7 +629,7 @@ where
     }
 
     // Deepest hop: search each candidate terminal type, union the refs.
-    let mut current_refs: Vec<String> = Vec::new();
+    let mut terminal_queries = Vec::with_capacity(terminal_types.len());
     for terminal_target in &terminal_types {
         // The implied system of a `code` element is the terminal type's (#1395).
         let mut terminal = terminal.clone();
@@ -571,6 +650,10 @@ where
             chain: vec![],
             components: vec![],
         });
+        terminal_queries.push((terminal_target.clone(), terminal_query));
+    }
+    let mut current_refs: Vec<String> = Vec::new();
+    for (terminal_target, terminal_query) in options.confine_candidates(terminal_queries)? {
         let ids = search_all_ids(storage, tenant, terminal_query).await?;
         current_refs.extend(ids.into_iter().map(|id| format!("{terminal_target}/{id}")));
     }
@@ -578,9 +661,16 @@ where
         return Ok(Some(Vec::new()));
     }
 
-    walk_back_out(storage, tenant, hops, &parent_types_per_hop, current_refs)
-        .await
-        .map(Some)
+    walk_back_out(
+        storage,
+        tenant,
+        hops,
+        &parent_types_per_hop,
+        current_refs,
+        options,
+    )
+    .await
+    .map(Some)
 }
 
 /// Resolves a forward chain that ends in `_has` (`patient._has:Group:member:_id`,
@@ -627,29 +717,48 @@ where
     else {
         return Ok(None);
     };
+    // The last hop's candidate types are searched (by id) too, so they are
+    // judged like any other hop.
+    let admitted = options.confine_candidates(
+        terminal_types
+            .iter()
+            .map(|t| (t.clone(), SearchQuery::new(t)))
+            .collect(),
+    )?;
     let mut current_refs: Vec<String> = Vec::new();
     for (target, ids) in terminal_types.iter().zip(referenced) {
+        let Some((_, scope)) = admitted.iter().find(|(t, _)| t == target) else {
+            continue;
+        };
         // The `_has` yields the ids its sources *refer to*. Only those of
         // resources that exist are reached by the chain, as a terminal
         // search's matches are and a top-level `_has`'s final search is.
-        let live = existing_ids(storage, tenant, target, ids).await?;
+        let live = existing_ids(storage, tenant, scope, ids).await?;
         current_refs.extend(live.into_iter().map(|id| format!("{target}/{id}")));
     }
     if current_refs.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
-    walk_back_out(storage, tenant, hops, &parent_types_per_hop, current_refs)
-        .await
-        .map(Some)
+    walk_back_out(
+        storage,
+        tenant,
+        hops,
+        &parent_types_per_hop,
+        current_refs,
+        options,
+    )
+    .await
+    .map(Some)
 }
 
-/// The distinct ids among `ids` of `resource_type` resources that exist in the
-/// tenant, read without resource bodies, `CHAIN_VALUE_CHUNK` ids per search.
+/// The distinct ids among `ids` of resources that exist in the tenant and
+/// match `scope` (a query on their type that the hop guard may have narrowed),
+/// read without resource bodies, `CHAIN_VALUE_CHUNK` ids per search.
 async fn existing_ids<S>(
     storage: &S,
     tenant: &TenantContext,
-    resource_type: &str,
+    scope: &SearchQuery,
     ids: Vec<String>,
 ) -> StorageResult<Vec<String>>
 where
@@ -662,7 +771,7 @@ where
         .collect();
     let mut live = Vec::new();
     for chunk in ids.chunks(CHAIN_VALUE_CHUNK) {
-        let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+        let query = scope.clone().with_parameter(SearchParameter {
             name: "_id".to_string(),
             param_type: SearchParamType::Token,
             modifier: None,
@@ -720,6 +829,7 @@ async fn walk_back_out<S>(
     hops: &[ChainedParameter],
     parent_types_per_hop: &[Vec<String>],
     mut current_refs: Vec<String>,
+    options: ChainResolveOptions<'_>,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -735,10 +845,18 @@ where
         // referencing refs in two chunks does not inflate the next hop.
         let mut seen: HashSet<String> = HashSet::new();
         let mut next_refs: Vec<String> = Vec::new();
-        for parent_type in &parent_types_per_hop[i] {
+        // Each candidate parent type is judged once, as an empty query on it,
+        // and that (possibly narrowed) query is the base of every chunk.
+        let parents = options.confine_candidates(
+            parent_types_per_hop[i]
+                .iter()
+                .map(|t| (t.clone(), SearchQuery::new(t)))
+                .collect(),
+        )?;
+        for (parent_type, scope) in &parents {
             for chunk in current_refs.chunks(CHAIN_VALUE_CHUNK) {
                 let values: Vec<SearchValue> = chunk.iter().map(SearchValue::eq).collect();
-                let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
+                let query = scope.clone().with_parameter(SearchParameter {
                     name: ref_param.clone(),
                     param_type: SearchParamType::Reference,
                     modifier: None,
@@ -898,6 +1016,11 @@ where
             components: vec![],
         })
     };
+
+    // The source resources are a hop of their own: judged, and narrowed to
+    // what the caller may see, before they decide anything.
+    let mut source_query = source_query;
+    options.confine_hop(&mut source_query)?;
 
     let mut ids: Vec<Vec<String>> = vec![Vec::new(); base_types.len()];
     let mut keep = |reference: &str| {
@@ -1533,6 +1656,165 @@ mod tests {
             .map(|r| r.id().to_string())
             .collect();
         assert_eq!(ids, vec!["o1"], "only Smith's observation matches");
+    }
+
+    /// #2501: the hop guard sees every hop the resolver runs and decides it.
+    /// A guard that narrows a hop (here, to one patient's Observations) changes
+    /// what a `_has` finds; one that refuses a hop's only type refuses the
+    /// search; one that refuses some candidates of a polymorphic hop leaves the
+    /// others to answer.
+    #[tokio::test]
+    async fn the_hop_guard_judges_every_hop() {
+        struct Guard;
+        impl ChainHopGuard for Guard {
+            fn confine_hop(&self, query: &mut SearchQuery) -> StorageResult<()> {
+                match query.resource_type.as_str() {
+                    // Only p1's own Observations.
+                    "Observation" => {
+                        query.compartment = Some(crate::types::CompartmentMembership {
+                            params: vec!["subject".into()],
+                            reference: "Patient/p1".into(),
+                        });
+                        Ok(())
+                    }
+                    "Practitioner" | "Location" => {
+                        Err(StorageError::Search(SearchError::ChainHopRefused {
+                            message: format!("no {}", query.resource_type),
+                        }))
+                    }
+                    _ => Ok(()),
+                }
+            }
+        }
+        let b = backend();
+        let t = tenant();
+        for (resource_type, body) in [
+            (
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+            ),
+            ("Patient", json!({"resourceType": "Patient", "id": "p2"})),
+            (
+                "Location",
+                json!({"resourceType": "Location", "id": "l1", "name": "One"}),
+            ),
+            (
+                "Practitioner",
+                json!({"resourceType": "Practitioner", "id": "pr1"}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o-leak",
+                "status": "final", "code": {"coding": [{"code": "LEAK-1"}]},
+                "subject": {"reference": "Patient/p2"},
+                "focus": [{"reference": "Patient/p1"}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o1",
+                "status": "final", "code": {"coding": [{"code": "X"}]},
+                "subject": {"reference": "Patient/p1"},
+                "performer": [{"reference": "Practitioner/pr1"}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o-location",
+                "status": "final", "code": {"coding": [{"code": "X"}]},
+                "subject": {"reference": "Location/l1"}}),
+            ),
+        ] {
+            b.create(&t, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let guarded = ChainResolveOptions {
+            hop_guard: Some(&Guard),
+            ..Default::default()
+        };
+        let ids_of = |query: SearchQuery, options: ChainResolveOptions<'static>| {
+            let (b, t) = (&b, &t);
+            async move {
+                let rewritten = resolve_chains_with(b, t, &query, options).await?;
+                let mut ids: Vec<String> = b
+                    .search(t, &rewritten)
+                    .await?
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                ids.sort();
+                StorageResult::Ok(ids)
+            }
+        };
+
+        // Patient?_has:Observation:focus:code=LEAK-1
+        let mut has = SearchQuery::new("Patient");
+        has.reverse_chains.push(ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "focus".to_string(),
+            search_param: "code".to_string(),
+            modifier: None,
+            value: Some(SearchValue::eq("LEAK-1")),
+            nested: None,
+        });
+        assert_eq!(
+            ids_of(has.clone(), ChainResolveOptions::default())
+                .await
+                .unwrap(),
+            ["p1"]
+        );
+        assert!(ids_of(has, guarded).await.unwrap().is_empty());
+
+        // Observation?performer:Practitioner._id=pr1: the only hop is refused.
+        let mut performer = SearchQuery::new("Observation");
+        performer.parameters.push(SearchParameter {
+            name: "performer".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("pr1")],
+            chain: vec![ChainedParameter {
+                reference_param: "performer".to_string(),
+                target_type: Some("Practitioner".to_string()),
+                target_param: "_id".to_string(),
+                has: None,
+            }],
+            components: vec![],
+        });
+        assert_eq!(
+            ids_of(performer.clone(), ChainResolveOptions::default())
+                .await
+                .unwrap(),
+            ["o1"]
+        );
+        assert!(matches!(
+            ids_of(performer, guarded).await,
+            Err(StorageError::Search(SearchError::ChainHopRefused { .. }))
+        ));
+
+        // Observation?subject.name=One: Patient answers, the refused Location
+        // candidate contributes nothing.
+        let mut subject_name = SearchQuery::new("Observation");
+        subject_name.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("One")],
+            chain: vec![ChainedParameter {
+                reference_param: "subject".to_string(),
+                target_type: None,
+                target_param: "name".to_string(),
+                has: None,
+            }],
+            components: vec![],
+        });
+        assert_eq!(
+            ids_of(subject_name.clone(), ChainResolveOptions::default())
+                .await
+                .unwrap(),
+            ["o-location", "o1"]
+        );
+        assert_eq!(ids_of(subject_name, guarded).await.unwrap(), ["o1"]);
     }
 
     #[tokio::test]
@@ -2798,6 +3080,7 @@ mod tests {
             ChainResolveOptions::default(),
             ChainResolveOptions {
                 terminology: Some(&expander),
+                ..Default::default()
             },
         ] {
             for q in [
@@ -2935,6 +3218,7 @@ mod tests {
     ) -> StorageResult<Vec<String>> {
         let options = ChainResolveOptions {
             terminology: Some(expander),
+            ..Default::default()
         };
         let rewritten = resolve_chains_with(b, t, query, options).await?;
         let mut ids: Vec<String> = b

@@ -62,7 +62,7 @@ jobs:
     needs: matrix-setup
     runs-on: [self-hosted, Linux]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -101,7 +101,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: hfs-bulk-submit-smoke-binary

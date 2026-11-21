@@ -58,7 +58,7 @@ jobs:
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -100,7 +100,7 @@ jobs:
           echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
 
       - name: Checkout us-quality-core-test-kit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.TEST_KIT_REPO }}
           ref: ${{ env.TEST_KIT_REF }}
@@ -250,10 +250,10 @@ jobs:
           - { suite_id: us_quality_core_v100_ballot, version_label: "v1.0.0-ballot" }
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Checkout us-quality-core-test-kit (fixtures)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.TEST_KIT_REPO }}
           ref: ${{ env.TEST_KIT_REF }}
