@@ -84,7 +84,6 @@ async fn server_with(
             patient: Some(p.to_string()),
             ..Default::default()
         }),
-        ..Default::default()
     };
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(
         axum::middleware::from_fn(move |mut request: axum::extract::Request, next: Next| {
