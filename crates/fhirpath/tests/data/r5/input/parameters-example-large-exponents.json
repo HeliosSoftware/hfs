@@ -1,0 +1,20 @@
+{
+  "resourceType": "Parameters",
+  "id": "example-large-exponents",
+  "parameter": [
+    {
+      "name": "huge-quantity",
+      "valueQuantity": { "value": 1e999999999, "unit": "kg", "system": "http://unitsofmeasure.org", "code": "kg" }
+    },
+    {
+      "name": "tiny-quantity",
+      "valueQuantity": { "value": 1e-999999999, "unit": "kg", "system": "http://unitsofmeasure.org", "code": "kg" }
+    },
+    { "name": "huge-decimal", "valueDecimal": 1e999999999 },
+    { "name": "tiny-decimal", "valueDecimal": 1e-999999999 },
+    {
+      "name": "huge-duration",
+      "valueQuantity": { "value": 1e999999999, "unit": "days", "system": "http://unitsofmeasure.org", "code": "d" }
+    }
+  ]
+}

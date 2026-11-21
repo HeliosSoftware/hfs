@@ -185,14 +185,16 @@ fn message_header_event_code(message_header: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn engine_with_messaging_enabled() -> SubscriptionEngine {
+fn engine_with_messaging_enabled(receiver: &MockServer) -> SubscriptionEngine {
     let config = SubscriptionConfig {
         max_retries: 1,
         supported_channel_types: vec!["rest-hook".to_string(), "message".to_string()],
         messaging: Some(MessagingSettings {
             source_endpoint: SOURCE_ENDPOINT.to_string(),
             allow_private_endpoints: true, // wiremock binds to 127.0.0.1
+            credential_hosts: vec![receiver.address().to_string()],
         }),
+        allow_private_endpoints: true, // receivers are on loopback
         ..Default::default()
     };
     SubscriptionEngine::with_outbound_auth(
@@ -211,7 +213,7 @@ async fn messaging_handshake_and_event_notifications_follow_expected_flow() {
         .mount(&server)
         .await;
 
-    let engine = engine_with_messaging_enabled();
+    let engine = engine_with_messaging_enabled(&server);
     engine.on_resource_event(topic_create_event()).await;
 
     let endpoint = format!("{}/process-message", server.uri());
@@ -304,7 +306,7 @@ async fn subscription_authorization_header_takes_precedence() {
         .mount(&server)
         .await;
 
-    let engine = engine_with_messaging_enabled();
+    let engine = engine_with_messaging_enabled(&server);
     engine.on_resource_event(topic_create_event()).await;
 
     let endpoint = format!("{}/process-message", server.uri());
@@ -366,7 +368,7 @@ async fn tenant_isolation_does_not_cross_dispatch_boundaries() {
         .mount(&server)
         .await;
 
-    let engine = engine_with_messaging_enabled();
+    let engine = engine_with_messaging_enabled(&server);
     engine.on_resource_event(topic_create_event()).await;
 
     let endpoint = format!("{}/process-message", server.uri());

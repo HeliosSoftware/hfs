@@ -10384,6 +10384,18 @@ mod count_by_tenant_ownership_tests {
         );
     }
 
+    /// The general `statement_timeout` of the count-budget tests below. It is
+    /// far above [`BUDGET_CEILING`], so a count that ended inside the ceiling
+    /// was ended by its budget and not by this timeout, however slow the
+    /// runner is. A shared CI runner has taken 10.5 s to finish a count with
+    /// a 1 s budget.
+    const GENERAL_TIMEOUT_MS: u64 = 120_000;
+    /// `GENERAL_TIMEOUT_MS` as `SHOW statement_timeout` reports it.
+    const GENERAL_TIMEOUT_SHOWN: &str = "2min";
+    /// The most a budgeted count may take, or an abandoned one may hold its
+    /// session, before the test decides the budget did not end it.
+    const BUDGET_CEILING: Duration = Duration::from_secs(60);
+
     /// The session's own `statement_timeout`, as `SHOW` reports it.
     async fn session_statement_timeout(client: &deadpool_postgres::Client) -> String {
         client
@@ -10399,7 +10411,7 @@ mod count_by_tenant_ownership_tests {
     /// general timeout, and runs a statement longer than the budget.
     #[tokio::test]
     async fn count_budget_ends_a_blocked_count_without_leaking_to_the_session() {
-        let (backend, dbname) = isolated_with_budget(1, 30_000, 1_000).await;
+        let (backend, dbname) = isolated_with_budget(1, GENERAL_TIMEOUT_MS, 1_000).await;
         let observer = raw(&dbname).await;
         let blocker = raw(&dbname).await;
         let blocker_pid = block_resources(&blocker).await;
@@ -10411,7 +10423,9 @@ mod count_by_tenant_ownership_tests {
             .await
             .expect_err("count must hit its budget");
         let elapsed = started.elapsed();
-        println!("count budget 1000 ms (general 30000 ms) ended the count after {elapsed:?}");
+        println!(
+            "count budget 1000 ms (general {GENERAL_TIMEOUT_MS} ms) ended the count after {elapsed:?}"
+        );
         match &error {
             StorageError::Backend(BackendError::Timeout {
                 backend_name,
@@ -10426,8 +10440,8 @@ mod count_by_tenant_ownership_tests {
             other => panic!("the budget is a Timeout, got {other:?}"),
         }
         assert!(
-            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(10),
-            "the count budget, not the 30 s session timeout, ended it: {elapsed:?}"
+            elapsed >= Duration::from_millis(900) && elapsed < BUDGET_CEILING,
+            "the count budget, not the general session timeout, ended it: {elapsed:?}"
         );
 
         let client = timeout(NOT_HANDED_OUT, backend.get_client())
@@ -10437,7 +10451,10 @@ mod count_by_tenant_ownership_tests {
         assert_eq!(checkout_pid(&client).await, pid);
         let (state, _, _) = activity(&observer, pid).await.expect("session kept");
         assert_eq!(state, "idle", "the count's transaction was closed");
-        assert_eq!(session_statement_timeout(&client).await, "30s");
+        assert_eq!(
+            session_statement_timeout(&client).await,
+            GENERAL_TIMEOUT_SHOWN
+        );
         client
             .batch_execute("SELECT pg_sleep(1.5)")
             .await
@@ -10459,7 +10476,7 @@ mod count_by_tenant_ownership_tests {
     /// transaction and with its general timeout, while the lock is still held.
     #[tokio::test]
     async fn count_budget_settles_an_abandoned_count_before_reuse() {
-        let (backend, dbname) = isolated_with_budget(1, 30_000, 2_000).await;
+        let (backend, dbname) = isolated_with_budget(1, GENERAL_TIMEOUT_MS, 2_000).await;
         let observer = raw(&dbname).await;
         let blocker = raw(&dbname).await;
         let blocker_pid = block_resources(&blocker).await;
@@ -10476,14 +10493,17 @@ mod count_by_tenant_ownership_tests {
             timeout(NOT_HANDED_OUT, backend.get_client()).await.is_err(),
             "busy session handed out before its budget expired"
         );
-        let client = timeout(Duration::from_secs(10), backend.get_client())
+        let client = timeout(BUDGET_CEILING, backend.get_client())
             .await
             .expect("the budget settles the abandoned count")
             .expect("checkout");
         assert_eq!(checkout_pid(&client).await, count_pid);
         let (state, _, _) = activity(&observer, count_pid).await.expect("session kept");
         assert_eq!(state, "idle");
-        assert_eq!(session_statement_timeout(&client).await, "30s");
+        assert_eq!(
+            session_statement_timeout(&client).await,
+            GENERAL_TIMEOUT_SHOWN
+        );
         let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
         assert_eq!(state, "idle in transaction", "the lock was never released");
         drop(client);

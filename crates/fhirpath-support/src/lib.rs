@@ -41,7 +41,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+mod out_of_range_decimal;
 mod type_info;
+pub use out_of_range_decimal::OutOfRangeDecimal;
 pub use type_info::{TypeInfo, TypeInfoResult};
 
 /// Trait for FHIR choice element types.
@@ -189,6 +191,11 @@ pub fn with_choice_type_info(result: EvaluationResult, fhir_type: &str) -> Evalu
             let type_info =
                 existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
             EvaluationResult::Decimal(d, Some(type_info), m)
+        }
+        EvaluationResult::OutOfRangeDecimal(d, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::OutOfRangeDecimal(d, Some(type_info), m)
         }
         EvaluationResult::Boolean(b, existing_type_info, m) => {
             let type_info =
@@ -342,6 +349,18 @@ pub enum EvaluationResult {
     /// errors. Required for FHIR's decimal type and mathematical operations.
     Decimal(
         Decimal,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
+    /// A decimal outside `rust_decimal`'s range, such as `1e999999999`.
+    ///
+    /// Held as significand digits and an exponent, never expanded. It has the
+    /// Decimal type, but supports only ordering, equality, equivalence, `toString()`
+    /// and negation; arithmetic, unit conversion and boundaries on it give empty
+    /// (#2716). A FHIR Quantity whose `value` is out of range keeps this variant in
+    /// its `value` field.
+    OutOfRangeDecimal(
+        OutOfRangeDecimal,
         Option<TypeInfoResult>,
         Option<Box<PrimitiveElement>>,
     ),
@@ -657,6 +676,10 @@ impl PartialEq for EvaluationResult {
                 // Normalize decimals to handle precision differences (e.g., 1.0 == 1.00)
                 a.normalize() == b.normalize()
             }
+            (
+                EvaluationResult::OutOfRangeDecimal(a, _, _),
+                EvaluationResult::OutOfRangeDecimal(b, _, _),
+            ) => a == b,
             (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => a == b,
             (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => a == b,
             (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => a == b,
@@ -748,6 +771,13 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => a.cmp(b),
             (EvaluationResult::Decimal(_, _, _), _) => Ordering::Less,
             (_, EvaluationResult::Decimal(_, _, _)) => Ordering::Greater,
+
+            (
+                EvaluationResult::OutOfRangeDecimal(a, _, _),
+                EvaluationResult::OutOfRangeDecimal(b, _, _),
+            ) => a.cmp(b),
+            (EvaluationResult::OutOfRangeDecimal(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::OutOfRangeDecimal(_, _, _)) => Ordering::Greater,
 
             (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => a.cmp(b),
             (EvaluationResult::String(_, _, _), _) => Ordering::Less,
@@ -860,6 +890,7 @@ impl Hash for EvaluationResult {
             EvaluationResult::String(s, _, _) => s.hash(state),
             // Hash normalized decimal for consistency with equality
             EvaluationResult::Decimal(d, _, _) => d.normalize().hash(state),
+            EvaluationResult::OutOfRangeDecimal(d, _, _) => d.hash(state),
             EvaluationResult::Integer(i, _, _) => i.hash(state),
             EvaluationResult::Integer64(i, _, _) => i.hash(state),
             EvaluationResult::Date(d, _, _) => d.hash(state),
@@ -956,6 +987,37 @@ impl EvaluationResult {
         EvaluationResult::Decimal(value, Some(TypeInfoResult::new("FHIR", "decimal")), None)
     }
 
+    /// Creates a System Decimal result from decimal text, falling back to
+    /// [`EvaluationResult::OutOfRangeDecimal`] when `rust_decimal` cannot hold it.
+    /// Returns `None` when the text is not a decimal.
+    pub fn decimal_from_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let parsed = if text.contains(['e', 'E']) {
+            Decimal::from_scientific(text).ok()
+        } else {
+            text.parse::<Decimal>().ok()
+        };
+        match parsed {
+            Some(d) => Some(Self::decimal(d)),
+            None => OutOfRangeDecimal::parse(text).map(|d| {
+                EvaluationResult::OutOfRangeDecimal(
+                    d,
+                    Some(TypeInfoResult::new("System", "Decimal")),
+                    None,
+                )
+            }),
+        }
+    }
+
+    /// Creates an out-of-range Decimal result with FHIR type.
+    pub fn fhir_out_of_range_decimal(value: OutOfRangeDecimal) -> Self {
+        EvaluationResult::OutOfRangeDecimal(
+            value,
+            Some(TypeInfoResult::new("FHIR", "decimal")),
+            None,
+        )
+    }
+
     /// Creates a Date result with System type.
     pub fn date(value: String) -> Self {
         EvaluationResult::Date(value, Some(TypeInfoResult::new("System", "Date")), None)
@@ -987,6 +1049,7 @@ impl EvaluationResult {
             EvaluationResult::Boolean(_, _, e)
             | EvaluationResult::String(_, _, e)
             | EvaluationResult::Decimal(_, _, e)
+            | EvaluationResult::OutOfRangeDecimal(_, _, e)
             | EvaluationResult::Integer(_, _, e)
             | EvaluationResult::Integer64(_, _, e)
             | EvaluationResult::Date(_, _, e)
@@ -1008,6 +1071,9 @@ impl EvaluationResult {
             EvaluationResult::Boolean(v, t, _) => EvaluationResult::Boolean(v, t, boxed),
             EvaluationResult::String(v, t, _) => EvaluationResult::String(v, t, boxed),
             EvaluationResult::Decimal(v, t, _) => EvaluationResult::Decimal(v, t, boxed),
+            EvaluationResult::OutOfRangeDecimal(v, t, _) => {
+                EvaluationResult::OutOfRangeDecimal(v, t, boxed)
+            }
             EvaluationResult::Integer(v, t, _) => EvaluationResult::Integer(v, t, boxed),
             EvaluationResult::Integer64(v, t, _) => EvaluationResult::Integer64(v, t, boxed),
             EvaluationResult::Date(v, t, _) => EvaluationResult::Date(v, t, boxed),
@@ -1231,6 +1297,7 @@ impl EvaluationResult {
             EvaluationResult::Boolean(b, _, _) => *b,
             EvaluationResult::String(s, _, _) => !s.is_empty(),
             EvaluationResult::Decimal(d, _, _) => !d.is_zero(),
+            EvaluationResult::OutOfRangeDecimal(d, _, _) => !d.is_zero(),
             EvaluationResult::Integer(i, _, _) => *i != 0,
             EvaluationResult::Integer64(i, _, _) => *i != 0,
             EvaluationResult::Quantity(q, _, _, _) => !q.is_zero(), // Truthy if value is non-zero
@@ -1274,6 +1341,7 @@ impl EvaluationResult {
             EvaluationResult::Boolean(b, _, _) => b.to_string(),
             EvaluationResult::String(s, _, _) => s.clone(),
             EvaluationResult::Decimal(d, _, _) => d.to_string(),
+            EvaluationResult::OutOfRangeDecimal(d, _, _) => d.to_scientific_string(),
             EvaluationResult::Integer(i, _, _) => i.to_string(),
             EvaluationResult::Integer64(i, _, _) => i.to_string(),
             EvaluationResult::Date(d, _, _) => d.clone(), // Return stored string
@@ -1398,6 +1466,7 @@ impl EvaluationResult {
             }
             // Per FHIRPath spec section 5.2: other types evaluate to Empty for logical operators
             EvaluationResult::Decimal(_, _, _)
+            | EvaluationResult::OutOfRangeDecimal(_, _, _)
             | EvaluationResult::Date(_, _, _)
             | EvaluationResult::DateTime(_, _, _)
             | EvaluationResult::Time(_, _, _)
@@ -1454,7 +1523,9 @@ impl EvaluationResult {
             EvaluationResult::Empty => "Empty",
             EvaluationResult::Boolean(_, _, _) => "Boolean",
             EvaluationResult::String(_, _, _) => "String",
-            EvaluationResult::Decimal(_, _, _) => "Decimal",
+            EvaluationResult::Decimal(_, _, _) | EvaluationResult::OutOfRangeDecimal(_, _, _) => {
+                "Decimal"
+            }
             EvaluationResult::Integer(_, _, _) => "Integer",
             EvaluationResult::Integer64(_, _, _) => "Integer64",
             EvaluationResult::Date(_, _, _) => "Date",
@@ -1619,7 +1690,7 @@ where
 }
 
 /// Formats a unit for display in toString() output
-fn format_unit_for_display(unit: &str) -> String {
+pub fn format_unit_for_display(unit: &str) -> String {
     // FHIRPath spec formatting for units in toString():
     // - Calendar word units (week, day, etc.): displayed without quotes
     // - UCUM code units ('wk', 'mg', etc.): displayed with quotes

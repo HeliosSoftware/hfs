@@ -626,12 +626,10 @@ fn json_value_to_evaluation_result(value: &Value) -> FhirPathResult<EvaluationRe
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(EvaluationResult::integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(EvaluationResult::decimal(
-                    rust_decimal::Decimal::try_from(f).map_err(|e| {
-                        FhirPathError::InvalidInput(format!("Invalid decimal: {}", e))
-                    })?,
-                ))
+            } else if let Some(d) = EvaluationResult::decimal_from_text(&n.to_string()) {
+                // Parse the number's text, so a value beyond rust_decimal's range
+                // (`1e999999999`) is kept instead of failing through f64 (#2716).
+                Ok(d)
             } else {
                 Err(FhirPathError::InvalidInput("Invalid number".to_string()))
             }
@@ -729,6 +727,7 @@ fn convert_evaluation_result_to_json(result: &EvaluationResult) -> Value {
         EvaluationResult::String(s, _, _) => json!(s),
         EvaluationResult::Integer(i, _, _) => json!(i),
         EvaluationResult::Decimal(d, _, _) => json!(d.to_string()),
+        EvaluationResult::OutOfRangeDecimal(d, _, _) => json!(d.to_scientific_string()),
         EvaluationResult::Date(d, _, _) => json!(d),
         EvaluationResult::DateTime(dt, _, _) => json!(dt),
         EvaluationResult::Time(t, _, _) => json!(t),
@@ -835,6 +834,16 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             Ok(json!({
                 "name": type_name,
                 "valueDecimal": d
+            }))
+        }
+        EvaluationResult::OutOfRangeDecimal(d, type_info, _) => {
+            let type_name = match type_info {
+                Some(info) => info.name.clone(),
+                None => "decimal".to_string(),
+            };
+            Ok(json!({
+                "name": type_name,
+                "valueDecimal": crate::json_utils::out_of_range_decimal_to_json(&d)
             }))
         }
         EvaluationResult::Date(d, type_info, _) => {

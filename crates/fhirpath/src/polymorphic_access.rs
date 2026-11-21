@@ -994,7 +994,8 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".integer");
                         Ok(EvaluationResult::boolean(is_integer_type))
                     }
-                    EvaluationResult::Decimal(_, _, _) => {
+                    EvaluationResult::Decimal(_, _, _)
+                    | EvaluationResult::OutOfRangeDecimal(_, _, _) => {
                         // Check for qualifiers like "System.Decimal" and "FHIR.decimal"
                         let is_decimal_type = type_name == "Decimal"
                             || type_name == "decimal"

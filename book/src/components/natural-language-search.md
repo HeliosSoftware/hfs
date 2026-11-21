@@ -131,8 +131,10 @@ Prompt instructions alone are never sufficient, which is why they are paired
 with the two server-side checks above: if the model is talked into misbehaving,
 the response still fails validation.
 
-**Rate limits.** Requests are counted per authenticated user (per peer address
-when authentication is disabled), within a tenant:
+**Rate limits.** Requests are counted per authenticated user within its
+tenant. With authentication disabled they are counted per peer address alone:
+the tenant is then whatever the caller names in `X-Tenant-ID` or the URL, so
+it cannot open a fresh budget. The ceilings are:
 
 - a sliding window (`RATE_LIMIT` per `RATE_WINDOW_SECS`),
 - a daily ceiling (`DAILY_LIMIT`) as a backstop against a slow-drip abuser who

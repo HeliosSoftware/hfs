@@ -1,13 +1,17 @@
 //! REST-hook channel dispatcher.
 //!
 //! Delivers notification bundles via HTTP POST to the subscriber's endpoint.
+//!
+//! Endpoints that are, or resolve to, a loopback / private / link-local IP are
+//! rejected unless `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`, and
+//! redirects are never followed (see [`super::egress`]).
 
 use async_trait::async_trait;
 use helios_persistence::core::bulk_submit_input::{redact_url, redact_urls_in};
 use reqwest::Client;
-use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::channels::egress::{self, check_endpoint_host};
 use crate::channels::{ChannelDispatcher, DispatchResult};
 use crate::error::SubscriptionError;
 use crate::manager::{ActiveSubscription, PayloadContent};
@@ -18,22 +22,38 @@ use crate::manager::{ActiveSubscription, PayloadContent};
 /// Supports custom headers and TLS enforcement for full-resource payloads.
 pub struct RestHookChannel {
     client: Client,
+    /// When `true`, delivery to private/loopback IPs is allowed. Default
+    /// `false`; tests and local dev opt in.
+    private_endpoints_allowed: bool,
 }
 
 impl RestHookChannel {
     /// Creates a new REST-hook channel with default HTTP client settings.
     pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
-
-        Self { client }
+        Self {
+            client: egress::build_client(false),
+            private_endpoints_allowed: false,
+        }
     }
 
-    /// Creates a new REST-hook channel with a custom HTTP client.
+    /// Creates a new REST-hook channel with a custom HTTP client. The client
+    /// brings its own DNS and redirect behaviour; literal private/loopback
+    /// endpoint hosts are still refused unless
+    /// [`with_private_endpoints_allowed`](Self::with_private_endpoints_allowed)
+    /// says otherwise.
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            private_endpoints_allowed: false,
+        }
+    }
+
+    /// Enable or disable delivery to private/loopback IPs
+    /// (`HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS`). Replaces the HTTP client.
+    pub fn with_private_endpoints_allowed(mut self, allowed: bool) -> Self {
+        self.private_endpoints_allowed = allowed;
+        self.client = egress::build_client(allowed);
+        self
     }
 
     /// Sends a notification bundle to the given endpoint.
@@ -55,6 +75,13 @@ impl RestHookChannel {
             return Ok(DispatchResult::PermanentError(
                 "full-resource payload requires HTTPS endpoint".to_string(),
             ));
+        }
+
+        // SSRF guard.
+        if !self.private_endpoints_allowed {
+            if let Some(reason) = check_endpoint_host(endpoint) {
+                return Ok(DispatchResult::PermanentError(reason));
+            }
         }
 
         let mut request = self
@@ -95,6 +122,15 @@ impl RestHookChannel {
                         "Notification delivery failed (client error)"
                     );
                     Ok(DispatchResult::PermanentError(format!("HTTP {status}")))
+                } else if response.status().is_redirection() {
+                    warn!(
+                        subscription_id = %subscription.id,
+                        status,
+                        "Notification delivery failed (endpoint redirects; redirects are not followed)"
+                    );
+                    Ok(DispatchResult::PermanentError(format!(
+                        "HTTP {status}: redirects are not followed"
+                    )))
                 } else {
                     warn!(
                         subscription_id = %subscription.id,
@@ -107,7 +143,14 @@ impl RestHookChannel {
             Err(e) => {
                 // reqwest's message ends with `for url (...)`, query included.
                 let error = redact_urls_in(&e.to_string());
-                if e.is_timeout() {
+                if let Some(reason) = egress::blocked_resolution(&e) {
+                    warn!(
+                        subscription_id = %subscription.id,
+                        reason = %reason,
+                        "Notification delivery refused"
+                    );
+                    Ok(DispatchResult::PermanentError(reason))
+                } else if e.is_timeout() {
                     warn!(
                         subscription_id = %subscription.id,
                         "Notification delivery timed out"
@@ -205,7 +248,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
 
@@ -221,7 +264,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
 
@@ -237,7 +280,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
 
@@ -261,7 +304,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
 
@@ -270,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_enforcement_for_full_resource() {
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(
             "http://insecure.example.com/webhook",
             PayloadContent::FullResource,
@@ -292,7 +335,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         // MockServer uses HTTP, which is fine for id-only.
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
@@ -309,7 +352,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(&format!("{}/webhook", server.uri()), PayloadContent::IdOnly);
         let bundle = test_bundle();
         let result = channel.handshake(&sub, &bundle).await.unwrap();
@@ -319,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_error_message_redacts_endpoint_query() {
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let sub = test_subscription(
             "http://127.0.0.1:1/webhook?token=QUERYSECRET",
             PayloadContent::IdOnly,
@@ -335,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_error() {
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         // Use a port that nothing is listening on.
         let sub = test_subscription("http://127.0.0.1:1/webhook", PayloadContent::IdOnly);
         let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
@@ -345,11 +388,62 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_endpoint() {
-        let channel = RestHookChannel::new();
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
         let mut sub = test_subscription("http://example.com/webhook", PayloadContent::IdOnly);
         sub.channel.endpoint = None;
 
         let result = channel.dispatch(&sub, &test_bundle()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_endpoints_are_refused_unless_private_endpoints_are_allowed() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let channel = RestHookChannel::new();
+
+        for endpoint in [
+            format!("http://127.0.0.1:{port}/hook"),
+            format!("http://[::1]:{port}/hook"),
+            // Not an IP literal: refused when the name resolves.
+            format!("http://localhost:{port}/hook"),
+        ] {
+            let sub = test_subscription(&endpoint, PayloadContent::IdOnly);
+            let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
+            match result {
+                DispatchResult::PermanentError(msg) => {
+                    assert!(msg.contains("private/loopback IP"), "{endpoint}: {msg}")
+                }
+                other => panic!("{endpoint}: expected PermanentError, got {other:?}"),
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A redirect would carry the Subscription's headers to a host nobody
+    /// checked.
+    #[tokio::test]
+    async fn redirect_is_a_permanent_error_and_is_not_followed() {
+        let target = MockServer::start().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/elsewhere", target.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
+        let mut sub = test_subscription(&format!("{}/hook", server.uri()), PayloadContent::IdOnly);
+        sub.channel.headers = vec!["X-Api-Key: receiver-secret".to_string()];
+        let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
+        match result {
+            DispatchResult::PermanentError(msg) => {
+                assert!(msg.contains("redirects are not followed"), "{msg}")
+            }
+            other => panic!("expected PermanentError, got {other:?}"),
+        }
+        assert!(target.received_requests().await.unwrap().is_empty());
     }
 }

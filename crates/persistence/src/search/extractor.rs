@@ -1686,6 +1686,9 @@ fn evaluation_result_to_json_values(
                 serde_json::Number::from_f64(f).unwrap_or_else(|| serde_json::Number::from(0)),
             )])
         }
+        // A decimal beyond rust_decimal's range (`1e999999999`) has no numeric
+        // index value; index nothing rather than a wrong number (#2716).
+        EvaluationResult::OutOfRangeDecimal(..) => Ok(Vec::new()),
         EvaluationResult::Date(s, _, _) => Ok(vec![Value::String(s.clone())]),
         EvaluationResult::DateTime(s, _, _) => Ok(vec![Value::String(s.clone())]),
         EvaluationResult::Time(s, _, _) => Ok(vec![Value::String(s.clone())]),

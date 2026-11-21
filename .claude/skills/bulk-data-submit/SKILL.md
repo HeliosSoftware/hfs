@@ -17,7 +17,7 @@ HFS implements the FHIR Bulk Data Submit operation from the Argo25 branch as the
 | cancel | DELETE | `/bulk-submit-status/{poll_token}` | `202`; subsequent poll returns `404` |
 | HFS-served artifact | GET | `/bulk-submit-file/{poll_token}/{part}` | `200` `application/fhir+ndjson` |
 
-All surfaces require the `system/bulk-submit` SMART scope when auth is enabled. Status, cancel, and file endpoints also enforce submission ownership through `owner_subject` or a system wildcard scope.
+All surfaces require the `system/bulk-submit` SMART scope when auth is enabled. Status, cancel and file endpoints, and a kick-off or status kick-off that names an existing submission, also enforce submission ownership through `owner_subject` or a system wildcard scope; a non-owner is answered `404`.
 
 ## Kick-off Parameters
 
@@ -70,6 +70,8 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Reaches the worker since #1127; before that it was parsed and ignored, and every run used `100` whatever it said. The default was `100` until the deferred-rebuild measurements showed `1000` ingesting 19 % faster on SQLite (72k Synthea resources, 3.77 s at 100 against 3.05 s at 1000) and inline indexing ordering the same way (23.4 s against 19.7 s); the older 382 s-against-252 s figure was taken with the Elasticsearch index-during-ingest sink on, where the batch also sizes the sink's hand-off. Memory per in-flight batch grows with it (~5 MB per batch of Observations) |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes of a response before treating the body as broken and resuming it with `Range`; connecting is capped separately at 10 s. Must be `> 0` |
+| `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES` | `67108864` | Ceiling in decoded bytes on a fetched manifest, which is read whole; a larger body fails the manifest as soon as it passes the ceiling. Must be `> 0` |
+| `HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES` | `1073741824` | Ceiling in decoded bytes on a JWE-encrypted input file, which is buffered whole; unencrypted NDJSON streams and has no ceiling. Must be `> 0` |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical to it apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions, history rows or index rows. The entry's receipt still reads `success` |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. Measured: a queue of `32` on top of coalesce `16` made ingest a further 65 % slower |
 | `HFS_BULK_SUBMIT_INDEX_CONCURRENCY` | `4` | Index-during-ingest writer tasks. A resource always goes to the same writer, chosen by a hash of type and id, so its versions reach the secondary in order |
