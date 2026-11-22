@@ -4070,7 +4070,11 @@ async fn a_scan_whose_object_read_is_unavailable_fails_as_unavailable() {
         .expect("the unreadable object fails the scan");
     match error {
         SofError::Unavailable(message) => {
-            assert!(message.contains("after 3 attempts"), "message: {message}")
+            assert!(
+                message.contains(crate::error::OBJECT_STORE_UNAVAILABLE_TEXT),
+                "the client detail stays in the log: {message}"
+            );
+            assert!(!message.contains("streaming error"), "message: {message}");
         }
         other => panic!("expected SofError::Unavailable, got {other:?}"),
     }
@@ -7414,8 +7418,8 @@ fn conditional_conflict_maps_to_unavailable_not_query_error() {
     let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
     match backend.map_client_error(S3ClientError::ConditionalConflict("busy".to_string())) {
         StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-            assert!(message.contains("409"), "message was: {message}");
-            assert!(message.contains("busy"), "message was: {message}");
+            assert_eq!(message, crate::error::OBJECT_STORE_CONFLICT_TEXT);
+            assert!(!message.contains("busy"), "message was: {message}");
         }
         other => panic!("expected Unavailable (503), got {other:?}"),
     }

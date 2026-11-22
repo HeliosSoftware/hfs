@@ -10,7 +10,11 @@ use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, OBJECT_STORE_BUCKET_TEXT, OBJECT_STORE_CONFLICT_TEXT,
+    OBJECT_STORE_THROTTLED_TEXT, OBJECT_STORE_UNAVAILABLE_TEXT, StorageError, StorageResult,
+    s3_unavailable,
+};
 use crate::search::{SearchParameterDefinition, TenantSearchRegistries};
 use crate::tenant::{TenantContext, TenantId};
 
@@ -670,12 +674,11 @@ impl S3Backend {
             // The bucket is missing or invisible: the store is misconfigured. This
             // must always be an error — never an empty read — so a typo'd or
             // deleted bucket can't masquerade as a store with no data in it.
-            S3ClientError::BucketNotFound(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message: format!("S3 bucket not found or not accessible: {message}"),
-                })
-            }
+            S3ClientError::BucketNotFound(message) => StorageError::Backend(s3_unavailable(
+                "bucket not found or not accessible",
+                OBJECT_STORE_BUCKET_TEXT,
+                &message,
+            )),
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
@@ -683,24 +686,21 @@ impl S3Backend {
             // and wrote nothing. Deliberately NOT `QueryError`, which the
             // resource paths read as a lost precondition (AlreadyExists /
             // VersionConflict). `Unavailable` is served as 503 with Retry-After.
-            S3ClientError::ConditionalConflict(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message: format!(
-                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
-                    ),
-                })
-            }
-            S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
-                backend_name: "s3".to_string(),
-                message,
-            }),
-            S3ClientError::Unavailable(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message,
-                })
-            }
+            S3ClientError::ConditionalConflict(message) => StorageError::Backend(s3_unavailable(
+                "conflicting concurrent write (HTTP 409)",
+                OBJECT_STORE_CONFLICT_TEXT,
+                &message,
+            )),
+            S3ClientError::Throttled(message) => StorageError::Backend(s3_unavailable(
+                "throttled",
+                OBJECT_STORE_THROTTLED_TEXT,
+                &message,
+            )),
+            S3ClientError::Unavailable(message) => StorageError::Backend(s3_unavailable(
+                "unavailable",
+                OBJECT_STORE_UNAVAILABLE_TEXT,
+                &message,
+            )),
             S3ClientError::InvalidInput(message) => {
                 StorageError::Validation(crate::error::ValidationError::InvalidResource {
                     message,
