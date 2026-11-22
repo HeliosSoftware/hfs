@@ -285,6 +285,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled (see [crates/auth/README.md](crates/auth/README.md#tenant-resolution)) |
+| `HFS_SEARCH_PARAM_CACHE_MAX_TENANTS` | `1024` | How many per-tenant SearchParameter registries stay cached at once; the oldest insertion is evicted past it and rebuilt on its next access. Every distinct tenant id a request names costs one base-registry clone until the hourly refresh, so set it to at least the number of active tenants, and set `HFS_TENANT_REQUIRE_PROVISIONED=true` so unknown ids never reach the cache |
 
 **Terminology**
 
