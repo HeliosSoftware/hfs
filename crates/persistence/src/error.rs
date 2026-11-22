@@ -1272,6 +1272,16 @@ pub(crate) const OBJECT_STORE_CONFLICT_TEXT: &str =
 pub(crate) const OBJECT_STORE_BUCKET_TEXT: &str =
     "the object store bucket is not accessible; the server log has the detail";
 
+/// Client text for an object store that refused the server's credentials.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_ACCESS_TEXT: &str =
+    "the object store refused the server's credentials; the server log has the detail";
+
+/// Client text for a request the object store rejected as invalid.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_INVALID_TEXT: &str =
+    "the object store rejected the request as invalid; the server log has the detail";
+
 /// A [`BackendError::Unavailable`] for the S3 backend with the SDK or service
 /// text in the log and a fixed client sentence in the message, as the other
 /// backends do: the detail names the endpoint, the bucket and the provider's
@@ -1892,9 +1902,7 @@ mod tests {
         }
     }
 
-    /// A pool-acquire failure carries the last connect error, which for a
-    /// file-backed SQLite database is the file path; none of it reaches the
-    /// client.
+    /// The SDK text, the endpoint address and the bucket name stay in the log.
     #[cfg(feature = "s3")]
     #[test]
     fn test_s3_unavailable_leaves_the_detail_to_the_log() {
@@ -1915,6 +1923,9 @@ mod tests {
         }
     }
 
+    /// A pool-acquire failure carries the last connect error, which for a
+    /// file-backed SQLite database is the file path; none of it reaches the
+    /// client.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     fn test_connection_failed_leaves_the_detail_to_the_log() {
