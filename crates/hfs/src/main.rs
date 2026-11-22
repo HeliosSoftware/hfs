@@ -1100,7 +1100,8 @@ async fn create_audit_postgres_storage(
                 "HFS_AUDIT_DATABASE_URL must be a PostgreSQL connection string when primary backend is postgres"
             );
         }
-        let mut backend_config = PostgresBackend::config_from_connection_string(url)?;
+        let mut backend_config =
+            PostgresBackend::config_from_named_connection_string(url, "HFS_AUDIT_DATABASE_URL")?;
         backend_config.fhir_version = server_config.default_fhir_version;
         backend_config.data_dir = server_config.data_dir.clone();
         PostgresBackend::new(backend_config).await?

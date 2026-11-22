@@ -21,7 +21,7 @@ default = ["R4", "sqlite"]
 
 # Database backends
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
@@ -85,6 +85,12 @@ r2d2_sqlite = { version = "0.36", default-features = false, optional = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 postgres-types = { version = "0.2", features = ["derive", "with-serde_json-1"], optional = true }
+# TLS for PostgreSQL connections (#2746). `ring` is the provider the rest of the
+# tree already builds; the connector is given it explicitly, so no process-wide
+# default provider is needed.
+tokio-postgres-rustls = { version = "0.14", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Cassandra backend (using cdrs-tokio - pure Rust driver)
 cdrs-tokio = { version = "8", optional = true }

@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{Config, GenericClient, Pool, Runtime, SslMode};
+use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use tokio_postgres::NoTls;
 
 use helios_fhir::FhirVersion;
 
+use super::tls::{self, PostgresSslMode, PostgresTlsSettings};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
 use crate::search::{
@@ -197,9 +197,22 @@ pub struct PostgresConfig {
     #[serde(default)]
     pub password: Option<String>,
 
-    /// SSL mode.
+    /// SSL mode (`sslmode`). See [`tls`] for what each mode checks.
     #[serde(default)]
     pub ssl_mode: PostgresSslMode,
+
+    /// `sslrootcert`: a PEM file of trusted roots for the verify modes, or
+    /// `system` for the platform store (the default when unset).
+    #[serde(default)]
+    pub ssl_root_cert: Option<String>,
+
+    /// `sslcert`: a client certificate (PEM) for `cert` authentication.
+    #[serde(default)]
+    pub ssl_cert: Option<PathBuf>,
+
+    /// `sslkey`: the private key (PEM) of [`Self::ssl_cert`].
+    #[serde(default)]
+    pub ssl_key: Option<PathBuf>,
 
     /// Maximum number of connections in the pool.
     #[serde(default = "default_max_connections")]
@@ -302,68 +315,83 @@ pub struct PostgresConfig {
     pub search_offloaded: bool,
 }
 
-/// SSL mode for PostgreSQL connections, named as libpq names them.
-///
-/// This build connects with [`NoTls`], so `Disable` and `Prefer` both give a
-/// cleartext link and the three modes that ask for TLS refuse to start rather
-/// than connect in cleartext.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum PostgresSslMode {
-    /// Disable SSL.
-    Disable,
-    /// Prefer SSL, but allow non-SSL.
-    #[default]
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and a certificate signed by a trusted CA.
-    VerifyCa,
-    /// Require SSL, a trusted CA and a matching host name.
-    VerifyFull,
-}
-
-impl PostgresSslMode {
-    /// Parses a libpq `sslmode` value; `None` for anything else.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "disable" => Some(Self::Disable),
-            "prefer" => Some(Self::Prefer),
-            "require" => Some(Self::Require),
-            "verify-ca" => Some(Self::VerifyCa),
-            "verify-full" => Some(Self::VerifyFull),
-            _ => None,
-        }
-    }
-
-    /// The libpq spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disable => "disable",
-            Self::Prefer => "prefer",
-            Self::Require => "require",
-            Self::VerifyCa => "verify-ca",
-            Self::VerifyFull => "verify-full",
-        }
-    }
-
-    /// Whether the mode asks for an encrypted connection.
-    pub fn wants_tls(self) -> bool {
-        matches!(self, Self::Require | Self::VerifyCa | Self::VerifyFull)
-    }
-}
-
-/// `HFS_PG_SSL_MODE`: wins over the `sslmode` of `HFS_DATABASE_URL`.
+/// `HFS_PG_SSL_MODE`: the minimum `sslmode` for every PostgreSQL connection
+/// HFS opens. It raises a weaker `sslmode` on a connection URL and never lowers
+/// a stronger one (#2746).
 const SSL_MODE_ENV: &str = "HFS_PG_SSL_MODE";
+/// `HFS_PG_SSL_ROOT_CERT`: `sslrootcert` when the URL does not set one.
+const SSL_ROOT_CERT_ENV: &str = "HFS_PG_SSL_ROOT_CERT";
+/// `HFS_PG_SSL_CERT`: `sslcert` when the URL does not set one.
+const SSL_CERT_ENV: &str = "HFS_PG_SSL_CERT";
+/// `HFS_PG_SSL_KEY`: `sslkey` when the URL does not set one.
+const SSL_KEY_ENV: &str = "HFS_PG_SSL_KEY";
 
-fn unsupported_ssl_mode(source: &str, value: &str) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Internal {
+/// The source label of `HFS_DATABASE_URL` in configuration errors.
+const DATABASE_URL_ENV: &str = "HFS_DATABASE_URL";
+
+fn config_error(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::InvalidConfiguration {
         backend_name: "postgres".to_string(),
-        message: format!(
-            "{source}: sslmode {value:?} is not one of disable, prefer, require, verify-ca, verify-full"
-        ),
-        source: None,
+        message,
     })
+}
+
+/// The effective `sslmode` from a URL's `sslmode` (with the URL's source name)
+/// and the raw `HFS_PG_SSL_MODE` value.
+///
+/// The variable is a minimum: the stronger of the two wins, so a deployment-wide
+/// `HFS_PG_SSL_MODE=disable` cannot quietly weaken a `verify-full` written on one
+/// URL (the audit database's, say). A weaker variable is ignored with a warning.
+/// An unknown variable value is an error, so a misspelt mode cannot fall back
+/// to cleartext. With neither set, the mode is `prefer`.
+fn resolve_ssl_mode(
+    url: Option<(PostgresSslMode, &str)>,
+    env_value: Option<&str>,
+) -> StorageResult<PostgresSslMode> {
+    let env_mode = env_value
+        .map(|value| {
+            PostgresSslMode::parse(value)
+                .ok_or_else(|| config_error(tls::unknown_ssl_mode_message(SSL_MODE_ENV, value)))
+        })
+        .transpose()?;
+    Ok(match (url, env_mode) {
+        (Some((url_mode, source)), Some(env_mode)) => {
+            if env_mode < url_mode {
+                tracing::warn!(
+                    "{SSL_MODE_ENV}={} is weaker than sslmode={} on {source} and is ignored for \
+                     that connection: {SSL_MODE_ENV} sets a minimum",
+                    env_mode.as_str(),
+                    url_mode.as_str()
+                );
+            }
+            url_mode.max(env_mode)
+        }
+        (Some((url_mode, _)), None) => url_mode,
+        (None, Some(env_mode)) => env_mode,
+        (None, None) => PostgresSslMode::default(),
+    })
+}
+
+/// An error with its `source()` chain, `": "`-joined.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// A path-valued variable; unset and empty are the same.
+fn env_path(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// `plan_cache_mode` for pooled connections.
@@ -552,6 +580,9 @@ impl Debug for PostgresConfig {
             user,
             password,
             ssl_mode,
+            ssl_root_cert,
+            ssl_cert,
+            ssl_key,
             max_connections,
             limit_pool_to_server,
             connect_timeout_secs,
@@ -570,6 +601,9 @@ impl Debug for PostgresConfig {
             .field("user", user)
             .field("password", &password.as_ref().map(|_| "[redacted]"))
             .field("ssl_mode", ssl_mode)
+            .field("ssl_root_cert", ssl_root_cert)
+            .field("ssl_cert", ssl_cert)
+            .field("ssl_key", ssl_key)
             .field("max_connections", max_connections)
             .field("limit_pool_to_server", limit_pool_to_server)
             .field("connect_timeout_secs", connect_timeout_secs)
@@ -596,6 +630,9 @@ impl Default for PostgresConfig {
             user: default_user(),
             password: None,
             ssl_mode: PostgresSslMode::default(),
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
             max_connections: default_max_connections(),
             limit_pool_to_server: false,
             connect_timeout_secs: default_connect_timeout_secs(),
@@ -659,14 +696,37 @@ impl PostgresConfig {
         }
     }
 
-    /// Applies `HFS_PG_SSL_MODE`. Unlike the tuning knobs, a value that does
-    /// not parse is an error: a misspelt mode must not fall back to cleartext.
-    fn apply_ssl_mode_from_env(&mut self) -> StorageResult<()> {
-        if let Ok(value) = std::env::var(SSL_MODE_ENV) {
-            self.ssl_mode = PostgresSslMode::parse(&value)
-                .ok_or_else(|| unsupported_ssl_mode(SSL_MODE_ENV, &value))?;
-        }
+    /// Sets the TLS fields from a URL's parameters (`url`, with the URL's
+    /// source name) and the `HFS_PG_SSL_*` variables: `HFS_PG_SSL_MODE` is a
+    /// minimum (see [`resolve_ssl_mode`]); the certificate paths on the URL win
+    /// over the variables.
+    fn apply_tls(&mut self, url: Option<(&tls::UrlTlsParams, &str)>) -> StorageResult<()> {
+        let env_mode = std::env::var(SSL_MODE_ENV).ok();
+        self.ssl_mode = resolve_ssl_mode(
+            url.and_then(|(params, source)| params.mode.map(|mode| (mode, source))),
+            env_mode.as_deref(),
+        )?;
+        let params = url.map(|(params, _)| params);
+        self.ssl_root_cert = params
+            .and_then(|p| p.root_cert.clone())
+            .or_else(|| env_path(SSL_ROOT_CERT_ENV));
+        self.ssl_cert = params
+            .and_then(|p| p.cert.clone())
+            .or_else(|| env_path(SSL_CERT_ENV).map(PathBuf::from));
+        self.ssl_key = params
+            .and_then(|p| p.key.clone())
+            .or_else(|| env_path(SSL_KEY_ENV).map(PathBuf::from));
         Ok(())
+    }
+
+    /// The TLS parameters of this configuration.
+    pub fn tls_settings(&self) -> PostgresTlsSettings {
+        PostgresTlsSettings {
+            mode: self.ssl_mode,
+            root_cert: self.ssl_root_cert.clone(),
+            cert: self.ssl_cert.clone(),
+            key: self.ssl_key.clone(),
+        }
     }
 
     /// The `statement_timeout` the cross-tenant `count_by_tenant` aggregate
@@ -777,9 +837,22 @@ impl PostgresBackend {
         let client = pool.get().await.map_err(|e| {
             crate::error::StorageError::Backend(BackendError::ConnectionFailed {
                 backend_name: "postgres".to_string(),
-                message: e.to_string(),
+                // The chain, not just `Display`: tokio-postgres prints only the
+                // error kind ("db error", "error performing TLS handshake"), and
+                // the reason (pg_hba rejection, certificate not trusted, ...)
+                // is in `source()`.
+                message: error_chain(&e),
             })
         })?;
+
+        // Say once whether the link is encrypted, read from the server (#2746).
+        tls::log_connection_security(
+            &client,
+            "fhir-store",
+            &format!("{}:{}", config.host, config.port),
+            &config.tls_settings(),
+        )
+        .await;
 
         // Keep default-sized pools within what the server accepts, together with
         // the other pools of this process on the same server (see `pool_budget`).
@@ -899,12 +972,27 @@ impl PostgresBackend {
         Self::new(Self::config_from_connection_string(url)?).await
     }
 
+    /// [`Self::from_connection_string`] for a URL read from `source`
+    /// (`HTS_DATABASE_URL`, ...), which configuration errors name.
+    pub async fn from_named_connection_string(url: &str, source: &str) -> StorageResult<Self> {
+        Self::new(Self::config_from_named_connection_string(url, source)?).await
+    }
+
     /// Builds the configuration `from_connection_string` would connect with,
     /// without connecting. Callers that need to override config fields the URL
     /// cannot express (e.g. the server's default FHIR version) adjust the
     /// returned config and pass it to [`PostgresBackend::new`].
     pub fn config_from_connection_string(url: &str) -> StorageResult<PostgresConfig> {
-        let mut config = Self::parse_connection_string(url)?;
+        Self::config_from_named_connection_string(url, DATABASE_URL_ENV)
+    }
+
+    /// [`Self::config_from_connection_string`] for a URL read from `source`
+    /// (`HFS_AUDIT_DATABASE_URL`, ...), which configuration errors name.
+    pub fn config_from_named_connection_string(
+        url: &str,
+        source: &str,
+    ) -> StorageResult<PostgresConfig> {
+        let mut config = Self::parse_connection_string_from(url, source)?;
         config.connect_timeout_secs = connect_timeout_secs_from_env();
         Ok(config)
     }
@@ -950,7 +1038,7 @@ impl PostgresBackend {
         // Pool/timeout knobs are applied through the shared helper so this path and
         // the connection-URL path cannot drift apart again.
         config.apply_env_overrides();
-        config.apply_ssl_mode_from_env()?;
+        config.apply_tls(None)?;
         Ok(config)
     }
 
@@ -961,39 +1049,17 @@ impl PostgresBackend {
         cfg.dbname = Some(config.dbname.clone());
         cfg.user = Some(config.user.clone());
         cfg.password = config.password.clone();
-        // The pool is built with `NoTls`, so a mode that asks for TLS cannot be
-        // honoured; refusing here keeps the request from degrading into the
-        // cleartext link `Prefer` would make.
-        if config.ssl_mode.wants_tls() {
-            return Err(crate::error::StorageError::Backend(
-                BackendError::Internal {
-                    backend_name: "postgres".to_string(),
-                    message: format!(
-                        "sslmode={} asks for an encrypted connection to {}:{}, but this build has no \
-                     TLS connector for PostgreSQL; terminate TLS next to HFS (a local proxy or \
-                     tunnel) and set sslmode=disable, or set sslmode=prefer to accept a cleartext \
-                     connection",
-                        config.ssl_mode.as_str(),
-                        config.host,
-                        config.port
-                    ),
-                    source: None,
-                },
-            ));
-        }
-        tracing::warn!(
-            host = %config.host,
-            port = config.port,
-            sslmode = config.ssl_mode.as_str(),
-            "PostgreSQL connection is not encrypted: this build has no TLS connector for PostgreSQL"
-        );
-        cfg.ssl_mode = Some(match config.ssl_mode {
-            PostgresSslMode::Disable => SslMode::Disable,
-            PostgresSslMode::Prefer => SslMode::Prefer,
-            PostgresSslMode::Require | PostgresSslMode::VerifyCa | PostgresSslMode::VerifyFull => {
-                SslMode::Require
-            }
-        });
+        // The driver knows disable / prefer / require; the certificate checks of
+        // the verify modes live in the connector (#2746).
+        cfg.ssl_mode = Some(config.ssl_mode.driver_mode());
+        let tls = config.tls_settings().connector().map_err(|message| {
+            config_error(format!(
+                "TLS for {}:{} (sslmode={}): {message}",
+                config.host,
+                config.port,
+                config.ssl_mode.as_str()
+            ))
+        })?;
 
         let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
 
@@ -1020,7 +1086,7 @@ impl PostgresBackend {
         cfg.application_name = Some("hfs".to_string());
 
         let pool = cfg
-            .builder(NoTls)
+            .builder(tls)
             .map_err(|e| {
                 crate::error::StorageError::Backend(BackendError::Internal {
                     backend_name: "postgres".to_string(),
@@ -1058,7 +1124,12 @@ impl PostgresBackend {
         Ok(pool)
     }
 
+    #[cfg(test)]
     fn parse_connection_string(url: &str) -> StorageResult<PostgresConfig> {
+        Self::parse_connection_string_from(url, DATABASE_URL_ENV)
+    }
+
+    fn parse_connection_string_from(url: &str, source: &str) -> StorageResult<PostgresConfig> {
         // Parse postgres:// URL format
         // postgres://user:password@host:port/dbname[?params]
         let url = url
@@ -1068,22 +1139,18 @@ impl PostgresBackend {
 
         // Split the query string off before splitting on '/', otherwise it lands
         // in `dbname` verbatim (`.../postgres?sslmode=require` → dbname
-        // "postgres?sslmode=require", which no server will resolve). `sslmode`
-        // is the one parameter read from it.
+        // "postgres?sslmode=require", which no server will resolve). The TLS
+        // parameters are the ones read from it.
         let (url, query) = match url.split_once('?') {
             Some((url, query)) => (url, Some(query)),
             None => (url, None),
         };
 
         let mut config = PostgresConfig::default();
-        if let Some(value) = query.and_then(|query| {
-            query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("sslmode="))
-        }) {
-            config.ssl_mode = PostgresSslMode::parse(value)
-                .ok_or_else(|| unsupported_ssl_mode("HFS_DATABASE_URL", value))?;
-        }
+        let tls_params = match query {
+            Some(query) => tls::take_tls_params(query, source).map_err(config_error)?.0,
+            None => tls::UrlTlsParams::default(),
+        };
 
         // Split user:password@host:port/dbname
         if let Some((userinfo, rest)) = url.split_once('@') {
@@ -1111,7 +1178,7 @@ impl PostgresBackend {
         }
 
         config.apply_env_overrides();
-        config.apply_ssl_mode_from_env()?;
+        config.apply_tls(Some((&tls_params, source)))?;
         Ok(config)
     }
 
@@ -2244,34 +2311,98 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_unknown_sslmode() {
+    fn refuses_an_unknown_sslmode_naming_the_variable() {
         let Err(err) =
             PostgresBackend::parse_connection_string("postgres://u:p@h/db?sslmode=requier")
         else {
             panic!("an unknown sslmode is refused, not ignored");
         };
-        assert!(err.to_string().contains("requier"), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("invalid postgres configuration: HFS_DATABASE_URL: "),
+            "{text}"
+        );
+        assert!(text.contains("requier"), "{text}");
+
+        let Err(err) = PostgresBackend::parse_connection_string_from(
+            "postgres://u:p@h/db?sslmode=requier",
+            "HFS_AUDIT_DATABASE_URL",
+        ) else {
+            panic!("an unknown sslmode is refused, not ignored");
+        };
+        assert!(
+            err.to_string()
+                .contains("HFS_AUDIT_DATABASE_URL: sslmode \"requier\""),
+            "{err}"
+        );
     }
 
     #[test]
-    fn a_mode_that_asks_for_tls_is_refused_without_a_connector() {
-        for mode in [
-            PostgresSslMode::Require,
-            PostgresSslMode::VerifyCa,
-            PostgresSslMode::VerifyFull,
-        ] {
-            let cfg = PostgresConfig {
-                ssl_mode: mode,
-                ..Default::default()
-            };
-            let Err(err) = PostgresBackend::create_pool(&cfg) else {
-                panic!("a TLS mode cannot be served by a NoTls pool");
-            };
-            let text = err.to_string();
-            assert!(text.contains(mode.as_str()), "{text}");
-            assert!(text.contains("no TLS connector"), "{text}");
+    fn the_last_sslmode_wins_and_allow_is_accepted() {
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://u:p@h/db?sslmode=disable&sslmode=require",
+        )
+        .unwrap();
+        assert_eq!(cfg.ssl_mode, PostgresSslMode::Require);
+        let cfg =
+            PostgresBackend::parse_connection_string("postgres://u:p@h/db?sslmode=allow").unwrap();
+        assert_eq!(cfg.ssl_mode, PostgresSslMode::Allow);
+    }
+
+    #[test]
+    fn reads_the_certificate_parameters_from_the_query_string() {
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=%2Fetc%2Fpg%2Fca.pem&sslcert=/c.pem&sslkey=/k.pem",
+        )
+        .unwrap();
+        assert_eq!(cfg.dbname, "db");
+        assert_eq!(cfg.ssl_root_cert.as_deref(), Some("/etc/pg/ca.pem"));
+        assert_eq!(cfg.ssl_cert, Some(PathBuf::from("/c.pem")));
+        assert_eq!(cfg.ssl_key, Some(PathBuf::from("/k.pem")));
+        let tls = cfg.tls_settings();
+        assert_eq!(tls.mode, PostgresSslMode::VerifyFull);
+        assert_eq!(tls.root_cert.as_deref(), Some("/etc/pg/ca.pem"));
+    }
+
+    #[test]
+    fn the_variable_is_a_minimum_for_the_url_mode() {
+        let url = |mode| Some((mode, "HFS_AUDIT_DATABASE_URL"));
+        // Raises a weaker URL mode.
+        assert_eq!(
+            resolve_ssl_mode(url(PostgresSslMode::Prefer), Some("verify-full")).unwrap(),
+            PostgresSslMode::VerifyFull
+        );
+        // Never lowers a stronger one.
+        assert_eq!(
+            resolve_ssl_mode(url(PostgresSslMode::VerifyFull), Some("disable")).unwrap(),
+            PostgresSslMode::VerifyFull
+        );
+        // Alone, each side is taken as given; neither means `prefer`.
+        assert_eq!(
+            resolve_ssl_mode(url(PostgresSslMode::Disable), None).unwrap(),
+            PostgresSslMode::Disable
+        );
+        assert_eq!(
+            resolve_ssl_mode(None, Some("disable")).unwrap(),
+            PostgresSslMode::Disable
+        );
+        assert_eq!(
+            resolve_ssl_mode(None, None).unwrap(),
+            PostgresSslMode::Prefer
+        );
+        // A misspelt or empty variable is an error, never a silent fallback.
+        for bad in ["requier", ""] {
+            let err = resolve_ssl_mode(url(PostgresSslMode::Require), Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("HFS_PG_SSL_MODE: sslmode"),
+                "{err}"
+            );
         }
-        for mode in [PostgresSslMode::Disable, PostgresSslMode::Prefer] {
+    }
+
+    #[test]
+    fn every_mode_builds_a_pool_with_the_tls_connector() {
+        for mode in PostgresSslMode::ALL {
             let cfg = PostgresConfig {
                 ssl_mode: mode,
                 ..Default::default()
@@ -2282,6 +2413,25 @@ mod tests {
                 mode.as_str()
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_root_certificate_is_a_configuration_error() {
+        let cfg = PostgresConfig {
+            ssl_mode: PostgresSslMode::VerifyCa,
+            ssl_root_cert: Some("/nonexistent/root.crt".to_string()),
+            ..Default::default()
+        };
+        let Err(err) = PostgresBackend::create_pool(&cfg) else {
+            panic!("a missing sslrootcert is refused at startup");
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("invalid postgres configuration: TLS for "),
+            "{text}"
+        );
+        assert!(text.contains("sslmode=verify-ca"), "{text}");
+        assert!(text.contains("/nonexistent/root.crt"), "{text}");
     }
 
     #[test]
