@@ -39,17 +39,14 @@ pub fn repeat_function(
     // of repeated projections, NOT including the initial items
     let mut result = Vec::new();
 
-    // Use a HashSet to track what we've already seen to avoid infinite recursion
-    // and to make it easier to check if we've seen an item before
+    // Items already in the output. A projected item is added (and projected
+    // again) only if it is not already here, which is also what stops cycles.
+    // The input collection is deliberately NOT seeded into this set: repeat()
+    // does not output its input as such, but an input item the projection
+    // yields is new to the output and must be included, so
+    // `(1 | 2).repeat($this)` is `1 | 2` (tests-fhir-r5.xml testRepeat6).
+    // The debug representation serves as a simple equality key.
     let mut seen_items = HashSet::new();
-
-    // Add all initial items to the seen set, but don't add them to the result
-    // According to the FHIRPath spec, repeat() doesn't include the initial collection
-    for item in &initial_items {
-        // We use the debug representation as a simple way to create a string key
-        let item_key = format!("{:?}", item);
-        seen_items.insert(item_key);
-    }
 
     // Keep track of items we still need to process
     let mut items_to_process = initial_items;
@@ -282,5 +279,21 @@ mod tests {
         } else {
             panic!("Expected collection result, got: {:?}", result);
         }
+    }
+
+    #[test]
+    fn test_repeat_includes_input_items_the_projection_yields() {
+        // tests-fhir-r5.xml testRepeat6: (1 | 2).repeat($this) is 1 | 2. The
+        // input is not output as such, but an item the projection yields is
+        // new to the output even when it was also in the input.
+        let input = EvaluationResult::Collection {
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
+            has_undefined_order: false,
+            type_info: None,
+        };
+        let context = EvaluationContext::new_empty_with_default_version();
+        let parsed = parser().parse("$this").into_result().unwrap();
+        let result = repeat_function(&input, &parsed, &context).unwrap();
+        assert_eq!(result.count(), 2, "got {result:?}");
     }
 }
