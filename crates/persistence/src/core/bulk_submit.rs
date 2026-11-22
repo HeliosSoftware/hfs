@@ -1066,10 +1066,26 @@ pub struct BulkProcessingOptions {
     /// correct with several batches in flight.
     #[serde(default = "default_batch_writers")]
     pub batch_writers: u32,
+    /// Longest line of an NDJSON input file the stream buffers before parsing
+    /// it (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). A longer line is rejected like a
+    /// malformed one, its bytes are discarded up to the next newline, and the
+    /// file continues or aborts under the `max_errors` rules. Bounds the
+    /// memory one provider-served line can take in the server process.
+    #[serde(default = "default_max_line_bytes")]
+    pub max_line_bytes: u64,
 }
 
 fn default_submit_batch_size() -> u32 {
     100
+}
+
+/// Longest NDJSON line the ingest buffers before parsing it
+/// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`): the REST API's default body ceiling,
+/// so a single submitted resource may be as large as one the API accepts.
+pub const DEFAULT_MAX_LINE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn default_max_line_bytes() -> u64 {
+    DEFAULT_MAX_LINE_BYTES
 }
 
 fn default_batch_writers() -> u32 {
@@ -1107,7 +1123,15 @@ impl BulkProcessingOptions {
             skip_unchanged: false,
             resume_after_line: 0,
             batch_writers: default_batch_writers(),
+            max_line_bytes: default_max_line_bytes(),
         }
+    }
+
+    /// Sets the longest NDJSON line the stream buffers (see
+    /// [`Self::max_line_bytes`]). Values below 1 are treated as 1.
+    pub fn with_max_line_bytes(mut self, max_line_bytes: u64) -> Self {
+        self.max_line_bytes = max_line_bytes.max(1);
+        self
     }
 
     /// Sets how many batches of one file write concurrently (see

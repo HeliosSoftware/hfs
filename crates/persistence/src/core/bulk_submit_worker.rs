@@ -1246,6 +1246,9 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Entries per ingest transaction (`HFS_BULK_SUBMIT_BATCH_SIZE`, #1127).
     /// `None` keeps the engine's default.
     batch_size: Option<u32>,
+    /// Longest NDJSON line buffered before parsing
+    /// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). `None` keeps the engine's default.
+    max_line_bytes: Option<u64>,
     /// Batches of one output file written concurrently
     /// (`HFS_BULK_SUBMIT_BATCH_WRITERS`). `None` keeps the engine's default
     /// of one; the engine caps it (SQLite: always one).
@@ -1881,6 +1884,7 @@ where
             file_concurrency: 1,
             owned_file_executor: None,
             batch_size: None,
+            max_line_bytes: None,
             batch_writers: None,
             skip_unchanged: false,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1909,6 +1913,23 @@ where
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size.max(1));
         self
+    }
+
+    /// Sets the longest NDJSON line the ingest buffers before parsing it
+    /// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). Values below 1 are treated as 1.
+    pub fn with_max_line_bytes(mut self, max_line_bytes: u64) -> Self {
+        self.max_line_bytes = Some(max_line_bytes.max(1));
+        self
+    }
+
+    /// The line ceiling in force for this worker.
+    fn max_line_bytes(&self) -> usize {
+        usize::try_from(
+            self.max_line_bytes
+                .unwrap_or(crate::core::bulk_submit::DEFAULT_MAX_LINE_BYTES),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1)
     }
 
     /// Sets how many batches of one output file the ingest writes
@@ -2118,6 +2139,10 @@ where
             .with_cancel(cancel.clone());
         let opts = match self.batch_size {
             Some(batch_size) => opts.with_batch_size(batch_size),
+            None => opts,
+        };
+        let opts = match self.max_line_bytes {
+            Some(max_line_bytes) => opts.with_max_line_bytes(max_line_bytes),
             None => opts,
         };
         let opts = match self.batch_writers {
@@ -2932,11 +2957,22 @@ where
         reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         refs: &mut Vec<String>,
     ) -> std::io::Result<()> {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = reader.lines();
+        use crate::core::bulk_submit_stream::{LineRead, read_line_capped};
+        let mut reader = reader;
+        let max_line_bytes = self.max_line_bytes();
+        let mut buf = Vec::new();
         // A read error used to end the loop exactly like end-of-file, so a
         // deleted file cut short mid-stream went unnoticed (#1127).
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            buf.clear();
+            match read_line_capped(&mut reader, &mut buf, max_line_bytes).await? {
+                LineRead::Eof => break,
+                LineRead::TooLong => continue,
+                LineRead::Line(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
