@@ -443,6 +443,13 @@ hts run --storage-backend postgres \
   --database-url "postgresql://user:pass@localhost/hts"
 ```
 
+The connection URL takes libpq's TLS parameters: `sslmode` (`disable`, `allow`, `prefer` (the default), `require`, `verify-ca`, `verify-full`), `sslrootcert` (a PEM file of trusted roots, or `system` with `verify-full`; the platform trust store when unset), and `sslcert` / `sslkey` for a client certificate. `prefer` encrypts when the server offers TLS without checking its certificate; use `verify-full` with the database's CA to check both chain and host name. Startup logs whether the link is encrypted.
+
+```bash
+hts run --storage-backend postgres \
+  --database-url "postgresql://user:pass@db.example.com/hts?sslmode=verify-full&sslrootcert=/etc/hts/db-ca.pem"
+```
+
 ## API Endpoints
 
 ### Terminology Operations

@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use tokio_postgres::NoTls;
 use tracing::info;
 
 use crate::error::HtsError;
@@ -25,6 +24,7 @@ use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{
     ExpansionContains, LookupResponse, ResourceSearchQuery, SubsumesResponse, TranslateResponse,
 };
+use helios_persistence::backends::postgres::tls::{self, PostgresSslMode, PostgresTlsSettings};
 use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 
@@ -314,7 +314,7 @@ impl PostgresTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub async fn new(database_url: &str) -> Result<Self, HtsError> {
-        let pool = build_pool(database_url)?;
+        let (pool, target, tls_settings) = build_pool(database_url)?;
 
         {
             let mut client = pool.get().await.map_err(|e| {
@@ -323,6 +323,9 @@ impl PostgresTerminologyBackend {
                     error_chain(&e)
                 ))
             })?;
+
+            // Say once whether the link is encrypted, read from the server (#2746).
+            tls::log_connection_security(&client, "hts", &target, &tls_settings).await;
 
             schema::apply(&client).await.map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
@@ -457,9 +460,51 @@ pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
+/// Builds the pool, with the TLS connector the URL's `sslmode`, `sslrootcert`,
+/// `sslcert` and `sslkey` ask for (#2746). Those parameters are read here and
+/// taken off the URL, since the driver knows neither the verify modes nor the
+/// certificate parameters. Returns the pool, the `host:port` it connects to
+/// (for the startup log) and the TLS settings.
+fn build_pool(database_url: &str) -> Result<(Pool, String, PostgresTlsSettings), HtsError> {
+    let config_error = |message: String| {
+        HtsError::StorageError(format!("Invalid PostgreSQL configuration: {message}"))
+    };
+    let (url, params) =
+        tls::split_tls_params(database_url, "HTS_DATABASE_URL").map_err(config_error)?;
+    let pg_config: tokio_postgres::Config = url
+        .parse()
+        .map_err(|e| config_error(format!("HTS_DATABASE_URL: {}", error_chain(&e))))?;
+    // A `key=value` string keeps its `sslmode` (disable / prefer / require)
+    // with the driver; read it back so the connector and the log agree.
+    let mode = params.mode.unwrap_or(match pg_config.get_ssl_mode() {
+        tokio_postgres::config::SslMode::Disable => PostgresSslMode::Disable,
+        tokio_postgres::config::SslMode::Require => PostgresSslMode::Require,
+        _ => PostgresSslMode::Prefer,
+    });
+    let tls_settings = PostgresTlsSettings {
+        mode,
+        root_cert: params.root_cert,
+        cert: params.cert,
+        key: params.key,
+    };
+    let host = match pg_config.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(host)) => host.clone(),
+        #[cfg(unix)]
+        Some(tokio_postgres::config::Host::Unix(path)) => path.display().to_string(),
+        None => "localhost".to_string(),
+    };
+    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
+    let target = format!("{host}:{port}");
+    let connector = tls_settings.connector().map_err(|message| {
+        config_error(format!(
+            "TLS for {target} (sslmode={}): {message}",
+            mode.as_str()
+        ))
+    })?;
+
     let mut cfg = Config::new();
-    cfg.url = Some(database_url.to_string());
+    cfg.url = Some(url);
+    cfg.ssl_mode = Some(mode.driver_mode());
     // 32 connections: warm requests bypass the pool entirely (see the
     // closure-page / inline-compose warm-hit fast paths in value_set.rs), so
     // the pool only gates *cold* expansions. 16 was too few to warm a
@@ -467,9 +512,12 @@ fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
     // cold-warming throughput while staying well under PG's
     // `max_connections=100`.
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(32));
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls).map_err(|e| {
-        HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
-    })
+    let pool = cfg
+        .create_pool(Some(Runtime::Tokio1), connector)
+        .map_err(|e| {
+            HtsError::StorageError(format!("Failed to create PG pool: {}", error_chain(&e)))
+        })?;
+    Ok((pool, target, tls_settings))
 }
 
 // ── TerminologyMetadata ────────────────────────────────────────────────────────

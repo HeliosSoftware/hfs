@@ -1310,6 +1310,7 @@ impl From<BackendError> for RestError {
             // 500. Their raw detail is sanitized and logged by
             // `RestError::client_response`, never leaked to the client.
             BackendError::MigrationError { .. }
+            | BackendError::InvalidConfiguration { .. }
             | BackendError::Internal { .. }
             | BackendError::QueryError { .. }
             | BackendError::SerializationError { .. } => RestError::InternalError {
@@ -1822,6 +1823,10 @@ mod tests {
         let faults = vec![
             BackendError::MigrationError {
                 message: "column \"foo\" already exists".to_string(),
+            },
+            BackendError::InvalidConfiguration {
+                backend_name: "postgres".to_string(),
+                message: "sslrootcert /etc/pg/ca.pem: No such file".to_string(),
             },
             BackendError::Internal {
                 backend_name: "sqlite".to_string(),

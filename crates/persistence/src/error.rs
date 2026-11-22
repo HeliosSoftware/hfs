@@ -819,6 +819,17 @@ pub enum BackendError {
         message: String,
     },
 
+    /// The backend's configuration is invalid (an unknown `sslmode`, an
+    /// unreadable certificate file, ...). Raised at startup, before any
+    /// request; the message says what to change.
+    #[error("invalid {backend_name} configuration: {message}")]
+    InvalidConfiguration {
+        /// Backend identifier.
+        backend_name: String,
+        /// What is wrong and how to fix it.
+        message: String,
+    },
+
     /// Internal backend error.
     #[error("internal error in {backend_name}: {message}")]
     Internal {
