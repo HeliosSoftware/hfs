@@ -17,7 +17,7 @@ use crate::core::bulk_export_output::{
     DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, tenant_path_segment};
 
 const WRITE_BUFFER_CAPACITY: usize = 64 * 1024;
 
@@ -57,9 +57,15 @@ impl LocalFsOutputStore {
         self
     }
 
+    /// The directory holding every job of a tenant: one component under the
+    /// root per tenant id, so a hierarchical id never nests under another's.
+    fn tenant_dir(&self, tenant_id: &str) -> PathBuf {
+        self.root.join(tenant_path_segment(tenant_id))
+    }
+
     /// The directory holding all parts for a single job.
     fn job_dir(&self, tenant_id: &str, job_id: &ExportJobId) -> PathBuf {
-        self.root.join(tenant_id).join(job_id.as_str())
+        self.tenant_dir(tenant_id).join(job_id.as_str())
     }
 
     /// The final file path for a part.
@@ -177,12 +183,17 @@ impl ExportOutputStore for LocalFsOutputStore {
     }
 
     async fn delete_tenant_outputs(&self, tenant_id: &str) -> StorageResult<()> {
-        // `root.join("")` is the root itself and `..` escapes it: refuse
-        // anything that is not a single plain path component.
-        if !is_single_component(tenant_id) {
+        // `root.join("")` is the root itself and `..` escapes it. The segment
+        // is one plain component for every other id; this check keeps it so.
+        let segment = tenant_path_segment(tenant_id);
+        if tenant_id.is_empty()
+            || tenant_id == "."
+            || tenant_id == ".."
+            || !is_single_component(&segment)
+        {
             return Err(io_err(format!("refusing tenant output path {tenant_id:?}")));
         }
-        delete_dir_idempotent(&self.root.join(tenant_id)).await
+        delete_dir_idempotent(&self.tenant_dir(tenant_id)).await
     }
 }
 
@@ -274,9 +285,35 @@ mod tests {
         store.delete_tenant_outputs("t1").await.unwrap(); // idempotent
         assert!(!tmp.path().join("t1").exists());
         assert!(tmp.path().join("t2").exists());
-        for bad in ["", "..", ".", "a/b"] {
+        for bad in ["", "..", "."] {
             assert!(store.delete_tenant_outputs(bad).await.is_err(), "{bad:?}");
         }
+        assert!(tmp.path().exists());
+    }
+
+    #[tokio::test]
+    async fn a_hierarchical_tenant_does_not_nest_under_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFsOutputStore::new(tmp.path(), "http://localhost:8080");
+        let mut keys = Vec::new();
+        for tenant in ["acme", "acme/research"] {
+            let key = ExportPartKey::output(tenant, ExportJobId::new(), "Patient", 0, 1);
+            let mut w = store.open_writer(&key).await.unwrap();
+            w.write_line("{}").await.unwrap();
+            store.finalize_part(&key, w).await.unwrap();
+            keys.push(key);
+        }
+        assert!(!tmp.path().join("acme").join("research").exists());
+
+        store.delete_tenant_outputs("acme").await.unwrap();
+        assert!(!tmp.path().join("acme").exists());
+        assert!(
+            store.open_reader(&keys[1]).await.is_ok(),
+            "the child tenant keeps its part"
+        );
+
+        store.delete_tenant_outputs("acme/research").await.unwrap();
+        assert!(store.open_reader(&keys[1]).await.is_err());
         assert!(tmp.path().exists());
     }
 
