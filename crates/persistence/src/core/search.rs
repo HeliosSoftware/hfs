@@ -586,6 +586,41 @@ pub trait SearchProvider: ResourceStorage {
         Vec::new()
     }
 
+    /// Whether [`search`](Self::search) serves the search parameter `code` of
+    /// type `param_type` on `resource_type`, as opposed to refusing it.
+    ///
+    /// Defaults to `true`: every registered parameter is assumed served. A
+    /// storage that refuses some parameters (a whole type, or one parameter
+    /// such as `near`) overrides this, and a wrapper that forwards `search`
+    /// forwards this too; `CompositeStorage` answers for whichever provider
+    /// its `search` reaches.
+    ///
+    /// The REST layer builds `GET /metadata` from this, where
+    /// [`supports_search`](Self::supports_search) is `true`: a parameter it
+    /// answers `false` for is left out of `searchParam` (the common `_`
+    /// parameters included), and a reference parameter it answers `false` for
+    /// is left out of `searchInclude` and `searchRevInclude` too. FHIR's
+    /// `searchParam` lists the "Search parameters for implementations to
+    /// support and/or make use of"
+    /// (<https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.searchParam>),
+    /// so a parameter every request for which is refused does not belong in it.
+    ///
+    /// A common `_` parameter is asked about with the type `/metadata`
+    /// advertises for it, which is not always the registry's: `_text` and
+    /// `_content` are asked as `special`, though R4's registry types them
+    /// `string`. `_list` and `_in` are asked about as `_id` of type token,
+    /// since the REST layer resolves both into an `_id` filter before
+    /// [`search`](Self::search) is called.
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: SearchParamType,
+    ) -> bool {
+        let _ = (resource_type, code, param_type);
+        true
+    }
+
     /// Makes every write this storage acknowledged before the call visible
     /// to a subsequent [`search`](Self::search) of the given resource types.
     ///
