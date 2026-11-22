@@ -1924,7 +1924,32 @@ impl SubmitClaimStrategy for MongoBackend {
             .await
             .or_query_error("scan claimable manifests")?;
 
-        for candidate in collect(cursor).await? {
+        // A tenant that already holds a live lease waits behind the tenants
+        // that hold none: one tenant's slow origins cannot take every worker
+        // while another tenant's manifests queue. Stable, so each group keeps
+        // its arrival order.
+        let busy_tenants: std::collections::HashSet<String> = manifests
+            .distinct(
+                "tenant_id",
+                doc! {
+                    "status": ManifestStatus::Processing.to_string(),
+                    "lease_expiry": { "$gte": to_bson_time(now) },
+                },
+            )
+            .await
+            .or_query_error("list tenants holding a live lease")?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        let mut candidates = collect(cursor).await?;
+        candidates.sort_by_key(|candidate| {
+            candidate
+                .get_str("tenant_id")
+                .map(|tenant| busy_tenants.contains(tenant))
+                .unwrap_or(false)
+        });
+
+        for candidate in candidates {
             let (Ok(tenant_id), Ok(submitter), Ok(submission_id), Ok(manifest_id)) = (
                 candidate.get_str("tenant_id"),
                 candidate.get_str("submitter"),

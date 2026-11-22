@@ -2231,7 +2231,15 @@ impl SubmitClaimStrategy for SqliteBackend {
                  -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
                         OR (m.status = 'processing' AND m.lease_expiry < ?1))
-                 ORDER BY m.added_at LIMIT 1",
+                 -- A tenant that already holds a live lease waits behind the
+                 -- tenants that hold none: one tenant's slow origins cannot take
+                 -- every worker while another tenant's manifests queue.
+                 ORDER BY EXISTS (SELECT 1 FROM bulk_manifests p
+                                  WHERE p.tenant_id = m.tenant_id
+                                    AND p.status = 'processing'
+                                    AND p.lease_expiry >= ?1),
+                          m.added_at
+                 LIMIT 1",
                 params![now_str],
                 |row| {
                     Ok((
@@ -6218,6 +6226,47 @@ mod tests {
                 .is_empty(),
             "a finished rebuild leaves nothing to resume"
         );
+    }
+
+    /// A tenant holding a live lease waits behind tenants holding none,
+    /// whatever the arrival order; within a tenant the order stays FIFO.
+    #[tokio::test]
+    async fn a_tenant_with_a_live_lease_waits_behind_the_others() {
+        let backend = create_test_backend();
+        let busy = create_test_tenant();
+        let other = TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let busy_first = seed_claimable(&backend, &busy).await;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        let busy_second = seed_claimable(&backend, &busy).await;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        let other_sub = seed_claimable(&backend, &other).await;
+
+        let backend = &backend;
+        let claim = |worker: &str| {
+            let worker = WorkerId::new(worker);
+            async move {
+                backend
+                    .claim_next_manifest(&worker, StdDuration::from_secs(60))
+                    .await
+            }
+        };
+        assert_eq!(
+            claim("w1").await.unwrap().unwrap().submission_id,
+            busy_first
+        );
+        assert_eq!(
+            claim("w2").await.unwrap().unwrap().submission_id,
+            other_sub,
+            "the other tenant goes before the busy tenant's second manifest"
+        );
+        assert_eq!(
+            claim("w3").await.unwrap().unwrap().submission_id,
+            busy_second
+        );
+        assert!(claim("w4").await.unwrap().is_none());
     }
 
     #[tokio::test]

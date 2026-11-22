@@ -2316,7 +2316,14 @@ impl SubmitClaimStrategy for PostgresBackend {
                  -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
                         OR (m.status = 'processing' AND m.lease_expiry < $1))
-                 ORDER BY m.added_at
+                 -- A tenant that already holds a live lease waits behind the
+                 -- tenants that hold none: one tenant's slow origins cannot take
+                 -- every worker while another tenant's manifests queue.
+                 ORDER BY EXISTS (SELECT 1 FROM bulk_manifests p
+                                  WHERE p.tenant_id = m.tenant_id
+                                    AND p.status = 'processing'
+                                    AND p.lease_expiry >= $1),
+                          m.added_at
                  LIMIT 1
                  FOR UPDATE OF m SKIP LOCKED",
                 &[&now],

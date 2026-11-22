@@ -796,6 +796,12 @@ pub struct BulkSubmitConfig {
     /// `Range` request, in seconds (#1127). Set with
     /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
     pub fetch_read_timeout_secs: u64,
+    /// Wall-clock budget, in seconds, for fetching one remote Bulk Export
+    /// manifest. The idle read timeout above cannot bound a body that keeps
+    /// producing bytes; past this budget the manifest fails with a fetch
+    /// error and the worker moves on. Set with
+    /// `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`.
+    pub manifest_fetch_timeout_secs: u64,
     /// Ceiling, in decoded bytes, on a Bulk Export manifest the worker
     /// fetches; the manifest is read whole. Set with
     /// `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`.
@@ -907,6 +913,7 @@ impl fmt::Debug for BulkSubmitConfig {
             batch_size,
             batch_writers,
             fetch_read_timeout_secs,
+            manifest_fetch_timeout_secs,
             max_manifest_bytes,
             max_encrypted_file_bytes,
             skip_unchanged,
@@ -950,6 +957,7 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("batch_size", batch_size)
             .field("batch_writers", batch_writers)
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("manifest_fetch_timeout_secs", manifest_fetch_timeout_secs)
             .field("max_manifest_bytes", max_manifest_bytes)
             .field("max_encrypted_file_bytes", max_encrypted_file_bytes)
             .field("skip_unchanged", skip_unchanged)
@@ -1001,6 +1009,7 @@ impl Default for BulkSubmitConfig {
             batch_size: 1000,
             batch_writers: 4,
             fetch_read_timeout_secs: 60,
+            manifest_fetch_timeout_secs: 600,
             max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
             max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
             skip_unchanged: false,
@@ -1167,6 +1176,10 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
             ),
+            manifest_fetch_timeout_secs: env_u64(
+                "HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT",
+                d.manifest_fetch_timeout_secs,
+            ),
             max_manifest_bytes: env_u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
             max_encrypted_file_bytes: env_u64(
                 "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
@@ -1279,6 +1292,9 @@ impl BulkSubmitConfig {
         }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.manifest_fetch_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT must be > 0".to_string());
         }
         if self.max_manifest_bytes == 0 {
             errors.push("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES must be > 0".to_string());
