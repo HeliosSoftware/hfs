@@ -1358,11 +1358,11 @@ async fn create_postgres_backend(
             backend_config
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
-            PostgresBackend::config_from_env()
+            PostgresBackend::config_from_env()?
         }
     } else {
         info!("Initializing PostgreSQL backend from environment variables");
-        PostgresBackend::config_from_env()
+        PostgresBackend::config_from_env()?
     };
     backend_config.fhir_version = config.default_fhir_version;
     backend_config.data_dir = config.data_dir.clone();

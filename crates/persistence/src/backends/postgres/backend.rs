@@ -302,9 +302,13 @@ pub struct PostgresConfig {
     pub search_offloaded: bool,
 }
 
-/// SSL mode for PostgreSQL connections.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// SSL mode for PostgreSQL connections, named as libpq names them.
+///
+/// This build connects with [`NoTls`], so `Disable` and `Prefer` both give a
+/// cleartext link and the three modes that ask for TLS refuse to start rather
+/// than connect in cleartext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum PostgresSslMode {
     /// Disable SSL.
     Disable,
@@ -313,6 +317,53 @@ pub enum PostgresSslMode {
     Prefer,
     /// Require SSL.
     Require,
+    /// Require SSL and a certificate signed by a trusted CA.
+    VerifyCa,
+    /// Require SSL, a trusted CA and a matching host name.
+    VerifyFull,
+}
+
+impl PostgresSslMode {
+    /// Parses a libpq `sslmode` value; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disable" => Some(Self::Disable),
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            "verify-ca" => Some(Self::VerifyCa),
+            "verify-full" => Some(Self::VerifyFull),
+            _ => None,
+        }
+    }
+
+    /// The libpq spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+
+    /// Whether the mode asks for an encrypted connection.
+    pub fn wants_tls(self) -> bool {
+        matches!(self, Self::Require | Self::VerifyCa | Self::VerifyFull)
+    }
+}
+
+/// `HFS_PG_SSL_MODE`: wins over the `sslmode` of `HFS_DATABASE_URL`.
+const SSL_MODE_ENV: &str = "HFS_PG_SSL_MODE";
+
+fn unsupported_ssl_mode(source: &str, value: &str) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::Internal {
+        backend_name: "postgres".to_string(),
+        message: format!(
+            "{source}: sslmode {value:?} is not one of disable, prefer, require, verify-ca, verify-full"
+        ),
+        source: None,
+    })
 }
 
 /// `plan_cache_mode` for pooled connections.
@@ -608,6 +659,16 @@ impl PostgresConfig {
         }
     }
 
+    /// Applies `HFS_PG_SSL_MODE`. Unlike the tuning knobs, a value that does
+    /// not parse is an error: a misspelt mode must not fall back to cleartext.
+    fn apply_ssl_mode_from_env(&mut self) -> StorageResult<()> {
+        if let Ok(value) = std::env::var(SSL_MODE_ENV) {
+            self.ssl_mode = PostgresSslMode::parse(&value)
+                .ok_or_else(|| unsupported_ssl_mode(SSL_MODE_ENV, &value))?;
+        }
+        Ok(())
+    }
+
     /// The `statement_timeout` the cross-tenant `count_by_tenant` aggregate
     /// runs under (#1911): [`Self::count_by_tenant_statement_timeout_ms`],
     /// capped by [`Self::statement_timeout_ms`] unless that is `0` (no
@@ -856,6 +917,7 @@ impl PostgresBackend {
     /// - `HFS_PG_DBNAME` (default: "helios")
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
+    /// - `HFS_PG_SSL_MODE` (default: "prefer"; an unknown value is an error)
     /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64 and, at
     ///   startup, to this pool's share of half of the server's `max_connections`)
     /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
@@ -863,13 +925,13 @@ impl PostgresBackend {
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     /// - `HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: 25000)
     pub async fn from_env() -> StorageResult<Self> {
-        Self::new(Self::config_from_env()).await
+        Self::new(Self::config_from_env()?).await
     }
 
     /// Builds the configuration `from_env` would connect with, without
     /// connecting. Same override contract as
     /// [`PostgresBackend::config_from_connection_string`].
-    pub fn config_from_env() -> PostgresConfig {
+    pub fn config_from_env() -> StorageResult<PostgresConfig> {
         let mut config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("HFS_PG_PORT")
@@ -888,7 +950,8 @@ impl PostgresBackend {
         // Pool/timeout knobs are applied through the shared helper so this path and
         // the connection-URL path cannot drift apart again.
         config.apply_env_overrides();
-        config
+        config.apply_ssl_mode_from_env()?;
+        Ok(config)
     }
 
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {
@@ -898,10 +961,38 @@ impl PostgresBackend {
         cfg.dbname = Some(config.dbname.clone());
         cfg.user = Some(config.user.clone());
         cfg.password = config.password.clone();
+        // The pool is built with `NoTls`, so a mode that asks for TLS cannot be
+        // honoured; refusing here keeps the request from degrading into the
+        // cleartext link `Prefer` would make.
+        if config.ssl_mode.wants_tls() {
+            return Err(crate::error::StorageError::Backend(
+                BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message: format!(
+                        "sslmode={} asks for an encrypted connection to {}:{}, but this build has no \
+                     TLS connector for PostgreSQL; terminate TLS next to HFS (a local proxy or \
+                     tunnel) and set sslmode=disable, or set sslmode=prefer to accept a cleartext \
+                     connection",
+                        config.ssl_mode.as_str(),
+                        config.host,
+                        config.port
+                    ),
+                    source: None,
+                },
+            ));
+        }
+        tracing::warn!(
+            host = %config.host,
+            port = config.port,
+            sslmode = config.ssl_mode.as_str(),
+            "PostgreSQL connection is not encrypted: this build has no TLS connector for PostgreSQL"
+        );
         cfg.ssl_mode = Some(match config.ssl_mode {
             PostgresSslMode::Disable => SslMode::Disable,
             PostgresSslMode::Prefer => SslMode::Prefer,
-            PostgresSslMode::Require => SslMode::Require,
+            PostgresSslMode::Require | PostgresSslMode::VerifyCa | PostgresSslMode::VerifyFull => {
+                SslMode::Require
+            }
         });
 
         let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
@@ -975,12 +1066,24 @@ impl PostgresBackend {
             .or_else(|| url.strip_prefix("postgresql://"))
             .unwrap_or(url);
 
-        // Strip any query string before splitting on '/', otherwise it lands in
-        // `dbname` verbatim (`.../postgres?sslmode=require` → dbname
-        // "postgres?sslmode=require", which no server will resolve).
-        let url = url.split('?').next().unwrap_or(url);
+        // Split the query string off before splitting on '/', otherwise it lands
+        // in `dbname` verbatim (`.../postgres?sslmode=require` → dbname
+        // "postgres?sslmode=require", which no server will resolve). `sslmode`
+        // is the one parameter read from it.
+        let (url, query) = match url.split_once('?') {
+            Some((url, query)) => (url, Some(query)),
+            None => (url, None),
+        };
 
         let mut config = PostgresConfig::default();
+        if let Some(value) = query.and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("sslmode="))
+        }) {
+            config.ssl_mode = PostgresSslMode::parse(value)
+                .ok_or_else(|| unsupported_ssl_mode("HFS_DATABASE_URL", value))?;
+        }
 
         // Split user:password@host:port/dbname
         if let Some((userinfo, rest)) = url.split_once('@') {
@@ -1008,6 +1111,7 @@ impl PostgresBackend {
         }
 
         config.apply_env_overrides();
+        config.apply_ssl_mode_from_env()?;
         Ok(config)
     }
 
@@ -2079,7 +2183,7 @@ mod tests {
 
     #[test]
     fn config_from_env_builds_without_connecting() {
-        let cfg = PostgresBackend::config_from_env();
+        let cfg = PostgresBackend::config_from_env().unwrap();
         assert!(!cfg.host.is_empty());
         assert!(cfg.port > 0);
         assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
@@ -2112,6 +2216,72 @@ mod tests {
         assert_eq!(cfg.dbname, "clinical");
         assert_eq!(cfg.host, "db.example.com");
         assert_eq!(cfg.port, 5433);
+    }
+
+    #[test]
+    fn reads_sslmode_from_the_query_string() {
+        for (url, expected) in [
+            (
+                "postgres://u:p@h/db?sslmode=require",
+                PostgresSslMode::Require,
+            ),
+            (
+                "postgres://u:p@h/db?connect_timeout=10&sslmode=verify-full",
+                PostgresSslMode::VerifyFull,
+            ),
+            (
+                "postgres://u:p@h/db?sslmode=Disable",
+                PostgresSslMode::Disable,
+            ),
+            (
+                "postgres://u:p@h/db?application_name=x",
+                PostgresSslMode::Prefer,
+            ),
+        ] {
+            let cfg = PostgresBackend::parse_connection_string(url).unwrap();
+            assert_eq!(cfg.ssl_mode, expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn refuses_an_unknown_sslmode() {
+        let Err(err) =
+            PostgresBackend::parse_connection_string("postgres://u:p@h/db?sslmode=requier")
+        else {
+            panic!("an unknown sslmode is refused, not ignored");
+        };
+        assert!(err.to_string().contains("requier"), "{err}");
+    }
+
+    #[test]
+    fn a_mode_that_asks_for_tls_is_refused_without_a_connector() {
+        for mode in [
+            PostgresSslMode::Require,
+            PostgresSslMode::VerifyCa,
+            PostgresSslMode::VerifyFull,
+        ] {
+            let cfg = PostgresConfig {
+                ssl_mode: mode,
+                ..Default::default()
+            };
+            let Err(err) = PostgresBackend::create_pool(&cfg) else {
+                panic!("a TLS mode cannot be served by a NoTls pool");
+            };
+            let text = err.to_string();
+            assert!(text.contains(mode.as_str()), "{text}");
+            assert!(text.contains("no TLS connector"), "{text}");
+        }
+        for mode in [PostgresSslMode::Disable, PostgresSslMode::Prefer] {
+            let cfg = PostgresConfig {
+                ssl_mode: mode,
+                ..Default::default()
+            };
+            assert!(
+                PostgresBackend::create_pool(&cfg).is_ok(),
+                "{}",
+                mode.as_str()
+            );
+        }
     }
 
     #[test]
