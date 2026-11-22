@@ -59,6 +59,10 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+/// TLS connections against a real server (#2746).
+#[path = "tls/postgres_tls.rs"]
+mod postgres_tls;
+
 #[path = "common/sof_terminology_suite.rs"]
 mod sof_terminology_suite;
 
