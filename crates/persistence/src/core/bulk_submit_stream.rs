@@ -372,21 +372,80 @@ enum StreamEvent {
     Failed(StorageError),
 }
 
+/// What [`read_line_capped`] produced.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LineRead {
+    /// A line of this many bytes, newline included when there was one.
+    Line(usize),
+    /// The line ran past the ceiling; its bytes were discarded up to and
+    /// including the next newline (or the end of the stream).
+    TooLong,
+    /// Nothing left to read.
+    Eof,
+}
+
+/// Reads one line into `buf` without ever holding more than `max_bytes` of
+/// it: `AsyncBufReadExt::read_line` grows its buffer until a newline
+/// arrives, whatever the line's length.
+pub(crate) async fn read_line_capped<R: AsyncBufRead + Unpin + ?Sized>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<LineRead> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line(buf.len())
+            });
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |at| at + 1);
+        if buf.len() + take > max_bytes {
+            // Discard the rest of the line, chunk by chunk.
+            reader.consume(take);
+            if newline.is_some() {
+                return Ok(LineRead::TooLong);
+            }
+            loop {
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    return Ok(LineRead::TooLong);
+                }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let take = newline.map_or(available.len(), |at| at + 1);
+                reader.consume(take);
+                if newline.is_some() {
+                    return Ok(LineRead::TooLong);
+                }
+            }
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(LineRead::Line(buf.len()));
+        }
+    }
+}
+
 /// Reads, parses and batches the stream, one task per file.
 async fn read_batches(
     mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
     resource_type: String,
     batch_size: usize,
     resume_after_line: u64,
+    max_line_bytes: usize,
     tx: mpsc::Sender<StreamEvent>,
 ) {
     let mut line_number = 0u64;
     let mut batch = Vec::with_capacity(batch_size);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        let bytes_read = match reader.read_line(&mut line).await {
-            Ok(n) => n,
+        buf.clear();
+        let read = match read_line_capped(&mut reader, &mut buf, max_line_bytes).await {
+            Ok(read) => read,
             Err(e) => {
                 // #1127: surface the reader's own message (e.g. the
                 // fetcher's give-up text) unprefixed so it reaches the
@@ -402,7 +461,7 @@ async fn read_batches(
                 return;
             }
         };
-        if bytes_read == 0 {
+        if read == LineRead::Eof {
             break;
         }
         line_number += 1;
@@ -410,6 +469,33 @@ async fn read_batches(
         if line_number <= resume_after_line {
             continue;
         }
+        if read == LineRead::TooLong {
+            let event = StreamEvent::Rejected {
+                line_number,
+                abort_reason: format!(
+                    "Parse error: line is longer than {max_line_bytes} bytes \
+                     (HFS_BULK_SUBMIT_MAX_LINE_BYTES)"
+                ),
+            };
+            if tx.send(event).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(line) => line,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamEvent::Failed(StorageError::BulkSubmit(
+                        BulkSubmitError::InputStream {
+                            message: format!("line {line_number} is not valid UTF-8: {e}"),
+                            source: None,
+                        },
+                    )))
+                    .await;
+                return;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -714,11 +800,15 @@ where
     let batch_size = options.batch_size.max(1) as usize;
 
     let (tx, mut rx) = mpsc::channel(READ_AHEAD_BATCHES);
+    let max_line_bytes = usize::try_from(options.max_line_bytes)
+        .unwrap_or(usize::MAX)
+        .max(1);
     let mut reader_task = AbortOnDrop(tokio::spawn(read_batches(
         reader,
         resource_type.to_string(),
         batch_size,
         options.resume_after_line,
+        max_line_bytes,
         tx,
     )));
 
@@ -931,6 +1021,89 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_line_above_the_ceiling_is_discarded_and_the_next_one_read() {
+        let second = "{\"resourceType\":\"Patient\"}\n";
+        let data = format!("{}\n{second}", "x".repeat(100));
+        let mut reader =
+            tokio::io::BufReader::with_capacity(16, std::io::Cursor::new(data.into_bytes()));
+        let mut buf = Vec::new();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 32)
+                .await
+                .unwrap(),
+            super::LineRead::TooLong
+        );
+        assert!(
+            buf.len() <= 32,
+            "never buffers past the ceiling: {}",
+            buf.len()
+        );
+        buf.clear();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 32)
+                .await
+                .unwrap(),
+            super::LineRead::Line(second.len())
+        );
+        assert_eq!(buf, second.as_bytes());
+        buf.clear();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 32)
+                .await
+                .unwrap(),
+            super::LineRead::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_at_the_ceiling_and_a_last_line_without_newline_are_read() {
+        let mut reader =
+            tokio::io::BufReader::with_capacity(2, std::io::Cursor::new(b"abc\nde".to_vec()));
+        let mut buf = Vec::new();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 4)
+                .await
+                .unwrap(),
+            super::LineRead::Line(4)
+        );
+        buf.clear();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 4)
+                .await
+                .unwrap(),
+            super::LineRead::Line(2)
+        );
+        assert_eq!(buf, b"de");
+        buf.clear();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 4)
+                .await
+                .unwrap(),
+            super::LineRead::Eof
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlong_last_line_without_newline_is_too_long() {
+        let mut reader =
+            tokio::io::BufReader::with_capacity(4, std::io::Cursor::new(b"abcdefghij".to_vec()));
+        let mut buf = Vec::new();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 5)
+                .await
+                .unwrap(),
+            super::LineRead::TooLong
+        );
+        buf.clear();
+        assert_eq!(
+            super::read_line_capped(&mut reader, &mut buf, 5)
+                .await
+                .unwrap(),
+            super::LineRead::Eof
+        );
+    }
+
     use super::*;
     use crate::tenant::{TenantId, TenantPermissions};
     use std::sync::Mutex;

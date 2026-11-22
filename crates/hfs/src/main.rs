@@ -3581,6 +3581,7 @@ fn spawn_submit_workers(
     }
     let batch_size = cfg.batch_size;
     let manifest_fetch_timeout = std::time::Duration::from_secs(cfg.manifest_fetch_timeout_secs);
+    let max_line_bytes = cfg.max_line_bytes;
     // Batches of one file written concurrently; the engine caps it (SQLite
     // keeps one, PostgreSQL half its pool), and the stream driver keeps the
     // file watermark in file order whatever the width.
@@ -3666,6 +3667,7 @@ fn spawn_submit_workers(
                     .with_batch_size(batch_size)
                     .with_manifest_fetch_timeout(manifest_fetch_timeout)
                     .with_batch_writers(batch_writers)
+                    .with_max_line_bytes(max_line_bytes)
                     .with_skip_unchanged(skip_unchanged)
                     .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {
