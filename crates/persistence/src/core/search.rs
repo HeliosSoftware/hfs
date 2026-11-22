@@ -611,6 +611,12 @@ pub trait SearchProvider: ResourceStorage {
     /// `string`. `_list` and `_in` are asked about as `_id` of type token,
     /// since the REST layer resolves both into an `_id` filter before
     /// [`search`](Self::search) is called.
+    ///
+    /// Only the parameters `/metadata` can list are asked about: each
+    /// registered parameter whose code does not start with `_`, and the common
+    /// ones above. A control or result parameter (`_sort`, `_count`,
+    /// `_include`, `_has`, `_query`, `_type`, ...) is not, and the answer for
+    /// one says nothing about whether `search` accepts it.
     fn serves_search_param(
         &self,
         resource_type: &str,
@@ -649,6 +655,31 @@ pub trait SearchProvider: ResourceStorage {
         let _ = (tenant, resource_types);
         Ok(())
     }
+}
+
+/// Every `special` search parameter code in the spec registry of each enabled
+/// FHIR version (the repository's `data/` directory), with `_text` and
+/// `_content`, which `/metadata` lists on every version. The backends' tests
+/// check their `serves_search_param` answer for each against what their
+/// `search` does with it (#2593).
+#[cfg(test)]
+pub(crate) fn special_search_param_codes() -> std::collections::BTreeSet<String> {
+    let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let mut codes: std::collections::BTreeSet<String> =
+        ["_text", "_content"].map(String::from).into();
+    for version in FhirVersion::enabled_versions() {
+        let definitions = crate::search::SearchParameterLoader::new(*version)
+            .load_from_spec_file(&data_dir)
+            .expect("spec SearchParameters");
+        codes.extend(
+            definitions
+                .into_iter()
+                .filter(|def| def.param_type == SearchParamType::Special)
+                .map(|def| def.code),
+        );
+    }
+    assert!(codes.contains("near"), "the spec registry was not read");
+    codes
 }
 
 /// Search provider that supports searching across multiple resource types.

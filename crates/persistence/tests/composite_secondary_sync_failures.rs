@@ -208,6 +208,15 @@ impl SearchProvider for FlakyIndex {
     fn supports_search(&self) -> bool {
         self.inner.supports_search()
     }
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: helios_persistence::types::SearchParamType,
+    ) -> bool {
+        self.inner
+            .serves_search_param(resource_type, code, param_type)
+    }
 
     async fn search(
         &self,

@@ -237,8 +237,12 @@ mod serves_search_param_tests {
             .collect()
     }
 
-    /// The default path: a storage that keeps the trait default lists exactly
-    /// what SQLite's own statement lists, for every type and FHIR version.
+    /// The default path: a storage that keeps the trait default lists what
+    /// SQLite's own statement lists, for every type and FHIR version, and also
+    /// the `special` parameters SQLite builds no condition for and so leaves
+    /// out (`near`, and from R5 `contains` and `section-text`, #2593), with the
+    /// composite `section-code-text`, whose `section-text` component SQLite
+    /// does not serve. Nothing else differs, the include lists included.
     #[tokio::test]
     async fn the_default_serves_every_registered_parameter() {
         let stub = metadata_server(HookStub::with_params(serves_all));
@@ -247,7 +251,45 @@ mod serves_search_param_tests {
             let from_stub = lists(&statement(&stub, *version).await);
             let from_sqlite = lists(&statement(&sqlite, *version).await);
             assert!(!from_stub.is_empty());
-            assert_eq!(from_stub, from_sqlite, "{version:?}");
+            assert_eq!(
+                from_stub.keys().collect::<Vec<_>>(),
+                from_sqlite.keys().collect::<Vec<_>>(),
+                "{version:?}"
+            );
+            let mut only_default = BTreeSet::new();
+            for (resource_type, [params, includes, revincludes]) in &from_stub {
+                let [sqlite_params, sqlite_includes, sqlite_revincludes] =
+                    &from_sqlite[resource_type];
+                assert!(
+                    sqlite_params.is_subset(params),
+                    "{version:?} {resource_type}"
+                );
+                for name in params.difference(sqlite_params) {
+                    only_default.insert(format!("{resource_type}.{name}"));
+                }
+                assert_eq!(includes, sqlite_includes, "{version:?} {resource_type}");
+                assert_eq!(
+                    revincludes, sqlite_revincludes,
+                    "{version:?} {resource_type}"
+                );
+            }
+            let mut expected: BTreeSet<String> = ["Location.near".to_string()].into();
+            if from_stub["Location"][0].contains("contains") {
+                expected.insert("Location.contains".to_string());
+            }
+            if from_stub
+                .get("Composition")
+                .is_some_and(|lists| lists[0].contains("section-text"))
+            {
+                expected.insert("Composition.section-text".to_string());
+            }
+            if from_stub
+                .get("Composition")
+                .is_some_and(|lists| lists[0].contains("section-code-text"))
+            {
+                expected.insert("Composition.section-code-text".to_string());
+            }
+            assert_eq!(only_default, expected, "{version:?}");
             let patient = &from_stub["Patient"];
             assert!(patient[0].contains("name"), "{version:?}");
             assert!(patient[1].contains("Patient:general-practitioner"));

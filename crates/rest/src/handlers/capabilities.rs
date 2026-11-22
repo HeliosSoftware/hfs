@@ -23,7 +23,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, ResourceStorage, SearchProvider,
 };
-use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
@@ -559,6 +559,8 @@ fn build_resource_capability(
 /// registry. Control/common params (those starting with `_`) and duplicates are
 /// skipped, and so is every parameter `serves` (the storage's
 /// [`SearchProvider::serves_search_param`]) refuses, common ones included.
+/// A composite is also skipped unless each of its components resolves and is
+/// served ([`composite_components_served`]).
 ///
 /// A common parameter is asked about with the type `/metadata` advertises for
 /// it, except `_list` and `_in`: REST resolves both into an `_id` filter before
@@ -580,7 +582,7 @@ fn build_search_params(
         }
         param["type"]
             .as_str()
-            .and_then(search_param_type_from_code)
+            .and_then(|code| code.parse::<SearchParamType>().ok())
             .is_some_and(|param_type| serves(resource_type, name, param_type))
     });
     let mut seen: std::collections::HashSet<String> = params
@@ -591,6 +593,8 @@ fn build_search_params(
     for def in registry.get_active_params(resource_type) {
         if def.code.starts_with('_')
             || !serves(resource_type, &def.code, def.param_type)
+            || (def.param_type == SearchParamType::Composite
+                && !composite_components_served(resource_type, &def, registry, serves))
             || !seen.insert(def.code.clone())
         {
             continue;
@@ -642,23 +646,31 @@ fn fhir_search_param_type(t: SearchParamType) -> &'static str {
     }
 }
 
-/// The reverse of [`fhir_search_param_type`]: an internal search-parameter type
-/// from its FHIR `searchParam.type` code, for the common parameters, which are
-/// built as JSON.
-fn search_param_type_from_code(code: &str) -> Option<SearchParamType> {
-    [
-        SearchParamType::Number,
-        SearchParamType::Date,
-        SearchParamType::String,
-        SearchParamType::Token,
-        SearchParamType::Reference,
-        SearchParamType::Composite,
-        SearchParamType::Quantity,
-        SearchParamType::Uri,
-        SearchParamType::Special,
-    ]
-    .into_iter()
-    .find(|t| fhir_search_param_type(*t) == code)
+/// Whether the composite `def` can be searched: it names at least one
+/// component, each component resolves in `registry` by its definition URL (as
+/// the search query builder resolves them), and `serves` serves each one.
+///
+/// A composite is searched through its components, so a component the storage
+/// refuses makes every search for the composite fail (MongoDB refuses
+/// `Composition.section-code-text`, whose `section-text` component is
+/// `special`). A component that does not resolve leaves the composite with
+/// fewer components than it defines, which the backends refuse or match
+/// differently from the spec (some R5 and R6 composites name component
+/// definitions the spec bundles do not publish).
+fn composite_components_served(
+    resource_type: &str,
+    def: &SearchParameterDefinition,
+    registry: &SearchParameterRegistry,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
+) -> bool {
+    def.component.as_deref().is_some_and(|components| {
+        !components.is_empty()
+            && components.iter().all(|component| {
+                registry
+                    .get_by_url(&component.definition)
+                    .is_some_and(|sub| serves(resource_type, &sub.code, sub.param_type))
+            })
+    })
 }
 
 /// Builds the reverse-include index used for `searchRevInclude`: maps each target
@@ -1212,7 +1224,7 @@ mod tests {
         for version in FhirVersion::enabled_versions() {
             for param in build_common_search_params(true, *version) {
                 let code = param["type"].as_str().expect("type");
-                let param_type = search_param_type_from_code(code).expect(code);
+                let param_type: SearchParamType = code.parse().expect(code);
                 assert_eq!(fhir_search_param_type(param_type), code);
             }
         }
@@ -1283,6 +1295,95 @@ mod tests {
             );
         }
         assert!(names.contains(&"_lastUpdated".to_string()), "{names:?}");
+    }
+
+    /// A composite is listed only when it names components, each resolves in
+    /// the registry by its definition URL, and each is served: a composite with
+    /// a component the storage refuses, or one the registry does not hold, is
+    /// refused or matched on fewer components than it defines.
+    #[test]
+    fn composites_are_listed_only_when_every_component_is_served() {
+        use helios_persistence::search::registry::CompositeComponentDef;
+
+        let mut reg = SearchParameterRegistry::new();
+        for (url, code, param_type) in [
+            (
+                "http://example.org/Obs-code",
+                "code",
+                SearchParamType::Token,
+            ),
+            (
+                "http://example.org/Obs-value",
+                "value",
+                SearchParamType::Quantity,
+            ),
+            (
+                "http://example.org/Obs-text",
+                "text",
+                SearchParamType::Special,
+            ),
+        ] {
+            reg.register(
+                SearchParameterDefinition::new(url, code, param_type, "Observation.id")
+                    .with_base(["Observation"]),
+            )
+            .unwrap();
+        }
+        for (code, components) in [
+            ("code-value", vec!["Obs-code", "Obs-value"]),
+            ("code-text", vec!["Obs-code", "Obs-text"]),
+            ("code-missing", vec!["Obs-code", "Obs-unpublished"]),
+            ("no-components", vec![]),
+        ] {
+            let mut composite = SearchParameterDefinition::new(
+                format!("http://example.org/Obs-{code}"),
+                code,
+                SearchParamType::Composite,
+                "Observation",
+            )
+            .with_base(["Observation"]);
+            composite.component = Some(
+                components
+                    .into_iter()
+                    .map(|c| CompositeComponentDef {
+                        definition: format!("http://example.org/{c}"),
+                        expression: "Observation.id".to_string(),
+                    })
+                    .collect(),
+            );
+            reg.register(composite).unwrap();
+        }
+        let listed = |serves: &dyn Fn(&str, &str, SearchParamType) -> bool| {
+            let params = build_search_params(
+                "Observation",
+                &reg,
+                false,
+                &std::collections::HashMap::new(),
+                serves,
+                FhirVersion::default(),
+            );
+            param_names(&params)
+                .into_iter()
+                .filter(|name| !name.starts_with('_'))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let all = |_: &str, _: &str, _: SearchParamType| true;
+        assert_eq!(
+            listed(&all),
+            ["code", "code-text", "code-value", "text", "value"]
+                .map(String::from)
+                .into()
+        );
+        let no_special = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Special;
+        assert_eq!(
+            listed(&no_special),
+            ["code", "code-value", "value"].map(String::from).into()
+        );
+        let no_quantity = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Quantity;
+        assert_eq!(
+            listed(&no_quantity),
+            ["code", "code-text", "text"].map(String::from).into()
+        );
     }
 
     /// A storage that searches yields the same statement for the whole server:
