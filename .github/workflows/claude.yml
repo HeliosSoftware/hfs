@@ -12,11 +12,29 @@ on:
 
 jobs:
   claude:
+    # Mention of @claude by a repository owner, member or collaborator. The
+    # gate is evaluated here, before any step runs, because a step that exits
+    # 0 does not stop the steps after it.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      ) && (
+        (
+          (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        ) ||
+        (
+          github.event_name == 'pull_request_review' &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
+        ) ||
+        (
+          github.event_name == 'issues' &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+        )
+      )
     runs-on: [self-hosted, Linux]
     permissions:
       contents: read
@@ -24,16 +42,13 @@ jobs:
       issues: read
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
+    env:
+      # The runner is persistent and shared with pull-request jobs, so the
+      # signing key and the signing configuration live under this job's temp
+      # directory, never in the runner user's ~/.gnupg or ~/.gitconfig.
+      GNUPGHOME: ${{ runner.temp }}/gnupg
+      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/gitconfig
     steps:
-      - name: Check permissions
-        if: >
-          github.event.comment.author_association != 'OWNER' &&
-          github.event.comment.author_association != 'MEMBER' &&
-          github.event.comment.author_association != 'COLLABORATOR'
-        run: |
-          echo "Unauthorized user, skipping"
-          exit 0
-
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
@@ -41,6 +56,7 @@ jobs:
 
       - name: Import GPG key and configure signing
         run: |
+          mkdir -p -m 700 "$GNUPGHOME"
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
           git config --global user.signingkey ${{ secrets.GPG_KEY_ID }}
           git config --global commit.gpgsign true
@@ -64,6 +80,12 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr:*)'
+
+      - name: Remove the signing key and configuration
+        if: always()
+        run: |
+          gpgconf --kill gpg-agent 2>/dev/null || true
+          rm -rf "$GNUPGHOME" "$GIT_CONFIG_GLOBAL"
 
       # claude-code-action points `origin` at a URL carrying this job's token
       # and leaves it there. This job runs in the runner's shared checkout, so
