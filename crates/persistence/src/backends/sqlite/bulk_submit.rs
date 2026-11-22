@@ -5241,6 +5241,21 @@ mod tests {
         .await;
     }
 
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760).
+    #[tokio::test]
+    async fn test_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &create_test_backend(),
+            &create_test_tenant(),
+            &TenantContext::new(
+                TenantId::new("claim-fairness-other"),
+                TenantPermissions::full_access(),
+            ),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn bulk_submit_worker_exact_artifacts_across_pages() {
         consumer_contract::worker_receipts(

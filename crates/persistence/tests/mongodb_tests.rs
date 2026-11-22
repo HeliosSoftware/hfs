@@ -16025,6 +16025,21 @@ mod bulk_submit {
         .await;
     }
 
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). The database is this test's own, so its claim queue is empty.
+    #[tokio::test]
+    async fn test_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let Some(backend) = create_backend("submit_claim_fairness").await else {
+            return;
+        };
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
+        )
+        .await;
+    }
+
     #[async_trait::async_trait]
     impl receipt_paging_contract::ReceiptFixture for MongoBackend {
         async fn seed_receipts(

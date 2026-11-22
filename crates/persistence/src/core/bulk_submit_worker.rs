@@ -1848,12 +1848,12 @@ fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
     }
 }
 
-/// Logs a run abandoned because its lease is gone. A lost lease is never
-/// silent: whoever reclaims the manifest walks it again from its first file,
-/// which on a large corpus costs hours (#1127).
 /// Default for [`DefaultSubmitWorker::with_manifest_fetch_timeout`].
 pub const DEFAULT_MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Logs a run abandoned because its lease is gone. A lost lease is never
+/// silent: whoever reclaims the manifest walks it again from its first file,
+/// which on a large corpus costs hours (#1127).
 fn warn_lease_lost(lease: &ManifestLease, step: &str) {
     tracing::warn!(
         submission = %lease.submission_id,

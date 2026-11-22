@@ -2279,6 +2279,14 @@ impl BulkSubmitRollbackProvider for PostgresBackend {
     }
 }
 
+/// First key of the two-part `pg_advisory_xact_lock` that
+/// [`SubmitClaimStrategy::claim_next_manifest`] holds while it picks a
+/// manifest. The two-int4 form is its own lock space, shared with the
+/// namespaces in `lock_protocol` and `user_settings`; this value is none of
+/// theirs. Arbitrary, but it must stay the same across releases so that old and
+/// new servers in a rolling deploy exclude each other.
+const SUBMIT_CLAIM_LOCK_NAMESPACE: i32 = 0x4846_534D; // "HFSM" (HFS Submit Manifest)
+
 #[async_trait]
 impl SubmitClaimStrategy for PostgresBackend {
     async fn claim_next_manifest(
@@ -2287,49 +2295,74 @@ impl SubmitClaimStrategy for PostgresBackend {
         lease_duration: StdDuration,
     ) -> StorageResult<Option<ManifestLease>> {
         let mut client = self.get_client().await?;
-        let now = Utc::now();
-        let lease_expiry = now
-            + chrono::Duration::from_std(lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
-
         let txn = client
             .transaction()
             .await
             .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
 
-        let rows = txn
-            .query(
-                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
-                 FROM bulk_manifests m
-                 JOIN bulk_submissions s
-                   ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
-                      AND s.submission_id = m.submission_id
-                 -- `complete` is admitted alongside `in-progress`: it means the
-                 -- submitter will send no further manifests, not that already
-                 -- registered ones should be dropped. `aborted` stays excluded.
-                 WHERE m.manifest_url IS NOT NULL
-                   AND s.status IN ('in-progress', 'complete')
-                 -- A `processing` manifest is reclaimable only once its lease
-                 -- lapses. One with no lease at all is being ingested right now
-                 -- by a synchronous `process_entries` caller, which promotes
-                 -- `pending` without taking a lease; every worker path writes
-                 -- the lease together with `processing` (#1530).
-                   AND (m.status = 'pending'
-                        OR (m.status = 'processing' AND m.lease_expiry < $1))
-                 -- A tenant that already holds a live lease waits behind the
-                 -- tenants that hold none: one tenant's slow origins cannot take
-                 -- every worker while another tenant's manifests queue.
-                 ORDER BY EXISTS (SELECT 1 FROM bulk_manifests p
-                                  WHERE p.tenant_id = m.tenant_id
-                                    AND p.status = 'processing'
-                                    AND p.lease_expiry >= $1),
-                          m.added_at
-                 LIMIT 1
-                 FOR UPDATE OF m SKIP LOCKED",
-                &[&now],
-            )
+        // One claim at a time, across every worker and every server on this
+        // database. Idle workers poll on the same cadence, so without this
+        // several claims run at the same instant, each in a snapshot that
+        // predates the others' leases: all of them see the same tenant as
+        // idle and take its manifests, leaving the other tenants queued. The
+        // lock ends with this transaction, a few statements below.
+        txn.execute(
+            "SELECT pg_advisory_xact_lock($1, 0)",
+            &[&SUBMIT_CLAIM_LOCK_NAMESPACE],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to lock the claim queue: {}", e)))?;
+        // Read after the lock: a lease another worker took while this one
+        // waited must count as live below.
+        let now = Utc::now();
+        let lease_expiry = now
+            + chrono::Duration::from_std(lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+
+        // Two passes over the same candidates. The first takes the oldest
+        // manifest of a tenant that holds no live lease, so one tenant's slow
+        // origins cannot take every worker while another tenant's manifests
+        // queue; the second, reached only when every waiting tenant already
+        // has work in flight, is plain arrival order. Two `LIMIT 1` queries
+        // rather than one `ORDER BY <tenant is busy>, added_at`: sorting on
+        // the computed key measured 138 ms against 100,000 queued manifests,
+        // each of these 20-26 ms.
+        const CANDIDATES: &str =
+            "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
+             FROM bulk_manifests m
+             JOIN bulk_submissions s
+               ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
+                  AND s.submission_id = m.submission_id
+             -- `complete` is admitted alongside `in-progress`: it means the
+             -- submitter will send no further manifests, not that already
+             -- registered ones should be dropped. `aborted` stays excluded.
+             WHERE m.manifest_url IS NOT NULL
+               AND s.status IN ('in-progress', 'complete')
+             -- A `processing` manifest is reclaimable only once its lease
+             -- lapses. One with no lease at all is being ingested right now
+             -- by a synchronous `process_entries` caller, which promotes
+             -- `pending` without taking a lease; every worker path writes
+             -- the lease together with `processing` (#1530).
+               AND (m.status = 'pending'
+                    OR (m.status = 'processing' AND m.lease_expiry < $1))";
+        const TENANT_IS_IDLE: &str = "AND NOT EXISTS (SELECT 1 FROM bulk_manifests p
+                             WHERE p.tenant_id = m.tenant_id
+                               AND p.status = 'processing'
+                               AND p.lease_expiry >= $1)";
+        const OLDEST: &str = "ORDER BY m.added_at LIMIT 1 FOR UPDATE OF m SKIP LOCKED";
+
+        let mut rows = txn
+            .query(&format!("{CANDIDATES} {TENANT_IS_IDLE} {OLDEST}"), &[&now])
             .await
             .map_err(|e| internal_error(format!("Failed to select claimable manifest: {}", e)))?;
+        if rows.is_empty() {
+            rows = txn
+                .query(&format!("{CANDIDATES} {OLDEST}"), &[&now])
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to select claimable manifest: {}", e))
+                })?;
+        }
 
         let Some(row) = rows.first() else {
             txn.commit()
