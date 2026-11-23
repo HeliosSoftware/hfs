@@ -71,6 +71,7 @@ const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ui/bulk-import/some-id/abort"),
     ("POST", "/ui/bulk-import/some-id/complete"),
     ("POST", "/ui/bulk-import/some-id/edit"),
+    ("GET", "/ui/subscriptions"),
     ("GET", "/ui/bulk-export"),
     ("GET", "/ui/bulk-export/new"),
     ("GET", "/ui/bulk-export/active"),
