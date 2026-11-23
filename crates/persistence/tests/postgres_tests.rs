@@ -2348,6 +2348,20 @@ mod postgres_integration {
         .await;
     }
 
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). A database of its own: the shared one carries other tests'
+    /// claimable manifests, and this asserts on what the next claims return.
+    #[tokio::test]
+    async fn postgres_bulk_submit_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
