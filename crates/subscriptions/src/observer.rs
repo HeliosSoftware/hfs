@@ -73,8 +73,17 @@ fn resource_event(event: &WriteEvent) -> Option<ResourceEvent> {
 
 impl WriteObserver for SubscriptionWriteObserver {
     fn on_write(&self, event: &WriteEvent) {
-        if let WriteEvent::Resource(write) = event {
-            self.engine.observe_write(write);
+        match event {
+            WriteEvent::Resource(write) => self.engine.observe_write(write),
+            // A purge erases resources and their history without a
+            // per-resource delete notice, and a deregistered tenant may be
+            // provisioned again: the engine drops the state it derived from
+            // them, as it does for a FHIR delete.
+            WriteEvent::Erased { tenant, scope } => {
+                self.engine.observe_erased(tenant.as_str(), scope)
+            }
+            WriteEvent::TenantRemoved { tenant } => self.engine.forget_tenant(tenant.as_str()),
+            WriteEvent::Counts { .. } => {}
         }
     }
 }
@@ -259,6 +268,123 @@ mod tests {
         assert!(
             settle(|| !registered()).await,
             "the delete notice deregistered it"
+        );
+    }
+
+    /// A purge erases without a delete notice, and a tenant removal carries
+    /// no resource ids at all: both drop what the engine derived from the
+    /// erased data, so nothing keeps delivering to the erased endpoints.
+    #[tokio::test]
+    async fn erased_and_removed_tenant_events_drop_the_engine_state() {
+        use crate::topics::{ResourceTrigger, TopicDefinition};
+
+        let engine = engine();
+        let topic_url = "http://example.org/topic/patient-create";
+        let add_topic = || {
+            engine.topic_registry().add_topic(
+                "acme",
+                TopicDefinition {
+                    canonical_url: topic_url.to_string(),
+                    title: None,
+                    resource_triggers: vec![ResourceTrigger {
+                        resource_type: "Patient".to_string(),
+                        interactions: vec![ResourceEventType::Create],
+                        fhirpath_criteria: None,
+                    }],
+                    can_filter_by: vec![],
+                    notification_shape: vec![],
+                },
+            )
+        };
+        let subscription = crate::manager::tests::build_subscription_json(
+            topic_url,
+            "rest-hook",
+            Some("https://receiver.example/hook"),
+        );
+        let observer = SubscriptionWriteObserver::new(Arc::clone(&engine));
+        let create = || {
+            WriteEvent::Resource(ResourceWrite {
+                tenant: TenantId::new("acme".to_string()),
+                fhir_version: FhirVersion::default(),
+                resource_type: "Subscription".to_string(),
+                live_delta: 0,
+                notice: Some(WriteNotice {
+                    kind: WriteKind::Create,
+                    resource_id: "sub-1".to_string(),
+                    version_id: "1".to_string(),
+                    resource: Some(subscription.clone()),
+                    previous: None,
+                }),
+                at: Utc::now(),
+            })
+        };
+        let registered = || engine.manager().get_subscription("acme", "sub-1").is_some();
+        async fn settle(check: impl Fn() -> bool) -> bool {
+            for _ in 0..200 {
+                if check() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        }
+
+        add_topic();
+        observer.on_write(&create());
+        assert!(settle(registered).await);
+        observer.on_write(&WriteEvent::Erased {
+            tenant: TenantId::new("acme".to_string()),
+            scope: ErasedScope::Instance {
+                resource_type: "Subscription".to_string(),
+                id: "sub-1".to_string(),
+            },
+        });
+        assert!(
+            settle(|| !registered()).await,
+            "an erased instance is dropped"
+        );
+
+        observer.on_write(&create());
+        assert!(settle(registered).await);
+        observer.on_write(&WriteEvent::Erased {
+            tenant: TenantId::new("acme".to_string()),
+            scope: ErasedScope::Type("Subscription".to_string()),
+        });
+        assert!(settle(|| !registered()).await, "an erased type is dropped");
+
+        observer.on_write(&create());
+        assert!(settle(registered).await);
+        observer.on_write(&WriteEvent::TenantRemoved {
+            tenant: TenantId::new("acme".to_string()),
+        });
+        assert!(
+            settle(|| !registered()).await,
+            "a removed tenant is dropped"
+        );
+        assert!(
+            engine
+                .topic_registry()
+                .get_topic("acme", topic_url)
+                .is_none(),
+            "the tenant's topics go with it"
+        );
+
+        add_topic();
+        observer.on_write(&create());
+        assert!(settle(registered).await);
+        observer.on_write(&WriteEvent::Erased {
+            tenant: TenantId::new("acme".to_string()),
+            scope: ErasedScope::Tenant,
+        });
+        assert!(
+            settle(|| !registered()).await,
+            "an erased tenant is dropped"
+        );
+        assert!(
+            engine
+                .topic_registry()
+                .get_topic("acme", topic_url)
+                .is_none()
         );
     }
 }
