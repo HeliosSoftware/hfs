@@ -22,9 +22,9 @@ R6 = ["helios-fhir/R6"]
 otel = ["helios-observability/otel"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.9" }
-helios-observability = { path = "../observability", version = "0.2.9" }
+helios-fhir = { path = "../fhir", version = "0.2.10", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.10" }
+helios-observability = { path = "../observability", version = "0.2.10" }
 chumsky = "0.10"
 chrono = { workspace = true } # For date/time parsing and functions
 rust_decimal = { version = "1.0", features = ["serde-with-float", "macros"] }
