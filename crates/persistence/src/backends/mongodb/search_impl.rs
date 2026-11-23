@@ -983,7 +983,19 @@ fn split_missing_stages<'a>(
             return None;
         }
     }
-    (metadata_missing > 0).then_some(stages.as_slice())
+    // The unstamped side runs the plan's stages as-is, so they must be exactly
+    // one set of fallback stages per metadata `:missing=true` parameter and
+    // nothing else (a `:not` or `:missing=false` stage would be skipped by the
+    // stamped count).
+    if metadata_missing == 0 {
+        return None;
+    }
+    debug_assert_eq!(
+        stages.len(),
+        metadata_missing * missing_fallback_stages(Document::new()).len(),
+        "split totals expect only missing fallback stages"
+    );
+    Some(stages.as_slice())
 }
 
 /// The hint both split counts carry: one candidate plan with fixed bounds.
