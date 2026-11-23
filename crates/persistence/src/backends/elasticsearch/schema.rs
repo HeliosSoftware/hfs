@@ -77,7 +77,20 @@ use super::backend::ElasticsearchBackend;
 ///   it lack the field, so a reference search or `_revinclude` does not match
 ///   their absolute references (`http://host/fhir/Patient/p1`) until a
 ///   `$reindex`; relative references are unaffected.
-pub const SCHEMA_VERSION: u64 = 3;
+/// - `4` — `search_params.quantity.high` and `.canonical_high`, the upper end
+///   of the interval a quantity row covers (#2602). A `Range` is indexed as
+///   `[low, high]`; a `Quantity` or `Age` is a point (`high = value`).
+///   Documents indexed before it have no `high`, and the quantity search
+///   falls back to `value` for them, so `Quantity` and `Age` results do not
+///   change; a stored `Range` produced no row at all and is not found until a
+///   `$reindex`. Also `.range_high` and `.canonical_range_high`, written only
+///   on a Range (`high != value`), which `ap` reads for the Ranges that start
+///   below its window; a point or a pre-upgrade document is found by `value`
+///   alone. Also `.sort_name`: a Range with `low != high` adds a second,
+///   sort-only entry (`sort_name` and its upper bound as `value`, no `name`)
+///   that a descending sort reads, so every sort reads `value` and no
+///   document is rewritten on upgrade.
+pub const SCHEMA_VERSION: u64 = 4;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -227,13 +240,31 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                             "type": "nested",
                             "properties": {
                                 "name": { "type": "keyword" },
+                                // The interval a row covers, `[value, high]` (#2602):
+                                // a point for a Quantity or Age, the bounds of a
+                                // Range otherwise (an open side is a finite
+                                // sentinel, ES cannot store ±Inf).
                                 "value": { "type": "double" },
+                                "high": { "type": "double" },
+                                // Only on a proper Range (`high != value`): its
+                                // upper end again, in a field no point has, so
+                                // `ap` reads the Ranges alone (`range_high` for
+                                // the raw unit, `canonical_range_high` for the
+                                // UCUM-canonical one).
+                                "range_high": { "type": "double" },
+                                // Sort-only entries (no `name`, so no filter or
+                                // `:missing` ever selects one): a Range's upper
+                                // bound as an extra `value`, tagged with the
+                                // parameter name here, for descending sorts.
+                                "sort_name": { "type": "keyword" },
                                 "unit": { "type": "keyword" },
                                 "system": { "type": "keyword" },
                                 "code": { "type": "keyword" },
                                 // UCUM-canonical value/unit (computed by the writer)
                                 // for unit-equivalent quantity search (g ⇄ mg).
                                 "canonical_value": { "type": "double" },
+                                "canonical_high": { "type": "double" },
+                                "canonical_range_high": { "type": "double" },
                                 "canonical_unit": { "type": "keyword" }
                             }
                         },
@@ -815,6 +846,17 @@ fn predates_reference_target(meta: Option<&Value>) -> bool {
     stored_schema_version(meta) < REFERENCE_TARGET_SCHEMA_VERSION
 }
 
+/// The first [`SCHEMA_VERSION`] whose documents carry
+/// `search_params.quantity.high` (#2602).
+const QUANTITY_RANGE_SCHEMA_VERSION: u64 = 4;
+
+/// Whether an index whose mapping `_meta` is `meta` was laid out before
+/// [`QUANTITY_RANGE_SCHEMA_VERSION`], so that a `Range` it holds was never
+/// indexed as a quantity.
+fn predates_quantity_range(meta: Option<&Value>) -> bool {
+    stored_schema_version(meta) < QUANTITY_RANGE_SCHEMA_VERSION
+}
+
 /// Document counts per index out of a filtered `GET {indices}/_stats/docs`
 /// response (`indices.<name>.primaries.docs.count`). An index the response does
 /// not list has no entry.
@@ -930,6 +972,28 @@ fn warn_reference_reindex_needed(indices: &[String]) {
     );
 }
 
+/// Notes, once, that the documents of `indices` were indexed before #2602
+/// (schema version `4`): a quantity parameter selecting a `Range` (`onset-age`,
+/// `abatement-age`, `context-quantity`) produced no row for them, so such a
+/// `Range` is not found until `$reindex` indexes it again. `Quantity` and `Age`
+/// values are unaffected: filters fall back to `value` for an entry without
+/// `high`, and sorts read `value`.
+fn warn_quantity_reindex_needed(indices: &[String]) {
+    if indices.is_empty() {
+        return;
+    }
+    const SAMPLE: usize = 5;
+    tracing::warn!(
+        indices = indices.len(),
+        sample = indices[..indices.len().min(SAMPLE)].join(", "),
+        schema_version = SCHEMA_VERSION,
+        "Elasticsearch indices holding documents indexed before #2602 were upgraded to a \
+         mapping with `search_params.quantity.high`, but a Range stored in those documents \
+         was never indexed, so it will not match quantity searches (onset-age, \
+         abatement-age, context-quantity) until `$reindex` is run"
+    );
+}
+
 /// Brings every existing HFS index under the configured prefix up to
 /// [`SCHEMA_VERSION`]. Run at startup; see [`SCHEMA_VERSION`] for the
 /// convention and the failure policy.
@@ -1017,6 +1081,15 @@ pub async fn reconcile_index_mappings(backend: &ElasticsearchBackend) -> Reconci
         let counts = document_counts(backend, &predating_ref).await;
         warn_reference_reindex_needed(&indices_holding_documents(&predating_ref, &counts));
     }
+    let predating_qty: Vec<String> = updated_names
+        .iter()
+        .filter(|name| predates_quantity_range(previous.get(*name).and_then(Option::as_ref)))
+        .cloned()
+        .collect();
+    if !predating_qty.is_empty() {
+        let counts = document_counts(backend, &predating_qty).await;
+        warn_quantity_reindex_needed(&indices_holding_documents(&predating_qty, &counts));
+    }
     if report.updated > 0 || report.failed > 0 {
         tracing::info!(
             schema_version = SCHEMA_VERSION,
@@ -1041,6 +1114,7 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
     }
     let mut predates_end = false;
     let mut predates_ref = false;
+    let mut predates_qty = false;
     let outcome = match read_schema_versions(backend, index).await {
         Err(outcome) => outcome,
         Ok(body) => match stale_indices(&body) {
@@ -1048,6 +1122,7 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
                 let meta = stale[0].1.as_ref();
                 predates_end = predates_date_range_end(meta);
                 predates_ref = predates_reference_target(meta);
+                predates_qty = predates_quantity_range(meta);
                 let body = reconcile_mapping_body(backend.config(), meta);
                 put_mapping(backend, &[index], body).await
             }
@@ -1062,7 +1137,7 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             schema_version = SCHEMA_VERSION,
             "reconciled Elasticsearch index mapping"
         );
-        if predates_end || predates_ref {
+        if predates_end || predates_ref || predates_qty {
             let names = [index.to_string()];
             let counts = document_counts(backend, &names).await;
             let holding = indices_holding_documents(&names, &counts);
@@ -1072,25 +1147,84 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
             if predates_ref {
                 warn_reference_reindex_needed(&holding);
             }
+            if predates_qty {
+                warn_quantity_reindex_needed(&holding);
+            }
         }
     }
     note_reconcile_outcome(backend, index, &outcome);
 }
 
+/// Attempts [`ensure_index`] gives an index check or creation that the cluster
+/// answers `429` or `5xx`, the first included (#2724).
+const ENSURE_INDEX_ATTEMPTS: u32 = 5;
+
+/// One [`ensure_index`] attempt the cluster asked to have repeated: a `429` or
+/// `5xx` answer to the existence check or to the create request.
+#[derive(Debug)]
+struct EnsureIndexRetry {
+    /// The client-facing step, status included.
+    context: String,
+    /// The index and Elasticsearch's answer, for the log only (#2385).
+    detail: String,
+}
+
 /// Ensures an index exists for the given tenant and resource type, creating it
 /// if necessary, and that an existing one carries the current mapping.
+///
+/// A `429` or `5xx` answer to either request is repeated, up to
+/// [`ENSURE_INDEX_ATTEMPTS`] attempts in all, with the doubling, jittered
+/// backoff the reads and writes use (100, 200, 400, 800 ms before jitter;
+/// at most ~2.25 s of waiting). It is the first write of a type in a tenant
+/// that creates the index, and a throttled or busy cluster there failed that
+/// write although the same request moments later succeeds (#2724). Every attempt checks existence again, so a create
+/// that went through despite its error answer is not sent twice. A transport
+/// failure is not repeated: a timeout has already cost the full request
+/// timeout. An exhausted retry is the same [`BackendError::Unavailable`] the
+/// first failure used to be.
 pub async fn ensure_index(
     backend: &ElasticsearchBackend,
     tenant_id: &str,
     resource_type: &str,
 ) -> StorageResult<()> {
     let index = backend.index_name(tenant_id, resource_type);
+    let mut attempt = 0;
+    loop {
+        let retry = match ensure_index_once(backend, &index).await? {
+            None => return Ok(()),
+            Some(retry) => retry,
+        };
+        attempt += 1;
+        if attempt >= ENSURE_INDEX_ATTEMPTS {
+            return Err(index_unavailable(&retry.context, &retry.detail));
+        }
+        let delay_ms =
+            super::storage::jittered_ms(super::search_impl::RETRY_BASE_DELAY_MS << (attempt - 1));
+        tracing::warn!(
+            attempt,
+            max = ENSURE_INDEX_ATTEMPTS,
+            delay_ms,
+            index,
+            failure = %retry.detail,
+            "{}; retrying",
+            retry.context
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
 
+/// One attempt of [`ensure_index`]: `Ok(None)` when the index exists or was
+/// created, `Ok(Some(_))` when the cluster asked for the attempt to be
+/// repeated.
+async fn ensure_index_once(
+    backend: &ElasticsearchBackend,
+    index: &str,
+) -> StorageResult<Option<EnsureIndexRetry>> {
     // Check if index exists
     let exists_response = backend
         .client()
         .indices()
-        .exists(IndicesExistsParts::Index(&[&index]))
+        .exists(IndicesExistsParts::Index(&[index]))
         .send()
         .await
         .map_err(|e| {
@@ -1099,16 +1233,16 @@ pub async fn ensure_index(
 
     let exists_status = exists_response.status_code();
     if exists_status.is_success() {
-        reconcile_index(backend, &index).await;
-        return Ok(());
+        reconcile_index(backend, index).await;
+        return Ok(None);
     }
     // A throttled or failing cluster says nothing about whether the index
     // exists; creating it now would only fail the same way, or worse, race.
     if super::storage::is_transient_bulk_status(u64::from(exists_status.as_u16())) {
-        return Err(index_unavailable(
-            &format!("Failed to check index existence (status {exists_status})"),
-            &format!("index {index} answered status {exists_status}"),
-        ));
+        return Ok(Some(EnsureIndexRetry {
+            context: format!("Failed to check index existence (status {exists_status})"),
+            detail: format!("index {index} answered status {exists_status}"),
+        }));
     }
 
     // Create the index with mappings
@@ -1117,7 +1251,7 @@ pub async fn ensure_index(
     let response = backend
         .client()
         .indices()
-        .create(IndicesCreateParts::Index(&index))
+        .create(IndicesCreateParts::Index(index))
         .body(mapping)
         .send()
         .await
@@ -1128,13 +1262,13 @@ pub async fn ensure_index(
         let body = response.text().await.unwrap_or_default();
         // 400 with "resource_already_exists_exception" is OK (race condition)
         if body.contains("resource_already_exists_exception") {
-            return Ok(());
+            return Ok(None);
         }
         if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
-            return Err(index_unavailable(
-                &format!("Failed to create index (status {status})"),
-                &format!("{index}: {body}"),
-            ));
+            return Ok(Some(EnsureIndexRetry {
+                context: format!("Failed to create index (status {status})"),
+                detail: format!("{index}: {body}"),
+            }));
         }
         let message = format!(
             "Failed to create index {} (status {}): {}",
@@ -1166,9 +1300,9 @@ pub async fn ensure_index(
     }
 
     // Created from the current mapping, marker included.
-    backend.mark_schema_checked(&index);
+    backend.mark_schema_checked(index);
     tracing::debug!("Created Elasticsearch index '{}'", index);
-    Ok(())
+    Ok(None)
 }
 
 // `delete_index` — a whole-index `DELETE` addressed by index name alone — was
@@ -1495,6 +1629,38 @@ mod tests {
         );
     }
 
+    /// #2602: an index recorded below version 4 holds documents without
+    /// `search_params.quantity.high`; the mapping carries both new fields.
+    #[test]
+    fn test_predates_quantity_range() {
+        assert!(predates_quantity_range(None));
+        assert!(predates_quantity_range(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 3 })
+        )));
+        assert!(!predates_quantity_range(Some(
+            &json!({ SCHEMA_VERSION_META_KEY: 4 })
+        )));
+        let mapping = create_index_mapping(&ElasticsearchConfig::default());
+        let quantity = &mapping["mappings"]["properties"]["search_params"]["properties"]["quantity"]
+            ["properties"];
+        assert_eq!(quantity["high"]["type"], "double");
+        assert_eq!(quantity["canonical_high"]["type"], "double");
+        assert_eq!(quantity["range_high"]["type"], "double");
+        assert_eq!(quantity["canonical_range_high"]["type"], "double");
+        assert_eq!(quantity["sort_name"]["type"], "keyword");
+    }
+
+    /// #2602: the warning names the remedy, once.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_warn_quantity_reindex_needed_message() {
+        warn_quantity_reindex_needed(&[]);
+        assert!(!logs_contain("#2602"));
+        warn_quantity_reindex_needed(&["hfs_t_condition".to_string()]);
+        assert!(logs_contain("quantity.high"));
+        assert!(logs_contain("$reindex"));
+    }
+
     /// #2394: the warning names the field and the remedy, once.
     #[test]
     #[tracing_test::traced_test]
@@ -1678,6 +1844,42 @@ mod tests {
             assert!(!warnings[0].contains("hfs_t_empty"), "{}", warnings[0]);
             Ok(())
         });
+    }
+
+    /// #2602: upgrading a version-3 index holding documents rewrites no
+    /// document: no `_update_by_query` (or any other write) is sent, only the
+    /// mapping update and the read-only lookups.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn quantity_upgrade_sends_no_update_by_query() {
+        let server = stub_cluster(
+            &[("hfs_t_condition", v(3))],
+            200,
+            Some(&[("hfs_t_condition", 7)]),
+        )
+        .await;
+        let report = reconcile_index_mappings(&backend_on(&server)).await;
+        assert_eq!((report.updated, report.failed), (1, 0));
+        // Let any (unwanted) spawned background request land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in &requests {
+            assert!(
+                !request.url.path().contains("_update_by_query"),
+                "unexpected rewrite: {} {}",
+                request.method,
+                request.url
+            );
+            if request.method.as_str() != "GET" {
+                assert!(
+                    request.url.path().ends_with("/_mapping"),
+                    "only the mapping update may write: {} {}",
+                    request.method,
+                    request.url
+                );
+            }
+        }
     }
 
     /// #1391: an index with nothing in it, or already at version 2, is not

@@ -1758,7 +1758,6 @@ mod inventory_hook_tests {
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
             self_base_url: "http://localhost:8080".to_string(),
-            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),

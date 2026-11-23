@@ -2505,3 +2505,53 @@ async fn error_receipts_name_the_input_file_and_line() {
 
     assert_eq!(manifest["output"][0]["count"], 1, "{manifest:#}");
 }
+
+/// With `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` set, a kick-off naming a manifest
+/// at another origin is refused with 400 before anything is stored.
+#[tokio::test]
+async fn test_kickoff_refuses_a_manifest_outside_the_trusted_providers() {
+    let cfg = BulkSubmitConfig {
+        trusted_providers: vec!["https://provider".to_string()],
+        ..BulkSubmitConfig::default()
+    };
+    let (server, backend, ..) = create_submit_server_with(mock_fetcher(), cfg).await;
+
+    let refused = server
+        .post("/$bulk-submit")
+        .json(&kickoff_body_at(
+            "https://elsewhere/manifest.json?sig=secret123",
+        ))
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.text()
+    );
+    let text = refused.text();
+    assert!(text.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{text}");
+    assert!(!text.contains("secret123"), "{text}");
+    let tenant = TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "it-1");
+    assert_eq!(
+        backend
+            .get_submission_status(&tenant, &sub_id)
+            .await
+            .unwrap(),
+        None,
+        "nothing was stored"
+    );
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK,
+        "the listed origin is accepted"
+    );
+}

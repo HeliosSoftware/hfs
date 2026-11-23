@@ -40,12 +40,14 @@ env:
   # Pinned commit of our fork of inferno-framework/us-quality-core-test-kit.
   # Provides both the Inferno stack and the fixture bundles loaded into HFS,
   # so the suite and its data always move together. The fork carries no
-  # upstream tags, so pin by SHA: 4b8bc2b is the fork's helios/ci-combined-fixes,
+  # upstream tags, so pin by SHA: 44ae186 is the fork's helios/ci-combined-fixes,
   # upstream v0.2.0 (41fc954) plus our two fixes that are open upstream as
-  # inferno-framework/us-quality-core-test-kit#45 and #46. Move the pin back
-  # to an upstream release once one includes them.
+  # inferno-framework/us-quality-core-test-kit#45 and #46, plus a fixture fix
+  # for the NDC 49281-0121-65 display ('/' where the bundle had '>'), which the
+  # unpinned validator began rejecting as "Wrong Display Name". Move the pin
+  # back to an upstream release once one includes them.
   TEST_KIT_REPO: HeliosSoftware/us-quality-core-test-kit
-  TEST_KIT_REF: ${{ inputs.test_kit_ref || '4b8bc2b814ee253058cf5820d35aab6e13d0640e' }}
+  TEST_KIT_REF: ${{ inputs.test_kit_ref || '44ae186a46e3c65cb545f884d55f8e0b32c4ae32' }}
   # Remote Docker daemon (required repository secret). Published container ports are
   # reached on its host part, exported as DOCKER_HOST_IP by each job's first step.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
@@ -454,6 +456,13 @@ jobs:
           # of every synchronous write: at the 1s default a 473-entry batch
           # Bundle (entries synced one at a time, 16-wide) ran into the 30s
           # request timeout; 200ms keeps it to a few seconds.
+          #
+          # The 121-entry patient transaction Bundle is the slow write here: 39
+          # resource types each create their index on first write, and the
+          # entries sync one after another. That is ~10s on a quiet Docker
+          # host and 14-30s+ when another workflow shares it, which answered
+          # 408 at the 30s default and failed the load step. 120s leaves room
+          # for a busy host; the plain-database legs keep the default.
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
@@ -461,6 +470,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -483,6 +493,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="$DOCKER_HOST_IP"
@@ -501,6 +512,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -512,6 +524,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
+            HFS_REQUEST_TIMEOUT=120 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_BASE_URL="$HFS_BASE_URL" \

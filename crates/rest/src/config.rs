@@ -30,7 +30,7 @@
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
-//! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
+//! | `HFS_AUTH_TENANT_CLAIM` | tenant_id | JWT claim carrying the tenant id when authentication is enabled (read by `helios-auth`) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
 //! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
 //! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
@@ -234,8 +234,6 @@ pub struct MultitenancyConfig {
     pub routing_mode: TenantRoutingMode,
     /// If true, error when URL path and header specify different tenants.
     pub strict_validation: bool,
-    /// JWT claim name containing tenant ID (for future JWT-based tenant resolution).
-    pub jwt_tenant_claim: String,
     /// If true, only tenants provisioned through the admin API are valid: a
     /// request resolving to a tenant absent from the registry is rejected rather
     /// than implicitly created. The default (`"default"`) tenant is
@@ -252,10 +250,25 @@ impl Default for MultitenancyConfig {
         Self {
             routing_mode: TenantRoutingMode::HeaderOnly,
             strict_validation: false,
-            jwt_tenant_claim: "tenant_id".to_string(),
             require_provisioned_tenant: false,
         }
     }
+}
+
+/// The startup error for a set `HFS_JWT_TENANT_CLAIM`.
+///
+/// The variable was read into a field nothing consumed; the claim the bearer
+/// provider reads is `HFS_AUTH_TENANT_CLAIM`. A deployment that named its
+/// claim through the dead variable kept reading `tenant_id`, so every token
+/// without that exact claim was served from the default tenant, silently.
+/// Refusing to start is the only answer that cannot be missed.
+pub(crate) fn dead_tenant_claim_variable(value: Option<std::ffi::OsString>) -> Option<String> {
+    value.map(|_| {
+        "HFS_JWT_TENANT_CLAIM is set but is not read by any component; the JWT tenant claim is \
+         configured with HFS_AUTH_TENANT_CLAIM (default tenant_id). Set that and unset \
+         HFS_JWT_TENANT_CLAIM."
+            .to_string()
+    })
 }
 
 impl MultitenancyConfig {
@@ -270,9 +283,6 @@ impl MultitenancyConfig {
             .map(|s| s.to_lowercase() == "true" || s == "1")
             .unwrap_or(false);
 
-        let jwt_tenant_claim =
-            std::env::var("HFS_JWT_TENANT_CLAIM").unwrap_or_else(|_| "tenant_id".to_string());
-
         let require_provisioned_tenant = std::env::var("HFS_TENANT_REQUIRE_PROVISIONED")
             .map(|s| s.to_lowercase() == "true" || s == "1")
             .unwrap_or(false);
@@ -280,7 +290,6 @@ impl MultitenancyConfig {
         Self {
             routing_mode,
             strict_validation,
-            jwt_tenant_claim,
             require_provisioned_tenant,
         }
     }
@@ -782,11 +791,31 @@ pub struct BulkSubmitConfig {
     /// This is the *configured* value: the engine caps it, and SQLite always
     /// writes a file's batches one at a time (one write lock, #942).
     pub batch_writers: u32,
+    /// Longest line of an NDJSON input file the ingest buffers before parsing
+    /// it. A longer line is rejected like a malformed one and its bytes are
+    /// discarded up to the next newline. Defaults to the REST API's body
+    /// ceiling (128 MiB). Set with `HFS_BULK_SUBMIT_MAX_LINE_BYTES`.
+    pub max_line_bytes: u64,
     /// How long the input-file fetcher waits for the next bytes of a
     /// response before treating the body as broken and resuming it with a
     /// `Range` request, in seconds (#1127). Set with
     /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
     pub fetch_read_timeout_secs: u64,
+    /// Wall-clock budget, in seconds, for fetching one remote Bulk Export
+    /// manifest. The idle read timeout above cannot bound a body that keeps
+    /// producing bytes; past this budget the manifest fails with a fetch
+    /// error and the worker moves on. Set with
+    /// `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`.
+    pub manifest_fetch_timeout_secs: u64,
+    /// Ceiling, in decoded bytes, on a Bulk Export manifest the worker
+    /// fetches; the manifest is read whole. Set with
+    /// `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`.
+    pub max_manifest_bytes: u64,
+    /// Ceiling, in decoded bytes, on a JWE-encrypted input file; encrypted
+    /// files are read whole, since the authentication tag trails the
+    /// ciphertext. Unencrypted NDJSON streams and has no ceiling. Set with
+    /// `HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES`.
+    pub max_encrypted_file_bytes: u64,
     /// Leave an existing resource untouched when a submitted resource is
     /// identical to it (ignoring `meta.versionId`/`meta.lastUpdated`), so
     /// replaying a manifest writes no new versions (#1127). Off by default.
@@ -836,9 +865,13 @@ pub struct BulkSubmitConfig {
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
-    /// Origins (`scheme://host[:port]`) trusted as Data Providers: where the
-    /// client assertion may be presented and where a token obtained there may
-    /// be sent. Empty confines each token to its token endpoint's origin.
+    /// Origins (`scheme://host[:port]`) trusted as Data Providers: the only
+    /// origins `$bulk-submit` fetches from (`manifestUrl`, `oauthMetadataUrl`,
+    /// manifest output URLs, redirects), where the client assertion may be
+    /// presented and where a token obtained there may be sent. Empty permits
+    /// every origin, confines each token to its token endpoint's origin, and
+    /// keeps the status or transport detail of a failed fetch out of the
+    /// submitter's error artifact.
     pub trusted_providers: Vec<String>,
     /// `Retry-After` (seconds) advertised on an in-progress status poll once
     /// ingestion is under way.
@@ -884,7 +917,11 @@ impl fmt::Debug for BulkSubmitConfig {
             max_concurrent_per_tenant,
             batch_size,
             batch_writers,
+            max_line_bytes,
             fetch_read_timeout_secs,
+            manifest_fetch_timeout_secs,
+            max_manifest_bytes,
+            max_encrypted_file_bytes,
             skip_unchanged,
             index_queue,
             index_concurrency,
@@ -925,7 +962,11 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("max_concurrent_per_tenant", max_concurrent_per_tenant)
             .field("batch_size", batch_size)
             .field("batch_writers", batch_writers)
+            .field("max_line_bytes", max_line_bytes)
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("manifest_fetch_timeout_secs", manifest_fetch_timeout_secs)
+            .field("max_manifest_bytes", max_manifest_bytes)
+            .field("max_encrypted_file_bytes", max_encrypted_file_bytes)
             .field("skip_unchanged", skip_unchanged)
             .field("index_queue", index_queue)
             .field("index_concurrency", index_concurrency)
@@ -974,7 +1015,11 @@ impl Default for BulkSubmitConfig {
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             batch_writers: 4,
+            max_line_bytes: helios_persistence::core::bulk_submit::DEFAULT_MAX_LINE_BYTES,
             fetch_read_timeout_secs: 60,
+            manifest_fetch_timeout_secs: 600,
+            max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
+            max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
             skip_unchanged: false,
             index_queue: 16,
             index_concurrency: 4,
@@ -1135,9 +1180,19 @@ impl BulkSubmitConfig {
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
             batch_writers: env_u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
+            max_line_bytes: env_u64("HFS_BULK_SUBMIT_MAX_LINE_BYTES", d.max_line_bytes),
             fetch_read_timeout_secs: env_u64(
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
+            ),
+            manifest_fetch_timeout_secs: env_u64(
+                "HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT",
+                d.manifest_fetch_timeout_secs,
+            ),
+            max_manifest_bytes: env_u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
+            max_encrypted_file_bytes: env_u64(
+                "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
+                d.max_encrypted_file_bytes,
             ),
             skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
             index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
@@ -1244,8 +1299,20 @@ impl BulkSubmitConfig {
         if self.batch_writers == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_WRITERS must be >= 1".to_string());
         }
+        if self.max_line_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_LINE_BYTES must be > 0".to_string());
+        }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.manifest_fetch_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT must be > 0".to_string());
+        }
+        if self.max_manifest_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES must be > 0".to_string());
+        }
+        if self.max_encrypted_file_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES must be > 0".to_string());
         }
         if self.index_queue == 0 {
             errors.push("HFS_BULK_SUBMIT_INDEX_QUEUE must be >= 1".to_string());
@@ -2429,6 +2496,10 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        if let Some(error) = dead_tenant_claim_variable(std::env::var_os("HFS_JWT_TENANT_CLAIM")) {
+            errors.push(error);
+        }
+
         if self.port == 0 {
             errors.push("Port cannot be 0".to_string());
         }
@@ -3212,7 +3283,17 @@ mod tests {
         let config = MultitenancyConfig::default();
         assert_eq!(config.routing_mode, TenantRoutingMode::HeaderOnly);
         assert!(!config.strict_validation);
-        assert_eq!(config.jwt_tenant_claim, "tenant_id");
+    }
+
+    /// `HFS_JWT_TENANT_CLAIM` never reached the bearer provider; a deployment
+    /// that set it to name its claim kept reading `tenant_id`, and every token
+    /// without that claim landed in the default tenant. Refused at startup.
+    #[test]
+    fn a_set_dead_tenant_claim_variable_is_a_startup_error() {
+        assert_eq!(dead_tenant_claim_variable(None), None);
+        let error = dead_tenant_claim_variable(Some("org".into())).expect("refused");
+        assert!(error.contains("HFS_JWT_TENANT_CLAIM"), "{error}");
+        assert!(error.contains("HFS_AUTH_TENANT_CLAIM"), "{error}");
     }
 
     // ── validate() – max_body_size == 0 ───────────────────────────
@@ -3821,12 +3902,10 @@ mod tests {
         let config = MultitenancyConfig {
             routing_mode: TenantRoutingMode::UrlPath,
             strict_validation: true,
-            jwt_tenant_claim: "custom_claim".to_string(),
             ..Default::default()
         };
         assert_eq!(config.routing_mode, TenantRoutingMode::UrlPath);
         assert!(config.strict_validation);
-        assert_eq!(config.jwt_tenant_claim, "custom_claim");
     }
 
     #[test]

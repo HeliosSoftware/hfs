@@ -214,7 +214,19 @@ The FHIR Messaging channel is disabled by default and is enabled only when `HFS_
 |----------|---------|-------------|
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel. |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers. |
-| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow delivery to private or loopback endpoint hosts; intended for local development and CI only. |
+| `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow rest-hook and FHIR Messaging delivery to endpoints that are, or resolve to, private, loopback, link-local or shared (`100.64.0.0/10`) addresses; intended for local development and CI only. Applies to both channels. |
+| `HFS_SUBSCRIPTION_MESSAGING_CREDENTIAL_HOSTS` | *(none)* | Comma-separated receivers (`host` or `host:port`) that may be sent the server's outbound credential when the Subscription supplies no `Authorization` header. An entry without a port matches any port; wildcards are not supported. Unset means no receiver gets it; the credential travels only over HTTPS unless private endpoints are allowed. |
+| `HFS_SUBSCRIPTION_MESSAGING_BEARER_TOKEN` | *(none)* | Bearer token sent to the listed receivers. Unset falls back to `HFS_OUTBOUND_BEARER_TOKEN`, which is also the credential the server's own self-calls use and one HFS itself may accept; set this to give receivers a separate one. |
+
+### Endpoint safety
+
+A Subscription's endpoint is written by whoever can write the resource, so rest-hook and FHIR Messaging deliveries follow the same egress rules:
+
+- An endpoint whose host is a literal private, loopback, link-local, shared or unspecified address is refused with a permanent error.
+- A DNS name is checked when it is resolved: if it resolves only to such addresses (`localhost`, an internal record) the delivery is refused, and the connection is made to the address that was checked.
+- Redirects are never followed. A `3xx` answer is a permanent delivery error, so the Subscription's headers are not re-sent to a host the endpoint did not name. Register the final URL.
+
+`HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` lifts the first two rules for local development and CI. Deliveries made through an HTTP proxy are resolved by the proxy and are outside these checks.
 
 ## Enabling in HFS
 
@@ -399,6 +411,8 @@ After a successful bind message, the server sends a handshake notification bundl
 
 The WebSocket protocol is **unidirectional** (server → client) after binding. Additional bind messages on the same connection are rejected; close frames trigger graceful cleanup.
 
+**Deadlines and queueing:** a connection that sends no bind message within 10 seconds is closed (`1008 bind-timeout`). Each bound client has a queue of 256 notifications; a client that stops reading its socket is given 30 seconds to accept a frame and is dropped once its queue is full, so a stalled client retains no further notifications in the server. It reconnects with a new binding token and replays missed events through `$events`.
+
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 
 **Subscription deletion:** Deleting the `Subscription` resource closes all connected WebSocket clients for that subscription.
@@ -531,5 +545,5 @@ A Kafka-backed architecture addresses most of the single-instance and performanc
 - Batch and transaction bundle entries do not emit subscription events — only direct CRUD handlers (create, update, delete, patch) do
 - [`eventTrigger`](https://hl7.org/fhir/subscriptiontopic.html) is not supported — only `resourceTrigger` (create, update, delete) is implemented
 - The engine is in-memory only and single-instance — subscriptions and topics are not shared across cluster nodes or reloaded from storage on restart (see [Clustering](#clustering) above)
-- WebSocket notifications are best-effort — if no clients are connected when an event fires the notification is silently dropped; there is no replay or queueing for late-connecting clients
+- WebSocket notifications are best-effort — if no clients are connected when an event fires the notification is silently dropped; there is no replay or queueing for late-connecting clients, and a connected client that stops reading is dropped once 256 notifications are queued for it
 - Email and FHIR messaging channels are not yet implemented (planned for subsequent phases)

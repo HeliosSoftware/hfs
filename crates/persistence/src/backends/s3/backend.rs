@@ -10,7 +10,11 @@ use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, OBJECT_STORE_ACCESS_TEXT, OBJECT_STORE_BUCKET_TEXT, OBJECT_STORE_CONFLICT_TEXT,
+    OBJECT_STORE_INVALID_TEXT, OBJECT_STORE_THROTTLED_TEXT, OBJECT_STORE_UNAVAILABLE_TEXT,
+    StorageError, StorageResult, s3_unavailable,
+};
 use crate::search::{SearchParameterDefinition, TenantSearchRegistries};
 use crate::tenant::{TenantContext, TenantId};
 
@@ -277,7 +281,7 @@ impl S3Backend {
         };
 
         if backend.config.validate_buckets_on_startup {
-            backend.validate_buckets().await?;
+            backend.validate_buckets_at_startup().await?;
         }
 
         Ok(backend)
@@ -319,6 +323,43 @@ impl S3Backend {
                 .map_err(|e| self.map_client_error(e))?;
         }
         Ok(())
+    }
+
+    /// [`Self::validate_buckets`] for the constructor: the same `HeadBucket`
+    /// per configured bucket, with the bucket and the client's detail kept in
+    /// the error.
+    ///
+    /// A constructor failure is the process's exit message, read by the
+    /// operator and never served to a client, and it must name its cause
+    /// whatever the log level: [`Self::map_client_error`] leaves the detail to
+    /// a `warn` line that `HFS_LOG_LEVEL=error` drops.
+    async fn validate_buckets_at_startup(&self) -> StorageResult<()> {
+        for bucket in self.config.configured_buckets() {
+            self.client
+                .head_bucket(&bucket)
+                .await
+                .map_err(|e| Self::startup_error(&bucket, e))?;
+        }
+        Ok(())
+    }
+
+    /// The error [`Self::validate_buckets_at_startup`] reports for `bucket`.
+    pub(crate) fn startup_error(bucket: &str, error: S3ClientError) -> StorageError {
+        let detail = match error {
+            S3ClientError::NotFound => "not found".to_string(),
+            S3ClientError::PreconditionFailed => "precondition failed".to_string(),
+            S3ClientError::BucketNotFound(detail)
+            | S3ClientError::ConditionalConflict(detail)
+            | S3ClientError::Throttled(detail)
+            | S3ClientError::Unavailable(detail)
+            | S3ClientError::AccessDenied(detail)
+            | S3ClientError::InvalidInput(detail)
+            | S3ClientError::Internal(detail) => detail,
+        };
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name: "s3".to_string(),
+            message: format!("bucket {bucket} failed its startup check: {detail}"),
+        })
     }
 
     /// Resolves the bucket and keyspace for the given tenant.
@@ -670,12 +711,11 @@ impl S3Backend {
             // The bucket is missing or invisible: the store is misconfigured. This
             // must always be an error — never an empty read — so a typo'd or
             // deleted bucket can't masquerade as a store with no data in it.
-            S3ClientError::BucketNotFound(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message: format!("S3 bucket not found or not accessible: {message}"),
-                })
-            }
+            S3ClientError::BucketNotFound(message) => StorageError::Backend(s3_unavailable(
+                "bucket not found or not accessible",
+                OBJECT_STORE_BUCKET_TEXT,
+                &message,
+            )),
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
@@ -683,27 +723,36 @@ impl S3Backend {
             // and wrote nothing. Deliberately NOT `QueryError`, which the
             // resource paths read as a lost precondition (AlreadyExists /
             // VersionConflict). `Unavailable` is served as 503 with Retry-After.
-            S3ClientError::ConditionalConflict(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message: format!(
-                        "S3 reported a conflicting concurrent write (HTTP 409); retry: {message}"
-                    ),
-                })
-            }
-            S3ClientError::Throttled(message) => StorageError::Backend(BackendError::Unavailable {
-                backend_name: "s3".to_string(),
-                message,
-            }),
-            S3ClientError::Unavailable(message) => {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "s3".to_string(),
-                    message,
-                })
-            }
+            S3ClientError::ConditionalConflict(message) => StorageError::Backend(s3_unavailable(
+                "conflicting concurrent write (HTTP 409)",
+                OBJECT_STORE_CONFLICT_TEXT,
+                &message,
+            )),
+            S3ClientError::Throttled(message) => StorageError::Backend(s3_unavailable(
+                "throttled",
+                OBJECT_STORE_THROTTLED_TEXT,
+                &message,
+            )),
+            S3ClientError::Unavailable(message) => StorageError::Backend(s3_unavailable(
+                "unavailable",
+                OBJECT_STORE_UNAVAILABLE_TEXT,
+                &message,
+            )),
+            // S3 was reached and refused the server's credentials. Still
+            // `Unavailable` (503): the request is not at fault and an expired
+            // token recovers on its own. The text says so instead of "could
+            // not be reached".
+            S3ClientError::AccessDenied(message) => StorageError::Backend(s3_unavailable(
+                "access denied",
+                OBJECT_STORE_ACCESS_TEXT,
+                &message,
+            )),
+            // Still a 400. S3's own sentence names the argument and can quote
+            // the bucket or key, so it goes to the log like the 503 details.
             S3ClientError::InvalidInput(message) => {
+                tracing::warn!(error = %message, "S3 rejected the request as invalid");
                 StorageError::Validation(crate::error::ValidationError::InvalidResource {
-                    message,
+                    message: OBJECT_STORE_INVALID_TEXT.to_string(),
                     details: Vec::new(),
                 })
             }

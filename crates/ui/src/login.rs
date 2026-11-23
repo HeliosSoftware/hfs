@@ -368,8 +368,9 @@ mod tests {
 /// REST middleware uses — a token about to lapse is refreshed, a session whose
 /// refresh is dead is dropped — so a page's server-side call runs with exactly
 /// the credential its browser-side calls run with. `None` when no login is
-/// installed or the request carries no valid session; the caller then falls
-/// back to the process's outbound service credential as before.
+/// installed or the request carries no valid session; a data self-call then
+/// carries no credential at all, and only the conformance reads fall back to
+/// the process's outbound service credential (#2692).
 pub(crate) async fn session_authorization(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -384,8 +385,9 @@ pub(crate) async fn session_authorization(
 
 /// A [`crate::Caller`] for this request: the browser's own `Authorization`
 /// when it sent one, else the signed-in session's bearer (#1480), else none —
-/// in which case the conformance source applies the outbound service
-/// credential. The `$sql-export` self-calls run as the user who clicked.
+/// in which case the `$sql-export` self-call carries no credential (#2692),
+/// never the outbound service credential. The `$sql-export` self-calls run
+/// as the user who clicked.
 pub(crate) async fn caller_for(
     state: &WebState,
     headers: &axum::http::HeaderMap,
@@ -400,8 +402,7 @@ pub(crate) async fn caller_for(
 
 /// The credential a page's own server-side self-call carries under the
 /// interactive login (#1480): the browser's `Authorization` when it sent one,
-/// else the signed-in session's bearer, else nothing (the outbound service
-/// credential applies downstream).
+/// else the signed-in session's bearer, else nothing (#2692).
 #[cfg(test)]
 mod selfcall_tests {
     use std::sync::Arc;
@@ -462,7 +463,6 @@ mod selfcall_tests {
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),
             self_base_url: "http://localhost:8080".to_string(),
-            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             tenant_path_routing: false,
             fhir_version: helios_fhir::FhirVersion::R4,
             default_tenant: "default".to_string(),
@@ -565,9 +565,37 @@ mod selfcall_tests {
             Some("Bearer browser-token")
         );
 
-        // No session: the outbound provider (a no-op here) is all there is.
+        // No session: nothing goes on.
         let sent = built_headers(&state, &HeaderMap::new()).await;
         assert!(sent.get("authorization").is_none());
+    }
+
+    /// #2692: a caller that brought no credential sends nothing on a data
+    /// self-call (`$export`, its manifest and files, the Patient/Group
+    /// lookups, `$bulk-submit`). `WebState` holds no outbound service
+    /// credential at all — only the conformance source does — so there is
+    /// nothing for these self-calls to fall back to.
+    #[tokio::test]
+    async fn forward_identity_sends_nothing_for_an_anonymous_caller() {
+        let state = web_state(None);
+        let sent = built_headers(&state, &HeaderMap::new()).await;
+        assert!(
+            sent.get("authorization").is_none(),
+            "anonymous self-call carried {:?}",
+            sent.get("authorization")
+        );
+
+        // The browser's own credential still rides, unchanged.
+        let mut own = HeaderMap::new();
+        own.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer browser-token"),
+        );
+        let sent = built_headers(&state, &own).await;
+        assert_eq!(
+            sent.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer browser-token")
+        );
     }
 
     async fn import_headers(

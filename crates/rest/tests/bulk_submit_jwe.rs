@@ -223,5 +223,11 @@ async fn fetcher_is_usable_behind_arc_as_a_trait_object() {
         .fetch_manifest("http://127.0.0.1:1/nope.json", &[], &[], None)
         .await
         .expect_err("connection refused");
-    assert!(err.to_string().contains("manifest GET"), "{err}");
+    // No trusted providers are listed, so the transport detail stays in the
+    // log and the submitter's text only names the URL.
+    assert!(
+        err.to_string()
+            .contains("fetching http://127.0.0.1:1/nope.json failed"),
+        "{err}"
+    );
 }

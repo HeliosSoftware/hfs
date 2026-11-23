@@ -647,7 +647,8 @@ fn compare_evaluation_results(a: &EvaluationResult, b: &EvaluationResult) -> std
                 EvaluationResult::Boolean(_, _, _) => 1,
                 EvaluationResult::Integer(_, _, _) => 2,
                 EvaluationResult::Integer64(_, _, _) => 3,
-                EvaluationResult::Decimal(_, _, _) => 4,
+                EvaluationResult::Decimal(_, _, _)
+                | EvaluationResult::OutOfRangeDecimal(_, _, _) => 4,
                 EvaluationResult::String(_, _, _) => 5,
                 EvaluationResult::Date(_, _, _) => 6,
                 EvaluationResult::DateTime(_, _, _) => 7,

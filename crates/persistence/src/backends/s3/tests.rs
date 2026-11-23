@@ -4070,7 +4070,11 @@ async fn a_scan_whose_object_read_is_unavailable_fails_as_unavailable() {
         .expect("the unreadable object fails the scan");
     match error {
         SofError::Unavailable(message) => {
-            assert!(message.contains("after 3 attempts"), "message: {message}")
+            assert!(
+                message.contains(crate::error::OBJECT_STORE_UNAVAILABLE_TEXT),
+                "the client detail stays in the log: {message}"
+            );
+            assert!(!message.contains("streaming error"), "message: {message}");
         }
         other => panic!("expected SofError::Unavailable, got {other:?}"),
     }
@@ -7414,11 +7418,122 @@ fn conditional_conflict_maps_to_unavailable_not_query_error() {
     let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
     match backend.map_client_error(S3ClientError::ConditionalConflict("busy".to_string())) {
         StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-            assert!(message.contains("409"), "message was: {message}");
-            assert!(message.contains("busy"), "message was: {message}");
+            assert_eq!(message, crate::error::OBJECT_STORE_CONFLICT_TEXT);
+            assert!(!message.contains("busy"), "message was: {message}");
         }
         other => panic!("expected Unavailable (503), got {other:?}"),
     }
+}
+
+/// Every arm of `map_client_error` whose detail is the SDK's or the
+/// provider's answers its fixed sentence, as a 503, and none of the detail.
+#[test]
+fn map_client_error_keeps_the_client_detail_out_of_the_message() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let detail = "PutObject s3://hfs-prod-phi/default/x.json: 10.0.3.7:9000 said no";
+    let cases = [
+        (
+            S3ClientError::BucketNotFound(detail.to_string()),
+            crate::error::OBJECT_STORE_BUCKET_TEXT,
+        ),
+        (
+            S3ClientError::ConditionalConflict(detail.to_string()),
+            crate::error::OBJECT_STORE_CONFLICT_TEXT,
+        ),
+        (
+            S3ClientError::Throttled(detail.to_string()),
+            crate::error::OBJECT_STORE_THROTTLED_TEXT,
+        ),
+        (
+            S3ClientError::Unavailable(detail.to_string()),
+            crate::error::OBJECT_STORE_UNAVAILABLE_TEXT,
+        ),
+        (
+            S3ClientError::AccessDenied(detail.to_string()),
+            crate::error::OBJECT_STORE_ACCESS_TEXT,
+        ),
+    ];
+    for (error, text) in cases {
+        match backend.map_client_error(error.clone()) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(message, text, "for {error:?}");
+            }
+            other => panic!("expected Unavailable for {error:?}, got {other:?}"),
+        }
+    }
+}
+
+/// Refused credentials are not "could not be reached": S3 answered.
+#[test]
+fn access_denied_does_not_claim_the_store_is_unreachable() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let error = S3ClientError::AccessDenied("access denied: ExpiredToken".to_string());
+    let text = backend.map_client_error(error).to_string();
+    assert!(text.contains("refused the server's credentials"), "{text}");
+    assert!(!text.contains("could not be reached"), "{text}");
+    assert!(!text.contains("ExpiredToken"), "{text}");
+}
+
+/// S3's wording for an invalid argument can quote the bucket or key; the 400
+/// carries a fixed sentence.
+#[test]
+fn invalid_input_stays_a_validation_error_without_the_provider_text() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let error = S3ClientError::InvalidInput("Bucket name hfs-prod-phi is not valid".to_string());
+    match backend.map_client_error(error) {
+        StorageError::Validation(crate::error::ValidationError::InvalidResource {
+            message,
+            ..
+        }) => assert_eq!(message, crate::error::OBJECT_STORE_INVALID_TEXT),
+        other => panic!("expected a validation error (400), got {other:?}"),
+    }
+}
+
+/// The constructor's bucket check is the process's exit message: it names the
+/// bucket and keeps the client detail, so the cause survives a log level that
+/// drops `warn`.
+#[test]
+fn a_startup_bucket_failure_names_the_bucket_and_keeps_the_detail() {
+    let error = S3ClientError::Unavailable(
+        "HeadBucket s3://hfs-prod-phi: connection failed: ConnectionRefused".to_string(),
+    );
+    match S3Backend::startup_error("hfs-prod-phi", error) {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(message.contains("hfs-prod-phi"), "{message}");
+            assert!(message.contains("ConnectionRefused"), "{message}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+/// A per-entry failure record is served to the submitter: a backend fault
+/// keeps its text in the log, a transient one keeps its fixed sentence.
+#[test]
+fn a_bulk_submit_entry_record_does_not_carry_backend_fault_text() {
+    let fault = StorageError::Backend(BackendError::Internal {
+        backend_name: "s3".to_string(),
+        message: "S3 error (HTTP 500, code=InternalError): node 10.0.3.7 is unwell".to_string(),
+        source: None,
+    });
+    let outcome = S3Backend::bulk_submit_operation_outcome(&fault);
+    assert_eq!(outcome["issue"][0]["code"], "exception");
+    assert_eq!(
+        outcome["issue"][0]["diagnostics"],
+        super::bulk_submit::ENTRY_BACKEND_FAULT_TEXT
+    );
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let transient = backend.map_client_error(S3ClientError::Unavailable(
+        "10.0.3.7:9000 refused".to_string(),
+    ));
+    let outcome = S3Backend::bulk_submit_operation_outcome(&transient);
+    assert_eq!(outcome["issue"][0]["code"], "transient");
+    let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        diagnostics.contains(crate::error::OBJECT_STORE_UNAVAILABLE_TEXT),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains("10.0.3.7"), "{diagnostics}");
 }
 
 /// A 409 on a resource write is a retryable 503, not a conflict: the resource

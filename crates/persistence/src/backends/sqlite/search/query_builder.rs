@@ -365,6 +365,11 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
         if let Some(merged) = reference_exists_predicate(rows_sql, outer_key) {
             return Some(merged);
         }
+        // A quantity's `ap` arms (#2602): the same rows of one parameter, so
+        // one `EXISTS` with the arms ORed, not one lookup per arm.
+        if let Some(merged) = quantity_exists_predicate(rows_sql, outer_key) {
+            return Some(merged);
+        }
         let branches = rows_sql
             .split(" UNION ALL ")
             .map(|branch| parameter_exists_predicate(branch, outer_key))
@@ -372,6 +377,40 @@ pub(crate) fn membership_exists_predicate(rows_sql: &str, outer_key: &str) -> Op
         return Some(format!("({})", branches.join(" OR ")));
     }
     parameter_exists_predicate(rows_sql, outer_key)
+}
+
+/// [`membership_exists_predicate`] for the `UNION ALL` of a quantity `ap`
+/// search (`quantity_range_union`): every select reads the rows of one
+/// parameter and tests only `value_quantity_*` columns, and the row is pinned
+/// by `resource_key`, so the arms are the row filter of a single `EXISTS`
+/// seeking `idx_search_composite`. `None` when `rows_sql` is not that shape.
+fn quantity_exists_predicate(rows_sql: &str, outer_key: &str) -> Option<String> {
+    let mut name = None;
+    let mut tests = Vec::new();
+    for arm in rows_sql.split(" UNION ALL ") {
+        let rest = arm.strip_prefix(PARAMETER_ROWS_HEAD)?;
+        let (arm_name, cond) = rest.split_once(" AND (")?;
+        let cond = cond.strip_suffix(')')?;
+        if !arm_name.starts_with("param_name = ")
+            || cond.contains("SELECT")
+            || !cond.contains("value_quantity_")
+            || name.is_some_and(|n| n != arm_name)
+        {
+            return None;
+        }
+        name = Some(arm_name);
+        tests.push(format!("({cond})"));
+    }
+    let name = name?;
+    if tests.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "EXISTS (SELECT 1 FROM search_index INDEXED BY idx_search_composite \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = {outer_key} \
+         AND {name} AND ({}))",
+        tests.join(" OR ")
+    ))
 }
 
 /// [`membership_exists_predicate`] for a reference parameter's selects (see
@@ -546,6 +585,11 @@ pub struct QueryBuilder {
     /// Off unless the caller has seen both indexes exist: `INDEXED BY` fails
     /// to prepare against a missing one (a bulk rebuild drops them).
     composite_rewrite: bool,
+    /// The tenant's search-parameter registry, when the caller has one.
+    /// `_filter` reads it to classify a parameter by its registered type
+    /// (any Quantity parameter, custom ones included); without it `_filter`
+    /// falls back to the spec's quantity parameter names.
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 }
 
 impl QueryBuilder {
@@ -557,7 +601,20 @@ impl QueryBuilder {
             param_offset: 0,
             skip_base_params: false,
             composite_rewrite: false,
+            registry: None,
         }
+    }
+
+    /// Gives the builder the search-parameter registry, so `_filter` resolves
+    /// every registered Quantity parameter (custom ones too) to the interval
+    /// quantity path instead of relying on a fixed name list. The registry is
+    /// only read, under a short read lock, when a `_filter` is built.
+    pub fn with_registry(
+        mut self,
+        registry: std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+    ) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Builds a token+quantity composite as the code-first pairing, which
@@ -1186,6 +1243,12 @@ impl QueryBuilder {
             return Some(Self::membership(param, rows));
         }
 
+        // `ap` on a quantity is two disjoint reads (#2602): the value index
+        // for the points, the Range-only index for the Ranges.
+        if let Some(rows) = Self::quantity_range_union(param, param_offset) {
+            return Some(Self::membership(param, rows));
+        }
+
         // A plain multi-value reference search (all `Type/id`, no modifier)
         // collapses to a single index-friendly `value_reference IN (...)`
         // instead of ORing one `(= OR range)` branch per value (#1052). The
@@ -1324,6 +1387,28 @@ impl QueryBuilder {
         if alternatives.len() < 2 {
             return None;
         }
+        let sql = alternatives
+            .iter()
+            .map(|alternative| parameter_rows(&param.name, alternative))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// The rows of a quantity parameter with a single `ap` value: one `SELECT`
+    /// per alternative of [`QuantityHandler::build_alternatives`],
+    /// `UNION ALL`-ed. `a ≤ L ≤ b` seeks `idx_search_quantity` (every point,
+    /// whatever its high bound), the Ranges that start below the window seek
+    /// `idx_search_quantity_range`, and the two never return the same row.
+    /// `None` for anything else, which keeps the single condition.
+    fn quantity_range_union(param: &SearchParameter, param_offset: usize) -> Option<SqlFragment> {
+        let [value] = param.values.as_slice() else {
+            return None;
+        };
+        if param.param_type != SearchParamType::Quantity {
+            return None;
+        }
+        let (alternatives, params) = QuantityHandler::build_alternatives(value, param_offset)?;
         let sql = alternatives
             .iter()
             .map(|alternative| parameter_rows(&param.name, alternative))
@@ -1645,6 +1730,9 @@ impl QueryBuilder {
                 Ok(expr) => {
                     // Generate SQL from the parsed expression
                     let mut generator = FilterSqlGenerator::new(current_offset);
+                    if let Some(registry) = &self.registry {
+                        generator = generator.with_registry(&registry.read(), &self.resource_type);
+                    }
                     let sql = generator.generate(&expr);
                     current_offset += sql.params.len();
                     conditions.push(sql);
@@ -1816,6 +1904,10 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending if col == "value_date" => {
                         ("MAX", "value_date_end")
                     }
+                    // Likewise a quantity row is an interval (#2602).
+                    crate::types::SortDirection::Descending if col == "value_quantity_value" => {
+                        ("MAX", "value_quantity_high")
+                    }
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
@@ -1877,6 +1969,47 @@ fn positive_membership_subquery(condition: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_filter` resolves a registered Quantity parameter that is not in the
+    /// generator's name list through the registry the builder carries.
+    #[test]
+    fn filter_uses_the_registry_for_custom_quantity_parameters() {
+        use crate::search::registry::{
+            SearchParamType as RegType, SearchParameterDefinition, SearchParameterRegistry,
+        };
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(
+            SearchParameterDefinition::new(
+                "http://example.org/sp/my-qty",
+                "my-qty",
+                RegType::Quantity,
+                "Observation.value",
+            )
+            .with_base(["Observation"]),
+        )
+        .unwrap();
+        let registry = std::sync::Arc::new(parking_lot::RwLock::new(reg));
+        let filter = SearchValue::eq("my-qty gt 45");
+        let sql_of = |b: &QueryBuilder| {
+            b.build_filter_condition(std::slice::from_ref(&filter), 2)
+                .unwrap()
+                .sql
+        };
+
+        let with = sql_of(&QueryBuilder::new("t", "Observation").with_registry(registry.clone()));
+        let without = sql_of(&QueryBuilder::new("t", "Observation"));
+        assert!(
+            with.contains("value_quantity_high"),
+            "a registered quantity parameter takes the interval path: {with}"
+        );
+        assert!(
+            !without.contains("value_quantity_high"),
+            "no registry, no custom quantity classification: {without}"
+        );
+        // A registry that does not know the parameter keeps the fallback.
+        let other = sql_of(&QueryBuilder::new("t", "Patient").with_registry(registry));
+        assert!(!other.contains("value_quantity_high"), "{other}");
+    }
 
     #[test]
     fn exists_form_only_for_one_plain_parameter_select() {
@@ -3563,6 +3696,324 @@ mod tests {
                 .unwrap_or_else(|| panic!("{context}: a dropped condition matches everything"));
             assert_eq!(fragment.sql, "1 = 0", "{context}");
             assert!(fragment.params.is_empty(), "{context}");
+        }
+    }
+
+    /// #2602 `ap` on a quantity: exactness and plan of the two-select form.
+    mod quantity_ap {
+        use super::*;
+        use crate::search::{QUANTITY_OPEN_HIGH, QUANTITY_OPEN_LOW};
+        use crate::types::SearchPrefix;
+        use helios_fhirpath::ucum::canonicalize_quantity as canon;
+
+        struct Row {
+            low: f64,
+            /// `None` is a row written before the upper bound existed.
+            high: Option<f64>,
+            unit: &'static str,
+        }
+
+        fn canonical(unit: &str, v: f64) -> f64 {
+            if v == QUANTITY_OPEN_LOW || v == QUANTITY_OPEN_HIGH {
+                v
+            } else {
+                canon(v, unit).unwrap().0
+            }
+        }
+
+        fn fixture(rows: &[Row]) -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::backends::sqlite::schema::initialize_schema(&conn).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            let mut insert = conn
+                .prepare(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key,
+                        param_name, value_quantity_value, value_quantity_high, value_quantity_unit,
+                        value_quantity_canonical_value, value_quantity_canonical_high,
+                        value_quantity_canonical_unit)
+                     VALUES ('t', 'Observation', ?1, ?1, 'value-quantity', ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let canon_unit = canon(1.0, row.unit).unwrap().1;
+                insert
+                    .execute(rusqlite::params![
+                        i as i64 + 1,
+                        row.low,
+                        row.high,
+                        row.unit,
+                        canonical(row.unit, row.low),
+                        row.high.map(|h| canonical(row.unit, h)),
+                        canon_unit,
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            conn.execute_batch("ANALYZE").unwrap();
+            conn
+        }
+
+        fn fragment(raw: &str) -> SqlFragment {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(SearchPrefix::Ap, raw)],
+                chain: vec![],
+                components: vec![],
+            });
+            QueryBuilder::new("t", "Observation").build(&query).unwrap()
+        }
+
+        fn to_sql(p: &SqlParam) -> rusqlite::types::Value {
+            match p {
+                SqlParam::String(s) => rusqlite::types::Value::Text(s.clone()),
+                SqlParam::Integer(i) => rusqlite::types::Value::Integer(*i),
+                SqlParam::Float(f) => rusqlite::types::Value::Real(*f),
+                SqlParam::Null => rusqlite::types::Value::Null,
+            }
+        }
+
+        fn keys(conn: &rusqlite::Connection, fragment: &SqlFragment) -> Vec<i64> {
+            let mut stmt = conn.prepare(&fragment.sql).unwrap();
+            let mut found: Vec<i64> = stmt
+                .query_map(
+                    rusqlite::params_from_iter(fragment.params.iter().map(to_sql)),
+                    |r| r.get(0),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            found
+        }
+
+        fn plan(conn: &rusqlite::Connection, fragment: &SqlFragment) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", fragment.sql))
+                .unwrap();
+            stmt.query_map(
+                rusqlite::params_from_iter(fragment.params.iter().map(to_sql)),
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        }
+
+        /// Rows of mixed shape in `mg` (and `g`, to cross units).
+        fn mixed_rows() -> Vec<Row> {
+            let mut rows = Vec::new();
+            for i in 0..400 {
+                let v = f64::from(i) * 0.5;
+                rows.push(Row {
+                    low: v,
+                    high: Some(v),
+                    unit: "mg",
+                });
+            }
+            // Written before the upper bound existed.
+            for v in [89.0, 90.0, 100.0, 110.0, 111.0] {
+                rows.push(Row {
+                    low: v,
+                    high: None,
+                    unit: "mg",
+                });
+            }
+            for (low, high) in [
+                (40.0, 50.0),
+                (0.0, 1000.0),
+                (95.0, 96.0),
+                (80.0, 90.0),
+                (110.0, 130.0),
+                (111.0, 130.0),
+                (10.0, 89.99),
+                (QUANTITY_OPEN_LOW, 20.0),
+                (QUANTITY_OPEN_LOW, 95.0),
+                (60.0, QUANTITY_OPEN_HIGH),
+                (105.0, QUANTITY_OPEN_HIGH),
+                (150.0, QUANTITY_OPEN_HIGH),
+                (QUANTITY_OPEN_LOW, QUANTITY_OPEN_HIGH),
+            ] {
+                rows.push(Row {
+                    low,
+                    high: Some(high),
+                    unit: "mg",
+                });
+            }
+            // 0.1 g is 100 mg.
+            for (low, high) in [(0.1, 0.1), (0.05, 0.2), (0.3, 0.4), (0.0, 0.0895)] {
+                rows.push(Row {
+                    low,
+                    high: Some(high),
+                    unit: "g",
+                });
+            }
+            rows
+        }
+
+        /// Brute force over the rows: raw bounds in the stored unit when the
+        /// search names it, canonical bounds when the unit converts.
+        fn oracle(rows: &[Row], raw: &str) -> Vec<i64> {
+            let q = crate::search::FhirQuantityValue::parse(raw).unwrap();
+            let (a, b) = crate::search::approx_range(q.number.value, q.number.text());
+            let code = q.code.as_deref();
+            let (ca, cb) = match code {
+                Some(c) => (canon(a, c).map(|(v, _)| v), canon(b, c).map(|(v, _)| v)),
+                None => (None, None),
+            };
+            let canon_unit = code.and_then(|c| canon(1.0, c)).map(|(_, u)| u);
+            let mut out = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                let high = row.high.unwrap_or(row.low);
+                let raw_hit = code.is_none_or(|c| row.unit == c) && row.low <= b && high >= a;
+                // A row without a stored upper bound has none canonical either.
+                let canon_hit = match (ca, cb, &canon_unit, row.high) {
+                    (Some(ca), Some(cb), Some(u), Some(_)) => {
+                        canon(1.0, row.unit).unwrap().1 == *u
+                            && canonical(row.unit, row.low) <= cb
+                            && canonical(row.unit, high) >= ca
+                    }
+                    (Some(ca), Some(cb), Some(u), None) => {
+                        // Canonical bounds NULL: only the point test on the
+                        // value (arm 1) can see it.
+                        canon(1.0, row.unit).unwrap().1 == *u
+                            && canonical(row.unit, row.low) >= ca
+                            && canonical(row.unit, row.low) <= cb
+                    }
+                    _ => false,
+                };
+                if raw_hit || canon_hit {
+                    out.push(i as i64 + 1);
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn ap_two_selects_equal_brute_force() {
+            let rows = mixed_rows();
+            let conn = fixture(&rows);
+            for raw in [
+                "100",
+                "100|mg",
+                "100|http://unitsofmeasure.org|mg",
+                "0.1|g",
+                "0",
+                "45",
+                "50|mg",
+                "1000",
+                "-3",
+                "1e2",
+                "100.0|mg",
+                "7|g",
+            ] {
+                let frag = fragment(raw);
+                assert!(frag.sql.contains(" UNION ALL "), "{raw}: {}", frag.sql);
+                assert_eq!(keys(&conn, &frag), oracle(&rows, raw), "ap {raw}");
+            }
+        }
+
+        #[test]
+        fn ap_not_modifier_is_the_complement() {
+            let rows = mixed_rows();
+            let conn = fixture(&rows);
+            let mut query = SearchQuery::new("Observation");
+            query.parameters.push(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: Some(SearchModifier::Not),
+                values: vec![SearchValue::new(SearchPrefix::Ap, "100|mg")],
+                chain: vec![],
+                components: vec![],
+            });
+            let frag = QueryBuilder::new("t", "Observation").build(&query).unwrap();
+            assert!(frag.sql.contains(" NOT IN ("), "{}", frag.sql);
+            let want = oracle(&rows, "100|mg");
+            let got = keys(&conn, &frag);
+            assert!(got.iter().all(|k| !want.contains(k)));
+            assert_eq!(got.len() + want.len(), rows.len());
+        }
+
+        /// One merged `EXISTS` (and no `UNION`) is the window form.
+        #[test]
+        fn ap_has_one_exists_form_that_agrees() {
+            let rows = mixed_rows();
+            let conn = fixture(&rows);
+            for raw in ["100", "100|mg", "0.1|g"] {
+                let frag = fragment(raw);
+                let exists = membership_exists_predicate(&frag.sql, "w.rk").unwrap();
+                assert_eq!(exists.matches("EXISTS").count(), 1, "{exists}");
+                assert!(!exists.contains("UNION"), "{exists}");
+                let sql = format!(
+                    "SELECT w.rk FROM (SELECT DISTINCT resource_key AS rk FROM search_index \
+                     WHERE tenant_id = ?1 AND resource_type = ?2) AS w WHERE {exists}"
+                );
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let mut got: Vec<i64> = stmt
+                    .query_map(
+                        rusqlite::params_from_iter(frag.params.iter().map(to_sql)),
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, oracle(&rows, raw), "ap {raw}");
+            }
+        }
+
+        /// The two reads are seeks: the value index for points, the
+        /// Range-only index for Ranges; never a multi-index OR or a scan.
+        #[test]
+        fn ap_plan_uses_the_value_and_range_only_indexes() {
+            let mut rows = Vec::new();
+            for i in 0..20_000 {
+                rows.push(Row {
+                    low: f64::from(i) * 0.01,
+                    high: Some(f64::from(i) * 0.01),
+                    unit: "mg",
+                });
+            }
+            for i in 0..40 {
+                let low = f64::from(i) * 5.0;
+                rows.push(Row {
+                    low,
+                    high: Some(low + 3.0),
+                    unit: "mg",
+                });
+            }
+            let conn = fixture(&rows);
+            for raw in ["100", "100|mg", "100|http://unitsofmeasure.org|mg"] {
+                let frag = fragment(raw);
+                let plan = plan(&conn, &frag);
+                let text = plan.join("\n");
+                assert!(!text.contains("MULTI-INDEX OR"), "{raw}\n{text}");
+                assert!(!text.contains("SCAN search_index"), "{raw}\n{text}");
+                assert!(
+                    plan.iter().any(|l| l.contains("idx_search_quantity (")),
+                    "{raw}\n{text}"
+                );
+                assert!(
+                    plan.iter().any(|l| l.contains("idx_search_quantity_range")),
+                    "{raw}\n{text}"
+                );
+                if raw == "100" {
+                    assert!(
+                        plan.iter()
+                            .any(|l| l.contains("COVERING INDEX idx_search_quantity (")),
+                        "{raw}\n{text}"
+                    );
+                }
+                if raw.contains('|') {
+                    assert!(
+                        plan.iter()
+                            .any(|l| l.contains("idx_search_quantity_canonical_range")),
+                        "{raw}\n{text}"
+                    );
+                }
+            }
         }
     }
 }

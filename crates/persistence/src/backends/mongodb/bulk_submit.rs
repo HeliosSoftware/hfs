@@ -91,6 +91,11 @@ pub(crate) const SUBMIT_FILES_COLLECTION: &str = "bulk_submit_files";
 /// head of the queue.
 const CLAIM_CANDIDATES: i64 = 16;
 
+/// How many times one claim attempt scans the tenants with nothing in flight.
+/// A scan is repeated only when it lost a swap to another worker and found
+/// nothing else to take.
+const IDLE_TENANT_SCANS: usize = 4;
+
 fn internal_error(message: impl Into<String>) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
@@ -1884,6 +1889,110 @@ impl BulkSubmitRollbackProvider for MongoBackend {
     }
 }
 
+/// What one compare-and-swap on a claim candidate came to.
+enum ClaimAttempt {
+    Claimed(ManifestLease),
+    /// Another worker changed the manifest between the scan and the swap.
+    Lost,
+    /// Not claimable at all: a malformed row, or a submission that stopped
+    /// being ingestable.
+    Skipped,
+}
+
+impl MongoBackend {
+    /// The oldest [`CLAIM_CANDIDATES`] manifests matching `filter`.
+    async fn claim_candidates(&self, filter: Document) -> StorageResult<Vec<Document>> {
+        let options = FindOptions::builder()
+            .sort(doc! { "added_at": 1_i32 })
+            .limit(Some(CLAIM_CANDIDATES))
+            .build();
+        let cursor = self
+            .manifests()
+            .await?
+            .find(filter)
+            .with_options(options)
+            .await
+            .or_query_error("scan claimable manifests")?;
+        collect(cursor).await
+    }
+
+    /// Tries to take the lease on one scanned candidate.
+    async fn try_claim(
+        &self,
+        candidate: &Document,
+        worker_id: &WorkerId,
+        lease_expiry: DateTime<Utc>,
+        lease_duration: StdDuration,
+    ) -> StorageResult<ClaimAttempt> {
+        let manifests = self.manifests().await?;
+        let (Ok(tenant_id), Ok(submitter), Ok(submission_id), Ok(manifest_id)) = (
+            candidate.get_str("tenant_id"),
+            candidate.get_str("submitter"),
+            candidate.get_str("submission_id"),
+            candidate.get_str("manifest_id"),
+        ) else {
+            return Ok(ClaimAttempt::Skipped);
+        };
+        let tenant = tenant_from_id(tenant_id);
+        let id = SubmissionId::new(submitter, submission_id);
+
+        // `complete` is admitted alongside `in-progress`: it means the
+        // submitter will send no further manifests, not that already
+        // registered ones should be dropped. `aborted` stays excluded.
+        let submission_status = self
+            .submissions()
+            .await?
+            .find_one(submission_filter(&tenant, &id))
+            .await
+            .or_query_error("read submission for claim")?
+            .and_then(|d| opt_str(&d, "status"));
+        let admissible = matches!(
+            submission_status.as_deref(),
+            Some("in-progress") | Some("complete")
+        );
+        if !admissible {
+            return Ok(ClaimAttempt::Skipped);
+        }
+
+        // CAS on the exact document we read: another worker that claimed it
+        // in between bumped `fencing_token`, so our filter matches nothing.
+        let token = candidate.get_i64("fencing_token").unwrap_or(0);
+        let status = candidate.get_str("status").unwrap_or("pending").to_string();
+        let mut guard = manifest_filter(&tenant, &id, manifest_id);
+        guard.insert("fencing_token", token);
+        guard.insert("status", status);
+
+        let claimed = manifests
+            .find_one_and_update(
+                guard,
+                doc! {
+                    "$set": {
+                        "status": ManifestStatus::Processing.to_string(),
+                        "worker_id": worker_id.as_str(),
+                        "lease_expiry": to_bson_time(lease_expiry),
+                    },
+                    "$inc": { "fencing_token": 1_i64 },
+                },
+            )
+            .return_document(ReturnDocument::After)
+            .await
+            .map_err(|e| internal_error(format!("claim manifest: {e}")))?;
+
+        let Some(claimed) = claimed else {
+            return Ok(ClaimAttempt::Lost);
+        };
+        Ok(ClaimAttempt::Claimed(ManifestLease {
+            tenant,
+            submission_id: id,
+            manifest_id: manifest_id.to_string(),
+            worker_id: worker_id.clone(),
+            lease_expiry,
+            lease_duration,
+            fencing_token: claimed.get_i64("fencing_token").unwrap_or(token + 1).max(0) as u64,
+        }))
+    }
+}
+
 #[async_trait]
 impl SubmitClaimStrategy for MongoBackend {
     async fn claim_next_manifest(
@@ -1914,82 +2023,82 @@ impl SubmitClaimStrategy for MongoBackend {
                 },
             ],
         };
-        let options = FindOptions::builder()
-            .sort(doc! { "added_at": 1_i32 })
-            .limit(Some(CLAIM_CANDIDATES))
-            .build();
-        let cursor = manifests
-            .find(eligible)
-            .with_options(options)
+        // A tenant that already holds a live lease waits behind the tenants
+        // that hold none: one tenant's slow origins cannot take every worker
+        // while another tenant's manifests queue. Arrival order within each
+        // group.
+        let mut busy_tenants: std::collections::HashSet<String> = manifests
+            .distinct(
+                "tenant_id",
+                doc! {
+                    "status": ManifestStatus::Processing.to_string(),
+                    "lease_expiry": { "$gte": to_bson_time(now) },
+                },
+            )
             .await
-            .or_query_error("scan claimable manifests")?;
+            .or_query_error("list tenants holding a live lease")?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
 
-        for candidate in collect(cursor).await? {
-            let (Ok(tenant_id), Ok(submitter), Ok(submission_id), Ok(manifest_id)) = (
-                candidate.get_str("tenant_id"),
-                candidate.get_str("submitter"),
-                candidate.get_str("submission_id"),
-                candidate.get_str("manifest_id"),
-            ) else {
-                continue;
-            };
-            let tenant = tenant_from_id(tenant_id);
-            let id = SubmissionId::new(submitter, submission_id);
-
-            // `complete` is admitted alongside `in-progress`: it means the
-            // submitter will send no further manifests, not that already
-            // registered ones should be dropped. `aborted` stays excluded.
-            let submission_status = self
-                .submissions()
-                .await?
-                .find_one(submission_filter(&tenant, &id))
-                .await
-                .or_query_error("read submission for claim")?
-                .and_then(|d| opt_str(&d, "status"));
-            let admissible = matches!(
-                submission_status.as_deref(),
-                Some("in-progress") | Some("complete")
+        // First the tenants with nothing in flight. They are selected in the
+        // query, not sorted to the front of one window: a busy tenant with
+        // more than `CLAIM_CANDIDATES` manifests queued would otherwise fill
+        // the window and hide everyone behind it.
+        //
+        // Idle workers poll on the same cadence, so several of them scan the
+        // same queue at the same instant and all read the same "nobody is
+        // busy". The swap settles it: losing one means another worker took
+        // that manifest a moment ago, so its tenant is busy now and the rest
+        // of its manifests are passed over. When a lost swap leaves nothing
+        // else to take, the scan is repeated without the tenants found busy,
+        // a bounded number of times.
+        for _ in 0..IDLE_TENANT_SCANS {
+            let mut idle = eligible.clone();
+            idle.insert(
+                "tenant_id",
+                doc! { "$nin": busy_tenants.iter().cloned().collect::<Vec<_>>() },
             );
-            if !admissible {
-                continue;
+            // With nobody busy this scan already covers every tenant, so the
+            // arrival-order scan below would only repeat it: an idle worker's
+            // poll of an empty queue stays at two reads.
+            let scans_every_tenant = busy_tenants.is_empty();
+            let mut lost_a_swap = false;
+            for candidate in self.claim_candidates(idle).await? {
+                let Ok(tenant_id) = candidate.get_str("tenant_id") else {
+                    continue;
+                };
+                if busy_tenants.contains(tenant_id) {
+                    continue;
+                }
+                match self
+                    .try_claim(&candidate, worker_id, lease_expiry, lease_duration)
+                    .await?
+                {
+                    ClaimAttempt::Claimed(lease) => return Ok(Some(lease)),
+                    ClaimAttempt::Lost => {
+                        busy_tenants.insert(tenant_id.to_string());
+                        lost_a_swap = true;
+                    }
+                    ClaimAttempt::Skipped => {}
+                }
             }
+            if !lost_a_swap {
+                if scans_every_tenant {
+                    return Ok(None);
+                }
+                break;
+            }
+        }
 
-            // CAS on the exact document we read: another worker that claimed it
-            // in between bumped `fencing_token`, so our filter matches nothing.
-            let token = candidate.get_i64("fencing_token").unwrap_or(0);
-            let status = candidate.get_str("status").unwrap_or("pending").to_string();
-            let mut guard = manifest_filter(&tenant, &id, manifest_id);
-            guard.insert("fencing_token", token);
-            guard.insert("status", status);
-
-            let claimed = manifests
-                .find_one_and_update(
-                    guard,
-                    doc! {
-                        "$set": {
-                            "status": ManifestStatus::Processing.to_string(),
-                            "worker_id": worker_id.as_str(),
-                            "lease_expiry": to_bson_time(lease_expiry),
-                        },
-                        "$inc": { "fencing_token": 1_i64 },
-                    },
-                )
-                .return_document(ReturnDocument::After)
-                .await
-                .map_err(|e| internal_error(format!("claim manifest: {e}")))?;
-
-            let Some(claimed) = claimed else {
-                continue;
-            };
-            return Ok(Some(ManifestLease {
-                tenant,
-                submission_id: id,
-                manifest_id: manifest_id.to_string(),
-                worker_id: worker_id.clone(),
-                lease_expiry,
-                lease_duration,
-                fencing_token: claimed.get_i64("fencing_token").unwrap_or(token + 1).max(0) as u64,
-            }));
+        // Only tenants with work in flight are left waiting: arrival order.
+        for candidate in self.claim_candidates(eligible).await? {
+            if let ClaimAttempt::Claimed(lease) = self
+                .try_claim(&candidate, worker_id, lease_expiry, lease_duration)
+                .await?
+            {
+                return Ok(Some(lease));
+            }
         }
 
         Ok(None)

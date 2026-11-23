@@ -1,6 +1,6 @@
 //! Quantity parameter SQL handler.
 
-use crate::search::FhirQuantityValue;
+use crate::search::{FhirQuantityValue, QuantityBound};
 use crate::types::{SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
@@ -50,13 +50,16 @@ impl QuantityHandler {
 
         // Raw match: numeric comparison plus the stored unit/system verbatim.
         let raw = {
-            let num = Self::build_numeric_condition(
+            let predicate =
+                crate::search::quantity_interval_predicate(value.prefix, num_value, num_str);
+            let num = Self::build_interval_condition(
                 &format!("{table}value_quantity_value"),
-                num_value,
-                num_str,
-                value.prefix,
+                &format!("{table}value_quantity_high"),
+                &predicate,
+                Some,
                 param_num,
-            );
+            )
+            .expect("the identity mapping never fails");
             let mut conditions = vec![num.sql];
             let mut params = num.params;
             let mut next_param = param_num + params.len();
@@ -94,14 +97,13 @@ impl QuantityHandler {
         raw
     }
 
-    /// Builds the canonical-column predicate. For `eq`/`ne` the search value's
-    /// implicit-precision *bounds* (range endpoints, derived from `num_str`)
-    /// are each canonicalized with the supplied UCUM code, so unit
-    /// equivalence is honored without losing implicit-precision semantics to
-    /// float rounding. For every other comparator the exact search value is
-    /// canonicalized and compared with a single boundary, since the FHIR spec
-    /// says those prefixes ignore implicit precision. Returns `None` if the
-    /// unit cannot be canonicalized.
+    /// Builds the canonical-column predicate: the same interval predicate as
+    /// the raw branch, with every bound of it mapped through UCUM
+    /// canonicalization by the supplied code, over the canonical low and high
+    /// columns. For `eq`/`ne` the bounds are the search value's
+    /// implicit-precision range; the comparators use the exact value, since
+    /// the FHIR spec says they ignore implicit precision. Returns `None` if
+    /// the unit cannot be canonicalized.
     fn build_canonical_condition(
         table: &str,
         code: &str,
@@ -111,76 +113,191 @@ impl QuantityHandler {
         param_num: usize,
     ) -> Option<(String, Vec<SqlParam>)> {
         use helios_fhirpath::ucum::canonicalize_quantity as canon;
-        let col = format!("{table}value_quantity_canonical_value");
-
-        let (sql, mut params, unit) = match prefix {
-            SearchPrefix::Eq | SearchPrefix::Ne => {
-                let (lo, hi) = crate::search::implicit_range(value, num_str);
-                let (lo, unit) = canon(lo, code)?;
-                let (hi, _) = canon(hi, code)?;
-                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                let sql = if matches!(prefix, SearchPrefix::Eq) {
-                    format!("{col} >= ?{} AND {col} < ?{}", param_num, param_num + 1)
-                } else {
-                    format!("({col} < ?{} OR {col} >= ?{})", param_num, param_num + 1)
-                };
-                (sql, vec![SqlParam::float(lo), SqlParam::float(hi)], unit)
-            }
-            // gt/lt/ge/le/sa/eb compare against the exact canonicalized
-            // value: per the FHIR spec, the implicit precision is ignored
-            // for these prefixes.
-            SearchPrefix::Gt | SearchPrefix::Sa => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} > ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Lt | SearchPrefix::Eb => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} < ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Ge => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} >= ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            SearchPrefix::Le => {
-                let (b, unit) = canon(value, code)?;
-                (
-                    format!("{col} <= ?{}", param_num),
-                    vec![SqlParam::float(b)],
-                    unit,
-                )
-            }
-            // ap: the shared window, both ends canonicalized.
-            SearchPrefix::Ap => {
-                let (lo, hi) = crate::search::approx_range(value, num_str);
-                let (lo, unit) = canon(lo, code)?;
-                let (hi, _) = canon(hi, code)?;
-                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                (
-                    format!("{col} BETWEEN ?{} AND ?{}", param_num, param_num + 1),
-                    vec![SqlParam::float(lo), SqlParam::float(hi)],
-                    unit,
-                )
-            }
-        };
-
+        let (_, unit) = canon(value, code)?;
+        let predicate = crate::search::quantity_interval_predicate(prefix, value, num_str);
+        let fragment = Self::build_interval_condition(
+            &format!("{table}value_quantity_canonical_value"),
+            &format!("{table}value_quantity_canonical_high"),
+            &predicate,
+            |bound| canon(bound, code).map(|(c, _)| c),
+            param_num,
+        )?;
+        let mut params = fragment.params;
         let unit_param = param_num + params.len();
         params.push(SqlParam::string(&unit));
         Some((
-            format!("{sql} AND {table}value_quantity_canonical_unit = ?{unit_param}"),
+            format!(
+                "{} AND {table}value_quantity_canonical_unit = ?{unit_param}",
+                fragment.sql
+            ),
             params,
         ))
+    }
+
+    /// Renders a [`QuantityIntervalPredicate`] over a stored closed interval
+    /// whose lower end is `low_col` and upper end `high_col` (#2602). Every
+    /// bound is passed through `map` (identity for the raw columns, UCUM
+    /// canonicalization for the canonical ones); `None` from `map` aborts.
+    /// A point (`high = low`) behaves exactly as the old single-column
+    /// comparison; `gt`/`ge`/`eb`/`eq`/`ne` constrain the upper end, which
+    /// the `idx_search_quantity_high` indexes lead with. `ap` is two groups
+    /// ORed here (see [`Self::interval_groups`]); a standalone `ap` search
+    /// reads them as separate selects instead ([`Self::build_alternatives`]).
+    fn build_interval_condition(
+        low_col: &str,
+        high_col: &str,
+        predicate: &crate::search::QuantityIntervalPredicate,
+        map: impl Fn(f64) -> Option<f64>,
+        param_num: usize,
+    ) -> Option<SqlFragment> {
+        let (mut groups, params) =
+            Self::interval_groups(low_col, high_col, predicate, map, param_num)?;
+        let sql = if groups.len() == 1 {
+            groups.remove(0)
+        } else {
+            format!(
+                "({})",
+                groups
+                    .iter()
+                    .map(|g| format!("({g})"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        };
+        Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// One SQL conjunction per group of `predicate`, and the values they
+    /// bind, numbered from `param_num`. A predicate with a
+    /// [`QuantityBound::RangeOnly`] marker (`ap`) binds one placeholder per
+    /// distinct value, so its groups can be read as separate selects, or
+    /// merged into one condition, over the same parameter list. The marker is
+    /// the Range-only test `high > low`, spelled exactly as the partial
+    /// indexes `idx_search_quantity_range` /
+    /// `idx_search_quantity_canonical_range` say it, which is what lets the
+    /// planner use them.
+    fn interval_groups(
+        low_col: &str,
+        high_col: &str,
+        predicate: &crate::search::QuantityIntervalPredicate,
+        map: impl Fn(f64) -> Option<f64>,
+        param_num: usize,
+    ) -> Option<(Vec<String>, Vec<SqlParam>)> {
+        use crate::search::Cmp;
+        let op = |cmp: Cmp| match cmp {
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        };
+        let share = predicate
+            .any_of
+            .iter()
+            .flatten()
+            .any(|b| matches!(b, QuantityBound::RangeOnly));
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        let mut groups = Vec::new();
+        for group in &predicate.any_of {
+            let mut terms = Vec::new();
+            for bound in group {
+                let (col, cmp, v) = match *bound {
+                    QuantityBound::Low(cmp, v) => (low_col, cmp, v),
+                    QuantityBound::High(cmp, v) => (high_col, cmp, v),
+                    QuantityBound::RangeOnly => {
+                        terms.push(format!("{high_col} > {low_col}"));
+                        continue;
+                    }
+                };
+                let v = map(v)?;
+                let placeholder = match seen.iter().find(|(bits, _)| share && *bits == v.to_bits())
+                {
+                    Some(&(_, n)) => n,
+                    None => {
+                        params.push(SqlParam::float(v));
+                        seen.push((v.to_bits(), param_num + params.len() - 1));
+                        param_num + params.len() - 1
+                    }
+                };
+                terms.push(format!("{col} {} ?{placeholder}", op(cmp)));
+            }
+            groups.push(terms.join(" AND "));
+        }
+        Some((groups, params))
+    }
+
+    /// The groups of a standalone `ap` search as separate conditions, each
+    /// with the stored unit/system tests (and, for a convertible UCUM code,
+    /// the canonical twins): `a ≤ L ≤ b` on the value index, and the Ranges
+    /// that start below the window and reach it, on the Range-only index.
+    /// They share one numbered parameter list, laid out as in
+    /// [`Self::build_sql_for`]. `None` for any other prefix or a value that
+    /// does not parse, which keep the single condition. The caller reads one
+    /// `SELECT` per condition, `UNION ALL`-ed: ORed, SQLite plans a
+    /// multi-index OR that costs more than both reads together.
+    pub(crate) fn build_alternatives(
+        value: &SearchValue,
+        param_offset: usize,
+    ) -> Option<(Vec<String>, Vec<SqlParam>)> {
+        if value.prefix != SearchPrefix::Ap {
+            return None;
+        }
+        let quantity = FhirQuantityValue::parse(&value.value).ok()?;
+        let (num_str, num_value) = (quantity.number.text(), quantity.number.value);
+        let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
+        let param_num = param_offset + 1;
+        let predicate =
+            crate::search::quantity_interval_predicate(value.prefix, num_value, num_str);
+        let (groups, mut params) = Self::interval_groups(
+            "value_quantity_value",
+            "value_quantity_high",
+            &predicate,
+            Some,
+            param_num,
+        )?;
+        let mut extra = Vec::new();
+        if let Some(sys) = system {
+            params.push(SqlParam::string(sys));
+            extra.push(format!(
+                "value_quantity_system = ?{}",
+                param_num + params.len() - 1
+            ));
+        }
+        if let Some(c) = code {
+            params.push(SqlParam::string(c));
+            extra.push(format!(
+                "value_quantity_unit = ?{}",
+                param_num + params.len() - 1
+            ));
+        }
+        let with_extra = |group: &str, extra: &[String]| {
+            std::iter::once(group.to_string())
+                .chain(extra.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let mut arms: Vec<String> = groups.iter().map(|g| with_extra(g, &extra)).collect();
+        if let Some(c) = code {
+            use helios_fhirpath::ucum::canonicalize_quantity as canon;
+            if let Some((_, unit)) = canon(num_value, c)
+                && let Some((canon_groups, canon_params)) = Self::interval_groups(
+                    "value_quantity_canonical_value",
+                    "value_quantity_canonical_high",
+                    &predicate,
+                    |bound| canon(bound, c).map(|(v, _)| v),
+                    param_num + params.len(),
+                )
+            {
+                params.extend(canon_params);
+                params.push(SqlParam::string(&unit));
+                let unit_test = format!(
+                    "value_quantity_canonical_unit = ?{}",
+                    param_num + params.len() - 1
+                );
+                arms.extend(canon_groups.iter().map(|g| format!("{g} AND {unit_test}")));
+            }
+        }
+        Some((arms, params))
     }
 
     /// Builds the numeric comparison part of the condition against `column`.
@@ -289,7 +406,7 @@ mod tests {
         // gt/le ignore implicit precision and compare against the exact
         // search value, per the FHIR spec.
         let gt = QuantityHandler::build_sql(&SearchValue::new(SearchPrefix::Gt, "60|kg"), 0);
-        assert!(gt.sql.contains("value_quantity_value > ?1"));
+        assert!(gt.sql.contains("value_quantity_high > ?1"));
         match &gt.params[0] {
             SqlParam::Float(f) => assert!((*f - 60.0).abs() < 1e-9),
             _ => panic!("expected float param"),
@@ -321,7 +438,7 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Gt, "60|http://unitsofmeasure.org|kg");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("value_quantity_canonical_value > ?"));
+        assert!(frag.sql.contains("value_quantity_canonical_high > ?"));
 
         // The canonical bound must equal canon(60.0, "kg") exactly, not a
         // value widened by half the implicit precision (e.g. 60.5).
@@ -342,17 +459,49 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Ap, "100");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains("BETWEEN"));
-        // The shared window (#1390): [90, 110] around 100.
+        // The shared window (#1390): [90, 110] around 100, as the exact split
+        // of the interval overlap `low <= 110 AND high >= 90` (#2602): the
+        // points and every row starting inside the window, or the Ranges
+        // that start below it and reach it. One placeholder per distinct
+        // value.
+        assert_eq!(
+            frag.sql,
+            "((value_quantity_value >= ?1 AND value_quantity_value <= ?2) OR \
+             (value_quantity_value < ?1 AND value_quantity_high >= ?1 AND \
+             value_quantity_high > value_quantity_value))"
+        );
         assert!(
             matches!(
                 frag.params.as_slice(),
-                [SqlParam::Float(lo), SqlParam::Float(hi), ..]
+                [SqlParam::Float(lo), SqlParam::Float(hi)]
                     if (lo - 90.0).abs() < 1e-9 && (hi - 110.0).abs() < 1e-9
             ),
             "{:?}",
             frag.params
         );
+    }
+
+    /// The standalone `ap` search reads the two groups as separate selects.
+    #[test]
+    fn ap_alternatives_share_one_parameter_list() {
+        let value = SearchValue::new(SearchPrefix::Ap, "100|http://unitsofmeasure.org|mg");
+        let (arms, params) = QuantityHandler::build_alternatives(&value, 2).unwrap();
+        assert_eq!(
+            arms,
+            vec![
+                "value_quantity_value >= ?3 AND value_quantity_value <= ?4 AND value_quantity_system = ?5 AND value_quantity_unit = ?6",
+                "value_quantity_value < ?3 AND value_quantity_high >= ?3 AND value_quantity_high > value_quantity_value AND value_quantity_system = ?5 AND value_quantity_unit = ?6",
+                "value_quantity_canonical_value >= ?7 AND value_quantity_canonical_value <= ?8 AND value_quantity_canonical_unit = ?9",
+                "value_quantity_canonical_value < ?7 AND value_quantity_canonical_high >= ?7 AND value_quantity_canonical_high > value_quantity_canonical_value AND value_quantity_canonical_unit = ?9",
+            ]
+        );
+        assert_eq!(params.len(), 7);
+        // Other prefixes keep the single condition.
+        for prefix in [SearchPrefix::Eq, SearchPrefix::Ge, SearchPrefix::Ne] {
+            assert!(
+                QuantityHandler::build_alternatives(&SearchValue::new(prefix, "100"), 0).is_none()
+            );
+        }
     }
 
     /// Defence in depth behind `validate_numeric_values` (#1340): a number

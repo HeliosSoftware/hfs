@@ -5136,9 +5136,33 @@ fn test_math_functions() {
         "Negative decimal sqrt should return Empty"
     );
 
+    // --- Out-of-range round precision gives empty, not an error or a panic ---
+    // (tests-fhir-r5.xml testNegativeRoundPrecision / testHugeRoundPrecision)
+    for expr in [
+        "1.round(-1)",
+        "1.5.round(-1)",
+        "1.5.round(29)",
+        "1.5.round(2000000000)",
+    ] {
+        assert_eq!(
+            eval(expr, &context).unwrap(),
+            EvaluationResult::Empty,
+            "{expr} should return Empty"
+        );
+    }
+    // The largest precision a Decimal holds still rounds, as does a large value
+    // whose value * 10^precision would not fit in a Decimal.
+    assert_eq!(
+        eval("1.5.round(28)", &context).unwrap(),
+        EvaluationResult::decimal("1.5".parse::<Decimal>().unwrap())
+    );
+    assert_eq!(
+        eval("123456789012345678901.25.round(8)", &context).unwrap(),
+        EvaluationResult::decimal("123456789012345678901.25".parse::<Decimal>().unwrap())
+    );
+
     // --- Error Cases for round, sqrt, and abs ---
     let round_error_cases = vec![
-        "1.round(-1)",     // Negative precision
         "'abc'.round()",   // Non-numeric input
         "1.round('abc')",  // Non-integer precision
         "(1 | 2).round()", // Collection input

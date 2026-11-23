@@ -147,7 +147,7 @@ fn jitter_fraction() -> f64 {
 
 /// `base_ms` spread over `[base_ms / 2, 3 * base_ms / 2)`, so writers that were
 /// all released by the same event do not retry in lockstep.
-fn jittered_ms(base_ms: u64) -> u64 {
+pub(super) fn jittered_ms(base_ms: u64) -> u64 {
     base_ms / 2 + (jitter_fraction() * base_ms as f64) as u64
 }
 
@@ -568,6 +568,8 @@ pub(crate) fn build_es_document(
     let mut date_params: Vec<Value> = Vec::new();
     let mut number_params: Vec<Value> = Vec::new();
     let mut quantity_params: Vec<Value> = Vec::new();
+    // Sort-only quantity entries (see `sort_name`), appended after the others.
+    let mut quantity_sort_params: Vec<Value> = Vec::new();
     let mut reference_params: Vec<Value> = Vec::new();
     let mut uri_params: Vec<Value> = Vec::new();
     // Composite instances, keyed by (param name, group) so all components of one
@@ -650,10 +652,17 @@ pub(crate) fn build_es_document(
                 unit,
                 system,
                 code,
+                high,
             } => {
+                // `value` is the lower bound of the closed interval the row
+                // covers and `high` the upper one (#2602): a point for a
+                // `Quantity` or `Age`, the bounds of a `Range` otherwise, with
+                // an open side as a finite sentinel (ES cannot store `±Inf`).
+                let high_value = high.resolve(*value);
                 let mut qty = json!({
                     "name": ev.param_name,
                     "value": value,
+                    "high": high_value,
                 });
                 if let Some(u) = unit {
                     qty["unit"] = json!(u);
@@ -666,15 +675,37 @@ pub(crate) fn build_es_document(
                 }
                 // UCUM-canonical value/unit so quantity search matches equivalent
                 // units (g ⇄ mg). Uses the code if present, else the unit display.
-                if let Some((cv, cu)) = code
-                    .as_deref()
-                    .or(unit.as_deref())
-                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                // Each bound is converted on its own; an open side keeps its
+                // sentinel (scaling `f64::MAX` would overflow).
+                if let Some(u) = code.as_deref().or(unit.as_deref())
+                    && let Some((_, cu)) = helios_fhirpath::ucum::canonicalize_quantity(1.0, u)
                 {
+                    let (cv, ch) = crate::search::canonical_range(*value, high_value, |x| {
+                        helios_fhirpath::ucum::canonicalize_quantity(x, u).map_or(x, |(v, _)| v)
+                    });
                     qty["canonical_value"] = json!(cv);
+                    qty["canonical_high"] = json!(ch);
                     qty["canonical_unit"] = json!(cu);
+                    if ch != cv {
+                        qty["canonical_range_high"] = json!(ch);
+                    }
+                }
+                // Only a proper Range carries `range_high`: `ap` reads the
+                // Ranges through it and the points through `value`.
+                if high_value != *value {
+                    qty["range_high"] = json!(high_value);
                 }
                 quantity_params.push(qty);
+                // A Range also indexes its upper bound as an extra entry with
+                // no `name`, so no filter or `:missing` selects it, tagged
+                // with `sort_name` instead: a descending sort takes the
+                // maximum `value` over both entries (a point adds nothing).
+                if high_value != *value {
+                    quantity_sort_params.push(json!({
+                        "sort_name": ev.param_name,
+                        "value": high_value,
+                    }));
+                }
             }
             IndexValue::Reference {
                 reference,
@@ -710,6 +741,7 @@ pub(crate) fn build_es_document(
     }
 
     let composite_params: Vec<Value> = composite_groups.into_values().collect();
+    quantity_params.extend(quantity_sort_params);
 
     json!({
         "resource_type": resource_type,
@@ -3757,6 +3789,156 @@ mod tests {
                 { "name": "combo", "group_id": 0, "string": ["kept"] },
                 { "name": "combo", "group_id": 1, "date": ["2017-01-01T00:00:00.000Z"] },
             ])
+        );
+    }
+
+    /// #2602: a quantity row is the interval `[value, high]`: a point for a
+    /// `Quantity`, the bounds of a `Range` otherwise, an open side as a finite
+    /// sentinel that is never scaled by the UCUM canonicalization.
+    #[test]
+    fn document_indexes_a_quantity_as_an_interval() {
+        use crate::search::converters::QuantityHigh;
+        let qty = |value: f64, high: QuantityHigh| {
+            let value = IndexValue::Quantity {
+                value,
+                unit: Some("a".into()),
+                system: Some("http://unitsofmeasure.org".into()),
+                code: Some("a".into()),
+                high,
+            };
+            ExtractedValue::new(
+                "onset-age",
+                "http://hl7.org/fhir/SearchParameter/Condition-onset-age",
+                value.param_type(),
+                value,
+            )
+        };
+        let doc = build_es_document(
+            "t1",
+            "Condition",
+            "c1",
+            "1",
+            test_instant(),
+            &json!({ "resourceType": "Condition", "id": "c1" }),
+            FhirVersion::default(),
+            &[
+                qty(45.0, QuantityHigh::Point),
+                qty(40.0, QuantityHigh::At(50.0)),
+                qty(60.0, QuantityHigh::Open),
+                qty(crate::search::QUANTITY_OPEN_LOW, QuantityHigh::At(10.0)),
+            ],
+        );
+        let rows = doc["search_params"]["quantity"].as_array().expect("rows");
+        assert_eq!(
+            (rows[0]["value"].as_f64(), rows[0]["high"].as_f64()),
+            (Some(45.0), Some(45.0))
+        );
+        assert_eq!(
+            (rows[1]["value"].as_f64(), rows[1]["high"].as_f64()),
+            (Some(40.0), Some(50.0))
+        );
+        assert_eq!(
+            rows[2]["high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[2]["canonical_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[3]["value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_LOW)
+        );
+        assert_eq!(
+            rows[3]["canonical_value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_LOW)
+        );
+        assert!(rows[3]["canonical_high"].as_f64().unwrap().is_finite());
+        // Only a proper Range carries `range_high` / `canonical_range_high`.
+        assert!(rows[0].get("range_high").is_none());
+        assert!(rows[0].get("canonical_range_high").is_none());
+        assert_eq!(rows[1]["range_high"].as_f64(), Some(50.0));
+        assert_eq!(
+            rows[2]["range_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(
+            rows[2]["canonical_range_high"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
+        );
+        assert_eq!(rows[3]["range_high"].as_f64(), Some(10.0));
+        assert!(
+            rows[3]["canonical_range_high"]
+                .as_f64()
+                .unwrap()
+                .is_finite()
+        );
+    }
+
+    /// #2602: a Range with a high bound apart from its low one adds exactly one
+    /// sort-only entry (the high bound as `value`, tagged `sort_name`, no
+    /// `name`); a point adds none, and an open high side uses the sentinel.
+    #[test]
+    fn document_adds_a_sort_only_entry_for_a_range() {
+        use crate::search::converters::QuantityHigh;
+        let qty = |value: f64, high: QuantityHigh| {
+            let value = IndexValue::Quantity {
+                value,
+                unit: Some("a".into()),
+                system: Some("http://unitsofmeasure.org".into()),
+                code: Some("a".into()),
+                high,
+            };
+            ExtractedValue::new(
+                "onset-age",
+                "http://hl7.org/fhir/SearchParameter/Condition-onset-age",
+                value.param_type(),
+                value,
+            )
+        };
+        let rows_for = |values: Vec<ExtractedValue>| {
+            let doc = build_es_document(
+                "t1",
+                "Condition",
+                "c1",
+                "1",
+                test_instant(),
+                &json!({ "resourceType": "Condition", "id": "c1" }),
+                FhirVersion::default(),
+                &values,
+            );
+            doc["search_params"]["quantity"].as_array().unwrap().clone()
+        };
+        let sort_only = |rows: &[serde_json::Value]| -> Vec<serde_json::Value> {
+            rows.iter()
+                .filter(|r| r.get("name").is_none())
+                .cloned()
+                .collect()
+        };
+
+        let rows = rows_for(vec![qty(45.0, QuantityHigh::Point)]);
+        assert_eq!(rows.len(), 1);
+        assert!(sort_only(&rows).is_empty());
+
+        // A degenerate Range (low == high) is a point too.
+        let rows = rows_for(vec![qty(45.0, QuantityHigh::At(45.0))]);
+        assert!(sort_only(&rows).is_empty());
+
+        let rows = rows_for(vec![qty(40.0, QuantityHigh::At(50.0))]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "onset-age");
+        let extra = sort_only(&rows);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0]["sort_name"], "onset-age");
+        assert_eq!(extra[0]["value"].as_f64(), Some(50.0));
+        assert_eq!(extra[0].as_object().unwrap().len(), 2);
+
+        let rows = rows_for(vec![qty(60.0, QuantityHigh::Open)]);
+        let extra = sort_only(&rows);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(
+            extra[0]["value"].as_f64(),
+            Some(crate::search::QUANTITY_OPEN_HIGH)
         );
     }
 

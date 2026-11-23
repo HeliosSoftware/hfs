@@ -40,7 +40,10 @@ use super::search_index_catalog::{
 /// that `search_index.value_reference` is stored normalized (version suffix
 /// stripped, absolute URLs also carried as `value_reference_target`, #2394):
 /// a v16 build would write unnormalized rows after the backfill, so it must
-/// refuse to start on a v17 database.
+/// refuse to start on a v17 database. v18 records that quantity rows carry
+/// `value_quantity_high` (#2602): a v17 build writes rows without it, which
+/// the new quantity comparisons would miss, so it must refuse to start on a
+/// v18 database.
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
@@ -48,7 +51,7 @@ use super::search_index_catalog::{
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2352).
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///

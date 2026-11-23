@@ -22,7 +22,7 @@
 //! backend, so an Elasticsearch backend that *shares* this container resolves
 //! per-tenant params through the primary's storage without its own DB handle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -39,6 +39,23 @@ use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
 /// poisons the tenant with an empty overlay (#787).
 pub type StoredParamLoader =
     Arc<dyn Fn(&str) -> Option<Vec<SearchParameterDefinition>> + Send + Sync>;
+
+/// `HFS_SEARCH_PARAM_CACHE_MAX_TENANTS`: how many per-tenant registries stay
+/// cached at once. Every distinct tenant id a request names costs one base
+/// clone until the hourly refresh, so the cache is bounded independently of
+/// what the REST layer admits.
+pub const MAX_TENANTS_ENV: &str = "HFS_SEARCH_PARAM_CACHE_MAX_TENANTS";
+
+/// Default for [`MAX_TENANTS_ENV`].
+pub const DEFAULT_MAX_TENANTS: usize = 1024;
+
+fn max_tenants_from_env() -> usize {
+    std::env::var(MAX_TENANTS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_TENANTS)
+}
 
 /// One [`TenantSearchRegistries::cache_authoritative`] entry.
 struct AuthoritativeEntry {
@@ -58,8 +75,13 @@ pub struct TenantSearchRegistries {
     /// at construction via [`base`](Self::base); read-mostly thereafter.
     base: Arc<RwLock<SearchParameterRegistry>>,
     /// Per-tenant registries (`base` clone + tenant stored overlay), keyed by
-    /// tenant id. Built on first access, dropped on invalidation.
+    /// tenant id. Built on first access, dropped on invalidation, and never
+    /// more than `max_tenants` of them: the oldest insertion goes first.
     per_tenant: RwLock<HashMap<String, Arc<RwLock<SearchParameterRegistry>>>>,
+    /// Insertion order of `per_tenant`, for eviction at the cap.
+    insertion_order: RwLock<VecDeque<String>>,
+    /// Cap on `per_tenant`.
+    max_tenants: usize,
     /// Per-tenant registries a guarded write built from the *persisted*
     /// overlay (PostgreSQL's `authoritative_extractor`), each tagged with the
     /// fingerprint of the stored `SearchParameter` rows it was built from.
@@ -75,12 +97,24 @@ impl TenantSearchRegistries {
     /// Creates a container over an empty base and the given stored-param loader.
     /// Callers populate the base via [`base`](Self::base) immediately after.
     pub fn new(loader: StoredParamLoader) -> Self {
+        Self::with_max_tenants(loader, max_tenants_from_env())
+    }
+
+    /// [`Self::new`] with an explicit cap on cached per-tenant registries.
+    pub fn with_max_tenants(loader: StoredParamLoader, max_tenants: usize) -> Self {
         Self {
             base: Arc::new(RwLock::new(SearchParameterRegistry::new())),
             per_tenant: RwLock::new(HashMap::new()),
+            insertion_order: RwLock::new(VecDeque::new()),
+            max_tenants: max_tenants.max(1),
             authoritative: RwLock::new(HashMap::new()),
             loader,
         }
+    }
+
+    /// How many per-tenant registries the cache holds at most.
+    pub fn max_tenants(&self) -> usize {
+        self.max_tenants
     }
 
     /// Creates a container whose tenants never have stored overlays — every
@@ -141,9 +175,21 @@ impl TenantSearchRegistries {
             let _ = reg.register(def);
         }
         let arc = Arc::new(RwLock::new(reg));
-        self.per_tenant
-            .write()
-            .insert(tenant_id.to_string(), arc.clone());
+        let mut per_tenant = self.per_tenant.write();
+        let mut order = self.insertion_order.write();
+        if per_tenant
+            .insert(tenant_id.to_string(), arc.clone())
+            .is_none()
+        {
+            order.push_back(tenant_id.to_string());
+        }
+        while per_tenant.len() > self.max_tenants {
+            let Some(oldest) = order.pop_front() else {
+                break;
+            };
+            per_tenant.remove(&oldest);
+            self.authoritative.write().remove(&oldest);
+        }
         arc
     }
 
@@ -207,6 +253,9 @@ impl TenantSearchRegistries {
     /// from storage. Called when that tenant writes a `SearchParameter`.
     pub fn invalidate(&self, tenant_id: &str) {
         self.per_tenant.write().remove(tenant_id);
+        self.insertion_order
+            .write()
+            .retain(|cached| cached != tenant_id);
         self.authoritative.write().remove(tenant_id);
     }
 
@@ -214,6 +263,7 @@ impl TenantSearchRegistries {
     /// source of truth, so each tenant's overlay is re-read on next access).
     pub fn invalidate_all(&self) {
         self.per_tenant.write().clear();
+        self.insertion_order.write().clear();
         self.authoritative.write().clear();
     }
 
@@ -259,6 +309,39 @@ mod tests {
             ))
             .unwrap();
         regs
+    }
+
+    #[test]
+    fn the_cache_holds_at_most_max_tenants_registries_oldest_out_first() {
+        let regs =
+            TenantSearchRegistries::with_max_tenants(Arc::new(|_tenant: &str| Some(Vec::new())), 3);
+        for t in ["t1", "t2", "t3"] {
+            regs.for_tenant(t);
+        }
+        assert_eq!(regs.cached_tenant_count(), 3);
+
+        // A fourth id evicts the oldest, not the newest.
+        regs.for_tenant("t4");
+        assert_eq!(regs.cached_tenant_count(), 3);
+        assert!(regs.cached("t1").is_none());
+        assert!(regs.cached("t4").is_some());
+
+        // Rebuilding a cached tenant does not count twice.
+        regs.build_and_cache("t4", Vec::new());
+        assert_eq!(regs.cached_tenant_count(), 3);
+
+        // Invalidation frees a slot and forgets the order entry.
+        regs.invalidate("t2");
+        assert_eq!(regs.cached_tenant_count(), 2);
+        regs.for_tenant("t5");
+        assert_eq!(regs.cached_tenant_count(), 3);
+        assert!(regs.cached("t3").is_some());
+
+        // A thousand unknown ids cost at most the cap.
+        for i in 0..1000 {
+            regs.for_tenant(&format!("anon-{i}"));
+        }
+        assert_eq!(regs.cached_tenant_count(), 3);
     }
 
     #[test]
