@@ -39,6 +39,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -279,12 +280,57 @@ async fn probe_degraded(state: &HtsUiState) -> Option<&'static str> {
 
 // ── POST /hts/import ────────────────────────────────────────────────────
 
+/// Whether a request was sent by a page served from another origin.
+///
+/// `Sec-Fetch-Site` decides when the browser sends it; otherwise `Origin`
+/// has to match the `Host` the request arrived on. Both are forbidden
+/// request headers, so a page cannot set them from script. A request with
+/// neither header is not a browser form post from another site.
+pub(crate) fn is_cross_site(headers: &HeaderMap) -> bool {
+    match headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some("same-origin") | Some("none") => false,
+        Some(_) => true,
+        None => match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            None => false,
+            Some(origin) => {
+                let origin_host = origin
+                    .trim()
+                    .parse::<Uri>()
+                    .ok()
+                    .and_then(|uri| uri.authority().map(|a| a.as_str().to_ascii_lowercase()));
+                let host = headers
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|h| h.trim().to_ascii_lowercase());
+                origin_host.is_none() || origin_host != host
+            }
+        },
+    }
+}
+
+fn cross_site_refused() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "cross-site request refused",
+    )
+        .into_response()
+}
+
 async fn import_run(
     State(state): State<Arc<HtsUiState>>,
     HxRequest(is_htmx): HxRequest,
     locale: RequestLocale,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if is_cross_site(&headers) {
+        return cross_site_refused();
+    }
     let form = parse_form(&body);
     let target_url = import_target_url(&state);
     let chrome = Chrome {
@@ -394,4 +440,71 @@ fn single(form: &HashMap<String, Vec<String>>, key: &str) -> String {
         .and_then(|v| v.first())
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cross_site;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn sec_fetch_site_decides_when_present() {
+        assert!(!is_cross_site(&headers(&[(
+            "sec-fetch-site",
+            "same-origin"
+        )])));
+        assert!(!is_cross_site(&headers(&[("sec-fetch-site", "none")])));
+        assert!(is_cross_site(&headers(&[("sec-fetch-site", "cross-site")])));
+        assert!(is_cross_site(&headers(&[("sec-fetch-site", "same-site")])));
+        assert!(is_cross_site(&headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "http://localhost:8090"),
+            ("host", "localhost:8090"),
+        ])));
+    }
+
+    #[test]
+    fn origin_must_match_host_when_sec_fetch_site_is_absent() {
+        assert!(!is_cross_site(&headers(&[
+            ("origin", "http://localhost:8090"),
+            ("host", "localhost:8090"),
+        ])));
+        assert!(!is_cross_site(&headers(&[
+            ("origin", "http://LOCALHOST:8090"),
+            ("host", "localhost:8090"),
+        ])));
+        assert!(is_cross_site(&headers(&[
+            ("origin", "http://evil.example"),
+            ("host", "localhost:8090"),
+        ])));
+        assert!(is_cross_site(&headers(&[
+            ("origin", "http://localhost:8091"),
+            ("host", "localhost:8090"),
+        ])));
+        assert!(is_cross_site(&headers(&[
+            ("origin", "null"),
+            ("host", "localhost:8090"),
+        ])));
+        assert!(is_cross_site(&headers(&[(
+            "origin",
+            "http://localhost:8090"
+        )])));
+    }
+
+    #[test]
+    fn a_request_without_either_header_is_not_cross_site() {
+        assert!(!is_cross_site(&headers(&[])));
+        assert!(!is_cross_site(&headers(&[("host", "localhost:8090")])));
+    }
 }
