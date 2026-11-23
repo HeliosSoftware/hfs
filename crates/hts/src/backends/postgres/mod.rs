@@ -742,8 +742,15 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     continue;
                 }
             }
-            if let Err(e) =
-                write_code_system(&tx, cs, &mut identities, &mut stats, parsed.fresh_load).await
+            if let Err(e) = write_code_system(
+                &tx,
+                cs,
+                &mut identities,
+                &mut stats,
+                parsed.fresh_load,
+                parsed.defer_closure,
+            )
+            .await
             {
                 stats
                     .errors
@@ -981,7 +988,7 @@ pub(crate) async fn write_resource_in_transaction(
     let mut identities = resource_identity::ImportIdentities::load(client, &parsed, true).await?;
     let mut stats = ImportStats::default();
     for cs in &parsed.code_systems {
-        write_code_system(client, cs, &mut identities, &mut stats, false).await?;
+        write_code_system(client, cs, &mut identities, &mut stats, false, false).await?;
         let row = client
             .query_one(
                 "SELECT id FROM code_systems WHERE url = $1 AND \
@@ -1087,6 +1094,10 @@ async fn write_code_system(
     // properties/designations is skipped (fast path for first-time bulk loads).
     // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
     skip_child_delete: bool,
+    // When `true` this write is one chunk of a bulk load: a closure the system
+    // already has is kept and marked stale instead of dropped. See
+    // [`crate::import::bundle_parser::ParsedBundle::defer_closure`].
+    defer_closure: bool,
 ) -> Result<(), HtsError> {
     let now = utc_now();
 
@@ -1303,17 +1314,28 @@ async fn write_code_system(
         }
     }
 
-    // Invalidate stale closure rows so the post-import / startup migration
-    // knows to (re)build the full closure once all batches are loaded. Without
-    // this, a partial closure from an earlier batch would be mistakenly treated
-    // as complete. Mirrors sqlite/import/fhir_bundle.rs.
-    client
-        .execute(
-            "DELETE FROM concept_closure WHERE system_id = $1",
-            &[&system_id],
-        )
-        .await
-        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    // A plain write drops the closure; the caller rebuilds it once the
+    // transaction commits. A deferred (chunked) write keeps the closure the
+    // system already has and marks it stale, so readers keep answering from
+    // it until the load's finalize or the next startup rebuilds it. Mirrors
+    // sqlite/import/fhir_bundle.rs.
+    if defer_closure {
+        client
+            .execute(
+                "INSERT INTO concept_closure_stale (system_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                &[&system_id],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    } else {
+        client
+            .execute(
+                "DELETE FROM concept_closure WHERE system_id = $1",
+                &[&system_id],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    }
 
     invalidate_expansion_cache_for_system(client, &cs.url).await?;
     stats.code_systems += 1;

@@ -327,23 +327,23 @@ pub trait BundleImportBackend: Send + Sync {
     }
 
     /// Build `concept_closure` for every system that has hierarchy edges but no
-    /// closure rows, and return the number of systems rebuilt.
+    /// closure rows or a stale one, and return the number of systems rebuilt.
     ///
     /// A deferred batch ([`Self::import_bundle_deferred`], or a parsed bundle
-    /// with [`bundle_parser::ParsedBundle::defer_closure`]) deletes the closure
-    /// of a system that already had concepts and does not rebuild it, because
-    /// rebuilding after every chunk of a bulk load is O(n²) — for SNOMED CT
-    /// that is hours. The CLI and bootstrap loads run this once at the end. A
-    /// *chunked import into an already-running server* (`POST
-    /// /import?defer_closure=true`) has no such end step of its own, so the
-    /// system is left with hierarchy but no closure, which silently answers
-    /// `not-subsumed` from `$subsumes` on SQLite and empties closure-backed
-    /// `is-a` expansion on PostgreSQL.
+    /// with [`bundle_parser::ParsedBundle::defer_closure`]) keeps the closure
+    /// a populated system already has and marks it stale instead of
+    /// rebuilding it, because rebuilding after every chunk of a bulk load is
+    /// O(n²) — for SNOMED CT that is hours. Readers keep answering from the
+    /// kept closure, which does not yet cover the concepts the batch added.
+    /// The CLI and bootstrap loads run this once at the end. A *chunked import
+    /// into an already-running server* (`POST /import?defer_closure=true`)
+    /// has no such end step of its own, so the stale closure stays until a
+    /// finalize or the next startup.
     ///
     /// Chunked importers close that gap by calling this once after the final
     /// chunk, which is what `POST /import?finalize=true` does. It is idempotent
-    /// and only touches systems that are actually missing closure rows, so a
-    /// call on an up-to-date database costs one query.
+    /// and only touches systems whose closure is missing or stale, so a call
+    /// on an up-to-date database costs one query.
     ///
     /// The default returns `Ok(0)`: a backend with no closure table has nothing
     /// to rebuild.

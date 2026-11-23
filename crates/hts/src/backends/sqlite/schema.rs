@@ -279,6 +279,11 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+-- Systems whose closure was kept across a deferred (chunked) write and no
+-- longer covers every concept; rebuilt at the next finalize or startup.
+CREATE TABLE IF NOT EXISTS concept_closure_stale (
+    system_id TEXT PRIMARY KEY
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -344,6 +349,10 @@ pub(crate) fn build_concept_closure_in_transaction(
     if concepts.is_empty() {
         conn.execute(
             "DELETE FROM concept_closure WHERE system_id = ?1",
+            rusqlite::params![system_id],
+        )?;
+        conn.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = ?1",
             rusqlite::params![system_id],
         )?;
         return Ok(());
@@ -419,6 +428,10 @@ pub(crate) fn build_concept_closure_in_transaction(
             }
         }
     }
+    conn.execute(
+        "DELETE FROM concept_closure_stale WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
     Ok(())
 }
 
@@ -446,6 +459,10 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
                         SELECT 1 FROM concept_closure c
                         WHERE  c.system_id = h.system_id
                         LIMIT  1
+                    )
+                OR EXISTS (
+                        SELECT 1 FROM concept_closure_stale s
+                        WHERE  s.system_id = h.system_id
                     )",
         )?;
         stmt.query_map([], |r| r.get(0))?

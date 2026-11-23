@@ -229,6 +229,11 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+-- Systems whose closure was kept across a deferred (chunked) write and no
+-- longer covers every concept; rebuilt at the next finalize or startup.
+CREATE TABLE IF NOT EXISTS concept_closure_stale (
+    system_id TEXT PRIMARY KEY REFERENCES code_systems(id) ON DELETE CASCADE
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -406,6 +411,11 @@ pub(crate) async fn build_concept_closure_in_transaction(
             &[&system_id],
         )
         .await?;
+        tx.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await?;
         return Ok(());
     }
 
@@ -442,6 +452,11 @@ pub(crate) async fn build_concept_closure_in_transaction(
 
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
+        &[&system_id],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM concept_closure_stale WHERE system_id = $1",
         &[&system_id],
     )
     .await?;
@@ -518,11 +533,15 @@ pub async fn migrate_concept_closure_pg(
                        WHERE  h.system_id = cs.id
                        LIMIT  1
                    )
-               AND NOT EXISTS (
+               AND (NOT EXISTS (
                        SELECT 1 FROM concept_closure c
                        WHERE  c.system_id = cs.id
                        LIMIT  1
-                   )",
+                   )
+                    OR EXISTS (
+                       SELECT 1 FROM concept_closure_stale s
+                       WHERE  s.system_id = cs.id
+                   ))",
             &[],
         )
         .await?

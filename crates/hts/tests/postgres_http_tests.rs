@@ -777,8 +777,8 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
     }
 
     // Chunk 1: metadata only. Chunk 2: parent + child, builds the closure.
-    // Chunk 3: another child; the system is no longer empty, so the closure is
-    // deleted and not rebuilt.
+    // Chunk 3: another child; the system is no longer empty, so the closure
+    // chunk 2 built is kept and marked stale rather than rebuilt.
     let (status, body) = app.post_fhir(DEFER, chunk("")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = app
@@ -800,9 +800,10 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    assert!(
-        isa_members(&app, &sys).await.is_empty(),
-        "chunked import should have left the closure empty"
+    assert_eq!(
+        isa_members(&app, &sys).await,
+        ["A", "A.0"],
+        "the closure chunk 2 built is kept until finalize; A.1 is not in it yet"
     );
     // Unaffected on PostgreSQL: walks concept_hierarchy, not the closure.
     assert_eq!(subsumes(&app, &sys, "A", "A.0").await, "subsumes");

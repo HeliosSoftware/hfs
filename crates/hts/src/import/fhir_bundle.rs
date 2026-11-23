@@ -156,7 +156,7 @@ fn write_parsed_bundle(
              WHERE s.url = ?1)",
             [url], |row| row.get::<_, bool>(0),
         ).map_err(|error| HtsError::StorageError(error.to_string()))?;
-        match write_code_system(conn, cs, stats, parsed.fresh_load) {
+        match write_code_system(conn, cs, stats, parsed.fresh_load, parsed.defer_closure) {
             Ok(()) if needs_closure => {
                 systems_needing_closure.push((cs.url.clone(), cs.version.clone()))
             }
@@ -219,6 +219,10 @@ fn write_code_system(
     // pre-existing rows and the delete-before-reinsert is skipped (fast path for
     // first-time bulk loads). See [`ParsedBundle::fresh_load`].
     skip_child_delete: bool,
+    // When `true` this write is one chunk of a bulk load: a closure the system
+    // already has is kept and marked stale instead of dropped. See
+    // [`ParsedBundle::defer_closure`].
+    defer_closure: bool,
 ) -> Result<(), HtsError> {
     let now = utc_now();
 
@@ -481,14 +485,22 @@ fn write_code_system(
         stats.concepts += 1;
     }
 
-    // Invalidate stale closure rows so that migrate_concept_closure at server
-    // startup knows to (re)build the full closure once all batches are loaded.
-    // Without this, a previous partial closure (from a re-import or an earlier
-    // batch in the same session) would be mistakenly treated as complete.
-    let _ = conn.execute(
-        "DELETE FROM concept_closure WHERE system_id = ?1",
-        rusqlite::params![system_id],
-    );
+    // A plain write drops the closure; the caller rebuilds it as soon as the
+    // transaction commits. A deferred (chunked) write keeps the closure the
+    // system already has and marks it stale: readers keep answering from it
+    // until the load's finalize or the next startup rebuilds it, instead of
+    // answering not-subsumed for every pair while the load is in flight.
+    if defer_closure {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO concept_closure_stale (system_id) VALUES (?1)",
+            rusqlite::params![system_id],
+        );
+    } else {
+        let _ = conn.execute(
+            "DELETE FROM concept_closure WHERE system_id = ?1",
+            rusqlite::params![system_id],
+        );
+    }
 
     // Invalidate this system's concept FTS so a later filtered $expand rebuilds
     // it from the freshly-imported concepts/designations instead of serving
@@ -822,6 +834,11 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
     for sid in &system_ids {
         conn.execute("DELETE FROM concept_closure WHERE system_id = ?1", [sid])
             .map_err(|error| HtsError::StorageError(error.to_string()))?;
+        conn.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = ?1",
+            [sid],
+        )
+        .map_err(|error| HtsError::StorageError(error.to_string()))?;
         for table in [
             "concepts_fts",
             "concepts_word_fts",
@@ -933,7 +950,7 @@ pub(crate) fn write_resource_in_transaction(
     }
     let mut stats = ImportStats::default();
     for cs in &parsed.code_systems {
-        write_code_system(conn, cs, &mut stats, false)?;
+        write_code_system(conn, cs, &mut stats, false, false)?;
         let sid: String = conn
             .query_row(
                 "SELECT id FROM code_systems WHERE url = ?1 AND \
@@ -1478,9 +1495,9 @@ mod tests {
         );
     }
 
-    /// A deferred batch of an existing system leaves the rebuild to
-    /// `finalize_after_bootstrap`, which the chunked CLI / bootstrap loads run
-    /// once at the end.
+    /// A deferred batch of an existing system keeps the closure it has, marks
+    /// it stale, and leaves the rebuild to `finalize_after_bootstrap`, which
+    /// the chunked CLI / bootstrap loads run once at the end.
     #[tokio::test]
     async fn deferred_reimport_rebuilds_on_finalize() {
         use crate::types::SubsumptionOutcome;
@@ -1491,15 +1508,26 @@ mod tests {
         b.import_bundle_deferred(&ctx(), bundle.as_bytes())
             .await
             .unwrap();
-        let closure_rows: i64 = b
-            .pool()
-            .get()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM concept_closure", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(closure_rows, 0, "a deferred batch must not rebuild");
+        let count = |sql: &str| -> i64 {
+            b.pool()
+                .get()
+                .unwrap()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(
+            count("SELECT COUNT(*) FROM concept_closure") > 0,
+            "a deferred batch keeps the closure it found"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM concept_closure_stale"),
+            1,
+            "a deferred batch marks the closure stale"
+        );
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
 
         b.finalize_after_bootstrap().unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM concept_closure_stale"), 0);
         assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
     }
 
