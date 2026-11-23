@@ -25559,6 +25559,14 @@ mongodb_bundle_identity_test!(
 #[path = "mongodb/missing_index.rs"]
 mod missing_index;
 
+/// #2233: characterization net of `:missing=true` totals and pages.
+#[path = "mongodb/missing_equivalence.rs"]
+mod missing_equivalence;
+
+/// #2233: `explain` of the two counts that make up a `:missing=true` total.
+#[path = "mongodb/missing_split_plans.rs"]
+mod missing_split_plans;
+
 /// #2006: write, storage and cache cost of `missing_params` metadata.
 #[path = "mongodb/missing_params_cost_bench.rs"]
 mod missing_params_cost_bench;
