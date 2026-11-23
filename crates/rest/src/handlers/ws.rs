@@ -34,6 +34,13 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a bound client may take to accept one frame.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The largest message or frame the route reads from a client. The protocol
+/// reads one `bind-with-token <token>` message of a few dozen bytes and
+/// ignores everything after it, so the 64 MiB message and 16 MiB frame the
+/// WebSocket library allows by default would only let a peer make the server
+/// buffer that much per connection.
+const MAX_INCOMING_MESSAGE_BYTES: usize = 4 * 1024;
+
 /// WebSocket binding handler.
 ///
 /// The client connects to `/ws/subscriptions/bind` and then sends
@@ -57,9 +64,12 @@ where
     let request_tenant_id = tenant.tenant_id().to_string();
 
     // Upgrade the HTTP connection to WebSocket.
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, engine, request_tenant_id, base_url)
-    }))
+    Ok(ws
+        .max_message_size(MAX_INCOMING_MESSAGE_BYTES)
+        .max_frame_size(MAX_INCOMING_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            handle_ws_connection(socket, engine, request_tenant_id, base_url)
+        }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
