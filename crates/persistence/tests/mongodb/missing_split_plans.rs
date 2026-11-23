@@ -26,7 +26,11 @@ const DOCS: usize = 300;
 /// on every fifth only, `sp-c` is present everywhere except every hundredth
 /// (and nowhere absent at all when `narrow_c` is false).
 fn rows(n: usize, narrow_c: bool) -> [bool; 3] {
-    [n % 5 != 0, n % 5 == 0, !narrow_c || n % 100 != 0]
+    [
+        !n.is_multiple_of(5),
+        n.is_multiple_of(5),
+        !narrow_c || !n.is_multiple_of(100),
+    ]
 }
 
 /// Every fiftieth resource (2%) loses its `missing_params` array.
