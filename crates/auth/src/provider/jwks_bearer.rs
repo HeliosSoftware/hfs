@@ -370,7 +370,7 @@ mod tests {
     fn roles_grant_scopes() {
         let scopes = scopes_from_claims(&serde_json::json!({ "roles": ["system/*.cruds"] }));
         assert!(scopes.is_permitted("Patient", SmartPermissions::CREATE));
-        assert!(scopes.has_system_wildcard());
+        assert!(scopes.has_system_scope(SmartPermissions::CREATE));
     }
 
     #[test]

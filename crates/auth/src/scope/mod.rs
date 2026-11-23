@@ -130,16 +130,6 @@ impl ScopeSet {
         self.scopes.is_empty()
     }
 
-    /// Returns true if any parsed scope is a system-level wildcard (`system/*.<perms>`).
-    ///
-    /// Used as the ownership-bypass / broad-grant signal for bulk operations.
-    pub fn has_system_wildcard(&self) -> bool {
-        self.scopes.iter().any(|s| {
-            s.context == ScopeContext::System
-                && matches!(s.resource_type, ResourceTypeSpec::Wildcard)
-        })
-    }
-
     /// Returns true if the token grants the named system-level *operation* scope.
     ///
     /// Matches the literal raw scope `system/{name}` (e.g. `system/bulk-submit`),
@@ -208,13 +198,13 @@ mod tests {
         assert!(set.is_empty());
         assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
         assert!(!set.grants_operation("export", SmartPermissions::CREATE));
-        assert!(!set.has_system_wildcard());
+        assert!(!set.has_system_scope(SmartPermissions::CREATE));
     }
 
     #[test]
     fn test_grants_operation_via_wildcard() {
         let set = ScopeSet::parse("system/*.cruds");
-        assert!(set.has_system_wildcard());
+        assert!(set.has_system_scope(SmartPermissions::CREATE));
         // A system wildcard carrying the implied bit grants the operation.
         assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
         assert!(set.grants_operation("purge", SmartPermissions::DELETE));
@@ -227,7 +217,7 @@ mod tests {
     fn test_read_only_wildcard_does_not_grant_write_operations() {
         for scopes in ["system/*.r", "system/*.rs", "system/*.s"] {
             let set = ScopeSet::parse(scopes);
-            assert!(set.has_system_wildcard(), "{scopes}");
+            assert!(!set.has_system_scope(SmartPermissions::DELETE), "{scopes}");
             assert!(
                 !set.grants_operation("purge", SmartPermissions::DELETE),
                 "{scopes}"
@@ -258,7 +248,7 @@ mod tests {
         ]);
         assert!(set.grants_operation("bulk-submit", SmartPermissions::CREATE));
         assert!(set.is_permitted("Patient", SmartPermissions::READ));
-        assert!(!set.has_system_wildcard());
+        assert!(!set.has_system_scope(SmartPermissions::READ));
     }
 
     #[test]
