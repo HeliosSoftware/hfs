@@ -40,12 +40,14 @@ env:
   # Pinned commit of our fork of inferno-framework/us-quality-core-test-kit.
   # Provides both the Inferno stack and the fixture bundles loaded into HFS,
   # so the suite and its data always move together. The fork carries no
-  # upstream tags, so pin by SHA: 4b8bc2b is the fork's helios/ci-combined-fixes,
+  # upstream tags, so pin by SHA: 44ae186 is the fork's helios/ci-combined-fixes,
   # upstream v0.2.0 (41fc954) plus our two fixes that are open upstream as
-  # inferno-framework/us-quality-core-test-kit#45 and #46. Move the pin back
-  # to an upstream release once one includes them.
+  # inferno-framework/us-quality-core-test-kit#45 and #46, plus a fixture fix
+  # for the NDC 49281-0121-65 display ('/' where the bundle had '>'), which the
+  # unpinned validator began rejecting as "Wrong Display Name". Move the pin
+  # back to an upstream release once one includes them.
   TEST_KIT_REPO: HeliosSoftware/us-quality-core-test-kit
-  TEST_KIT_REF: ${{ inputs.test_kit_ref || '4b8bc2b814ee253058cf5820d35aab6e13d0640e' }}
+  TEST_KIT_REF: ${{ inputs.test_kit_ref || '44ae186a46e3c65cb545f884d55f8e0b32c4ae32' }}
   # Remote Docker daemon (required repository secret). Published container ports are
   # reached on its host part, exported as DOCKER_HOST_IP by each job's first step.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}

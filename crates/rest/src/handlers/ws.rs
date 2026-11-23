@@ -6,8 +6,15 @@
 //! The protocol is unidirectional (server → client): the server streams
 //! notification bundles as JSON text frames after the client sends a
 //! `bind-with-token <token>` message.
+//!
+//! A connection that does not bind within [`BIND_TIMEOUT`], or does not
+//! accept a frame within [`SEND_TIMEOUT`], is closed: an upgraded socket is
+//! outside the HTTP request timeout, and a peer that stops reading would
+//! otherwise park the handler in `send` for as long as it keeps the socket
+//! open while its notification queue fills.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::ws::{CloseFrame, Message, WebSocket},
@@ -20,6 +27,12 @@ use tracing::{debug, info, warn};
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
+
+/// How long a connection may take to send its `bind-with-token` message.
+const BIND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a bound client may take to accept one frame.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// WebSocket binding handler.
 ///
@@ -140,10 +153,10 @@ async fn handle_ws_connection(
     if let Ok(bundle) = handshake_bundle {
         match serde_json::to_string(&bundle) {
             Ok(msg) => {
-                if socket.send(Message::Text(msg.into())).await.is_err() {
+                if send_within_deadline(&mut socket, msg).await.is_err() {
                     warn!(
                         client_id = %client_id,
-                        "Failed to send handshake, client disconnected"
+                        "Failed to send handshake, client disconnected or not reading"
                     );
                     ws_manager.remove_client(&tenant_id, &subscription_id, &client_id);
                     return;
@@ -168,15 +181,24 @@ async fn handle_ws_connection(
                 match notification {
                     Some(bundle) => {
                         match serde_json::to_string(&bundle) {
-                            Ok(msg) => {
-                                if socket.send(Message::Text(msg.into())).await.is_err() {
+                            Ok(msg) => match send_within_deadline(&mut socket, msg).await {
+                                Ok(()) => {}
+                                Err(SendFailure::Disconnected) => {
                                     debug!(
                                         client_id = %client_id,
                                         "Client disconnected during send"
                                     );
                                     break;
                                 }
-                            }
+                                Err(SendFailure::Stalled) => {
+                                    warn!(
+                                        client_id = %client_id,
+                                        deadline_secs = SEND_TIMEOUT.as_secs(),
+                                        "Client did not accept a notification within the deadline; closing"
+                                    );
+                                    break;
+                                }
+                            },
                             Err(e) => {
                                 warn!(
                                     client_id = %client_id,
@@ -187,7 +209,9 @@ async fn handle_ws_connection(
                         }
                     }
                     None => {
-                        // Channel closed (subscription deregistered).
+                        // Channel closed: the subscription was deregistered,
+                        // or the manager dropped this client for not
+                        // draining its queue.
                         debug!(
                             client_id = %client_id,
                             "Notification channel closed"
@@ -242,8 +266,35 @@ async fn handle_ws_connection(
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SendFailure {
+    Disconnected,
+    Stalled,
+}
+
+/// Sends one text frame, giving up after [`SEND_TIMEOUT`]: a peer that stops
+/// reading leaves `send` pending once the socket buffers are full.
+async fn send_within_deadline(socket: &mut WebSocket, msg: String) -> Result<(), SendFailure> {
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(msg.into()))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SendFailure::Disconnected),
+        Err(_) => Err(SendFailure::Stalled),
+    }
+}
+
 async fn receive_bind_token(socket: &mut WebSocket) -> Option<String> {
-    match socket.recv().await {
+    let first = match tokio::time::timeout(BIND_TIMEOUT, socket.recv()).await {
+        Ok(first) => first,
+        Err(_) => {
+            warn!(
+                deadline_secs = BIND_TIMEOUT.as_secs(),
+                "WebSocket connection sent no bind message within the deadline"
+            );
+            close_with_policy_violation(socket, "bind-timeout").await;
+            return None;
+        }
+    };
+    match first {
         Some(Ok(Message::Text(text))) => {
             if let Some(token) = parse_bind_with_token_message(text.as_ref()) {
                 Some(token.to_string())

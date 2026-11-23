@@ -61,13 +61,19 @@ fn token_ttl(expires_in: u64) -> Duration {
 }
 
 /// Origins (`scheme://host[:port]`) the operator trusts as bulk-submit Data
-/// Providers: where HFS presents its client assertion, and where a token
-/// obtained there may be sent. Parsed from `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
+/// Providers: the only origins `$bulk-submit` fetches from at all (the
+/// `manifestUrl`, the `oauthMetadataUrl`, every manifest output URL and
+/// every redirect), where HFS presents its client assertion, and where a
+/// token obtained there may be sent. Parsed from
+/// `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
 ///
-/// Empty (the default) confines a token to the origin of the token endpoint
-/// that issued it and leaves discovery unconstrained.
+/// Empty (the default) lets the submitter name any origin and confines a
+/// token to the origin of the token endpoint that issued it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProviders(Vec<String>);
+
+/// Redirect hops followed, as reqwest's default policy allows.
+const MAX_REDIRECTS: usize = 10;
 
 impl TrustedProviders {
     /// Parses one origin per entry. An entry must be an absolute URL with a
@@ -104,8 +110,40 @@ impl TrustedProviders {
         self.0.is_empty()
     }
 
-    fn contains(&self, origin: &str) -> bool {
+    /// Whether `origin` is listed.
+    pub fn contains(&self, origin: &str) -> bool {
         self.0.iter().any(|o| o == origin)
+    }
+
+    /// Whether `$bulk-submit` may send a request to `url`: anywhere when no
+    /// origin is listed, otherwise only to a listed origin. A URL without an
+    /// origin (an opaque scheme) is never permitted by a configured list.
+    pub fn permits_url(&self, url: &str) -> bool {
+        self.is_empty() || origin_of(url).is_some_and(|origin| self.contains(&origin))
+    }
+
+    /// The redirect policy of a client that sends `$bulk-submit` requests:
+    /// with a list configured a hop is followed only to a listed origin,
+    /// otherwise reqwest's default policy applies. Both the file fetcher and
+    /// the OAuth client use it, so neither the manifest and file GETs nor the
+    /// metadata GET and the token POST (whose body is the signed client
+    /// assertion) leave the listed origins by way of a redirect.
+    pub(crate) fn redirect_policy(&self) -> reqwest::redirect::Policy {
+        if self.is_empty() {
+            return reqwest::redirect::Policy::default();
+        }
+        let trusted = self.clone();
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if trusted.permits_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.error(
+                    "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
+                )
+            }
+        })
     }
 
     /// With a list configured, refuses an origin outside it.
@@ -123,7 +161,7 @@ impl TrustedProviders {
 /// The `scheme://host[:port]` of an absolute URL, or `None` when it has no
 /// host (an opaque origin such as `data:`), the form every comparison here
 /// is made on.
-fn origin_of(url: &str) -> Option<String> {
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let origin = reqwest::Url::parse(url).ok()?.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
@@ -214,6 +252,7 @@ impl JwtClientCredentialsTokenProvider {
             .connect_timeout(timeouts.connect)
             .read_timeout(timeouts.read)
             .timeout(timeouts.total)
+            .redirect(trusted_providers.redirect_policy())
             .build()
             .expect("bulk-submit OAuth HTTP client configuration is valid");
         Some(Arc::new(Self {

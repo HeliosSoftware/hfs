@@ -1077,20 +1077,76 @@ async fn reconcile_index(backend: &ElasticsearchBackend, index: &str) {
     note_reconcile_outcome(backend, index, &outcome);
 }
 
+/// Attempts [`ensure_index`] gives an index check or creation that the cluster
+/// answers `429` or `5xx`, the first included (#2724).
+const ENSURE_INDEX_ATTEMPTS: u32 = 5;
+
+/// One [`ensure_index`] attempt the cluster asked to have repeated: a `429` or
+/// `5xx` answer to the existence check or to the create request.
+#[derive(Debug)]
+struct EnsureIndexRetry {
+    /// The client-facing step, status included.
+    context: String,
+    /// The index and Elasticsearch's answer, for the log only (#2385).
+    detail: String,
+}
+
 /// Ensures an index exists for the given tenant and resource type, creating it
 /// if necessary, and that an existing one carries the current mapping.
+///
+/// A `429` or `5xx` answer to either request is repeated, up to
+/// [`ENSURE_INDEX_ATTEMPTS`] attempts in all, with the doubling, jittered
+/// backoff the reads and writes use (100, 200, 400, 800 ms before jitter;
+/// at most ~2.25 s of waiting). It is the first write of a type in a tenant
+/// that creates the index, and a throttled or busy cluster there failed that
+/// write although the same request moments later succeeds (#2724). Every attempt checks existence again, so a create
+/// that went through despite its error answer is not sent twice. A transport
+/// failure is not repeated: a timeout has already cost the full request
+/// timeout. An exhausted retry is the same [`BackendError::Unavailable`] the
+/// first failure used to be.
 pub async fn ensure_index(
     backend: &ElasticsearchBackend,
     tenant_id: &str,
     resource_type: &str,
 ) -> StorageResult<()> {
     let index = backend.index_name(tenant_id, resource_type);
+    let mut attempt = 0;
+    loop {
+        let retry = match ensure_index_once(backend, &index).await? {
+            None => return Ok(()),
+            Some(retry) => retry,
+        };
+        attempt += 1;
+        if attempt >= ENSURE_INDEX_ATTEMPTS {
+            return Err(index_unavailable(&retry.context, &retry.detail));
+        }
+        let delay_ms =
+            super::storage::jittered_ms(super::search_impl::RETRY_BASE_DELAY_MS << (attempt - 1));
+        tracing::warn!(
+            attempt,
+            max = ENSURE_INDEX_ATTEMPTS,
+            delay_ms,
+            index,
+            failure = %retry.detail,
+            "{}; retrying",
+            retry.context
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
 
+/// One attempt of [`ensure_index`]: `Ok(None)` when the index exists or was
+/// created, `Ok(Some(_))` when the cluster asked for the attempt to be
+/// repeated.
+async fn ensure_index_once(
+    backend: &ElasticsearchBackend,
+    index: &str,
+) -> StorageResult<Option<EnsureIndexRetry>> {
     // Check if index exists
     let exists_response = backend
         .client()
         .indices()
-        .exists(IndicesExistsParts::Index(&[&index]))
+        .exists(IndicesExistsParts::Index(&[index]))
         .send()
         .await
         .map_err(|e| {
@@ -1099,16 +1155,16 @@ pub async fn ensure_index(
 
     let exists_status = exists_response.status_code();
     if exists_status.is_success() {
-        reconcile_index(backend, &index).await;
-        return Ok(());
+        reconcile_index(backend, index).await;
+        return Ok(None);
     }
     // A throttled or failing cluster says nothing about whether the index
     // exists; creating it now would only fail the same way, or worse, race.
     if super::storage::is_transient_bulk_status(u64::from(exists_status.as_u16())) {
-        return Err(index_unavailable(
-            &format!("Failed to check index existence (status {exists_status})"),
-            &format!("index {index} answered status {exists_status}"),
-        ));
+        return Ok(Some(EnsureIndexRetry {
+            context: format!("Failed to check index existence (status {exists_status})"),
+            detail: format!("index {index} answered status {exists_status}"),
+        }));
     }
 
     // Create the index with mappings
@@ -1117,7 +1173,7 @@ pub async fn ensure_index(
     let response = backend
         .client()
         .indices()
-        .create(IndicesCreateParts::Index(&index))
+        .create(IndicesCreateParts::Index(index))
         .body(mapping)
         .send()
         .await
@@ -1128,13 +1184,13 @@ pub async fn ensure_index(
         let body = response.text().await.unwrap_or_default();
         // 400 with "resource_already_exists_exception" is OK (race condition)
         if body.contains("resource_already_exists_exception") {
-            return Ok(());
+            return Ok(None);
         }
         if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
-            return Err(index_unavailable(
-                &format!("Failed to create index (status {status})"),
-                &format!("{index}: {body}"),
-            ));
+            return Ok(Some(EnsureIndexRetry {
+                context: format!("Failed to create index (status {status})"),
+                detail: format!("{index}: {body}"),
+            }));
         }
         let message = format!(
             "Failed to create index {} (status {}): {}",
@@ -1166,9 +1222,9 @@ pub async fn ensure_index(
     }
 
     // Created from the current mapping, marker included.
-    backend.mark_schema_checked(&index);
+    backend.mark_schema_checked(index);
     tracing::debug!("Created Elasticsearch index '{}'", index);
-    Ok(())
+    Ok(None)
 }
 
 // `delete_index` — a whole-index `DELETE` addressed by index name alone — was

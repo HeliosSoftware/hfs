@@ -34,6 +34,10 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// `BULK_MAX_ATTEMPTS`).
 const BULK_MAX_ATTEMPTS: usize = 5;
 
+/// Attempts `ensure_index` gives an index check or creation answered `429` or
+/// `5xx` (mirrors the private `ENSURE_INDEX_ATTEMPTS`, #2724).
+const ENSURE_INDEX_ATTEMPTS: usize = 5;
+
 fn tenant() -> TenantContext {
     TenantContext::new(TenantId::new("bulk-stub"), TenantPermissions::full_access())
 }
@@ -111,6 +115,17 @@ fn indexed(n: usize) -> ResponseTemplate {
         .map(|_| json!({"index": {"status": 201, "result": "created"}}))
         .collect();
     ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": false, "items": items}))
+}
+
+/// How many `method` requests the stub received.
+async fn requests_with_method(server: &MockServer, method: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|request| request.method.as_str() == method)
+        .count()
 }
 
 async fn bulk_requests(server: &MockServer) -> Vec<Request> {
@@ -946,6 +961,11 @@ async fn an_index_check_answered_with_a_server_error_is_transient() {
         bulk_requests(&server).await.is_empty(),
         "nothing is written to an index that could not be ensured"
     );
+    assert_eq!(
+        requests_with_method(&server, "HEAD").await,
+        ENSURE_INDEX_ATTEMPTS,
+        "the check is repeated before the write gives up"
+    );
 }
 
 #[tokio::test]
@@ -975,6 +995,82 @@ async fn an_index_creation_answered_with_a_server_error_is_transient() {
     );
     assert!(!message.contains("boom"), "{message}");
     assert!(!message.contains("hfs_"), "{message}");
+    assert_eq!(
+        requests_with_method(&server, "PUT").await,
+        ENSURE_INDEX_ATTEMPTS,
+        "the create is repeated before the write gives up"
+    );
+}
+
+/// The first write of a type in a new tenant creates its index. One `503` to
+/// that create (a busy single-node cluster, #2724) is retried, not reported:
+/// the index is checked again, created, and the write goes through.
+#[tokio::test]
+async fn a_server_error_on_index_creation_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "acknowledged": true,
+            "shards_acknowledged": true,
+            "index": "hfs_bulk-stub_patient"
+        })))
+        .mount(&server)
+        .await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+
+    assert_all_ok(&outcomes);
+    assert_eq!(requests_with_method(&server, "HEAD").await, 2);
+    assert_eq!(requests_with_method(&server, "PUT").await, 2);
+    assert_eq!(bulk_requests(&server).await.len(), 1);
+}
+
+/// A throttled existence check is retried too; once it answers, the index is
+/// created and the write goes through.
+#[tokio::test]
+async fn a_throttled_index_check_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "acknowledged": true,
+            "shards_acknowledged": true
+        })))
+        .mount(&server)
+        .await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |_| {});
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &page(&["a"]))
+        .await;
+
+    assert_all_ok(&outcomes);
+    assert_eq!(requests_with_method(&server, "HEAD").await, 3);
+    assert_eq!(requests_with_method(&server, "PUT").await, 1);
 }
 
 #[tokio::test]
@@ -1000,6 +1096,11 @@ async fn a_rejected_index_creation_stays_permanent() {
     assert!(is_permanent(&outcomes[0]), "{:?}", outcomes[0]);
     let message = outcomes[0].as_ref().unwrap_err().to_string();
     assert!(message.contains("bad mapping"), "{message}");
+    assert_eq!(
+        requests_with_method(&server, "PUT").await,
+        1,
+        "a rejection is not repeated"
+    );
 }
 
 // ============================================================================

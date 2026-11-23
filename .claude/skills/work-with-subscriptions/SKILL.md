@@ -14,7 +14,7 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 - The messaging channel is separately gated by `HFS_SUBSCRIPTION_MESSAGING_ENABLED`.
 - Endpoint safety (`channels/egress.rs`, rest-hook and messaging): endpoints that are, or resolve to, private/loopback addresses are refused unless `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true`, and redirects are never followed (a `3xx` is a permanent error). Tests that deliver to a loopback receiver set `SubscriptionConfig::allow_private_endpoints`.
 - Notification bundles follow the topic-based subscription spec; delivery failures retry with backoff (`engine/retry.rs`).
-- WebSocket subscriptions use binding tokens (`ws_token`) managed per connection (`ws_manager`).
+- WebSocket subscriptions use binding tokens (`ws_token`) managed per connection (`ws_manager`). A connection must bind within 10 s; a bound client has a 256-notification queue and 30 s to accept each frame, and is dropped when it stops draining.
 
 ## Channels (`crates/subscriptions/src/channels/`)
 

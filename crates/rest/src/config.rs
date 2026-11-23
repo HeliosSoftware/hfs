@@ -854,9 +854,13 @@ pub struct BulkSubmitConfig {
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
-    /// Origins (`scheme://host[:port]`) trusted as Data Providers: where the
-    /// client assertion may be presented and where a token obtained there may
-    /// be sent. Empty confines each token to its token endpoint's origin.
+    /// Origins (`scheme://host[:port]`) trusted as Data Providers: the only
+    /// origins `$bulk-submit` fetches from (`manifestUrl`, `oauthMetadataUrl`,
+    /// manifest output URLs, redirects), where the client assertion may be
+    /// presented and where a token obtained there may be sent. Empty permits
+    /// every origin, confines each token to its token endpoint's origin, and
+    /// keeps the status or transport detail of a failed fetch out of the
+    /// submitter's error artifact.
     pub trusted_providers: Vec<String>,
     /// `Retry-After` (seconds) advertised on an in-progress status poll once
     /// ingestion is under way.

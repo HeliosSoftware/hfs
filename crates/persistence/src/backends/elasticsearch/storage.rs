@@ -147,7 +147,7 @@ fn jitter_fraction() -> f64 {
 
 /// `base_ms` spread over `[base_ms / 2, 3 * base_ms / 2)`, so writers that were
 /// all released by the same event do not retry in lockstep.
-fn jittered_ms(base_ms: u64) -> u64 {
+pub(super) fn jittered_ms(base_ms: u64) -> u64 {
     base_ms / 2 + (jitter_fraction() * base_ms as f64) as u64
 }
 

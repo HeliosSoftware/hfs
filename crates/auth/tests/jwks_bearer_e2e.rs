@@ -142,6 +142,53 @@ async fn token_with_non_string_audience_is_rejected() {
 }
 
 #[tokio::test]
+async fn string_tenant_claim_binds_the_principal_to_that_tenant() {
+    let mut claims = valid_claims();
+    claims["tenant_id"] = json!("acme");
+    let principal = authenticate(&claims).await.expect("accepted");
+    assert_eq!(principal.tenant_id(), Some("acme"));
+}
+
+#[tokio::test]
+async fn absent_or_null_tenant_claim_leaves_the_principal_claimless() {
+    let principal = authenticate(&valid_claims()).await.expect("accepted");
+    assert_eq!(principal.tenant_id(), None);
+
+    let mut claims = valid_claims();
+    claims["tenant_id"] = json!(null);
+    let principal = authenticate(&claims).await.expect("accepted");
+    assert_eq!(principal.tenant_id(), None);
+}
+
+/// A tenant claim that is present with a non-string type is refused, not
+/// read as absent: absent means the default tenant, and a token that names a
+/// tenant the parser cannot read must not land there.
+#[tokio::test]
+async fn token_with_a_non_string_tenant_claim_is_rejected() {
+    for (value, type_name) in [
+        (json!(42), "a number"),
+        (json!(true), "a boolean"),
+        (json!(["acme"]), "an array"),
+        (json!({"id": "acme"}), "an object"),
+    ] {
+        let mut claims = valid_claims();
+        claims["tenant_id"] = value.clone();
+        let err = authenticate(&claims)
+            .await
+            .expect_err(&format!("tenant_id = {value} must be rejected"));
+        match err {
+            helios_auth::AuthError::ValidationError(message) => {
+                assert!(
+                    message.contains("tenant_id") && message.contains(type_name),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn token_without_issuer_is_rejected() {
     let mut claims = valid_claims();
     claims.as_object_mut().unwrap().remove("iss");
