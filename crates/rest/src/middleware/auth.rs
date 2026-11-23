@@ -428,6 +428,32 @@ pub async fn admin_authz_middleware(
     let method = request.method().clone();
     let (permission, letter) = admin_tier_permission(&method);
 
+    // A token bound to a tenant by its claim is not a cross-tenant
+    // administrator, whatever scopes it holds: the FHIR routes confine it to
+    // its own tenant, and this tier lists, registers and purges every tenant.
+    if let Some(tenant) = principal.tenant_id().filter(|t| !t.trim().is_empty()) {
+        warn!(
+            sub = %principal.subject(),
+            tenant = %tenant,
+            method = %method,
+            path = %path,
+            "Console admin authorization denied: token is bound to a tenant"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!(
+                "Forbidden: console admin access to {method} {path} refused for a token bound to tenant {tenant}"
+            ))
+            .principal(&principal)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(
+            "A token bound to a tenant cannot use the cross-tenant admin API; use a \
+             system-level token that carries no tenant claim",
+        );
+    }
+
     if principal.scopes.has_system_scope(permission) {
         debug!(
             sub = %principal.subject(),

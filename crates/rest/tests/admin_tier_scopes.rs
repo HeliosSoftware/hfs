@@ -259,7 +259,6 @@ async fn smart_v1_scopes_grant_nothing_on_the_admin_tier() {
 }
 
 #[tokio::test]
-#[ignore = "#2673: the admin tier ignores the JWT tenant claim"]
 async fn a_tenant_bound_token_cannot_administer_other_tenants() {
     let server = server();
     let setup = server
