@@ -30,15 +30,16 @@ pub struct RemoteFile {
 
 /// A Bulk Export Manifest fetched from a Data Provider's `manifestUrl`.
 ///
-/// Parsed leniently (all fields default) so that provider-specific extensions or
-/// omitted optional fields do not fail the fetch.
+/// Parsed leniently, so that provider-specific extensions or omitted optional
+/// fields do not fail the fetch, except for `output`: the manifest requires
+/// it, and without it any JSON object a URL answered would pass as a manifest
+/// with no files and complete the submission empty.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RemoteManifest {
     /// Whether the referenced files require an OAuth bearer token to download.
     #[serde(rename = "requiresAccessToken", default)]
     pub requires_access_token: bool,
     /// Files containing resources to ingest (create/update).
-    #[serde(default)]
     pub output: Vec<RemoteFile>,
     /// Files containing transaction Bundles describing resources to delete.
     #[serde(default)]
@@ -253,6 +254,15 @@ pub fn submission_output_job_id(id: &SubmissionId) -> ExportJobId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_manifest_needs_an_output_array() {
+        assert!(serde_json::from_str::<RemoteManifest>(r#"{"status":"ok"}"#).is_err());
+        let empty: RemoteManifest = serde_json::from_str(r#"{"output":[]}"#).unwrap();
+        assert!(empty.output.is_empty());
+        assert!(empty.deleted.is_empty());
+        assert!(!empty.requires_access_token);
+    }
 
     #[test]
     fn redact_urls_in_rewrites_every_embedded_url() {

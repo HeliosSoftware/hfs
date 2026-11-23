@@ -1100,7 +1100,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         let keys = self.resolve_keys(encryption_key)?;
         let bytes = match &keys {
             Some(keys) if jwe::looks_like_jwe(&bytes) => jwe::decrypt(&bytes, keys)
-                .map_err(|e| Self::err(format!("decrypting manifest {shown}: {e}")))?,
+                .map_err(|e| self.failure(&shown, format!("decrypting manifest {shown}: {e}")))?,
             Some(_) => {
                 tracing::warn!(
                     manifest_url = %shown,
@@ -1111,8 +1111,11 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             None => bytes,
         };
 
+        // Worded for the submitter like the status and transport errors: serde
+        // quotes scalar content, so a body that is not a manifest would
+        // otherwise be read back through the error artifact.
         serde_json::from_slice::<RemoteManifest>(&bytes)
-            .map_err(|e| Self::err(format!("parsing manifest {shown}: {e}")))
+            .map_err(|e| self.failure(&shown, format!("parsing manifest {shown}: {e}")))
     }
 
     /// Returns as soon as the response headers arrive; the body is read lazily
@@ -2099,6 +2102,35 @@ mod tests {
             .to_string();
         assert!(shown.contains("HTTP 503"), "{shown}");
         assert!(!shown.contains("secret123"), "{shown}");
+
+        // A 200 that is not a manifest: the parse error quotes scalar
+        // content, so it is withheld the same way.
+        for body in [
+            &b"\"internal-secret-value-42\""[..],
+            b"hello plain text",
+            b"{\"status\":\"ok\"}",
+        ] {
+            let (base, _) = scripted_server(vec![Scripted::ok(body)]).await;
+            let url = format!("{base}/manifest.json?sig=secret123");
+            let withheld = fetcher()
+                .fetch_manifest(&url, &[], &[], None)
+                .await
+                .expect_err("not a manifest")
+                .to_string();
+            assert!(!withheld.contains("internal-secret-value-42"), "{withheld}");
+            assert!(!withheld.contains("parsing manifest"), "{withheld}");
+            assert!(
+                withheld.contains("the reason is in the server log"),
+                "{withheld}"
+            );
+            let shown = trusting(&base)
+                .fetch_manifest(&url, &[], &[], None)
+                .await
+                .expect_err("not a manifest")
+                .to_string();
+            assert!(shown.contains("parsing manifest"), "{shown}");
+            assert!(!shown.contains("secret123"), "{shown}");
+        }
 
         let (base, _) = scripted_server(vec![unavailable()]).await;
         let url = format!("{base}/file.ndjson");
