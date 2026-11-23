@@ -5806,9 +5806,25 @@ impl MongoBackend {
                 value,
                 unit,
                 system,
+                high,
                 ..
             } => {
+                // #2602: the row is the closed interval
+                // `[value_quantity_value, value_quantity_high]`; a `Quantity`
+                // or `Age` is a point (`high = value`), and an open side of a
+                // `Range` is the finite sentinel.
                 doc.insert("value_quantity_value", *value);
+                let resolved_high = high.resolve(*value);
+                doc.insert("value_quantity_high", resolved_high);
+                // A proper Range (high != low) also carries the sparse
+                // `value_quantity_range_high` that `idx_search_quantity_range`
+                // is partial on; a point (nearly every row) does not.
+                if resolved_high != *value {
+                    doc.insert(
+                        super::search_index_catalog::QUANTITY_RANGE_HIGH_FIELD,
+                        resolved_high,
+                    );
+                }
                 if let Some(unit) = unit {
                     doc.insert("value_quantity_unit", unit.clone());
                 }
@@ -18103,3 +18119,229 @@ mod reference_document_tests {
 #[cfg(test)]
 #[path = "create_command_tests.rs"]
 mod create_command_tests;
+
+/// #2602: the sparse `value_quantity_range_high` and the plans of `ap`, which is
+/// the one prefix with a group that only a proper `Range` can satisfy.
+#[cfg(test)]
+mod quantity_range_field_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::backends::mongodb::search_index_catalog::{
+        QUANTITY_RANGE_HIGH_FIELD, SEARCH_QUANTITY_RANGE_INDEX,
+    };
+    use crate::search::range::{QUANTITY_OPEN_HIGH, QUANTITY_OPEN_LOW};
+    use crate::search::{FhirQuantityValue, QuantityHigh};
+    use crate::types::{SearchParamType, SearchParameter, SearchValue};
+
+    fn quantity_row(backend: &MongoBackend, id: &str, value: f64, high: QuantityHigh) -> Document {
+        let extracted = ExtractedValue::new(
+            "onset-age",
+            "http://hl7.org/fhir/SearchParameter/Condition-onset-age",
+            SearchParamType::Quantity,
+            IndexValue::Quantity {
+                value,
+                unit: Some("a".into()),
+                system: Some("http://unitsofmeasure.org".into()),
+                code: None,
+                high,
+            },
+        );
+        backend
+            .build_search_index_document("q", "Condition", id, &extracted)
+            .expect("document")
+    }
+
+    #[test]
+    fn only_a_proper_range_carries_the_sparse_range_high() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let row = |value: f64, high: QuantityHigh| quantity_row(&backend, "c", value, high);
+        for point in [
+            row(5.0, QuantityHigh::Point),
+            row(5.0, QuantityHigh::At(5.0)),
+        ] {
+            assert_eq!(point.get_f64("value_quantity_high"), Ok(5.0));
+            assert!(!point.contains_key(QUANTITY_RANGE_HIGH_FIELD), "{point:?}");
+        }
+        let spanning = row(5.0, QuantityHigh::At(9.0));
+        assert_eq!(spanning.get_f64(QUANTITY_RANGE_HIGH_FIELD), Ok(9.0));
+        assert_eq!(spanning.get_f64("value_quantity_high"), Ok(9.0));
+        let open_high = row(5.0, QuantityHigh::Open);
+        assert_eq!(
+            open_high.get_f64(QUANTITY_RANGE_HIGH_FIELD),
+            Ok(QUANTITY_OPEN_HIGH)
+        );
+        let open_low = row(QUANTITY_OPEN_LOW, QuantityHigh::At(5.0));
+        assert_eq!(open_low.get_f64(QUANTITY_RANGE_HIGH_FIELD), Ok(5.0));
+        assert_eq!(
+            open_low.get_f64("value_quantity_value"),
+            Ok(QUANTITY_OPEN_LOW)
+        );
+    }
+
+    fn collect_index_names(plan: &Bson, out: &mut Vec<String>) {
+        match plan {
+            Bson::Document(d) => {
+                if let Ok(name) = d.get_str("indexName") {
+                    out.push(name.to_string());
+                }
+                for value in d.values() {
+                    collect_index_names(value, out);
+                }
+            }
+            Bson::Array(a) => a.iter().for_each(|v| collect_index_names(v, out)),
+            _ => {}
+        }
+    }
+
+    /// Real server: many points and a few Ranges, every prefix equals brute
+    /// force, and `ap` is an index walk on the right indexes with few keys.
+    #[tokio::test]
+    async fn ap_uses_the_range_index_and_every_prefix_agrees_with_brute_force() {
+        use futures::stream::TryStreamExt;
+        use testcontainers::ImageExt;
+        use testcontainers::runners::AsyncRunner;
+        let (uri, _container) = match std::env::var("HFS_TEST_MONGODB_URL") {
+            Ok(uri) => (uri, None),
+            Err(_) => match testcontainers_modules::mongo::Mongo::default()
+                .with_tag("9.0.8")
+                .start()
+                .await
+            {
+                Ok(container) => {
+                    let host = container.get_host().await.unwrap();
+                    let port = container.get_host_port_ipv4(27017).await.unwrap();
+                    (format!("mongodb://{host}:{port}"), Some(container))
+                }
+                Err(error) => {
+                    assert!(
+                        std::env::var("HFS_TEST_REQUIRE_MONGODB").is_err(),
+                        "HFS_TEST_REQUIRE_MONGODB forbids skipping: {error}"
+                    );
+                    eprintln!("Skipping ap plan test: {error}");
+                    return;
+                }
+            },
+        };
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: uri,
+            database_name: format!("hfs_qrange_{}", uuid::Uuid::new_v4().simple()),
+            ..Default::default()
+        })
+        .unwrap();
+        backend.init_schema().await.unwrap();
+        backend.wait_for_search_index_build().await;
+        let db = backend.get_database().await.unwrap();
+        let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        // (id, low, high) as stored; a point is `low == high`.
+        let mut fixture: Vec<(String, f64, f64)> = (0..6000)
+            .map(|n| (format!("p{n:05}"), f64::from(n) / 2.0, f64::from(n) / 2.0))
+            .collect();
+        for (id, low, high) in [
+            ("r-open-low", QUANTITY_OPEN_LOW, 10.0),
+            ("r-open-high", 1500.0, QUANTITY_OPEN_HIGH),
+            ("r-spanning", 1400.0, 1600.0),
+            ("r-below", 100.0, 120.0),
+            ("r-above", 2600.0, 2700.0),
+            ("r-edge-low", 1400.0, 1450.0),
+            ("r-edge-high", 1550.0, 1560.0),
+            ("r-inner", 1480.0, 1490.0),
+        ] {
+            fixture.push((id.to_string(), low, high));
+        }
+        let rows: Vec<Document> = fixture
+            .iter()
+            .map(|(id, low, high)| {
+                let high = if low == high {
+                    QuantityHigh::Point
+                } else if *high == QUANTITY_OPEN_HIGH {
+                    QuantityHigh::Open
+                } else {
+                    QuantityHigh::At(*high)
+                };
+                quantity_row(&backend, id, *low, high)
+            })
+            .collect();
+        for chunk in rows.chunks(1000) {
+            index.insert_many(chunk.to_vec()).await.unwrap();
+        }
+
+        let param = |raw: &str| SearchParameter {
+            name: "onset-age".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse(raw)],
+            chain: vec![],
+            components: vec![],
+        };
+        for prefix in ["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            for text in [
+                "0", "10", "1500", "1480.5", "1425", "2650", "2999.5", "5000",
+            ] {
+                let raw = format!("{prefix}{text}");
+                let filter = backend
+                    .build_search_index_filter("q", "Condition", &param(&raw))
+                    .unwrap();
+                let mut found: Vec<String> = index
+                    .find(filter)
+                    .await
+                    .unwrap()
+                    .map_ok(|d| d.get_str("resource_id").unwrap().to_string())
+                    .try_collect()
+                    .await
+                    .unwrap();
+                found.sort();
+                let value = SearchValue::parse(&raw);
+                let predicate = FhirQuantityValue::parse(&value.value)
+                    .unwrap()
+                    .number
+                    .interval_predicate(value.prefix);
+                let mut expected: Vec<String> = fixture
+                    .iter()
+                    .filter(|(_, l, h)| predicate.matches(*l, *h))
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                expected.sort();
+                assert_eq!(found, expected, "{raw}");
+            }
+        }
+
+        // `ap1500` window is [1350, 1650]: 601 points in G1 plus the Ranges
+        // that start below 1350 and reach it (`r-open-low` ends at 10, so not
+        // it). Hint-free: the planner must walk the right indexes.
+        let filter = backend
+            .build_search_index_filter("q", "Condition", &param("ap1500"))
+            .unwrap();
+        let explain = db
+            .run_command(doc! {
+                "explain": { "find": MongoBackend::SEARCH_INDEX_COLLECTION, "filter": filter },
+                "verbosity": "executionStats",
+            })
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        collect_index_names(
+            explain.get("queryPlanner").expect("queryPlanner"),
+            &mut names,
+        );
+        let stats = explain.get_document("executionStats").unwrap();
+        let keys = stats
+            .get_i32("totalKeysExamined")
+            .map(i64::from)
+            .or_else(|_| stats.get_i64("totalKeysExamined"))
+            .unwrap();
+        let docs = stats
+            .get_i32("totalDocsExamined")
+            .map(i64::from)
+            .or_else(|_| stats.get_i64("totalDocsExamined"))
+            .unwrap();
+        eprintln!("ap1500 plan indexes {names:?}, keys {keys}, docs {docs}");
+        assert!(
+            names.iter().any(|n| n == SEARCH_QUANTITY_RANGE_INDEX),
+            "ap1500 must read {SEARCH_QUANTITY_RANGE_INDEX}: {names:?}"
+        );
+        // 6008 rows; G1 reads about 601 point keys, G2 a handful of Ranges.
+        assert!(keys <= 700, "ap1500 examined {keys} keys: {names:?}");
+        assert!(docs <= 700, "ap1500 examined {docs} docs: {names:?}");
+    }
+}

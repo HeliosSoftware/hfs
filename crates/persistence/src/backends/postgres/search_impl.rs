@@ -454,8 +454,8 @@ fn fast_index_pred(
 /// The fast path takes its page from `idx_search_quantity_recent`, which is
 /// keyed `(tenant_id, resource_type, param_name, last_updated DESC,
 /// resource_id)` — the scan streams the parameter slice newest-first and
-/// filters `value_quantity_value` from the payload as it goes, so the `LIMIT`
-/// can stop after 21 matches. Costing that plan needs the *selectivity* of the
+/// filters `value_quantity_value` / `value_quantity_high` (both in the payload
+/// since v56) as it goes, so the `LIMIT` can stop after 21 matches. Costing that plan needs the *selectivity* of the
 /// value predicate, and Postgres has only a table-wide histogram of
 /// `value_quantity_value` — one column shared by every `param_name` of every
 /// resource type. On the benchmark corpus `Observation.value-quantity` tops out
@@ -524,6 +524,20 @@ fn fast_index_pred(
 /// ahead of the sort key in those indexes, so the scan seeks straight to the
 /// value and the `LIMIT` stops after 21 whatever the selectivity. Selectivity
 /// stops mattering, and there is nothing to guard.
+///
+/// # Interval storage (#2602)
+///
+/// A quantity is a closed interval `[value_quantity_value, value_quantity_high]`.
+/// `gt`/`ge`/`eb` now compare the `high` column and `lt`/`le`/`sa` the `value`
+/// column, but the guard is unchanged: it repeats the outer predicate verbatim,
+/// so its `EXISTS` seeks `idx_search_quantity_high` for the former and
+/// `idx_search_quantity` for the latter, and `high` shares the pooled-histogram
+/// problem described above. The ordered scan itself needs v56's rebuilt
+/// `idx_search_quantity_recent`: partial on `value IS NOT NULL OR high IS NOT
+/// NULL` with both bounds in the payload, which the planner can prove for a
+/// `high`-only predicate. On the v20 shape (partial on `value`, no `high`) a
+/// broad `gt` left it, read every match from `idx_search_quantity_high` and
+/// sorted them (0.12 ms -> 211-330 ms at 350k rows per type).
 fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
     let [param] = query.parameters.as_slice() else {
         return false;

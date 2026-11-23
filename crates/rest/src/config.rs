@@ -791,11 +791,22 @@ pub struct BulkSubmitConfig {
     /// This is the *configured* value: the engine caps it, and SQLite always
     /// writes a file's batches one at a time (one write lock, #942).
     pub batch_writers: u32,
+    /// Longest line of an NDJSON input file the ingest buffers before parsing
+    /// it. A longer line is rejected like a malformed one and its bytes are
+    /// discarded up to the next newline. Defaults to the REST API's body
+    /// ceiling (128 MiB). Set with `HFS_BULK_SUBMIT_MAX_LINE_BYTES`.
+    pub max_line_bytes: u64,
     /// How long the input-file fetcher waits for the next bytes of a
     /// response before treating the body as broken and resuming it with a
     /// `Range` request, in seconds (#1127). Set with
     /// `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`.
     pub fetch_read_timeout_secs: u64,
+    /// Wall-clock budget, in seconds, for fetching one remote Bulk Export
+    /// manifest. The idle read timeout above cannot bound a body that keeps
+    /// producing bytes; past this budget the manifest fails with a fetch
+    /// error and the worker moves on. Set with
+    /// `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`.
+    pub manifest_fetch_timeout_secs: u64,
     /// Ceiling, in decoded bytes, on a Bulk Export manifest the worker
     /// fetches; the manifest is read whole. Set with
     /// `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`.
@@ -906,7 +917,9 @@ impl fmt::Debug for BulkSubmitConfig {
             max_concurrent_per_tenant,
             batch_size,
             batch_writers,
+            max_line_bytes,
             fetch_read_timeout_secs,
+            manifest_fetch_timeout_secs,
             max_manifest_bytes,
             max_encrypted_file_bytes,
             skip_unchanged,
@@ -949,7 +962,9 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("max_concurrent_per_tenant", max_concurrent_per_tenant)
             .field("batch_size", batch_size)
             .field("batch_writers", batch_writers)
+            .field("max_line_bytes", max_line_bytes)
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
+            .field("manifest_fetch_timeout_secs", manifest_fetch_timeout_secs)
             .field("max_manifest_bytes", max_manifest_bytes)
             .field("max_encrypted_file_bytes", max_encrypted_file_bytes)
             .field("skip_unchanged", skip_unchanged)
@@ -1000,7 +1015,9 @@ impl Default for BulkSubmitConfig {
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             batch_writers: 4,
+            max_line_bytes: helios_persistence::core::bulk_submit::DEFAULT_MAX_LINE_BYTES,
             fetch_read_timeout_secs: 60,
+            manifest_fetch_timeout_secs: 600,
             max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
             max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
             skip_unchanged: false,
@@ -1163,9 +1180,14 @@ impl BulkSubmitConfig {
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
             batch_writers: env_u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
+            max_line_bytes: env_u64("HFS_BULK_SUBMIT_MAX_LINE_BYTES", d.max_line_bytes),
             fetch_read_timeout_secs: env_u64(
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
+            ),
+            manifest_fetch_timeout_secs: env_u64(
+                "HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT",
+                d.manifest_fetch_timeout_secs,
             ),
             max_manifest_bytes: env_u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
             max_encrypted_file_bytes: env_u64(
@@ -1277,8 +1299,14 @@ impl BulkSubmitConfig {
         if self.batch_writers == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_WRITERS must be >= 1".to_string());
         }
+        if self.max_line_bytes == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_LINE_BYTES must be > 0".to_string());
+        }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
+        }
+        if self.manifest_fetch_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT must be > 0".to_string());
         }
         if self.max_manifest_bytes == 0 {
             errors.push("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES must be > 0".to_string());

@@ -21,7 +21,7 @@ default = ["R4", "sqlite"]
 
 # Database backends
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
@@ -39,13 +39,13 @@ R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit/R6"
 
 [dependencies]
 # Core dependencies (always included)
-helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
-helios-fhirpath = { path = "../fhirpath", version = "0.2.9", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.9" }
+helios-fhir = { path = "../fhir", version = "0.2.10", default-features = false }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.10", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.10" }
 # Shared SoF v2 spec parsing (ConstantValue, run-params extractor). Kept
 # default-features = false so persistence can pick its own FHIR-version set.
-helios-sof = { path = "../sof", version = "0.2.9", default-features = false }
-helios-observability = { path = "../observability", version = "0.2.9" }
+helios-sof = { path = "../sof", version = "0.2.10", default-features = false }
+helios-observability = { path = "../observability", version = "0.2.10" }
 rust_decimal = "1"
 serde.workspace = true
 serde_json.workspace = true
@@ -85,6 +85,12 @@ r2d2_sqlite = { version = "0.36", default-features = false, optional = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 postgres-types = { version = "0.2", features = ["derive", "with-serde_json-1"], optional = true }
+# TLS for PostgreSQL connections (#2746). `ring` is the provider the rest of the
+# tree already builds; the connector is given it explicitly, so no process-wide
+# default provider is needed.
+tokio-postgres-rustls = { version = "0.14", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Cassandra backend (using cdrs-tokio - pure Rust driver)
 cdrs-tokio = { version = "8", optional = true }
@@ -117,13 +123,13 @@ sha2 = { version = "0.10" }
 # `helios-rest` — which does not enable the feature — could not call the shared
 # emit helpers at all, so it grew a hand-rolled duplicate that silently drifted.
 # helios-audit only depends on helios-fhir, so this introduces no cycle.
-helios-audit = { path = "../audit", version = "0.2.9", default-features = false }
+helios-audit = { path = "../audit", version = "0.2.10", default-features = false }
 
 # The web UI's login sessions (#1481) live in the primary store so a session
 # established on one node resolves on another and survives a restart; each
 # backend implements `helios_auth::SessionPersistence` beside its user
 # settings store. helios-auth depends on no other workspace crate.
-helios-auth = { path = "../auth", version = "0.2.9" }
+helios-auth = { path = "../auth", version = "0.2.10" }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }

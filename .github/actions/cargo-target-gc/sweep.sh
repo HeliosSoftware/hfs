@@ -200,6 +200,58 @@ sweep_maxsize() {
   echo "${gb}GB"
 }
 
+# cargo >= 1.100 stores every compilation unit in the new build-dir layout,
+# `<profile>/build/<pkg>/<hash>/{fingerprint,out}`, instead of `deps/`,
+# `.fingerprint/` and `build/<pkg>-<hash>/`. cargo-sweep 0.8.0 (the latest
+# release) only knows the old layout (holmgr/cargo-sweep#140, #150), so from
+# then on it evicted next to nothing: github-agent6's `<workspace>-target`
+# reached 211GB against the 100GB cap, 122GB of it ~400 stale
+# `build/helios-rest/<hash>` units, filled the disk and took the runner
+# offline (2026-11-22, run 45009250885).
+#
+# Evict those units least-recently-used first until the build dir is at or
+# below $1 GB on disk. A unit's last use is the newest atime or mtime of its
+# fingerprint files, which cargo reads on every build that depends on the unit
+# (mtime as well, in case atime updates are off). Units used in the last hour
+# are kept: they belong to the build that just ran, and evicting them would
+# only make the next run rebuild what this one produced. Deleting a unit is
+# safe: cargo sees no fingerprint and rebuilds it.
+#
+# Skipped on Windows, where `du` over the build dir does not finish in time
+# (see dir_size); cargo-sweep still runs there.
+evict_build_units() {
+  local ceiling_gb="$1" used_kb cap_kb n=0 freed_kb=0 t unit kb
+  [ "${RUNNER_OS:-}" = "Windows" ] && return 0
+  command -v perl >/dev/null 2>&1 || { echo "::warning::perl not found; cannot evict new-layout build units."; return 0; }
+  if command -v timeout >/dev/null 2>&1; then
+    used_kb="$(timeout 300 du -sk "$TARGET_DIR" 2>/dev/null | cut -f1)"
+  else
+    used_kb="$(du -sk "$TARGET_DIR" 2>/dev/null | cut -f1)"
+  fi
+  [ -n "$used_kb" ] || { echo "Could not measure ${TARGET_DIR}; skipping build-unit eviction."; return 0; }
+  cap_kb=$(( ceiling_gb * 1024 * 1024 ))
+  if [ "$used_kb" -le "$cap_kb" ]; then
+    echo "${TARGET_DIR}: $((used_kb / 1048576))GB on disk, within ${ceiling_gb}GB; no build units to evict."
+    return 0
+  fi
+  while read -r t unit; do
+    [ "$used_kb" -gt "$cap_kb" ] || break
+    [ -d "$unit" ] || continue
+    kb="$(du -sk "$unit" 2>/dev/null | cut -f1)"
+    rm -rf "$unit" 2>/dev/null || continue
+    used_kb=$(( used_kb - ${kb:-0} ))
+    freed_kb=$(( freed_kb + ${kb:-0} ))
+    n=$(( n + 1 ))
+  done < <(
+    find "$TARGET_DIR" -mindepth 6 -maxdepth 7 -type f -path '*/build/*/*/fingerprint/*' 2>/dev/null |
+      perl -ne 'chomp; my @s = stat($_) or next; my $t = $s[8] > $s[9] ? $s[8] : $s[9];
+        (my $u = $_) =~ s{/fingerprint/[^/]*$}{}; $m{$u} = $t if !exists $m{$u} || $t > $m{$u};
+        END { my $keep = time - 3600; print "$m{$_} $_\n" for grep { $m{$_} < $keep } keys %m }' |
+      sort -n
+  )
+  echo "Evicted ${n} least-recently-used build unit(s) (new cargo build-dir layout, which cargo-sweep does not manage): $((freed_kb / 1048576))GB freed, ${TARGET_DIR} now ~$((used_kb / 1048576))GB on disk (ceiling ${ceiling_gb}GB)."
+}
+
 if [ "$MODE" = "preflight" ]; then
   prune_incremental
   free="$(free_gb)"
@@ -225,6 +277,7 @@ if [ "$MODE" = "preflight" ]; then
       [ "$ceiling" -lt 10 ] && break
       echo "Sweeping target/ to ${ceiling}GB on disk..."
       cargo sweep --maxsize "$(sweep_maxsize "$ceiling")" || true
+      evict_build_units "$ceiling"
       free="$(free_gb)"
       echo "  ${free}GB free."
     done
@@ -243,7 +296,8 @@ if [ "$MODE" = "preflight" ]; then
 fi
 
 if ! ensure_cargo_sweep; then
-  echo "::warning::cargo-sweep unavailable (install failed?); skipping target dir GC. This runner's target/ is unbounded until a later run succeeds."
+  echo "::warning::cargo-sweep unavailable (install failed?); only evicting new-layout build units. Old-layout artifacts in this runner's target/ are unbounded until a later run succeeds."
+  [ "$(maxsize_gb)" -ge 1 ] && evict_build_units "$(maxsize_gb)"
   exit 0
 fi
 
@@ -253,6 +307,7 @@ prune_incremental
 cap="$(maxsize_gb)"
 if [ "$cap" -ge 1 ]; then cap="$(sweep_maxsize "$cap")"; else cap="$MAXSIZE"; fi
 cargo sweep --maxsize "$cap" || true
+[ "$(maxsize_gb)" -ge 1 ] && evict_build_units "$(maxsize_gb)"
 after="$(dir_size "$TARGET_DIR")"
 if [ "${RUNNER_OS:-}" = "Windows" ]; then
   echo "${TARGET_DIR}: swept to ceiling ${MAXSIZE} (size not measured on Windows; see cargo-sweep's 'Cleaned' line above)."
