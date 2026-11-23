@@ -493,7 +493,7 @@ async fn add_sort_rows(fixture: &Fixture) {
             rows.push(
                 doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
                 "resource_id":&row.id, "param_name":"value-quantity",
-                "value_quantity_value":value },
+                "value_quantity_value":value.clone(), "value_quantity_high":value },
             );
         }
     }

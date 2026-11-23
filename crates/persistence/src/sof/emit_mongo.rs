@@ -937,7 +937,7 @@ fn lower_join_aggregate(
                 "$cond": [
                     doc! { "$eq": [doc! { "$ifNull": ["$$value", Bson::Null] }, Bson::Null] },
                     doc! { "$toString": "$$this" },
-                    doc! { "$concat": ["$$value", separator, doc! { "$toString": "$$this" }] },
+                    doc! { "$concat": ["$$value", doc! { "$literal": separator }, doc! { "$toString": "$$this" }] },
                 ]
             }
         }
@@ -1291,6 +1291,26 @@ mod tests {
 
     fn stage_op(stage: &mongodb::bson::Document) -> &str {
         stage.keys().next().map(String::as_str).unwrap_or("")
+    }
+
+    /// A `join()` separator is caller text: a `$`-prefixed one must be a
+    /// `$literal`, never a field path of the stored document.
+    #[test]
+    fn join_separator_is_a_literal_not_a_field_path() {
+        let pipeline = compile(json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "given", "path": "name.given.join('$fhir_version')" }] }],
+        }));
+        let rendered = format!("{:?}", pipeline.last().unwrap());
+        assert!(
+            rendered.contains("\"$literal\": String(\"$fhir_version\")"),
+            "separator must be wrapped in $literal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("String(\"$$value\"), String(\"$fhir_version\")"),
+            "separator must not appear as a bare $concat operand: {rendered}"
+        );
     }
 
     #[test]

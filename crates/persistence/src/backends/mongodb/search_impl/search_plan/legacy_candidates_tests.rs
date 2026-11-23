@@ -610,8 +610,8 @@ async fn bounded_membership_preserves_types_multivalues_and_candidate_origins() 
             "amount",
             SearchParamType::Quantity,
             "gt10|http://unitsofmeasure.org|mg",
-            doc! { "value_quantity_value": 20.0, "value_quantity_system": "http://unitsofmeasure.org", "value_quantity_unit": "mg" },
-            doc! { "value_quantity_value": 5.0, "value_quantity_system": "http://unitsofmeasure.org", "value_quantity_unit": "mg" },
+            doc! { "value_quantity_value": 20.0, "value_quantity_high": 20.0, "value_quantity_system": "http://unitsofmeasure.org", "value_quantity_unit": "mg" },
+            doc! { "value_quantity_value": 5.0, "value_quantity_high": 5.0, "value_quantity_system": "http://unitsofmeasure.org", "value_quantity_unit": "mg" },
         ),
         (
             "link",

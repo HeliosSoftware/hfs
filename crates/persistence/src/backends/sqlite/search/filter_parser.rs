@@ -451,12 +451,101 @@ impl<'a> FilterParser<'a> {
 /// SQL generator for filter expressions.
 pub struct FilterSqlGenerator {
     param_offset: usize,
+    /// Search-parameter types by code for the resource type being searched,
+    /// when the caller supplied them ([`Self::with_registry`]). A parameter
+    /// found here is classified by its registered type; one that is not falls
+    /// back to the name heuristics of [`Self::infer_column`].
+    param_types:
+        Option<std::collections::HashMap<String, crate::search::registry::SearchParamType>>,
 }
 
 impl FilterSqlGenerator {
     /// Creates a new SQL generator with the given parameter offset.
     pub fn new(param_offset: usize) -> Self {
-        Self { param_offset }
+        Self {
+            param_offset,
+            param_types: None,
+        }
+    }
+
+    /// Resolves parameter types from the search-parameter registry for
+    /// `resource_type`, so a quantity-typed parameter (`onset-age`,
+    /// `abatement-age`, `context-quantity`, `component-value-quantity`, custom
+    /// ones) reads the quantity columns without being named in a hard-coded
+    /// list (#2602). `QueryBuilder::build_filter_condition` calls this with the
+    /// tenant's registry whenever the builder carries one; the name list is
+    /// only the fallback for callers that pass none.
+    pub fn with_registry(
+        mut self,
+        registry: &crate::search::registry::SearchParameterRegistry,
+        resource_type: &str,
+    ) -> Self {
+        self.param_types = Some(
+            registry
+                .get_active_params(resource_type)
+                .into_iter()
+                .map(|p| (p.code.clone(), p.param_type))
+                .collect(),
+        );
+        self
+    }
+
+    /// Whether `param` is a quantity parameter: by its registered type when
+    /// known, otherwise by the names the spec defines as quantity.
+    fn is_quantity_param(&self, param: &str) -> bool {
+        use crate::search::registry::SearchParamType;
+        match self.param_types.as_ref().and_then(|t| t.get(param)) {
+            Some(ty) => *ty == SearchParamType::Quantity,
+            None => matches!(
+                param,
+                "value-quantity"
+                    | "dose-quantity"
+                    | "age"
+                    | "onset-age"
+                    | "abatement-age"
+                    | "context-quantity"
+            ),
+        }
+    }
+
+    /// The prefix a `_filter` operator stands for, when it is one of the nine.
+    fn search_prefix(op: FilterOp) -> Option<crate::types::SearchPrefix> {
+        use crate::types::SearchPrefix;
+        Some(match op {
+            FilterOp::Eq => SearchPrefix::Eq,
+            FilterOp::Ne => SearchPrefix::Ne,
+            FilterOp::Gt => SearchPrefix::Gt,
+            FilterOp::Lt => SearchPrefix::Lt,
+            FilterOp::Ge => SearchPrefix::Ge,
+            FilterOp::Le => SearchPrefix::Le,
+            FilterOp::Sa => SearchPrefix::Sa,
+            FilterOp::Eb => SearchPrefix::Eb,
+            FilterOp::Ap => SearchPrefix::Ap,
+            _ => return None,
+        })
+    }
+
+    /// A quantity comparison, built by the same builder as the normal quantity
+    /// search: the stored `[value_quantity_value, value_quantity_high]`
+    /// interval against the prefix, with the raw and canonical arms and the
+    /// `value|system|code` grammar (#2602). `None` for `co`/`sw`/`ew`, which
+    /// have no quantity meaning and keep the generic text handling.
+    fn build_quantity_condition(
+        &self,
+        param: &str,
+        op: FilterOp,
+        value: &str,
+        param_num: usize,
+    ) -> Option<(String, Vec<SqlParam>)> {
+        if !self.is_quantity_param(param) {
+            return None;
+        }
+        let prefix = Self::search_prefix(op)?;
+        let frag = super::parameter_handlers::QuantityHandler::build_sql(
+            &crate::types::SearchValue::new(prefix, value),
+            param_num - 1,
+        );
+        Some((frag.sql, frag.params))
     }
 
     /// Generates SQL for a filter expression.
@@ -487,21 +576,22 @@ impl FilterSqlGenerator {
     fn generate_comparison(&mut self, param: &str, op: FilterOp, value: &str) -> SqlFragment {
         let param_num = self.param_offset + 1;
 
-        // Determine the column and condition based on parameter and operator.
-        // A date binds one value per bound of its range comparison; every
-        // other comparison binds exactly one.
-        let (condition, binds): (String, Vec<SqlParam>) =
-            match self.build_date_condition(param, op, value, param_num) {
-                Some((condition, binds)) => {
-                    (condition, binds.into_iter().map(SqlParam::String).collect())
-                }
-                None if op == FilterOp::Ap => self.build_approx_condition(param, value, param_num),
-                None => {
-                    let (_column, condition, sql_value) =
-                        self.build_condition(param, op, value, param_num);
-                    (condition, vec![SqlParam::String(sql_value)])
-                }
-            };
+        // Determine the condition based on parameter and operator. A date
+        // binds one value per bound of its range comparison and a quantity
+        // one per bound of its interval comparison; every other comparison
+        // binds exactly one.
+        let (condition, binds): (String, Vec<SqlParam>) = if let Some((condition, binds)) =
+            self.build_date_condition(param, op, value, param_num)
+        {
+            (condition, binds.into_iter().map(SqlParam::String).collect())
+        } else if let Some(quantity) = self.build_quantity_condition(param, op, value, param_num) {
+            quantity
+        } else if op == FilterOp::Ap {
+            self.build_approx_condition(param)
+        } else {
+            let (_column, condition, sql_value) = self.build_condition(param, op, value, param_num);
+            (condition, vec![SqlParam::String(sql_value)])
+        };
         self.param_offset += binds.len();
 
         // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
@@ -523,43 +613,17 @@ impl FilterSqlGenerator {
         )
     }
 
-    /// The `ap` comparison for a non-date parameter (#1503).
-    ///
-    /// A quantity column uses the shared approximate window of the `ap` search
-    /// prefix (`approx_range`), as a closed `BETWEEN`. A literal that is not a
-    /// number matches nothing. `ap` has no defined meaning on a string, token,
-    /// reference or URI column, so it matches nothing there either, rather
-    /// than doing a substring match.
-    fn build_approx_condition(
-        &self,
-        param: &str,
-        value: &str,
-        param_num: usize,
-    ) -> (String, Vec<SqlParam>) {
-        use crate::search::FhirNumberValue;
-        use crate::types::SearchPrefix;
-
-        let column = self.infer_column(param);
-        if column != "value_quantity_value" {
-            tracing::warn!(
-                "_filter `ap` is only defined for date and quantity parameters; '{}' is not one — matching nothing",
-                param
-            );
-            return ("1 = 0".to_string(), Vec::new());
-        }
-        match FhirNumberValue::parse(value) {
-            Ok(number) => {
-                let frag = super::parameter_handlers::QuantityHandler::build_numeric_condition(
-                    column,
-                    number.value,
-                    number.text(),
-                    SearchPrefix::Ap,
-                    param_num,
-                );
-                (frag.sql, frag.params)
-            }
-            Err(_) => ("1 = 0".to_string(), Vec::new()),
-        }
+    /// The `ap` comparison for a parameter that is neither a date nor a
+    /// quantity (#1503). `ap` has no defined meaning on a string, token,
+    /// reference or URI column, so it matches nothing, rather than doing a
+    /// substring match. (A quantity `ap` is built by
+    /// [`Self::build_quantity_condition`].)
+    fn build_approx_condition(&self, param: &str) -> (String, Vec<SqlParam>) {
+        tracing::warn!(
+            "_filter `ap` is only defined for date and quantity parameters; '{}' is not one — matching nothing",
+            param
+        );
+        ("1 = 0".to_string(), Vec::new())
     }
 
     /// The comparison for a date parameter: the FHIR range comparison against
@@ -692,11 +756,12 @@ impl FilterSqlGenerator {
     fn infer_column(&self, param: &str) -> &'static str {
         // Common patterns for parameter types
         match param {
+            // Quantity parameters: by registered type, else the spec's names.
+            // Listed first so a registered quantity wins over the name lists.
+            _ if self.is_quantity_param(param) => "value_quantity_value",
             // Date parameters
             "birthdate" | "date" | "issued" | "effective" | "period" | "authored" | "created"
             | "_lastUpdated" => "value_date",
-            // Numeric parameters
-            "value-quantity" | "dose-quantity" | "age" => "value_quantity_value",
             // Token parameters (identifiers, codes)
             "identifier" | "code" | "status" | "category" | "type" | "class" | "_tag"
             | "_profile" | "_security" | "gender" => "value_token_code",
@@ -945,13 +1010,18 @@ mod date_filter_tests {
         assert!(frag.sql.contains("value_token_code = ?4"), "{}", frag.sql);
     }
 
-    /// #1503: `ap` on a quantity column is the shared closed window.
+    /// #1503, #2602: `ap` on a quantity column is the shared closed window,
+    /// matched against the stored interval (overlap, as the exact two-group split).
     #[test]
     fn filter_quantity_ap_is_the_shared_window() {
         let frag = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("value-quantity ap 100").unwrap());
         assert!(
-            frag.sql.contains("value_quantity_value BETWEEN ?2 AND ?3"),
+            frag.sql.contains(
+                "(value_quantity_value >= ?2 AND value_quantity_value <= ?3) OR \
+                 (value_quantity_value < ?2 AND value_quantity_high >= ?2 AND \
+                 value_quantity_high > value_quantity_value)"
+            ),
             "{}",
             frag.sql
         );
@@ -966,7 +1036,15 @@ mod date_filter_tests {
         let frag = FilterSqlGenerator::new(1)
             .generate(&FilterParser::parse("age ap 5 and name eq Smith").unwrap());
         assert_eq!(frag.params.len(), 3);
-        assert!(frag.sql.contains("BETWEEN ?2 AND ?3"), "{}", frag.sql);
+        assert!(
+            frag.sql.contains(
+                "(value_quantity_value >= ?2 AND value_quantity_value <= ?3) OR \
+                 (value_quantity_value < ?2 AND value_quantity_high >= ?2 AND \
+                 value_quantity_high > value_quantity_value)"
+            ),
+            "{}",
+            frag.sql
+        );
         assert!(frag.sql.contains("value_string = ?4"), "{}", frag.sql);
         assert!(matches!(&frag.params[2], SqlParam::String(s) if s == "Smith"));
     }
@@ -1008,5 +1086,192 @@ mod date_filter_tests {
         let frag =
             FilterSqlGenerator::new(1).generate(&FilterParser::parse("name eq Smith").unwrap());
         assert!(frag.sql.contains("value_string = ?2"), "{}", frag.sql);
+    }
+}
+
+#[cfg(test)]
+mod quantity_filter_tests {
+    use super::*;
+    use crate::search::registry::{
+        SearchParamType, SearchParameterDefinition, SearchParameterRegistry,
+    };
+    use crate::types::SearchPrefix;
+    use rusqlite::{Connection, params_from_iter};
+
+    const PREFIXES: [(&str, SearchPrefix); 9] = [
+        ("eq", SearchPrefix::Eq),
+        ("ne", SearchPrefix::Ne),
+        ("gt", SearchPrefix::Gt),
+        ("lt", SearchPrefix::Lt),
+        ("ge", SearchPrefix::Ge),
+        ("le", SearchPrefix::Le),
+        ("sa", SearchPrefix::Sa),
+        ("eb", SearchPrefix::Eb),
+        ("ap", SearchPrefix::Ap),
+    ];
+
+    fn db(rows: &[(&str, &str, f64, f64)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_index (resource_key INTEGER, tenant_id TEXT, param_name TEXT,
+               value_string TEXT, value_quantity_value REAL, value_quantity_high REAL,
+               value_quantity_system TEXT, value_quantity_unit TEXT,
+               value_quantity_canonical_value REAL, value_quantity_canonical_high REAL,
+               value_quantity_canonical_unit TEXT);",
+        )
+        .unwrap();
+        for (i, (_id, param, lo, hi)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO search_index (resource_key, tenant_id, param_name, value_quantity_value, value_quantity_high) VALUES (?1, 't', ?2, ?3, ?4)",
+                rusqlite::params![i as i64 + 1, param, lo, hi],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn to_sql(p: &SqlParam) -> rusqlite::types::Value {
+        match p {
+            SqlParam::String(s) => rusqlite::types::Value::Text(s.clone()),
+            SqlParam::Integer(i) => rusqlite::types::Value::Integer(*i),
+            SqlParam::Float(f) => rusqlite::types::Value::Real(*f),
+            SqlParam::Null => rusqlite::types::Value::Null,
+        }
+    }
+
+    /// Runs a `_filter` generator's fragment (`?1` is the tenant) and returns
+    /// the matching `resource_key`s.
+    fn run(conn: &Connection, gen_: FilterSqlGenerator, filter: &str) -> Vec<i64> {
+        let frag = {
+            let mut g = gen_;
+            g.generate(&FilterParser::parse(filter).unwrap())
+        };
+        let sql = format!(
+            "SELECT DISTINCT resource_key FROM search_index WHERE {} ORDER BY 1",
+            frag.sql
+        );
+        let mut all = vec![rusqlite::types::Value::Text("t".into())];
+        all.extend(frag.params.iter().map(to_sql));
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map(params_from_iter(all), |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn registry() -> SearchParameterRegistry {
+        let mut reg = SearchParameterRegistry::new();
+        for code in ["onset-age", "abatement-age", "context-quantity", "my-qty"] {
+            reg.register(
+                SearchParameterDefinition::new(
+                    format!("http://example.org/sp/{code}"),
+                    code,
+                    SearchParamType::Quantity,
+                    "Condition.onset",
+                )
+                .with_base(["Condition"]),
+            )
+            .unwrap();
+        }
+        reg
+    }
+
+    #[test]
+    fn an_interval_is_matched_by_the_overlap_semantics() {
+        // onsetRange [40, 50]
+        let conn = db(&[("c", "onset-age", 40.0, 50.0)]);
+        let reg = registry();
+        let hit = |f: &str| {
+            !run(
+                &conn,
+                FilterSqlGenerator::new(1).with_registry(&reg, "Condition"),
+                f,
+            )
+            .is_empty()
+        };
+        assert!(hit("onset-age gt 45"));
+        assert!(hit("onset-age lt 45"));
+        // `eq` needs the stored range inside the searched one: [40,50] is
+        // not inside 45 (precision [44.5, 45.5)), but is inside 45 +- 10%.
+        assert!(!hit("onset-age eq 45"));
+        assert!(hit("onset-age ne 45"));
+        assert!(hit("onset-age ap 45"));
+        assert!(!hit("onset-age sa 50"));
+        assert!(hit("onset-age sa 39"));
+        assert!(hit("onset-age eb 51"));
+        assert!(!hit("onset-age gt 50"));
+        assert!(!hit("onset-age lt 40"));
+        assert!(hit("onset-age ge 50"));
+        assert!(hit("onset-age le 40"));
+        assert!(!hit("onset-age eq 60"));
+        // Registry-less generators know the spec's quantity names too.
+        assert!(!run(&conn, FilterSqlGenerator::new(1), "onset-age gt 45").is_empty());
+        // A registered custom quantity parameter needs the registry.
+        let conn2 = db(&[("c", "my-qty", 40.0, 50.0)]);
+        assert_eq!(
+            run(
+                &conn2,
+                FilterSqlGenerator::new(1).with_registry(&reg, "Condition"),
+                "my-qty gt 45"
+            ),
+            vec![1]
+        );
+    }
+
+    /// A point (`high = low`) answers every prefix as the single-column
+    /// comparison it replaces.
+    #[test]
+    fn points_match_the_point_semantics_for_all_nine_prefixes() {
+        use super::super::parameter_handlers::QuantityHandler;
+        let points = [10.0, 40.0, 44.0, 45.0, 46.0, 50.0, 100.0];
+        let rows: Vec<_> = points
+            .iter()
+            .map(|p| ("x", "value-quantity", *p, *p))
+            .collect();
+        let conn = db(&rows);
+        for v in ["45", "45.0", "0", "50"] {
+            for (name, prefix) in PREFIXES {
+                let got = run(
+                    &conn,
+                    FilterSqlGenerator::new(1),
+                    &format!("value-quantity {name} {v}"),
+                );
+                let n = crate::search::FhirNumberValue::parse(v).unwrap();
+                let old = QuantityHandler::build_numeric_condition(
+                    "value_quantity_value",
+                    n.value,
+                    n.text(),
+                    prefix,
+                    2,
+                );
+                let sql = format!(
+                    "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND param_name = 'value-quantity' AND {} ORDER BY 1",
+                    old.sql
+                );
+                let mut all = vec![rusqlite::types::Value::Text("t".into())];
+                all.extend(old.params.iter().map(to_sql));
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let want: Vec<i64> = stmt
+                    .query_map(params_from_iter(all), |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(got, want, "value-quantity {name} {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn numbering_continues_after_a_quantity() {
+        let frag = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("onset-age gt 45 and name eq Smith").unwrap());
+        // The string bind is the last one, so its number is the bind count + 1
+        // (the tenant is `?1`).
+        let last = frag.params.len() + 1;
+        assert!(
+            frag.sql.contains(&format!("value_string = ?{last}")),
+            "{}",
+            frag.sql
+        );
     }
 }

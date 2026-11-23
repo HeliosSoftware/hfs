@@ -285,6 +285,11 @@ pub(crate) struct IndexRow {
     value_quantity_system: Option<String>,
     value_quantity_canonical_value: Option<f64>,
     value_quantity_canonical_unit: Option<String>,
+    /// Upper bound of the stored interval (#2602); equals `value_quantity_value`
+    /// for a point.
+    value_quantity_high: Option<f64>,
+    /// UCUM-canonical upper bound; equals the canonical value for a point.
+    value_quantity_canonical_high: Option<f64>,
     value_reference: Option<String>,
     value_reference_target: Option<String>,
     value_reference_display: Option<String>,
@@ -420,6 +425,20 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
         "text[]",
         |r: &&IndexRow| r.value_quantity_canonical_unit.clone()
     );
+    column!(
+        p,
+        rows,
+        "value_quantity_high",
+        "float8[]",
+        |r: &&IndexRow| r.value_quantity_high
+    );
+    column!(
+        p,
+        rows,
+        "value_quantity_canonical_high",
+        "float8[]",
+        |r: &&IndexRow| r.value_quantity_canonical_high
+    );
     column!(p, rows, "value_reference", "text[]", |r: &&IndexRow| r
         .value_reference
         .clone());
@@ -479,7 +498,7 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
 /// crud run, and never once re-used, because the text changed with the row
 /// count and `execute(&str)` prepares a throwaway statement each call.
 ///
-/// Now there is a single text with 33 parameters — three scalars and 30 arrays —
+/// Now there is a single text with 35 parameters — three scalars and 32 arrays —
 /// whatever the row count, so it is prepared once per connection and every
 /// execution after the fifth runs on a cached generic plan.
 ///
@@ -566,7 +585,7 @@ const CLEAR_SQL: &str = "DELETE FROM search_index \
 /// So this form promotes those two to arrays and keeps only `tenant_id` scalar,
 /// which a transaction genuinely does hold constant (a `PostgresTransaction`
 /// carries exactly one `TenantContext`). Everything else — the column list, the
-/// bind order, the parameter *numbers* of the 29 value arrays — is shared with
+/// bind order, the parameter *numbers* of the 31 value arrays — is shared with
 /// [`INSERT_SQL`] by construction, because both are built from the same
 /// [`insert_plan`].
 static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
@@ -589,7 +608,7 @@ static INSERT_SQL_MULTI: LazyLock<String> = LazyLock::new(|| {
 /// Rows per statement.
 ///
 /// With the `unnest` form this is no longer a bind-parameter limit — 128 rows
-/// cost the same 32 parameters as one row does — so it exists only to bound the
+/// cost the same 34 parameters as one row does — so it exists only to bound the
 /// array a single statement has to marshal. It is well above the 24.2 index rows
 /// an average resource produces; what it changes is the tail. `Provenance.target`
 /// alone writes 1,626 rows for one resource, which the old 128-row cap split
@@ -697,15 +716,21 @@ impl IndexRow {
                 unit,
                 system,
                 code,
+                high,
             } => {
                 // Canonicalize using the UCUM code (else the unit display) so
-                // quantity search can match equivalent units (g <-> mg).
-                let (canonical_value, canonical_unit) = code
+                // quantity search can match equivalent units (g <-> mg). Both
+                // ends of a `Range` are converted; the open-side sentinels are
+                // kept as they are (`f64::MAX` times a factor would overflow).
+                let high_value = high.resolve(*value);
+                let (canonical_value, canonical_high, canonical_unit) = code
                     .as_deref()
                     .or(unit.as_deref())
-                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
-                    .map(|(v, u)| (Some(v), Some(u)))
-                    .unwrap_or((None, None));
+                    .and_then(|u| canonical_interval(*value, high_value, u))
+                    .map(|(l, h, u)| (Some(l), Some(h), Some(u)))
+                    .unwrap_or((None, None, None));
+                row.value_quantity_high = Some(high_value);
+                row.value_quantity_canonical_high = canonical_high;
                 row.value_quantity_value = Some(*value);
                 row.value_quantity_unit = unit.clone();
                 row.value_quantity_system = system.clone();
@@ -792,6 +817,10 @@ impl IndexRow {
             value_number: row.value_number,
             value_number_2: row.value_number_2,
             value_quantity_value: row.value_quantity_value,
+            // A composite component is a point (a `Range` with `low != high`
+            // is dropped before this; one with `low == high` is a point), so
+            // its high end is its value.
+            value_quantity_high: row.value_quantity_value,
             value_quantity_unit: row.value_quantity_unit.clone(),
             value_quantity_system: row.value_quantity_system.clone(),
             value_reference: row.value_reference.clone(),
@@ -801,12 +830,26 @@ impl IndexRow {
     }
 }
 
+/// UCUM-canonical `(low, high, unit)` of the stored interval `[low, high]` in
+/// the unit `u`, or `None` when `u` cannot be canonicalized. The open-side
+/// sentinels of a `Range` are kept as they are.
+fn canonical_interval(low: f64, high: f64, u: &str) -> Option<(f64, f64, String)> {
+    let (_, unit) = helios_fhirpath::ucum::canonicalize_quantity(1.0, u)?;
+    let convert = |x: f64| {
+        helios_fhirpath::ucum::canonicalize_quantity(x, u)
+            .map(|(v, _)| v)
+            .unwrap_or(f64::NAN)
+    };
+    let (l, h) = crate::search::canonical_range(low, high, convert);
+    (!l.is_nan() && !h.is_nan()).then_some((l, h, unit))
+}
+
 /// The identity of a `search_index` row, for the de-duplication in
 /// [`dedup_rows`].
 ///
 /// Every column the table has, in borrowed form: the three that identify the
 /// resource (bound once per statement, so they are passed in rather than read
-/// off the row) plus all 30 of [`IndexRow`]'s. Two rows with equal keys are the
+/// off the row) plus all 32 of [`IndexRow`]'s. Two rows with equal keys are the
 /// same tuple, byte for byte, and Postgres would store both.
 ///
 /// `f64` is not `Eq`/`Hash`, so the five float columns are keyed on their IEEE
@@ -840,6 +883,8 @@ struct RowKey<'a> {
     value_quantity_system: Option<&'a String>,
     value_quantity_canonical_value: Option<u64>,
     value_quantity_canonical_unit: Option<&'a String>,
+    value_quantity_high: Option<u64>,
+    value_quantity_canonical_high: Option<u64>,
     value_reference: Option<&'a String>,
     value_reference_target: Option<&'a String>,
     value_reference_display: Option<&'a String>,
@@ -884,6 +929,8 @@ impl IndexRow {
             value_quantity_system,
             value_quantity_canonical_value,
             value_quantity_canonical_unit,
+            value_quantity_high,
+            value_quantity_canonical_high,
             value_reference,
             value_reference_target,
             value_reference_display,
@@ -920,6 +967,8 @@ impl IndexRow {
             value_quantity_system: value_quantity_system.as_ref(),
             value_quantity_canonical_value: value_quantity_canonical_value.map(f64::to_bits),
             value_quantity_canonical_unit: value_quantity_canonical_unit.as_ref(),
+            value_quantity_high: value_quantity_high.map(f64::to_bits),
+            value_quantity_canonical_high: value_quantity_canonical_high.map(f64::to_bits),
             value_reference: value_reference.as_ref(),
             value_reference_target: value_reference_target.as_ref(),
             value_reference_display: value_reference_display.as_ref(),
@@ -1756,6 +1805,28 @@ mod tests {
     /// new column that is not added to it fails to compile; this covers the
     /// columns that exist today.
     #[test]
+    fn canonical_interval_converts_each_end_and_keeps_open_sentinels() {
+        use crate::search::{QUANTITY_OPEN_HIGH, QUANTITY_OPEN_LOW};
+        // A point converts like the single canonical value did.
+        let (l, h, unit) = canonical_interval(2.0, 2.0, "kg").expect("kg");
+        let (expected, expected_unit) =
+            helios_fhirpath::ucum::canonicalize_quantity(2.0, "kg").unwrap();
+        assert_eq!((l, h, unit), (expected, expected, expected_unit));
+        // Both ends of a range convert.
+        let (l, h, _) = canonical_interval(1.0, 3.0, "kg").unwrap();
+        assert!(l < h);
+        // An open side stays the sentinel instead of overflowing to infinity.
+        let (l, h, _) = canonical_interval(QUANTITY_OPEN_LOW, 3.0, "kg").unwrap();
+        assert_eq!(l, QUANTITY_OPEN_LOW);
+        assert!(h.is_finite());
+        let (l, h, _) = canonical_interval(1.0, QUANTITY_OPEN_HIGH, "kg").unwrap();
+        assert!(l.is_finite());
+        assert_eq!(h, QUANTITY_OPEN_HIGH);
+        // A unit UCUM cannot convert has no canonical interval.
+        assert!(canonical_interval(1.0, 2.0, "not-a-unit|x").is_none());
+    }
+
+    #[test]
     fn every_column_distinguishes_two_rows() {
         let base = IndexRow::default();
         type ColumnMutator = (&'static str, fn(&mut IndexRow));
@@ -1805,6 +1876,10 @@ mod tests {
             }),
             ("value_quantity_canonical_unit", |r| {
                 r.value_quantity_canonical_unit = Some("g".into())
+            }),
+            ("value_quantity_high", |r| r.value_quantity_high = Some(1.0)),
+            ("value_quantity_canonical_high", |r| {
+                r.value_quantity_canonical_high = Some(1.0)
             }),
             ("value_reference", |r| {
                 r.value_reference = Some("P/1".into())

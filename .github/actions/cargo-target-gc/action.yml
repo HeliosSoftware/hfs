@@ -30,6 +30,11 @@ description: >
 # overwritten by the next build; it does not accumulate. Expect the swept
 # directory to settle slightly above `maxsize`, not exactly at it.
 #
+# Since cargo 1.100 most of target/ is in the new build-dir layout
+# (`<profile>/build/<pkg>/<hash>/`), which cargo-sweep 0.8.0 does not manage
+# at all. sweep.sh evicts those units itself, least-recently-used first, down
+# to the same on-disk cap; see `evict_build_units` there.
+#
 # cargo-sweep does not manage `target/<profile>/incremental/` at all: it never
 # removes it, but it does count it toward `maxsize`. Left alone, incremental
 # caches for hashes nobody builds any more (and rustc sessions a cancelled run

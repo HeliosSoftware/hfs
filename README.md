@@ -285,6 +285,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_TENANT_ROUTING_MODE` | `header_only` | Tenant routing: `header_only`, `url_path`, or `both` |
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Error if URL and header tenant disagree |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled (see [crates/auth/README.md](crates/auth/README.md#tenant-resolution)) |
+| `HFS_SEARCH_PARAM_CACHE_MAX_TENANTS` | `1024` | How many per-tenant SearchParameter registries stay cached at once; the oldest insertion is evicted past it and rebuilt on its next access. Every distinct tenant id a request names costs one base-registry clone until the hourly refresh, so set it to at least the number of active tenants, and set `HFS_TENANT_REQUIRE_PROVISIONED=true` so unknown ids never reach the cache |
 
 **Terminology**
 
@@ -323,6 +324,10 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_DBNAME` | `helios` | Database name |
 | `HFS_PG_USER` | `helios` | Database user |
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
+| `HFS_PG_SSL_MODE` | `prefer` | The minimum `sslmode` for every PostgreSQL connection `hfs` opens: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`, as in libpq. `?sslmode=` on `HFS_DATABASE_URL` (or `HFS_AUDIT_DATABASE_URL`) is honoured too, and the stronger of the two wins, so this variable can raise a URL's mode but never lower it (a weaker value is logged and ignored). An unknown value refuses to start. `prefer` and `allow` encrypt when the server offers TLS without checking its certificate; `require` always encrypts and checks the certificate chain only when a root certificate is given; `verify-ca` checks the chain; `verify-full` also checks the host name. Startup logs whether the link is encrypted, read from the server (a WARN when `prefer` fell back to cleartext). |
+| `HFS_PG_SSL_ROOT_CERT` | *(platform trust store)* | Trusted roots for `verify-ca` / `verify-full` (and `require`): a PEM file, or `system` for the platform store (only with `verify-full`). `?sslrootcert=` on the URL wins. For managed databases (Amazon RDS, Azure) point it at the provider's CA bundle. |
+| `HFS_PG_SSL_CERT` | *(none)* | Client certificate (PEM) for `cert` authentication, with `HFS_PG_SSL_KEY`. `?sslcert=` on the URL wins. |
+| `HFS_PG_SSL_KEY` | *(none)* | Private key (PEM) of `HFS_PG_SSL_CERT`. `?sslkey=` on the URL wins. |
 | `HFS_PG_MAX_CONNECTIONS` | `cores * 4`, 16 to 64 | Connection pool size. Without this variable (or with a value that does not parse) the pool is also limited at startup to half of the server's `max_connections`, shared with the other pools `hfs` opens against the same host and port, such as the `HFS_AUDIT_BACKEND=database` pool: on a stock server (`max_connections = 100`) the two get at most 25 each. A value you set is used as given, with a warning in the log when the pools add up to more than the server's limit. Raise it when PostgreSQL shares the machine with `hfs` and writes wait on the WAL flush; on a database with its own cores a larger pool did not raise throughput (#2216). |
 | `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
 | `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
