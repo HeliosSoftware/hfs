@@ -797,6 +797,47 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
     assert_eq!(issue_code, "too-costly");
 }
 
+// ── negative cache vs tx-resource ─────────────────────────────────────────────
+
+/// A url-only miss is remembered so later url-only requests skip the store;
+/// a request that supplies the ValueSet inline as a `tx-resource` never
+/// consults the store for that url and must not be answered by that miss.
+#[tokio::test]
+async fn a_url_only_miss_does_not_poison_a_tx_resource_expansion() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let url = "http://hts.test/vs/not-in-store";
+
+    let (status, _) = app.get_fhir(&format!("/ValueSet/$expand?url={url}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": url},
+            {"name": "tx-resource", "resource": {
+                "resourceType": "ValueSet",
+                "url": url,
+                "status": "active",
+                "compose": {"include": [{
+                    "system": bundles::ANATOMY_CS_URL,
+                    "concept": [{"code": "arm"}]
+                }]}
+            }}
+        ]
+    });
+    let (status, expansion) = app.post_fhir("/ValueSet/$expand", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{expansion}");
+    assert_eq!(expansion["expansion"]["contains"][0]["code"], "arm");
+
+    let (status, _) = app.get_fhir(&format!("/ValueSet/$expand?url={url}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the url-only miss still stands"
+    );
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]

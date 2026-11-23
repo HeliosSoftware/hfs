@@ -1804,20 +1804,6 @@ async fn process_expand_inner<B: TerminologyBackend>(
         }
     }
 
-    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
-    // URLs that previously returned NotFound are remembered here so we can skip
-    // all backend queries on repeated requests (saves 5+ SQLite round-trips per
-    // hit).
-    if instance.is_none()
-        && let Some(ref url_str) = url
-    {
-        if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(url_str.as_str()) {
-                return Err(HtsError::NotFound(url_str.clone()));
-            }
-        }
-    }
-
     // `tx-resource` parameters provide ad-hoc terminology that the caller does
     // not want to import. Each is a full FHIR resource (typically a ValueSet)
     // that the backend should treat as in-scope only for this single request —
@@ -1875,6 +1861,23 @@ async fn process_expand_inner<B: TerminologyBackend>(
     } else {
         (url, value_set)
     };
+
+    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
+    // URLs that previously returned NotFound are remembered here so we can skip
+    // all backend queries on repeated requests (saves 5+ SQLite round-trips per
+    // hit). Checked after the tx-resource shortcut: a request that supplies
+    // the ValueSet inline never consults the store for that URL, so an earlier
+    // miss recorded for a url-only request must not answer it.
+    if instance.is_none()
+        && let Some(ref url_str) = url
+    {
+        if let Ok(neg) = state.not_found_urls.read() {
+            if neg.contains(url_str.as_str()) {
+                return Err(HtsError::NotFound(url_str.clone()));
+            }
+        }
+    }
+
     // Preserve the URL before it moves into ExpandRequest so we can record it
     // in the negative cache if the backend returns NotFound. Also clone the
     // inline ValueSet body (when present) so we can echo its top-level
