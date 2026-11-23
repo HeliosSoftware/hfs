@@ -677,6 +677,17 @@ where
                         }
                     }
                 }
+                if let Some(principal) = principal {
+                    admit_subscription_authority_entry(
+                        state,
+                        &tenant,
+                        fhir_version,
+                        index,
+                        &bundle_entry,
+                        principal,
+                    )
+                    .await?;
+                }
                 // An instance read runs inside the storage transaction on
                 // `bundle_entry.url`; it reads the address judged above and
                 // nothing else.
@@ -1512,6 +1523,16 @@ where
             {
                 return entry_failure(error);
             }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
+                return entry_failure(error);
+            }
 
             // Write-path validation (per-entry outcome in batch semantics).
             //
@@ -1627,6 +1648,16 @@ where
             if let Err(error) =
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
             {
+                return entry_failure(error);
+            }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
                 return entry_failure(error);
             }
 
@@ -1948,6 +1979,7 @@ where
                 &id,
                 criteria,
                 if_match,
+                principal,
                 audit_target,
             )
             .await
@@ -1965,6 +1997,7 @@ async fn process_batch_patch<S>(
     id: &str,
     criteria: Option<&str>,
     if_match: Option<&str>,
+    principal: Option<&Principal>,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
@@ -2049,6 +2082,17 @@ where
             };
         (current, candidate)
     };
+
+    if let Err(error) = super::subscription_authority::admit_write(
+        state,
+        tenant,
+        current.fhir_version(),
+        resource_type,
+        &candidate,
+        principal,
+    ) {
+        return entry_failure(error);
+    }
 
     let validator = RestPatchValidator {
         validation: state.validation(),
@@ -3767,6 +3811,95 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
         BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
         BundleMethod::Delete => FhirOperation::Delete,
     }
+}
+
+/// A transaction entry that writes a Subscription or a topic is judged by the
+/// writer's authority over the resource types the topic names (see
+/// `subscription_authority`), on the document the entry will store: the
+/// submitted resource of a POST or PUT, or the patched current document of a
+/// PATCH, computed here as the batch arm computes it. An entry the
+/// transaction will refuse anyway (no resource, malformed patch, no match)
+/// is left to it.
+async fn admit_subscription_authority_entry<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    index: usize,
+    entry: &BundleEntry,
+    principal: &Principal,
+) -> RestResult<()>
+where
+    S: ResourceStorage + ConditionalStorage + Send + Sync,
+{
+    let (resource_type, id) =
+        parse_request_url(&entry.url).map_err(|e| RestError::InvalidElementValue {
+            message: format!("Entry {index}: {e}"),
+        })?;
+    if !super::subscription_authority::is_judged(&resource_type) {
+        return Ok(());
+    }
+    let document = match entry.method {
+        BundleMethod::Post | BundleMethod::Put => match &entry.resource {
+            Some(resource) => resource.clone(),
+            None => return Ok(()),
+        },
+        BundleMethod::Patch => {
+            let Some(document) = &entry.resource else {
+                return Ok(());
+            };
+            let Ok(patch) = decode_bundle_patch_resource(document, fhir_version) else {
+                return Ok(());
+            };
+            let Ok(if_match) =
+                helios_persistence::core::EntityTagPrecondition::parse(entry.if_match.as_deref())
+            else {
+                return Ok(());
+            };
+            if let Some(criteria) = conditional_criteria(&entry.url, &id) {
+                match state
+                    .storage()
+                    .prepare_conditional_patch(
+                        tenant.context(),
+                        &resource_type,
+                        criteria,
+                        &patch,
+                        &if_match,
+                    )
+                    .await
+                {
+                    Ok(ConditionalPatchPreparation::Ready { patched, .. }) => patched,
+                    _ => return Ok(()),
+                }
+            } else {
+                match state
+                    .storage()
+                    .read(tenant.context(), &resource_type, &id)
+                    .await
+                {
+                    Ok(Some(current)) => {
+                        match apply_patch_for_version(
+                            current.content(),
+                            &patch,
+                            current.fhir_version(),
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+        BundleMethod::Get | BundleMethod::Delete => return Ok(()),
+    };
+    super::subscription_authority::admit_write(
+        state,
+        tenant,
+        fhir_version,
+        &resource_type,
+        &document,
+        Some(principal),
+    )
 }
 
 /// Returns a processing order for bundle methods per FHIR spec.

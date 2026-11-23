@@ -65,6 +65,7 @@ pub async fn patch_handler<S>(
     headers: HeaderMap,
     tenant: TenantExtractor,
     compartment: PatientCompartment,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
@@ -156,6 +157,15 @@ where
         existing.fhir_version(),
         &patched_content,
         "patch",
+    )?;
+
+    super::subscription_authority::admit_write(
+        &state,
+        &tenant,
+        existing.fhir_version(),
+        &resource_type,
+        &patched_content,
+        principal.as_ref().map(|p| &p.0),
     )?;
 
     state
@@ -265,6 +275,7 @@ pub async fn conditional_patch_handler<S>(
     headers: HeaderMap,
     tenant: TenantExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
@@ -343,6 +354,14 @@ where
                     &patched,
                 )
                 .await?;
+            super::subscription_authority::admit_write(
+                &state,
+                &tenant,
+                current.fhir_version(),
+                &resource_type,
+                &patched,
+                principal.as_ref().map(|p| &p.0),
+            )?;
             super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
             let stored = state
                 .storage()
