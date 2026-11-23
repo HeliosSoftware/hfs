@@ -710,8 +710,15 @@ where
     // The markers' diagnostics are re-emitted through
     // `append_warning_outcome_with_code` below, AFTER subsetting, the same
     // way ignored-parameter and sort warnings are.
-    let truncation_messages =
-        finish_includes(state, tenant, compartment, &query.includes, &mut result).await?;
+    let includes = finish_includes(
+        state,
+        tenant,
+        compartment,
+        chains,
+        &query.includes,
+        &mut result,
+    )
+    .await?;
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(tenant);
@@ -781,10 +788,20 @@ where
         // #1061: include/revinclude resolution truncated at the configured
         // resource cap. Emitted here (post-subsetting) rather than by leaving
         // the marker in `included`, so `_elements`/`_summary` cannot strip it.
-        append_truncation_outcomes(&mut bundle_json, &truncation_messages);
+        append_truncation_outcomes(&mut bundle_json, &includes.truncation);
+        append_omitted_types_outcome(&mut bundle_json, &includes.omitted_types);
     }
 
     Ok(bundle_json)
+}
+
+/// What [`finish_includes`] took out of `included` and why: the #1061
+/// truncation markers' diagnostics, and the resource types the token's
+/// scopes do not let it read, in type order.
+#[derive(Debug, Default)]
+pub(crate) struct IncludeReport {
+    pub(crate) truncation: Vec<String>,
+    pub(crate) omitted_types: Vec<String>,
 }
 
 /// Completes the `_include` / `_revinclude` side of a search result, for the
@@ -815,9 +832,10 @@ pub(crate) async fn finish_includes<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     compartment: &PatientCompartment,
+    chains: &ChainAccess,
     includes: &[IncludeDirective],
     result: &mut SearchResult,
-) -> RestResult<Vec<String>>
+) -> RestResult<IncludeReport>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
@@ -853,12 +871,67 @@ where
             result.included.extend(continuation);
         }
     }
-    let truncation_messages = drain_truncation_markers(&mut result.included);
+    let truncation = drain_truncation_markers(&mut result.included);
     compartment.retain_members(
         || state.storage().search_param_registry(tenant.context()),
         &mut result.included,
     );
-    Ok(truncation_messages)
+    // An include follows references into any type; SMART scopes are granted
+    // per type, so an included resource comes back only when the token may
+    // read its type, as `$everything` keeps only the types it may read
+    // (#2628). A `patient/` grant counts as permitting the type: the
+    // compartment filter above has already confined it.
+    let mut omitted = std::collections::BTreeSet::new();
+    if let Some(principal) = chains.principal() {
+        result.included.retain(|resource| {
+            let resource_type = resource.resource_type();
+            if helios_auth::SmartScopePolicy::check(
+                principal,
+                resource_type,
+                helios_auth::FhirOperation::Read,
+            )
+            .is_ok()
+            {
+                true
+            } else {
+                omitted.insert(resource_type.to_string());
+                false
+            }
+        });
+    }
+    Ok(IncludeReport {
+        truncation,
+        omitted_types: omitted.into_iter().collect(),
+    })
+}
+
+/// Appends one `information` outcome naming the included resource types the
+/// token's scopes do not cover, when any were left out. Call it after
+/// subsetting, like the other outcomes.
+pub(crate) fn append_omitted_types_outcome(
+    bundle_json: &mut serde_json::Value,
+    omitted: &[String],
+) {
+    if omitted.is_empty() {
+        return;
+    }
+    let outcome = crate::responses::OperationOutcomeBuilder::new()
+        .information(
+            crate::responses::operation_outcome::IssueType::Informational,
+            format!(
+                "Omitted included resource types the token's scopes do not cover: {}",
+                omitted.join(", ")
+            ),
+        )
+        .build();
+    let entry = serde_json::json!({
+        "search": { "mode": "outcome" },
+        "resource": outcome,
+    });
+    match bundle_json.get_mut("entry").and_then(|e| e.as_array_mut()) {
+        Some(entries) => entries.push(entry),
+        None => bundle_json["entry"] = serde_json::json!([entry]),
+    }
 }
 
 /// Appends one `incomplete` warning per #1061 include-truncation message to

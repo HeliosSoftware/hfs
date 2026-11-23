@@ -49,6 +49,8 @@ const BAD_CONTEXT: &str = "bad-context-token";
 const MIXED: &str = "mixed-token";
 /// `user/Patient.rs` only: no scope for any other type.
 const PATIENT_ONLY: &str = "patient-only-token";
+/// `user/Observation.rs` only: no scope for the types its references name.
+const OBSERVATION_ONLY: &str = "observation-only-token";
 
 struct StubProvider;
 
@@ -67,6 +69,7 @@ impl AuthProvider for StubProvider {
             BAD_CONTEXT => ("patient/*.rs", Some("https://ehr.example/fhir/Patient/p1")),
             MIXED => ("user/Observation.rs patient/*.rs", Some("p1")),
             PATIENT_ONLY => ("user/Patient.rs", None),
+            OBSERVATION_ONLY => ("user/Observation.rs", None),
             _ => return Err(AuthError::InvalidSignature),
         };
         Ok(Principal {
@@ -548,6 +551,84 @@ pub async fn includes_outside_the_compartment_are_dropped(server: &TestServer) {
     )
     .await;
     assert_eq!(included_ids(&r.json()), ["p1", "pr1"]);
+}
+
+/// An include follows references into any type, but the token is granted per
+/// type: included resources of a type it may not read are left out and the
+/// bundle says which types were omitted (#2676), as `$everything` does.
+pub async fn included_types_outside_the_scopes_are_dropped(server: &TestServer) {
+    // `_include` reaches Patient and Practitioner from an Observation grant.
+    let r = get(
+        server,
+        OBSERVATION_ONLY,
+        "/Observation?_id=o3&_include=Observation:performer&_include=Observation:subject",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["o3"]);
+    assert!(included_ids(&bundle).is_empty(), "{bundle}");
+    assert_eq!(
+        omitted_types(&bundle),
+        ["Patient, Practitioner"],
+        "{bundle}"
+    );
+
+    // `_revinclude` reaches Observations from a Patient grant.
+    let r = get(
+        server,
+        PATIENT_ONLY,
+        "/Patient?_id=p1&_revinclude=Observation:subject",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["p1"]);
+    assert!(included_ids(&bundle).is_empty(), "{bundle}");
+    assert_eq!(omitted_types(&bundle), ["Observation"], "{bundle}");
+
+    // The compartment search applies the same rule.
+    let r = get(
+        server,
+        OBSERVATION_ONLY,
+        "/Patient/p1/Observation?_include=Observation:performer",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert!(included_ids(&bundle).is_empty(), "{bundle}");
+    assert_eq!(omitted_types(&bundle), ["Practitioner"], "{bundle}");
+
+    // A grant on the included type returns it, with nothing to report.
+    let r = get(
+        server,
+        SYSTEM,
+        "/Observation?_id=o3&_include=Observation:performer&_include=Observation:subject",
+    )
+    .await;
+    let bundle: Value = r.json();
+    assert_eq!(included_ids(&bundle), ["p1", "pr1"]);
+    assert!(omitted_types(&bundle).is_empty(), "{bundle}");
+}
+
+/// The types named by the omitted-types outcome entries, one string per entry.
+fn omitted_types(bundle: &Value) -> Vec<String> {
+    bundle["entry"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e["search"]["mode"].as_str() == Some("outcome"))
+                .filter_map(|e| e["resource"]["issue"][0]["details"]["text"].as_str())
+                .filter_map(|d| {
+                    d.strip_prefix(
+                        "Omitted included resource types the token's scopes do not cover: ",
+                    )
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn compartment_search_includes_outside_the_compartment_are_dropped(server: &TestServer) {
@@ -1359,7 +1440,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, compartment_search_includes_outside_the_compartment_are_dropped, compartment_search_does_not_return_linked_patients, chained_and_has_hops_are_judged_like_direct_searches, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, included_types_outside_the_scopes_are_dropped, compartment_search_includes_outside_the_compartment_are_dropped, compartment_search_does_not_return_linked_patients, chained_and_has_hops_are_judged_like_direct_searches, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(
