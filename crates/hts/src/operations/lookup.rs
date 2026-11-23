@@ -33,9 +33,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{
-    AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache,
-};
+use crate::state::{AppState, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache};
 use crate::traits::{SupplementInfo, TerminologyBackend};
 use crate::types::{DesignationValue, LookupRequest, ResourceIdentity};
 
@@ -94,9 +92,6 @@ fn lookup_cache_get(cache: &LookupHandlerCache, key: &str) -> Option<Arc<Value>>
 /// [`LOOKUP_HANDLER_CACHE_MAX`].
 fn lookup_cache_put(cache: &LookupHandlerCache, key: String, value: Arc<Value>) {
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= LOOKUP_HANDLER_CACHE_MAX {
-            return;
-        }
         guard.insert(key, value);
     }
 }

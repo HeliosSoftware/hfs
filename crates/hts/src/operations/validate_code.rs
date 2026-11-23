@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{AppState, VALIDATE_CODE_HANDLER_CACHE_MAX, ValidateCodeHandlerCache};
+use crate::state::{AppState, ValidateCodeHandlerCache};
 use crate::traits::{CodeSystemOperations, SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
@@ -2169,9 +2169,6 @@ fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value:
         return;
     }
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= VALIDATE_CODE_HANDLER_CACHE_MAX {
-            return;
-        }
         guard.insert(key, value);
     }
 }

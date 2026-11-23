@@ -46,10 +46,7 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{
-    AppState, EXPAND_CACHE_MAX, EXPAND_HANDLER_CACHE_MAX, ExpandCacheKey, ExpandHandlerCache,
-    NOT_FOUND_CACHE_MAX,
-};
+use crate::state::{AppState, ExpandCacheKey, ExpandHandlerCache, NOT_FOUND_CACHE_MAX};
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -1461,9 +1458,6 @@ fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Byt
 /// [`EXPAND_HANDLER_CACHE_MAX`].
 fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= EXPAND_HANDLER_CACHE_MAX {
-            return;
-        }
         guard.insert(key, value);
     }
 }
@@ -4096,11 +4090,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     );
 
     if let Ok(mut cache) = state.expand_cache.write() {
-        if cache.len() < EXPAND_CACHE_MAX {
-            // `Bytes::clone` is O(1); storing it here and returning the clone
-            // below means both the cache and the caller share the same buffer.
-            cache.insert(cache_key, bytes.clone());
-        }
+        // `Bytes::clone` is O(1); storing it here and returning the clone
+        // below means both the cache and the caller share the same buffer.
+        cache.insert(cache_key, bytes.clone());
     }
 
     // EX_PROBE: total wall time for the whole request including parse + post-
