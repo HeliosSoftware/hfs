@@ -3,6 +3,7 @@
 //! `Subscription` only: another type segment is an unknown path, whatever the
 //! token is granted on that type, and the Subscription form is judged by a
 //! read grant on Subscription.
+#![cfg(feature = "subscriptions")]
 
 use std::sync::Arc;
 
