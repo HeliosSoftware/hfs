@@ -506,12 +506,39 @@ async fn a_failed_edit_reopens_the_dialog_with_attempted_values_and_preserves_st
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(html.contains(r#"class="addbox addbox--modal" open"#));
     assert!(html.contains(r#"role="alert""#));
+    assert!(html.contains("could not be saved"), "{html}");
+    assert!(!html.contains("forced edit failure"), "{html}");
     assert!(html.contains(r#"value="Attempted""#));
     assert!(html.contains(r#"value="new-client""#));
 
     let (_, persisted) = get(&ctx, &detail_path).await;
     assert!(persisted.contains("BrettTest"));
     assert!(!persisted.contains(r#"value="Attempted""#));
+}
+
+/// A storage failure on create answers a fixed sentence; the storage error
+/// goes to the log, not to the browser.
+#[tokio::test]
+async fn a_failed_create_answers_a_fixed_sentence() {
+    let (settings, backing) = backing_stores();
+    let ctx = Ctx {
+        settings,
+        bulk_provider: Arc::new(FailNextPutStore {
+            inner: backing,
+            fail: std::sync::atomic::AtomicBool::new(true),
+        }),
+        recipient: "http://localhost:9/".to_string(),
+    };
+    let (status, _, body) = post_form(
+        &ctx,
+        "/ui/bulk-import",
+        "name=BrettTest&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(body.contains("could not be saved"), "{body}");
+    assert!(!body.contains("forced edit failure"), "{body}");
+    assert!(!body.contains("test-provider"), "{body}");
 }
 
 #[tokio::test]

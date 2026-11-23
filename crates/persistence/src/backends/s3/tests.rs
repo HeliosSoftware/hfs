@@ -6438,6 +6438,38 @@ async fn discover_tenants_honours_the_global_prefix() {
     assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
 }
 
+/// The bulk-provider store's errors go through the client error mapping:
+/// the operation is named, the SDK and provider detail stay in the log, and
+/// nothing is rendered with Rust `Debug` syntax.
+#[tokio::test]
+async fn bulk_provider_store_errors_carry_the_fixed_text_not_the_client_detail() {
+    use crate::core::BulkProviderStore;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let prefix = backend
+        .tenant_location(&tenant)
+        .unwrap()
+        .keyspace
+        .bulk_provider_prefix();
+    mock.fail_lists_at(
+        &prefix,
+        S3ClientError::Unavailable(
+            "connection failed: DispatchFailure { 127.0.0.1:59759 ConnectionRefused }".to_string(),
+        ),
+    );
+    let err = backend
+        .list_provider_submissions(&tenant)
+        .await
+        .expect_err("the list fails")
+        .to_string();
+    assert!(err.contains("list provider submissions"), "{err}");
+    assert!(!err.contains("DispatchFailure"), "{err}");
+    assert!(!err.contains("127.0.0.1"), "{err}");
+    assert!(!err.contains("Backend("), "{err}");
+}
+
 /// A failed delimiter page or a failed probe fails the call: never an empty
 /// or partial success.
 #[tokio::test]

@@ -19,6 +19,7 @@ use crate::tenant::TenantContext;
 
 use super::backend::{S3Backend, TenantLocation};
 use super::client::S3ClientError;
+use super::user_settings::context;
 
 /// Attempts at a compare-and-swap that lost its race (counts total attempts).
 /// Contention on one submission is the 5s status poller racing a user action,
@@ -82,7 +83,7 @@ impl S3Backend {
         let Some((stored, metadata)) = self
             .get_json_object::<ProviderObject>(bucket, key)
             .await
-            .map_err(|e| backend_err(format!("read provider submission: {e:?}")))?
+            .map_err(|e| context("read provider submission", e))?
         else {
             return Ok(None);
         };
@@ -110,12 +111,12 @@ impl BulkProviderStore for S3Backend {
                 .client
                 .list_objects(&location.bucket, &prefix, continuation.as_deref(), None)
                 .await
-                .map_err(|e| backend_err(format!("list provider submissions: {e:?}")))?;
+                .map_err(|e| context("list provider submissions", self.map_client_error(e)))?;
             for item in &page.items {
                 if let Some((stored, _etag)) = self
                     .get_json_object::<ProviderObject>(&location.bucket, &item.key)
                     .await
-                    .map_err(|e| backend_err(format!("read provider submission: {e:?}")))?
+                    .map_err(|e| context("read provider submission", e))?
                 {
                     out.push(StoredProviderSubmission {
                         id: stored.id,
@@ -208,7 +209,10 @@ impl BulkProviderStore for S3Backend {
             let lost_race = matches!(err, S3ClientError::PreconditionFailed)
                 || (matches!(err, S3ClientError::NotFound) && if_match.is_some());
             if !lost_race {
-                return Err(backend_err(format!("write provider submission: {err:?}")));
+                return Err(context(
+                    "write provider submission",
+                    self.map_client_error(err),
+                ));
             }
             // A version-conditioned write must not retry: the precondition the
             // caller asked for no longer holds.
@@ -236,7 +240,7 @@ impl BulkProviderStore for S3Backend {
         self.client
             .delete_object(&location.bucket, &key)
             .await
-            .map_err(|e| backend_err(format!("delete provider submission: {e:?}")))?;
+            .map_err(|e| context("delete provider submission", self.map_client_error(e)))?;
         Ok(existed)
     }
 }

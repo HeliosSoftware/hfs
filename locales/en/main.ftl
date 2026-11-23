@@ -710,6 +710,7 @@ bulk-import-test-auth-ok = Authentication succeeded.
 bulk-import-create-submit = Submit
 bulk-import-advanced = Advanced options
 bulk-import-unavailable = The storage backend does not host the settings store, so submissions cannot be saved.
+bulk-import-save-failed = The submission could not be saved. The server log has the detail.
 bulk-import-submissions = Submissions
 bulk-import-records = records
 bulk-import-col-name = Name

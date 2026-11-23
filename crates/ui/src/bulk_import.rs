@@ -619,6 +619,7 @@ pub struct CreateForm {
 /// manifest URL's origin at kick-off time.
 pub async fn create(
     State(state): State<WebState>,
+    locale: RequestLocale,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
     headers: HeaderMap,
@@ -670,7 +671,14 @@ pub async fn create(
     submit_one_with_id(&state, &mut submission, &headers, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import submission");
+            (
+                StatusCode::BAD_GATEWAY,
+                I18n::new(locale).t("bulk-import-save-failed"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -844,15 +852,17 @@ pub async fn edit(
     match save(&state, &rt, &id, &s, Some(sv)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => {
+            tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import submission");
             let i18n = I18n::new(locale);
             let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
+            let message = i18n.t("bulk-import-save-failed");
             let mut response = render_detail_page(
                 i18n,
                 current_status(&state, rv.0, &rt),
                 rebuild,
                 id,
                 s,
-                Some(e.to_string()),
+                Some(message),
                 true,
             );
             *response.status_mut() = StatusCode::BAD_GATEWAY;
