@@ -1679,6 +1679,10 @@ async fn a_throttled_poll_backs_off_and_stays_out_of_the_log() {
 async fn backend_services_auth_mints_and_attaches_tokens() {
     let ctx = ctx("http://localhost:9/");
     let token_url = mock_token_endpoint(StatusCode::OK, r#"{"access_token":"tok-123"}"#).await;
+    // The assertion goes only to listed Data Provider origins; each mock
+    // endpoint is listed as it is created.
+    let mut trusted = vec![token_url.clone()];
+    helios_ui::set_bulk_submit_trusted_providers(&trusted);
 
     // Phase 1 — no key configured: the gap is reported, not swallowed.
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PRIVATE_KEY") };
@@ -1714,6 +1718,8 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     // Phase 4 — the endpoint rejects: status is surfaced.
     let denied =
         mock_token_endpoint(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#).await;
+    trusted.push(denied.clone());
+    helios_ui::set_bulk_submit_trusted_providers(&trusted);
     let (_, _, html) = post_form(
         &ctx,
         "/ui/bulk-import/test-auth",
@@ -1724,6 +1730,8 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
 
     // Phase 5 — a token response without access_token is an error.
     let empty = mock_token_endpoint(StatusCode::OK, r#"{"scope":"none"}"#).await;
+    trusted.push(empty.clone());
+    helios_ui::set_bulk_submit_trusted_providers(&trusted);
     let (_, _, html) = post_form(
         &ctx,
         "/ui/bulk-import/test-auth",
@@ -1771,6 +1779,31 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     .await;
     assert!(html.contains("✓"), "RS384 mint: {html}");
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_SIGNING_ALG") };
+
+    // Phase 8 — a token endpoint outside the listed origins is refused
+    // before anything is signed or sent: no status, no transport detail.
+    let stray = mock_token_endpoint(StatusCode::OK, r#"{"access_token":"tok-stray"}"#).await;
+    let (_, _, html) = post_form(
+        &ctx,
+        "/ui/bulk-import/test-auth",
+        &format!("client_id=alice&token_url={}", urlencode(&stray)),
+    )
+    .await;
+    assert!(
+        html.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"),
+        "unlisted origin refused: {html}"
+    );
+    assert!(!html.contains("answered") && !html.contains("✓"), "{html}");
+
+    // Phase 9 — with nothing listed, a listed-until-now endpoint is refused too.
+    helios_ui::set_bulk_submit_trusted_providers(Vec::<String>::new());
+    let (_, _, html) = post_form(
+        &ctx,
+        "/ui/bulk-import/test-auth",
+        &format!("client_id=alice&token_url={}", urlencode(&token_url)),
+    )
+    .await;
+    assert!(html.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{html}");
 
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PRIVATE_KEY") };
 }
