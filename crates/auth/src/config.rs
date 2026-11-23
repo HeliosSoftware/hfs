@@ -205,10 +205,10 @@ impl AuthConfig {
             jwks_url: env::var("HFS_AUTH_JWKS_URL").ok(),
             expected_issuer: env::var("HFS_AUTH_ISSUER").ok(),
             expected_audience: env::var("HFS_AUTH_AUDIENCE").ok(),
-            tenant_claim: env::var("HFS_AUTH_TENANT_CLAIM")
-                .unwrap_or_else(|_| "tenant_id".to_string()),
             // A blank value falls back to the default: an empty claim name
-            // would match a `""` key.
+            // would match a `""` key, which for the tenant claim reads every
+            // token as claimless and serves every tenant from the default.
+            tenant_claim: claim_name_from_env("HFS_AUTH_TENANT_CLAIM", "tenant_id"),
             patient_claim: claim_name_from_env("HFS_AUTH_PATIENT_CLAIM", "patient"),
             encounter_claim: claim_name_from_env("HFS_AUTH_ENCOUNTER_CLAIM", "encounter"),
             fhir_user_claim: claim_name_from_env("HFS_AUTH_FHIR_USER_CLAIM", "fhirUser"),
@@ -299,6 +299,13 @@ impl AuthConfig {
         }
         if self.allowed_algorithms.is_empty() {
             errors.push("HFS_AUTH_ALGORITHMS must list at least one signing algorithm".to_string());
+        }
+        if self.tenant_claim.trim().is_empty() {
+            errors.push(
+                "HFS_AUTH_TENANT_CLAIM must not be blank (it names the claim that binds a \
+                 token to its tenant)"
+                    .to_string(),
+            );
         }
 
         if errors.is_empty() {
@@ -533,6 +540,21 @@ mod tests {
         };
         let errors = config.validate().unwrap_err();
         assert_eq!(errors.len(), 2, "got {errors:?}");
+    }
+
+    /// The tenant claim is an isolation boundary: a blank name is refused
+    /// rather than matched against a `""` key.
+    #[test]
+    fn validate_rejects_a_blank_tenant_claim() {
+        for blank in ["", "   "] {
+            let config = AuthConfig {
+                tenant_claim: blank.to_string(),
+                ..enabled_config()
+            };
+            let errors = config.validate().unwrap_err();
+            assert_eq!(errors.len(), 1, "got {errors:?}");
+            assert!(errors[0].contains("HFS_AUTH_TENANT_CLAIM"), "{errors:?}");
+        }
     }
 
     /// Every problem is reported at once, not just the first.
