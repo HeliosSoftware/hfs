@@ -897,9 +897,18 @@ async fn import_directory_files(
         );
         match dispatch_import(format, backend, ctx, entry, batch_size, dry_run, languages).await {
             Ok(file_stats) => {
+                let conflicts = file_stats.conflicts;
                 stats.merge(file_stats);
                 imported_count += 1;
-                if let (Some(tracker), Some((hash, size, mtime, langs))) =
+                if conflicts > 0 {
+                    tracing::error!(
+                        file = fname,
+                        conflicts,
+                        "bootstrap import left resources out because another owner holds \
+                         their canonical or id; the file is not recorded as imported and \
+                         will be attempted again at the next startup"
+                    );
+                } else if let (Some(tracker), Some((hash, size, mtime, langs))) =
                     (tracker, pending_signature.as_ref())
                     && !dry_run
                     && let Err(e) = tracker.record(fname, hash, *size, *mtime, langs).await
@@ -1162,6 +1171,125 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((imported, skipped), (1, 1));
+    }
+
+    /// A file whose resource was refused because a REST row owns its canonical
+    /// is not recorded in the ledger: the next sync attempts it again, and once
+    /// the REST row is gone the import lands and the file is recorded.
+    #[tokio::test]
+    async fn bootstrap_sync_retries_a_file_whose_resource_was_refused() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        let store = helios_persistence::backends::sqlite::SqliteBackend::open(db.path()).unwrap();
+        store.init_schema().unwrap();
+        let backend = SqliteTerminologyBackend::new(path).unwrap();
+        let state = helios_hts::state::AppState::new(backend.clone()).with_resource_store(store);
+        let router = helios_hts::server::create_app(&HtsConfig::default(), state);
+        let ctx = TenantContext::system();
+        let tracker = BootstrapTracker::Sqlite(&backend);
+
+        let rest = serde_json::json!({
+            "resourceType": "CodeSystem",
+            "id": "cs-rest",
+            "url": "http://example.org/cs",
+            "version": "1.0.0",
+            "status": "active",
+            "content": "complete",
+            "concept": [{ "code": "R", "display": "Rest" }]
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/CodeSystem/cs-rest")
+                    .header("content-type", "application/fhir+json")
+                    .body(Body::from(rest.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let boot = tempfile::tempdir().unwrap();
+        write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
+
+        for _ in 0..2 {
+            let (stats, imported, skipped) = import_directory_files(
+                &backend,
+                &ctx,
+                boot.path(),
+                500,
+                false,
+                &LanguageFilter::default(),
+                Some(&tracker),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (imported, skipped),
+                (1, 0),
+                "a refused file is attempted again"
+            );
+            assert_eq!(
+                (stats.conflicts, stats.code_systems),
+                (1, 0),
+                "{:?}",
+                stats.errors
+            );
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/CodeSystem/cs-rest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let (stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(
+            (stats.conflicts, stats.code_systems),
+            (0, 1),
+            "{:?}",
+            stats.errors
+        );
+
+        let (_stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (imported, skipped),
+            (0, 1),
+            "recorded once it imported cleanly"
+        );
     }
 
     /// Without a tracker (the `hts import <dir>` CLI path) every recognized file

@@ -147,6 +147,7 @@ fn write_parsed_bundle(
             stats
                 .errors
                 .push(format!("CodeSystem '{url}' import failed: {error}"));
+            stats.conflicts += 1;
             continue;
         }
         // Chunked loaders rebuild existing systems once after their final
@@ -161,9 +162,14 @@ fn write_parsed_bundle(
                 systems_needing_closure.push((cs.url.clone(), cs.version.clone()))
             }
             Ok(()) => {}
-            Err(error) => stats
-                .errors
-                .push(format!("CodeSystem '{url}' import failed: {error}")),
+            Err(error) => {
+                if matches!(error, HtsError::Conflict(_)) {
+                    stats.conflicts += 1;
+                }
+                stats
+                    .errors
+                    .push(format!("CodeSystem '{url}' import failed: {error}"));
+            }
         }
     }
     for vs in &parsed.value_sets {
@@ -180,6 +186,9 @@ fn write_parsed_bundle(
             Ok(())
         };
         if let Err(e) = ownership.and_then(|()| write_value_set(conn, vs, stats)) {
+            if matches!(e, HtsError::Conflict(_)) {
+                stats.conflicts += 1;
+            }
             stats
                 .errors
                 .push(format!("ValueSet '{url}' import failed: {e}"));
@@ -199,6 +208,9 @@ fn write_parsed_bundle(
             Ok(())
         };
         if let Err(e) = ownership.and_then(|()| write_concept_map(conn, cm, stats)) {
+            if matches!(e, HtsError::Conflict(_)) {
+                stats.conflicts += 1;
+            }
             stats
                 .errors
                 .push(format!("ConceptMap '{url}' import failed: {e}"));

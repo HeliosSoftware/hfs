@@ -212,6 +212,15 @@ pub struct ImportStats {
     /// The import continues past these; fatal errors are returned as `Err`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<String>,
+    /// Resources left out because another owner holds their canonical or
+    /// id (also listed in `errors`). Unlike a malformed resource, this is a
+    /// store condition that can change between imports of the same file.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub conflicts: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl ImportStats {
@@ -230,6 +239,7 @@ impl ImportStats {
         self.concept_maps = self.concept_maps.saturating_add(other.concept_maps);
         self.concepts = self.concepts.saturating_add(other.concepts);
         self.errors.extend(other.errors);
+        self.conflicts = self.conflicts.saturating_add(other.conflicts);
     }
 }
 
