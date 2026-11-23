@@ -1593,6 +1593,26 @@ async fn sort_key_group_commands(db: &mongodb::Database) -> Vec<Document> {
     .unwrap()
 }
 
+/// The index an unfiltered or over-cap sort walk reads: a descending date
+/// reads the end index and a descending quantity the interval-end index
+/// (#2602); everything else reads the index led by its value field.
+fn walk_index(spec: &str, param_type: SearchParamType) -> &'static str {
+    use crate::backends::mongodb::search_index_catalog::{
+        SEARCH_DATE_END_INDEX as DATE_END, SEARCH_QUANTITY_HIGH_INDEX as QUANTITY_HIGH,
+        value_index_led_by,
+    };
+    if spec == "-date" {
+        DATE_END
+    } else if spec == "-value-quantity" {
+        QUANTITY_HIGH
+    } else {
+        value_index_led_by(super::super::super::sort_value_field(&sort_by(
+            spec, param_type,
+        )))
+        .unwrap()
+    }
+}
+
 /// No sort-key `$group` runs for a walked sort, and its value index is
 /// hinted; the grouped backend is the positive control for the `$group`.
 #[tokio::test]
@@ -1605,16 +1625,7 @@ async fn unfiltered_param_sorts_do_not_group_the_parameter() {
     let grouped = grouped_backend(&fixture);
     for (spec, param_type) in both_directions() {
         let query = unfiltered_sort(&spec, param_type, 0);
-        let directive = sort_by(&spec, param_type);
-        // A descending date walks the end index, the rest the value index.
-        let index = if spec == "-date" {
-            SEARCH_DATE_END_INDEX
-        } else {
-            crate::backends::mongodb::search_index_catalog::value_index_led_by(
-                super::super::super::sort_value_field(&directive),
-            )
-            .unwrap()
-        };
+        let index = walk_index(&spec, param_type);
         restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
         with_result_id_cap(WIDE, fixture.backend.search(&fixture.tenant, &query))
             .await
@@ -1680,11 +1691,7 @@ async fn unfiltered_param_sorts_fall_back_when_their_index_is_dropped_hot() {
         };
         add_sort_rows(&fixture).await;
         add_typed_sort_rows(&fixture).await;
-        let directive = sort_by(spec, param_type);
-        let index = crate::backends::mongodb::search_index_catalog::value_index_led_by(
-            super::super::super::sort_value_field(&directive),
-        )
-        .unwrap();
+        let index = walk_index(spec, param_type);
         let query = unfiltered_sort(spec, param_type, 10);
         let expected = answer(&fixture.backend, &fixture, &query).await;
         fixture
@@ -1806,16 +1813,7 @@ async fn sort_key_cursors_examine_no_documents() {
     add_sort_rows(&fixture).await;
     add_typed_sort_rows(&fixture).await;
     fixture.mark_deleted(1, 20).await;
-    let index_of = |spec: &str, param_type: SearchParamType| {
-        if spec == "-date" {
-            SEARCH_DATE_END_INDEX
-        } else {
-            crate::backends::mongodb::search_index_catalog::value_index_led_by(
-                super::super::super::sort_value_field(&sort_by(spec, param_type)),
-            )
-            .unwrap()
-        }
-    };
+    let index_of = walk_index;
     let mut cases: Vec<(String, SearchQuery, usize)> = both_directions()
         .into_iter()
         .map(|(spec, param_type)| {

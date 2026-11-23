@@ -4791,7 +4791,7 @@ impl MongoBackend {
     /// Whether more than `allowed` rows of the sort parameter carry `key`:
     /// one covered count on the index the walk reads, bounded at `allowed + 1`
     /// keys (#2601; 0.13 microseconds a key). A descending date counts the
-    /// rows whose range ends at `key`; rows without an end that start at
+    /// rows whose range (or, for a quantity, interval) ends at `key`; rows without an end that start at
     /// `key` tie with them but are not counted, so the answer is a lower
     /// bound there, which can only let the walk finish a group, never change
     /// the page. An index dropped while running counts as too long: the
@@ -4817,6 +4817,13 @@ impl MongoBackend {
             filter.insert(value_field, doc! { "$ne": Bson::Null });
             filter.insert(VALUE_DATE_END, key.clone());
             SEARCH_DATE_END_INDEX
+        } else if value_field == "value_quantity_value"
+            && directive.direction == crate::types::SortDirection::Descending
+        {
+            // #2602: a descending quantity walks the interval end.
+            filter.insert(value_field, doc! { "$ne": Bson::Null });
+            filter.insert(VALUE_QUANTITY_HIGH, key.clone());
+            SEARCH_QUANTITY_HIGH_INDEX
         } else {
             filter.insert(value_field, key.clone());
             value_index_led_by(value_field).ok_or_else(|| {
