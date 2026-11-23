@@ -114,6 +114,14 @@ pub enum S3ClientError {
     Throttled(String),
     /// The service was unreachable (timeout, dispatch failure, etc.).
     Unavailable(String),
+    /// S3 answered and refused the server's credentials or permissions
+    /// (`AccessDenied`, an unknown or expired key, a signature mismatch, a
+    /// bare 403).
+    ///
+    /// Distinct from [`Self::Unavailable`] so the client is not told the store
+    /// "could not be reached": it was reached, and retrying the request will
+    /// not help until the deployment's credentials or bucket policy change.
+    AccessDenied(String),
     /// The request was rejected due to invalid input (bad bucket name, etc.).
     InvalidInput(String),
     /// An unexpected error occurred inside the SDK or service.
@@ -428,10 +436,12 @@ impl S3Api for AwsS3Client {
                 // thing a 404 can mean is that the *bucket* is absent (or
                 // invisible to these credentials). Report it as such so
                 // `validate_buckets` names the bucket rather than a phantom
-                // "resource". A 403 stays `Unavailable` (access-denied is the
+                // "resource". A 403 stays `AccessDenied` (access-denied is the
                 // common cause and must not be reported as a missing bucket).
-                S3ClientError::NotFound => S3ClientError::BucketNotFound(bucket.to_string()),
-                other => other,
+                S3ClientError::NotFound => S3ClientError::BucketNotFound(format!(
+                    "HeadBucket s3://{bucket}: bucket does not exist or is not visible"
+                )),
+                other => at("HeadBucket", bucket, None)(other),
             })?;
         self.remember_bucket(bucket);
         Ok(())
@@ -461,7 +471,7 @@ impl S3Api for AwsS3Client {
                 }))
             }
             Err(err) => {
-                let mapped = map_sdk_error(err);
+                let mapped = at("HeadObject", bucket, Some(key))(map_sdk_error(err));
                 if matches!(mapped, S3ClientError::NotFound) {
                     // A bodyless HEAD 404 cannot carry `<Code>NoSuchBucket</Code>`,
                     // so "missing object" and "missing bucket" are the same wire
@@ -509,7 +519,7 @@ impl S3Api for AwsS3Client {
             {
                 Ok(out) => out,
                 Err(err) => {
-                    let mapped = map_sdk_error(err);
+                    let mapped = at("GetObject", bucket, Some(key))(map_sdk_error(err));
                     return if matches!(mapped, S3ClientError::NotFound) {
                         Ok(None)
                     } else {
@@ -563,7 +573,11 @@ impl S3Api for AwsS3Client {
             req = req.if_none_match(if_none_match);
         }
 
-        let out = req.send().await.map_err(map_sdk_error)?;
+        let out =
+            req.send()
+                .await
+                .map_err(map_sdk_error)
+                .map_err(at("PutObject", bucket, Some(key)))?;
 
         Ok(ObjectMetadata {
             etag: out.e_tag().map(|s| s.to_string()),
@@ -579,7 +593,8 @@ impl S3Api for AwsS3Client {
             .key(key)
             .send()
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(map_sdk_error)
+            .map_err(at("DeleteObject", bucket, Some(key)))?;
         Ok(())
     }
 
@@ -614,7 +629,11 @@ impl S3Api for AwsS3Client {
             req = req.max_keys(max_keys);
         }
 
-        let out = req.send().await.map_err(map_sdk_error)?;
+        let out = req.send().await.map_err(map_sdk_error).map_err(at(
+            "ListObjectsV2",
+            bucket,
+            Some(prefix),
+        ))?;
         let mut items = Vec::new();
 
         for item in out.contents() {
@@ -654,7 +673,11 @@ impl S3Api for AwsS3Client {
                 req = req.continuation_token(token);
             }
 
-            let out = req.send().await.map_err(map_sdk_error)?;
+            let out = req.send().await.map_err(map_sdk_error).map_err(at(
+                "ListObjectsV2",
+                bucket,
+                Some(prefix),
+            ))?;
             for common in out.common_prefixes() {
                 if let Some(p) = common.prefix() {
                     prefixes.push(p.to_string());
@@ -691,7 +714,11 @@ impl S3Api for AwsS3Client {
             req = req.max_keys(max_keys);
         }
 
-        let out = req.send().await.map_err(map_sdk_error)?;
+        let out = req.send().await.map_err(map_sdk_error).map_err(at(
+            "ListObjectsV2",
+            bucket,
+            Some(prefix),
+        ))?;
         let common_prefixes = out
             .common_prefixes()
             .iter()
@@ -735,8 +762,41 @@ impl S3Api for AwsS3Client {
             .key(key)
             .presigned(presign_config)
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(map_sdk_error)
+            .map_err(at("presign GetObject", bucket, Some(key)))?;
         Ok(presigned.uri().to_string())
+    }
+}
+
+/// Names the operation and its target in the detail of the variants whose
+/// text only ever reaches the server log.
+///
+/// [`S3Backend::map_client_error`](super::backend::S3Backend::map_client_error)
+/// answers these five with a fixed client sentence and logs the detail, so the
+/// detail is the operator's only record of *which* request failed: without
+/// the bucket and key, a deployment with a bucket per tenant cannot tell which
+/// bucket went missing. `InvalidInput` and `Internal` are left as they are.
+fn at(
+    operation: &'static str,
+    bucket: &str,
+    key: Option<&str>,
+) -> impl Fn(S3ClientError) -> S3ClientError {
+    let target = match key {
+        Some(key) => format!("{operation} s3://{bucket}/{key}"),
+        None => format!("{operation} s3://{bucket}"),
+    };
+    move |error| match error {
+        S3ClientError::BucketNotFound(m) => S3ClientError::BucketNotFound(format!("{target}: {m}")),
+        S3ClientError::ConditionalConflict(m) => {
+            S3ClientError::ConditionalConflict(format!("{target}: {m}"))
+        }
+        S3ClientError::Throttled(m) => S3ClientError::Throttled(format!("{target}: {m}")),
+        S3ClientError::Unavailable(m) => S3ClientError::Unavailable(format!("{target}: {m}")),
+        S3ClientError::AccessDenied(m) => S3ClientError::AccessDenied(format!("{target}: {m}")),
+        other @ (S3ClientError::NotFound
+        | S3ClientError::PreconditionFailed
+        | S3ClientError::InvalidInput(_)
+        | S3ClientError::Internal(_)) => other,
     }
 }
 
@@ -797,13 +857,13 @@ where
                 "AccessDenied"
                 | "InvalidAccessKeyId"
                 | "SignatureDoesNotMatch"
-                | "ExpiredToken" => S3ClientError::Unavailable(format!("access denied: {code}")),
+                | "ExpiredToken" => S3ClientError::AccessDenied(format!("access denied: {code}")),
                 _ => {
                     // When S3 returns no error code (e.g. HeadBucket 403),
                     // fall back to the HTTP status for a cleaner message.
                     let status = service_err.raw().status().as_u16();
                     match status {
-                        403 => S3ClientError::Unavailable(
+                        403 => S3ClientError::AccessDenied(
                             "access denied (HTTP 403) — check AWS credentials and bucket policy"
                                 .to_string(),
                         ),

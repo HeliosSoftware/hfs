@@ -1263,6 +1263,53 @@ fn postgres_unavailable(context: &str, detail: &dyn std::fmt::Display) -> Backen
     }
 }
 
+/// Client text for an object store that could not be reached.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_UNAVAILABLE_TEXT: &str =
+    "the object store could not be reached; retry the request";
+
+/// Client text for an object store that is throttling requests.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_THROTTLED_TEXT: &str =
+    "the object store is throttling requests; retry the request";
+
+/// Client text for a conditional write the object store refused as conflicting.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_CONFLICT_TEXT: &str =
+    "the object store reported a conflicting concurrent write; retry the request";
+
+/// Client text for a bucket that is missing or not visible to the credentials.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_BUCKET_TEXT: &str =
+    "the object store bucket is not accessible; the server log has the detail";
+
+/// Client text for an object store that refused the server's credentials.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_ACCESS_TEXT: &str =
+    "the object store refused the server's credentials; the server log has the detail";
+
+/// Client text for a request the object store rejected as invalid.
+#[cfg(feature = "s3")]
+pub(crate) const OBJECT_STORE_INVALID_TEXT: &str =
+    "the object store rejected the request as invalid; the server log has the detail";
+
+/// A [`BackendError::Unavailable`] for the S3 backend with the SDK or service
+/// text in the log and a fixed client sentence in the message, as the other
+/// backends do: the detail names the endpoint, the bucket and the provider's
+/// wording, none of which belongs in a 503 body.
+#[cfg(feature = "s3")]
+pub(crate) fn s3_unavailable(
+    what: &str,
+    text: &str,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
+    tracing::warn!(what, error = %detail, "S3 request failed");
+    BackendError::Unavailable {
+        backend_name: "s3".to_string(),
+        message: text.to_string(),
+    }
+}
+
 /// Classifies a `tokio_postgres` error into a [`BackendError`] by SQLSTATE,
 /// preserving the code rather than collapsing everything to `Internal`.
 ///
@@ -1861,6 +1908,27 @@ mod tests {
         match classify_sqlite_error("", sqlite_failure(6)) {
             BackendError::Unavailable { message, .. } => {
                 assert_eq!(message, "the database is busy; retry the request");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// The SDK text, the endpoint address and the bucket name stay in the log.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn test_s3_unavailable_leaves_the_detail_to_the_log() {
+        let detail = "connection failed: DispatchFailure(ConnectorError { kind: Io, source: \
+                      hyper::Error(Connect, ConnectError(\"tcp connect error\", Os { code: 111, \
+                      kind: ConnectionRefused }))) bucket hfs-prod-phi endpoint 10.0.3.7:9000";
+        match s3_unavailable("put_object", OBJECT_STORE_UNAVAILABLE_TEXT, &detail) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "s3");
+                assert_eq!(message, OBJECT_STORE_UNAVAILABLE_TEXT);
+                assert!(!message.contains("10.0.3.7"));
+                assert!(!message.contains("hfs-prod-phi"));
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
