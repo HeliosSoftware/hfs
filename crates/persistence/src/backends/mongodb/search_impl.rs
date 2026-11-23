@@ -354,7 +354,10 @@ tokio::task_local! {
 /// `max(UNFILTERED_WALK_TIE_ROWS, offset + _count + 1)` of its rows remain,
 /// grouping is cheaper and the grouped aggregate answers. Finishing costs at
 /// most about 5.6 microseconds a row, below the 8.6 microseconds a window row
-/// the grouped path pays (689,080 Observations, mongo:9.0.8).
+/// the grouped path pays (689,080 Observations, mongo:9.0.8). A window inside
+/// a long first group is normally read by id before the walk starts
+/// (`unfiltered_first_group_window`) and so does not reach this guard; the
+/// guard applies when that read declines.
 const UNFILTERED_WALK_TIE_ROWS: usize = 16 * CANDIDATE_BATCH_SIZE;
 
 /// Rows of one equal key after which the unfiltered walk asks the server how
@@ -366,7 +369,9 @@ const UNFILTERED_WALK_MIN_BATCH: usize = 32;
 
 /// Bounds of the unfiltered walk's sort-key cursor batch (#2601): from 128
 /// to 2,048 rows per round trip the covered scan costs the same per row
-/// (1.35-1.37 microseconds); below 128 it is about 30% dearer.
+/// (1.35-1.37 microseconds); below 128 it is about 30% dearer. A first batch
+/// that opens with at least the minimum of rows of one key is what makes
+/// `unfiltered_first_group_window` read that group by id.
 const UNFILTERED_WALK_MIN_CURSOR_BATCH: usize = 128;
 const UNFILTERED_WALK_MAX_CURSOR_BATCH: usize = 2_048;
 
@@ -481,6 +486,47 @@ impl SortRowStream {
         }
         Ok(())
     }
+}
+
+/// The rows of the sort parameter whose key is `key`, and the index the
+/// unfiltered walk reads them from (#2601): a descending date selects the rows
+/// whose range ends at `key` on `idx_search_date_end`, a descending quantity
+/// those whose interval ends at `key` on `idx_search_quantity_high` (#2602),
+/// and every other sort the rows of its value field equal to `key` on the
+/// index that field leads. Rows without an end (a date written before #1391,
+/// a quantity not yet backfilled) are not selected by the descending forms.
+fn sort_key_group_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    directive: &crate::types::SortDirective,
+    key: &Bson,
+) -> StorageResult<(Document, &'static str)> {
+    let value_field = sort_value_field(directive);
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "param_name": &directive.parameter,
+    };
+    let index = if value_field == "value_date"
+        && directive.direction == crate::types::SortDirection::Descending
+    {
+        filter.insert(value_field, doc! { "$ne": Bson::Null });
+        filter.insert(VALUE_DATE_END, key.clone());
+        SEARCH_DATE_END_INDEX
+    } else if value_field == "value_quantity_value"
+        && directive.direction == crate::types::SortDirection::Descending
+    {
+        // #2602: a descending quantity walks the interval end.
+        filter.insert(value_field, doc! { "$ne": Bson::Null });
+        filter.insert(VALUE_QUANTITY_HIGH, key.clone());
+        SEARCH_QUANTITY_HIGH_INDEX
+    } else {
+        filter.insert(value_field, key.clone());
+        value_index_led_by(value_field).ok_or_else(|| {
+            internal_error(format!("no search_index index is led by {value_field}"))
+        })?
+    };
+    Ok((filter, index))
 }
 
 /// The next row in key order across `streams`, each already in that order.
@@ -4305,6 +4351,11 @@ impl MongoBackend {
     /// readiness check) or the walk met an equal-key group it cannot finish
     /// within `unfiltered_walk_tie_allowance`, as a parameter with few
     /// distinct values has: the caller then groups the rows as before.
+    ///
+    /// A window that lies inside a long first group is read by
+    /// [`Self::unfiltered_first_group_window`] before the walk starts: one
+    /// id-ordered read of that group and one liveness check, rather than
+    /// walking the group whole or handing it to the grouped aggregate.
     #[allow(clippy::too_many_arguments)]
     async fn unfiltered_param_sort_walk(
         &self,
@@ -4318,7 +4369,7 @@ impl MongoBackend {
         take: usize,
     ) -> StorageResult<Option<Vec<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let Some(streams) = self
+        let Some(mut streams) = self
             .open_sort_row_streams(
                 &search_index,
                 tenant_id,
@@ -4334,6 +4385,22 @@ impl MongoBackend {
             );
             return Ok(None);
         };
+        if let Some(window) = self
+            .unfiltered_first_group_window(
+                db,
+                &search_index,
+                tenant_id,
+                &query.resource_type,
+                directive,
+                &mut streams,
+                id_direction,
+                offset,
+                take,
+            )
+            .await?
+        {
+            return Ok(Some(window));
+        }
         self.param_sorted_filtered_window_over(
             streams,
             db,
@@ -4347,6 +4414,119 @@ impl MongoBackend {
             true,
         )
         .await
+    }
+
+    /// The window of an unfiltered sort when it lies inside the first
+    /// equal-key group (#2601), read by id instead of walked. The walk reads a
+    /// group whole to order it by id, and gives a long one to the grouped
+    /// aggregate: `_sort=status` on a type with one status, or `_sort=-date`
+    /// where many ranges share an open end (`9999-12-31`), paid for every row
+    /// of the group although the page needs `offset + take` ids.
+    ///
+    /// The first group's members are exactly the resources with a row of its
+    /// key `K`: no resource has a key before it, so `K` is the `$min`
+    /// (ascending) or `$max` (descending) of each of them, and the grouped path
+    /// orders them by id. So the group's rows are read from the walk's own
+    /// index ordered by `resource_id` in `id_direction`, limited to the window
+    /// plus a sixteenth (`unfiltered_walk_batch`), and checked for liveness in
+    /// one command; the window is their first `offset + take` live ids, with a
+    /// resource's repeated rows (adjacent in that order) counted once.
+    ///
+    /// It applies only when all of these hold, and otherwise answers `None`
+    /// and leaves the walk to run unchanged (the rows it looked at stay
+    /// buffered in `streams`): the first cursor batch, already requested, opens
+    /// with at least `UNFILTERED_WALK_MIN_CURSOR_BATCH` rows of one key; it
+    /// does not show the group ending before `offset + take` rows; a
+    /// descending date or quantity has no row without an end (its null-end
+    /// stream is empty), since such a row ties by its start, which this read
+    /// does not select; and `offset + take` is at most `SORT_ID_CHUNK`. It also
+    /// answers `None` when the group holds fewer live ids than the window (a
+    /// short group, stale rows of deleted resources) or the index was dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn unfiltered_first_group_window(
+        &self,
+        db: &mongodb::Database,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        directive: &crate::types::SortDirective,
+        streams: &mut [SortRowStream],
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Option<Vec<String>>> {
+        use crate::types::SortDirection;
+
+        let wanted = offset.saturating_add(take);
+        if wanted == 0 || wanted > SORT_ID_CHUNK {
+            return Ok(None);
+        }
+        let Some((first, rest)) = streams.split_first_mut() else {
+            return Ok(None);
+        };
+        // The first batch, which the walk reads anyway; `fill` keeps it
+        // buffered for the walk.
+        first.fill().await?;
+        let Some(key) = first.buffered.front().map(|(_, key)| key.clone()) else {
+            return Ok(None);
+        };
+        let run = first
+            .buffered
+            .iter()
+            .take_while(|(_, other)| compare_sort_keys(other, &key).is_eq())
+            .count();
+        if run < UNFILTERED_WALK_MIN_CURSOR_BATCH {
+            return Ok(None);
+        }
+        let group_ends = run < first.buffered.len() || first.exhausted;
+        if group_ends && run < wanted {
+            return Ok(None);
+        }
+        // Rows without an end: a descending date's or quantity's second
+        // stream. Any such row disables the read.
+        for stream in rest.iter_mut() {
+            stream.fill().await?;
+            if !stream.buffered.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let (filter, index) = sort_key_group_filter(tenant_id, resource_type, directive, &key)?;
+        let limit = unfiltered_walk_batch(wanted);
+        let opened = search_index
+            .find(filter)
+            .search_deadline()?
+            .projection(doc! { "_id": 0, "resource_id": 1 })
+            .sort(doc! { "resource_id": match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            } })
+            .hint(Hint::Name(index.to_owned()))
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .batch_size(u32::try_from(limit).unwrap_or(u32::MAX))
+            .await;
+        let mut cursor = match opened {
+            Err(error) if search_access::hint_rejected(&error) => return Ok(None),
+            opened => opened.or_query_error("Failed to read the first sort-key group")?,
+        };
+        let rows = read_cursor_batch(&mut cursor, limit).await?;
+        let mut ids: Vec<String> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Ok(id) = row.get_str("resource_id")
+                && ids.last().is_none_or(|previous| previous != id)
+            {
+                ids.push(id.to_owned());
+            }
+        }
+        let candidates: HashSet<String> = ids.iter().cloned().collect();
+        let live = self
+            .live_ids_among(db, tenant_id, resource_type, &candidates)
+            .await?;
+        let live: Vec<String> = ids.into_iter().filter(|id| live.contains(id)).collect();
+        if live.len() < wanted {
+            return Ok(None);
+        }
+        Ok(Some(live.into_iter().skip(offset).take(take).collect()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4805,31 +4985,7 @@ impl MongoBackend {
         key: &Bson,
         allowed: usize,
     ) -> StorageResult<bool> {
-        let value_field = sort_value_field(directive);
-        let mut filter = doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "param_name": &directive.parameter,
-        };
-        let index = if value_field == "value_date"
-            && directive.direction == crate::types::SortDirection::Descending
-        {
-            filter.insert(value_field, doc! { "$ne": Bson::Null });
-            filter.insert(VALUE_DATE_END, key.clone());
-            SEARCH_DATE_END_INDEX
-        } else if value_field == "value_quantity_value"
-            && directive.direction == crate::types::SortDirection::Descending
-        {
-            // #2602: a descending quantity walks the interval end.
-            filter.insert(value_field, doc! { "$ne": Bson::Null });
-            filter.insert(VALUE_QUANTITY_HIGH, key.clone());
-            SEARCH_QUANTITY_HIGH_INDEX
-        } else {
-            filter.insert(value_field, key.clone());
-            value_index_led_by(value_field).ok_or_else(|| {
-                internal_error(format!("no search_index index is led by {value_field}"))
-            })?
-        };
+        let (filter, index) = sort_key_group_filter(tenant_id, resource_type, directive, key)?;
         let counted = search_index
             .count_documents(filter)
             .search_deadline()?

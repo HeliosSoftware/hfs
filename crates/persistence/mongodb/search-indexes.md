@@ -514,6 +514,34 @@ after 8,192 rows with the walk thrown away. For a descending date the count
 sees only the rows with a range end, a lower bound of the group: it can let the
 walk finish a group, never change the page.
 
+A window inside the first group is not walked at all
+(`unfiltered_first_group_window`). Before the walk starts it looks at the
+sort-key cursor's first batch, which the walk requests anyway and keeps. When
+that batch opens with at least 128 rows of one key `K`
+(`UNFILTERED_WALK_MIN_CURSOR_BATCH`), does not show the group ending before
+`offset + _count + 1` rows, a descending date or quantity has no row without an
+end (its null-end stream is empty), and `offset + _count + 1` is at most 10,000,
+the group is read by id: one covered `find` of the rows with key `K` on the
+walk's own index (a descending date: `value_date_end = K` on
+`idx_search_date_end`; a descending quantity: `value_quantity_high = K` on
+`idx_search_quantity_high`), projected to `resource_id`, sorted by `resource_id`
+in the request's id direction and limited to the window plus a sixteenth
+(`unfiltered_walk_batch`), then one liveness check of those ids. A resource's
+repeated rows are adjacent in that order and count once. This is the grouped
+answer: no resource has a key before `K`, so the group's members are exactly
+the resources with a row of `K`, and they are ordered by id; resources after
+the group, and the keyless tail, are not reached. When the group holds fewer
+live ids than the window (a short group, stale rows of deleted resources) or the
+index was dropped, the walk runs unchanged from the buffered batch. On real data
+this serves `CarePlan?_sort=-date`, where 1,653 of 3,580 rows share the open end
+`9999-12-31` (the walk used to finish that group and check 1,655 ids in seven
+batches), and `Immunization?_sort=status` with one status over 14,927 rows (the
+walk used to give up after four batches and group). The sort by
+`resource_id` is index-provided only when nothing sits between the key and
+`resource_id` in the index (string, number, reference, uri); for the others
+(token, date, quantity) the server sorts the group's covered keys with a top-k
+sort bounded by the limit.
+
 These keep the grouped path: a sort whose parameter type is unknown
 (the `value_string` fallback), composite and special parameters, and sorts on
 more than one key.
