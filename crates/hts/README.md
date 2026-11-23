@@ -384,6 +384,7 @@ Options:
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_MAX_EXPANSION_SIZE_CEILING` | 100000 | Largest value a request may set the limit to through the `X-TOO-COSTLY-THRESHOLD` header. The header lowers the limit for its own request or raises it up to this ceiling, never beyond. |
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 | `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |

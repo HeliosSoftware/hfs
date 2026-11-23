@@ -162,6 +162,11 @@ pub struct AppState<B: TerminologyBackend> {
     /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
 
+    /// Largest value the `X-TOO-COSTLY-THRESHOLD` header may set
+    /// [`Self::max_expansion_size`] to for one request. Defaults to
+    /// `100_000`; override with `HTS_MAX_EXPANSION_SIZE_CEILING`.
+    pub max_expansion_size_ceiling: u32,
+
     /// In-process LRU-style cache for `$expand` responses.
     ///
     /// Eliminates redundant backend work when the same expansion is requested
@@ -257,6 +262,7 @@ impl<B: TerminologyBackend> AppState<B> {
             #[cfg(feature = "postgres")]
             resource_store_pg: None,
             max_expansion_size: 10_000,
+            max_expansion_size_ceiling: 100_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -313,6 +319,13 @@ impl<B: TerminologyBackend> AppState<B> {
     /// Override the maximum expansion size (default: 10 000).
     pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
         self.max_expansion_size = limit;
+        self
+    }
+
+    /// Override the largest per-request expansion size the
+    /// `X-TOO-COSTLY-THRESHOLD` header may ask for (default: 100 000).
+    pub fn with_max_expansion_size_ceiling(mut self, ceiling: u32) -> Self {
+        self.max_expansion_size_ceiling = ceiling;
         self
     }
 

@@ -92,6 +92,12 @@ pub struct HtsConfig {
     #[arg(long, env = "HTS_MAX_EXPANSION_SIZE", default_value = "3500")]
     pub max_expansion_size: u32,
 
+    /// Largest expansion size a request may ask for through the
+    /// `X-TOO-COSTLY-THRESHOLD` header. The header lowers the limit for its
+    /// own request or raises it up to this value, never beyond.
+    #[arg(long, env = "HTS_MAX_EXPANSION_SIZE_CEILING", default_value = "100000")]
+    pub max_expansion_size_ceiling: u32,
+
     /// Directory of terminology distribution files to auto-import on first
     /// run. When set and pointing at an existing directory, the server
     /// checks whether the target database already contains any code
@@ -146,6 +152,7 @@ impl fmt::Debug for HtsConfig {
             cors_origins,
             max_body_size,
             max_expansion_size,
+            max_expansion_size_ceiling,
             bootstrap_dir,
             bootstrap_batch_size,
             import_languages,
@@ -164,6 +171,7 @@ impl fmt::Debug for HtsConfig {
             .field("cors_origins", cors_origins)
             .field("max_body_size", max_body_size)
             .field("max_expansion_size", max_expansion_size)
+            .field("max_expansion_size_ceiling", max_expansion_size_ceiling)
             .field("bootstrap_dir", bootstrap_dir)
             .field("bootstrap_batch_size", bootstrap_batch_size)
             .field("import_languages", import_languages)
@@ -191,6 +199,7 @@ impl Default for HtsConfig {
             cors_origins: "*".into(),
             max_body_size: 10 * 1024 * 1024, // 10MB
             max_expansion_size: 10_000,
+            max_expansion_size_ceiling: 100_000,
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),

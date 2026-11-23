@@ -143,7 +143,8 @@ Supported request encodings: `gzip`, `deflate`, `br`, `zstd`. Unsupported →
 415. Decompressed payload > `HTS_MAX_BODY_SIZE` (default 10 MiB) → 413.
 Per-request timeout is 30 seconds → 408. Expansion beyond
 `HTS_MAX_EXPANSION_SIZE` (CLI default 3,500) → 422 with `too-costly`. The UI
-can inject a request-scoped ceiling via the `X-TOO-COSTLY-THRESHOLD` header.
+can inject a request-scoped ceiling via the `X-TOO-COSTLY-THRESHOLD` header;
+the server clamps it to `HTS_MAX_EXPANSION_SIZE_CEILING` (default 100,000).
 
 ### 4.5 Error model — always parse OperationOutcome
 

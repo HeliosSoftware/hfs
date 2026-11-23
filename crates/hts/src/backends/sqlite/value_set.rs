@@ -1229,23 +1229,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // we suppress tree-building outright in that case.  The legacy
             // HL7-tx `hierarchical=true` convention still asks for an
             // explicit tree on non-enumerated VSes.
-            let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
-            if want_tree {
-                let total = filtered.len() as u32;
-                let tree = build_hierarchical_expansion(&conn, filtered)?;
-                return Ok(ExpandResponse {
-                    total: Some(total),
-                    offset: None,
-                    contains: tree,
-                    warnings,
-                });
-            }
-
             let total = filtered.len() as u32;
 
             // Enforce the expansion size cap only when no explicit count (page size) was
             // requested. When count is set, the response is already bounded and the limit
             // would only reject valid paginated requests against large code systems.
+            // A tree expansion is never paged, so it is subject to the cap as well.
             if req.count.is_none() {
                 if let Some(limit) = req.max_expansion_size {
                     if u64::from(total) > u64::from(limit) {
@@ -1256,6 +1245,17 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         )));
                     }
                 }
+            }
+
+            let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
+            if want_tree {
+                let tree = build_hierarchical_expansion(&conn, filtered)?;
+                return Ok(ExpandResponse {
+                    total: Some(total),
+                    offset: None,
+                    contains: tree,
+                    warnings,
+                });
             }
 
             let offset = req.offset.unwrap_or(0) as usize;
