@@ -2106,18 +2106,33 @@ fn acts_on_storage_directly(path: &str) -> bool {
         || path.starts_with("/ui/bulk-export/")
 }
 
+/// The UI routes that read or write the caller's settings document with
+/// nothing but the request to key it on: the SQL Export workspace (its job
+/// records live in that document) and the preference writes. In the
+/// bearer-only posture no principal ever reaches `/ui`, so every caller,
+/// including one presenting a bearer, would share the `l2:` document that
+/// is reserved for the auth-disabled deployment; these are refused there.
+fn keeps_shared_settings(method: &axum::http::Method, path: &str) -> bool {
+    path == "/ui/sql/export"
+        || path.starts_with("/ui/sql/export/")
+        || (*method == axum::http::Method::POST
+            && matches!(path, "/ui/version" | "/ui/sql/views" | "/ui/sql/queries"))
+}
+
 /// Middleware (#1619): in the bearer-only posture — authentication enabled,
 /// no interactive login installed, so no session principal can ever be
-/// stamped — a request for a route that acts on storage directly is refused
-/// with `401` and the same notice the shell shows. With a login installed
-/// `require_session` gates every page instead, and with authentication off
-/// there is nothing to refuse.
+/// stamped — a request for a route that acts on storage directly, or that
+/// keeps settings for a caller it cannot name, is refused with `401` and the
+/// same notice the shell shows. With a login installed `require_session`
+/// gates every page instead, and with authentication off there is nothing to
+/// refuse.
 async fn refuse_anonymous_storage_access(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
     if bearer_only_auth()
-        && acts_on_storage_directly(request.uri().path())
+        && (acts_on_storage_directly(request.uri().path())
+            || keeps_shared_settings(request.method(), request.uri().path()))
         && request
             .extensions()
             .get::<helios_auth::SessionPrincipal>()
