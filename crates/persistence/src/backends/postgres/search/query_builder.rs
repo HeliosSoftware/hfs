@@ -1898,6 +1898,122 @@ impl PostgresQueryBuilder {
         }
     }
 
+    /// The `search_index` column an unfiltered date-sort walk reads, and the
+    /// name of the index that serves it: the end for a descending sort (the
+    /// key is `MAX(value_date_end)`), the start for an ascending one (the key
+    /// is `MIN(value_date)`), exactly as [`Self::sort_expression`] keys them.
+    pub(crate) fn date_walk_column(desc: bool) -> (&'static str, &'static str) {
+        if desc {
+            ("value_date_end", "idx_search_date_end")
+        } else {
+            ("value_date", "idx_search_date")
+        }
+    }
+
+    /// One page of the ordered date-index walk (#2731): the resources that
+    /// have a value for the date parameter, one row per resource, in key order.
+    ///
+    /// A resource may have several `date` rows. A row is kept only when it is
+    /// the resource's `MAX(value_date_end)` (descending) or `MIN(value_date)`
+    /// (ascending), with the row's physical position breaking a tie between two
+    /// rows of the same value, so each resource appears exactly once and its
+    /// key equals the correlated subquery's. The anti-join filters match that
+    /// subquery's (tenant, type, parameter, no `is_contained` filter).
+    ///
+    /// The join to live `resources` sits before `LIMIT`, so a deleted resource
+    /// never shortens the page.
+    ///
+    /// Bind layout: `$1` tenant, `$2` type, and `$3`/`$4` the cursor's value and
+    /// id when `keyset_condition` references them. `order` is
+    /// `ORDER BY`-ready (`si.<col> ..., si.resource_id ...`).
+    pub(crate) fn date_walk_page_sql(
+        parameter: &str,
+        desc: bool,
+        keyset_condition: Option<&str>,
+        order: &str,
+        limit: usize,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let better = if desc { ">" } else { "<" };
+        let boundary = keyset_condition
+            .map(|c| format!(" AND {c}"))
+            .unwrap_or_default();
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+             si.{col} AS sort_key \
+             FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id \
+             AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             AND r.is_deleted = FALSE \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL{boundary} \
+             AND NOT EXISTS (SELECT 1 FROM search_index s2 \
+             WHERE s2.tenant_id = $1 AND s2.resource_type = $2 \
+             AND s2.resource_id = si.resource_id AND s2.param_name = {lit} \
+             AND (s2.{col} {better} si.{col} \
+             OR (s2.{col} = si.{col} AND s2.ctid < si.ctid))) \
+             ORDER BY {order} LIMIT {limit}{offset}"
+        )
+    }
+
+    /// The resources with no value for the date parameter (#2731), in id
+    /// order, which is where the general path's `NULLS LAST` puts them.
+    ///
+    /// `id_after` is the comparison against the cursor's id (`">"` forward,
+    /// `"<"` backward), bound as `$3`; `id_descending` orders the mirror walk.
+    pub(crate) fn date_walk_tail_sql(
+        parameter: &str,
+        desc: bool,
+        id_after: Option<&str>,
+        id_descending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let boundary = id_after
+            .map(|op| format!(" AND r.id {op} $3"))
+            .unwrap_or_default();
+        let dir = if id_descending { "DESC" } else { "ASC" };
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+             NULL::timestamptz AS sort_key \
+             FROM resources r \
+             WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE{boundary} \
+             AND NOT EXISTS (SELECT 1 FROM search_index s \
+             WHERE s.tenant_id = $1 AND s.resource_type = $2 \
+             AND s.resource_id = r.id AND s.param_name = {lit} AND s.{col} IS NOT NULL) \
+             ORDER BY r.id {dir} LIMIT {limit}{offset}"
+        )
+    }
+
+    /// How many live resources have a value for the date parameter; the size
+    /// of the walk's keyed part, which an offset past it needs (#2731).
+    pub(crate) fn date_walk_keyed_count_sql(parameter: &str, desc: bool) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        format!(
+            "SELECT COUNT(DISTINCT si.resource_id) FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id \
+             AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             AND r.is_deleted = FALSE \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL"
+        )
+    }
+
     /// Builds a condition for a single search parameter.
     ///
     /// `None` means "no condition for this parameter", which is only the right
@@ -6167,6 +6283,61 @@ mod tests {
                 assert_eq!(next, 7);
             }
         }
+    }
+
+    /// #2731: the date-index walk keys a resource exactly as the correlated
+    /// sort subquery does: the end descending, the start ascending, over the
+    /// same (tenant, type, parameter) rows, one row per resource, with the live
+    /// join before the `LIMIT`.
+    #[test]
+    fn the_date_walk_keys_like_the_sort_subquery() {
+        let (col, index) = PostgresQueryBuilder::date_walk_column(true);
+        assert_eq!((col, index), ("value_date_end", "idx_search_date_end"));
+        let (col, index) = PostgresQueryBuilder::date_walk_column(false);
+        assert_eq!((col, index), ("value_date", "idx_search_date"));
+
+        let desc = PostgresQueryBuilder::date_walk_page_sql(
+            "date",
+            true,
+            Some("(si.value_date_end < $3 OR (si.value_date_end = $3 AND si.resource_id > $4))"),
+            "si.value_date_end DESC, si.resource_id ASC",
+            21,
+            0,
+        );
+        assert!(
+            desc.contains("s2.value_date_end > si.value_date_end"),
+            "{desc}"
+        );
+        assert!(desc.contains("s2.ctid < si.ctid"), "{desc}");
+        assert!(desc.contains("r.is_deleted = FALSE"), "{desc}");
+        assert!(desc.contains("AND si.param_name = 'date'"), "{desc}");
+        assert!(!desc.contains("is_contained"), "{desc}");
+        assert!(
+            desc.ends_with("ORDER BY si.value_date_end DESC, si.resource_id ASC LIMIT 21"),
+            "{desc}"
+        );
+        let asc = PostgresQueryBuilder::date_walk_page_sql(
+            "date",
+            false,
+            None,
+            "si.value_date ASC, si.resource_id ASC",
+            21,
+            40,
+        );
+        assert!(asc.contains("s2.value_date < si.value_date"), "{asc}");
+        assert!(asc.ends_with("LIMIT 21 OFFSET 40"), "{asc}");
+
+        // The unkeyed ones: no value in the column the key reads.
+        let tail = PostgresQueryBuilder::date_walk_tail_sql("date", true, Some(">"), false, 5, 0);
+        assert!(tail.contains("s.value_date_end IS NOT NULL"), "{tail}");
+        assert!(tail.contains("AND r.id > $3"), "{tail}");
+        assert!(tail.ends_with("ORDER BY r.id ASC LIMIT 5"), "{tail}");
+        let mirror = PostgresQueryBuilder::date_walk_tail_sql("date", false, Some("<"), true, 5, 2);
+        assert!(mirror.contains("s.value_date IS NOT NULL"), "{mirror}");
+        assert!(
+            mirror.ends_with("ORDER BY r.id DESC LIMIT 5 OFFSET 2"),
+            "{mirror}"
+        );
     }
 
     /// `_sort=-date` orders by where each resource's latest range ends, so a

@@ -143,6 +143,10 @@ mod tiebreak_order_suite;
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
 
+/// The backend-agnostic parity suite for the unfiltered date sort (#2731).
+#[path = "search/unfiltered_date_sort_suite.rs"]
+mod unfiltered_date_sort_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -35863,6 +35867,226 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::sort_meta_suite::meta_params_sort_by_value(&backend, &unique_base("sort_meta"))
             .await;
+    }
+
+    /// #2731: the ordered date-index walk and the general path return the same
+    /// pages, cursors and totals.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_matches_the_general_path() {
+        let backend = create_backend().await;
+        super::unfiltered_date_sort_suite::unfiltered_date_sort_matches_the_general_path(
+            &backend,
+            &unique_base("date_walk"),
+        )
+        .await;
+    }
+
+    /// Seeds `rows` Observations with one `date` index row each (second
+    /// resolution) straight into an isolated database, and analyzes it.
+    async fn seed_date_walk_rows(backend: &PostgresBackend, tenant_id: &str, rows: i64) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'o-' || lpad(series::text, 6, '0')),
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z', FALSE
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_date, value_date_end, last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), 'date',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute'
+                            + INTERVAL '1 second',
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+    }
+
+    fn date_sort_query(
+        direction: helios_persistence::types::SortDirection,
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+        SearchQuery::new("Observation")
+            .with_count(20)
+            .with_sort(SortDirective {
+                parameter: "date".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Date),
+            })
+    }
+
+    /// #2731: the unfiltered date sort reads the date index in order. No node
+    /// of the plan is a per-resource subplan or a sequential scan of
+    /// `resources`, the right index serves each direction, and a page reads
+    /// about a page of index entries, not the type.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_walks_the_date_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 20_000;
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("date-walk-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        seed_date_walk_rows(&backend, tenant_id, ROWS).await;
+
+        for (direction, order, index) in [
+            (
+                SortDirection::Descending,
+                "ORDER BY si.value_date_end DESC",
+                "idx_search_date_end",
+            ),
+            (
+                SortDirection::Ascending,
+                "ORDER BY si.value_date ASC",
+                "idx_search_date",
+            ),
+        ] {
+            let page = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 20);
+            assert!(page.resources.page_info.has_next);
+
+            let client = backend.get_client().await.unwrap();
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT r.id, r.version_id%'
+                       AND statement LIKE '%FROM search_index si%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 2",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached walk statement: {e}"))
+                .get(0);
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ('{tenant_id}', 'Observation')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2731] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            // The sort key is not a per-resource subplan.
+            assert!(
+                !all.iter().any(|n| n["Parent Relationship"] == "SubPlan"
+                    && n["Index Name"] == "idx_search_resource"),
+                "{direction:?}: a per-resource subplan drives the sort: {plan}"
+            );
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"] == "Seq Scan" && n["Relation Name"] == "resources"),
+                "{direction:?}: sequential scan of resources: {plan}"
+            );
+            let scan = all
+                .iter()
+                .find(|n| n["Index Name"] == index)
+                .unwrap_or_else(|| panic!("{direction:?}: {index} unused: {plan}"));
+            let read = scan["Actual Rows"].as_u64().unwrap()
+                * scan["Actual Loops"].as_u64().unwrap_or(1).max(1);
+            assert!(
+                read <= 200,
+                "{direction:?}: read {read} entries of {index} for a 20-row page of {ROWS}: {plan}"
+            );
+            client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        }
+    }
+
+    /// #2731: while the date index is invalid (a concurrent build in progress
+    /// or a failed one) the sort falls back to the general statement, with the
+    /// same page.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_falls_back_without_a_valid_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        let backend = hfs1407_backend(false).await;
+        let tenant = create_tenant("date-walk-fallback");
+        seed_date_walk_rows(&backend, tenant.tenant_id().as_str(), 300).await;
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for (direction, index) in [
+            (SortDirection::Descending, "idx_search_date_end"),
+            (SortDirection::Ascending, "idx_search_date"),
+        ] {
+            let walked = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            // Marks the index invalid, as an interrupted `CREATE INDEX
+            // CONCURRENTLY` leaves it. The database is this test's own.
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let general = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(ids(&general), ids(&walked), "{direction:?}");
+            assert_eq!(
+                general.resources.page_info.has_next,
+                walked.resources.page_info.has_next
+            );
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = TRUE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+        }
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one

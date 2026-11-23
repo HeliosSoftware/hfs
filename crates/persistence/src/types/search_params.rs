@@ -950,6 +950,36 @@ impl SearchQuery {
         matches!(self.total, Some(TotalMode::Estimate | TotalMode::Accurate))
     }
 
+    /// The sort directive, and whether it is descending, when this query is an
+    /// unfiltered sort by exactly one date search parameter (#2731).
+    ///
+    /// Such a query can be served by an ordered walk of the date index instead
+    /// of computing the sort key for every resource of the type. It holds only
+    /// when nothing narrows or reshapes the candidate set: no parameters, no
+    /// `_has` chains, no `_list`, no compartment, no `_contained` mode, no
+    /// FHIR-version filter, and a single resolved `Date` sort key that is not
+    /// `_id` / `_lastUpdated`.
+    pub fn unfiltered_single_date_sort(&self) -> Option<(&SortDirective, bool)> {
+        if !self.parameters.is_empty()
+            || !self.reverse_chains.is_empty()
+            || !self.list.is_empty()
+            || self.compartment.is_some()
+            || self.contained != ContainedMode::Off
+            || self.fhir_version.is_some()
+        {
+            return None;
+        }
+        let [directive] = self.sort.as_slice() else {
+            return None;
+        };
+        if directive.param_type != Some(SearchParamType::Date)
+            || matches!(directive.parameter.as_str(), "_id" | "_lastUpdated")
+        {
+            return None;
+        }
+        Some((directive, directive.direction == SortDirection::Descending))
+    }
+
     /// Adds a search parameter.
     pub fn with_parameter(mut self, param: SearchParameter) -> Self {
         self.parameters.push(param);
@@ -1528,5 +1558,88 @@ mod tests {
             }
             .matches_nothing()
         );
+    }
+
+    /// #2731: only an unfiltered sort by one resolved `Date` key qualifies for
+    /// the ordered date-index walk.
+    #[test]
+    fn unfiltered_single_date_sort_requires_nothing_else() {
+        let date = |s: &str| SortDirective::parse(s).with_param_type(Some(SearchParamType::Date));
+        let base = || SearchQuery::new("Observation");
+
+        let descending = base().with_sort(date("-date"));
+        let (directive, desc) = descending
+            .unfiltered_single_date_sort()
+            .expect("descending date sort");
+        assert_eq!(directive.parameter, "date");
+        assert!(desc);
+        let ascending = base().with_sort(date("date"));
+        let (_, desc) = ascending
+            .unfiltered_single_date_sort()
+            .expect("ascending date sort");
+        assert!(!desc);
+
+        // No sort, an unresolved type, a non-date type and the built-in keys.
+        assert!(base().unfiltered_single_date_sort().is_none());
+        assert!(
+            base()
+                .with_sort(SortDirective::parse("date"))
+                .unfiltered_single_date_sort()
+                .is_none()
+        );
+        for (key, ty) in [
+            ("status", SearchParamType::Token),
+            ("_lastUpdated", SearchParamType::Date),
+            ("_id", SearchParamType::Date),
+        ] {
+            assert!(
+                base()
+                    .with_sort(SortDirective::parse(key).with_param_type(Some(ty)))
+                    .unfiltered_single_date_sort()
+                    .is_none(),
+                "{key}"
+            );
+        }
+
+        // More than one key.
+        assert!(
+            base()
+                .with_sort(date("date"))
+                .with_sort(date("-issued"))
+                .unfiltered_single_date_sort()
+                .is_none()
+        );
+
+        // Anything that narrows or reshapes the candidate set.
+        let sorted = || base().with_sort(date("date"));
+        assert!(
+            sorted()
+                .with_parameter(SearchParameter {
+                    name: "status".to_string(),
+                    ..Default::default()
+                })
+                .unfiltered_single_date_sort()
+                .is_none()
+        );
+        let mut q = sorted();
+        q.list = vec!["l1".to_string()];
+        assert!(q.unfiltered_single_date_sort().is_none());
+        let mut q = sorted();
+        q.compartment = Some(CompartmentMembership {
+            params: vec!["patient".to_string()],
+            reference: "Patient/1".to_string(),
+        });
+        assert!(q.unfiltered_single_date_sort().is_none());
+        let mut q = sorted();
+        q.contained = ContainedMode::Both;
+        assert!(q.unfiltered_single_date_sort().is_none());
+        let q = sorted().with_fhir_version(helios_fhir::FhirVersion::default());
+        assert!(q.unfiltered_single_date_sort().is_none());
+
+        // Paging and totals do not matter.
+        let mut q = sorted().with_count(5);
+        q.offset = Some(3);
+        q.total = Some(TotalMode::Accurate);
+        assert!(q.unfiltered_single_date_sort().is_some());
     }
 }
