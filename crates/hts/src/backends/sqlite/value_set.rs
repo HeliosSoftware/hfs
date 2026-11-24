@@ -70,7 +70,14 @@ use super::SqliteTerminologyBackend;
 // typical operation imports happen at startup and the cache is then stable
 // for the life of the process, so the cost amortises over millions of
 // subsequent requests.
-type SystemIdCacheMap = HashMap<String, (String, Option<String>)>;
+//
+// The map is keyed by database file first, then URL: system ids are
+// server-assigned, so an id resolved against one database means nothing in
+// another. In-memory databases (`SqliteTerminologyBackend::in_memory`, used by
+// tests that each open their own) have no file name to key on and bypass the
+// cache; sharing it between them answered one test's expansions with another
+// test's ids.
+type SystemIdCacheMap = HashMap<String, HashMap<String, (String, Option<String>)>>;
 static SYSTEM_ID_CACHE: OnceLock<RwLock<SystemIdCacheMap>> = OnceLock::new();
 
 fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
@@ -120,9 +127,13 @@ fn resolve_system_id_with_version_cached(
     conn: &Connection,
     url: &str,
 ) -> Result<Option<(String, Option<String>)>, HtsError> {
-    if let Ok(read) = cs_id_cache().read() {
-        if let Some(rec) = read.get(url) {
-            return Ok(Some(rec.clone()));
+    // `path()` is `Some("")` for an in-memory database: nothing to key on.
+    let db_file = conn.path().filter(|p| !p.is_empty());
+    if let Some(db_file) = db_file {
+        if let Ok(read) = cs_id_cache().read() {
+            if let Some(rec) = read.get(db_file).and_then(|by_url| by_url.get(url)) {
+                return Ok(Some(rec.clone()));
+            }
         }
     }
 
@@ -159,9 +170,11 @@ fn resolve_system_id_with_version_cached(
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    if let Some(ref rec) = row {
+    if let (Some(db_file), Some(rec)) = (db_file, row.as_ref()) {
         if let Ok(mut w) = cs_id_cache().write() {
-            w.insert(url.to_owned(), rec.clone());
+            w.entry(db_file.to_owned())
+                .or_default()
+                .insert(url.to_owned(), rec.clone());
         }
     }
 
