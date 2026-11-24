@@ -56,6 +56,11 @@ pub(super) struct SchemaSet {
     /// Identity dedup (`Arc` pointer): the same schema reachable under
     /// several aliases (name and canonical URL) is added once.
     seen: HashSet<usize>,
+    /// Registry targets of the `elementReference`s already followed, by
+    /// `Arc` pointer. The schema added for a reference is a fresh copy
+    /// without cardinality, so `seen` cannot recognise it; this set ends a
+    /// reference that leads back to one already followed.
+    followed: HashSet<usize>,
 }
 
 impl SchemaSet {
@@ -229,13 +234,17 @@ pub(super) fn add_schemas_to_set(
 
     // `elementReference` pulls another element's schema into the set —
     // the mechanism behind recursive structures like Questionnaire.item.
-    // Cycles terminate via the identity dedup above.
+    // Each target is followed once per set, keyed on its registry `Arc`:
+    // the copy added for it is new every time, so a reference cycle is
+    // ended here rather than by the identity dedup above.
     if let Some(segments) = schema.element_reference.clone() {
         let ref_key = segments.join(".");
         match resolve_element_reference(ctx.resolver, &segments) {
             Some(target) => {
-                let stripped = Arc::new(target.without_cardinality());
-                add_schemas_to_set(ctx, set, stripped, &ref_key);
+                if set.followed.insert(Arc::as_ptr(&target) as usize) {
+                    let stripped = Arc::new(target.without_cardinality());
+                    add_schemas_to_set(ctx, set, stripped, &ref_key);
+                }
             }
             None => ctx.error(
                 ErrorKind::UnknownSchema,
