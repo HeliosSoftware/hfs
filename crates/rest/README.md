@@ -421,7 +421,13 @@ them, and exposes results through a status manifest.
   poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
-  (principal, else peer address) per poll token.
+  (principal, else peer address) per poll token. A poll that answers `404` (a token
+  that resolves to nothing, or to a submission the client may not see) also spends
+  one of the client's `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` misses per window, shared by
+  all its tokens and checked before the lookup, so inventing tokens earns a `429`
+  instead of a fresh bucket and a database read each time. A caller with neither a
+  principal nor a peer address is not billed for misses. Each limiter holds at most
+  100,000 buckets; a new key past that is refused with `429` for a window.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
   backend — no separate job store to configure.
@@ -477,7 +483,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll once ingestion has started. |
 | `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` (seconds) advertised while the submission is pre-ingest (queued / reading manifest / sizing / downloading). Never above `RETRY_AFTER`, never below `POLL_RATE_WINDOW / POLL_RATE_LIMIT`. |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
-| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
+| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window, and polls answering `404` allowed per client across all tokens per window. `0` disables poll rate limiting. |
 | `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. The same value bounds automatic deferred-reindex generations to `W` active jobs and `2W` resident tenants per `ReindexOperation`; there is no separate reindex-concurrency setting. |
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | How many of a single manifest's files one worker ingests at once (fan-out). **SQLite always runs at `1` regardless of the configured value** because it serialises writers; a higher fan-out queues batch writes behind one lock until they outlast `busy_timeout` and abort the import (#942). On standalone PostgreSQL, an effective value above `1` runs admitted output files in independent Tokio tasks. Existing standalone PostgreSQL deployments configured above `1` change scheduling on upgrade. Setting `1` restores inline scheduling and also reduces concurrency to one; there is no switch that keeps inline scheduling above `1`. Every other mode, including PostgreSQL plus Elasticsearch, keeps inline scheduling at its current effective concurrency. |
