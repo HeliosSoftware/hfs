@@ -414,7 +414,7 @@ async fn write_noise(backend: &MongoBackend, db: &mongodb::Database, tenant: &Te
         };
         write(backend, db, &foreign, &doc).await;
     }
-    for id in ["c0", "c1"] {
+    for id in ["c0", "c1", "c2"] {
         backend
             .seed_create(
                 tenant,
@@ -425,11 +425,15 @@ async fn write_noise(backend: &MongoBackend, db: &mongodb::Database, tenant: &Te
             )
             .await
             .unwrap();
+        // `c2` has no `missing_params` and no pending marker: the unstamped
+        // side must still leave it out because it is not an Observation.
+        let update = if id == "c2" {
+            doc! { "$unset": { "missing_params": "" } }
+        } else {
+            doc! { "$set": { "missing_params": NAMES.to_vec() } }
+        };
         db.collection::<Document>("resources")
-            .update_one(
-                scope(tenant, "Condition", id),
-                doc! { "$set": { "missing_params": NAMES.to_vec() } },
-            )
+            .update_one(scope(tenant, "Condition", id), update)
             .await
             .unwrap();
     }
@@ -753,6 +757,10 @@ fn fixed_shapes() -> Vec<Shape> {
             Extra::UpdatedList(vec![2, 5]),
             Extra::UpdatedRange(3, 5),
             Extra::IdNot("x000-m0s0p0d0".into()),
+            // Unstamped (`s1`), no rows, not pending, not deleted: it is
+            // counted by `True(..)`, so `_id:not` must drop it from the
+            // unstamped side too.
+            Extra::IdNot("x004-m0s1p0d0".into()),
             Extra::IdNot("no-such-id".into()),
         ] {
             shapes.push(shape(crits.clone(), extra));
