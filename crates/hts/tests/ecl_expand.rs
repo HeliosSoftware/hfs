@@ -372,6 +372,41 @@ async fn ecl_invalid_expression_returns_error() {
     );
 }
 
+/// An inline value set whose ECL nests groups far past the limit is refused
+/// with 400, and the server keeps answering: the parser used to recurse once
+/// per `(` on a blocking thread, which a deep enough expression overflowed.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn ecl_nesting_past_the_limit_is_refused_and_the_server_keeps_answering() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::ecl_bundle()).await;
+
+    let depth = 20_000;
+    let ecl = format!("{}limb{}", "(".repeat(depth), ")".repeat(depth));
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "valueSet",
+            "resource": {
+                "resourceType": "ValueSet",
+                "url": "http://hts.test/vs/ecl-deep",
+                "status": "active",
+                "compose": {"include": [{
+                    "system": "http://hts.test/anatomy",
+                    "filter": [{"property": "constraint", "op": "=", "value": ecl}]
+                }]}
+            }
+        }]
+    })
+    .to_string();
+    let (status, resp) = app.post_fhir("/ValueSet/$expand", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert!(resp.to_string().contains("nesting is deeper"), "{resp}");
+
+    let codes = expand_codes(&app, bundles::ECL_CONSTRAINT_VS_URL).await;
+    assert_eq!(codes, ["arm", "leg", "limb"], "got: {codes:?}");
+}
+
 // ── ECL + hierarchical mode ────────────────────────────────────────────────────
 
 /// ECL expansion with `hierarchical=true` should return a nested tree.
