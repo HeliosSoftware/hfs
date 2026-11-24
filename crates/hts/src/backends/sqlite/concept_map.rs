@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::HtsError;
 use crate::traits::ConceptMapOperations;
@@ -437,32 +437,14 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
             None => continue, // Unknown system; skip silently.
         };
 
-        // For each code that has descendants in the input set, build an element.
-        let mut elements: Vec<serde_json::Value> = Vec::new();
-
-        for ancestor_code in codes {
-            let mut targets: Vec<serde_json::Value> = Vec::new();
-
-            for descendant_code in codes {
-                if ancestor_code == descendant_code {
-                    continue;
-                }
-
-                if is_ancestor_of(conn, &system_id, ancestor_code, descendant_code)? {
-                    targets.push(json!({
-                        "code": descendant_code,
-                        "equivalence": "subsumes"
-                    }));
-                }
-            }
-
-            if !targets.is_empty() {
-                elements.push(json!({
-                    "code": ancestor_code,
-                    "target": targets
-                }));
-            }
+        // One ancestor walk per distinct input code, then pair them in memory.
+        let codes = crate::backends::closure::distinct_codes(codes);
+        let wanted: HashSet<&str> = codes.iter().copied().collect();
+        let mut ancestors = Vec::with_capacity(codes.len());
+        for code in &codes {
+            ancestors.push(input_ancestors(conn, &system_id, code, &wanted)?);
         }
+        let elements = crate::backends::closure::closure_elements(&codes, &ancestors);
 
         if !elements.is_empty() {
             groups.push(json!({
@@ -487,17 +469,16 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     })
 }
 
-/// Returns `true` if `ancestor_code` is a (possibly transitive) ancestor of
-/// `descendant_code` in the given code system.
+/// The (possibly transitive) ancestors of `code` in the given code system
+/// that are among `wanted`.
 ///
-/// Uses a recursive CTE that walks *up* from `descendant_code`, collecting
-/// all ancestor codes, then checks whether `ancestor_code` appears in the set.
-fn is_ancestor_of(
+/// One recursive CTE walks *up* from `code`; `UNION` stops it at a cycle.
+fn input_ancestors(
     conn: &Connection,
     system_id: &str,
-    ancestor_code: &str,
-    descendant_code: &str,
-) -> Result<bool, HtsError> {
+    code: &str,
+    wanted: &HashSet<&str>,
+) -> Result<HashSet<String>, HtsError> {
     let sql = "
         WITH RECURSIVE ancestors(code) AS (
             SELECT parent_code
@@ -509,20 +490,23 @@ fn is_ancestor_of(
             INNER JOIN ancestors a ON ch.child_code = a.code
             WHERE ch.system_id = ?1
         )
-        SELECT 1 FROM ancestors WHERE code = ?3
-        LIMIT 1
+        SELECT code FROM ancestors
     ";
-
-    let found: Option<i32> = conn
-        .query_row(
-            sql,
-            rusqlite::params![system_id, descendant_code, ancestor_code],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
-
-    Ok(found.is_some())
+    let db = |e: rusqlite::Error| HtsError::StorageError(format!("DB error: {e}"));
+    let mut stmt = conn.prepare_cached(sql).map_err(db)?;
+    let rows = stmt
+        .query_map(rusqlite::params![system_id, code], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(db)?;
+    let mut found = HashSet::new();
+    for row in rows {
+        let ancestor = row.map_err(db)?;
+        if wanted.contains(ancestor.as_str()) {
+            found.insert(ancestor);
+        }
+    }
+    Ok(found)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

@@ -27,6 +27,11 @@ use crate::types::{ClosureRequest, CodingConcept};
 use super::format::{fhir_respond, negotiate_format};
 use super::params::extract_parameter_array;
 
+/// Most `concept` parameters one `$closure` request may carry. Each distinct
+/// code costs one ancestor walk, and the answer pairs every code with every
+/// other.
+pub const MAX_CLOSURE_CONCEPTS: usize = 1000;
+
 /// POST /ConceptMap/$closure
 pub async fn closure_handler<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
@@ -67,6 +72,12 @@ pub async fn closure_handler<B: TerminologyBackend>(
             })
         })
         .collect();
+    if concepts.len() > MAX_CLOSURE_CONCEPTS {
+        return Err(HtsError::TooCostly(format!(
+            "$closure accepts at most {MAX_CLOSURE_CONCEPTS} concepts per request, got {}",
+            concepts.len()
+        )));
+    }
 
     // Optional `version` parameter.
     let version = params
@@ -329,5 +340,51 @@ mod tests {
 
         let resp = post_json(app, "/ConceptMap/$closure", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    fn closure_of(codes: impl IntoIterator<Item = String>) -> Value {
+        let mut parameter = vec![json!({"name": "name", "valueString": "bounded"})];
+        parameter.extend(
+            codes
+                .into_iter()
+                .map(|code| concept_param("http://example.org/cs", &code)),
+        );
+        json!({"resourceType": "Parameters", "parameter": parameter})
+    }
+
+    /// Past the cap the request is refused before any ancestor walk: the
+    /// pairwise loop it replaced ran one recursive query per ordered pair.
+    #[tokio::test]
+    async fn closure_past_the_concept_cap_is_too_costly() {
+        let body = closure_of((0..=MAX_CLOSURE_CONCEPTS).map(|i| format!("X{i}")));
+        let resp = post_json(make_app(), "/ConceptMap/$closure", body).await;
+        assert_eq!(resp.status(), 422);
+        let json = body_json(resp).await;
+        assert_eq!(json["issue"][0]["code"], "too-costly", "{json}");
+    }
+
+    /// At the cap the request is served, with one walk per distinct code.
+    #[tokio::test]
+    async fn closure_at_the_concept_cap_is_served() {
+        let codes = (0..MAX_CLOSURE_CONCEPTS - 3)
+            .map(|i| format!("X{i}"))
+            .chain(["A", "B", "C"].map(String::from));
+        let resp = post_json(make_app(), "/ConceptMap/$closure", closure_of(codes)).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let group = &json["parameter"][0]["resource"]["group"][0];
+        assert_eq!(group["element"].as_array().unwrap().len(), 2, "{group}");
+    }
+
+    /// A code sent twice is one element with its targets listed once.
+    #[tokio::test]
+    async fn closure_repeated_codes_are_paired_once() {
+        let codes = ["A", "C", "A", "C"].map(String::from);
+        let resp = post_json(make_app(), "/ConceptMap/$closure", closure_of(codes)).await;
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["parameter"][0]["resource"]["group"][0]["element"],
+            json!([{"code": "A", "target": [{"code": "C", "equivalence": "subsumes"}]}])
+        );
     }
 }
