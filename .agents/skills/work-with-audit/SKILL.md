@@ -31,6 +31,16 @@ destructive operations emit their own lifecycle events through helpers in
 | `purge` | handler, on success **and** on failure | `0` / `8` | `count`, `resource-type` |
 | `reindex` | job start, and its terminal state (complete / cancel / fail) | `0` / `4` / `8`; `complete` is `4` when the job recorded resource errors | `phase`, `job-id`, `resources-processed`, `resource-types` |
 
+The SQL-on-FHIR operations record their own scope decision from the handler
+(`helios-rest`, `handlers::sof::authz::authorize_reads`), because neither
+middleware audits them: the authorization middleware leaves them to the
+handler, and the audit middleware leaves every `POST` without a resource type
+to the batch handler.
+
+| `audit-operation` | Emitted at | Outcome codes | Other details |
+|---|---|---|---|
+| `sql-run`, `sql-export` | the handler's scope check, on a grant **and** on a refusal | `0` / `8` | `resource-type` (one per type the subject reads), `subject` (its canonical, else `type/id`); `outcomeDesc` is `Granted: $sql-run reading Observation` or `Forbidden: …` |
+
 Note the phase detail is keyed `bulk-export-operation` for export but `phase`
 for reindex — the former predates the shared helper and is kept for consumers
 already parsing it.

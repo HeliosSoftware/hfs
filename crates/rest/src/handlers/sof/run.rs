@@ -221,11 +221,15 @@ where
     // Library subject is checked once its dependency graph is resolved, in
     // `run_library_subject`.
     if subject.kind == SubjectKind::ViewDefinition && body_params.inline_resources.is_empty() {
-        super::authz::check_read_scopes(
+        super::authz::authorize_reads(
+            &state,
+            tenant.context(),
             principal.as_ref(),
             "$sql-run",
+            &subject.resource,
             super::authz::view_resource_type(&subject.resource),
-        )?;
+        )
+        .await?;
     }
 
     // `resource` carries inline FHIR resources to transform instead of using
