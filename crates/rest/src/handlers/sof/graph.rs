@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
+use helios_auth::Principal;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
@@ -228,12 +229,32 @@ pub(crate) trait ArtifactFetcher: Send + Sync {
 pub(crate) struct StorageArtifactFetcher<'a, S> {
     state: &'a AppState<S>,
     tenant: &'a TenantContext,
+    /// The token a terminology dependency is resolved for, and the operation
+    /// it is resolved by (see [`Self::reading_as`]).
+    reader: Option<(&'a Principal, &'static str)>,
 }
 
 impl<'a, S> StorageArtifactFetcher<'a, S> {
     /// Builds a fetcher scoped to one request's state and tenant.
     pub(crate) fn new(state: &'a AppState<S>, tenant: &'a TenantContext) -> Self {
-        Self { state, tenant }
+        Self {
+            state,
+            tenant,
+            reader: None,
+        }
+    }
+
+    /// Resolves terminology dependencies for `principal` only when it may
+    /// read one ([`super::authz::check_terminology_reachable`]): otherwise
+    /// `operation` is refused before the persisted table or the terminology
+    /// server is consulted.
+    pub(crate) fn reading_as(
+        mut self,
+        principal: Option<&'a Principal>,
+        operation: &'static str,
+    ) -> Self {
+        self.reader = principal.map(|principal| (principal, operation));
+        self
     }
 }
 
@@ -256,6 +277,9 @@ where
     }
 
     async fn fetch_terminology(&self, url: &str) -> Result<Option<TerminologyRelation>, RestError> {
+        if let Some((principal, operation)) = self.reader {
+            super::authz::check_terminology_reachable(Some(principal), operation, url)?;
+        }
         super::terminology::resolve_relation(self.state, self.tenant, url).await
     }
 }
@@ -548,6 +572,9 @@ pub(crate) async fn build_plan(
                         });
                         failed.insert(dep.url.clone());
                     }
+                    // A refused grant answers 403 on its own, not as one
+                    // issue among the graph's structural ones.
+                    Err(e @ RestError::Forbidden { .. }) => return Err(vec![e]),
                     Err(e) => {
                         errors.push(e);
                         failed.insert(dep.url.clone());
