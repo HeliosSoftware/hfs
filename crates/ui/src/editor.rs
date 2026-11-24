@@ -26,7 +26,8 @@ use askama::Template;
 use axum::{
     Form,
     extract::{Query, State},
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use helios_fhir_validator::{
     Addable, AddableKind, Step, SyncOutcome, ValidationOptions, Validator, editor, packs,
@@ -341,6 +342,56 @@ pub async fn page(
     })
 }
 
+/// Most JSON nodes a document may have for the guided form to build rows for
+/// it. Every node becomes a row, and every row is validated and offered its
+/// schema's add picker.
+pub const MAX_EDITOR_NODES: usize = 5_000;
+
+/// Most rows plus picker entries one render may emit. A row's add picker
+/// lists every element its schema allows, so a few bytes of posted document
+/// (an empty object in an array) can render a whole picker; this bounds the
+/// HTML a request produces.
+pub const MAX_EDITOR_RENDER_ITEMS: usize = 20_000;
+
+/// The number of JSON nodes in `value`, counting at most `limit + 1`.
+fn node_count(value: &Value, limit: usize) -> usize {
+    let mut count = 0;
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        count += 1;
+        if count > limit {
+            break;
+        }
+        match node {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(fields) => stack.extend(fields.values()),
+            _ => {}
+        }
+    }
+    count
+}
+
+/// The rows of a render plus every option their pickers list.
+fn render_items(rows: &[Row]) -> usize {
+    rows.iter()
+        .map(|row| {
+            1 + row.addable.len()
+                + row.ext_options.len()
+                + row.collection.as_ref().map_or(0, |c| c.append.len())
+        })
+        .sum()
+}
+
+/// The answer for a document past the guided form's budget: the source view
+/// still edits it.
+fn too_large_for_the_form() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "This document is too large for the guided form; edit it in the JSON view",
+    )
+        .into_response()
+}
+
 /// Applies a mutation and re-renders. One endpoint for every structural edit:
 /// the operation and the whole document arrive together, and the whole editor
 /// body goes back.
@@ -405,6 +456,10 @@ pub async fn render_body(
         }
     };
 
+    if node_count(&document, MAX_EDITOR_NODES) > MAX_EDITOR_NODES {
+        return too_large_for_the_form();
+    }
+
     let resource_type = document
         .get("resourceType")
         .and_then(Value::as_str)
@@ -414,7 +469,7 @@ pub async fn render_body(
     let created = apply(&*registry, &resource_type, &mut document, &form, &hidden);
 
     if form_pane_only {
-        render(build_form_pane(
+        let pane = build_form_pane(
             i18n,
             registry,
             rv.0,
@@ -424,9 +479,13 @@ pub async fn render_body(
             false, // #843: this HTTP endpoint never renders needs-js — see EditorFormPane::needs_js
             &hidden,
             &form.legend,
-        ))
+        );
+        if render_items(&pane.rows) > MAX_EDITOR_RENDER_ITEMS {
+            return too_large_for_the_form();
+        }
+        render(pane)
     } else {
-        render(build_body(
+        let body = build_body(
             i18n,
             registry,
             rv.0,
@@ -436,7 +495,11 @@ pub async fn render_body(
             created,
             &hidden,
             &form.legend,
-        ))
+        );
+        if render_items(&body.rows) > MAX_EDITOR_RENDER_ITEMS {
+            return too_large_for_the_form();
+        }
+        render(body)
     }
 }
 

@@ -2061,6 +2061,57 @@ async fn edit(form: &str) -> String {
     body_text(response).await
 }
 
+/// The status of `POST /ui/editor/render` for `doc`, full body or form pane.
+async fn edit_status(doc: &Value, pane: &str) -> StatusCode {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("doc", &doc.to_string());
+    serializer.append_pair("pane", pane);
+    app()
+        .oneshot(
+            Request::post("/ui/editor/render")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(serializer.finish()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The guided form refuses a document it would render without bound: one
+/// with more nodes than it builds rows for, and one whose rows' add pickers
+/// (an empty object lists every element it allows) exceed the render budget.
+/// An ordinary resource still renders.
+#[tokio::test]
+async fn editor_render_refuses_documents_past_its_budget() {
+    let many_nodes = serde_json::json!({
+        "resourceType": "Patient",
+        "name": (0..3_000).map(|i| serde_json::json!({"family": format!("f{i}")})).collect::<Vec<_>>()
+    });
+    let many_pickers = serde_json::json!({
+        "resourceType": "Patient",
+        "contact": vec![serde_json::json!({}); 4_000]
+    });
+    for pane in ["", "form"] {
+        assert_eq!(
+            edit_status(&many_nodes, pane).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            edit_status(&many_pickers, pane).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            edit_status(
+                &serde_json::json!({"resourceType": "Patient", "contact": [{}]}),
+                pane
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+}
+
 /// Builds a `pane=form` request body (#843): `doc` plus any extra fields
 /// (`op`, `path`, `name`, ...), form-urlencoded the way the browser would.
 fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
