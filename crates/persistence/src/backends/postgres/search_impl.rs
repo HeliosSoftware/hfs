@@ -609,6 +609,52 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        self.search_with_client_tie_cap(
+            client,
+            tenant,
+            query,
+            total,
+            crate::types::DATE_WALK_MAX_TIE_GROUP,
+        )
+        .await
+    }
+
+    /// [`SearchProvider::search`] with the date walk's tie-group cap set by
+    /// the caller instead of `DATE_WALK_MAX_TIE_GROUP` (#2731).
+    ///
+    /// `#[doc(hidden)] pub` only so the integration tests can show the
+    /// fallback past the cap without seeding thousands of equal keys.
+    #[doc(hidden)]
+    pub async fn search_with_date_walk_tie_cap(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+        let client = self.get_client().await?;
+        self.search_with_client_tie_cap(&client, tenant, query, total, tie_cap)
+            .await
+    }
+
+    /// The body of [`Self::search_with_client`], with the date walk's
+    /// tie-group cap as a parameter.
+    async fn search_with_client_tie_cap(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(
             query,
             self.supports_native_reverse_chains(tenant, query),
@@ -661,6 +707,7 @@ impl PostgresBackend {
                     desc,
                     cursor.as_ref(),
                     count,
+                    tie_cap,
                 )
                 .await?
             }
@@ -1975,6 +2022,13 @@ impl PostgresBackend {
     /// without, in id order. Rows come back in traversal order, up to
     /// `count + 1`, with the same columns as the general statement and the key
     /// in column 5. A cursor takes precedence over an offset, as there.
+    ///
+    /// Before the keyed part is read, the equal-key group at the head of the
+    /// page is sized up to `tie_cap` rows (`DATE_WALK_MAX_TIE_GROUP` outside
+    /// tests): the walk would read and sort all of it, so a larger one is
+    /// `None`. The head is the first key from the offset with no cursor, the
+    /// cursor's key, or, backward from a resource with no date, the last key.
+    /// Forward from such a resource only the unkeyed ones are read.
     #[allow(clippy::too_many_arguments)]
     async fn date_walk_rows(
         &self,
@@ -1985,6 +2039,7 @@ impl PostgresBackend {
         desc: bool,
         cursor: Option<&PageCursor>,
         count: usize,
+        tie_cap: usize,
     ) -> StorageResult<Option<Vec<tokio_postgres::Row>>> {
         type Params = Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>;
         let (col, index) = PostgresQueryBuilder::date_walk_column(desc);
@@ -2032,11 +2087,46 @@ impl PostgresBackend {
         );
         let mut rows: Vec<tokio_postgres::Row> = Vec::new();
 
+        // The tie-group probe: whether the group of the key bound as `$3` in
+        // `params` holds more rows than the walk may read for a page head.
+        let tie_sql = PostgresQueryBuilder::date_walk_tie_group_sql(parameter, desc, tie_cap);
+        let group_too_big = |params: Params| {
+            let sql = tie_sql.clone();
+            async move {
+                let rows = run(sql, params, true).await?;
+                let size: i64 = rows.first().map_or(0, |r| r.get(0));
+                Ok::<bool, crate::error::StorageError>(usize::try_from(size).unwrap_or(0) > tie_cap)
+            }
+        };
+        // The same for the key `offset` rows in from the start (or the end)
+        // of the key order, when there is one.
+        let head_group_too_big = |from_end: bool, offset: usize| async move {
+            let sql =
+                PostgresQueryBuilder::date_walk_head_key_sql(parameter, desc, from_end, offset);
+            let Some(head) = run(sql, base(), offset == 0)
+                .await?
+                .first()
+                .map(|r| r.get::<_, chrono::DateTime<Utc>>(0))
+            else {
+                return Ok(false);
+            };
+            let mut p = base();
+            p.push(Box::new(head));
+            group_too_big(p).await
+        };
+
         match cursor {
             Some(cursor) => {
                 let backward = cursor.direction() == CursorDirection::Previous;
                 let missing = cursor_value_is_null(cursor);
                 let id_param = |p: &mut Params| p.push(Box::new(cursor.resource_id().to_string()));
+                if !missing {
+                    let mut p = base();
+                    Self::bind_cursor_value(&mut p, key.kind, false, cursor)?;
+                    if group_too_big(p).await? {
+                        return Ok(None);
+                    }
+                }
                 if missing && !backward {
                     // Past the keyed part: the rest of the unkeyed ones by id.
                     let mut p = base();
@@ -2067,6 +2157,10 @@ impl PostgresBackend {
                         rows = run(sql, p, true).await?;
                     }
                     if rows.len() < want {
+                        if missing && head_group_too_big(true, 0).await? {
+                            // Backward into the keyed part from its far end.
+                            return Ok(None);
+                        }
                         let remaining = want - rows.len();
                         let mut p = base();
                         let (condition, order) = if missing {
@@ -2112,6 +2206,9 @@ impl PostgresBackend {
             }
             None => {
                 let offset = query.offset.unwrap_or(0) as usize;
+                if head_group_too_big(false, offset).await? {
+                    return Ok(None);
+                }
                 let sql = PostgresQueryBuilder::date_walk_page_sql(
                     parameter,
                     desc,
@@ -2129,7 +2226,8 @@ impl PostgresBackend {
                         0
                     } else {
                         let sql = PostgresQueryBuilder::date_walk_keyed_count_sql(parameter, desc);
-                        let keyed: i64 = run(sql, base(), false).await?[0].get(0);
+                        // One text per parameter and direction: cacheable.
+                        let keyed: i64 = run(sql, base(), true).await?[0].get(0);
                         offset.saturating_sub(usize::try_from(keyed).unwrap_or(0))
                     };
                     let sql = PostgresQueryBuilder::date_walk_tail_sql(

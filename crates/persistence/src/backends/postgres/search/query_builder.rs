@@ -1998,6 +1998,14 @@ impl PostgresQueryBuilder {
     ///
     /// `id_after` is the comparison against the cursor's id (`">"` forward,
     /// `"<"` backward), bound as `$3`; `id_descending` orders the mirror walk.
+    ///
+    /// The cursor bound is repeated on the anti-join's side
+    /// (`s.resource_id > $3`), which `s.resource_id = r.id` already implies.
+    /// Without it PostgreSQL may answer the anti-join as a merge join over
+    /// `idx_search_resource` that starts at the type's first resource, not at
+    /// the cursor: measured on 20,000 Observations with five parameters each,
+    /// a 21-row page from the middle read 50,541 index entries (19,922
+    /// buffers), so paging through the tail grew with the square of its length.
     pub(crate) fn date_walk_tail_sql(
         parameter: &str,
         desc: bool,
@@ -2010,6 +2018,9 @@ impl PostgresQueryBuilder {
         let lit = sql_string_literal(parameter);
         let boundary = id_after
             .map(|op| format!(" AND r.id {op} $3"))
+            .unwrap_or_default();
+        let probe_boundary = id_after
+            .map(|op| format!(" AND s.resource_id {op} $3"))
             .unwrap_or_default();
         let dir = if id_descending { "DESC" } else { "ASC" };
         let offset = if offset > 0 {
@@ -2024,8 +2035,54 @@ impl PostgresQueryBuilder {
              WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE{boundary} \
              AND NOT EXISTS (SELECT 1 FROM search_index s \
              WHERE s.tenant_id = $1 AND s.resource_type = $2 \
-             AND s.resource_id = r.id AND s.param_name = {lit} AND s.{col} IS NOT NULL) \
+             AND s.resource_id = r.id{probe_boundary} \
+             AND s.param_name = {lit} AND s.{col} IS NOT NULL) \
              ORDER BY r.id {dir} LIMIT {limit}{offset}"
+        )
+    }
+
+    /// The key at the head of a walk page (#2731): the date row `offset` rows
+    /// in from the start of the key order (`from_end`: from its end), read
+    /// from the date index alone. It feeds the tie-group probe, so it skips
+    /// the walk's one-row-per-resource rule and its join to live resources:
+    /// both would make it read the very group it is sizing. No row means the
+    /// offset is past the keyed part. Bind layout: `$1` tenant, `$2` type.
+    pub(crate) fn date_walk_head_key_sql(
+        parameter: &str,
+        desc: bool,
+        from_end: bool,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let dir = if desc != from_end { "DESC" } else { "ASC" };
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT si.{col} FROM search_index si \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL \
+             ORDER BY si.{col} {dir} LIMIT 1{offset}"
+        )
+    }
+
+    /// The size of the equal-key group `$3` belongs to, counted up to
+    /// `cap + 1` rows (#2731): the walk orders `key, id`, so it reads and sorts
+    /// a whole group before the first row of a page in it, and a group above
+    /// `cap` sends the page to the general statement
+    /// (`DATE_WALK_MAX_TIE_GROUP`). The `LIMIT` bounds the probe itself.
+    /// Bind layout: `$1` tenant, `$2` type, `$3` the key.
+    pub(crate) fn date_walk_tie_group_sql(parameter: &str, desc: bool, cap: usize) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let limit = cap.saturating_add(1);
+        format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM search_index si \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} = $3 LIMIT {limit}) tie"
         )
     }
 
@@ -6419,6 +6476,8 @@ mod tests {
         let tail = PostgresQueryBuilder::date_walk_tail_sql("date", true, Some(">"), false, 5, 0);
         assert!(tail.contains("s.value_date_end IS NOT NULL"), "{tail}");
         assert!(tail.contains("AND r.id > $3"), "{tail}");
+        // The probe side carries the cursor bound too (see the builder).
+        assert!(tail.contains("AND s.resource_id > $3"), "{tail}");
         assert!(tail.ends_with("ORDER BY r.id ASC LIMIT 5"), "{tail}");
         let mirror = PostgresQueryBuilder::date_walk_tail_sql("date", false, Some("<"), true, 5, 2);
         assert!(mirror.contains("s.value_date IS NOT NULL"), "{mirror}");
