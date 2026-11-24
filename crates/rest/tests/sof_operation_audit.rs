@@ -93,7 +93,10 @@ impl AuthProvider for StubProvider {
     }
 }
 
-fn server() -> (TestServer, CollectorSink) {
+/// The server, its collecting sink, and the directory its `$sql-export` jobs
+/// write to, removed when dropped.
+fn server() -> (TestServer, CollectorSink, tempfile::TempDir) {
+    let exports = tempfile::tempdir().expect("export dir");
     let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
     backend.init_schema().expect("init schema");
     let sink = CollectorSink::default();
@@ -113,12 +116,15 @@ fn server() -> (TestServer, CollectorSink) {
     });
     let app = helios_rest::create_app_with_auth(
         backend,
-        ServerConfig::for_testing(),
+        ServerConfig {
+            export_dir: exports.path().to_string_lossy().into_owned(),
+            ..ServerConfig::for_testing()
+        },
         AuthConfig::default(),
         Some(auth),
         Some(audit),
     );
-    (TestServer::new(app).expect("test server"), sink)
+    (TestServer::new(app).expect("test server"), sink, exports)
 }
 
 fn bearer(scopes: &str) -> HeaderValue {
@@ -178,7 +184,7 @@ fn only_event(sink: &CollectorSink, operation: &str, scopes: &str, subject: &str
 
 #[tokio::test]
 async fn sql_run_records_a_grant_and_a_refusal() {
-    let (server, sink) = server();
+    let (server, sink, _exports) = server();
 
     assert_eq!(
         sql_run(&server, "user/Observation.rs", observation_view()).await,
@@ -207,7 +213,7 @@ async fn sql_run_records_a_grant_and_a_refusal() {
 
 #[tokio::test]
 async fn sql_export_records_a_grant_and_a_refusal() {
-    let (server, sink) = server();
+    let (server, sink, _exports) = server();
 
     assert_ne!(
         sql_export(&server, "user/Observation.rs").await,
@@ -226,7 +232,7 @@ async fn sql_export_records_a_grant_and_a_refusal() {
 /// A Library's event names every type its dependency graph reads, once.
 #[tokio::test]
 async fn a_library_run_names_the_types_its_views_read() {
-    let (server, sink) = server();
+    let (server, sink, _exports) = server();
     let stored = server
         .put("/ViewDefinition/observations")
         .add_header(AUTHORIZATION, bearer("system/*.cruds"))
