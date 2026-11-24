@@ -303,9 +303,17 @@ where
     }
 
     // Generate binding token.
-    let (token, expiration) = engine
-        .ws_token_manager()
-        .generate_token(tenant.tenant_id(), &id);
+    let tokens = engine.ws_token_manager();
+    let Some((token, expiration)) = tokens.generate_token(tenant.tenant_id(), &id) else {
+        return Err(RestError::TooManyRequests {
+            message: format!(
+                "this subscription already has {} unused binding tokens; use one or let it \
+                 expire",
+                helios_subscriptions::channels::ws_token::MAX_PENDING_TOKENS_PER_SUBSCRIPTION
+            ),
+            retry_after_secs: Some(tokens.token_lifetime_secs().max(1) as u64),
+        });
+    };
 
     // Build WebSocket URL from the base URL.
     let ws_http_url = state.public_url_for_request(&tenant, ["ws", "subscriptions", "bind"]);
