@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub cors_headers: String,
     /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
     pub terminology_server: Option<String>,
+    /// The URL prefixes a `$sql-run` `source` may name; empty refuses `source`.
+    pub source_prefixes: crate::data_source::SourcePolicy,
 }
 
 /// Prints `terminology_server` without its credentials, query or fragment
@@ -59,8 +61,10 @@ impl std::fmt::Debug for ServerConfig {
             cors_methods,
             cors_headers,
             terminology_server,
+            source_prefixes,
         } = self;
         f.debug_struct("ServerConfig")
+            .field("source_prefixes", source_prefixes)
             .field("port", port)
             .field("host", host)
             .field("log_level", log_level)
@@ -93,6 +97,7 @@ impl Default for ServerConfig {
             cors_methods: "GET,POST,PUT,DELETE,OPTIONS".to_string(),
             cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With,Content-Encoding".to_string(),
             terminology_server: None,
+            source_prefixes: crate::data_source::SourcePolicy::default(),
         }
     }
 }
@@ -159,6 +164,9 @@ pub fn create_app_with_config(config: &ServerConfig) -> Router {
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
+        .layer(axum::Extension(std::sync::Arc::new(
+            config.source_prefixes.clone(),
+        )))
         // Add body size limit. The decompression layer below replaces the
         // request body before extractors read it, so this limit applies to
         // the *decompressed* bytes â€” a small highly-compressed payload
