@@ -109,6 +109,43 @@ fn comment_and_backtick_evasions_are_rejected() {
     assert_rejected_everywhere(&format!("`a\\`` + {long}"));
 }
 
+/// The scan used to take everything after `@` that looked like part of a
+/// literal (letters, digits, `.`, `-`, `:`, `+`) and to end a `//` comment
+/// only at `\n`, while the parser takes a fixed-width literal and ends a
+/// comment at any line terminator. Chains written after either were not
+/// counted, and evaluating them overflowed the stack.
+#[test]
+fn chains_after_a_temporal_literal_or_a_line_comment_are_counted() {
+    let n = MAX_EXPRESSION_DEPTH + 50;
+    assert_rejected_everywhere(&format!("@2020-01-01{}", ".a".repeat(n)));
+    assert_rejected_everywhere(&format!("@2020{}", "+1".repeat(n)));
+    assert_rejected_everywhere(&format!("@2020-01-01T10:00:00.123Z{}", "-1".repeat(n)));
+    assert_rejected_everywhere(&format!("@T10:30{}", ".a".repeat(n)));
+    for terminator in ['\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}'] {
+        assert_rejected_everywhere(&format!("1 // note{terminator} + {}", chain("1", " + ", n)));
+    }
+}
+
+#[test]
+fn temporal_literals_still_parse() {
+    for literal in [
+        "@2020",
+        "@2020-01",
+        "@2020-01-01",
+        "@2020T",
+        "@2020-01-01T10",
+        "@2020-01-01T10:30:15.123+05:30",
+        "@2020-01-01T10:30:15Z",
+        "@T10:30:15.5",
+    ] {
+        assert!(
+            parse_expression(&format!("{literal} = {literal}")).is_ok(),
+            "{literal}"
+        );
+    }
+    assert!(parse_expression(&format!("@2020-01-01{}", ".a".repeat(100))).is_ok());
+}
+
 #[test]
 fn function_chains_and_type_operators_count() {
     let n = MAX_EXPRESSION_DEPTH + 50;

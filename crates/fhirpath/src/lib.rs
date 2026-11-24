@@ -517,6 +517,72 @@ impl Level {
     }
 }
 
+/// Whether the parser ends a `//` comment at `c`: every line terminator
+/// chumsky's `text::newline` accepts, not only `\n`. A comment the scan ran
+/// past would hide the rest of the expression from it.
+fn is_line_terminator(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// How many characters after `@` the parser's date, datetime or time literal
+/// takes at most: `YYYY[-MM[-DD]][T[hh[:mm[:ss[.f{1,3}]]][tz]]]` or
+/// `Thh[:mm[:ss[.f{1,3}]]][tz]`, where `tz` is `Z` or `±hh:mm`. The scan
+/// takes no more than that, so steps and operands written right after a
+/// literal are counted like any others.
+fn temporal_literal_len(rest: &[char]) -> usize {
+    let digits = |at: usize, count: usize| {
+        rest.get(at..at + count)
+            .is_some_and(|s| s.iter().all(|c| c.is_ascii_digit()))
+    };
+    let mut n = 0;
+    if rest.first() != Some(&'T') {
+        if !digits(0, 4) {
+            return 0;
+        }
+        n = 4;
+        if rest.get(n) == Some(&'-') && digits(n + 1, 2) {
+            n += 3;
+            if rest.get(n) == Some(&'-') && digits(n + 1, 2) {
+                n += 3;
+            }
+        }
+        if rest.get(n) != Some(&'T') {
+            return n;
+        }
+    }
+    n += 1; // the `T`
+    if !digits(n, 2) {
+        return n;
+    }
+    n += 2;
+    if rest.get(n) == Some(&':') && digits(n + 1, 2) {
+        n += 3;
+        if rest.get(n) == Some(&':') && digits(n + 1, 2) {
+            n += 3;
+            if rest.get(n) == Some(&'.') && digits(n + 1, 1) {
+                n += 2;
+                let mut fraction = 1;
+                while fraction < 3 && digits(n, 1) {
+                    n += 1;
+                    fraction += 1;
+                }
+            }
+        }
+    }
+    match rest.get(n) {
+        Some('Z') => n + 1,
+        Some('+' | '-')
+            if digits(n + 1, 2) && rest.get(n + 3) == Some(&':') && digits(n + 4, 2) =>
+        {
+            n + 6
+        }
+        _ => n,
+    }
+}
+
 /// One linear pass over `expression` measuring both the deepest
 /// `(`/`[`/`{` nesting and the accumulated operator-chain depth (see
 /// [`MAX_EXPRESSION_DEPTH`]). Returns `(bracket_depth, chain_depth)`.
@@ -555,7 +621,7 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 prev_operand = true;
             }
             '/' if next == Some('/') => {
-                while i < chars.len() && chars[i] != '\n' {
+                while i < chars.len() && !is_line_terminator(chars[i]) {
                     i += 1;
                 }
             }
@@ -567,12 +633,7 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 i += 1;
             }
             '@' => {
-                while chars
-                    .get(i + 1)
-                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
-                {
-                    i += 1;
-                }
+                i += temporal_literal_len(&chars[i + 1..]);
                 prev_operand = true;
             }
             c if c.is_ascii_digit() => {
