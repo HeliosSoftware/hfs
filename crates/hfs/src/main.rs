@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+mod env_names;
 mod worker_shutdown;
 
 use helios_audit::{
@@ -2154,6 +2155,12 @@ async fn main() -> anyhow::Result<()> {
     // backed by the reqlog ring buffer, so it opts into recording. Servers that
     // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
     helios_observability::reqlog::enable();
+
+    for warning in env_names::unknown_variable_warnings(
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    ) {
+        warn!("{warning}");
+    }
 
     if let Some(message) = config.loopback_public_base_warning() {
         warn!(
