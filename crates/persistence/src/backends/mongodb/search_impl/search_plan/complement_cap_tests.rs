@@ -6,9 +6,10 @@
 
 use super::super::super::{
     CANDIDATE_BATCH_SIZE, ParamSortWindow, SEARCH_DATE_END_INDEX, SORT_ID_CHUNK,
-    UNFILTERED_WALK_MIN_BATCH, UNFILTERED_WALK_MIN_CURSOR_BATCH, UNFILTERED_WALK_TIE_PROBE_ROWS,
-    UNFILTERED_WALK_TIE_ROWS, unfiltered_walk_batch, unfiltered_walk_cursor_batch,
-    unfiltered_walk_tie_allowance, with_result_id_cap,
+    UNFILTERED_WALK_FULL_TIE_PROBE_ROWS, UNFILTERED_WALK_MIN_BATCH,
+    UNFILTERED_WALK_MIN_CURSOR_BATCH, UNFILTERED_WALK_TIE_PROBE_ROWS, UNFILTERED_WALK_TIE_ROWS,
+    unfiltered_closes_group_by_id, unfiltered_group_read_limit, unfiltered_walk_batch,
+    unfiltered_walk_cursor_batch, unfiltered_walk_tie_allowance, with_result_id_cap,
 };
 use super::*;
 use crate::error::StorageError;
@@ -285,7 +286,8 @@ async fn resource_memberships(db: &mongodb::Database) -> usize {
 /// id order (`unfiltered_first_group_window`): neither direction groups now,
 /// although the descending head (3/4 of the type) is past
 /// `unfiltered_walk_tie_allowance`, which used to hand it to the grouped
-/// aggregate. A long group the walk reaches after other keys still does
+/// aggregate. A long group the walk reaches after other keys is read by id
+/// too when the window ends in it, and grouped only when it cannot be
 /// (`unfiltered_param_sort_gives_up_on_a_tie_past_its_allowance`).
 #[tokio::test]
 async fn unfiltered_param_sort_on_a_huge_head_tie_group_reads_it_by_id() {
@@ -1477,7 +1479,17 @@ async fn answer(
     fixture: &Fixture,
     query: &SearchQuery,
 ) -> (Vec<String>, bool, Option<u64>) {
-    let result = with_result_id_cap(WIDE, backend.search(&fixture.tenant, query))
+    answer_capped(backend, fixture, query, WIDE).await
+}
+
+/// [`answer`] under the id-set cap `cap`, for windows deeper than `WIDE`.
+async fn answer_capped(
+    backend: &MongoBackend,
+    fixture: &Fixture,
+    query: &SearchQuery,
+    cap: usize,
+) -> (Vec<String>, bool, Option<u64>) {
+    let result = with_result_id_cap(cap, backend.search(&fixture.tenant, query))
         .await
         .unwrap();
     (
@@ -1934,12 +1946,15 @@ async fn unfiltered_param_sort_finishes_a_long_tie_the_window_needs() {
     fixture.close().await;
 }
 
-/// A group the walk cannot finish within its allowance hands the sort to the
-/// grouped aggregate after one count when the walk reaches it after a prefix
-/// of other keys; a window that closes before the group never enters it. The
-/// same group as the first key (ascending) holds the whole window and is read
-/// by id instead (`unfiltered_first_group_window`), without grouping. The
-/// answers are the grouped ones in every case.
+/// A group past the walk's allowance, reached after a prefix of other keys,
+/// is read by id when the window ends in it (`unfiltered_group_closed_by_id`).
+/// A descending date with a row without an end cannot be read that way (the
+/// row ties by its start, which the read does not select): there the group
+/// hands the sort to the grouped aggregate after one count. A window that
+/// closes before the group never enters it, and the same group as the first
+/// key (ascending) holds the whole window and is read by id
+/// (`unfiltered_first_group_window`). The answers are the grouped ones in
+/// every case.
 #[tokio::test]
 async fn unfiltered_param_sort_gives_up_on_a_tie_past_its_allowance() {
     const TIED: usize = UNFILTERED_WALK_TIE_ROWS + 2_000;
@@ -1948,18 +1963,53 @@ async fn unfiltered_param_sort_gives_up_on_a_tie_past_its_allowance() {
         return;
     };
     add_tied_method_rows(&fixture, TIED).await;
+    // `date` mirrors `method` for a descending sort: the first `TIED`
+    // resources share one range end, the others have distinct, later ends,
+    // and one has a second row without an end that starts long before.
+    let shared_end = BASE_MS + 10 * DAY_MS;
+    let mut dates: Vec<Document> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(number, row)| {
+            let end = if number < TIED {
+                shared_end
+            } else {
+                shared_end + number as i64 * 60_000
+            };
+            doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+            "resource_id":&row.id, "param_name":"date",
+            "value_date":at(BASE_MS), "value_date_end":at(end) }
+        })
+        .collect();
+    dates.push(
+        doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+        "resource_id":&fixture.rows[TIED + 7].id, "param_name":"date",
+        "value_date":at(BASE_MS - 400 * DAY_MS) },
+    );
+    for chunk in dates.chunks(5_000) {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(chunk.to_vec())
+            .await
+            .unwrap();
+    }
     let grouped = grouped_backend(&fixture);
     let cap = rows * 2;
     // Ascending, page 1 is inside the group, which is the first key: it is
     // read by id and never grouped. Descending, the 2,000 distinct keys of
     // live resources come first: a window of 1,991 ids ends before the group,
-    // one of 2,001 needs its first id in id order, and so all of it.
-    for (spec, offset, groups) in [
-        ("method", 0u32, false),
-        ("-method", 1_980, false),
-        ("-method", 1_990, true),
+    // one of 2,001 needs its first id in id order: `method` reads it by id,
+    // `date`, with its row without an end, groups.
+    for (spec, param_type, offset, groups, reads_by_id) in [
+        ("method", SearchParamType::Token, 0u32, false, 1),
+        ("-method", SearchParamType::Token, 1_980, false, 0),
+        ("-method", SearchParamType::Token, 1_990, false, 1),
+        ("-date", SearchParamType::Date, 1_980, false, 0),
+        ("-date", SearchParamType::Date, 1_990, true, 0),
     ] {
-        let query = unfiltered_sort(spec, SearchParamType::Token, offset);
+        let query = unfiltered_sort(spec, param_type, offset);
         let label = format!("_sort={spec} offset {offset}");
         restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
         let walked = with_result_id_cap(cap, fixture.backend.search(&fixture.tenant, &query))
@@ -1969,11 +2019,16 @@ async fn unfiltered_param_sort_gives_up_on_a_tie_past_its_allowance() {
         assert_eq!(
             !sort_key_group_commands(&fixture.db).await.is_empty(),
             groups,
-            "{label}: the grouped aggregate runs only for a group past the allowance after other keys"
+            "{label}: the grouped aggregate runs only for a group past the allowance after other keys that cannot be read by id"
+        );
+        assert_eq!(
+            first_group_reads(&fixture.db).await.len(),
+            reads_by_id,
+            "{label}: reads by id"
         );
         if groups {
             // Given up after at most a probe's worth of the group, not 8,192 rows.
-            let read: i64 = sort_key_cursor_entries(&fixture.db, "idx_search_token_v2", "method")
+            let read: i64 = sort_key_cursor_entries(&fixture.db, SEARCH_DATE_END_INDEX, "date")
                 .await
                 .iter()
                 .map(|entry| profiled(entry, "nreturned"))
@@ -2325,6 +2380,445 @@ async fn unfiltered_first_group_read_is_off_with_an_endless_row() {
                     "{label}: the first group was read: {reads:?}"
                 );
                 assert_eq!(walked, answer(&grouped, &fixture, &query).await, "{label}");
+            }
+        }
+    }
+    fixture.close().await;
+}
+
+// #2601: the window ends in a long equal-key group after other keys. The walk
+// counts that group and, when it is much longer than the window still needs,
+// reads it by id (`unfiltered_group_closed_by_id`) instead of walking it to its
+// end or handing it to the grouped aggregate.
+
+const LONG_GROUP_RESOURCES: usize = 3_000;
+
+/// An id-set cap past every window of these tests.
+const LONG_GROUP_CAP: usize = 2 * LONG_GROUP_RESOURCES;
+
+/// The group (0 to 3) of resource `number`'s own key: a tenth each for the
+/// outer groups 0 and 3, two fifths each for the long groups 1 and 2.
+fn long_group_own(number: usize) -> usize {
+    match number % 10 {
+        0 => 0,
+        1..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    }
+}
+
+/// The groups of resource `number`'s keys: its own and, for every seventh
+/// resource of a long group, the other long group's, and for every thirtieth
+/// of group 0 group 2's.
+fn long_group_keys(number: usize) -> Vec<usize> {
+    let own = long_group_own(number);
+    let mut keys = vec![own];
+    if number % 7 == 3 && (own == 1 || own == 2) {
+        keys.push(3 - own);
+    } else if own == 0 && number.is_multiple_of(30) {
+        keys.push(2);
+    }
+    keys
+}
+
+/// The group resource `number` sorts in: its lowest key ascending, its
+/// highest descending.
+fn long_group_member(number: usize, descending: bool) -> usize {
+    let keys = long_group_keys(number);
+    if descending {
+        keys.into_iter().max().unwrap()
+    } else {
+        keys.into_iter().min().unwrap()
+    }
+}
+
+/// The sorts the long-group tests walk: a token (whose index puts the system
+/// between the code and `resource_id`), a string (index-ordered by id inside a
+/// key), and a date (by start ascending, by end descending).
+fn long_group_sorts() -> Vec<(&'static str, SearchParamType)> {
+    vec![
+        ("method", SearchParamType::Token),
+        ("family", SearchParamType::String),
+        ("date", SearchParamType::Date),
+    ]
+}
+
+/// Rows of `long_group_sorts` for every resource: one per key of
+/// `long_group_keys`, the own key written twice on every eleventh resource.
+async fn add_long_group_rows(fixture: &Fixture) {
+    let mut rows = Vec::new();
+    for (number, row) in fixture.rows.iter().enumerate() {
+        let mut groups = long_group_keys(number);
+        if number % 11 == 5 {
+            groups.push(groups[0]);
+        }
+        for group in groups {
+            let start = BASE_MS + group as i64 * DAY_MS;
+            let code = ["a", "b", "c", "d"][group];
+            for (name, fields) in [
+                ("method", doc! { "value_token_code": code }),
+                ("family", doc! { "value_string": format!("g{group}") }),
+                (
+                    "date",
+                    doc! { "value_date": at(start), "value_date_end": at(start + DAY_MS) },
+                ),
+            ] {
+                let mut entry = doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                "resource_id":&row.id, "param_name":name };
+                entry.extend(fields);
+                rows.push(entry);
+            }
+        }
+    }
+    for chunk in rows.chunks(5_000) {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(chunk.to_vec())
+            .await
+            .unwrap();
+    }
+}
+
+/// Where the first, second and third groups end in the sort's direction:
+/// live members counted, in key order.
+fn long_group_boundaries(fixture: &Fixture, descending: bool) -> Vec<usize> {
+    let mut sizes = [0usize; 4];
+    for (number, row) in fixture.rows.iter().enumerate() {
+        if !row.deleted {
+            sizes[long_group_member(number, descending)] += 1;
+        }
+    }
+    if descending {
+        sizes.reverse();
+    }
+    let mut end = 0;
+    sizes[..3]
+        .iter()
+        .map(|size| {
+            end += size;
+            end
+        })
+        .collect()
+}
+
+/// Pages on both sides of the ends of the first three groups (into the
+/// second, the third and the fourth group) match the grouped answer, in both
+/// key and both id directions, with the total.
+async fn assert_long_group_parity(fixture: &Fixture, grouped: &MongoBackend, state: &str) {
+    for (name, param_type) in long_group_sorts() {
+        for spec in [name.to_owned(), format!("-{name}")] {
+            let descending = spec.starts_with('-');
+            for boundary in long_group_boundaries(fixture, descending) {
+                for offset in [
+                    boundary - 15,
+                    boundary - 11,
+                    boundary - 10,
+                    boundary - 1,
+                    boundary,
+                    boundary + 20,
+                ] {
+                    for ids_descending in [false, true] {
+                        let query =
+                            unfiltered_sort_by_id(&spec, param_type, offset as u32, ids_descending);
+                        let label = format!(
+                            "{state}: _sort={spec} ids descending {ids_descending} offset {offset}"
+                        );
+                        let walked =
+                            answer_capped(&fixture.backend, fixture, &query, LONG_GROUP_CAP).await;
+                        let expected =
+                            answer_capped(grouped, fixture, &query, LONG_GROUP_CAP).await;
+                        assert_eq!(walked.0, expected.0, "{label}: page");
+                        assert_eq!(walked.1, expected.1, "{label}: has_next");
+                        assert_eq!(walked.2, expected.2, "{label}: total");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Marks every live resource `dead` selects deleted, in `resources` and in
+/// the fixture's rows.
+async fn mark_deleted_where(fixture: &mut Fixture, dead: impl Fn(usize) -> bool) {
+    let ids: Vec<String> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(number, row)| !row.deleted && dead(*number))
+        .map(|(_, row)| row.id.clone())
+        .collect();
+    fixture
+        .db
+        .collection::<Document>("resources")
+        .update_many(
+            doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation", "id":{"$in":&ids} },
+            doc! { "$set":{"is_deleted":true} },
+        )
+        .await
+        .unwrap();
+    for (number, row) in fixture.rows.iter_mut().enumerate() {
+        if dead(number) {
+            row.deleted = true;
+        }
+    }
+}
+
+/// The `limit` of each id-ordered read of a search, in the order they ran.
+async fn group_read_limits(db: &mongodb::Database) -> Vec<i64> {
+    first_group_reads(db)
+        .await
+        .iter()
+        .map(|read| profiled(read.get_document("command").unwrap(), "limit"))
+        .collect()
+}
+
+#[tokio::test]
+async fn unfiltered_walk_closes_a_long_group_by_id_like_the_grouped_pages() {
+    let Some(mut fixture) = Fixture::new("sort-long-group-parity", LONG_GROUP_RESOURCES).await
+    else {
+        return;
+    };
+    add_long_group_rows(&fixture).await;
+    let grouped = grouped_backend(&fixture);
+
+    // Stale rows of deleted resources among the lowest ids of every group.
+    fixture.mark_deleted(1, 40).await;
+    assert_long_group_parity(&fixture, &grouped, "low ids deleted").await;
+
+    // A window 10 ids into the second group, ids descending: the walk reads
+    // the group in ascending id order, counts it once and reads its 21
+    // highest live members by id, once; nothing is grouped.
+    let boundary = long_group_boundaries(&fixture, false)[0];
+    for (name, param_type) in long_group_sorts() {
+        let index = walk_index(name, param_type);
+        let query = unfiltered_sort_by_id(name, param_type, boundary as u32 + 10, true);
+        let label = format!("_sort={name},-_id offset {}", boundary + 10);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let found = sort_key_group_commands(&fixture.db).await;
+        assert!(
+            found.is_empty(),
+            "{label}: the sort-key $group ran: {found:?}"
+        );
+        let reads = first_group_reads(&fixture.db).await;
+        assert_eq!(reads.len(), 1, "{label}: reads by id {reads:?}");
+        let command = reads[0].get_document("command").unwrap();
+        assert_eq!(command.get_str("hint"), Ok(index), "{label}: hint");
+        assert_eq!(
+            command.get_document("sort").unwrap(),
+            &doc! { "resource_id": -1 },
+            "{label}: id direction"
+        );
+        assert_eq!(profiled(&reads[0], "docsExamined"), 0, "{label}: fetched");
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, LONG_GROUP_CAP).await,
+            "{label}"
+        );
+    }
+
+    // The second group's lowest members (about 270, those under number 600)
+    // are dead: its first reads by id find no live member, and each next one
+    // asks for twice the rows.
+    mark_deleted_where(&mut fixture, |number| {
+        number < 600 && long_group_member(number, false) == 1
+    })
+    .await;
+    let boundary = long_group_boundaries(&fixture, false)[0];
+    for (name, param_type) in long_group_sorts() {
+        let query = unfiltered_sort_by_id(name, param_type, boundary as u32 + 20, false);
+        let label = format!("dead head: _sort={name} offset {}", boundary + 20);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert!(
+            sort_key_group_commands(&fixture.db).await.is_empty(),
+            "{label}: grouped"
+        );
+        let limits = group_read_limits(&fixture.db).await;
+        assert!(limits.len() >= 2, "{label}: reads by id {limits:?}");
+        assert!(
+            limits.windows(2).all(|pair| pair[1] == 2 * pair[0]),
+            "{label}: each read doubles the last: {limits:?}"
+        );
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, LONG_GROUP_CAP).await,
+            "{label}"
+        );
+    }
+    assert_long_group_parity(&fixture, &grouped, "dead head of the second group").await;
+
+    // Every member of the ascending second group is dead: the reads by id
+    // find none, the walk goes on through the group, and the pages agree.
+    mark_deleted_where(&mut fixture, |number| long_group_member(number, false) == 1).await;
+    assert_long_group_parity(&fixture, &grouped, "second group dead").await;
+    fixture.close().await;
+}
+
+/// A first group that runs past the cursor's first batch but holds fewer rows
+/// than the window is declined after one bounded count: it is not read by id
+/// (and the group that follows, of distinct keys, is walked).
+#[tokio::test]
+async fn unfiltered_first_group_shorter_than_the_window_is_not_read_by_id() {
+    const TIED: usize = 2_100;
+    let rows = TIED + 400;
+    let Some(fixture) = Fixture::new("sort-first-group-short", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    let grouped = grouped_backend(&fixture);
+    for ids_descending in [false, true] {
+        // A window of 2,200 ids.
+        let query = unfiltered_sort_by_id("method", SearchParamType::Token, 2_189, ids_descending);
+        let label = format!("ids descending {ids_descending}");
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let reads = first_group_reads(&fixture.db).await;
+        assert!(reads.is_empty(), "{label}: read by id: {reads:?}");
+        assert!(
+            sort_key_group_commands(&fixture.db).await.is_empty(),
+            "{label}: grouped"
+        );
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, LONG_GROUP_CAP).await,
+            "{label}"
+        );
+    }
+    fixture.close().await;
+}
+
+#[test]
+fn unfiltered_group_reads_and_the_by_id_threshold() {
+    // A sixteenth more than lacking, at least 32, not cut at SORT_ID_CHUNK.
+    assert_eq!(unfiltered_group_read_limit(1), UNFILTERED_WALK_MIN_BATCH);
+    assert_eq!(unfiltered_group_read_limit(31), 33);
+    assert_eq!(unfiltered_group_read_limit(9_600), 10_201);
+    assert!(unfiltered_group_read_limit(10_000) > SORT_ID_CHUNK);
+    // The rows read, the lack and a quarter, and a margin of 256.
+    assert!(!unfiltered_closes_group_by_id(384, 128, 0));
+    assert!(unfiltered_closes_group_by_id(385, 128, 0));
+    assert!(!unfiltered_closes_group_by_id(1_893, 512, 900));
+    assert!(unfiltered_closes_group_by_id(1_894, 512, 900));
+    assert!(!unfiltered_closes_group_by_id(u64::MAX, usize::MAX, 1));
+    // The allowance a probe counts up to is always above the threshold, so
+    // the bounded count decides it.
+    for (tie_rows, lacking, wanted) in [
+        (UNFILTERED_WALK_FULL_TIE_PROBE_ROWS, 0, 11),
+        (UNFILTERED_WALK_TIE_PROBE_ROWS, 400, 401),
+        (UNFILTERED_WALK_TIE_PROBE_ROWS, 29_000, 30_021),
+        (UNFILTERED_WALK_TIE_PROBE_ROWS, 290_000, 290_021),
+    ] {
+        let allowed = unfiltered_walk_tie_allowance(tie_rows, lacking, wanted);
+        assert!(unfiltered_closes_group_by_id(
+            allowed as u64 + 1,
+            tie_rows,
+            lacking
+        ));
+    }
+}
+
+/// `may_keep` is false only for rows `push` drops whether they match or not:
+/// pushing such a row as a match or as a miss leaves the same window, also
+/// when the answer was taken before a whole batch of pushes.
+#[test]
+fn param_sort_window_may_keep_only_skips_rows_push_drops() {
+    use crate::types::SortDirection;
+
+    fn same(a: &ParamSortWindow, b: &ParamSortWindow) -> bool {
+        a.ordered == b.ordered && a.tied == b.tied && a.key == b.key
+    }
+
+    for direction in [SortDirection::Ascending, SortDirection::Descending] {
+        for wanted in [1, 5, 11, 40] {
+            // Keys in order, ties of very different lengths, ids in an order
+            // unrelated to the key; a third of the rows fail their check.
+            let rows: Vec<(String, Bson, bool)> = (0..600u64)
+                .map(|number| {
+                    let key = match number {
+                        0..=29 => 0,
+                        30..=99 => 1,
+                        100..=104 => 2,
+                        _ => 3 + (number - 105) / 150,
+                    };
+                    let id = format!("{:05}", number * 7_919 % 10_007);
+                    (id, Bson::Int64(key as i64), number % 3 != 1)
+                })
+                .collect();
+            let mut skipped = 0;
+            for batch in [1usize, 7, 64] {
+                let mut plain = ParamSortWindow::new(wanted, direction);
+                let mut skipping = ParamSortWindow::new(wanted, direction);
+                for chunk in rows.chunks(batch) {
+                    let keep: Vec<bool> = chunk
+                        .iter()
+                        .map(|(id, key, _)| skipping.may_keep(id, key))
+                        .collect();
+                    for ((id, key, matches), keep) in chunk.iter().zip(keep) {
+                        if !keep {
+                            skipped += 1;
+                            let mut as_match = skipping.clone();
+                            as_match.push(id.clone(), key.clone(), true);
+                            let mut as_miss = skipping.clone();
+                            as_miss.push(id.clone(), key.clone(), false);
+                            assert!(same(&as_match, &as_miss), "{direction:?} {wanted} {id}");
+                        }
+                        let done_plain = plain.push(id.clone(), key.clone(), *matches);
+                        let done_skipping =
+                            skipping.push(id.clone(), key.clone(), *matches && keep);
+                        assert_eq!(done_plain, done_skipping);
+                        assert!(same(&plain, &skipping), "{direction:?} {wanted} {id}");
+                    }
+                }
+                assert_eq!(plain.finish(), skipping.finish());
+            }
+            assert!(skipped > 0, "{direction:?} {wanted}: nothing was skipped");
+        }
+    }
+}
+
+/// MongoDB orders `-0.0` and `0.0` as one key; the walk's key comparison
+/// must too, or a group of zeros splits and its ids lose their order.
+#[tokio::test]
+async fn unfiltered_sort_treats_signed_zeros_as_one_key() {
+    let Some(fixture) = Fixture::new("sort-signed-zero", 400).await else {
+        return;
+    };
+    let rows: Vec<Document> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(number, row)| {
+            let value = match number % 4 {
+                0 => Bson::Double(-0.0),
+                1 => Bson::Double(0.0),
+                2 => Bson::Int32(0),
+                _ => Bson::Double(number as f64),
+            };
+            doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+            "resource_id":&row.id, "param_name":"probability", "value_number":value }
+        })
+        .collect();
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .insert_many(rows)
+        .await
+        .unwrap();
+    let grouped = grouped_backend(&fixture);
+    for spec in ["probability", "-probability"] {
+        for ids_descending in [false, true] {
+            for offset in [0u32, 140, 290, 295, 300, 390] {
+                let query =
+                    unfiltered_sort_by_id(spec, SearchParamType::Number, offset, ids_descending);
+                let label = format!("_sort={spec} ids descending {ids_descending} offset {offset}");
+                let walked = answer(&fixture.backend, &fixture, &query).await;
+                let expected = answer(&grouped, &fixture, &query).await;
+                assert_eq!(walked, expected, "{label}");
             }
         }
     }

@@ -501,9 +501,10 @@ the page.
 
 The walk does have a guard on the equal-key groups it reads whole, to order
 them by id. A parameter with few distinct values (`status`, `gender`) has a
-group of hundreds of thousands of rows. When a group reaches 512 rows the walk
-counts it once, with a covered count bounded just above what it may read
-(`sort_key_rows_exceed`, about 0.13 microseconds a key). If more of its rows
+group of hundreds of thousands of rows. When a group reaches 512 rows (128
+when the window already holds every id it needs and only waits for that group
+to end) the walk counts it once, with a covered count bounded just above what it may read
+(`sort_key_rows_upto`, about 0.13 microseconds a key). If more of its rows
 remain than the window still lacks plus `max(UNFILTERED_WALK_TIE_ROWS,
 offset + _count + 1)` (`UNFILTERED_WALK_TIE_ROWS` is 8,192), grouping is
 cheaper and the grouped aggregate answers with the same page, after at most
@@ -514,19 +515,58 @@ after 8,192 rows with the walk thrown away. For a descending date the count
 sees only the rows with a range end, a lower bound of the group: it can let the
 walk finish a group, never change the page.
 
+The count also tells the walk when the group its window ends in is much longer
+than the window still needs: more rows than those already read, plus what the
+window lacks and a quarter more, plus 256 (`unfiltered_closes_group_by_id`).
+Then, before finishing or abandoning the group, the walk reads it by id
+(`unfiltered_group_closed_by_id`): it pushes the batch's rows of earlier keys,
+takes the ids ordered before the group (the open tie of the group itself is
+dropped), and reads the group's rows on the walk's own index, with the same
+key filter as the count, sorted by `resource_id` in the request's id direction
+and limited to what the window lacks plus a sixteenth (at least 32). Resources
+the walk already met at an earlier key are not members and are skipped, as
+are a resource's repeated rows; the rest are checked for liveness in one
+command (ids the walk already found live are not checked again), and the first
+ones that fill the window close it. This is the grouped answer: every key
+before the group is complete, and the group's members follow in id order. A
+read cut before enough live members is repeated with twice the limit, up to
+10,000 rows; when the limit would pass that, the group ends with too few live
+members, or the index was dropped, the walk goes on exactly as without the
+read, and still hands a group past its allowance to the grouped aggregate. A
+descending date or quantity with any row without an end does not read by id,
+for the reason given below. This serves a window that crosses from a first
+group into a long second one (`CarePlan?_sort=status&_offset=1700`,
+`Condition?_sort=clinical-status&_offset=8600`), which used to read the
+first group by id in vain, walk it again, walk into the second group and then
+either finish it row by row or, when it was too long, group the whole
+parameter.
+
+Inside a batch, a row whose key is that of a full open tie and whose id cannot
+displace the tie's worst id is dropped by the window whatever its check says;
+such rows are not sent to the liveness (or membership) check, and a batch with
+none left sends no command.
+
+Numeric keys compare `-0.0` equal to `0.0`, as the server orders and matches
+them; telling them apart split a group of zeros into alternating groups and
+lost its id order.
+
 A window inside the first group is not walked at all
 (`unfiltered_first_group_window`). Before the walk starts it looks at the
 sort-key cursor's first batch, which the walk requests anyway and keeps. When
 that batch opens with at least 128 rows of one key `K`
 (`UNFILTERED_WALK_MIN_CURSOR_BATCH`), does not show the group ending before
-`offset + _count + 1` rows, a descending date or quantity has no row without an
-end (its null-end stream is empty), and `offset + _count + 1` is at most 10,000,
+`offset + _count + 1` distinct resources, a descending date or quantity has no
+row without an end (its null-end stream is empty), a group that goes on past
+the batch has at least `offset + _count + 1` rows (one bounded count, so a
+window that crosses the group's end costs a count instead of a read and a
+liveness check), and `offset + _count + 1` is at most 10,000,
 the group is read by id: one covered `find` of the rows with key `K` on the
 walk's own index (a descending date: `value_date_end = K` on
 `idx_search_date_end`; a descending quantity: `value_quantity_high = K` on
 `idx_search_quantity_high`), projected to `resource_id`, sorted by `resource_id`
 in the request's id direction and limited to the window plus a sixteenth
-(`unfiltered_walk_batch`), then one liveness check of those ids. A resource's
+(`unfiltered_group_read_limit`, which is not cut at 10,000, so a window close to
+it keeps room for stale rows), then one liveness check of those ids. A resource's
 repeated rows are adjacent in that order and count once. This is the grouped
 answer: no resource has a key before `K`, so the group's members are exactly
 the resources with a row of `K`, and they are ordered by id; resources after
