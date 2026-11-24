@@ -179,6 +179,18 @@ async fn handle_ws_connection(
             // Notification from the subscription engine.
             notification = rx.recv() => {
                 match notification {
+                    // The manager released this client: it let its queue
+                    // fill and was dropped, or the subscription went away.
+                    // The backlog is not delivered, so a client that reads
+                    // just inside the send deadline cannot keep its queued
+                    // bundles in memory for hours after being dropped.
+                    Some(_) if rx.is_closed() => {
+                        warn!(
+                            client_id = %client_id,
+                            "WebSocket client was released by the subscription engine; closing without delivering its backlog"
+                        );
+                        break;
+                    }
                     Some(bundle) => {
                         match serde_json::to_string(&bundle) {
                             Ok(msg) => match send_within_deadline(&mut socket, msg).await {
