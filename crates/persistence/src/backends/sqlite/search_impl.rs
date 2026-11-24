@@ -883,7 +883,9 @@ fn date_walk_index_present(conn: &rusqlite::Connection, desc: bool) -> bool {
 ///
 /// An `_offset` past every resource with a value places the offset of the
 /// tail from a `COUNT` of them, which is linear in the resources of the type
-/// (as the correlated sort was).
+/// (as the correlated sort was). An `_offset` above `DATE_WALK_MAX_OFFSET` never
+/// reaches here: `unfiltered_single_date_sort` refuses it and the general
+/// statement serves the page.
 #[allow(clippy::too_many_arguments)]
 fn walk_date_page(
     conn: &rusqlite::Connection,

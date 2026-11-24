@@ -85,9 +85,10 @@ pub use pagination::{
 
 pub use search_params::{
     ChainConfig, ChainedParameter, CompartmentMembership, CompositeSearchComponent, ContainedMode,
-    ContainedReturn, IncludeDirective, IncludeType, ReverseChainedParameter, SearchModifier,
-    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirection,
-    SortDirective, SummaryMode, TotalMode, absolute_reference_target, strip_reference_version,
+    ContainedReturn, DATE_WALK_MAX_OFFSET, IncludeDirective, IncludeType, ReverseChainedParameter,
+    SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    SortDirection, SortDirective, SummaryMode, TotalMode, absolute_reference_target,
+    strip_reference_version,
 };
 
 pub use meta_update::{MetaOperation, apply_meta_operation, merge_update_meta};

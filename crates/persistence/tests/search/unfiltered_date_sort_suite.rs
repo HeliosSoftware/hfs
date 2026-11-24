@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider, SearchResult};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_persistence::types::DATE_WALK_MAX_OFFSET;
 use helios_persistence::types::{
     SearchParamType, SearchQuery, SortDirection, SortDirective, TotalMode,
 };
@@ -553,6 +554,21 @@ where
                 );
             }
         }
+
+        // An offset above the walk's cap is served by the general statement
+        // (the predicate refuses it) and still answers the same page.
+        let deep = DATE_WALK_MAX_OFFSET as u32 + 1;
+        let mut walk = query(rt, direction, Path::Walk, 7);
+        walk.offset = Some(deep);
+        assert!(
+            walk.unfiltered_single_date_sort().is_none(),
+            "{label}: a deep offset is not walked"
+        );
+        let mut on_general = query(rt, direction, Path::General, 7);
+        on_general.offset = Some(deep);
+        let walk = PageView::of(&run(backend, &tenant, &walk).await);
+        let on_general = PageView::of(&run(backend, &tenant, &on_general).await);
+        assert_eq!(walk, on_general, "{label} offset={deep}: deep offset page");
     }
 
     // --- The total: the same on both paths, and the count of live resources --
