@@ -421,7 +421,8 @@ them, and exposes results through a status manifest.
   poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
-  (principal, else peer address) per poll token.
+  (principal, else peer address, an IPv6 peer by its /64 network per
+  `HFS_RATE_LIMIT_IPV6_PREFIX`) per poll token.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
   backend — no separate job store to configure.

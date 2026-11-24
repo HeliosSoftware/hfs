@@ -973,6 +973,8 @@ where
 
     // Throttle before any job-store work: a client ignoring the advertised
     // Retry-After should cost a cheap 429, not a round trip per poll.
+    let peer = peer
+        .map(|ip| crate::extractors::rate_limit_peer(ip, state.config().rate_limit_ipv6_prefix));
     check_poll_rate_limit(cfg, &token, principal.as_ref(), peer)?;
 
     let target = jobs
