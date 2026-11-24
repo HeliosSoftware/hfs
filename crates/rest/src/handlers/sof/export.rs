@@ -256,7 +256,40 @@ where
         return Ok(missing_subject_response());
     }
 
-    submit_export_job(&state, &tenant, work, inputs).await
+    let owner_subject = principal.map(|p| p.subject);
+    submit_export_job(&state, &tenant, work, inputs, owner_subject).await
+}
+
+/// Whether `principal` may poll, read, download or cancel job `job_id`: the
+/// subject that started it, or a wildcard reader outside `patient/`, the rule
+/// `$export` jobs follow. With auth off there is no principal and no check.
+fn may_access_job<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    job_id: &str,
+    principal: Option<&Principal>,
+) -> bool
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let owner = state
+        .export_controller()
+        .and_then(|c| c.owner_subject(tenant.tenant_id(), job_id));
+    crate::handlers::bulk_export::owns_job(principal, owner.as_deref())
+}
+
+/// The `404` a job the caller may not see answers with, the same as an
+/// unknown job's.
+fn job_not_found(job_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "not-found",
+                "diagnostics": format!("Export job '{job_id}' not found")}]
+        })),
+    )
+        .into_response()
 }
 
 /// 400 response for a request that names no subject. `subject` is `1..*`, and
@@ -587,6 +620,7 @@ async fn submit_export_job<S>(
     tenant: &TenantExtractor,
     work: ExportWork,
     inputs: ExportInputs,
+    owner_subject: Option<String>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -671,7 +705,7 @@ where
         return Ok(resp);
     }
 
-    dispatch_export_job(state, tenant, work, inputs).await
+    dispatch_export_job(state, tenant, work, inputs, owner_subject).await
 }
 
 /// Shared tail of every export kick-off: require the controller, build the
@@ -681,6 +715,7 @@ async fn dispatch_export_job<S>(
     tenant: &TenantExtractor,
     work: ExportWork,
     inputs: ExportInputs,
+    owner_subject: Option<String>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -720,6 +755,7 @@ where
         format: inputs.format.clone(),
         header: inputs.header,
         client_tracking_id: inputs.client_tracking_id.clone(),
+        owner_subject,
     };
 
     let job_id = match controller.submit(task) {
@@ -772,11 +808,13 @@ pub async fn get_export_status_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
     headers: HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // Spec Common Operation Behavior — Asynchronous Delivery: the `Accept`
     // header on each poll governs that poll's response (interim `202 Accepted`
     // bodies and error responses). The FHIR XML representation is not supported
@@ -797,6 +835,9 @@ where
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.get_status(tenant.tenant_id(), &job_id) {
         None | Some(JobStatus::Cancelled { .. }) => Ok((
@@ -972,11 +1013,13 @@ pub async fn get_export_result_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
     headers: HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // The result `GET`'s `Accept` header governs the manifest representation.
     // FHIR XML is not supported → 406, same as the run operations.
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
@@ -994,6 +1037,9 @@ where
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.get_status(tenant.tenant_id(), &job_id) {
         // Unknown, cancelled, or still running → no result available. The
@@ -1127,16 +1173,21 @@ pub async fn cancel_export_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     let controller = match state.export_controller() {
         Some(c) => c,
         None => {
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     if controller.cancel(tenant.tenant_id(), &job_id) {
         // Spec: cancellation responds 202 Accepted, not 204 No Content.
@@ -1171,16 +1222,21 @@ pub async fn download_export_file_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path((job_id, filename)): Path<(String, String)>,
+    principal: Option<axum::Extension<Principal>>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     let controller = match state.export_controller() {
         Some(c) => c,
         None => {
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.read_shard(tenant.tenant_id(), &job_id, &filename) {
         None => Ok((

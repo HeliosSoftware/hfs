@@ -56,6 +56,10 @@ pub struct JobManifest {
     pub completed_at: DateTime<Utc>,
     /// Client-supplied tracking id, echoed back to the caller if present.
     pub client_tracking_id: Option<String>,
+    /// Subject that started the job, so a restarted process keeps enforcing
+    /// it. Absent in manifests written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_subject: Option<String>,
 }
 
 /// One output file inside a [`JobManifest`], mirroring
@@ -474,6 +478,7 @@ mod tests {
                 submitted_at: Utc::now(),
                 completed_at: Utc::now(),
                 client_tracking_id: None,
+                owner_subject: None,
             },
         )
         .unwrap();

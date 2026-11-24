@@ -339,7 +339,30 @@ const PATIENT_SCOPE_ENDPOINT_REFUSED: &str = "This endpoint is not available und
 /// `patient/` scopes: the root batch/transaction endpoint only, whose handler
 /// authorizes each entry itself.
 fn patient_only_unclassified_path_allowed(routed_path: &str) -> bool {
-    routed_path.split('/').all(str::is_empty)
+    let segments: Vec<&str> = routed_path.split('/').filter(|s| !s.is_empty()).collect();
+    // A `Patient/$export` job is confined to the launch patient when it is
+    // started, and its handlers admit only the token that started it.
+    segments.is_empty() || is_bulk_export_job_route(&segments)
+}
+
+/// `GET|DELETE /export-status/{job}` and `GET /export-file/{job}/{part}`: the
+/// poll, cancel and download routes of a `$export` job.
+fn is_bulk_export_job_route(segments: &[&str]) -> bool {
+    matches!(segments, ["export-status", _] | ["export-file", _, _])
+}
+
+/// The asynchronous job routes: `$export`'s status and file routes,
+/// `$sql-export`'s `/export/{job}/status|result|{file}`, and `$bulk-submit`'s
+/// status and file routes. Their segments are not resource types, so the
+/// middleware does not judge them as resource operations; each handler admits
+/// the principal that started the job, or a wildcard reader (`$export`,
+/// `$sql-export`) or a `system/bulk-submit` holder (`$bulk-submit`).
+fn is_handler_authorized_job_route(segments: &[&str]) -> bool {
+    is_bulk_export_job_route(segments)
+        || matches!(
+            segments,
+            ["export", _, _] | ["bulk-submit-status", _] | ["bulk-submit-file", _, _]
+        )
 }
 
 /// The request shapes a compartment-confined grant may proceed with — those
@@ -608,6 +631,10 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         return None;
     }
 
+    if is_handler_authorized_job_route(&segments) {
+        return None;
+    }
+
     // The first segment is the resource type (or tenant — handled by prefix stripping)
     let resource_type = first.to_string();
 
@@ -730,6 +757,51 @@ fn forbidden_response(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The job routes are not resource operations: their handlers authorize
+    /// the caller (#2660). A path of the same length under a real type still is.
+    #[test]
+    fn job_routes_are_left_to_their_handlers() {
+        for (path, method) in [
+            ("/export-status/job-1", "GET"),
+            ("/export-status/job-1", "DELETE"),
+            ("/export-file/job-1/Patient-0.ndjson", "GET"),
+            ("/export/job-1/status", "GET"),
+            ("/export/job-1/status", "DELETE"),
+            ("/export/job-1/result", "GET"),
+            ("/export/job-1/shard-0.ndjson", "GET"),
+            ("/bulk-submit-status/token", "GET"),
+            ("/bulk-submit-status/token", "DELETE"),
+            ("/bulk-submit-file/token/part-0", "GET"),
+        ] {
+            assert_eq!(extract_operation(path, method), None, "{method} {path}");
+        }
+        assert_eq!(
+            extract_operation("/Patient/p1/Observation", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Search))
+        );
+        assert!(extract_operation("/export-status/job-1/extra", "GET").is_some());
+    }
+
+    /// A patient-only token may reach the `$export` job routes, whose job it
+    /// can only have started as `Patient/$export`, and no other job route.
+    #[test]
+    fn a_patient_only_token_may_reach_only_the_export_job_routes() {
+        assert!(patient_only_unclassified_path_allowed("/"));
+        assert!(patient_only_unclassified_path_allowed(
+            "/export-status/job-1"
+        ));
+        assert!(patient_only_unclassified_path_allowed(
+            "/export-file/job-1/Observation-0.ndjson"
+        ));
+        assert!(!patient_only_unclassified_path_allowed(
+            "/export/job-1/status"
+        ));
+        assert!(!patient_only_unclassified_path_allowed(
+            "/bulk-submit-status/token"
+        ));
+        assert!(!patient_only_unclassified_path_allowed("/_history"));
+    }
 
     #[test]
     fn test_exempt_paths() {

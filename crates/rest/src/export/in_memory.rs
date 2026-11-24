@@ -218,6 +218,23 @@ pub struct CleanupConfig {
     pub interval: Duration,
 }
 
+/// Who submitted a job: its tenant, and the subject of the principal that
+/// started it when auth was on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobOwner {
+    tenant_id: String,
+    subject: Option<String>,
+}
+
+impl From<String> for JobOwner {
+    fn from(tenant_id: String) -> Self {
+        Self {
+            tenant_id,
+            subject: None,
+        }
+    }
+}
+
 /// In-memory export job controller.
 ///
 /// Jobs are tracked in a `DashMap` and execute in background `tokio` tasks,
@@ -228,9 +245,10 @@ pub struct CleanupConfig {
 /// in memory, so the queue is bounded per tenant.
 pub struct InMemoryController<Sink: ExportSink> {
     jobs: Arc<DashMap<String, JobStatus>>,
-    /// Tenant ID that submitted each job. Used to gate status / cancel /
-    /// download so one tenant cannot access another tenant's exports.
-    job_tenants: Arc<DashMap<String, String>>,
+    /// Tenant (and subject) that submitted each job. Used to gate status /
+    /// cancel / download so one tenant cannot access another tenant's exports,
+    /// and the handlers admit only the owner within the tenant.
+    job_tenants: Arc<DashMap<String, JobOwner>>,
     runner: Arc<dyn SofRunner>,
     sink: Sink,
     semaphore: Arc<Semaphore>,
@@ -393,7 +411,7 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
     fn tenant_matches(&self, tenant_id: &str, job_id: &str) -> bool {
         self.job_tenants
             .get(job_id)
-            .map(|v| v.value() == tenant_id)
+            .map(|v| v.value().tenant_id == tenant_id)
             .unwrap_or(false)
     }
 }
@@ -415,8 +433,13 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         let job_id = Uuid::new_v4().to_string();
         let submitted_at = Utc::now();
 
-        self.job_tenants
-            .insert(job_id.clone(), task.tenant.tenant_id().as_str().to_string());
+        self.job_tenants.insert(
+            job_id.clone(),
+            JobOwner {
+                tenant_id: task.tenant.tenant_id().as_str().to_string(),
+                subject: task.owner_subject.clone(),
+            },
+        );
 
         self.jobs.insert(
             job_id.clone(),
@@ -543,6 +566,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                             submitted_at,
                             completed_at,
                             client_tracking_id: task.client_tracking_id.clone(),
+                            owner_subject: task.owner_subject.clone(),
                         };
                         if let Err(e) = sink.persist_completion(&jid, &manifest) {
                             // Degrade to pre-fix behaviour: the job still
@@ -632,6 +656,13 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         });
 
         Ok(job_id)
+    }
+
+    fn owner_subject(&self, tenant_id: &str, job_id: &str) -> Option<String> {
+        self.job_tenants
+            .get(job_id)
+            .filter(|owner| owner.tenant_id == tenant_id)
+            .and_then(|owner| owner.subject.clone())
     }
 
     fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
@@ -782,7 +813,7 @@ fn download_url_lifetime_cap(
 /// the server from starting.
 fn rehydrate_completed_jobs<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
-    job_tenants: &DashMap<String, String>,
+    job_tenants: &DashMap<String, JobOwner>,
     sink: &Sink,
 ) {
     for (key, manifest) in sink.load_completed() {
@@ -807,7 +838,13 @@ fn rehydrate_completed_jobs<Sink: ExportSink>(
             })
             .collect();
 
-        job_tenants.insert(manifest.job_id.clone(), manifest.tenant_id.clone());
+        job_tenants.insert(
+            manifest.job_id.clone(),
+            JobOwner {
+                tenant_id: manifest.tenant_id.clone(),
+                subject: manifest.owner_subject.clone(),
+            },
+        );
         jobs.insert(
             manifest.job_id.clone(),
             JobStatus::Completed {
@@ -836,7 +873,7 @@ fn rehydrate_completed_jobs<Sink: ExportSink>(
 /// ([`JobStatus::terminal_at`] returns `None` for them).
 fn reap_expired<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
-    job_tenants: &DashMap<String, String>,
+    job_tenants: &DashMap<String, JobOwner>,
     sink: &Sink,
     output_ttl: Duration,
 ) {
@@ -1852,6 +1889,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -1908,6 +1946,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -2028,6 +2067,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -2174,6 +2214,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -2290,6 +2331,7 @@ mod tests {
             format: "ndjson".to_string(),
             header: true,
             client_tracking_id: None,
+            owner_subject: None,
         })
         .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
@@ -2360,6 +2402,7 @@ mod tests {
             format: "ndjson".to_string(),
             header: true,
             client_tracking_id: None,
+            owner_subject: None,
         })
         .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
@@ -2652,6 +2695,7 @@ mod tests {
                 format: "csv".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
@@ -2725,6 +2769,7 @@ mod tests {
                 format: "csv".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
@@ -2796,6 +2841,7 @@ mod tests {
                 format: "csv".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
@@ -2867,6 +2913,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -2938,6 +2985,7 @@ mod tests {
                 format: "ndjson".to_string(),
                 header: true,
                 client_tracking_id: None,
+                owner_subject: None,
             })
             .expect("job accepted");
 
@@ -2981,7 +3029,7 @@ mod tests {
     fn reap_expired_reclaims_terminal_jobs_only() {
         let sink = InMemorySink::new("http://localhost");
         let jobs: DashMap<String, JobStatus> = DashMap::new();
-        let job_tenants: DashMap<String, String> = DashMap::new();
+        let job_tenants: DashMap<String, JobOwner> = DashMap::new();
 
         // An old completed job with written output — should be reclaimed.
         let old = "old-completed".to_string();
@@ -2996,7 +3044,7 @@ mod tests {
                 client_tracking_id: None,
             },
         );
-        job_tenants.insert(old.clone(), "t1".to_string());
+        job_tenants.insert(old.clone(), "t1".to_string().into());
         sink.write_shard(&old, 0, b"old\n".to_vec(), "ndjson")
             .unwrap();
 
@@ -3012,7 +3060,7 @@ mod tests {
                 client_tracking_id: None,
             },
         );
-        job_tenants.insert(fresh.clone(), "t1".to_string());
+        job_tenants.insert(fresh.clone(), "t1".to_string().into());
 
         // A running job — never reclaimed regardless of age.
         let running = "still-running".to_string();
@@ -3025,7 +3073,7 @@ mod tests {
                 submitted_at: two_hours_ago,
             },
         );
-        job_tenants.insert(running.clone(), "t1".to_string());
+        job_tenants.insert(running.clone(), "t1".to_string().into());
 
         // Reap anything terminal for longer than one hour.
         reap_expired(&jobs, &job_tenants, &sink, Duration::from_secs(3600));
@@ -3100,6 +3148,7 @@ mod tests {
             submitted_at: Utc::now(),
             completed_at: Utc::now(),
             client_tracking_id: None,
+            owner_subject: None,
         }
     }
 
@@ -3126,7 +3175,7 @@ mod tests {
             ],
         };
         let jobs: DashMap<String, JobStatus> = DashMap::new();
-        let job_tenants: DashMap<String, String> = DashMap::new();
+        let job_tenants: DashMap<String, JobOwner> = DashMap::new();
 
         rehydrate_completed_jobs(&jobs, &job_tenants, &sink);
 
@@ -3147,7 +3196,10 @@ mod tests {
             "a matching key/job_id manifest must be rehydrated"
         );
         assert_eq!(
-            job_tenants.get(&uuid_c).as_deref().map(String::as_str),
+            job_tenants
+                .get(&uuid_c)
+                .map(|o| o.tenant_id.clone())
+                .as_deref(),
             Some("t1"),
             "a rehydrated job's tenant must be recorded in job_tenants"
         );
@@ -3393,7 +3445,7 @@ mod tests {
         );
         controller
             .job_tenants
-            .insert("job-1".to_string(), "t1".to_string());
+            .insert("job-1".to_string(), "t1".to_string().into());
         controller.jobs.insert("job-1".to_string(), completed());
         assert!(
             controller
@@ -3414,7 +3466,7 @@ mod tests {
         let no_reaper = InMemoryController::new(runner, sink, None);
         no_reaper
             .job_tenants
-            .insert("job-1".to_string(), "t1".to_string());
+            .insert("job-1".to_string(), "t1".to_string().into());
         no_reaper.jobs.insert("job-1".to_string(), completed());
         assert!(
             no_reaper
@@ -3493,7 +3545,7 @@ mod tests {
         let job_id = "job-1".to_string();
         controller
             .job_tenants
-            .insert(job_id.clone(), "t1".to_string());
+            .insert(job_id.clone(), "t1".to_string().into());
 
         // Two polls yield two distinct URLs — proof the URL is resolved fresh
         // rather than reused from write time.
@@ -3807,6 +3859,7 @@ mod tests {
             format: "ndjson".to_string(),
             header: true,
             client_tracking_id: None,
+            owner_subject: None,
         }
     }
 
@@ -4093,7 +4146,7 @@ mod tests {
         let sink = ScriptedSink::new();
         sink.fail_deletes.store(true, Ordering::SeqCst);
         let jobs: DashMap<String, JobStatus> = DashMap::new();
-        let job_tenants: DashMap<String, String> = DashMap::new();
+        let job_tenants: DashMap<String, JobOwner> = DashMap::new();
 
         let id = "old-completed".to_string();
         let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
@@ -4107,7 +4160,7 @@ mod tests {
                 client_tracking_id: None,
             },
         );
-        job_tenants.insert(id.clone(), "t1".to_string());
+        job_tenants.insert(id.clone(), "t1".to_string().into());
         sink.write_shard(&id, 0, b"old\n".to_vec(), "ndjson")
             .unwrap();
 
