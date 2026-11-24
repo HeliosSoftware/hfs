@@ -3502,6 +3502,9 @@ async fn build_bulk_submit(
         .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
         .with_decryption_keys(decryption_keys)
         .with_body_limits(cfg.max_manifest_bytes, cfg.max_encrypted_file_bytes)
+        .with_encrypted_file_fetch_timeout(std::time::Duration::from_secs(
+            cfg.encrypted_file_fetch_timeout_secs,
+        ))
         .with_trusted_providers(trusted_providers),
     );
 

@@ -90,6 +90,10 @@ pub const DEFAULT_MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 /// (`HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES`).
 pub const DEFAULT_MAX_ENCRYPTED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Default wall-clock budget for downloading one JWE-encrypted file
+/// (`HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT`).
+pub const DEFAULT_ENCRYPTED_FILE_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// How many times one file may be re-requested after its transfer broke.
 pub const MAX_BODY_RETRIES: u32 = 3;
 
@@ -143,6 +147,8 @@ pub struct HttpSubmitInputFetcher {
     max_manifest_bytes: u64,
     /// Ceiling on a JWE file body; encrypted files are read whole.
     max_encrypted_file_bytes: u64,
+    /// Wall-clock budget for reading one JWE file whole, retries included.
+    encrypted_file_fetch_timeout: Duration,
 }
 
 /// Builds the decoding and the non-decoding client with the same timeouts.
@@ -185,6 +191,7 @@ impl HttpSubmitInputFetcher {
             trusted_providers,
             max_manifest_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             max_encrypted_file_bytes: DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
+            encrypted_file_fetch_timeout: DEFAULT_ENCRYPTED_FILE_FETCH_TIMEOUT,
         }
     }
 
@@ -264,6 +271,15 @@ impl HttpSubmitInputFetcher {
     ) -> Self {
         self.max_manifest_bytes = max_manifest_bytes;
         self.max_encrypted_file_bytes = max_encrypted_file_bytes;
+        self
+    }
+
+    /// The wall-clock budget for downloading one JWE-encrypted file
+    /// (`HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT`). The idle read timeout
+    /// resets on every chunk, so without it a body that drips a byte at a
+    /// time holds a worker for as long as the provider likes.
+    pub fn with_encrypted_file_fetch_timeout(mut self, timeout: Duration) -> Self {
+        self.encrypted_file_fetch_timeout = timeout;
         self
     }
 
@@ -1143,7 +1159,21 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 requires_access_token,
                 oauth_metadata_urls,
             );
-            let bytes = self.fetch_whole_file(&request).await?;
+            // Final, like a file past its byte ceiling: fetching it again
+            // would only hold the worker for another budget.
+            let bytes = tokio::time::timeout(
+                self.encrypted_file_fetch_timeout,
+                self.fetch_whole_file(&request),
+            )
+            .await
+            .map_err(|_| {
+                Self::err(format!(
+                    "encrypted file {} was not downloaded within {} s \
+                     (HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT)",
+                    request.shown_url,
+                    self.encrypted_file_fetch_timeout.as_secs()
+                ))
+            })??;
             let bytes = self
                 .decrypt_file(bytes, Some(keys))
                 .map_err(|e| Self::err(format!("decrypting file {}: {e}", request.shown_url)))?;
@@ -2189,6 +2219,53 @@ mod tests {
             requests.lock().unwrap().len(),
             1,
             "a file that is too large is not fetched again"
+        );
+    }
+
+    /// A JWE body that keeps dripping bytes inside the idle read timeout
+    /// fails at the wall-clock budget, naming the setting (#2726).
+    #[tokio::test]
+    async fn test_a_dripping_encrypted_file_fails_at_its_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                .await;
+            while socket.write_all(b"a").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let key = [7u8; 32];
+        let enc_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode(key)});
+        let fetcher = quick_fetcher().with_encrypted_file_fetch_timeout(Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let err = match fetcher
+            .open_file_stream(
+                &format!("http://{addr}/f.ndjson.jwe"),
+                &[],
+                false,
+                &[],
+                Some(&enc_key),
+            )
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a dripping file opens no stream"),
+        };
+        assert!(
+            err.contains("HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the budget, not the idle timeout, ended the read"
         );
     }
 
