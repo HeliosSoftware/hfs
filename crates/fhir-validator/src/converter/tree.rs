@@ -19,6 +19,13 @@ pub(super) struct Segment {
     pub slice: Option<String>,
 }
 
+/// Most segments an ElementDefinition id may have below its root. The tree
+/// built from the ids, and every walk over it (finalizing it, validating
+/// against the schema, dropping it), is as deep as the longest id, and one
+/// id string is not bounded by JSON's nesting limit. The deepest element
+/// paths in the core specification have about a dozen segments.
+pub(super) const MAX_ID_SEGMENTS: usize = 64;
+
 /// Parse an ElementDefinition id into segments, dropping the root segment.
 /// `"Patient.identifier:mrn.system"` → `[identifier:mrn, system]`.
 pub(super) fn parse_segments(id: &str) -> Result<Vec<Segment>, String> {
@@ -29,6 +36,9 @@ pub(super) fn parse_segments(id: &str) -> Result<Vec<Segment>, String> {
     }
     let mut segments = Vec::new();
     for part in parts {
+        if segments.len() == MAX_ID_SEGMENTS {
+            return Err(format!("more than {MAX_ID_SEGMENTS} segments"));
+        }
         if part.is_empty() {
             return Err("empty segment".to_string());
         }

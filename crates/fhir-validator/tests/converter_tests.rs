@@ -483,6 +483,37 @@ fn converted_ordered_slicing_is_enforced_by_the_engine() {
     );
 }
 
+/// An element id with more segments than any element path is refused: the
+/// tree built from it, and every recursive walk over that tree, is as deep as
+/// the id, so a single long dotted id used to overflow the stack.
+#[test]
+fn an_element_id_past_the_segment_limit_is_refused() {
+    let profile = |segments: usize| {
+        let id = format!("Patient{}", ".a".repeat(segments));
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": "https://example.invalid/StructureDefinition/deep",
+            "name": "Deep",
+            "kind": "resource",
+            "type": "Patient",
+            "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "differential": { "element": [
+                { "id": "Patient", "path": "Patient" },
+                { "id": id, "path": id, "min": 0, "max": "1" }
+            ]}
+        })
+    };
+    assert!(convert(&profile(64)).is_ok());
+    let error = convert(&profile(100_000)).expect_err("refused").to_string();
+    assert!(error.contains("more than 64 segments"), "{error}");
+    assert!(
+        error.len() < 400,
+        "the id is not echoed whole: {} bytes",
+        error.len()
+    );
+}
+
 #[test]
 fn converts_canonical_content_reference_and_additional_resource() {
     // The SQL on FHIR ViewDefinition, trimmed: an additional resource whose
