@@ -408,7 +408,7 @@ impl HttpSubmitInputFetcher {
                 "fileEncryptionKey was supplied but the file is not a JWE",
             ));
         }
-        jwe::decrypt(&bytes, keys).map_err(Self::err)
+        jwe::decrypt_with_limit(&bytes, keys, self.max_encrypted_file_bytes).map_err(Self::err)
     }
 
     /// Downloads a whole file, re-fetching it from the start when the
@@ -1099,8 +1099,10 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         // a plaintext *file* is rejected outright.
         let keys = self.resolve_keys(encryption_key)?;
         let bytes = match &keys {
-            Some(keys) if jwe::looks_like_jwe(&bytes) => jwe::decrypt(&bytes, keys)
-                .map_err(|e| Self::err(format!("decrypting manifest {shown}: {e}")))?,
+            Some(keys) if jwe::looks_like_jwe(&bytes) => {
+                jwe::decrypt_with_limit(&bytes, keys, self.max_manifest_bytes)
+                    .map_err(|e| Self::err(format!("decrypting manifest {shown}: {e}")))?
+            }
             Some(_) => {
                 tracing::warn!(
                     manifest_url = %shown,

@@ -527,11 +527,26 @@ fn parse_json(text: &str) -> Result<Jwe> {
 /// With a general-JSON JWE every recipient is attempted; the last failure is
 /// reported when none succeeds.
 pub fn decrypt(jwe_bytes: &[u8], keys: &DecryptionKeys) -> Result<Vec<u8>> {
+    decrypt_with_limit(jwe_bytes, keys, DEFAULT_MAX_INFLATED_BYTES)
+}
+
+/// The ceiling [`decrypt`] puts on a `zip: "DEF"` payload's inflated size.
+pub const DEFAULT_MAX_INFLATED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`decrypt`], with the ceiling on a `zip: "DEF"` payload's inflated size
+/// chosen by the caller. Deflate reaches about 1000:1, so a JWE of a few MB
+/// would otherwise inflate to several GB; the inflate stops one byte past the
+/// ceiling and the JWE is refused.
+pub fn decrypt_with_limit(
+    jwe_bytes: &[u8],
+    keys: &DecryptionKeys,
+    max_inflated: u64,
+) -> Result<Vec<u8>> {
     let jwe = parse(jwe_bytes)?;
     let aad = jwe.aad();
     let mut last_err = None;
     for recipient in &jwe.recipients {
-        match decrypt_recipient(&jwe, recipient, &aad, keys) {
+        match decrypt_recipient(&jwe, recipient, &aad, keys, max_inflated) {
             Ok(plaintext) => return Ok(plaintext),
             Err(e) => last_err = Some(e),
         }
@@ -544,6 +559,7 @@ fn decrypt_recipient(
     recipient: &Recipient,
     aad: &[u8],
     keys: &DecryptionKeys,
+    max_inflated: u64,
 ) -> Result<Vec<u8>> {
     let header = &recipient.header;
     let alg = header
@@ -575,8 +591,14 @@ fn decrypt_recipient(
         Some("DEF") => {
             let mut out = Vec::new();
             flate2::read::DeflateDecoder::new(&plaintext[..])
+                .take(max_inflated.saturating_add(1))
                 .read_to_end(&mut out)
                 .map_err(|e| format!("JWE zip=DEF decompression failed: {e}"))?;
+            if out.len() as u64 > max_inflated {
+                return Err(format!(
+                    "JWE zip=DEF payload inflates past the {max_inflated}-byte ceiling"
+                ));
+            }
             Ok(out)
         }
         Some(other) => Err(format!("unsupported JWE zip '{other}' (expected DEF)")),
@@ -1294,6 +1316,32 @@ mod tests {
         let compact = dir_compact(header, &iv, &ct, &tag);
         let out = decrypt(compact.as_bytes(), &DecryptionKeys::shared(key)).unwrap();
         assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn zip_def_past_the_ceiling_is_refused_while_inflating() {
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let key = vec![0x44u8; 32];
+        let iv = [0x55u8; 12];
+        let plaintext = vec![b'a'; 1024 * 1024];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 8 * 1024, "a small bomb");
+
+        let header = r#"{"alg":"dir","enc":"A256GCM","zip":"DEF"}"#;
+        let aad = B64URL.encode(header);
+        let (ct, tag) = seal_gcm(&key, &iv, aad.as_bytes(), &compressed);
+        let compact = dir_compact(header, &iv, &ct, &tag);
+        let keys = DecryptionKeys::shared(key);
+
+        let err = decrypt_with_limit(compact.as_bytes(), &keys, 64 * 1024).unwrap_err();
+        assert!(err.contains("65536-byte ceiling"), "{err}");
+        let exact = decrypt_with_limit(compact.as_bytes(), &keys, plaintext.len() as u64).unwrap();
+        assert_eq!(exact, plaintext);
     }
 
     #[test]
