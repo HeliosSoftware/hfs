@@ -3146,13 +3146,7 @@ impl SubmitWorkerStorage for SqliteBackend {
             return Ok(token);
         }
         let token = Uuid::new_v4().to_string();
-        conn.execute(
-            "UPDATE bulk_submissions SET poll_token = ?1
-             WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
-            params![token, tenant_id, id.submitter, id.submission_id],
-        )
-        .map_err(|e| internal_error(format!("set poll token: {e}")))?;
-        Ok(token)
+        store_poll_token_if_unset(&conn, tenant_id, id, &token)
     }
 
     async fn list_expired_submissions(
@@ -3961,6 +3955,34 @@ fn publish_manifest_artifacts_in_tx(
     Ok(Some(ManifestPublicationResult::Published))
 }
 
+/// Stores `minted` as the submission's poll token unless one is already set,
+/// and returns the stored token. Two first calls can both read no token; the
+/// one whose write lands second keeps the first one's token instead of
+/// overwriting it, so every caller returns the same status URL.
+fn store_poll_token_if_unset(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    id: &SubmissionId,
+    minted: &str,
+) -> StorageResult<String> {
+    conn.execute(
+        "UPDATE bulk_submissions SET poll_token = ?1
+         WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
+           AND poll_token IS NULL",
+        params![minted, tenant_id, id.submitter, id.submission_id],
+    )
+    .map_err(|e| internal_error(format!("set poll token: {e}")))?;
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT poll_token FROM bulk_submissions
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            params![tenant_id, id.submitter, id.submission_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .map_err(|e| internal_error(format!("read poll token: {e}")))?;
+    Ok(stored.unwrap_or_else(|| minted.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3990,6 +4012,29 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/bulk_submit/claim_contract.rs"
         ));
+    }
+
+    /// A caller that read no token before another one stored its token keeps
+    /// the stored one rather than overwriting it (#2702).
+    #[tokio::test]
+    async fn a_stored_poll_token_wins_over_a_concurrent_mint() {
+        let backend = SqliteBackend::in_memory().unwrap();
+        backend.init_schema().unwrap();
+        let tenant = TenantContext::new(TenantId::new("t"), TenantPermissions::full_access());
+        let id = SubmissionId::generate("sys");
+        backend.create_submission(&tenant, &id, None).await.unwrap();
+
+        let first = backend.ensure_poll_token(&tenant, &id).await.unwrap();
+        let conn = backend.get_connection().unwrap();
+        let raced =
+            store_poll_token_if_unset(&conn, tenant.tenant_id().as_str(), &id, "late-minted")
+                .unwrap();
+        assert_eq!(raced, first);
+        drop(conn);
+        assert_eq!(
+            backend.ensure_poll_token(&tenant, &id).await.unwrap(),
+            first
+        );
     }
 
     mod publication {
