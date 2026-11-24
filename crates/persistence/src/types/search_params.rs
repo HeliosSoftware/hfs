@@ -932,6 +932,12 @@ pub fn absolute_reference_target(reference: &str) -> Option<String> {
     (type_ok && id_ok).then(|| format!("{resource_type}/{id}"))
 }
 
+/// Deepest `_offset` the ordered date-index walk serves (#2731). Past it the
+/// walk reads and probes every skipped row, which loses to the general sort (an
+/// offset beyond the dated set measured slower than it on SQLite), so the
+/// general statement keeps those requests.
+pub const DATE_WALK_MAX_OFFSET: usize = 10_000;
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -957,7 +963,8 @@ impl SearchQuery {
     /// of computing the sort key for every resource of the type. It holds only
     /// when nothing narrows or reshapes the candidate set: no parameters, no
     /// `_has` chains, no `_list`, no compartment, no `_contained` mode, no
-    /// FHIR-version filter, and a single resolved `Date` sort key that is not
+    /// FHIR-version filter, no `_offset` above [`DATE_WALK_MAX_OFFSET`], and a
+    /// single resolved `Date` sort key that is not
     /// `_id` / `_lastUpdated`.
     pub fn unfiltered_single_date_sort(&self) -> Option<(&SortDirective, bool)> {
         if !self.parameters.is_empty()
@@ -966,6 +973,9 @@ impl SearchQuery {
             || self.compartment.is_some()
             || self.contained != ContainedMode::Off
             || self.fhir_version.is_some()
+            || self
+                .offset
+                .is_some_and(|o| o as usize > DATE_WALK_MAX_OFFSET)
         {
             return None;
         }
@@ -1641,5 +1651,11 @@ mod tests {
         q.offset = Some(3);
         q.total = Some(TotalMode::Accurate);
         assert!(q.unfiltered_single_date_sort().is_some());
+
+        // A deep offset keeps the general statement (#2731).
+        q.offset = Some(DATE_WALK_MAX_OFFSET as u32);
+        assert!(q.unfiltered_single_date_sort().is_some());
+        q.offset = Some(DATE_WALK_MAX_OFFSET as u32 + 1);
+        assert!(q.unfiltered_single_date_sort().is_none());
     }
 }
