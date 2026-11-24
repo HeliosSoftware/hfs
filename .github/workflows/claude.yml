@@ -42,32 +42,24 @@ jobs:
       issues: read
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
-    env:
-      # The runner is persistent and shared with pull-request jobs, so the
-      # signing key and the signing configuration live under this job's temp
-      # directory, never in the runner user's ~/.gnupg or ~/.gitconfig.
-      GNUPGHOME: ${{ runner.temp }}/gnupg
-      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/gitconfig
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
-      - name: Import GPG key and configure signing
-        run: |
-          mkdir -p -m 700 "$GNUPGHOME"
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          git config --global user.signingkey ${{ secrets.GPG_KEY_ID }}
-          git config --global commit.gpgsign true
-          git config --global user.email "claude-bot@heliossoftware.com"
-          git config --global user.name "Claude Bot"
-
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Every branch requires signed commits (the "Enforce Only Signed
+          # Commits" ruleset). The action commits through the GitHub API, so
+          # GitHub signs for claude[bot] and no signing key is ever on the
+          # runner, which is persistent and shared with pull-request jobs.
+          # The cost: no rebase, cherry-pick or other history rewriting.
+          use_commit_signing: true
 
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
@@ -80,12 +72,6 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr:*)'
-
-      - name: Remove the signing key and configuration
-        if: always()
-        run: |
-          gpgconf --kill gpg-agent 2>/dev/null || true
-          rm -rf "$GNUPGHOME" "$GIT_CONFIG_GLOBAL"
 
       # claude-code-action points `origin` at a URL carrying this job's token
       # and leaves it there. This job runs in the runner's shared checkout, so
