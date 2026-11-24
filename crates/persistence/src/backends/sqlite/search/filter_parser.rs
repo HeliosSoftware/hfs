@@ -154,20 +154,50 @@ impl std::fmt::Display for FilterParseError {
 
 impl std::error::Error for FilterParseError {}
 
+/// Longest accepted `_filter` expression, in bytes.
+pub const MAX_FILTER_LEN: usize = 64 * 1024;
+
+/// Deepest accepted nesting of `( … )` groups in a `_filter` expression.
+pub const MAX_FILTER_DEPTH: usize = 32;
+
+/// Most comparisons accepted in one `_filter` expression. A chain of `and` or
+/// `or` builds a tree as deep as it is long, which SQL generation walks
+/// recursively, and each comparison adds bind parameters to the statement.
+pub const MAX_FILTER_COMPARISONS: usize = 256;
+
 /// Parser for FHIR _filter expressions.
 pub struct FilterParser<'a> {
     input: &'a str,
     pos: usize,
+    /// Groups open at the current position.
+    depth: usize,
+    /// Comparisons parsed so far.
+    comparisons: usize,
 }
 
 impl<'a> FilterParser<'a> {
     /// Creates a new filter parser.
     pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            depth: 0,
+            comparisons: 0,
+        }
     }
 
     /// Parses the entire filter expression.
+    ///
+    /// An expression longer than [`MAX_FILTER_LEN`], nesting deeper than
+    /// [`MAX_FILTER_DEPTH`] or holding more than [`MAX_FILTER_COMPARISONS`]
+    /// comparisons is an error.
     pub fn parse(input: &str) -> Result<FilterExpr, FilterParseError> {
+        if input.len() > MAX_FILTER_LEN {
+            return Err(FilterParseError {
+                message: format!("expression exceeds the maximum length of {MAX_FILTER_LEN} bytes"),
+                position: MAX_FILTER_LEN,
+            });
+        }
         let mut parser = FilterParser::new(input);
         let expr = parser.parse_or_expr()?;
         parser.skip_whitespace();
@@ -207,11 +237,13 @@ impl<'a> FilterParser<'a> {
         Some(c)
     }
 
-    /// Checks if the input starts with the given string (case-insensitive).
+    /// Checks if the input at the current position starts with the ASCII
+    /// keyword `s`, ignoring ASCII case. Only `s.len()` bytes are compared.
     fn starts_with_ci(&self, s: &str) -> bool {
-        self.input[self.pos..]
-            .to_lowercase()
-            .starts_with(&s.to_lowercase())
+        self.input
+            .as_bytes()
+            .get(self.pos..self.pos + s.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(s.as_bytes()))
     }
 
     /// Parses an OR expression (lowest precedence).
@@ -288,8 +320,16 @@ impl<'a> FilterParser<'a> {
         self.skip_whitespace();
 
         if self.peek() == Some('(') {
+            if self.depth >= MAX_FILTER_DEPTH {
+                return Err(FilterParseError {
+                    message: format!("nesting is deeper than the maximum of {MAX_FILTER_DEPTH}"),
+                    position: self.pos,
+                });
+            }
             self.consume(); // consume '('
+            self.depth += 1;
             let expr = self.parse_or_expr()?;
+            self.depth -= 1;
             self.skip_whitespace();
             if self.peek() != Some(')') {
                 return Err(FilterParseError {
@@ -307,6 +347,15 @@ impl<'a> FilterParser<'a> {
     /// Parses a comparison expression: paramName op value
     fn parse_comparison(&mut self) -> Result<FilterExpr, FilterParseError> {
         self.skip_whitespace();
+        self.comparisons += 1;
+        if self.comparisons > MAX_FILTER_COMPARISONS {
+            return Err(FilterParseError {
+                message: format!(
+                    "expression has more than the maximum of {MAX_FILTER_COMPARISONS} comparisons"
+                ),
+                position: self.pos,
+            });
+        }
 
         // Parse parameter name
         let param = self.parse_identifier()?;
@@ -881,6 +930,52 @@ mod tests {
             },
             _ => panic!("Expected Not"),
         }
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}name eq x{}", "(".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn nesting_is_accepted_up_to_the_maximum() {
+        assert!(FilterParser::parse(&nested(MAX_FILTER_DEPTH)).is_ok());
+        let e = FilterParser::parse(&nested(MAX_FILTER_DEPTH + 1)).unwrap_err();
+        assert!(e.message.contains("nesting is deeper"), "{e}");
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_without_recursing_through_it() {
+        let e = FilterParser::parse(&nested(20_000)).unwrap_err();
+        assert!(e.message.contains("nesting is deeper"), "{e}");
+    }
+
+    #[test]
+    fn comparisons_are_accepted_up_to_the_maximum() {
+        let chain = |n: usize| vec!["name eq x"; n].join(" or ");
+        assert!(FilterParser::parse(&chain(MAX_FILTER_COMPARISONS)).is_ok());
+        let e = FilterParser::parse(&chain(MAX_FILTER_COMPARISONS + 1)).unwrap_err();
+        assert!(e.message.contains("more than the maximum"), "{e}");
+    }
+
+    #[test]
+    fn an_expression_longer_than_the_maximum_is_refused() {
+        let value = |n: usize| format!("name eq {}", "x".repeat(n));
+        assert!(FilterParser::parse(&value(MAX_FILTER_LEN - 8)).is_ok());
+        let e = FilterParser::parse(&value(MAX_FILTER_LEN - 7)).unwrap_err();
+        assert!(e.message.contains("maximum length"), "{e}");
+    }
+
+    #[test]
+    fn keywords_match_in_any_ascii_case_and_only_at_a_word_boundary() {
+        assert!(matches!(
+            FilterParser::parse("name eq a AnD name eq b OR NOT name eq c").unwrap(),
+            FilterExpr::Logical {
+                op: LogicalOp::Or,
+                ..
+            }
+        ));
+        let expr = FilterParser::parse("name eq andrew").unwrap();
+        assert!(matches!(expr, FilterExpr::Comparison { ref value, .. } if value == "andrew"));
     }
 
     #[test]

@@ -1742,9 +1742,11 @@ impl QueryBuilder {
                     // would return an unfiltered superset (everything matching
                     // the other params). Fail closed: emit a match-nothing
                     // condition so the client gets zero results, not wrong ones.
+                    let shown: String = value.value.chars().take(200).collect();
                     tracing::warn!(
+                        length = value.value.len(),
                         "Failed to parse _filter expression '{}': {} — failing closed (no matches)",
-                        value.value,
+                        shown,
                         e
                     );
                     conditions.push(SqlFragment::new("1 = 0"));
