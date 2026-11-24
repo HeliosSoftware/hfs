@@ -403,12 +403,16 @@ impl SchedulerState {
             let core = Arc::clone(core);
             let state = Arc::clone(self);
             tokio::spawn(async move {
-                let _lease = WorkerLease {
+                let mut lease = WorkerLease {
                     state: Arc::clone(&state),
                     _permit: permit,
+                    key: k.clone(),
+                    generation: generation.clone(),
+                    released: false,
                 };
                 loop {
                     let Some(job) = state.next_job(&k, &generation) else {
+                        lease.released = true;
                         break;
                     };
                     core.dispatch_with_retry(
@@ -473,13 +477,51 @@ impl SchedulerState {
         tokio::select! { biased; _ = self.closed() => None, _ = snapshot.generation.cancelled() => None, result = future => Some(result) }
     }
 }
+/// A queue's worker. `released` is set once [`SchedulerState::next_job`] has
+/// handed ownership of the queue back; a worker dropped before that (its task
+/// panicked or was aborted) releases it here, or the queue would keep
+/// `worker` set and every later notification for it would wait forever.
 struct WorkerLease {
     state: Arc<SchedulerState>,
     _permit: OwnedSemaphorePermit,
+    key: Key,
+    generation: GenerationToken,
+    released: bool,
 }
 impl Drop for WorkerLease {
     fn drop(&mut self) {
-        self.state.lock().stats.notification_workers -= 1;
+        let stranded = {
+            let mut inner = self.state.lock();
+            inner.stats.notification_workers -= 1;
+            if self.released {
+                VecDeque::new()
+            } else {
+                let mut stranded = VecDeque::new();
+                if let Some(queue) = inner
+                    .queues
+                    .get_mut(&self.key)
+                    .filter(|q| q.generation.same_generation(&self.generation))
+                {
+                    queue.worker = false;
+                    stranded = std::mem::take(&mut queue.pending);
+                    if queue.resident == 0 {
+                        inner.queues.remove(&self.key);
+                    }
+                }
+                stranded
+            }
+        };
+        if !self.released {
+            warn!(
+                tenant_id = %self.key.0,
+                subscription_id = %self.key.1,
+                dropped = stranded.len(),
+                "Subscription notification worker stopped unexpectedly; its queued notifications were dropped"
+            );
+        }
+        // Dropping the jobs releases their resident budget, which locks the
+        // state again, so it happens after the guard above is gone.
+        drop(stranded);
     }
 }
 pub(super) struct AttemptGuard {
@@ -931,6 +973,51 @@ mod tests {
         drop(replacement);
         assert_eq!(state.snapshot().resident_notifications, 0);
     }
+    /// A delivery that panics (here reqwest's header map overflowing on a
+    /// snapshot that skipped the registration cap) must not leave its queue
+    /// marked as having a worker: the next notification for the same
+    /// subscription is still delivered.
+    #[tokio::test]
+    async fn a_worker_that_panics_releases_its_queue_for_the_next_notification() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&hook)
+            .await;
+        let engine = engine(4);
+        let good = snapshot_with_endpoint(&engine, "a", &hook.uri());
+        let mut bad = good.clone();
+        bad.subscription.channel.headers = (0..40_000).map(|i| format!("x-h{i}: v")).collect();
+        let state = &engine.scheduler.state;
+
+        let resident = state.reserve(&bad).unwrap();
+        state.submit(&engine.core, bad, json!({}), 1, resident, None);
+        settle(|| {
+            let s = state.snapshot();
+            s.notification_workers == 0 && s.resident_notifications == 0
+        })
+        .await;
+        assert!(state.lock().queues.is_empty(), "the queue is released");
+
+        let resident = state.reserve(&good).unwrap();
+        state.submit(&engine.core, good, json!({}), 2, resident, None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hook
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the next notification is delivered");
+    }
+
     #[tokio::test]
     async fn worker_leases_bound_retirement_and_receipts_close_after_attempt_cancellation() {
         let engine = engine(1);
