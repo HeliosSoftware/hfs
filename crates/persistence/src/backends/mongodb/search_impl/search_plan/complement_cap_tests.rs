@@ -1921,7 +1921,9 @@ async fn unfiltered_param_sort_finishes_a_long_tie_the_window_needs() {
     // Ascending the group is the head, descending it follows 2,000 distinct
     // keys; either way the window ends deep inside it. The ascending windows,
     // inside the first group, are read from it by id
-    // (`unfiltered_first_group_window`); the descending one is walked.
+    // (`unfiltered_first_group_window`); the descending one is walked through
+    // the distinct keys and closed by reading the group by id once the walk
+    // counts it (`unfiltered_group_closed_by_id`).
     for (spec, offset) in [("method", 6_000u32), ("-method", 6_000), ("method", 9_000)] {
         let query = unfiltered_sort(spec, SearchParamType::Token, offset);
         let label = format!("_sort={spec} offset {offset}");
@@ -1932,6 +1934,8 @@ async fn unfiltered_param_sort_finishes_a_long_tie_the_window_needs() {
         fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
         let found = sort_key_group_commands(&fixture.db).await;
         assert!(found.is_empty(), "{label}: the walk gave up: {found:?}");
+        let reads = first_group_reads(&fixture.db).await;
+        assert_eq!(reads.len(), 1, "{label}: reads by id {reads:?}");
         let expected = with_result_id_cap(cap, grouped.search(&fixture.tenant, &query))
             .await
             .unwrap();
@@ -2506,7 +2510,17 @@ fn long_group_boundaries(fixture: &Fixture, descending: bool) -> Vec<usize> {
 /// second, the third and the fourth group) match the grouped answer, in both
 /// key and both id directions, with the total.
 async fn assert_long_group_parity(fixture: &Fixture, grouped: &MongoBackend, state: &str) {
-    for (name, param_type) in long_group_sorts() {
+    assert_long_group_parity_of(fixture, grouped, state, long_group_sorts()).await;
+}
+
+/// [`assert_long_group_parity`] for `sorts`.
+async fn assert_long_group_parity_of(
+    fixture: &Fixture,
+    grouped: &MongoBackend,
+    state: &str,
+    sorts: Vec<(&'static str, SearchParamType)>,
+) {
+    for (name, param_type) in sorts {
         for spec in [name.to_owned(), format!("-{name}")] {
             let descending = spec.starts_with('-');
             for boundary in long_group_boundaries(fixture, descending) {
@@ -2620,8 +2634,9 @@ async fn unfiltered_walk_closes_a_long_group_by_id_like_the_grouped_pages() {
     }
 
     // The second group's lowest members (about 270, those under number 600)
-    // are dead: its first reads by id find no live member, and each next one
-    // asks for twice the rows.
+    // are dead: the first read by id, sized by the members the walk met,
+    // finds no live member, and the second and last one reads `SORT_ID_CHUNK`
+    // rows.
     mark_deleted_where(&mut fixture, |number| {
         number < 600 && long_group_member(number, false) == 1
     })
@@ -2638,10 +2653,10 @@ async fn unfiltered_walk_closes_a_long_group_by_id_like_the_grouped_pages() {
             "{label}: grouped"
         );
         let limits = group_read_limits(&fixture.db).await;
-        assert!(limits.len() >= 2, "{label}: reads by id {limits:?}");
+        assert_eq!(limits.len(), 2, "{label}: reads by id {limits:?}");
         assert!(
-            limits.windows(2).all(|pair| pair[1] == 2 * pair[0]),
-            "{label}: each read doubles the last: {limits:?}"
+            limits[0] < SORT_ID_CHUNK as i64 && limits[1] == SORT_ID_CHUNK as i64,
+            "{label}: the second read is the last, of SORT_ID_CHUNK rows: {limits:?}"
         );
         assert_eq!(
             walked,
@@ -2821,6 +2836,329 @@ async fn unfiltered_sort_treats_signed_zeros_as_one_key() {
                 assert_eq!(walked, expected, "{label}");
             }
         }
+    }
+    fixture.close().await;
+}
+
+/// The bounded counts of an equal-key group of `parameter`
+/// (`sort_key_rows_upto`) a search ran, as the profiler recorded them.
+async fn sort_key_counts(db: &mongodb::Database, parameter: &str) -> usize {
+    collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! {
+                "ns": format!("{}.search_index", db.name()),
+                "command.aggregate": { "$exists": true },
+                "command.pipeline.$match.param_name": parameter,
+                "command.pipeline.$group.n": { "$exists": true },
+            })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .len()
+}
+
+/// The long groups of `long_group_keys` where a group's rows do not share one
+/// index key: `method` puts each code under one of two systems, and every
+/// fifth resource under both (the walk meets its rows of one code at two
+/// places, the read by id has them adjacent); `date` gives each start one of
+/// three ends (ascending, one group over different ends; descending, three).
+async fn add_split_key_rows(fixture: &Fixture) {
+    let mut rows = Vec::new();
+    for (number, row) in fixture.rows.iter().enumerate() {
+        for group in long_group_keys(number) {
+            let code = ["a", "b", "c", "d"][group];
+            let systems: &[&str] = if number % 5 == 0 {
+                &["s1", "s2"]
+            } else if number % 2 == 0 {
+                &["s1"]
+            } else {
+                &["s2"]
+            };
+            for system in systems {
+                rows.push(
+                    doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                    "resource_id":&row.id, "param_name":"method",
+                    "value_token_system":*system, "value_token_code":code },
+                );
+            }
+            let start = BASE_MS + group as i64 * DAY_MS;
+            let end = start + DAY_MS + (number % 3) as i64 * 3_600_000;
+            rows.push(
+                doc! { "tenant_id":PLAN_TENANT, "resource_type":"Observation",
+                "resource_id":&row.id, "param_name":"date",
+                "value_date":at(start), "value_date_end":at(end) },
+            );
+        }
+    }
+    for chunk in rows.chunks(5_000) {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(chunk.to_vec())
+            .await
+            .unwrap();
+    }
+}
+
+/// A token code under two systems and a date start with different ends: the
+/// group the walk closes by id spans several index keys, and the pages still
+/// match the grouped ones in all four key and id directions.
+#[tokio::test]
+async fn unfiltered_walk_closes_a_group_over_several_index_keys_like_the_grouped_pages() {
+    let Some(mut fixture) = Fixture::new("sort-split-key-group", LONG_GROUP_RESOURCES).await else {
+        return;
+    };
+    add_split_key_rows(&fixture).await;
+    fixture.mark_deleted(1, 40).await;
+    let grouped = grouped_backend(&fixture);
+    let sorts = vec![
+        ("method", SearchParamType::Token),
+        ("date", SearchParamType::Date),
+    ];
+    assert_long_group_parity_of(&fixture, &grouped, "split keys", sorts.clone()).await;
+
+    // The window 10 ids into the second group is closed by id, in at most
+    // two reads, without grouping.
+    let boundary = long_group_boundaries(&fixture, false)[0];
+    for (name, param_type) in sorts {
+        for ids_descending in [false, true] {
+            let query =
+                unfiltered_sort_by_id(name, param_type, boundary as u32 + 10, ids_descending);
+            let label = format!("_sort={name} ids descending {ids_descending}");
+            restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+            let walked = answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+            fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+            assert!(
+                sort_key_group_commands(&fixture.db).await.is_empty(),
+                "{label}: grouped"
+            );
+            // A first-group read the walk declined (the first group holds
+            // fewer live ids than the window) may come first.
+            let limits = group_read_limits(&fixture.db).await;
+            let first_group = unfiltered_group_read_limit(boundary + 21) as i64;
+            let closing = match limits.split_first() {
+                Some((first, rest)) if *first == first_group => rest,
+                _ => &limits[..],
+            };
+            assert!(
+                (1..=2).contains(&closing.len()),
+                "{label}: reads by id {limits:?}"
+            );
+            assert_eq!(
+                walked,
+                answer_capped(&grouped, &fixture, &query, LONG_GROUP_CAP).await,
+                "{label}"
+            );
+        }
+    }
+    fixture.close().await;
+}
+
+const LAST_GROUP_RESOURCES: usize = 1_200;
+
+/// Every resource has a row of the last key `z`; most also have an earlier
+/// one (`a` under 600, `b` above), so the long `z` group has few members:
+/// for `method` the 50 lowest ids, for `category` the 50 highest.
+async fn add_last_group_rows(fixture: &Fixture) {
+    let mut rows = Vec::new();
+    for (number, row) in fixture.rows.iter().enumerate() {
+        for (name, only_z) in [
+            ("method", number < 50),
+            ("category", number >= LAST_GROUP_RESOURCES - 50),
+        ] {
+            rows.push(index_row(&row.id, name, "z"));
+            if !only_z {
+                rows.push(index_row(
+                    &row.id,
+                    name,
+                    if number < 600 { "a" } else { "b" },
+                ));
+            }
+        }
+    }
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .insert_many(rows)
+        .await
+        .unwrap();
+}
+
+/// The last pages end in a long group whose members cannot fill them: the
+/// reads by id are at most two (none when the walk met no member of the
+/// group in the rows it read of it, as for `category`, whose members have the
+/// highest ids), then the walk finishes the group, and the pages, `has_next`
+/// and totals are the grouped ones.
+#[tokio::test]
+async fn unfiltered_walk_bounds_the_reads_of_a_group_short_of_members() {
+    let Some(fixture) = Fixture::new("sort-last-group-short", LAST_GROUP_RESOURCES).await else {
+        return;
+    };
+    add_last_group_rows(&fixture).await;
+    let grouped = grouped_backend(&fixture);
+    for name in ["method", "category"] {
+        for ids_descending in [false, true] {
+            for offset in [1_100u32, 1_140, 1_180, 1_190, 1_195] {
+                let query =
+                    unfiltered_sort_by_id(name, SearchParamType::Token, offset, ids_descending);
+                let label = format!("_sort={name} ids descending {ids_descending} offset {offset}");
+                restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+                let walked =
+                    answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+                fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+                let limits = group_read_limits(&fixture.db).await;
+                assert!(limits.len() <= 2, "{label}: reads by id {limits:?}");
+                if limits.len() == 2 {
+                    assert_eq!(limits[1], SORT_ID_CHUNK as i64, "{label}: {limits:?}");
+                }
+                if name == "category" {
+                    assert!(limits.is_empty(), "{label}: no member met: {limits:?}");
+                }
+                assert!(
+                    sort_key_group_commands(&fixture.db).await.is_empty(),
+                    "{label}: grouped"
+                );
+                assert_eq!(
+                    walked,
+                    answer_capped(&grouped, &fixture, &query, LONG_GROUP_CAP).await,
+                    "{label}"
+                );
+            }
+        }
+        // The window of 1,201 ids lacks 51 members after the 1,150 of `a`
+        // and `b`, and the group has 50, one of them deleted: the first read
+        // is cut and the second, of SORT_ID_CHUNK rows, finds too few.
+        if name == "method" {
+            let query = unfiltered_sort_by_id(name, SearchParamType::Token, 1_190, false);
+            restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+            answer_capped(&fixture.backend, &fixture, &query, LONG_GROUP_CAP).await;
+            fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+            let limits = group_read_limits(&fixture.db).await;
+            assert_eq!(limits.len(), 2, "_sort=method offset 1190: {limits:?}");
+        }
+    }
+    fixture.close().await;
+}
+
+/// A group past the walk's allowance whose reads by id find no live member
+/// (every `m` resource is deleted) is handed to the grouped aggregate after
+/// the two reads, with the grouped page.
+#[tokio::test]
+async fn unfiltered_walk_groups_a_dead_group_past_its_allowance_after_two_reads() {
+    const TIED: usize = UNFILTERED_WALK_TIE_ROWS + 2_000;
+    let rows = TIED + 2_000;
+    let Some(mut fixture) = Fixture::new("sort-dead-group-exceeds", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    fixture.mark_deleted(0, TIED).await;
+    let grouped = grouped_backend(&fixture);
+    let cap = rows * 2;
+    // `-method`: the 2,000 live distinct keys, then the dead group. A window
+    // of 1,991 ids ends before the group; one of 2,001 lacks one member.
+    for (offset, groups, reads) in [(1_980u32, false, 0usize), (1_990, true, 2)] {
+        let query = unfiltered_sort("-method", SearchParamType::Token, offset);
+        let label = format!("_sort=-method offset {offset}");
+        restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, cap).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(
+            !sort_key_group_commands(&fixture.db).await.is_empty(),
+            groups,
+            "{label}: grouped"
+        );
+        let limits = group_read_limits(&fixture.db).await;
+        assert_eq!(limits.len(), reads, "{label}: reads by id {limits:?}");
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, cap).await,
+            "{label}"
+        );
+    }
+    fixture.close().await;
+}
+
+/// The bounds of both reads by id. Closing a group after 100 distinct keys:
+/// a window of 9,511 ids lacks 9,411, read with exactly `SORT_ID_CHUNK` rows;
+/// one more lacks 9,412, past it, and is not read by id. A first-group window
+/// of 10,000 ids is read with 10,626 rows; one of 10,001 is not.
+#[tokio::test]
+async fn unfiltered_reads_by_id_stop_at_their_bounds() {
+    const TIED: usize = 12_700;
+    let rows = TIED + 100;
+    let Some(fixture) = Fixture::new("sort-by-id-bounds", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    let grouped = grouped_backend(&fixture);
+    let cap = rows * 2;
+    assert_eq!(unfiltered_group_read_limit(9_411), SORT_ID_CHUNK);
+    assert_eq!(unfiltered_group_read_limit(10_000), 10_626);
+    for (spec, offset, limits) in [
+        ("-method", 9_500u32, vec![SORT_ID_CHUNK as i64]),
+        ("-method", 9_501, vec![]),
+        ("method", 9_989, vec![10_626]),
+        ("method", 9_990, vec![]),
+    ] {
+        let query = unfiltered_sort(spec, SearchParamType::Token, offset);
+        let label = format!("_sort={spec} offset {offset}");
+        restart_profiling(&fixture.db, 64 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, cap).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(
+            group_read_limits(&fixture.db).await,
+            limits,
+            "{label}: read limits"
+        );
+        assert!(
+            sort_key_group_commands(&fixture.db).await.is_empty(),
+            "{label}: grouped"
+        );
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, cap).await,
+            "{label}"
+        );
+    }
+    fixture.close().await;
+}
+
+/// A first group that runs past the first cursor batch with exactly as many
+/// rows as the count is bounded at, or more, is read: 6,100 rows against a
+/// window of 6,011 cost one count and one read of 6,387 rows.
+#[tokio::test]
+async fn unfiltered_first_group_counted_at_the_window_is_read_once() {
+    const TIED: usize = 6_100;
+    let rows = 6_500;
+    let Some(fixture) = Fixture::new("sort-first-group-counted", rows).await else {
+        return;
+    };
+    add_tied_method_rows(&fixture, TIED).await;
+    let grouped = grouped_backend(&fixture);
+    let cap = rows * 2;
+    for ids_descending in [false, true] {
+        let query = unfiltered_sort_by_id("method", SearchParamType::Token, 6_000, ids_descending);
+        let label = format!("ids descending {ids_descending}");
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let walked = answer_capped(&fixture.backend, &fixture, &query, cap).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(
+            group_read_limits(&fixture.db).await,
+            vec![6_387],
+            "{label}: reads by id"
+        );
+        assert_eq!(
+            sort_key_counts(&fixture.db, "method").await,
+            1,
+            "{label}: counts"
+        );
+        assert_eq!(
+            walked,
+            answer_capped(&grouped, &fixture, &query, cap).await,
+            "{label}"
+        );
     }
     fixture.close().await;
 }

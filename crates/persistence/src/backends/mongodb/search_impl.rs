@@ -369,7 +369,8 @@ const UNFILTERED_WALK_TIE_PROBE_ROWS: usize = CANDIDATE_BATCH_SIZE;
 
 /// [`UNFILTERED_WALK_TIE_PROBE_ROWS`] for a window that already holds every
 /// id it needs and only waits for its open tie to close: the rest of that
-/// group can only reorder the tie, so the walk asks sooner (#2601).
+/// group can only reorder the tie, so the walk asks sooner (#2601), when it
+/// reads one stream and so may read the group by id.
 const UNFILTERED_WALK_FULL_TIE_PROBE_ROWS: usize = 128;
 
 /// Rows of the group a window ends in, beyond the rows already read and a
@@ -658,22 +659,25 @@ impl ParamSortWindow {
     }
 
     /// Whether `push(id, key, true)` could retain `id`. It is false only when
-    /// `key` is the open tie's, the tie already holds every id the window
-    /// still lacks, and `id` does not displace the tie's worst id in the id
-    /// direction: `push` drops such a row whether it matches or not, so the
-    /// walk need not check it (#2601). Later pushes of the same key only make
-    /// the tie's worst id better, so an answer taken before a batch still
-    /// holds for every row of that batch.
+    /// the open tie already holds every id the window still lacks and either
+    /// `key` is another key, whose row closes the window when pushed, or `key`
+    /// is the tie's and `id` does not displace the tie's worst id in the id
+    /// direction: `push` drops such a row, or completes the window on it,
+    /// whether it matches or not, so the walk need not check it (#2601).
+    /// Later pushes of the tie's key keep the tie full and only make its worst
+    /// id better, and the first push of another key completes the window, so
+    /// an answer taken before a batch still holds for every row of that batch.
     fn may_keep(&self, id: &str, key: &Bson) -> bool {
         use crate::types::SortDirection;
 
         let Some(open) = self.key.as_ref() else {
             return true;
         };
-        if compare_sort_keys(open, key).is_ne()
-            || self.tied.len() < self.wanted.saturating_sub(self.ordered.len())
-        {
+        if self.tied.len() < self.wanted.saturating_sub(self.ordered.len()) {
             return true;
+        }
+        if compare_sort_keys(open, key).is_ne() {
+            return false;
         }
         match self.id_direction {
             SortDirection::Ascending => self.tied.last().is_none_or(|last| id < last.as_str()),
@@ -726,6 +730,31 @@ impl ParamSortWindow {
         self.finish_key();
         self.ordered
     }
+}
+
+/// What `unfiltered_first_group_window` made of the first equal-key group of
+/// an unfiltered walk (#2601).
+enum FirstGroupRead {
+    /// The window, read from the group by id.
+    Window(Vec<String>),
+    /// Not read: the walk runs unchanged.
+    Declined,
+    /// Not read because the group of this key holds fewer live members than
+    /// the window, with its size known and within any allowance the walk
+    /// would count it against: the walk need not count it again.
+    Short(Bson),
+}
+
+/// What `unfiltered_group_closed_by_id` made of the group a window ends in
+/// (#2601).
+enum GroupClose {
+    /// The group's first live members in the id direction, as many as the
+    /// window lacks.
+    Closed(Vec<String>),
+    /// Not closed: the walk goes on as before.
+    Open,
+    /// The walk's index was rejected: the grouped plan answers.
+    IndexGone,
 }
 
 /// A search's parameters as `retain_matching_candidates` checks them:
@@ -4417,6 +4446,7 @@ impl MongoBackend {
             offset,
             take,
             false,
+            None,
         )
         .await?
         .ok_or_else(|| internal_error("a filtered sort walk gave up".to_owned()))
@@ -4484,7 +4514,7 @@ impl MongoBackend {
             );
             return Ok(None);
         };
-        if let Some(window) = self
+        let counted_group = match self
             .unfiltered_first_group_window(
                 db,
                 &search_index,
@@ -4498,8 +4528,10 @@ impl MongoBackend {
             )
             .await?
         {
-            return Ok(Some(window));
-        }
+            FirstGroupRead::Window(window) => return Ok(Some(window)),
+            FirstGroupRead::Declined => None,
+            FirstGroupRead::Short(key) => Some(key),
+        };
         self.param_sorted_filtered_window_over(
             streams,
             db,
@@ -4511,6 +4543,7 @@ impl MongoBackend {
             offset,
             take,
             true,
+            counted_group,
         )
         .await
     }
@@ -4533,19 +4566,26 @@ impl MongoBackend {
     /// `offset + take` live ids, with a resource's repeated rows (adjacent in
     /// that order) counted once.
     ///
-    /// It applies only when all of these hold, and otherwise answers `None`
-    /// and leaves the walk to run unchanged (the rows it looked at stay
-    /// buffered in `streams`): the first cursor batch, already requested, opens
-    /// with at least `UNFILTERED_WALK_MIN_CURSOR_BATCH` rows of one key; it
-    /// does not show the group ending before `offset + take` resources; a
-    /// descending date or quantity has no row without an end (its null-end
-    /// stream is empty), since such a row ties by its start, which this read
-    /// does not select; a group that goes on past the batch has at least
-    /// `offset + take` rows (one count bounded there, so a group the window
-    /// crosses costs a count, not a read and a liveness check); and
-    /// `offset + take` is at most `SORT_ID_CHUNK`. It also answers `None` when
-    /// the group holds fewer distinct or live ids than the window (a short
-    /// group, stale rows of deleted resources) or the index was dropped.
+    /// It applies only when all of these hold, and otherwise declines and
+    /// leaves the walk to run unchanged (the rows it looked at stay buffered
+    /// in `streams`): the first cursor batch, already requested, opens with at
+    /// least `UNFILTERED_WALK_MIN_CURSOR_BATCH` rows of one key; a descending
+    /// date or quantity has no row without an end (its null-end stream is
+    /// empty), since such a row ties by its start, which this read does not
+    /// select; it does not show the group ending before `offset + take`
+    /// resources; a group that goes on past the batch has at least `offset +
+    /// take` rows (one count bounded there, so a group the window crosses
+    /// costs a count, not a read and a liveness check); and `offset + take` is
+    /// at most `SORT_ID_CHUNK`. It also declines when the group holds fewer
+    /// distinct or live ids than the window (a short group, stale rows of
+    /// deleted resources) or the index was dropped.
+    ///
+    /// A group declined for holding fewer members than the window whose size
+    /// that showed (it ends in the batch, the count, or a read not cut) is
+    /// within `unfiltered_walk_tie_allowance` answers `Short`: the walk then
+    /// treats it as counted, so it neither counts it again nor stops its
+    /// batches at the probe, and the group, too short to hold the window, is
+    /// never read by id there either.
     #[allow(clippy::too_many_arguments)]
     async fn unfiltered_first_group_window(
         &self,
@@ -4558,21 +4598,21 @@ impl MongoBackend {
         id_direction: crate::types::SortDirection,
         offset: usize,
         take: usize,
-    ) -> StorageResult<Option<Vec<String>>> {
+    ) -> StorageResult<FirstGroupRead> {
         use crate::types::SortDirection;
 
         let wanted = offset.saturating_add(take);
         if wanted == 0 || wanted > SORT_ID_CHUNK {
-            return Ok(None);
+            return Ok(FirstGroupRead::Declined);
         }
         let Some((first, rest)) = streams.split_first_mut() else {
-            return Ok(None);
+            return Ok(FirstGroupRead::Declined);
         };
         // The first batch, which the walk reads anyway; `fill` keeps it
         // buffered for the walk.
         first.fill().await?;
         let Some(key) = first.buffered.front().map(|(_, key)| key.clone()) else {
-            return Ok(None);
+            return Ok(FirstGroupRead::Declined);
         };
         let run = first
             .buffered
@@ -4580,8 +4620,26 @@ impl MongoBackend {
             .take_while(|(_, other)| compare_sort_keys(other, &key).is_eq())
             .count();
         if run < UNFILTERED_WALK_MIN_CURSOR_BATCH {
-            return Ok(None);
+            return Ok(FirstGroupRead::Declined);
         }
+        // Rows without an end: a descending date's or quantity's second
+        // stream, which the walk fills anyway. Any such row disables the read.
+        for stream in rest.iter_mut() {
+            stream.fill().await?;
+            if !stream.buffered.is_empty() {
+                return Ok(FirstGroupRead::Declined);
+            }
+        }
+        // A group of `rows` rows with fewer members than the window: the walk
+        // need not count it when no allowance it would count it against can
+        // be below it.
+        let short = |rows: usize| {
+            if rows <= unfiltered_walk_tie_allowance(0, 0, wanted) {
+                FirstGroupRead::Short(key.clone())
+            } else {
+                FirstGroupRead::Declined
+            }
+        };
         let group_ends = run < first.buffered.len() || first.exhausted;
         // A group that ends in the batch has as many members as distinct
         // resources among its rows there.
@@ -4596,15 +4654,7 @@ impl MongoBackend {
                     .len()
                     < wanted)
         {
-            return Ok(None);
-        }
-        // Rows without an end: a descending date's or quantity's second
-        // stream. Any such row disables the read.
-        for stream in rest.iter_mut() {
-            stream.fill().await?;
-            if !stream.buffered.is_empty() {
-                return Ok(None);
-            }
+            return Ok(short(run));
         }
         // A group that goes on past the first batch but has fewer rows than
         // the window has fewer members too: one bounded count declines it
@@ -4622,7 +4672,9 @@ impl MongoBackend {
                 .await?
             {
                 Some(rows) if rows >= wanted as u64 => {}
-                _ => return Ok(None),
+                // Bounded at `wanted`, a smaller count is exact.
+                Some(rows) => return Ok(short(rows as usize)),
+                None => return Ok(FirstGroupRead::Declined),
             }
         }
 
@@ -4641,10 +4693,18 @@ impl MongoBackend {
             .batch_size(u32::try_from(limit).unwrap_or(u32::MAX))
             .await;
         let mut cursor = match opened {
-            Err(error) if search_access::hint_rejected(&error) => return Ok(None),
+            Err(error) if search_access::hint_rejected(&error) => {
+                return Ok(FirstGroupRead::Declined);
+            }
             opened => opened.or_query_error("Failed to read the first sort-key group")?,
         };
         let rows = read_cursor_batch(&mut cursor, limit).await?;
+        // A read that was not cut holds the whole group.
+        let declined = if rows.len() < limit {
+            short(rows.len())
+        } else {
+            FirstGroupRead::Declined
+        };
         let mut ids: Vec<String> = Vec::with_capacity(rows.len());
         for row in &rows {
             if let Ok(id) = row.get_str("resource_id")
@@ -4654,7 +4714,7 @@ impl MongoBackend {
             }
         }
         if ids.len() < wanted {
-            return Ok(None);
+            return Ok(declined);
         }
         let candidates: HashSet<String> = ids.iter().cloned().collect();
         let live = self
@@ -4662,37 +4722,47 @@ impl MongoBackend {
             .await?;
         let live: Vec<String> = ids.into_iter().filter(|id| live.contains(id)).collect();
         if live.len() < wanted {
-            return Ok(None);
+            return Ok(declined);
         }
-        Ok(Some(live.into_iter().skip(offset).take(take).collect()))
+        Ok(FirstGroupRead::Window(
+            live.into_iter().skip(offset).take(take).collect(),
+        ))
     }
 
-    /// The window of an unfiltered walk closed by reading, by id, the
-    /// equal-key group of `key` it ends in (#2601), instead of walking the
-    /// group's remaining rows to order it, or handing a long one to the
-    /// grouped aggregate. `window` has every row before the group pushed;
-    /// `keyed` holds every resource a row was read for, and `fresh` those
-    /// whose first row read is of `key`.
+    /// The members of the equal-key group of `key` an unfiltered walk's
+    /// window ends in, read by id (#2601), instead of walking the group's
+    /// remaining rows to order it, or handing a long one to the grouped
+    /// aggregate. `window` has every row before the group pushed; `keyed`
+    /// maps every resource a row was read for to the ordinal of the group its
+    /// first row read is of, `group` is the ordinal of `key`'s, and `fresh` of
+    /// the `tie_rows` rows read of it are of resources first met there.
     ///
     /// The ids before the group are the window's (`ordered_before`); it lacks
     /// `lacking` more, which are the group's first live members in the id
     /// direction. The group's members are the resources with a row of `key`
     /// and none before it: every row of an earlier key has been read, so they
     /// are the resources with a row of `key` that are not in `keyed`, or are
-    /// in `fresh`. The rows of `key` are read on the walk's index ordered by
-    /// `resource_id` in `id_direction` (a resource's repeated rows are
-    /// adjacent and count once), limited to `unfiltered_group_read_limit
-    /// (lacking)`, and those members checked for liveness in one command
-    /// (`known_live` are not checked again). That is the grouped answer:
-    /// members ordered by id after every earlier key. When the read was cut
-    /// before `lacking` live members, the limit is doubled and the group read
-    /// again, up to `SORT_ID_CHUNK` rows.
+    /// keyed in `group`. The rows of `key` are read on the walk's index
+    /// ordered by `resource_id` in `id_direction` (a resource's repeated rows
+    /// are adjacent and count once), and the members checked for liveness in
+    /// one command, up to the `lacking`-th member already known live: one of
+    /// `known_live` (the current batch's live ids) or of the open tie of
+    /// `key`. That is the grouped answer: members ordered by id after every
+    /// earlier key.
     ///
-    /// `None`, with nothing changed, when the limit passes `SORT_ID_CHUNK`,
-    /// the group ends with fewer live members, or the index was dropped: the
-    /// walk then goes on as before. The caller applies it only when the walk
-    /// reads a single stream: a descending date's or quantity's row without
-    /// an end ties by its start, which this read does not select.
+    /// At most two reads. The first is sized by the members the walk met per
+    /// row of the group (`lacking * tie_rows / fresh` rows, through
+    /// `unfiltered_group_read_limit`), at most `SORT_ID_CHUNK`; when it was
+    /// cut before `lacking` live members, the group is read once more with
+    /// `SORT_ID_CHUNK` rows, and only the members not checked yet are checked.
+    ///
+    /// `Open`, with nothing changed, when no member of the group was met
+    /// (`fresh` is 0), `unfiltered_group_read_limit(lacking)` passes
+    /// `SORT_ID_CHUNK`, or the reads end with fewer live members: the walk
+    /// then goes on as before. `IndexGone` when the index was rejected. The
+    /// caller applies it only when the walk reads a single stream: a
+    /// descending date's or quantity's row without an end ties by its start,
+    /// which this read does not select.
     #[allow(clippy::too_many_arguments)]
     async fn unfiltered_group_closed_by_id(
         &self,
@@ -4703,21 +4773,29 @@ impl MongoBackend {
         directive: &crate::types::SortDirective,
         key: &Bson,
         window: &ParamSortWindow,
-        keyed: &HashSet<String>,
-        fresh: &HashSet<String>,
+        keyed: &HashMap<String, usize>,
+        group: usize,
+        fresh: usize,
+        tie_rows: usize,
         known_live: &HashSet<String>,
-    ) -> StorageResult<Option<Vec<String>>> {
+    ) -> StorageResult<GroupClose> {
         use crate::types::SortDirection;
 
         let in_tie = window.in_tie(key);
         let lacking = window.wanted - window.ordered_before(key);
         if lacking == 0 {
-            return Ok(Some(window.clone().closed_with(key, Vec::new())));
+            return Ok(GroupClose::Closed(Vec::new()));
         }
-        let mut limit = unfiltered_group_read_limit(lacking);
+        if fresh == 0 || unfiltered_group_read_limit(lacking) > SORT_ID_CHUNK {
+            return Ok(GroupClose::Open);
+        }
+        // Rows of the group that hold `lacking` members at the density the
+        // walk met them; `fresh <= tie_rows`, so never fewer than `lacking`.
+        let expected_rows = lacking.saturating_mul(tie_rows).div_ceil(fresh);
+        let mut limit = unfiltered_group_read_limit(expected_rows).min(SORT_ID_CHUNK);
         let mut live: HashSet<String> = HashSet::new();
         let mut checked: HashSet<String> = HashSet::new();
-        while limit <= SORT_ID_CHUNK {
+        loop {
             let (filter, index) = sort_key_group_filter(tenant_id, resource_type, directive, key)?;
             let opened = search_index
                 .find(filter)
@@ -4732,7 +4810,9 @@ impl MongoBackend {
                 .batch_size(u32::try_from(limit).unwrap_or(u32::MAX))
                 .await;
             let mut cursor = match opened {
-                Err(error) if search_access::hint_rejected(&error) => return Ok(None),
+                Err(error) if search_access::hint_rejected(&error) => {
+                    return Ok(GroupClose::IndexGone);
+                }
                 opened => opened.or_query_error("Failed to read a sort-key group by id")?,
             };
             let rows = read_cursor_batch(&mut cursor, limit).await?;
@@ -4741,15 +4821,25 @@ impl MongoBackend {
             for row in &rows {
                 if let Ok(id) = row.get_str("resource_id")
                     && members.last().is_none_or(|previous| previous != id)
-                    && (!keyed.contains(id) || fresh.contains(id))
+                    && keyed.get(id).is_none_or(|first| *first == group)
                 {
                     members.push(id.to_owned());
                 }
             }
+            // Members past the `lacking`-th one known live cannot be among
+            // the first `lacking` live ones: they are not checked.
+            let mut known = 0usize;
             let mut unchecked: HashSet<String> = HashSet::new();
             for id in &members {
-                if known_live.contains(id) || (in_tie && window.tied.contains(id)) {
+                if live.contains(id)
+                    || known_live.contains(id)
+                    || (in_tie && window.tied.contains(id))
+                {
                     live.insert(id.clone());
+                    known += 1;
+                    if known == lacking {
+                        break;
+                    }
                 } else if !checked.contains(id) {
                     unchecked.insert(id.clone());
                 }
@@ -4767,14 +4857,13 @@ impl MongoBackend {
                 .take(lacking)
                 .collect();
             if members.len() == lacking {
-                return Ok(Some(window.clone().closed_with(key, members)));
+                return Ok(GroupClose::Closed(members));
             }
-            if !cut {
-                return Ok(None);
+            if !cut || limit >= SORT_ID_CHUNK {
+                return Ok(GroupClose::Open);
             }
-            limit = limit.saturating_mul(2);
+            limit = SORT_ID_CHUNK;
         }
-        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4790,6 +4879,7 @@ impl MongoBackend {
         offset: usize,
         take: usize,
         unfiltered: bool,
+        counted_group: Option<Bson>,
     ) -> StorageResult<Option<Vec<String>>> {
         use crate::types::SortDirection;
 
@@ -4822,12 +4912,15 @@ impl MongoBackend {
             CANDIDATE_BATCH_SIZE
         };
         // The current equal-key group of the unfiltered walk: its key, the
-        // rows read of it, whether it was counted and can be finished, and,
-        // until it is counted, the resources whose first row read is of it.
+        // rows read of it, whether it was counted and can be finished, its
+        // ordinal among the groups met, and how many resources its rows were
+        // the first read for. A first group `unfiltered_first_group_window`
+        // already sized (`counted_group`) starts counted.
         let mut tie_rows = 0usize;
-        let mut tie_key: Option<Bson> = None;
-        let mut tie_counted = false;
-        let mut tie_fresh: HashSet<String> = HashSet::new();
+        let mut tie_counted = counted_group.is_some();
+        let mut tie_key: Option<Bson> = counted_group;
+        let mut tie_group = 0usize;
+        let mut tie_fresh = 0usize;
         // A group is read by id (`unfiltered_group_closed_by_id`) only when
         // the walk reads one stream: a descending date or quantity has its
         // stream of rows without an end empty from the start.
@@ -4838,17 +4931,19 @@ impl MongoBackend {
                 single_stream &= stream.buffered.is_empty();
             }
         }
-        // Every resource a row was read for, matching or not: its first row
-        // held its key, so its later rows are skipped.
-        let mut keyed: HashSet<String> = HashSet::new();
+        // Every resource a row was read for, matching or not, with the
+        // ordinal of the group of its first row: that row held its key, so
+        // its later rows are skipped.
+        let mut keyed: HashMap<String, usize> = HashMap::new();
         let mut window = ParamSortWindow::new(wanted, id_direction);
         let mut complete = false;
         while !complete {
             // Live ids the window still lacks.
             let need = wanted - window.held();
             // A window that holds what it needs only waits for its open tie
-            // to close: count that group sooner.
-            let probe_rows = if need == 0 {
+            // to close: count that group sooner, when the count can let the
+            // walk read it by id.
+            let probe_rows = if need == 0 && single_stream {
                 UNFILTERED_WALK_FULL_TIE_PROBE_ROWS
             } else {
                 UNFILTERED_WALK_TIE_PROBE_ROWS
@@ -4867,13 +4962,15 @@ impl MongoBackend {
                                 tie_rows = 1;
                                 tie_key = Some(key.clone());
                                 tie_counted = false;
-                                tie_fresh.clear();
+                                tie_group += 1;
+                                tie_fresh = 0;
                             }
                         }
-                        if keyed.insert(id.clone()) {
-                            if unfiltered && !tie_counted {
-                                tie_fresh.insert(id.clone());
-                            }
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            keyed.entry(id.clone())
+                        {
+                            slot.insert(tie_group);
+                            tie_fresh += 1;
                             // Once the batch holds what the window lacks, a
                             // resource with a new key closes the window: stop
                             // there, so the walk never enters the group that
@@ -4929,8 +5026,13 @@ impl MongoBackend {
                 };
                 let exceeds = rows > allowed as u64;
                 // `allowed` is above the by-id threshold, so the bounded count
-                // decides it exactly.
-                if single_stream && unfiltered_closes_group_by_id(rows, tie_rows, lacking) {
+                // decides it exactly. A group whose read by id could not hold
+                // what the window lacks is not tried: past the allowance it
+                // is grouped before the batch is checked.
+                if single_stream
+                    && unfiltered_closes_group_by_id(rows, tie_rows, lacking)
+                    && unfiltered_group_read_limit(lacking) <= SORT_ID_CHUNK
+                {
                     close_by_id = Some((key.clone(), exceeds));
                 } else if exceeds {
                     return Ok(None);
@@ -4991,7 +5093,7 @@ impl MongoBackend {
                 }
             }
             if let Some((key, exceeds)) = close_by_id {
-                if let Some(closed) = self
+                match self
                     .unfiltered_group_closed_by_id(
                         db,
                         &search_index,
@@ -5001,17 +5103,29 @@ impl MongoBackend {
                         &key,
                         &window,
                         &keyed,
-                        &tie_fresh,
+                        tie_group,
+                        tie_fresh,
+                        tie_rows,
                         &passing,
                     )
                     .await?
                 {
-                    return Ok(Some(closed.into_iter().skip(offset).take(take).collect()));
-                }
-                // Not read by id: the walk goes on as before, or gives the
-                // group to the grouped aggregate as it would have.
-                if exceeds {
-                    return Ok(None);
+                    GroupClose::Closed(members) => {
+                        return Ok(Some(
+                            window
+                                .closed_with(&key, members)
+                                .into_iter()
+                                .skip(offset)
+                                .take(take)
+                                .collect(),
+                        ));
+                    }
+                    // The walk's index is gone: so would its cursors be.
+                    GroupClose::IndexGone => return Ok(None),
+                    // Not read by id: the walk goes on as before, or gives
+                    // the group to the grouped aggregate as it would have.
+                    GroupClose::Open if exceeds => return Ok(None),
+                    GroupClose::Open => {}
                 }
             }
             for (id, key) in rows {
@@ -5070,7 +5184,7 @@ impl MongoBackend {
             let unkeyed: Vec<String> = batch
                 .iter()
                 .filter_map(|doc| doc.get_str("id").ok())
-                .filter(|id| !keyed.contains(*id))
+                .filter(|id| !keyed.contains_key(*id))
                 .map(ToString::to_string)
                 .collect();
             if !unkeyed.is_empty() {

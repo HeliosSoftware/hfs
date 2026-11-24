@@ -502,37 +502,57 @@ the page.
 The walk does have a guard on the equal-key groups it reads whole, to order
 them by id. A parameter with few distinct values (`status`, `gender`) has a
 group of hundreds of thousands of rows. When a group reaches 512 rows (128
-when the window already holds every id it needs and only waits for that group
-to end) the walk counts it once, with a covered count bounded just above what it may read
-(`sort_key_rows_upto`, about 0.13 microseconds a key). If more of its rows
-remain than the window still lacks plus `max(UNFILTERED_WALK_TIE_ROWS,
-offset + _count + 1)` (`UNFILTERED_WALK_TIE_ROWS` is 8,192), grouping is
-cheaper and the grouped aggregate answers with the same page, after at most
-512 rows of the group and one count. Otherwise the walk finishes the group,
-however long, so a deep window inside a long group (`_sort=code&_offset=30000`,
+when the window already holds every id it needs, only waits for that group to
+end, and the walk reads one stream) the walk counts it once, with a covered
+count bounded just above what it may read (`sort_key_rows_upto`, about 0.13
+microseconds a key). If more of its rows remain than the window still lacks
+plus `max(UNFILTERED_WALK_TIE_ROWS, offset + _count + 1)`
+(`UNFILTERED_WALK_TIE_ROWS` is 8,192), the group is past the walk's allowance:
+unless the read by id below closes the window in it, grouping is cheaper and
+the grouped aggregate answers with the same page, after at most 512 rows of
+the group, one count and the reads by id, if tried. A group within the
+allowance that the read by id does not close is walked to its end, so a deep
+window inside a long group (`_sort=code&_offset=30000`,
 `_sort=subject&_offset=10000` on the same data) is walked instead of abandoned
 after 8,192 rows with the walk thrown away. For a descending date the count
 sees only the rows with a range end, a lower bound of the group: it can let the
 walk finish a group, never change the page.
 
+A first group that `unfiltered_first_group_window` declined because it holds
+fewer members than the window, when that showed its size (it ends in the first
+cursor batch, its bounded count, or a read that was not cut) and the size is
+within any allowance, is treated as counted: the walk neither counts it again
+nor cuts its batches at 512 rows of it, so its liveness checks are not split
+there either.
+
 The count also tells the walk when the group its window ends in is much longer
 than the window still needs: more rows than those already read, plus what the
-window lacks and a quarter more, plus 256 (`unfiltered_closes_group_by_id`).
-Then, before finishing or abandoning the group, the walk reads it by id
-(`unfiltered_group_closed_by_id`): it pushes the batch's rows of earlier keys,
-takes the ids ordered before the group (the open tie of the group itself is
-dropped), and reads the group's rows on the walk's own index, with the same
-key filter as the count, sorted by `resource_id` in the request's id direction
-and limited to what the window lacks plus a sixteenth (at least 32). Resources
-the walk already met at an earlier key are not members and are skipped, as
-are a resource's repeated rows; the rest are checked for liveness in one
-command (ids the walk already found live are not checked again), and the first
-ones that fill the window close it. This is the grouped answer: every key
-before the group is complete, and the group's members follow in id order. A
-read cut before enough live members is repeated with twice the limit, up to
-10,000 rows; when the limit would pass that, the group ends with too few live
-members, or the index was dropped, the walk goes on exactly as without the
-read, and still hands a group past its allowance to the grouped aggregate. A
+window lacks and a quarter more, plus 256 (`unfiltered_closes_group_by_id`),
+and the read below could hold what the window lacks (what it lacks plus a
+sixteenth is at most 10,000 rows). Then, before finishing or abandoning the
+group, the walk reads it by id (`unfiltered_group_closed_by_id`): it pushes the
+batch's rows of earlier keys, takes the ids ordered before the group (the open
+tie of the group itself is dropped), and reads the group's rows on the walk's
+own index, with the same key filter as the count, sorted by `resource_id` in
+the request's id direction. Resources the walk already met at an earlier key
+are not members and are skipped, as are a resource's repeated rows; the rest
+are checked for liveness in one command, and the first ones that fill the
+window close it. Ids the walk already knows live are not checked again, but
+only those of the current batch and of the group's open tie; members after the
+one that completes the window from those known ids are not checked at all. This
+is the grouped answer: every key before the group is complete, and the group's
+members follow in id order.
+
+There are at most two reads. The first asks for what the window lacks scaled by
+the rows the walk read of the group per member it met in them, plus a
+sixteenth (at least 32, at most 10,000): a group whose rows are mostly
+resources already met at an earlier key, or repeated, is read far enough at
+once. A read cut before enough live members is followed by one read of 10,000
+rows, which checks only the members not checked yet. When the walk met no
+member in the group's rows, what the window lacks would need more than 10,000
+rows, or the group ends with too few live members, the walk goes on exactly as
+without the reads, and still hands a group past its allowance to the grouped
+aggregate; when the index was dropped, the grouped aggregate answers. A
 descending date or quantity with any row without an end does not read by id,
 for the reason given below. This serves a window that crosses from a first
 group into a long second one (`CarePlan?_sort=status&_offset=1700`,
@@ -541,10 +561,11 @@ first group by id in vain, walk it again, walk into the second group and then
 either finish it row by row or, when it was too long, group the whole
 parameter.
 
-Inside a batch, a row whose key is that of a full open tie and whose id cannot
-displace the tie's worst id is dropped by the window whatever its check says;
-such rows are not sent to the liveness (or membership) check, and a batch with
-none left sends no command.
+Inside a batch, when the open tie already holds every id the window lacks, a
+row of the tie's key whose id cannot displace the tie's worst id is dropped by
+the window whatever its check says, and a row of another key completes the
+window whatever its check says; such rows are not sent to the liveness (or
+membership) check, and a batch with none left sends no command.
 
 Numeric keys compare `-0.0` equal to `0.0`, as the server orders and matches
 them; telling them apart split a group of zeros into alternating groups and
