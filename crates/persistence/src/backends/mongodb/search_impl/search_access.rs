@@ -235,25 +235,32 @@ pub(super) fn date_hint_rejected(hint: &Option<Hint>, error: &mongodb::error::Er
 /// still hinting a superseded value index that a newer node has dropped
 /// (rolling upgrade), runs the operation once more without it. The identity
 /// index is required, so a rejection of that hint propagates.
-pub(super) async fn with_hint_fallback<T, F>(
+///
+/// Not an `async fn`: `#[track_caller]` has no effect on one, and the command
+/// is tagged with the line that called this helper, not with a line in here.
+#[track_caller]
+pub(super) fn with_hint_fallback<T, F>(
     mut hint: Option<Hint>,
     operation: impl Fn(Option<Hint>) -> F,
-) -> StorageResult<mongodb::error::Result<T>>
+) -> impl Future<Output = StorageResult<mongodb::error::Result<T>>>
 where
     F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    loop {
-        // Build a fresh command budget for the unhinted retry as well.
-        let result = operation(hint.clone()).search_deadline()?.await;
-        if let Err(error) = &result
-            && date_hint_rejected(&hint, error)
-        {
-            search_deadline::check()?;
-            tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-            hint = None;
-            continue;
+    let site = std::panic::Location::caller();
+    async move {
+        loop {
+            // Build a fresh command budget for the unhinted retry as well.
+            let result = operation(hint.clone()).search_deadline_at(site)?.await;
+            if let Err(error) = &result
+                && date_hint_rejected(&hint, error)
+            {
+                search_deadline::check()?;
+                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+                hint = None;
+                continue;
+            }
+            return Ok(result);
         }
-        return Ok(result);
     }
 }
 

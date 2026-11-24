@@ -1786,33 +1786,41 @@ fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>
 /// Optional probes retain their own budget, capped by the shared search
 /// deadline. The duration supplier also preserves a shared tie-break budget
 /// across a missing-index retry.
-async fn with_probe_hint_fallback<T, F>(
+///
+/// Not an `async fn`, so the command is tagged with the line that called this
+/// helper (see `search_access::with_hint_fallback`).
+#[track_caller]
+fn with_probe_hint_fallback<T, F>(
     mut hint: Option<Hint>,
     probe_timeout: impl Fn() -> Duration,
     operation: impl Fn(Option<Hint>) -> F,
-) -> StorageResult<Option<T>>
+) -> impl Future<Output = StorageResult<Option<T>>>
 where
     F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    loop {
-        search_deadline::check()?;
-        let remaining = probe_timeout();
-        if remaining < Duration::from_millis(1) {
-            return Ok(None);
-        }
-        let (command, budget) = operation(hint.clone()).search_probe_deadline(remaining)?;
-        let result = command.await;
-        budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
-        match result {
-            Err(error) if date_hint_rejected(&hint, &error) => {
-                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-                hint = None;
+    let site = std::panic::Location::caller();
+    async move {
+        loop {
+            search_deadline::check()?;
+            let remaining = probe_timeout();
+            if remaining < Duration::from_millis(1) {
+                return Ok(None);
             }
-            Err(error) if optional_probe_timed_out(&error) => return Ok(None),
-            result => {
-                return result
-                    .map(Some)
-                    .or_query_error("Failed to probe search candidates");
+            let (command, budget) =
+                operation(hint.clone()).search_probe_deadline_at(remaining, site)?;
+            let result = command.await;
+            budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
+            match result {
+                Err(error) if date_hint_rejected(&hint, &error) => {
+                    tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+                    hint = None;
+                }
+                Err(error) if optional_probe_timed_out(&error) => return Ok(None),
+                result => {
+                    return result
+                        .map(Some)
+                        .or_query_error("Failed to probe search candidates");
+                }
             }
         }
     }

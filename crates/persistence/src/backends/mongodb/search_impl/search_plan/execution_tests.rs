@@ -1811,14 +1811,15 @@ const MISSING_INDEX: &str = "planner returned error :: caused by :: \
                              hint provided does not correspond to an existing index";
 
 impl<T> SearchCommand for std::future::Ready<mongodb::error::Result<T>> {
-    fn search_deadline(self) -> StorageResult<Self> {
+    fn search_deadline_at(self, _site: search_deadline::CallSite) -> StorageResult<Self> {
         search_deadline::check()?;
         Ok(self)
     }
 
-    fn search_probe_deadline(
+    fn search_probe_deadline_at(
         self,
         probe: Duration,
+        _site: search_deadline::CallSite,
     ) -> StorageResult<(Self, search_deadline::ProbeBudget)> {
         Ok((self, search_deadline::ProbeBudget::new(probe)?))
     }
