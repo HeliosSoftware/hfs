@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
 /// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
@@ -757,6 +757,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             46 => migrate_v46_to_v47(conn)?,
             47 => migrate_v47_to_v48(conn)?,
             48 => migrate_v48_to_v49(conn)?,
+            49 => migrate_v49_to_v50(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2708,6 +2709,21 @@ fn migrate_v47_to_v48(conn: &Connection) -> StorageResult<()> {
             conn.execute(sql, [])
                 .map_err(|e| migration_err(format!("v48 create {name}: {e}")))?;
         }
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 49 to version 50 (#2664): `bulk_manifests.attempts`,
+/// the claims a manifest has used. A claim past `HFS_BULK_SUBMIT_MAX_ATTEMPTS`
+/// fails the manifest instead of running it. Existing rows start at 0.
+fn migrate_v49_to_v50(conn: &Connection) -> StorageResult<()> {
+    let columns = table_columns(conn, "bulk_manifests")?;
+    if !columns.iter().any(|c| c == "attempts") {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v50 add attempts: {e}")))?;
     }
     Ok(())
 }

@@ -2328,7 +2328,8 @@ impl SubmitClaimStrategy for PostgresBackend {
         // the computed key measured 138 ms against 100,000 queued manifests,
         // each of these 20-26 ms.
         const CANDIDATES: &str =
-            "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
+            "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token,
+                    m.attempts
              FROM bulk_manifests m
              JOIN bulk_submissions s
                ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
@@ -2375,11 +2376,14 @@ impl SubmitClaimStrategy for PostgresBackend {
         let submission_id: String = row.get(2);
         let manifest_id: String = row.get(3);
         let fencing_token: i64 = row.get(4);
+        let attempts: i32 = row.get(5);
         let new_token = fencing_token + 1;
+        let attempt = attempts.max(0).saturating_add(1);
 
         txn.execute(
             "UPDATE bulk_manifests
-             SET status = 'processing', worker_id = $1, lease_expiry = $2, fencing_token = $3
+             SET status = 'processing', worker_id = $1, lease_expiry = $2, fencing_token = $3,
+                 attempts = $8
              WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6 AND manifest_id = $7",
             &[
                 &worker_id.as_str(),
@@ -2389,6 +2393,7 @@ impl SubmitClaimStrategy for PostgresBackend {
                 &submitter,
                 &submission_id,
                 &manifest_id,
+                &attempt,
             ],
         )
         .await
@@ -2406,6 +2411,7 @@ impl SubmitClaimStrategy for PostgresBackend {
             lease_expiry,
             lease_duration,
             fencing_token: new_token as u64,
+            attempt: attempt as u32,
         }))
     }
 
@@ -2442,7 +2448,8 @@ impl SubmitClaimStrategy for PostgresBackend {
         let released = client
             .execute(
                 "UPDATE bulk_manifests
-                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL,
+                     attempts = GREATEST(attempts - 1, 0)
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
                    AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6
                    AND status = 'processing'",

@@ -84,6 +84,7 @@ where
 
     let worker_a = WorkerId::new(format!("release-a-{}", uuid::Uuid::new_v4()));
     let lease_a = claim_manifest(backend, &worker_a, &submission, &manifest_id).await;
+    assert_eq!(lease_a.attempt, 1, "the first claim is the first attempt");
     assert_eq!(
         manifest_status(backend, tenant, &submission, &manifest_id).await,
         ManifestStatus::Processing
@@ -106,6 +107,10 @@ where
     let worker_b = WorkerId::new(format!("release-b-{}", uuid::Uuid::new_v4()));
     let lease_b = claim_manifest(backend, &worker_b, &submission, &manifest_id).await;
     assert!(lease_b.fencing_token > lease_a.fencing_token);
+    assert_eq!(
+        lease_b.attempt, 1,
+        "a graceful release gives its attempt back (#2664)"
+    );
 
     assert!(
         !backend.release(lease_a).await.unwrap(),

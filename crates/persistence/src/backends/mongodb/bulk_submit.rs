@@ -1971,7 +1971,7 @@ impl MongoBackend {
                         "worker_id": worker_id.as_str(),
                         "lease_expiry": to_bson_time(lease_expiry),
                     },
-                    "$inc": { "fencing_token": 1_i64 },
+                    "$inc": { "fencing_token": 1_i64, "attempts": 1_i64 },
                 },
             )
             .return_document(ReturnDocument::After)
@@ -1989,6 +1989,7 @@ impl MongoBackend {
             lease_expiry,
             lease_duration,
             fencing_token: claimed.get_i64("fencing_token").unwrap_or(token + 1).max(0) as u64,
+            attempt: u32::try_from(claimed.get_i64("attempts").unwrap_or(1)).unwrap_or(u32::MAX),
         }))
     }
 }
@@ -2142,11 +2143,14 @@ impl SubmitClaimStrategy for MongoBackend {
             .await?
             .update_one(
                 filter,
-                doc! { "$set": {
-                    "status": ManifestStatus::Pending.to_string(),
-                    "worker_id": null,
-                    "lease_expiry": null,
-                }},
+                doc! {
+                    "$set": {
+                        "status": ManifestStatus::Pending.to_string(),
+                        "worker_id": null,
+                        "lease_expiry": null,
+                    },
+                    "$inc": { "attempts": -1_i64 },
+                },
             )
             .await
             .map_err(|e| internal_error(format!("release manifest lease: {e}")))?;

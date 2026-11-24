@@ -92,6 +92,10 @@ pub struct SubmissionManifestState {
     /// Monotonically increasing token, bumped on every claim.
     #[serde(default)]
     pub fencing_token: u64,
+    /// Claims the manifest has used; a graceful release gives its claim back
+    /// (#2664).
+    #[serde(default)]
+    pub attempts: u32,
     /// Base URL for resolving relative references in ingested resources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fhir_base_url: Option<String>,
@@ -132,6 +136,7 @@ impl SubmissionManifestState {
             worker_id: None,
             lease_expiry: None,
             fencing_token: 0,
+            attempts: 0,
             fhir_base_url: None,
             output_format: None,
             file_request_headers: Vec::new(),
