@@ -94,7 +94,8 @@ pub struct HtsConfig {
 
     /// Largest expansion size a request may ask for through the
     /// `X-TOO-COSTLY-THRESHOLD` header. The header lowers the limit for its
-    /// own request or raises it up to this value, never beyond.
+    /// own request or raises it up to this value, never beyond. A value
+    /// below `HTS_MAX_EXPANSION_SIZE` is treated as `HTS_MAX_EXPANSION_SIZE`.
     #[arg(long, env = "HTS_MAX_EXPANSION_SIZE_CEILING", default_value = "100000")]
     pub max_expansion_size_ceiling: u32,
 

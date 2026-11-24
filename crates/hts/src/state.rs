@@ -164,7 +164,9 @@ pub struct AppState<B: TerminologyBackend> {
 
     /// Largest value the `X-TOO-COSTLY-THRESHOLD` header may set
     /// [`Self::max_expansion_size`] to for one request. Defaults to
-    /// `100_000`; override with `HTS_MAX_EXPANSION_SIZE_CEILING`.
+    /// `100_000`; override with `HTS_MAX_EXPANSION_SIZE_CEILING`. Read it
+    /// through [`Self::expansion_size_ceiling`], which never goes below
+    /// [`Self::max_expansion_size`].
     pub max_expansion_size_ceiling: u32,
 
     /// In-process LRU-style cache for `$expand` responses.
@@ -327,6 +329,15 @@ impl<B: TerminologyBackend> AppState<B> {
     pub fn with_max_expansion_size_ceiling(mut self, ceiling: u32) -> Self {
         self.max_expansion_size_ceiling = ceiling;
         self
+    }
+
+    /// The largest limit the `X-TOO-COSTLY-THRESHOLD` header may set for one
+    /// request: [`Self::max_expansion_size_ceiling`], but never below
+    /// [`Self::max_expansion_size`]. A ceiling configured under the default
+    /// limit would otherwise turn a header asking for more codes into one
+    /// that lowers the limit.
+    pub fn expansion_size_ceiling(&self) -> u32 {
+        self.max_expansion_size_ceiling.max(self.max_expansion_size)
     }
 
     /// Override [`Self::import_finalize_wait`].

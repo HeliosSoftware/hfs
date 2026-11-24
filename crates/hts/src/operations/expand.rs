@@ -4283,7 +4283,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params, state.max_expansion_size_ceiling);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4316,7 +4316,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params, state.max_expansion_size_ceiling);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4480,8 +4480,8 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
 /// expansion would exceed it. We surface the value as a synthetic
 /// `__max_expansion_size__` parameter so `process_expand` can override
 /// `state.max_expansion_size` for this request, clamped to `ceiling`
-/// (`HTS_MAX_EXPANSION_SIZE_CEILING`). The synthetic parameter is only ever
-/// set here: one arriving in the request body is dropped.
+/// ([`AppState::expansion_size_ceiling`]). The synthetic parameter is only
+/// ever set here: one arriving in the request body is dropped.
 fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>, ceiling: u32) {
     params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
     if let Some(v) = headers
@@ -4564,7 +4564,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     let mut params = instance_expand_params(raw_params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params, state.max_expansion_size_ceiling);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,
@@ -4596,7 +4596,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     let mut params = instance_expand_params(params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params, state.max_expansion_size_ceiling);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,

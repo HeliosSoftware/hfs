@@ -905,6 +905,41 @@ async fn a_tree_expansion_is_subject_to_the_limit() {
     );
 }
 
+/// `count` pages a flat expansion, but a tree ignores it and returns every
+/// code, so a tree with `count` must still be held to the limit.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_tree_expansion_with_count_is_subject_to_the_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+            {"name": "hierarchical", "valueBoolean": true},
+            {"name": "count", "valueInteger": 1}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::ecl_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// A ceiling configured below the limit must not let the header, which asks
+/// for more codes, lower the limit instead.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_ceiling_below_the_limit_never_lowers_it() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "url", "valueUri": bundles::LIMBS_VS_URL}]
+    });
+    // Limit 5 lets the three limbs codes through; a ceiling of 2 would cut
+    // the header's 10 down to 2 if it were taken as is.
+    let app = capped_app(5, 2, bundles::r4_bundle()).await;
+    assert_eq!(expand_status(app, body, Some("10")).await, StatusCode::OK);
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]
