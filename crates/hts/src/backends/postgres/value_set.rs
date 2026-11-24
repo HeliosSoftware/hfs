@@ -3417,12 +3417,42 @@ async fn pg_filter_child_of(
 /// pre-narrows by `concept_properties` rows for that property name (resolving
 /// FHIR-canonical aliases via `cs_property_local_codes`), then anchored regex
 /// is applied to the value.
+/// Longest `regex` filter value accepted. PostgreSQL warns that a regular
+/// expression from an untrusted source can take arbitrary time and memory;
+/// the statement timeout bounds the time, and this bounds the pattern.
+pub(crate) const MAX_REGEX_FILTER_LEN: usize = 1024;
+
+/// Refuses a `regex` filter value longer than [`MAX_REGEX_FILTER_LEN`].
+fn check_regex_filter_len(value: &str) -> Result<(), HtsError> {
+    if value.len() > MAX_REGEX_FILTER_LEN {
+        return Err(HtsError::InvalidRequest(format!(
+            "regex filter value exceeds the maximum length of {MAX_REGEX_FILTER_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod regex_filter_tests {
+    use super::*;
+
+    #[test]
+    fn a_regex_filter_longer_than_the_maximum_is_refused() {
+        assert!(check_regex_filter_len(&"a".repeat(MAX_REGEX_FILTER_LEN)).is_ok());
+        assert!(matches!(
+            check_regex_filter_len(&"a".repeat(MAX_REGEX_FILTER_LEN + 1)),
+            Err(HtsError::InvalidRequest(_))
+        ));
+    }
+}
+
 async fn pg_filter_regex(
     client: &tokio_postgres::Client,
     system_id: &str,
     property: &str,
     value: &str,
 ) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    check_regex_filter_len(value)?;
     // The FHIR `regex` filter requires a full match. PG's `~` is POSIX
     // regex and matches substrings unless anchored, and Rust's `regex`
     // crate likewise matches anywhere unless anchored. Wrap once here

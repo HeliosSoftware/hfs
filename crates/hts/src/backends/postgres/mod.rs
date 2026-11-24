@@ -460,6 +460,48 @@ pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
+/// How long one terminology statement may run, the same as the HTTP request
+/// timeout. Dropping a request does not cancel its statement, so without
+/// this the statement would keep its pooled connection after the 408.
+pub(crate) const STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// The connection `options` for the pool: the URL's own, plus
+/// `statement_timeout` unless they set one already. Setting `options` on the
+/// pool replaces the URL's, so they are carried over.
+fn with_statement_timeout(url_options: Option<&str>) -> Option<String> {
+    let url_options = url_options.unwrap_or("").trim();
+    if url_options.contains("statement_timeout") {
+        return Some(url_options.to_string());
+    }
+    let timeout = format!("-c statement_timeout={STATEMENT_TIMEOUT_MS}");
+    Some(if url_options.is_empty() {
+        timeout
+    } else {
+        format!("{url_options} {timeout}")
+    })
+}
+
+#[cfg(test)]
+mod statement_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn the_pool_adds_a_statement_timeout_and_keeps_the_urls_options() {
+        assert_eq!(
+            with_statement_timeout(None).as_deref(),
+            Some("-c statement_timeout=30000")
+        );
+        assert_eq!(
+            with_statement_timeout(Some("-c search_path=hts")).as_deref(),
+            Some("-c search_path=hts -c statement_timeout=30000")
+        );
+        assert_eq!(
+            with_statement_timeout(Some("-c statement_timeout=5000")).as_deref(),
+            Some("-c statement_timeout=5000")
+        );
+    }
+}
+
 /// Builds the pool, with the TLS connector the URL's `sslmode`, `sslrootcert`,
 /// `sslcert` and `sslkey` ask for (#2746). Those parameters are read here and
 /// taken off the URL, since the driver knows neither the verify modes nor the
@@ -505,6 +547,7 @@ fn build_pool(database_url: &str) -> Result<(Pool, String, PostgresTlsSettings),
     let mut cfg = Config::new();
     cfg.url = Some(url);
     cfg.ssl_mode = Some(mode.driver_mode());
+    cfg.options = with_statement_timeout(pg_config.get_options());
     // 32 connections: warm requests bypass the pool entirely (see the
     // closure-page / inline-compose warm-hit fast paths in value_set.rs), so
     // the pool only gates *cold* expansions. 16 was too few to warm a

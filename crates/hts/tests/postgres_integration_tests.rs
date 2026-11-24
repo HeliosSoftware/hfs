@@ -154,6 +154,19 @@ async fn schema_applies_idempotently() {
         .expect("Second schema application (idempotent) should also succeed");
 }
 
+/// Every pooled connection carries the terminology statement timeout, so a
+/// statement the request timeout has given up on is stopped by the server.
+#[tokio::test]
+async fn pooled_connections_carry_the_statement_timeout() {
+    let backend = fresh_backend().await;
+    let client = backend.pool().get().await.expect("connection");
+    let row = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .expect("SHOW statement_timeout");
+    assert_eq!(row.get::<_, String>(0), "30s");
+}
+
 #[tokio::test]
 async fn backend_name_is_postgres() {
     let backend = fresh_backend().await;
