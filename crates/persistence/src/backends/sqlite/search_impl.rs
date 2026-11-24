@@ -28,8 +28,8 @@ use crate::types::{
 
 use super::SqliteBackend;
 use super::search::query_builder::{
-    DateTailRange, DateWalkRange, date_walk_index, date_walk_keyed_count_sql, date_walk_page_sql,
-    date_walk_tail_sql,
+    DateTailRange, DateTieProbe, DateWalkRange, date_walk_index, date_walk_keyed_count_sql,
+    date_walk_page_sql, date_walk_tail_sql, date_walk_tie_probe_sql,
 };
 use super::search::{
     DEFAULT_ORDER_BY, KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
@@ -517,8 +517,9 @@ impl SqliteBackend {
                 cursor.as_ref(),
                 query.offset.unwrap_or(0) as usize,
                 count,
+                tie_group_cap(),
             ) {
-                Ok((raw_rows, has_previous)) => {
+                Ok(Some((raw_rows, has_previous))) => {
                     return assemble_page(
                         tenant,
                         resource_type,
@@ -530,6 +531,9 @@ impl SqliteBackend {
                         total,
                     );
                 }
+                // The page starts in an equal-key group too large to walk: the
+                // general statement below serves it.
+                Ok(None) => {}
                 // The index was dropped between the probe and the prepare.
                 Err(error) if error.to_string().contains("no such index") => {}
                 Err(error) => return Err(error),
@@ -862,6 +866,16 @@ fn assemble_page(
     })
 }
 
+/// The equal-key group size the date walk tolerates: the constant, or what a
+/// test sets for its own thread.
+fn tie_group_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = tests::TIE_CAP.with(|cap| cap.get()) {
+        return cap;
+    }
+    crate::types::DATE_WALK_MAX_TIE_GROUP
+}
+
 /// Whether the index the date walk reads exists. A bulk rebuild drops the
 /// value indexes for its duration (`BULK_REBUILD_DROPPED_INDEXES`); without
 /// them the walk would scan `search_index`, so the caller keeps the correlated
@@ -886,8 +900,75 @@ fn date_walk_index_present(conn: &rusqlite::Connection, desc: bool) -> bool {
 /// (as the correlated sort was). An `_offset` above `DATE_WALK_MAX_OFFSET` never
 /// reaches here: `unfiltered_single_date_sort` refuses it and the general
 /// statement serves the page.
+///
+/// `None` means the page starts in an equal-key group of more than `tie_cap`
+/// rows, which the walk would read, probe and sort whole for every page; the
+/// caller serves it with the general statement. Only the group the page
+/// starts at is measured: with an `_offset` (at most `DATE_WALK_MAX_OFFSET`)
+/// the page can start in a later group that this does not see.
 #[allow(clippy::too_many_arguments)]
 fn walk_date_page(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    param: &str,
+    desc: bool,
+    cursor: Option<&PageCursor>,
+    offset: usize,
+    count: usize,
+    tie_cap: usize,
+) -> StorageResult<Option<(Vec<RawRow>, bool)>> {
+    let probe = match cursor {
+        None => Some(DateTieProbe::Head { reverse: false }),
+        Some(cursor) => {
+            let backward = cursor.direction() == CursorDirection::Previous;
+            match (backward, cursor_value_is_null(cursor)) {
+                // Forward from a resource with no value: only the tail.
+                (false, true) => None,
+                // Backward from one: reads the keyed resources from the end.
+                (true, true) => Some(DateTieProbe::Head { reverse: true }),
+                _ => Some(DateTieProbe::Value),
+            }
+        }
+    };
+    if let Some(probe) = probe {
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if probe == DateTieProbe::Value
+            && let Some(cursor) = cursor
+        {
+            bind_cursor_value(&mut bound, SortValueKind::Timestamp, cursor)?;
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+        let group: i64 = conn
+            .query_row(
+                &date_walk_tie_probe_sql(param, desc, probe, tie_cap),
+                refs.as_slice(),
+                |row| row.get(0),
+            )
+            .or_query_error("Failed to measure the date tie group")?;
+        if group as usize > tie_cap {
+            return Ok(None);
+        }
+    }
+    walk_date_rows(
+        conn,
+        tenant_id,
+        resource_type,
+        param,
+        desc,
+        cursor,
+        offset,
+        count,
+    )
+    .map(Some)
+}
+
+/// The rows of [`walk_date_page`] once its first group is known to be small.
+#[allow(clippy::too_many_arguments)]
+fn walk_date_rows(
     conn: &rusqlite::Connection,
     tenant_id: &str,
     resource_type: &str,
@@ -4552,6 +4633,10 @@ mod tests {
     thread_local! {
         static TRACED_SQL: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// Equal-key group size the date walk tolerates on this thread; `None`
+        /// is the production constant.
+        pub(super) static TIE_CAP: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// `Connection::trace_v2` callback: keeps each statement as it starts,
@@ -4624,6 +4709,7 @@ mod tests {
             Some(record_traced_sql),
         )
         .unwrap();
+        let mut tail_seen = false;
         for (desc, index) in [(true, "idx_search_date_end"), (false, "idx_search_date")] {
             let query = date_sort_query(desc, 2);
             let mut pages = Vec::new();
@@ -4678,6 +4764,20 @@ mod tests {
                         .any(|line| line.contains("USE TEMP B-TREE FOR ORDER BY")),
                     "{sql}\n{plan:#?}"
                 );
+                // The tail (resources with no value) runs when a page is
+                // short; its probe must seek by resource, not read the
+                // parameter's whole index for each one.
+                let tail = TRACED_SQL.with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id"))
+                        .cloned()
+                });
+                if let Some(tail) = tail {
+                    tail_seen = true;
+                    assert_seeks_by_resource(&conn, &tail);
+                }
                 pages.push(result.resources.items.len());
                 match result.resources.page_info.next_cursor {
                     Some(next) => cursor_query.cursor = Some(next),
@@ -4685,7 +4785,68 @@ mod tests {
                 }
             }
             assert_eq!(pages[0], 2);
+
+            // An `_offset` past every resource with a value counts them.
+            let mut past = date_sort_query(desc, 2);
+            past.offset = Some(8);
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            backend
+                .search_with_connection_probe(&conn, &tenant, &past, None, false)
+                .unwrap();
+            let count = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT COUNT(*) FROM resources"))
+                        .cloned()
+                })
+                .expect("the count of resources with a value");
+            assert_seeks_by_resource(&conn, &count);
         }
+        assert!(tail_seen, "no page reached the resources with no value");
+    }
+
+    /// The `search_index` probes of `sql` (the tail or the count of the date
+    /// walk) seek `idx_search_composite` by `resource_key`; the partial date
+    /// indexes have no such prefix and would be read whole per resource, which
+    /// made the descending tail and count quadratic (#2731).
+    fn assert_seeks_by_resource(conn: &rusqlite::Connection, sql: &str) {
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let probes: Vec<&String> = plan
+            .iter()
+            .filter(|line| line.contains("search_index") || line.starts_with("SEARCH s "))
+            .collect();
+        assert!(
+            !probes.is_empty(),
+            "{sql}
+{plan:#?}"
+        );
+        for line in probes {
+            assert!(
+                line.contains("resource_key=?"),
+                "probe without resource_key: {line}
+{sql}
+{plan:#?}"
+            );
+            assert!(
+                !line.contains("idx_search_date"),
+                "probe on a date index: {line}
+{sql}
+{plan:#?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|line| line.contains("USE TEMP B-TREE")),
+            "{sql}
+{plan:#?}"
+        );
     }
 
     /// #2731: with the date index gone (a bulk rebuild drops it), the page is
@@ -4727,6 +4888,148 @@ mod tests {
             assert!(!walked_sql, "the walk ran without {index}");
             assert_eq!(ids(&walked), ids(&fallback), "{index}");
             assert_eq!(ids(&walked).len(), 9);
+        }
+    }
+
+    /// Seeds `ties` Observations at one instant (the latest) and `others` at
+    /// distinct earlier ones, so the head of a descending sort is one big
+    /// equal-key group.
+    async fn seed_date_ties(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        ties: usize,
+        others: usize,
+    ) {
+        for i in 0..ties + others {
+            let instant = if i < ties {
+                "2030-01-01T00:00:00Z".to_string()
+            } else {
+                format!("20{:02}-01-01T00:00:00Z", 10 + (i - ties))
+            };
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": format!("t{i:03}"),
+                           "status": "final", "effectiveDateTime": instant}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Every id of an unfiltered date sort, one cursor page at a time.
+    fn date_sort_ids(
+        backend: &SqliteBackend,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut paged = query.clone();
+        loop {
+            let result = backend
+                .search_with_connection_probe(conn, tenant, &paged, None, false)
+                .unwrap();
+            ids.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            match result.resources.page_info.next_cursor {
+                Some(next) => paged.cursor = Some(next),
+                None => return ids,
+            }
+        }
+    }
+
+    fn walk_statement_ran() -> bool {
+        TRACED_SQL.with(|traced| {
+            traced
+                .borrow()
+                .iter()
+                .any(|sql| sql.contains("FROM search_index si CROSS JOIN resources r"))
+        })
+    }
+
+    /// #2731: a page that starts in an equal-key group above the tolerated size
+    /// is served by the general statement, with the same ids and order; below
+    /// it the walk serves it. A cursor paging through the big group and out of
+    /// it gives the same list on either path.
+    #[tokio::test]
+    async fn a_large_equal_key_group_is_served_by_the_general_statement() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_ties(&backend, &tenant, 12, 6).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            let general = {
+                let mut query = date_sort_query(desc, 100);
+                query.fhir_version = Some(FhirVersion::default());
+                date_sort_ids(&backend, &conn, &tenant, &query)
+            };
+            assert_eq!(general.len(), 18);
+            for (cap, walked) in [(5usize, false), (100, true)] {
+                TIE_CAP.with(|c| c.set(Some(cap)));
+                // The first page starts in the 12 ties when descending, and in
+                // the single earliest rows when ascending.
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let first = backend
+                    .search_with_connection_probe(
+                        &conn,
+                        &tenant,
+                        &date_sort_query(desc, 5),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                let expect_walk = walked || !desc;
+                assert_eq!(walk_statement_ran(), expect_walk, "desc={desc} cap={cap}");
+                let first: Vec<String> = first
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(first, general[..5], "desc={desc} cap={cap}");
+                // Paged by cursor across the group boundary: the same list.
+                let paged = date_sort_ids(&backend, &conn, &tenant, &date_sort_query(desc, 5));
+                assert_eq!(paged, general, "desc={desc} cap={cap}");
+            }
+            TIE_CAP.with(|c| c.set(None));
+        }
+    }
+
+    /// #2731: an `_offset` up to `DATE_WALK_MAX_OFFSET` is walked; one past it
+    /// is served by the general statement.
+    #[tokio::test]
+    async fn an_offset_past_the_cap_is_served_by_the_general_statement() {
+        use crate::types::DATE_WALK_MAX_OFFSET;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            for (offset, walked) in [
+                (DATE_WALK_MAX_OFFSET, true),
+                (DATE_WALK_MAX_OFFSET + 1, false),
+            ] {
+                let mut query = date_sort_query(desc, 2);
+                query.offset = Some(offset as u32);
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let page = backend
+                    .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                    .unwrap();
+                assert_eq!(walk_statement_ran(), walked, "desc={desc} offset={offset}");
+                assert!(page.resources.items.is_empty(), "past the 9 resources");
+            }
         }
     }
 

@@ -2052,15 +2052,22 @@ pub(crate) enum DateTailRange {
     Before,
 }
 
-/// The `NOT EXISTS` / `EXISTS` body that says a resource has a key for the
-/// walk: a row with a non-null walked column, as the correlated subquery's
-/// `MAX`/`MIN` would see.
-fn date_keyed_exists(param: &str, desc: bool) -> String {
+/// The scalar subquery whose `NULL`ness says a resource has no key for the
+/// walk: the `MAX` of the walked column over the resource's rows, as the
+/// correlated sort computes its key.
+///
+/// It must not filter on `<column> IS NOT NULL`: that predicate makes the
+/// planner pick the partial index on the walked column
+/// (`idx_search_date_end`), which has no `resource_key` prefix, so each
+/// probe would read every row of the parameter and the tail and the count
+/// would be quadratic (#2731). Without it the probe seeks
+/// `idx_search_composite` by resource, as the correlated sort does.
+fn date_key_of_resource(param: &str, desc: bool) -> String {
     format!(
-        "(SELECT 1 FROM search_index s WHERE s.tenant_id = ?1 AND s.resource_type = ?2 \
-         AND s.resource_key = resources.rowid AND s.param_name = {} AND s.{} IS NOT NULL)",
-        sql_string_literal(param),
-        date_walk_column(desc)
+        "(SELECT MAX(s.{}) FROM search_index s WHERE s.tenant_id = ?1 AND s.resource_type = ?2 \
+         AND s.resource_key = resources.rowid AND s.param_name = {})",
+        date_walk_column(desc),
+        sql_string_literal(param)
     )
 }
 
@@ -2083,9 +2090,46 @@ pub(crate) fn date_walk_tail_sql(
         "SELECT id, version_id, data, last_updated, fhir_version, NULL AS sort_key \
          FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{condition} \
-           AND NOT EXISTS {exists} \
+           AND {key} IS NULL \
          ORDER BY id {dir} LIMIT {limit} OFFSET {offset}",
-        exists = date_keyed_exists(param, desc)
+        key = date_key_of_resource(param, desc)
+    )
+}
+
+/// Which equal-key group [`date_walk_tie_probe_sql`] measures (#2731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTieProbe {
+    /// The first key of the walk's order (`reverse`: the last, where a
+    /// `Previous` page from the resources with no value starts reading).
+    Head { reverse: bool },
+    /// The cursor key `?3`.
+    Value,
+}
+
+/// Counts, up to `cap + 1`, the date rows that share the key a page starts
+/// at. More than `cap` means the walk would read, probe and sort that whole
+/// group for the page, and the general statement serves it instead. Binds
+/// `?1` tenant and `?2` type, plus `?3` key for [`DateTieProbe::Value`].
+pub(crate) fn date_walk_tie_probe_sql(
+    param: &str,
+    desc: bool,
+    probe: DateTieProbe,
+    cap: usize,
+) -> String {
+    let col = date_walk_column(desc);
+    let literal = sql_string_literal(param);
+    let key = match probe {
+        DateTieProbe::Value => "?3".to_string(),
+        DateTieProbe::Head { reverse } => {
+            let dir = if desc != reverse { "DESC" } else { "ASC" };
+            format!(
+                "(SELECT k.{col} FROM search_index k WHERE k.tenant_id = ?1                  AND k.resource_type = ?2 AND k.param_name = {literal}                  AND k.{col} IS NOT NULL ORDER BY k.{col} {dir} LIMIT 1)"
+            )
+        }
+    };
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM search_index si WHERE si.tenant_id = ?1          AND si.resource_type = ?2 AND si.param_name = {literal} AND si.{col} = {key}          LIMIT {})",
+        cap + 1
     )
 }
 
@@ -2096,8 +2140,8 @@ pub(crate) fn date_walk_keyed_count_sql(param: &str, desc: bool) -> String {
     format!(
         "SELECT COUNT(*) FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-           AND EXISTS {}",
-        date_keyed_exists(param, desc)
+           AND {} IS NOT NULL",
+        date_key_of_resource(param, desc)
     )
 }
 

@@ -933,10 +933,22 @@ pub fn absolute_reference_target(reference: &str) -> Option<String> {
 }
 
 /// Deepest `_offset` the ordered date-index walk serves (#2731). Past it the
-/// walk reads and probes every skipped row, which loses to the general sort (an
-/// offset beyond the dated set measured slower than it on SQLite), so the
-/// general statement keeps those requests.
-pub const DATE_WALK_MAX_OFFSET: usize = 10_000;
+/// walk reads and probes every skipped row (about 27 us each on SQLite against
+/// 3-9 us for the general sort), so the general statement keeps those requests.
+///
+/// 1,000 is a conservative value, not a calibrated one: at 191,797 rows the walk
+/// still won at offset 10,000 (274 ms against 1,331 ms descending), but on
+/// types of fewer than about 80,000 resources it can lose there. Recalibrate it
+/// with offsets 1,000 / 10,000 / 50,000 on a 1M data set (tracking issue #2180).
+pub const DATE_WALK_MAX_OFFSET: usize = 1_000;
+
+/// Most rows of one equal-key group the ordered date-index walk reads for the
+/// head of a page (#2731). The walk orders `key, id` inside a group, so a group
+/// larger than this makes it read, probe and sort the whole group for every
+/// page (50,000 equal keys measured 2.9 s against 1.6 s for the general sort on
+/// SQLite). Past it the general statement serves the page, as the MongoDB walk
+/// does at the same size. The value is MongoDB's, not yet calibrated for SQL.
+pub const DATE_WALK_MAX_TIE_GROUP: usize = 8_192;
 
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
