@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 
 use crate::core::bulk_export::{
     BulkExportStorage, ExportDataProvider, ExportJobId, ExportLevel, ExportProgress, ExportRequest,
@@ -338,6 +339,39 @@ pub trait ExportResourceProvider:
 impl<T> ExportResourceProvider for T where
     T: ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
 {
+}
+
+/// The text of a panic payload: the `&str` or `String` a `panic!` carries.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "a panic with a non-string payload".to_string()
+    }
+}
+
+/// The error a worker reports for a job whose run panicked: logged here with
+/// the payload, and an [`BackendError::Internal`] for the job's failure path,
+/// which keeps its text out of what the client sees.
+pub(crate) fn panicked_job_error(
+    component: &str,
+    job: &dyn std::fmt::Display,
+    payload: &(dyn std::any::Any + Send),
+) -> StorageError {
+    let message = panic_message(payload);
+    tracing::error!(
+        component,
+        job = %job,
+        panic = %message,
+        "a worker's job panicked; failing the job and keeping the worker"
+    );
+    StorageError::Backend(BackendError::Internal {
+        backend_name: component.to_string(),
+        message: format!("the job panicked: {message}"),
+        source: None,
+    })
 }
 
 /// The default in-process export worker.
@@ -781,7 +815,22 @@ where
         // that requested the export.
         let mut view: Option<WorkerJobView> = None;
 
-        let outcome = self.run_job_inner(&lease, &keeper, &mut view).await;
+        // A panic in the run fails this job like any other internal error,
+        // through the fenced write below, and returns to the worker loop: an
+        // unwinding `run_job` used to end the loop's task for the life of the
+        // process, and the reclaimed job then panicked the next worker.
+        let outcome =
+            match std::panic::AssertUnwindSafe(self.run_job_inner(&lease, &keeper, &mut view))
+                .catch_unwind()
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(payload) => Err(LeaseError::Storage(panicked_job_error(
+                    "bulk-export",
+                    &lease.job_id,
+                    payload.as_ref(),
+                ))),
+            };
         // Renewals stop before the lease is handed back: a heartbeat that
         // lands after the release finds the lease gone and would report it
         // stolen.
@@ -2630,6 +2679,109 @@ mod tests {
             assert!(
                 error_message.contains("g-missing"),
                 "error message should name the missing group, got: {error_message}"
+            );
+        }
+
+        /// An output store whose writer panics, standing in for any panic
+        /// reachable from a job's run.
+        struct PanickingOutput(Arc<LocalFsOutputStore>);
+
+        #[async_trait]
+        impl ExportOutputStore for PanickingOutput {
+            async fn open_writer(
+                &self,
+                _key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                panic!("injected panic while opening an export part")
+            }
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                self.0.finalize_part(key, writer).await
+            }
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.0.download_url(key, ttl).await
+            }
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.0.open_reader(key).await
+            }
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &crate::core::bulk_export::ExportJobId,
+            ) -> StorageResult<()> {
+                self.0.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// A panic in the run fails the job with the generic message and
+        /// returns to the caller, so the worker loop keeps claiming (#2663).
+        #[tokio::test]
+        async fn test_a_panicking_run_fails_the_job_and_returns() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(PanickingOutput(Arc::new(LocalFsOutputStore::new(
+                tmp.path(),
+                "http://localhost:8080",
+            ))));
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system().with_types(vec!["Patient".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-panic");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                output,
+                worker_id.clone(),
+            );
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            let result = worker.run_job(lease).await;
+            assert!(result.is_err(), "the failure is reported, not unwound");
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::Error);
+            let error_message = progress.error_message.unwrap_or_default();
+            assert_eq!(error_message, "export failed: internal storage error");
+            assert!(
+                !error_message.contains("injected panic"),
+                "the panic text stays in the log: {error_message}"
             );
         }
 
