@@ -38,7 +38,7 @@ mod tests {
             serde_json::from_value(params_json).expect("Failed to parse parameters");
 
         // Call the handler
-        let response = evaluate_fhirpath(Json(params)).await;
+        let response = evaluate_fhirpath(None, Json(params)).await;
 
         // Check that we got a successful response
         assert!(response.is_ok());
@@ -111,7 +111,7 @@ mod tests {
             serde_json::from_value(params_json).expect("Failed to parse parameters");
 
         // Call the handler
-        let response = evaluate_fhirpath(Json(params)).await;
+        let response = evaluate_fhirpath(None, Json(params)).await;
 
         assert!(response.is_ok());
 

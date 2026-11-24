@@ -25,13 +25,78 @@ use helios_fhir::{FhirResource, FhirVersion};
 /// This endpoint accepts a FHIR Parameters resource and evaluates the FHIRPath
 /// expression against the provided resource, returning results in the format
 /// specified by the fhirpath-lab API.
+/// The terminology servers a request's `terminologyServer` parameter may
+/// name. The server does not authenticate its callers, and the parameter
+/// becomes the base URL of the terminology client, so an unlisted value would
+/// let any caller make the server send requests to any host it can reach and
+/// read the answers. The operator's own `FHIRPATH_TERMINOLOGY_SERVER` is
+/// always allowed; others are listed in
+/// `FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS`.
+#[derive(Debug, Clone, Default)]
+pub struct TerminologyServerPolicy {
+    allowed: Vec<String>,
+}
+
+impl TerminologyServerPolicy {
+    /// A policy allowing `configured` (the operator's own server) and every
+    /// URL in `allowed`.
+    pub fn new(configured: Option<&str>, allowed: &[String]) -> Self {
+        Self {
+            allowed: configured
+                .into_iter()
+                .chain(allowed.iter().map(String::as_str))
+                .filter_map(normalized_base)
+                .collect(),
+        }
+    }
+
+    /// Whether `requested` names an allowed server: the same URL once parsed,
+    /// ignoring a trailing `/`.
+    pub fn allows(&self, requested: &str) -> bool {
+        normalized_base(requested).is_some_and(|url| self.allowed.contains(&url))
+    }
+
+    fn check(&self, requested: &str) -> Result<(), FhirPathError> {
+        if self.allows(requested) {
+            Ok(())
+        } else {
+            Err(FhirPathError::InvalidInput(
+                "terminologyServer is not a server this server allows; its operator lists them \
+                 in FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+/// `url` parsed and printed back, without a trailing `/`; `None` when it is
+/// not an absolute URL.
+fn normalized_base(url: &str) -> Option<String> {
+    reqwest::Url::parse(url.trim())
+        .ok()
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// The policy a handler applies: the one the router carries, else none.
+fn terminology_policy(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
+) -> std::sync::Arc<TerminologyServerPolicy> {
+    policy
+        .map(|axum::Extension(policy)| policy)
+        .unwrap_or_default()
+}
+
 pub async fn evaluate_fhirpath(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
 ) -> Result<Response, FhirPathError> {
     info!("Handling FHIRPath evaluation request");
 
     // Extract parameters
     let extracted = extract_parameters(params)?;
+    if let Some(requested) = &extracted.terminology_server {
+        terminology_policy(policy).check(requested)?;
+    }
     debug!("Extracted parameters: {:?}", extracted);
 
     // Get expression
@@ -231,6 +296,7 @@ pub async fn evaluate_fhirpath(
 async fn evaluate_fhirpath_with_version(
     params: FhirPathParameters,
     version: FhirVersion,
+    policy: std::sync::Arc<TerminologyServerPolicy>,
 ) -> Result<Response, FhirPathError> {
     info!(
         "Handling FHIRPath evaluation request for version {:?}",
@@ -274,6 +340,7 @@ async fn evaluate_fhirpath_with_version(
 
     // Set terminology server if provided
     if let Some(ts) = &extracted.terminology_server {
+        policy.check(ts)?;
         context.set_terminology_server(ts.clone());
     }
 
@@ -452,33 +519,37 @@ pub async fn health_check() -> impl IntoResponse {
 /// Handler for R4-specific evaluation
 #[cfg(feature = "R4")]
 pub async fn evaluate_fhirpath_r4(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
 ) -> Result<Response, FhirPathError> {
-    evaluate_fhirpath_with_version(params, FhirVersion::R4).await
+    evaluate_fhirpath_with_version(params, FhirVersion::R4, terminology_policy(policy)).await
 }
 
 /// Handler for R4B-specific evaluation
 #[cfg(feature = "R4B")]
 pub async fn evaluate_fhirpath_r4b(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
 ) -> Result<Response, FhirPathError> {
-    evaluate_fhirpath_with_version(params, FhirVersion::R4B).await
+    evaluate_fhirpath_with_version(params, FhirVersion::R4B, terminology_policy(policy)).await
 }
 
 /// Handler for R5-specific evaluation
 #[cfg(feature = "R5")]
 pub async fn evaluate_fhirpath_r5(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
 ) -> Result<Response, FhirPathError> {
-    evaluate_fhirpath_with_version(params, FhirVersion::R5).await
+    evaluate_fhirpath_with_version(params, FhirVersion::R5, terminology_policy(policy)).await
 }
 
 /// Handler for R6-specific evaluation
 #[cfg(feature = "R6")]
 pub async fn evaluate_fhirpath_r6(
+    policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
 ) -> Result<Response, FhirPathError> {
-    evaluate_fhirpath_with_version(params, FhirVersion::R6).await
+    evaluate_fhirpath_with_version(params, FhirVersion::R6, terminology_policy(policy)).await
 }
 
 /// Detect FHIR version from resource
