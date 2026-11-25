@@ -322,6 +322,7 @@ class HfsProcess:
                 "HFS_STORAGE_BACKEND": "postgres",
                 "HFS_DATABASE_URL": database_url,
                 "HFS_BULK_SUBMIT_ENABLED": "true",
+                "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS": "true",
                 "HFS_BULK_SUBMIT_WORKER_CONCURRENCY": "1",
                 "HFS_BULK_SUBMIT_FILE_CONCURRENCY": str(concurrency),
                 "HFS_BULK_SUBMIT_BATCH_SIZE": "100",

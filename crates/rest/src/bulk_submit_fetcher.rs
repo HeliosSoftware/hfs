@@ -145,18 +145,19 @@ pub struct HttpSubmitInputFetcher {
     max_encrypted_file_bytes: u64,
 }
 
-/// Builds the decoding and the non-decoding client with the same timeouts.
-/// With trusted providers listed, a redirect is followed only to a listed
-/// origin; otherwise reqwest's default policy applies.
+/// Builds the decoding and the non-decoding client with the same timeouts,
+/// on [`TrustedProviders::client_builder`]: with trusted providers listed a
+/// redirect is followed only to a listed origin, and without them neither a
+/// redirect nor a resolved name reaches a private address.
 fn build_clients(
     read_timeout: Duration,
     trusted_providers: &TrustedProviders,
 ) -> (reqwest::Client, reqwest::Client) {
     let base = || {
-        reqwest::Client::builder()
+        trusted_providers
+            .client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(read_timeout)
-            .redirect(trusted_providers.redirect_policy())
     };
     // `Client::new()` panics the same way when the TLS backend cannot start.
     let client = base()
@@ -236,15 +237,13 @@ impl HttpSubmitInputFetcher {
         !self.trusted_providers.is_empty()
     }
 
-    /// Refuses a URL outside the trusted providers before any request is sent.
+    /// Refuses a URL outside the trusted providers, or a literal private
+    /// address, before any request is sent.
     fn check_source(&self, url: &str) -> StorageResult<()> {
-        if self.trusted_providers.permits_url(url) {
-            return Ok(());
+        match self.trusted_providers.refusal(url) {
+            None => Ok(()),
+            Some(reason) => Err(Self::err(format!("{} {reason}", redact_url(url)))),
         }
-        Err(Self::err(format!(
-            "{} is not at a trusted Data Provider origin; list it in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
-            redact_url(url)
-        )))
     }
 
     /// The error for a request that failed, worded for the submitter.
@@ -651,11 +650,12 @@ impl FileRequest {
             .await
             .map_err(|e| Retry::Fatal(e.to_string()))?;
         rb.send().await.map_err(|e| {
-            Retry::Transient(format!(
-                "file GET {} failed: {}",
-                self.shown_url,
-                error_chain(&e)
-            ))
+            let message = format!("file GET {} failed: {}", self.shown_url, error_chain(&e));
+            if crate::bulk_submit_egress::is_blocked_resolution(&e) {
+                Retry::Fatal(message)
+            } else {
+                Retry::Transient(message)
+            }
         })
     }
 }
@@ -1259,8 +1259,11 @@ mod tests {
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+    /// The scripted servers listen on `127.0.0.1`, which a fetcher refuses
+    /// unless private networks are allowed.
     fn fetcher() -> HttpSubmitInputFetcher {
         HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+            .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true))
     }
 
     /// Builds a `dir` + A256GCM compact JWE over `plaintext`.
@@ -1355,7 +1358,8 @@ mod tests {
         let fetcher = HttpSubmitInputFetcher::new(
             Some(provider.clone() as Arc<dyn FileTokenProvider>),
             "system/*.rs".to_string(),
-        );
+        )
+        .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true));
         (fetcher, provider)
     }
 
@@ -2043,6 +2047,64 @@ mod tests {
             None
         );
         assert!(requests.lock().unwrap().is_empty(), "no request was sent");
+    }
+
+    #[tokio::test]
+    async fn test_a_private_address_is_refused_without_trusted_providers() {
+        let (base, requests) = scripted_server(vec![Scripted::ok(b"{}")]).await;
+        let port = base.rsplit(':').next().unwrap();
+        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
+
+        let err = fetcher
+            .fetch_manifest(
+                &format!("{base}/manifest.json?sig=secret123"),
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect_err("a literal loopback address is refused")
+            .to_string();
+        assert!(err.contains("is not a permitted destination"), "{err}");
+        assert!(!err.contains("secret123"), "{err}");
+        for url in [
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            "http://[::ffff:10.0.0.1]/file.ndjson".to_string(),
+            format!("{base}/file.ndjson"),
+        ] {
+            let err = stream_err(fetcher.open_file_stream(&url, &[], false, &[], None).await);
+            assert!(
+                err.contains("is not a permitted destination"),
+                "{url}: {err}"
+            );
+        }
+        assert_eq!(
+            fetcher
+                .file_size(&format!("{base}/file.ndjson"), &[], false, &[])
+                .await
+                .unwrap(),
+            None
+        );
+
+        // A name that resolves to loopback is refused when the client
+        // connects, and is not retried.
+        let named = format!("http://localhost:{port}/file.ndjson");
+        let err = stream_err(
+            fetcher
+                .open_file_stream(&named, &[], false, &[], None)
+                .await,
+        );
+        assert!(
+            err.contains("localhost is not a permitted destination"),
+            "{err}"
+        );
+        assert!(requests.lock().unwrap().is_empty(), "no request was sent");
+
+        fetcher
+            .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true))
+            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .await
+            .expect("private networks allowed");
     }
 
     #[tokio::test]

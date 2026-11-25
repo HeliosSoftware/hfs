@@ -176,6 +176,7 @@ echo "==> HFS on $HFS_URL (requested fan-out: $FILE_CONCURRENCY, effective on SQ
 # default here would quietly stop testing what the script was written to test.
 HFS_BASE_URL="$HFS_URL" \
 HFS_BULK_SUBMIT_ENABLED=true \
+HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true \
 HFS_BULK_SUBMIT_FILE_CONCURRENCY="$FILE_CONCURRENCY" \
 HFS_BULK_SUBMIT_DEFER_INDEXING=false \
 HFS_LOG_LEVEL=info \

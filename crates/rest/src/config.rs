@@ -873,6 +873,12 @@ pub struct BulkSubmitConfig {
     /// keeps the status or transport detail of a failed fetch out of the
     /// submitter's error artifact.
     pub trusted_providers: Vec<String>,
+    /// With no trusted provider listed, lets `$bulk-submit` reach loopback,
+    /// private (RFC 1918 / RFC 4193), link-local and shared addresses, cloud
+    /// instance metadata included. Off by default; for local development, CI
+    /// fixtures, and providers inside the operator's own network. Set with
+    /// `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`.
+    pub allow_private_networks: bool,
     /// `Retry-After` (seconds) advertised on an in-progress status poll once
     /// ingestion is under way.
     pub retry_after_secs: u64,
@@ -938,6 +944,7 @@ impl fmt::Debug for BulkSubmitConfig {
             decryption_key,
             outbound_scope,
             trusted_providers,
+            allow_private_networks,
             retry_after_secs,
             pre_ingest_retry_after_secs,
             manifest_page_size,
@@ -986,6 +993,7 @@ impl fmt::Debug for BulkSubmitConfig {
             )
             .field("outbound_scope", outbound_scope)
             .field("trusted_providers", trusted_providers)
+            .field("allow_private_networks", allow_private_networks)
             .field("retry_after_secs", retry_after_secs)
             .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
             .field("manifest_page_size", manifest_page_size)
@@ -1036,6 +1044,7 @@ impl Default for BulkSubmitConfig {
             decryption_key: None,
             outbound_scope: "system/*.rs".to_string(),
             trusted_providers: Vec::new(),
+            allow_private_networks: false,
             retry_after_secs: 120,
             pre_ingest_retry_after_secs: 10,
             manifest_page_size: 1000,
@@ -1230,6 +1239,10 @@ impl BulkSubmitConfig {
                         .collect()
                 })
                 .unwrap_or(d.trusted_providers),
+            allow_private_networks: env_bool(
+                "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS",
+                d.allow_private_networks,
+            ),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
             pre_ingest_retry_after_secs: env_u64(
                 "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",

@@ -16,6 +16,7 @@ use axum::routing::get;
 use base64::Engine;
 use helios_persistence::core::SubmitInputFetcher;
 use helios_rest::bulk_submit_fetcher::HttpSubmitInputFetcher;
+use helios_rest::bulk_submit_oauth::TrustedProviders;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
@@ -89,8 +90,11 @@ async fn read_all(fetcher: &HttpSubmitInputFetcher, url: &str, key: Option<&Valu
     out
 }
 
+/// The provider below listens on loopback, which a fetcher refuses unless
+/// private networks are allowed.
 fn fetcher() -> HttpSubmitInputFetcher {
     HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+        .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true))
 }
 
 #[tokio::test]

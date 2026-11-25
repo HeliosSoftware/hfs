@@ -150,6 +150,7 @@
 mod audit;
 pub mod build_info;
 pub mod bulk_export_auth;
+mod bulk_submit_egress;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
 pub mod chain_access;
