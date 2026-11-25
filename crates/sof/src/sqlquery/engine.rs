@@ -538,15 +538,19 @@ impl InMemorySqlEngine {
         bindings: &[BoundParam],
         max_rows: usize,
     ) -> Result<QueryResult, SqlQueryError> {
-        let refused: Arc<OnceLock<&'static str>> = Arc::default();
+        let refused: Arc<OnceLock<Refusal>> = Arc::default();
         let record = Arc::clone(&refused);
         let read_only = move |ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Function { function_name } if is_refused_function(function_name) => {
+                let _ = record.set(Refusal::Function(REFUSED_FUNCTION));
+                Authorization::Deny
+            }
             AuthAction::Select
             | AuthAction::Read { .. }
             | AuthAction::Function { .. }
             | AuthAction::Recursive => Authorization::Allow,
             other => {
-                let _ = record.set(refused_statement_keyword(&other));
+                let _ = record.set(Refusal::Statement(refused_statement_keyword(&other)));
                 Authorization::Deny
             }
         };
@@ -557,7 +561,10 @@ impl InMemorySqlEngine {
             .conn
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         match refused.get() {
-            Some(keyword) => Err(not_select(keyword)),
+            Some(Refusal::Statement(keyword)) => Err(not_select(keyword)),
+            Some(Refusal::Function(name)) => Err(SqlQueryError::NotSelect(format!(
+                "the SQL function {name}() is not permitted"
+            ))),
             None => result.and_then(|r| removed.map(|()| r).map_err(Into::into)),
         }
     }
@@ -649,6 +656,24 @@ fn refused_statement_keyword(action: &AuthAction<'_>) -> &'static str {
         AuthAction::Detach { .. } => "DETACH",
         _ => "non-SELECT",
     }
+}
+
+/// What the read-only authorizer refused first.
+enum Refusal {
+    /// A statement that is not a read, by its keyword.
+    Statement(&'static str),
+    /// A function a read may not call, by its name.
+    Function(&'static str),
+}
+
+/// The SQL function a query may not call. `fts3_tokenizer(name)` returns the
+/// address of a tokenizer module inside the server process, and with a second
+/// argument registers one at a caller-given address; neither belongs in a
+/// read-only query.
+const REFUSED_FUNCTION: &str = "fts3_tokenizer";
+
+fn is_refused_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case(REFUSED_FUNCTION)
 }
 
 fn not_select(keyword: &str) -> SqlQueryError {
@@ -1344,6 +1369,36 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// `fts3_tokenizer` returns a server-internal pointer, with its argument
+    /// literal or bound, and is refused whatever its case.
+    #[test]
+    fn execute_select_refuses_fts3_tokenizer() {
+        let mut engine = InMemorySqlEngine::open().unwrap();
+        for sql in [
+            "SELECT fts3_tokenizer('simple')",
+            "SELECT FTS3_Tokenizer('porter')",
+            "SELECT length(fts3_tokenizer('simple'))",
+        ] {
+            match engine.execute_select(sql, &[], 10) {
+                Err(SqlQueryError::NotSelect(message)) => assert_eq!(
+                    message, "the SQL function fts3_tokenizer() is not permitted",
+                    "{sql}"
+                ),
+                Err(other) => panic!("{sql}: expected NotSelect, got {other}"),
+                Ok(_) => panic!("{sql}: expected NotSelect, but the query ran"),
+            }
+        }
+        let bound = [BoundParam {
+            name: "t".to_string(),
+            value: rusqlite::types::Value::Text("simple".to_string()),
+        }];
+        assert!(matches!(
+            engine.execute_select("SELECT fts3_tokenizer(:t)", &bound, 10),
+            Err(SqlQueryError::NotSelect(_))
+        ));
+        assert!(engine.execute_select("SELECT upper('ok')", &[], 10).is_ok());
     }
 
     /// `VACUUM INTO` has no authorizer action and would write a file on the
