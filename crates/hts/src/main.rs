@@ -95,7 +95,8 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = AppState::new(backend)
         .with_resource_store(resource_store)
-        .with_max_expansion_size(config.max_expansion_size);
+        .with_max_expansion_size(config.max_expansion_size)
+        .with_max_expansion_size_ceiling(config.max_expansion_size_ceiling);
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -167,7 +168,8 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = helios_hts::state::AppState::new(backend)
         .with_resource_store_pg(resource_store)
-        .with_max_expansion_size(config.max_expansion_size);
+        .with_max_expansion_size(config.max_expansion_size)
+        .with_max_expansion_size_ceiling(config.max_expansion_size_ceiling);
 
     let app = helios_hts::server::create_app(&config, state);
 
