@@ -3844,6 +3844,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         count: None,
         offset: None,
         max_expansion_size: Some(state.max_expansion_size),
+        persisted_expansion_limit: Some(state.max_expansion_size),
         date: None,
         hierarchical: None,
         hierarchical_explicit: false,

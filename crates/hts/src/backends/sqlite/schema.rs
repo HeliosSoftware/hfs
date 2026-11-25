@@ -177,6 +177,14 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
 CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
     ON implicit_expansion_cache(url, code);
 
+-- One row per key of implicit_expansion_cache with the time it was last used
+-- (milliseconds since the Unix epoch). The cache keeps a fixed number of keys
+-- and drops the ones used longest ago; see trim_implicit_cache_keys.
+CREATE TABLE IF NOT EXISTS implicit_expansion_cache_keys (
+    url       TEXT PRIMARY KEY,
+    last_used INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
@@ -772,6 +780,7 @@ mod tests {
             "concept_maps",
             "concept_map_elements",
             "implicit_expansion_cache",
+            "implicit_expansion_cache_keys",
             "implicit_expansion_fts",
             "concepts_fts",
             "concepts_word_fts",

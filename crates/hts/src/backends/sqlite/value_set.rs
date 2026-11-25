@@ -54,6 +54,7 @@ use crate::types::{
 };
 
 use super::SqliteTerminologyBackend;
+use super::concept_index_cache::{CONCEPT_INDEX_CACHE_MAX_KEYS, ConceptIndexCache, now_ms};
 
 // ─── Process-wide CodeSystem URL → (system_id, version) cache ───────────────
 //
@@ -209,6 +210,32 @@ pub(crate) struct ImplicitConceptIndex {
     pub trigram_idx: HashMap<[u8; 3], Box<[u32]>>,
 }
 
+impl ImplicitConceptIndex {
+    /// Approximate heap bytes this index retains: the entries with their
+    /// strings, and the trigram posting lists. Used to charge the index
+    /// against a cache's byte budget.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        let entries: usize = self
+            .entries
+            .iter()
+            .map(|e| {
+                std::mem::size_of::<ImplicitConceptEntry>()
+                    + e.system_url.len()
+                    + e.code.len()
+                    + e.display.as_ref().map_or(0, String::len)
+                    + e.code_lower.len()
+                    + e.display_lower.len()
+            })
+            .sum();
+        let postings: usize = self
+            .trigram_idx
+            .values()
+            .map(|list| 32 + std::mem::size_of_val::<[u32]>(list))
+            .sum();
+        entries + postings
+    }
+}
+
 #[async_trait]
 impl ValueSetOperations for SqliteTerminologyBackend {
     /// Expand a value set by URL, returning all contained codes.
@@ -263,9 +290,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             && req.selected_value_set_id.is_none()
         {
             if let Some(url) = req.url.as_deref() {
-                if let Ok(guard) = self.implicit_index.read() {
-                    if let Some(concept_idx) = guard.get(url).cloned() {
-                        drop(guard); // release read lock before CPU work
+                {
+                    if let Some(concept_idx) = self.implicit_index.get(url) {
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
@@ -325,13 +351,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 let compose_cache_key = {
                     let compose = &vs["compose"];
                     format!(
-                        "inline-compose:{:016x}",
-                        fnv64(compose.to_string().as_bytes())
+                        "inline-compose:{}",
+                        compose_cache_hash(compose.to_string().as_bytes())
                     )
                 };
-                if let Ok(guard) = self.inline_compose_index.read() {
-                    if let Some(concept_idx) = guard.get(&compose_cache_key).cloned() {
-                        drop(guard);
+                {
+                    if let Some(concept_idx) = self.inline_compose_index.get(&compose_cache_key) {
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
                         let n = count_in_memory(&concept_idx, None);
@@ -374,12 +399,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         if let Some(ref vs) = req.value_set {
             if req.filter.is_some() && req.hierarchical != Some(true) {
                 let prop_key = format!(
-                    "prop-result:{:016x}",
-                    fnv64(vs["compose"].to_string().as_bytes())
+                    "prop-result:{}",
+                    compose_cache_hash(vs["compose"].to_string().as_bytes())
                 );
-                if let Ok(guard) = self.property_result_cache.read() {
-                    if let Some(concept_idx) = guard.get(&prop_key).cloned() {
-                        drop(guard);
+                {
+                    if let Some(concept_idx) = self.property_result_cache.get(&prop_key) {
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
@@ -431,11 +455,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     && inc["valueSet"].as_array().is_none_or(|a| a.is_empty())
                             });
                         if all_plain {
-                            let plain_key =
-                                format!("plain-fts:{:016x}", fnv64(compose.to_string().as_bytes()));
-                            if let Ok(guard) = self.plain_fts_cache.read() {
-                                if let Some(concept_idx) = guard.get(&plain_key).cloned() {
-                                    drop(guard);
+                            let plain_key = plain_fts_cache_key(compose);
+                            {
+                                if let Some(concept_idx) = self.plain_fts_cache.get(&plain_key) {
                                     // Zero-entry sentinel = corpus too large to cache;
                                     // fall through to spawn_blocking / FTS path.
                                     if !concept_idx.entries.is_empty() {
@@ -486,6 +508,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         let pool = self.pool().clone();
         let implicit_index = self.implicit_index.clone();
         let bg_index_pending = self.bg_index_pending.clone();
+        let implicit_fill_queue = self.implicit_fill_queue.clone();
         let inline_compose_index = self.inline_compose_index.clone();
         let property_result_cache = self.property_result_cache.clone();
         let plain_fts_cache = self.plain_fts_cache.clone();
@@ -588,8 +611,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                 {
                     let limit_hint = req.count.map(|c| ((c as usize) * 3).max(100));
                     let compose_str = compose.to_string();
-                    let prop_key = format!("prop-result:{:016x}", fnv64(compose_str.as_bytes()));
-                    let plain_key = format!("plain-fts:{:016x}", fnv64(compose_str.as_bytes()));
+                    let prop_key = format!("prop-result:{}", compose_cache_hash(compose_str.as_bytes()));
+                    let plain_key = plain_fts_cache_key(compose);
                     expand_inline_filtered(
                         &conn,
                         compose,
@@ -604,10 +627,10 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     // Cache inline compose expansions so that repeated requests for
                     // the same compose (e.g. ad-hoc POST from a benchmark VU pool)
                     // avoid recomputing expensive ECL subtree traversals every time.
-                    // Key format: "inline-compose:<fnv64-hex>" — stored in the same
+                    // Key format: "inline-compose:<sha256-hex>" — stored in the same
                     // implicit_expansion_cache table used for ?fhir_vs expansions.
                     let cache_key =
-                        format!("inline-compose:{:016x}", fnv64(compose_str.as_bytes()));
+                        format!("inline-compose:{}", compose_cache_hash(compose_str.as_bytes()));
 
                     let exists_in_cache: bool = conn
                         .query_row(
@@ -622,6 +645,9 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     // When the cache is warm and we have a bounded request with no text
                     // filter, serve the page directly via SQL rather than loading every
                     // cached concept into memory (O(count) vs O(total_in_cache)).
+                    if exists_in_cache {
+                        note_implicit_cache_use(&conn, &cache_key);
+                    }
                     if exists_in_cache && req.filter.is_none() && req.hierarchical != Some(true) {
                         if let Some(count) = req.count.filter(|&c| c > 0) {
                             let offset = i64::from(req.offset.unwrap_or(0));
@@ -762,14 +788,23 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         // later request without them could hit the wrong row.
                         let safe_to_cache = warnings.is_empty()
                             && inline_ctx.contained.is_empty()
-                            && inline_ctx.tx_resources.is_empty()
-                            && req
-                                .max_expansion_size
-                                .is_none_or(|cap| codes.len() as u64 <= u64::from(cap));
+                            && inline_ctx.tx_resources.is_empty();
                         if safe_to_cache {
                             // EX04_PROBE: persistence cost of the cache populate.
                             let probe_t_pop = std::time::Instant::now();
-                            let _ = populate_implicit_cache(&conn, &cache_key, &codes);
+                            // Only a set within the server's expansion limit
+                            // is written to the table; a larger one is kept in
+                            // memory alone, within the index's byte budget.
+                            let persist_cap =
+                                req.persisted_expansion_limit.or(req.max_expansion_size);
+                            if persist_cap.is_none_or(|cap| codes.len() as u64 <= u64::from(cap)) {
+                                let _ = populate_implicit_cache(
+                                    &conn,
+                                    &cache_key,
+                                    &codes,
+                                    &[&implicit_index, &inline_compose_index],
+                                );
+                            }
                             // Populate the in-memory inline compose index so that
                             // subsequent requests for the same compose body are served
                             // from process memory without entering spawn_blocking.
@@ -927,14 +962,8 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     {
                                         let limit_hint =
                                             req.count.map(|c| ((c as usize) * 10).max(100));
-                                        let prop_key = format!(
-                                            "prop-result:{:016x}",
-                                            fnv64(compose_str.as_bytes())
-                                        );
-                                        let plain_key = format!(
-                                            "plain-fts:{:016x}",
-                                            fnv64(compose_str.as_bytes())
-                                        );
+                                        let prop_key = format!("prop-result:{}", compose_cache_hash(compose_str.as_bytes()));
+                                        let plain_key = plain_fts_cache_key(&compose);
                                         expand_inline_filtered(
                                             &conn,
                                             &compose,
@@ -1070,45 +1099,27 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             page.len(),
                                         );
 
-                                        // Spawn one background thread per URL to populate
-                                        // implicit_expansion_cache (DB write only).  The
-                                        // in-memory trigram index is NOT built here to avoid
-                                        // peak memory pressure from concurrent large index
-                                        // builds on resource-constrained runners.  Instead,
-                                        // ensure_implicit_index is called lazily on the first
-                                        // spawn_blocking request after the cache is warm
-                                        // (the blocking path at line ~460 below).  From that
-                                        // point the async hot-path serves all requests without
-                                        // touching the pool.
-                                        // bg_index_pending prevents duplicate threads when
-                                        // many VUs hit the same uncached URL concurrently.
-                                        let url_owned = url.to_string();
-                                        let should_spawn = bg_index_pending
-                                            .lock()
-                                            .map(|mut p| {
-                                                if p.contains(&url_owned) {
-                                                    false
-                                                } else {
-                                                    p.insert(url_owned.clone());
-                                                    true
-                                                }
-                                            })
-                                            .unwrap_or(false);
-                                        if should_spawn {
-                                            let bg_pool = pool.clone();
-                                            let bg_pending = bg_index_pending.clone();
-                                            let bg_cap = req.max_expansion_size;
-                                            std::thread::spawn(move || {
-                                                if let Ok(bg_conn) = bg_pool.get() {
-                                                    let _ = ensure_implicit_cache(
-                                                        &bg_conn, &url_owned, None, bg_cap,
-                                                    );
-                                                }
-                                                if let Ok(mut p) = bg_pending.lock() {
-                                                    p.remove(&url_owned);
-                                                }
-                                            });
-                                        }
+                                        // Queue the fill of implicit_expansion_cache and
+                                        // of the in-memory index on the backend's single
+                                        // fill worker, so the number of distinct URLs
+                                        // callers ask for does not become a number of
+                                        // threads.  Once the index is loaded the async
+                                        // hot-path serves this URL without touching the
+                                        // pool.  A set over the server's expansion limit
+                                        // is loaded into memory only, never written.
+                                        queue_implicit_fill(
+                                            &implicit_fill_queue,
+                                            &pool,
+                                            &bg_index_pending,
+                                            &implicit_index,
+                                            &inline_compose_index,
+                                            ImplicitFillJob {
+                                                url: url.to_string(),
+                                                max_rows: req
+                                                    .persisted_expansion_limit
+                                                    .or(req.max_expansion_size),
+                                            },
+                                        );
 
                                         return Ok(ExpandResponse {
                                             total: None,
@@ -1121,83 +1132,76 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
 
-                        // ── Blocking path: cache is warm, or count is None ────────────
-                        let fill_cap = if req.count.is_none() {
-                            req.max_expansion_size
-                        } else {
-                            None
-                        };
-                        ensure_implicit_cache(&conn, url, req.date.as_deref(), fill_cap)?;
-                        // Load DB cache into the in-memory index so subsequent
-                        // requests bypass SQLite entirely (EX03 optimisation).
-                        ensure_implicit_index(&conn, url, &implicit_index)?;
+                        // ── Blocking path: cache is warm, or count is not > 0 ─────────
+                        // The table keeps only sets within the server's expansion
+                        // limit, whatever `count` says and whatever limit this
+                        // request carries: a larger set is served from memory.
+                        let persisted = ensure_implicit_cache(
+                            &conn,
+                            url,
+                            req.date.as_deref(),
+                            req.persisted_expansion_limit.or(req.max_expansion_size),
+                            &[&implicit_index, &inline_compose_index],
+                        )?;
 
                         let filter_lower = req.filter.as_deref().map(|f| f.to_lowercase());
+
+                        // An unpaged, unfiltered request for a set over its limit
+                        // is refused from the set's size alone, before the set is
+                        // read. (A persisted set is small; it is checked below.)
+                        if !persisted && req.count.is_none() && filter_lower.is_none() {
+                            if let Some(cap) = req.max_expansion_size {
+                                let (_, system_id, pattern) =
+                                    resolve_implicit_vs(&conn, url, req.date.as_deref())?;
+                                let n = implicit_vs_size(&conn, &system_id, &pattern)?;
+                                if n > i64::from(cap) {
+                                    return Err(HtsError::expansion_too_costly(
+                                        "ValueSet expansion",
+                                        n,
+                                        cap,
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Serve from the in-memory index, loading it on first use
+                        // so subsequent requests bypass SQLite entirely (EX03
+                        // optimisation).
+                        let concept_idx =
+                            load_implicit_index(&conn, url, req.date.as_deref(), &implicit_index)?;
+
                         let sql_offset = i64::from(req.offset.unwrap_or(0));
                         let sql_limit = req.count.map(i64::from).unwrap_or(-1);
 
-                        // Skip the COUNT query when the request is bounded (count > 0)
+                        // Skip the COUNT when the request is bounded (count > 0)
                         // and has a text filter: the total is not required by the
-                        // benchmark checks and halving the DB round-trips under 50 VUs
-                        // significantly reduces p95 latency (EX03 optimisation).
+                        // benchmark checks (EX03 optimisation).
                         // Always count for unbounded requests: needed for size-cap check.
                         let skip_count = req.count.is_some_and(|c| c > 0) && filter_lower.is_some();
 
-                        // Serve from the in-memory index — no DB connection needed for
-                        // filter/pagination once the index is warm.
-                        let in_mem = implicit_index.read().ok().and_then(|g| g.get(url).cloned());
-
-                        if let Some(concept_idx) = in_mem {
-                            let total = if skip_count {
-                                None
-                            } else {
-                                let n = count_in_memory(&concept_idx, filter_lower.as_deref());
-                                if req.count.is_none() {
-                                    if let Some(cap) = req.max_expansion_size {
-                                        if u64::from(n) > u64::from(cap) {
-                                            return Err(HtsError::expansion_too_costly("ValueSet expansion", n, cap));
-                                        }
-                                    }
-                                }
-                                Some(n)
-                            };
-                            let page = page_in_memory(
-                                &concept_idx,
-                                filter_lower.as_deref(),
-                                sql_offset,
-                                sql_limit,
-                            );
-                            return Ok(ExpandResponse {
-                                total,
-                                offset: req.offset,
-                                contains: page,
-                                warnings: vec![],
-                            });
-                        }
-
-                        // Fallback: SQL path (index lock poisoned — should not happen).
                         let total = if skip_count {
                             None
                         } else {
-                            let n = implicit_cache_count(&conn, url, filter_lower.as_deref())?;
+                            let n = count_in_memory(&concept_idx, filter_lower.as_deref());
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
                                     if u64::from(n) > u64::from(cap) {
-                                        return Err(HtsError::expansion_too_costly("ValueSet expansion", n, cap));
+                                        return Err(HtsError::expansion_too_costly(
+                                            "ValueSet expansion",
+                                            n,
+                                            cap,
+                                        ));
                                     }
                                 }
                             }
                             Some(n)
                         };
-
-                        let page = implicit_cache_page(
-                            &conn,
-                            url,
+                        let page = page_in_memory(
+                            &concept_idx,
                             filter_lower.as_deref(),
-                            sql_limit,
                             sql_offset,
-                        )?;
-
+                            sql_limit,
+                        );
                         return Ok(ExpandResponse {
                             total,
                             offset: req.offset,
@@ -1590,13 +1594,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             );
                         }
 
-                        // Other implicit ValueSets (e.g. CodeSystem.valueSet link): use the
-                        // expansion cache, then do an O(1) indexed SQL lookup.
-                        ensure_implicit_cache(&conn, &url, req.date.as_deref(), None)?;
-
-                        let found = lookup_in_implicit_cache(
+                        // Other implicit ValueSets (e.g. CodeSystem.valueSet link): an
+                        // O(1) indexed lookup, in the expansion cache when the set is
+                        // there and in the code system otherwise. Validating a code
+                        // never writes the set.
+                        let found = lookup_implicit_vs_code(
                             &conn,
                             &url,
+                            req.date.as_deref(),
                             &req.code,
                             req.system.as_deref(),
                         )?;
@@ -5713,20 +5718,6 @@ fn try_multiinclude_hierarchy_page(
     Ok(Some(all[start..end].to_vec()))
 }
 
-/// FNV-1a 64-bit hash — deterministic, no external dependencies, no random seed.
-///
-/// Used to derive stable cache keys for inline compose expansions.
-fn fnv64(data: &[u8]) -> u64 {
-    const PRIME: u64 = 0x00000100000001B3;
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    let mut h = OFFSET;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
-
 /// Pattern extracted from a `?fhir_vs` implicit ValueSet URL.
 ///
 /// FHIR defines query-parameter patterns on a CodeSystem URL that implicitly
@@ -7918,66 +7909,215 @@ fn validate_fhir_vs(
     }
 }
 
-/// Ensure the implicit expansion cache is populated for `url`.
-///
-/// If the cache already has entries the function returns immediately (fast path).
-/// Otherwise, determines the backing code system and writes all matching concepts
-/// atomically using `INSERT … SELECT` — avoids materialising hundreds-of-thousands
-/// of rows in Rust and is typically 10–50× faster than the previous row-loop
-/// approach for large systems such as SNOMED CT (~350 K concepts).
-/// Distinct keys `implicit_expansion_cache` keeps. Every fill drops the oldest
-/// keys beyond it, and the in-memory indexes built from the table stop
-/// admitting keys at the same count, so a caller choosing a new key per
-/// request cannot grow the data file, the resident set or the startup work
-/// without bound.
-pub(crate) const IMPLICIT_CACHE_MAX_KEYS: usize = 256;
+/// Distinct keys `implicit_expansion_cache` keeps. Every fill drops the keys
+/// used longest ago beyond it, so a caller choosing a new key per request
+/// cannot grow the data file or the startup work without bound.
+pub(crate) const IMPLICIT_CACHE_MAX_KEYS: usize = CONCEPT_INDEX_CACHE_MAX_KEYS;
 
-/// Drop every cache key except the `keep` most recently filled ones, together
-/// with their FTS mirrors, and return the dropped keys. Runs on the caller's
+/// How often reading a persisted key refreshes its `last_used` stamp. Reads
+/// in between leave the table alone, so the read path stays free of writes.
+const IMPLICIT_CACHE_TOUCH_INTERVAL_MS: i64 = 60_000;
+
+/// Largest implicit ValueSet the background worker loads into memory when the
+/// set is too large to persist.
+const IMPLICIT_INDEX_MAX_CONCEPTS: i64 = 500_000;
+
+/// Fills waiting for the background worker. A fill arriving at a full queue
+/// is dropped; the request that asked for it has already been answered and a
+/// later one asks again.
+const IMPLICIT_FILL_QUEUE_DEPTH: usize = 64;
+
+/// Hex SHA-256 of an inline compose body, used in the keys of the caches that
+/// hold its expansion. The key is all that identifies a cached expansion, so
+/// the hash must not let a caller craft a second body with the same key.
+fn compose_cache_hash(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn storage_err(e: rusqlite::Error) -> HtsError {
+    HtsError::StorageError(e.to_string())
+}
+
+/// Run `body` inside `BEGIN IMMEDIATE`, committing on `Ok` and rolling back
+/// on `Err`. The write lock is taken upfront so concurrent callers cannot
+/// both see an empty cache and then write the same expansion twice.
+fn with_immediate_txn<T>(
+    conn: &Connection,
+    body: impl FnOnce(&Connection) -> Result<T, HtsError>,
+) -> Result<T, HtsError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(storage_err)?;
+    match body(conn) {
+        Ok(value) => {
+            conn.execute_batch("COMMIT").map_err(storage_err)?;
+            Ok(value)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Record that `url` was just filled. The stamp is later than every stamp
+/// already in the table, so the newest fill is never the first to be trimmed.
+fn stamp_implicit_cache_key(conn: &Connection, url: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO implicit_expansion_cache_keys (url, last_used) \
+         VALUES (?1, MAX(?2, (SELECT COALESCE(MAX(last_used), 0) + 1 \
+                              FROM implicit_expansion_cache_keys))) \
+         ON CONFLICT(url) DO UPDATE SET last_used = excluded.last_used",
+        rusqlite::params![url, now_ms() as i64],
+    )
+    .map(|_| ())
+}
+
+/// Record that the persisted rows of `url` were just read. Writes at most
+/// once per [`IMPLICIT_CACHE_TOUCH_INTERVAL_MS`] for a key and ignores
+/// failures: a missed stamp only makes the key look a little older.
+fn note_implicit_cache_use(conn: &Connection, url: &str) {
+    let now = now_ms() as i64;
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT last_used FROM implicit_expansion_cache_keys WHERE url = ?1",
+            [url],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if last.is_some_and(|last| now - last < IMPLICIT_CACHE_TOUCH_INTERVAL_MS) {
+        return;
+    }
+    let _ = conn.execute(
+        "INSERT INTO implicit_expansion_cache_keys (url, last_used) VALUES (?1, ?2) \
+         ON CONFLICT(url) DO UPDATE SET last_used = MAX(last_used, excluded.last_used)",
+        rusqlite::params![url, now],
+    );
+}
+
+/// Delete `urls` from the cache table, its FTS mirrors and the key table.
+fn delete_implicit_cache_keys(conn: &Connection, urls: &[String]) -> rusqlite::Result<()> {
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let urls_json = serde_json::Value::from(urls.to_vec()).to_string();
+    for table in [
+        "implicit_expansion_cache",
+        "implicit_expansion_fts",
+        "implicit_expansion_word_fts",
+        "implicit_expansion_cache_keys",
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE url IN (SELECT value FROM json_each(?1))"),
+            [&urls_json],
+        )?;
+    }
+    Ok(())
+}
+
+/// Keep the `keep` most recently used cache keys and drop the rest together
+/// with their FTS mirrors, returning the dropped keys. Runs on the caller's
 /// connection, inside whatever transaction is open on it.
-fn trim_implicit_cache_keys(conn: &Connection, keep: usize) -> rusqlite::Result<Vec<String>> {
+///
+/// `hot` lists the in-memory indexes built from the table. A key served from
+/// memory never reads the table, so before choosing what to drop the time
+/// each such key was last used in memory is folded into its stamp.
+fn trim_implicit_cache_keys(
+    conn: &Connection,
+    keep: usize,
+    hot: &[&ConceptIndexCache],
+) -> rusqlite::Result<Vec<String>> {
+    // Rows of a key can be deleted elsewhere (re-import, REST delete); forget
+    // such keys first so they do not count against the budget.
+    conn.execute(
+        "DELETE FROM implicit_expansion_cache_keys WHERE NOT EXISTS (\
+             SELECT 1 FROM implicit_expansion_cache c \
+             WHERE c.url = implicit_expansion_cache_keys.url)",
+        [],
+    )?;
+    let keys: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM implicit_expansion_cache_keys",
+        [],
+        |r| r.get(0),
+    )?;
+    if keys <= keep as i64 {
+        return Ok(Vec::new());
+    }
+    {
+        let mut stmt = conn.prepare_cached(
+            "UPDATE implicit_expansion_cache_keys \
+             SET last_used = MAX(last_used, ?2) WHERE url = ?1",
+        )?;
+        for cache in hot {
+            for (key, last_used_ms) in cache.recency() {
+                stmt.execute(rusqlite::params![key, last_used_ms as i64])?;
+            }
+        }
+    }
     let evicted: Vec<String> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT url FROM (\
-                 SELECT url, MIN(rowid) AS first FROM implicit_expansion_cache \
-                 GROUP BY url ORDER BY first DESC LIMIT -1 OFFSET ?1)",
+            "SELECT url FROM implicit_expansion_cache_keys \
+             ORDER BY last_used DESC, url LIMIT -1 OFFSET ?1",
         )?;
         let rows = stmt.query_map([keep as i64], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for url in &evicted {
-        conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url])?;
-        conn.execute("DELETE FROM implicit_expansion_fts WHERE url = ?1", [url])?;
-        conn.execute(
-            "DELETE FROM implicit_expansion_word_fts WHERE url = ?1",
-            [url],
-        )?;
-    }
+    delete_implicit_cache_keys(conn, &evicted)?;
     Ok(evicted)
 }
 
-/// Fill the cache for `url` unless it is already populated. With `max_rows`,
-/// a set larger than that is refused with `TooCostly` before anything is
-/// written. After a fill the table is trimmed to [`IMPLICIT_CACHE_MAX_KEYS`].
-fn ensure_implicit_cache(
+/// Bring a database written by an earlier version within the cache's bounds
+/// before its rows are loaded into memory: keys under the superseded 64-bit
+/// compose hash are dropped (nothing looks them up any more), every remaining
+/// key gets a row in the key table, and the table is trimmed to
+/// [`IMPLICIT_CACHE_MAX_KEYS`].
+pub(crate) fn reconcile_implicit_cache_at_startup(conn: &Connection) {
+    let result = with_immediate_txn(conn, |conn| {
+        let legacy: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT url FROM implicit_expansion_cache \
+                     WHERE url LIKE 'inline-compose:%' AND length(url) < 79",
+                )
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(storage_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_err)?
+        };
+        delete_implicit_cache_keys(conn, &legacy).map_err(storage_err)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO implicit_expansion_cache_keys (url, last_used) \
+             SELECT DISTINCT url, 0 FROM implicit_expansion_cache",
+            [],
+        )
+        .map_err(storage_err)?;
+        let evicted =
+            trim_implicit_cache_keys(conn, IMPLICIT_CACHE_MAX_KEYS, &[]).map_err(storage_err)?;
+        Ok(legacy.len() + evicted.len())
+    });
+    match result {
+        Ok(0) => {}
+        Ok(dropped) => tracing::info!(dropped, "implicit expansion cache trimmed at startup"),
+        Err(e) => tracing::warn!("could not trim the implicit expansion cache at startup: {e}"),
+    }
+}
+
+/// The code system and concept pattern behind an implicit ValueSet URL:
+/// `(code system URL, system id, pattern)`.
+fn resolve_implicit_vs(
     conn: &Connection,
     url: &str,
     date: Option<&str>,
-    max_rows: Option<u32>,
-) -> Result<(), HtsError> {
-    let populated: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
-            [url],
-            |r| r.get(0),
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    if populated {
-        return Ok(());
-    }
-
-    // Determine the code system and the set of concepts to cache.
+) -> Result<(String, String, FhirVsPattern), HtsError> {
     // AllConcepts is also used for the CodeSystem.valueSet link path.
     let (cs_url, pattern) = if let Ok(cs_url) = find_cs_for_implicit_vs(conn, url, date) {
         (cs_url, FhirVsPattern::AllConcepts)
@@ -7988,101 +8128,196 @@ fn ensure_implicit_cache(
             "A definition for the value Set \'{url}\' could not be found"
         )));
     };
-
     let system_id = resolve_system_id_cached(conn, &cs_url)?
         .ok_or_else(|| HtsError::NotFound(format!("CodeSystem not found: {cs_url}")))?;
+    Ok((cs_url, system_id, pattern))
+}
 
-    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
-    // cannot both see an empty cache and then duplicate-write the expansion.
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+/// Number of concepts an implicit ValueSet holds, without materialising it.
+fn implicit_vs_size(
+    conn: &Connection,
+    system_id: &str,
+    pattern: &FhirVsPattern,
+) -> Result<i64, HtsError> {
+    match pattern {
+        FhirVsPattern::AllConcepts => conn.query_row(
+            "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
+            [system_id],
+            |r| r.get(0),
+        ),
+        FhirVsPattern::IsA(root_code) => conn.query_row(
+            "SELECT COUNT(*) FROM concept_closure WHERE system_id = ?1 AND ancestor_code = ?2",
+            rusqlite::params![system_id, root_code],
+            |r| r.get(0),
+        ),
+    }
+    .map_err(storage_err)
+}
 
-    // Re-check inside the lock: another VU may have populated this while we
-    // were waiting to acquire the write lock.
-    let still_empty: bool = match conn.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
+/// Whether `implicit_expansion_cache` holds rows for `url`.
+fn implicit_cache_is_populated(conn: &Connection, url: &str) -> Result<bool, HtsError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
         [url],
         |r| r.get(0),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
-        }
-    };
+    )
+    .map_err(storage_err)
+}
 
-    if !still_empty {
-        conn.execute_batch("COMMIT")
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        return Ok(());
+/// Ensure the implicit expansion cache is populated for `url`, and return
+/// whether it is.
+///
+/// If the cache already has entries the function returns immediately (fast path).
+/// Otherwise, determines the backing code system and writes all matching concepts
+/// atomically using `INSERT … SELECT` — avoids materialising hundreds-of-thousands
+/// of rows in Rust and is typically 10–50× faster than the previous row-loop
+/// approach for large systems such as SNOMED CT (~350 K concepts).
+///
+/// With `max_rows`, a set larger than that is not written and the answer is
+/// `Ok(false)`; the caller serves it without the table. After a fill the
+/// table is trimmed to [`IMPLICIT_CACHE_MAX_KEYS`]; see
+/// [`trim_implicit_cache_keys`] for `hot`.
+fn ensure_implicit_cache(
+    conn: &Connection,
+    url: &str,
+    date: Option<&str>,
+    max_rows: Option<u32>,
+    hot: &[&ConceptIndexCache],
+) -> Result<bool, HtsError> {
+    if implicit_cache_is_populated(conn, url)? {
+        return Ok(true);
     }
 
+    let (cs_url, system_id, pattern) = resolve_implicit_vs(conn, url, date)?;
+
+    // Size the set before taking the write lock: a set over the limit is
+    // never written, and turning it away must not wait behind other writers.
     if let Some(cap) = max_rows {
-        let rows: rusqlite::Result<i64> = match &pattern {
-            FhirVsPattern::AllConcepts => conn.query_row(
-                "SELECT COUNT(*) FROM concepts WHERE system_id = ?1",
-                [&system_id],
-                |r| r.get(0),
-            ),
-            FhirVsPattern::IsA(root_code) => conn.query_row(
-                "SELECT COUNT(*) FROM concept_closure WHERE system_id = ?1 AND ancestor_code = ?2",
-                rusqlite::params![system_id, root_code],
-                |r| r.get(0),
-            ),
-        };
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(HtsError::StorageError(e.to_string()));
-            }
-        };
-        if rows > i64::from(cap) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::TooCostly(format!(
-                "ValueSet expansion contains {rows} codes which exceeds the server \
-                 limit of {cap} (set HTS_MAX_EXPANSION_SIZE to raise it)"
-            )));
+        if implicit_vs_size(conn, &system_id, &pattern)? > i64::from(cap) {
+            return Ok(false);
         }
     }
 
-    if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
+    with_immediate_txn(conn, |conn| {
+        // Re-check inside the lock: another VU may have populated this while we
+        // were waiting to acquire the write lock.
+        if implicit_cache_is_populated(conn, url)? {
+            return Ok(true);
+        }
 
-    let insert_result = match &pattern {
-        FhirVsPattern::AllConcepts => conn.execute(
-            "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
-             SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
-            rusqlite::params![url, cs_url, system_id],
-        ),
-        FhirVsPattern::IsA(root_code) => {
-            // O(1) closure JOIN replaces the recursive CTE.
-            // << semantics: all descendants plus the root itself (self-link in closure).
-            conn.execute(
+        let inserted = match &pattern {
+            FhirVsPattern::AllConcepts => conn.execute(
                 "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
-                 SELECT ?1, ?2, c.code, c.display
-                 FROM   concept_closure cc
-                 JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
-                 WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
-                rusqlite::params![url, cs_url, system_id, root_code],
-            )
+                 SELECT ?1, ?2, code, display FROM concepts WHERE system_id = ?3",
+                rusqlite::params![url, cs_url, system_id],
+            ),
+            FhirVsPattern::IsA(root_code) => {
+                // O(1) closure JOIN replaces the recursive CTE.
+                // << semantics: all descendants plus the root itself (self-link in closure).
+                conn.execute(
+                    "INSERT OR IGNORE INTO implicit_expansion_cache (url, system_url, code, display)
+                     SELECT ?1, ?2, c.code, c.display
+                     FROM   concept_closure cc
+                     JOIN   concepts c ON c.system_id = ?3 AND c.code = cc.descendant_code
+                     WHERE  cc.system_id = ?3 AND cc.ancestor_code = ?4",
+                    rusqlite::params![url, cs_url, system_id, root_code],
+                )
+            }
         }
+        .map_err(storage_err)?;
+
+        if inserted > 0 {
+            stamp_implicit_cache_key(conn, url).map_err(storage_err)?;
+            trim_implicit_cache_keys(conn, IMPLICIT_CACHE_MAX_KEYS, hot).map_err(storage_err)?;
+        }
+        Ok(inserted > 0)
+    })
+}
+
+/// One request for the background worker: fill the cache table for `url`
+/// (unless the set is larger than `max_rows`) and load it into memory.
+pub(crate) struct ImplicitFillJob {
+    url: String,
+    max_rows: Option<u32>,
+}
+
+/// Sending half of the background worker's queue; see
+/// [`queue_implicit_fill`].
+pub(crate) type ImplicitFillQueue = Arc<OnceLock<std::sync::mpsc::SyncSender<ImplicitFillJob>>>;
+
+/// Hand `job` to the background fill worker, starting the worker on first
+/// use. One worker serves the whole backend, so however many distinct URLs
+/// callers ask for, at most one fill runs and at most
+/// [`IMPLICIT_FILL_QUEUE_DEPTH`] wait. `pending` drops a URL already queued.
+fn queue_implicit_fill(
+    queue: &ImplicitFillQueue,
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pending: &Arc<std::sync::Mutex<HashSet<String>>>,
+    implicit_index: &super::ImplicitIndex,
+    inline_compose_index: &super::InlineComposeIndex,
+    job: ImplicitFillJob,
+) {
+    let fresh = pending
+        .lock()
+        .map(|mut p| p.insert(job.url.clone()))
+        .unwrap_or(false);
+    if !fresh {
+        return;
+    }
+    let sender = queue.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ImplicitFillJob>(IMPLICIT_FILL_QUEUE_DEPTH);
+        let pool = pool.clone();
+        let pending = pending.clone();
+        let implicit_index = implicit_index.clone();
+        let inline_compose_index = inline_compose_index.clone();
+        // The loop ends when every clone of the backend, and with it every
+        // sender, is gone.
+        let spawned = std::thread::Builder::new()
+            .name("hts-implicit-fill".into())
+            .spawn(move || {
+                for job in rx {
+                    if let Ok(conn) = pool.get() {
+                        run_implicit_fill(&conn, &job, &implicit_index, &inline_compose_index);
+                    }
+                    if let Ok(mut p) = pending.lock() {
+                        p.remove(&job.url);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the implicit expansion fill worker: {e}");
+        }
+        tx
+    });
+    let url = job.url.clone();
+    if sender.try_send(job).is_err() {
+        if let Ok(mut p) = pending.lock() {
+            p.remove(&url);
+        }
+    }
+}
+
+fn run_implicit_fill(
+    conn: &Connection,
+    job: &ImplicitFillJob,
+    implicit_index: &super::ImplicitIndex,
+    inline_compose_index: &super::InlineComposeIndex,
+) {
+    let hot: [&ConceptIndexCache; 2] = [implicit_index, inline_compose_index];
+    let Ok(persisted) = ensure_implicit_cache(conn, &job.url, None, job.max_rows, &hot) else {
+        return;
     };
-
-    if let Err(e) = insert_result {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
+    if !persisted {
+        // Too large for the table. Memory can still hold it, within the
+        // index's byte budget, unless it is larger than any index we keep.
+        let fits = resolve_implicit_vs(conn, &job.url, None)
+            .and_then(|(_, system_id, pattern)| implicit_vs_size(conn, &system_id, &pattern))
+            .is_ok_and(|n| n <= IMPLICIT_INDEX_MAX_CONCEPTS);
+        if !fits {
+            return;
+        }
     }
-
-    if let Err(e) = trim_implicit_cache_keys(conn, IMPLICIT_CACHE_MAX_KEYS) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
-
-    conn.execute_batch("COMMIT")
-        .map_err(|e| HtsError::StorageError(e.to_string()))
+    let _ = load_implicit_index(conn, &job.url, None, implicit_index);
 }
 
 /// Look up a single code in the implicit expansion cache.
@@ -8153,60 +8388,124 @@ fn lookup_in_implicit_cache(
     }
 }
 
-/// Ensure the process-local in-memory concept index is populated for `url`.
-///
-/// Reads all rows for `url` from `implicit_expansion_cache` and stores them
-/// as an `Arc<[ImplicitConceptEntry]>` keyed by URL.  Subsequent calls for the
-/// same URL return immediately (O(1) read-lock check).  If two threads race on
-/// the first request, both load from DB but only the first writer's slice is
-/// kept (`or_insert` is a no-op for the second writer).
-fn ensure_implicit_index(
+/// Look up a single code in the implicit ValueSet `url` without filling the
+/// cache: in the persisted rows when the key is there, otherwise directly in
+/// the code system behind the URL.
+fn lookup_implicit_vs_code(
     conn: &Connection,
     url: &str,
-    index: &super::ImplicitIndex,
-) -> Result<(), HtsError> {
-    ensure_implicit_index_bounded(conn, url, index, IMPLICIT_CACHE_MAX_KEYS)
+    date: Option<&str>,
+    code: &str,
+    system: Option<&str>,
+) -> Result<Option<ExpansionContains>, HtsError> {
+    if implicit_cache_is_populated(conn, url)? {
+        return lookup_in_implicit_cache(conn, url, code, system);
+    }
+    let (cs_url, system_id, pattern) = resolve_implicit_vs(conn, url, date)?;
+    if system.is_some_and(|s| s != cs_url) {
+        return Ok(None);
+    }
+    let display: Option<Option<String>> = match &pattern {
+        FhirVsPattern::AllConcepts => conn
+            .query_row(
+                "SELECT display FROM concepts WHERE system_id = ?1 AND code = ?2",
+                rusqlite::params![system_id, code],
+                |r| r.get(0),
+            )
+            .optional(),
+        FhirVsPattern::IsA(root_code) => conn
+            .query_row(
+                "SELECT c.display \
+                 FROM   concept_closure cc \
+                 JOIN   concepts c ON c.system_id = ?1 AND c.code = cc.descendant_code \
+                 WHERE  cc.system_id = ?1 AND cc.ancestor_code = ?3 \
+                   AND  cc.descendant_code = ?2",
+                rusqlite::params![system_id, code, root_code],
+                |r| r.get(0),
+            )
+            .optional(),
+    }
+    .map_err(storage_err)?;
+    Ok(display.map(|display| ExpansionContains {
+        system: cs_url,
+        version: None,
+        code: code.to_owned(),
+        display,
+        is_abstract: None,
+        inactive: None,
+        designations: vec![],
+        properties: vec![],
+        extensions: vec![],
+        contains: vec![],
+    }))
 }
 
-/// [`ensure_implicit_index`] with an explicit key budget: once the index
-/// holds `max_keys` URLs no further URL is loaded, and requests for it are
-/// served from the table instead.
-fn ensure_implicit_index_bounded(
+/// The in-memory concept index for the implicit ValueSet `url`, loading it
+/// on first use.
+///
+/// The concepts come from `implicit_expansion_cache` when the key is
+/// persisted there and straight from the code system otherwise (a set too
+/// large to persist), in the same `(system_url, code)` order either way. The
+/// index is kept in `index` within that cache's key and byte budgets; one too
+/// large to keep is still returned for this request.
+fn load_implicit_index(
     conn: &Connection,
     url: &str,
-    index: &super::ImplicitIndex,
-    max_keys: usize,
-) -> Result<(), HtsError> {
-    // Fast path: already loaded — only needs a shared read lock.
-    {
-        let guard = index
-            .read()
-            .map_err(|_| HtsError::Internal("implicit index lock poisoned".into()))?;
-        if guard.contains_key(url) || guard.len() >= max_keys {
-            return Ok(());
-        }
+    date: Option<&str>,
+    index: &ConceptIndexCache,
+) -> Result<Arc<ImplicitConceptIndex>, HtsError> {
+    if let Some(loaded) = index.get(url) {
+        return Ok(loaded);
     }
 
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT system_url, code, display \
-             FROM implicit_expansion_cache \
-             WHERE url = ?1 \
-             ORDER BY system_url, code",
-        )
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    let rows: Vec<(String, String, Option<String>)> = if implicit_cache_is_populated(conn, url)? {
+        note_implicit_cache_use(conn, url);
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT system_url, code, display \
+                 FROM implicit_expansion_cache \
+                 WHERE url = ?1 \
+                 ORDER BY system_url, code",
+            )
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([url], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(storage_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_err)?
+    } else {
+        let (cs_url, system_id, pattern) = resolve_implicit_vs(conn, url, date)?;
+        let map_row = |r: &rusqlite::Row<'_>| Ok((cs_url.clone(), r.get(0)?, r.get(1)?));
+        match &pattern {
+            FhirVsPattern::AllConcepts => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT code, display FROM concepts WHERE system_id = ?1 ORDER BY code",
+                    )
+                    .map_err(storage_err)?;
+                let rows = stmt.query_map([&system_id], map_row).map_err(storage_err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }
+            FhirVsPattern::IsA(root_code) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT c.code, c.display \
+                         FROM   concept_closure cc \
+                         JOIN   concepts c ON c.system_id = ?1 AND c.code = cc.descendant_code \
+                         WHERE  cc.system_id = ?1 AND cc.ancestor_code = ?2 \
+                         ORDER BY c.code",
+                    )
+                    .map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![system_id, root_code], map_row)
+                    .map_err(storage_err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }
+        }
+        .map_err(storage_err)?
+    };
 
-    let entries: Vec<ImplicitConceptEntry> = stmt
-        .query_map([url], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
+    let entries: Vec<ImplicitConceptEntry> = rows
         .into_iter()
         .map(|(system_url, code, display)| {
             let code_lower = code.to_lowercase();
@@ -8224,45 +8523,7 @@ fn ensure_implicit_index_bounded(
         })
         .collect();
 
-    // Build trigram inverted index: for each entry, emit every distinct 3-byte
-    // sequence found in code_lower or display_lower.  Posting lists are appended
-    // in ascending entry-index order (they are inherently sorted since we process
-    // entries 0..N in order), so no sort step is needed after construction.
-    let mut trigram_idx: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
-    let mut seen: Vec<[u8; 3]> = Vec::with_capacity(64);
-    for (i, entry) in entries.iter().enumerate() {
-        seen.clear();
-        let idx = i as u32;
-        for text in [entry.code_lower.as_str(), entry.display_lower.as_str()] {
-            let bytes = text.as_bytes();
-            for w in bytes.windows(3) {
-                let tri = [w[0], w[1], w[2]];
-                // Deduplicate: don't add the same trigram for the same entry twice.
-                if !seen.contains(&tri) {
-                    seen.push(tri);
-                    trigram_idx.entry(tri).or_default().push(idx);
-                }
-            }
-        }
-    }
-    let trigram_idx: HashMap<[u8; 3], Box<[u32]>> = trigram_idx
-        .into_iter()
-        .map(|(k, v)| (k, v.into_boxed_slice()))
-        .collect();
-
-    let combined = Arc::new(ImplicitConceptIndex {
-        entries: entries.into_boxed_slice(),
-        trigram_idx,
-    });
-
-    {
-        let mut guard = index
-            .write()
-            .map_err(|_| HtsError::Internal("implicit index lock poisoned".into()))?;
-        guard.entry(url.to_string()).or_insert(combined);
-    }
-
-    Ok(())
+    Ok(index.insert(url, Arc::new(build_concept_index_from_entries(entries))))
 }
 
 /// Intersect two sorted posting lists using a merge-join — O(a + b).
@@ -8845,66 +9106,33 @@ fn populate_implicit_cache(
     conn: &Connection,
     url: &str,
     codes: &[ExpansionContains],
+    hot: &[&ConceptIndexCache],
 ) -> Result<(), HtsError> {
-    // BEGIN IMMEDIATE acquires the write lock upfront so concurrent callers
-    // cannot both see an empty cache and then duplicate-write the expansion.
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    // Re-check inside the lock: another VU may have populated this while we
-    // were waiting to acquire the write lock.
-    let already: bool = match conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM implicit_expansion_cache WHERE url = ?1 LIMIT 1)",
-        [url],
-        |r| r.get(0),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(HtsError::StorageError(e.to_string()));
+    with_immediate_txn(conn, |conn| {
+        // Re-check inside the lock: another VU may have populated this while we
+        // were waiting to acquire the write lock.
+        if implicit_cache_is_populated(conn, url)? {
+            return Ok(());
         }
-    };
-
-    if already {
-        conn.execute_batch("COMMIT")
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        return Ok(());
-    }
-
-    if let Err(e) = conn.execute("DELETE FROM implicit_expansion_cache WHERE url = ?1", [url]) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
-
-    {
-        let mut stmt = match conn.prepare_cached(
-            "INSERT OR IGNORE INTO implicit_expansion_cache
-             (url, system_url, code, display)
-             VALUES (?1, ?2, ?3, ?4)",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(HtsError::StorageError(e.to_string()));
-            }
-        };
-        for item in codes {
-            if let Err(e) =
+        {
+            let mut stmt = conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO implicit_expansion_cache
+                     (url, system_url, code, display)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(storage_err)?;
+            for item in codes {
                 stmt.execute(rusqlite::params![url, item.system, item.code, item.display])
-            {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(HtsError::StorageError(e.to_string()));
+                    .map_err(storage_err)?;
             }
         }
-    }
-
-    if let Err(e) = trim_implicit_cache_keys(conn, IMPLICIT_CACHE_MAX_KEYS) {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(HtsError::StorageError(e.to_string()));
-    }
-
-    conn.execute_batch("COMMIT")
-        .map_err(|e| HtsError::StorageError(e.to_string()))
+        if !codes.is_empty() {
+            stamp_implicit_cache_key(conn, url).map_err(storage_err)?;
+            trim_implicit_cache_keys(conn, IMPLICIT_CACHE_MAX_KEYS, hot).map_err(storage_err)?;
+        }
+        Ok(())
+    })
 }
 
 /// Incrementally populate the concept FTS indexes for every code system that is
@@ -9045,10 +9273,12 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) -> usize {
 /// allowing the async hot path in [`expand`] to fire from the very first
 /// request without waiting for a background build thread.
 pub(crate) fn prebuild_implicit_index(conn: &Connection, index: &super::ImplicitIndex) {
+    // Oldest first, so that if the index's byte budget cannot hold every key
+    // the most recently used ones are the ones left in memory.
     let urls: Vec<String> = conn
         .prepare(
-            "SELECT DISTINCT url FROM implicit_expansion_cache \
-             WHERE url NOT LIKE 'inline-compose:%'",
+            "SELECT url FROM implicit_expansion_cache_keys \
+             WHERE url NOT LIKE 'inline-compose:%' ORDER BY last_used, url",
         )
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, String>(0))
@@ -9057,7 +9287,7 @@ pub(crate) fn prebuild_implicit_index(conn: &Connection, index: &super::Implicit
         .unwrap_or_default();
 
     for url in &urls {
-        let _ = ensure_implicit_index(conn, url, index);
+        let _ = load_implicit_index(conn, url, None, index);
     }
 
     if !urls.is_empty() {
@@ -9072,7 +9302,9 @@ pub(crate) fn prebuild_implicit_index(conn: &Connection, index: &super::Implicit
 ///
 /// Entries are assumed to be already sorted by `(system_url, code)`.
 /// Constructs the trigram inverted index for O(k) filtered queries.
-fn build_concept_index_from_entries(entries: Vec<ImplicitConceptEntry>) -> ImplicitConceptIndex {
+pub(crate) fn build_concept_index_from_entries(
+    entries: Vec<ImplicitConceptEntry>,
+) -> ImplicitConceptIndex {
     let mut trigram_idx: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
     let mut seen: Vec<[u8; 3]> = Vec::with_capacity(64);
     for (i, entry) in entries.iter().enumerate() {
@@ -9110,14 +9342,9 @@ fn populate_inline_compose_index(
     cache_key: &str,
     index: &super::InlineComposeIndex,
 ) {
-    {
-        // Fast read-path: already populated by a concurrent request, or the
-        // index is at its key budget.
-        if let Ok(guard) = index.read() {
-            if guard.contains_key(cache_key) || guard.len() >= IMPLICIT_CACHE_MAX_KEYS {
-                return;
-            }
-        }
+    // Fast read-path: already populated by a concurrent request.
+    if index.get(cache_key).is_some() {
+        return;
     }
 
     let entries: Vec<ImplicitConceptEntry> = codes
@@ -9139,10 +9366,10 @@ fn populate_inline_compose_index(
         })
         .collect();
 
-    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
-    if let Ok(mut guard) = index.write() {
-        guard.entry(cache_key.to_string()).or_insert(concept_idx);
-    }
+    index.insert(
+        cache_key,
+        Arc::new(build_concept_index_from_entries(entries)),
+    );
 }
 
 /// Pre-warm the inline-compose in-memory index from any `inline-compose:*`
@@ -9153,10 +9380,13 @@ fn populate_inline_compose_index(
 /// from persisted rows, letting the async hot path in [`expand`] serve all
 /// inline-compose requests without ever entering `spawn_blocking`.
 pub(crate) fn prebuild_inline_compose_index(conn: &Connection, index: &super::InlineComposeIndex) {
+    // Oldest first, so that if the index's byte budget cannot hold every key
+    // the most recently used ones are the ones left in memory. The index
+    // enforces its own key and byte budgets on every insert.
     let keys: Vec<String> = conn
         .prepare(
-            "SELECT DISTINCT url FROM implicit_expansion_cache \
-             WHERE url LIKE 'inline-compose:%'",
+            "SELECT url FROM implicit_expansion_cache_keys \
+             WHERE url LIKE 'inline-compose:%' ORDER BY last_used, url",
         )
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, String>(0))
@@ -9204,10 +9434,7 @@ pub(crate) fn prebuild_inline_compose_index(conn: &Connection, index: &super::In
             })
             .collect();
 
-        let concept_idx = Arc::new(build_concept_index_from_entries(entries));
-        if let Ok(mut guard) = index.write() {
-            guard.insert(key.clone(), concept_idx);
-        }
+        index.insert(key, Arc::new(build_concept_index_from_entries(entries)));
         loaded += 1;
     }
 
@@ -9231,12 +9458,8 @@ fn populate_property_cache(
     cache_key: &str,
     cache: &super::PropertyResultCache,
 ) {
-    {
-        if let Ok(guard) = cache.read() {
-            if guard.contains_key(cache_key) {
-                return;
-            }
-        }
+    if cache.get(cache_key).is_some() {
+        return;
     }
     let entries: Vec<ImplicitConceptEntry> = codes
         .iter()
@@ -9256,10 +9479,33 @@ fn populate_property_cache(
             }
         })
         .collect();
-    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
-    if let Ok(mut guard) = cache.write() {
-        guard.entry(cache_key.to_string()).or_insert(concept_idx);
-    }
+    cache.insert(
+        cache_key,
+        Arc::new(build_concept_index_from_entries(entries)),
+    );
+}
+
+/// Key of the plain-corpus cache for a compose whose includes are all plain
+/// full-system includes: the hash of the distinct system URLs, sorted. The
+/// corpus depends on nothing else in the body, so two bodies naming the same
+/// systems share one entry and a caller cannot mint a new full copy of a
+/// code system by varying the rest of the compose.
+fn plain_fts_cache_key(compose: &serde_json::Value) -> String {
+    let mut systems: Vec<&str> = compose["include"]
+        .as_array()
+        .map(|includes| {
+            includes
+                .iter()
+                .filter_map(|inc| inc["system"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    systems.sort_unstable();
+    systems.dedup();
+    format!(
+        "plain-fts:{}",
+        compose_cache_hash(systems.join("\n").as_bytes())
+    )
 }
 
 /// Maximum number of concepts to load into the PlainFtsCache per compose body.
@@ -9294,14 +9540,12 @@ fn load_plain_corpus_and_cache(
     // Fast path: another request already populated the cache.
     // A zero-entry index is a "too-large" sentinel — return None so the
     // caller falls back to the FTS query without re-counting the corpus.
-    if let Ok(guard) = cache.read() {
-        if let Some(idx) = guard.get(cache_key).cloned() {
-            return if idx.entries.is_empty() {
-                None
-            } else {
-                Some(idx)
-            };
-        }
+    if let Some(idx) = cache.get(cache_key) {
+        return if idx.entries.is_empty() {
+            None
+        } else {
+            Some(idx)
+        };
     }
 
     // Resolve (system_url, system_id) pairs.
@@ -9354,10 +9598,10 @@ fn load_plain_corpus_and_cache(
     if corpus_count as usize > PLAIN_FTS_CACHE_MAX_CONCEPTS {
         // Store a zero-entry sentinel so subsequent requests (both the async
         // hot path and this function's own fast path) skip the COUNT query.
-        let sentinel = Arc::new(build_concept_index_from_entries(vec![]));
-        if let Ok(mut guard) = cache.write() {
-            guard.entry(cache_key.to_string()).or_insert(sentinel);
-        }
+        cache.insert(
+            cache_key,
+            Arc::new(build_concept_index_from_entries(vec![])),
+        );
         tracing::debug!(
             count = corpus_count,
             cache_key,
@@ -9414,13 +9658,10 @@ fn load_plain_corpus_and_cache(
         })
         .collect();
 
-    let concept_idx = Arc::new(build_concept_index_from_entries(entries));
-    if let Ok(mut guard) = cache.write() {
-        guard
-            .entry(cache_key.to_string())
-            .or_insert_with(|| concept_idx.clone());
-    }
-    Some(concept_idx)
+    Some(cache.insert(
+        cache_key,
+        Arc::new(build_concept_index_from_entries(entries)),
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -10554,65 +10795,332 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn the_implicit_cache_keeps_only_the_newest_keys() {
+    fn implicit_cache_key_rows(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT url FROM implicit_expansion_cache_keys ORDER BY url")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    const FVS_ALL: &str = "http://example.org/cs-fvs?fhir_vs";
+    const FVS_ROOT: &str = "http://example.org/cs-fvs?fhir_vs=isa/root";
+    const FVS_CHILD1: &str = "http://example.org/cs-fvs?fhir_vs=isa/child1";
+
+    async fn fvs_backend() -> SqliteTerminologyBackend {
         let b = backend();
         b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
             .await
             .unwrap();
+        b
+    }
+
+    #[tokio::test]
+    async fn the_implicit_cache_drops_the_keys_used_longest_ago() {
+        let b = fvs_backend().await;
         let conn = b.pool().get().unwrap();
-        let oldest = "http://example.org/cs-fvs?fhir_vs=isa/root";
-        let middle = "http://example.org/cs-fvs?fhir_vs=isa/child1";
-        let newest = "http://example.org/cs-fvs?fhir_vs";
-        for url in [oldest, middle, newest] {
-            ensure_implicit_cache(&conn, url, None, None).unwrap();
+        for url in [FVS_ROOT, FVS_CHILD1, FVS_ALL] {
+            assert!(ensure_implicit_cache(&conn, url, None, None, &[]).unwrap());
         }
         assert_eq!(implicit_cache_urls(&conn).len(), 3);
+        assert_eq!(implicit_cache_key_rows(&conn).len(), 3);
 
-        let evicted = trim_implicit_cache_keys(&conn, 2).unwrap();
-        assert_eq!(evicted, vec![oldest.to_string()]);
-        let mut kept = implicit_cache_urls(&conn);
-        kept.sort();
-        let mut expected = vec![middle.to_string(), newest.to_string()];
+        // The first key filled is read again, so the second is now the oldest.
+        conn.execute(
+            "UPDATE implicit_expansion_cache_keys \
+             SET last_used = (SELECT MAX(last_used) + 1 FROM implicit_expansion_cache_keys) \
+             WHERE url = ?1",
+            [FVS_ROOT],
+        )
+        .unwrap();
+        // FTS mirrors of the dropped key go with it.
+        ensure_implicit_fts(&conn, FVS_CHILD1).unwrap();
+
+        let evicted = trim_implicit_cache_keys(&conn, 2, &[]).unwrap();
+        assert_eq!(evicted, vec![FVS_CHILD1.to_string()]);
+        let mut expected = vec![FVS_ROOT.to_string(), FVS_ALL.to_string()];
         expected.sort();
-        assert_eq!(kept, expected);
+        assert_eq!(implicit_cache_urls(&conn), expected);
+        assert_eq!(implicit_cache_key_rows(&conn), expected);
+        for table in ["implicit_expansion_fts", "implicit_expansion_word_fts"] {
+            let mirrored: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE url = ?1"),
+                    [FVS_CHILD1],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(mirrored, 0, "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_in_use_in_memory_is_not_the_one_trimmed() {
+        let b = fvs_backend().await;
+        let conn = b.pool().get().unwrap();
+        // ROOT is filled first, so by table stamps alone it is the oldest.
+        for url in [FVS_ROOT, FVS_CHILD1, FVS_ALL] {
+            ensure_implicit_cache(&conn, url, None, None, &[]).unwrap();
+        }
+        // It is being served from memory, which never touches the table.
+        let hot = ConceptIndexCache::default();
+        load_implicit_index(&conn, FVS_ROOT, None, &hot).unwrap();
+        hot.set_last_used(FVS_ROOT, now_ms() + 60_000);
+
+        let evicted = trim_implicit_cache_keys(&conn, 2, &[&hot]).unwrap();
+        assert_eq!(evicted, vec![FVS_CHILD1.to_string()]);
     }
 
     #[tokio::test]
     async fn an_implicit_fill_over_the_cap_writes_nothing() {
-        let b = backend();
-        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
-            .await
-            .unwrap();
+        let b = fvs_backend().await;
         let conn = b.pool().get().unwrap();
-        let url = "http://example.org/cs-fvs?fhir_vs=isa/root";
 
-        let err = ensure_implicit_cache(&conn, url, None, Some(1)).unwrap_err();
-        assert!(matches!(err, HtsError::TooCostly(_)), "{err}");
+        assert!(!ensure_implicit_cache(&conn, FVS_ROOT, None, Some(1), &[]).unwrap());
         assert!(implicit_cache_urls(&conn).is_empty());
+        assert!(implicit_cache_key_rows(&conn).is_empty());
 
-        ensure_implicit_cache(&conn, url, None, Some(3)).unwrap();
-        assert_eq!(implicit_cache_urls(&conn), vec![url.to_string()]);
+        assert!(ensure_implicit_cache(&conn, FVS_ROOT, None, Some(3), &[]).unwrap());
+        assert_eq!(implicit_cache_urls(&conn), vec![FVS_ROOT.to_string()]);
     }
 
     #[tokio::test]
-    async fn the_in_memory_implicit_index_stops_at_its_key_budget() {
-        let b = backend();
-        b.import_bundle(&ctx(), bundle_fhir_vs_hierarchy().as_bytes())
+    async fn a_count_of_zero_reports_the_total_without_persisting_a_set_over_the_limit() {
+        let b = fvs_backend().await;
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some(FVS_ROOT.into()),
+                    count: Some(0),
+                    max_expansion_size: Some(1),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
-        let conn = b.pool().get().unwrap();
-        let first = "http://example.org/cs-fvs?fhir_vs=isa/root";
-        let second = "http://example.org/cs-fvs?fhir_vs=isa/child1";
-        ensure_implicit_cache(&conn, first, None, None).unwrap();
-        ensure_implicit_cache(&conn, second, None, None).unwrap();
+        assert_eq!(resp.total, Some(3));
+        assert!(resp.contains.is_empty());
+        assert!(implicit_cache_urls(&b.pool().get().unwrap()).is_empty());
+    }
 
-        let index: super::super::ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
-        ensure_implicit_index_bounded(&conn, first, &index, 1).unwrap();
-        ensure_implicit_index_bounded(&conn, second, &index, 1).unwrap();
-        let guard = index.read().unwrap();
-        assert!(guard.contains_key(first));
-        assert!(!guard.contains_key(second), "the budget admits one key");
+    #[tokio::test]
+    async fn a_set_over_the_limit_is_served_and_refused_as_before_but_never_persisted() {
+        let b = fvs_backend().await;
+        let request = |filter: Option<&str>| ExpandRequest {
+            url: Some(FVS_ALL.into()),
+            filter: filter.map(str::to_owned),
+            max_expansion_size: Some(2),
+            ..Default::default()
+        };
+
+        // Four concepts, limit two, no page size: refused.
+        let err = b.expand(&ctx(), request(None)).await.unwrap_err();
+        assert!(matches!(err, HtsError::TooCostly(_)), "{err}");
+
+        // The limit applies to what the filter leaves, as it always has.
+        let resp = b.expand(&ctx(), request(Some("child"))).await.unwrap();
+        let mut codes: Vec<&str> = resp.contains.iter().map(|c| c.code.as_str()).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, ["child1", "child2"]);
+
+        assert!(implicit_cache_urls(&b.pool().get().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_limit_above_the_server_limit_does_not_raise_what_is_persisted() {
+        let b = fvs_backend().await;
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    url: Some(FVS_ROOT.into()),
+                    // What `X-TOO-COSTLY-THRESHOLD` raised the limit to …
+                    max_expansion_size: Some(100),
+                    // … and what the server is configured with.
+                    persisted_expansion_limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.contains.len(), 3);
+        assert!(implicit_cache_urls(&b.pool().get().unwrap()).is_empty());
+
+        // Within the server limit the set is persisted as before.
+        b.expand(
+            &ctx(),
+            ExpandRequest {
+                url: Some(FVS_CHILD1.into()),
+                max_expansion_size: Some(100),
+                persisted_expansion_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            implicit_cache_urls(&b.pool().get().unwrap()),
+            vec![FVS_CHILD1.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paged_request_fills_through_the_worker_and_keeps_large_sets_in_memory_only() {
+        let b = fvs_backend().await;
+        for (url, persisted) in [(FVS_CHILD1, true), (FVS_ROOT, false)] {
+            let resp = b
+                .expand(
+                    &ctx(),
+                    ExpandRequest {
+                        url: Some(url.into()),
+                        count: Some(1),
+                        max_expansion_size: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.contains.len(), 1);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !b.implicit_index.contains_key(url) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker never loaded {url}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let in_table = implicit_cache_urls(&b.pool().get().unwrap()).contains(&url.to_string());
+            assert_eq!(in_table, persisted, "{url}");
+        }
+        assert!(b.bg_index_pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn validating_a_code_against_a_code_system_value_set_link_writes_nothing() {
+        let b = backend();
+        b.import_bundle(
+            &ctx(),
+            br#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{
+                "resourceType":"CodeSystem","id":"cs-link","url":"http://example.org/cs-link",
+                "valueSet":"http://example.org/vs-link","status":"active","content":"complete",
+                "concept":[{"code":"a","display":"Alpha"},{"code":"b","display":"Beta"}]}}]}"#,
+        )
+        .await
+        .unwrap();
+        let validate = |code: &str| ValidateCodeRequest {
+            url: Some("http://example.org/vs-link".into()),
+            system: Some("http://example.org/cs-link".into()),
+            code: code.into(),
+            ..Default::default()
+        };
+
+        let hit = b.validate_code(&ctx(), validate("a")).await.unwrap();
+        assert!(hit.result, "{:?}", hit.message);
+        assert_eq!(hit.display.as_deref(), Some("Alpha"));
+        let miss = b.validate_code(&ctx(), validate("zzz")).await.unwrap();
+        assert!(!miss.result);
+
+        assert!(implicit_cache_urls(&b.pool().get().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_drops_superseded_keys_and_trims_to_the_key_budget() {
+        let b = backend();
+        let conn = b.pool().get().unwrap();
+        // A database written before the key table and the SHA-256 keys existed.
+        {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO implicit_expansion_cache (url, system_url, code, display) \
+                     VALUES (?1, 'http://example.org/cs', 'a', 'A')",
+                )
+                .unwrap();
+            for i in 0..IMPLICIT_CACHE_MAX_KEYS + 20 {
+                stmt.execute([format!("http://example.org/cs?fhir_vs=isa/{i}")])
+                    .unwrap();
+            }
+            stmt.execute(["inline-compose:0123456789abcdef"]).unwrap();
+        }
+
+        reconcile_implicit_cache_at_startup(&conn);
+
+        let urls = implicit_cache_urls(&conn);
+        assert_eq!(urls.len(), IMPLICIT_CACHE_MAX_KEYS);
+        assert!(!urls.iter().any(|u| u.starts_with("inline-compose:")));
+        assert_eq!(implicit_cache_key_rows(&conn), urls);
+
+        // What is loaded into memory afterwards is what the table kept.
+        let index: super::super::ImplicitIndex = Arc::default();
+        prebuild_implicit_index(&conn, &index);
+        assert_eq!(index.len(), IMPLICIT_CACHE_MAX_KEYS);
+    }
+
+    #[tokio::test]
+    async fn an_inline_compose_over_the_limit_is_kept_in_memory_only() {
+        let b = fvs_backend().await;
+        let value_set = serde_json::json!({
+            "resourceType": "ValueSet",
+            "status": "active",
+            "compose": {"include": [{"system": "http://example.org/cs-fvs"}]}
+        });
+        let resp = b
+            .expand(
+                &ctx(),
+                ExpandRequest {
+                    value_set: Some(value_set),
+                    max_expansion_size: Some(100),
+                    persisted_expansion_limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.contains.len(), 4);
+        assert!(implicit_cache_urls(&b.pool().get().unwrap()).is_empty());
+        assert_eq!(b.inline_compose_index.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compose_bodies_naming_the_same_systems_share_one_plain_corpus() {
+        let b = fvs_backend().await;
+        for i in 0..5 {
+            let value_set = serde_json::json!({
+                "resourceType": "ValueSet",
+                "status": "active",
+                "compose": {
+                    "padding": i,
+                    "include": [{"system": "http://example.org/cs-fvs"}]
+                }
+            });
+            let resp = b
+                .expand(
+                    &ctx(),
+                    ExpandRequest {
+                        value_set: Some(value_set),
+                        filter: Some("child".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.contains.len(), 2);
+        }
+        assert_eq!(b.plain_fts_cache.len(), 1);
+    }
+
+    #[test]
+    fn compose_cache_keys_use_sha_256() {
+        assert_eq!(
+            compose_cache_hash(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Longer than any key under the superseded 64-bit hash, which is how
+        // startup tells the two apart.
+        assert!(format!("inline-compose:{}", compose_cache_hash(b"")).len() >= 79);
     }
 
     #[tokio::test]
