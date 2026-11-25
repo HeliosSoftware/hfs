@@ -108,6 +108,66 @@ impl ChainHopGuard for ChainHopAccess<'_> {
     }
 }
 
+/// [`ChainHopGuard`] for the hops of a bulk-export `_typeFilter`, judged at
+/// kick-off (#2668).
+///
+/// The export worker resolves a chained or `_has` `_typeFilter` after the
+/// request has returned, with no token, so its hops run over the whole
+/// tenant. What the worker may run unjudged is therefore only what this
+/// token could search without confinement: a hop type the token may not
+/// search is refused, and so is one it may search only under a `patient/`
+/// scope, which the worker could not confine to the launch patient.
+///
+/// Every refusal is kept. A polymorphic hop with one refused candidate goes
+/// on with the others here, as a search does, but the worker would search
+/// all of them, so any refusal refuses the export ([`Self::refusal`]).
+pub struct UnconfinedHopAccess<'a> {
+    principal: &'a Principal,
+    refusal: std::sync::Mutex<Option<String>>,
+}
+
+impl<'a> UnconfinedHopAccess<'a> {
+    /// Judges hops against `principal`'s scopes.
+    pub fn new(principal: &'a Principal) -> Self {
+        Self {
+            principal,
+            refusal: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The first hop refused, if any was.
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl ChainHopGuard for UnconfinedHopAccess<'_> {
+    fn confine_hop(&self, query: &mut SearchQuery) -> StorageResult<()> {
+        let resource_type = &query.resource_type;
+        let reason = match SmartScopePolicy::check(self.principal, resource_type, FhirOperation::Search)
+        {
+            Ok(AccessScope::Unrestricted) => return Ok(()),
+            Ok(AccessScope::PatientCompartment { .. }) => {
+                "it is granted only by a patient/ scope, and the export runs a _typeFilter's hops after the request, where they cannot be confined to the launch patient".to_string()
+            }
+            Err(e) => e.to_string(),
+        };
+        let message = format!(
+            "a chained or _has _typeFilter through {resource_type} is not permitted: {reason}"
+        );
+        self.refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(|| message.clone());
+        Err(StorageError::Search(SearchError::ChainHopRefused {
+            message,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +226,25 @@ mod tests {
         assert_eq!(patients.parameters[0].values[0].value, "p1");
 
         assert!(is_refused(judge(&access, "Practitioner")));
+    }
+
+    #[test]
+    fn a_type_filter_hop_is_refused_unless_the_token_searches_it_unconfined() {
+        let judge_unconfined = |scopes: &str, resource_type: &str| {
+            let principal = principal(scopes, Some("p1"));
+            let guard = UnconfinedHopAccess::new(&principal);
+            let mut query = SearchQuery::new(resource_type);
+            let result = guard.confine_hop(&mut query);
+            assert!(query.parameters.is_empty() && query.compartment.is_none());
+            (result.is_ok(), guard.refusal())
+        };
+        assert_eq!(judge_unconfined("system/*.rs", "Observation"), (true, None));
+        let (allowed, refusal) = judge_unconfined("patient/*.rs", "Observation");
+        assert!(!allowed);
+        assert!(refusal.unwrap().contains("patient/ scope"));
+        let (allowed, refusal) = judge_unconfined("user/Patient.rs", "Observation");
+        assert!(!allowed);
+        assert!(refusal.unwrap().contains("through Observation"));
     }
 
     #[test]
