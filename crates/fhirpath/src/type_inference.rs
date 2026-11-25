@@ -335,7 +335,9 @@ fn infer_function_return_type(
         "not" => Some(InferredType::system("Boolean")),
         "allTrue" | "anyTrue" | "allFalse" | "anyFalse" => Some(InferredType::system("Boolean")),
         // FHIR document functions (see document_functions.rs)
-        "hasCoding" | "sameSubject" => Some(InferredType::system("Boolean")),
+        "hasCoding" | "sameSubject" | "isKnown" | "hasData" => {
+            Some(InferredType::system("Boolean"))
+        }
 
         // Collection functions
         "count" => Some(InferredType::system("Integer")),
