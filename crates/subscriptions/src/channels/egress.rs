@@ -69,6 +69,30 @@ fn is_v6_private_or_link(addr: &Ipv6Addr) -> bool {
     unique_local || link_local
 }
 
+/// Whether a Subscription's `channel.header` entry is skipped on delivery.
+/// `Host` decides which backend answers on an origin that routes by it, so
+/// the endpoint check above, and the credential check that picks which
+/// receivers get the server's bearer token, would judge one host while
+/// another answered. The rest would reframe the request (`Content-Length`,
+/// `Transfer-Encoding`) or are hop-by-hop. Credentials (`Authorization`,
+/// API keys) stay allowed: carrying them is what the element is for.
+pub(crate) fn is_refused_delivery_header(name: &str) -> bool {
+    let name = name.trim();
+    [
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+    ]
+    .iter()
+    .any(|refused| name.eq_ignore_ascii_case(refused))
+        || name.len() >= 6 && name[..6].eq_ignore_ascii_case("proxy-")
+}
+
 /// Inspect the receiver URL and return a rejection reason if it does not
 /// parse or its host is a literal blocked address. DNS names pass here and
 /// are checked when the client resolves them.
@@ -207,6 +231,33 @@ mod tests {
         }
         assert_eq!(check_endpoint_host("https://receiver.example.org/x"), None);
         assert_eq!(check_endpoint_host("https://93.184.216.34/x"), None);
+    }
+
+    #[test]
+    fn routing_and_framing_headers_are_refused_whatever_their_case() {
+        for name in [
+            "Host",
+            " host ",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Authorization",
+        ] {
+            assert!(is_refused_delivery_header(name), "{name}");
+        }
+        for name in [
+            "Authorization",
+            "X-Api-Key",
+            "X-Proxy-Hint",
+            "Accept",
+            "Hostname",
+        ] {
+            assert!(!is_refused_delivery_header(name), "{name}");
+        }
     }
 
     #[tokio::test]

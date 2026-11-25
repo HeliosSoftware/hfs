@@ -95,6 +95,14 @@ impl RestHookChannel {
             if let Some((name, value)) = header.split_once(':') {
                 let name = name.trim();
                 let value = value.trim();
+                if egress::is_refused_delivery_header(name) {
+                    warn!(
+                        subscription_id = %subscription.id,
+                        header = %name,
+                        "skipping a routing or framing Subscription header"
+                    );
+                    continue;
+                }
                 request = request.header(name, value);
             }
         }
@@ -445,5 +453,32 @@ mod tests {
             other => panic!("expected PermanentError, got {other:?}"),
         }
         assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_header_does_not_reach_the_receiver() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let channel = RestHookChannel::new().with_private_endpoints_allowed(true);
+        let mut sub = test_subscription(&format!("{}/hook", server.uri()), PayloadContent::IdOnly);
+        sub.channel.headers = vec![
+            "Host: internal-admin.example".to_string(),
+            "X-Api-Key: receiver-secret".to_string(),
+        ];
+        let result = channel.dispatch(&sub, &test_bundle()).await.unwrap();
+        assert!(matches!(result, DispatchResult::Success), "{result:?}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let host = requests[0].headers.get("host").unwrap().to_str().unwrap();
+        assert_ne!(host, "internal-admin.example");
+        assert_eq!(
+            requests[0].headers.get("x-api-key").unwrap(),
+            "receiver-secret"
+        );
     }
 }
