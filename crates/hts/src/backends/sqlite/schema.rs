@@ -185,7 +185,9 @@ CREATE TABLE IF NOT EXISTS concept_maps (
     source_uri  TEXT,
     target_uri  TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- See code_systems.authority_rank.
+    authority_rank INTEGER
 );
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
@@ -513,8 +515,9 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
     Ok(())
 }
 
-/// Add the `authority_rank` provenance column to `code_systems` / `value_sets`,
-/// and force a re-import of packaged terminology when the column is newly added.
+/// Add the `authority_rank` provenance column to `code_systems`, `value_sets`
+/// and `concept_maps`, and force a re-import of packaged terminology when a
+/// column is newly added.
 ///
 /// `authority_rank` records whether the package that shipped a row actually owns
 /// the canonical URL it claims (see
@@ -539,6 +542,7 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
     for sql in &[
         "ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER",
         "ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER",
+        "ALTER TABLE concept_maps ADD COLUMN authority_rank INTEGER",
     ] {
         match conn.execute_batch(sql) {
             Ok(_) => column_added = true,
@@ -847,6 +851,10 @@ mod tests {
                  status TEXT NOT NULL DEFAULT 'active',
                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
              );
+             CREATE TABLE concept_maps (
+                 id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, version TEXT,
+                 status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+             );
              CREATE TABLE bootstrap_imports (
                  path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
                  size_bytes INTEGER NOT NULL, mtime_unix INTEGER,
@@ -887,13 +895,15 @@ mod tests {
     #[test]
     fn authority_rank_migration_adds_columns_and_forces_package_reimport() {
         let conn = legacy_db();
-        assert!(!has_authority_rank(&conn, "code_systems"));
-        assert!(!has_authority_rank(&conn, "value_sets"));
+        for table in ["code_systems", "value_sets", "concept_maps"] {
+            assert!(!has_authority_rank(&conn, table), "{table}");
+        }
 
         migrate_authority_rank(&conn).expect("migration should succeed");
 
-        assert!(has_authority_rank(&conn, "code_systems"));
-        assert!(has_authority_rank(&conn, "value_sets"));
+        for table in ["code_systems", "value_sets", "concept_maps"] {
+            assert!(has_authority_rank(&conn, table), "{table}");
+        }
 
         // The .tgz ledger entries are dropped so the next startup re-imports
         // those packages and stamps provenance. Without this the column would
@@ -907,6 +917,29 @@ mod tests {
             ],
             "only .tgz packages may be cleared; the bulk archives carry no \
              package provenance and re-importing them would cost hours"
+        );
+    }
+
+    /// A database migrated before ConceptMaps were ranked has the column on
+    /// `code_systems` and `value_sets` only. Adding it to `concept_maps` must
+    /// re-import the packages too, or every stored map would stay unclaimed
+    /// and any unattributed import could replace it.
+    #[test]
+    fn authority_rank_migration_ranks_concept_maps_on_a_database_ranked_before_them() {
+        let conn = legacy_db();
+        conn.execute_batch(
+            "ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER;
+             ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER;",
+        )
+        .unwrap();
+
+        migrate_authority_rank(&conn).expect("migration should succeed");
+
+        assert!(has_authority_rank(&conn, "concept_maps"));
+        assert!(
+            ledger_paths(&conn).iter().all(|p| !p.ends_with(".tgz")),
+            "packages must re-import to rank their ConceptMaps: {:?}",
+            ledger_paths(&conn)
         );
     }
 

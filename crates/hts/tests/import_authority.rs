@@ -40,6 +40,21 @@ fn value_set(title: &str, code: &str) -> Value {
     })
 }
 
+fn concept_map(id: &str, url: &str, title: &str, target: &str) -> Value {
+    json!({
+        "resourceType": "ConceptMap",
+        "id": id,
+        "url": url,
+        "status": "active",
+        "title": title,
+        "group": [{
+            "source": format!("{OWNER_BASE}/CodeSystem/owned"),
+            "target": "http://target.example/cs",
+            "element": [{"code": "a", "target": [{"code": target, "equivalence": "equivalent"}]}]
+        }]
+    })
+}
+
 fn bundle(resources: &[Value]) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "resourceType": "Bundle",
@@ -111,10 +126,91 @@ where
     }
 }
 
+/// The same rule for a ConceptMap, which is stored one row per canonical URL:
+/// neither an unattributed import of the same map nor a bundle that only
+/// shares its `id` replaces what the owning package wrote.
+async fn concept_map_authority_contract<B>(backend: B)
+where
+    B: TerminologyBackend + BundleImportBackend + Clone + 'static,
+{
+    let importer: Arc<dyn BundleImportBackend> = Arc::new(backend.clone());
+    let owned_url = format!("{OWNER_BASE}/ConceptMap/owned");
+    let stored_title = |backend: &B| {
+        backend
+            .resource_by_id("ConceptMap", "owned-cm")
+            .unwrap()
+            .expect("the owned map is still stored")["title"]
+            .clone()
+    };
+
+    let owned = [concept_map("owned-cm", &owned_url, "Owner title", "x")];
+    assert!(
+        import_as(&importer, &owned, Some(OWNER_BASE))
+            .await
+            .is_empty()
+    );
+
+    let errors = import_as(
+        &importer,
+        &[concept_map("owned-cm", &owned_url, "Replaced", "y")],
+        None,
+    )
+    .await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("authoritative source"), "{errors:?}");
+    assert_eq!(stored_title(&backend), "Owner title");
+
+    let errors = import_as(
+        &importer,
+        &[concept_map(
+            "owned-cm",
+            "http://attacker.example/cm",
+            "Hijacked",
+            "z",
+        )],
+        None,
+    )
+    .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        stored_title(&backend),
+        "Owner title",
+        "a bundle sharing only the id replaced the owned map"
+    );
+
+    let errors = import_as(
+        &importer,
+        &[concept_map("owned-cm", &owned_url, "Owner update", "w")],
+        Some(OWNER_BASE),
+    )
+    .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(stored_title(&backend), "Owner update");
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_unattributed_import_cannot_replace_owned_content() {
     authority_contract(helios_hts::backends::SqliteTerminologyBackend::in_memory().unwrap()).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_unattributed_import_cannot_replace_an_owned_concept_map() {
+    concept_map_authority_contract(
+        helios_hts::backends::SqliteTerminologyBackend::in_memory().unwrap(),
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_unattributed_import_cannot_replace_an_owned_concept_map() {
+    let url = common::pg_http_url().await;
+    let backend = helios_hts::backends::PostgresTerminologyBackend::new(url)
+        .await
+        .unwrap();
+    concept_map_authority_contract(backend).await;
 }
 
 #[cfg(feature = "postgres")]

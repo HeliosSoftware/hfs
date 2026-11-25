@@ -198,7 +198,9 @@ CREATE TABLE IF NOT EXISTS concept_maps (
     target_uri    TEXT,
     status        TEXT NOT NULL DEFAULT 'active',
     resource_json JSONB,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    -- See code_systems.authority_rank.
+    authority_rank INTEGER
 );
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
@@ -288,6 +290,15 @@ BEGIN
           AND attname = 'authority_rank' AND NOT attisdropped
     ) THEN
         ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER;
+        added := true;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'concept_maps'::regclass
+          AND attname = 'authority_rank' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE concept_maps ADD COLUMN authority_rank INTEGER;
         added := true;
     END IF;
 

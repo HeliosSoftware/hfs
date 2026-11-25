@@ -241,6 +241,9 @@ pub struct ParsedConceptMap {
     /// Flat list of all source→target mappings across all groups.
     pub elements: Vec<ParsedMapElement>,
     pub resource_json: Value,
+    /// Provenance precedence of the source, as for CodeSystems and ValueSets.
+    /// See [`authority_rank_for`].
+    pub authority_rank: i32,
 }
 
 /// One row in `concept_map_elements`.
@@ -323,7 +326,10 @@ pub fn parse_bundle_from_package(
                 )),
             },
             Some("ConceptMap") => match parse_concept_map(resource) {
-                Some(cm) => bundle.concept_maps.push(cm),
+                Some(mut cm) => {
+                    cm.authority_rank = authority_rank_for(&cm.url, package_canonical);
+                    bundle.concept_maps.push(cm);
+                }
                 None => bundle.parse_errors.push(format!(
                     "ConceptMap '{rid}' skipped: missing required field 'url'"
                 )),
@@ -626,6 +632,7 @@ fn parse_concept_map(cm: &Value) -> Option<ParsedConceptMap> {
         status: cm["status"].as_str().unwrap_or("active").to_owned(),
         elements,
         resource_json: cm.clone(),
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 

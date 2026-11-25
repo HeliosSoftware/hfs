@@ -710,29 +710,89 @@ fn write_concept_map(
     cm: &ParsedConceptMap,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
-    let resource_json = serde_json::to_string(&cm.resource_json).ok();
     let now = utc_now();
 
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO concept_maps
-         (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-    )
-    .and_then(|mut s| {
-        s.execute(rusqlite::params![
-            cm.id,
-            cm.url,
-            cm.version,
-            cm.name,
-            cm.title,
-            cm.source_uri,
-            cm.target_uri,
-            cm.status,
-            resource_json,
-            now
-        ])
-    })
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    // `concept_maps.url` is UNIQUE: one row per canonical. The row is found by
+    // URL, never by `id` alone, so a bundle that only shares a stored map's
+    // `id` cannot replace a map stored under another URL; it gets a fresh id.
+    let existing: Option<(String, Option<i32>)> = conn
+        .query_row(
+            "SELECT id, authority_rank FROM concept_maps WHERE url = ?1",
+            [&cm.url],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    if let Some((_, Some(existing_rank))) = &existing {
+        bundle_parser::check_authority(
+            "ConceptMap",
+            &cm.url,
+            cm.version.as_deref(),
+            *existing_rank,
+            cm.authority_rank,
+        )?;
+    }
+    let map_id = match existing {
+        Some((id, _)) => id,
+        None => {
+            let id_taken: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE id = ?1)",
+                    [&cm.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            if id_taken {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                cm.id.clone()
+            }
+        }
+    };
+    let mut stored_resource = cm.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(map_id.clone());
+    let resource_json = serde_json::to_string(&stored_resource)
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // authority_rank keeps the strongest claim ever asserted, as for
+    // CodeSystems (see `write_code_system`).
+    let upsert = format!(
+        "INSERT INTO concept_maps
+         (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at,
+          authority_rank)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(id) DO UPDATE SET
+           version        = excluded.version,
+           name           = excluded.name,
+           title          = excluded.title,
+           source_uri     = excluded.source_uri,
+           target_uri     = excluded.target_uri,
+           status         = excluded.status,
+           resource_json  = excluded.resource_json,
+           authority_rank = MIN(COALESCE(concept_maps.authority_rank, {unclaimed}),
+                                excluded.authority_rank)",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
+    conn.prepare_cached(&upsert)
+        .and_then(|mut s| {
+            s.execute(rusqlite::params![
+                map_id,
+                cm.url,
+                cm.version,
+                cm.name,
+                cm.title,
+                cm.source_uri,
+                cm.target_uri,
+                cm.status,
+                resource_json,
+                now,
+                cm.authority_rank
+            ])
+        })
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    conn.prepare_cached("DELETE FROM concept_map_elements WHERE map_id = ?1")
+        .and_then(|mut s| s.execute([&map_id]))
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     const INSERT_ELEMENT_SQL: &str = "INSERT OR IGNORE INTO concept_map_elements
          (map_id, source_system, source_code, target_system, target_code, equivalence)
@@ -741,7 +801,7 @@ fn write_concept_map(
         conn.prepare_cached(INSERT_ELEMENT_SQL)
             .and_then(|mut s| {
                 s.execute(rusqlite::params![
-                    cm.id,
+                    map_id,
                     el.source_system,
                     el.source_code,
                     el.target_system,

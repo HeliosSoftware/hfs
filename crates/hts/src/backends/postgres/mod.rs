@@ -1490,19 +1490,61 @@ async fn write_concept_map(
     cm: &ParsedConceptMap,
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
-    let resource_json = Some(cm.resource_json.clone());
     let now = utc_now();
+
+    // `concept_maps.url` is UNIQUE: one row per canonical. Mirrors the SQLite
+    // twin in `import/fhir_bundle.rs::write_concept_map`: the row is found by
+    // URL, its rank is checked, and an `id` held by a map under another URL is
+    // replaced by a fresh one instead of making the UPDATE below find no row.
+    let existing = client
+        .query_opt(
+            "SELECT id, authority_rank FROM concept_maps WHERE url = $1",
+            &[&cm.url],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    if let Some(existing_rank) = existing
+        .as_ref()
+        .and_then(|row| row.get::<_, Option<i32>>(1))
+    {
+        bundle_parser::check_authority(
+            "ConceptMap",
+            &cm.url,
+            cm.version.as_deref(),
+            existing_rank,
+            cm.authority_rank,
+        )?;
+    }
+    let storage_id: String = match existing {
+        Some(row) => row.get(0),
+        None => {
+            let id_taken = client
+                .query_opt("SELECT 1 FROM concept_maps WHERE id = $1", &[&cm.id])
+                .await
+                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
+                .is_some();
+            if id_taken {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                cm.id.clone()
+            }
+        }
+    };
+    let mut stored_resource = cm.resource_json.clone();
+    stored_resource["id"] = serde_json::Value::String(storage_id.clone());
+    let resource_json = Some(stored_resource);
 
     // Two-step upsert — see `write_code_system` for why `ON CONFLICT (url)`
     // alone is not safe under concurrent imports that share `cm.id`.
     client
         .execute(
             "INSERT INTO concept_maps
-             (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             (id, url, version, name, title, source_uri, target_uri, status, resource_json, created_at,
+              authority_rank)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT DO NOTHING",
             &[
-                &cm.id,
+                &storage_id,
                 &cm.url,
                 &cm.version,
                 &cm.name,
@@ -1512,23 +1554,29 @@ async fn write_concept_map(
                 &cm.status,
                 &resource_json,
                 &now,
+                &cm.authority_rank,
             ],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
 
+    let cm_update = format!(
+        "UPDATE concept_maps SET
+           version        = $1,
+           name           = $2,
+           title          = $3,
+           source_uri     = $4,
+           target_uri     = $5,
+           status         = $6,
+           resource_json  = $7,
+           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9)
+         WHERE url = $8
+         RETURNING id",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
     let rows = client
         .query(
-            "UPDATE concept_maps SET
-               version       = $1,
-               name          = $2,
-               title         = $3,
-               source_uri    = $4,
-               target_uri    = $5,
-               status        = $6,
-               resource_json = $7
-             WHERE url = $8
-             RETURNING id",
+            &cm_update,
             &[
                 &cm.version,
                 &cm.name,
@@ -1538,6 +1586,7 @@ async fn write_concept_map(
                 &cm.status,
                 &resource_json,
                 &cm.url,
+                &cm.authority_rank,
             ],
         )
         .await
