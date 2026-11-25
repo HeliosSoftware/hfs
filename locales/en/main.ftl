@@ -1178,6 +1178,8 @@ lib-tables-target-not-found = Not found
 lib-tables-target-not-found-detail = No ViewDefinition, SQL View, ValueSet or ConceptMap answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
 lib-tables-target-not-a-table-detail = Only a ViewDefinition, a SQL View, a ValueSet or a ConceptMap can be read.
+lib-tables-target-unresolved = Not looked up
+lib-tables-target-unresolved-detail = Only the first { $max } distinct dependencies are looked up.
 lib-tables-add-table-label = Table
 # The always-visible add row's own search field placeholder (#1238).
 lib-tables-add-table-placeholder = Add a table…
