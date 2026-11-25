@@ -153,6 +153,7 @@ fn build_query(
     // Process _include directives
     for include in params.include() {
         if let Some(directive) = parse_include_directive(include, IncludeType::Include) {
+            check_include_types("_include", include, &directive)?;
             query.includes.push(directive);
         }
     }
@@ -160,6 +161,7 @@ fn build_query(
     // Process _revinclude directives
     for revinclude in params.revinclude() {
         if let Some(directive) = parse_include_directive(revinclude, IncludeType::Revinclude) {
+            check_include_types("_revinclude", revinclude, &directive)?;
             query.includes.push(directive);
         }
     }
@@ -999,6 +1001,29 @@ fn parse_include_directive(directive: &str, include_type: IncludeType) -> Option
         target_type,
         iterate,
     })
+}
+
+/// Refuses an `_include` / `_revinclude` whose source or target type is not
+/// a FHIR resource type. Backends build storage names from these types (an
+/// Elasticsearch index name, for one), where a `,` or `*` would widen the
+/// index expression beyond the one type.
+fn check_include_types(
+    param: &str,
+    raw: &str,
+    directive: &IncludeDirective,
+) -> Result<(), RestError> {
+    let invalid = std::iter::once(directive.source_type.as_str())
+        .chain(directive.target_type.as_deref())
+        .find(|t| !crate::fhir_types::is_valid_resource_type(t));
+    match invalid {
+        Some(resource_type) => Err(RestError::InvalidParameter {
+            param: param.to_string(),
+            message: format!(
+                "{param} '{raw}' names '{resource_type}', which is not a resource type"
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Expands wildcard include directives (`_include=Type:*`) into a concrete
@@ -2710,6 +2735,30 @@ mod tests {
         let query = build_search_query("Patient", &sp, &test_registry()).unwrap();
 
         assert_eq!(query.reverse_chains.len(), 2);
+    }
+
+    #[test]
+    fn an_include_naming_something_other_than_a_resource_type_is_refused() {
+        for (param, value) in [
+            ("_revinclude", "*:subject"),
+            ("_revinclude", "hfs_other_observation:subject"),
+            ("_include", "Observation:subject:Pat*"),
+            ("_include", "observation:patient"),
+        ] {
+            let sp = SearchParams::from_pairs(vec![(param.to_string(), value.to_string())]);
+            match build_search_query("Patient", &sp, &test_registry()) {
+                Err(RestError::InvalidParameter { param: p, message }) => {
+                    assert_eq!(p, param);
+                    assert!(message.contains("not a resource type"), "{message}");
+                }
+                other => panic!("{param}={value}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        let sp = SearchParams::from_pairs(vec![(
+            "_revinclude".to_string(),
+            "Observation:subject:Patient".to_string(),
+        )]);
+        assert!(build_search_query("Patient", &sp, &test_registry()).is_ok());
     }
 
     #[test]
