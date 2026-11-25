@@ -2130,7 +2130,7 @@ impl<R: BufRead> Iterator for NdjsonChunkIterator<R> {
 /// Write CSV header row.
 fn write_csv_header<W: Write>(columns: &[String], writer: &mut W) -> Result<(), SofError> {
     let mut wtr = csv::Writer::from_writer(writer);
-    wtr.write_record(columns)?;
+    wtr.write_record(csv_header_cells(columns).iter().map(|c| c.as_ref()))?;
     wtr.flush()?;
     Ok(())
 }
@@ -4250,6 +4250,17 @@ pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The CSV header cells for `columns`, each through [`neutralize_csv_formula`]
+/// as a string cell is. Column names come from the ViewDefinition or Library
+/// author, so a name such as `=HYPERLINK(...)` would otherwise reach other
+/// users' spreadsheets as a formula.
+pub fn csv_header_cells(columns: &[String]) -> Vec<std::borrow::Cow<'_, str>> {
+    columns
+        .iter()
+        .map(|column| neutralize_csv_formula(column))
+        .collect()
+}
+
 /// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
 fn csv_field(v: Option<&serde_json::Value>) -> String {
     match v {
@@ -4273,7 +4284,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     let mut wtr = csv::Writer::from_writer(vec![]);
 
     if include_header {
-        wtr.write_record(&result.columns)?;
+        wtr.write_record(csv_header_cells(&result.columns).iter().map(|c| c.as_ref()))?;
     }
 
     for row in result.rows {
@@ -4411,7 +4422,7 @@ impl RowStreamEncoder {
                 ..
             } = &mut self.kind
             {
-                writer.write_record(&columns)?;
+                writer.write_record(csv_header_cells(&columns).iter().map(|c| c.as_ref()))?;
             }
             self.columns = Some(columns);
         }
@@ -5100,6 +5111,28 @@ mod tests {
         };
         let csv = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
         assert_eq!(csv, "a,b\n\"'=HYPERLINK(\"\"x\"\")\",-5\n-5,'@x\n");
+    }
+
+    #[test]
+    fn every_csv_header_writer_neutralizes_formula_column_names() {
+        let columns = vec![
+            "=HYPERLINK(\"x\")".to_string(),
+            "b".to_string(),
+            "@c".to_string(),
+        ];
+        let expected = "\"'=HYPERLINK(\"\"x\"\")\",b,'@c
+";
+
+        let result = ProcessedResult {
+            columns: columns.clone(),
+            rows: Vec::new(),
+        };
+        let buffered = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
+        assert_eq!(buffered, expected);
+
+        let mut streamed = Vec::new();
+        write_csv_header(&columns, &mut streamed).unwrap();
+        assert_eq!(String::from_utf8(streamed).unwrap(), expected);
     }
 
     #[test]
