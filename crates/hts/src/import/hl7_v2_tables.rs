@@ -117,7 +117,7 @@ pub async fn import_hl7_v2_tables(
         let seed_bytes = build_code_system_bundle(&meta, std::slice::from_ref(&root));
         let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
         stats.code_systems += seed_stats.code_systems;
-        stats.errors.extend(seed_stats.errors);
+        stats.take_errors(seed_stats);
 
         let total = table.entries.len();
         let total_batches = total.div_ceil(batch_size).max(1);
@@ -134,7 +134,7 @@ pub async fn import_hl7_v2_tables(
                 .collect();
             let bytes = build_code_system_bundle(&meta, &builder);
             let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-            stats.errors.extend(chunk.errors);
+            stats.take_errors(chunk);
 
             eprintln!(
                 "[hl7-v2-tables] table {} ({}) batch {}/{total_batches} — +{} codes",

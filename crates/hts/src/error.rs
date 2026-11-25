@@ -102,6 +102,23 @@ pub enum HtsError {
     TooCostly(String),
 }
 
+impl HtsError {
+    /// The `too-costly` error for an expansion of `total` codes over `limit`.
+    ///
+    /// `subject` names what was expanded (`"ValueSet expansion"`,
+    /// `"Implicit ValueSet expansion"`). The limit in force is
+    /// `HTS_MAX_EXPANSION_SIZE` unless the request moved it with the
+    /// `X-TOO-COSTLY-THRESHOLD` header, which can raise it no further than
+    /// `HTS_MAX_EXPANSION_SIZE_CEILING`, so the message names both settings.
+    pub fn expansion_too_costly(subject: &str, total: impl std::fmt::Display, limit: u32) -> Self {
+        HtsError::TooCostly(format!(
+            "{subject} contains {total} codes which exceeds the server limit of {limit} \
+             (HTS_MAX_EXPANSION_SIZE; the X-TOO-COSTLY-THRESHOLD header can move it \
+             for one request, up to HTS_MAX_EXPANSION_SIZE_CEILING)"
+        ))
+    }
+}
+
 /// Converts an [`HtsError`] into an Axum HTTP response.
 ///
 /// The response body is always a FHIR `OperationOutcome` JSON object with a
