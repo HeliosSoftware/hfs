@@ -737,7 +737,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("CodeSystem '{}' import failed: {error}", cs.url));
-                    stats.conflicts += 1;
+                    stats.count_owner_refusal(&error);
                     systems_needing_closure
                         .retain(|(url, version)| url != &cs.url || version != &cs.version);
                     continue;
@@ -746,9 +746,6 @@ impl BundleImportBackend for PostgresTerminologyBackend {
             if let Err(e) =
                 write_code_system(&tx, cs, &mut identities, &mut stats, parsed.fresh_load).await
             {
-                if matches!(e, HtsError::Conflict(_)) {
-                    stats.conflicts += 1;
-                }
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
@@ -765,14 +762,11 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ValueSet '{}' import failed: {error}", vs.url));
-                    stats.conflicts += 1;
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
             if let Err(e) = write_value_set(&tx, vs, &mut identities, &mut stats).await {
-                if matches!(e, HtsError::Conflict(_)) {
-                    stats.conflicts += 1;
-                }
                 stats
                     .errors
                     .push(format!("ValueSet '{}' import failed: {e}", vs.url));
@@ -789,14 +783,11 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ConceptMap '{}' import failed: {error}", cm.url));
-                    stats.conflicts += 1;
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
             if let Err(e) = write_concept_map(&tx, cm, &mut stats).await {
-                if matches!(e, HtsError::Conflict(_)) {
-                    stats.conflicts += 1;
-                }
                 stats
                     .errors
                     .push(format!("ConceptMap '{}' import failed: {e}", cm.url));

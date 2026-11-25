@@ -212,9 +212,13 @@ pub struct ImportStats {
     /// The import continues past these; fatal errors are returned as `Err`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<String>,
-    /// Resources left out because another owner holds their canonical or
+    /// Resources left out because a REST resource holds their canonical or
     /// id (also listed in `errors`). Unlike a malformed resource, this is a
     /// store condition that can change between imports of the same file.
+    ///
+    /// A refusal by the authority check is not counted: the stored row comes
+    /// from the package that owns the canonical, so importing the same file
+    /// again is refused the same way.
     #[serde(skip_serializing_if = "is_zero", default)]
     pub conflicts: u32,
 }
@@ -240,6 +244,24 @@ impl ImportStats {
         self.concepts = self.concepts.saturating_add(other.concepts);
         self.errors.extend(other.errors);
         self.conflicts = self.conflicts.saturating_add(other.conflicts);
+    }
+
+    /// Count a refusal by `check_import_owner` as a conflict. Only these are
+    /// counted; a refusal by the authority check inside the writers is listed
+    /// in `errors` only.
+    pub(crate) fn count_owner_refusal(&mut self, error: &crate::error::HtsError) {
+        if matches!(error, crate::error::HtsError::Conflict(_)) {
+            self.conflicts = self.conflicts.saturating_add(1);
+        }
+    }
+
+    /// Carry over the non-fatal errors and the conflict count of one chunk.
+    ///
+    /// For importers that write a terminology in several chunks and tally the
+    /// resource counts themselves.
+    pub fn take_errors(&mut self, chunk: ImportStats) {
+        self.errors.extend(chunk.errors);
+        self.conflicts = self.conflicts.saturating_add(chunk.conflicts);
     }
 }
 
