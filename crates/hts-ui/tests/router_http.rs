@@ -498,3 +498,57 @@ async fn an_upstream_restart_clears_the_ring_instead_of_plotting_a_cliff() {
         "pre-restart counters must not leak into the window totals",
     );
 }
+
+#[tokio::test]
+async fn import_post_from_another_origin_is_refused_before_reaching_hts() {
+    let app = app();
+    let form = "bundle=%7B%22resourceType%22%3A%22Bundle%22%7D";
+
+    for headers in [
+        vec![("sec-fetch-site", "cross-site")],
+        vec![
+            ("origin", "http://evil.example"),
+            ("host", "localhost:8090"),
+        ],
+        vec![("origin", "null"), ("host", "localhost:8090")],
+    ] {
+        let mut request = Request::post("/ui/hts/import")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (name, value) in &headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(form)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a form post from another origin must be refused: {headers:?}",
+        );
+        let text = body_text(response).await;
+        assert!(
+            !text.contains("<html"),
+            "the refusal must not render the import page: {text}",
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/hts/import")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
+                .header("origin", "http://localhost:8090")
+                .header("host", "localhost:8090")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the same-origin form reaches the handler (and renders the degraded result here)",
+    );
+}

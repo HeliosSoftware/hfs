@@ -1905,9 +1905,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",
@@ -2360,6 +2360,18 @@ dependencies = [
 
 [[package]]
 name = "der"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+dependencies = [
+ "const-oid 0.9.6",
+ "der_derive",
+ "flagset",
+ "zeroize",
+]
+
+[[package]]
+name = "der"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a996a108feb8b427a6e12fcf6af4aa83409b79d72c15337d7741368131ee004"
@@ -2367,6 +2379,17 @@ dependencies = [
  "const-oid 0.10.3",
  "pem-rfc7468",
  "zeroize",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2810,6 +2833,12 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "flagset"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "flatbuffers"
@@ -3299,7 +3328,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios-audit"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3319,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "helios-auth"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3341,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "helios-cds-hooks"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3353,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "chrono",
  "clap",
@@ -3372,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir-gen"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "chrono",
  "clap",
@@ -3385,7 +3414,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir-macro"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3395,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir-validator"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "clap",
@@ -3411,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhirpath"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "axum",
  "axum-test",
@@ -3450,14 +3479,14 @@ dependencies = [
 
 [[package]]
 name = "helios-fhirpath-support"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "rust_decimal",
 ]
 
 [[package]]
 name = "helios-hfs"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3490,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "helios-hts"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3535,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "helios-hts-ui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "askama",
  "async-trait",
@@ -3562,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "helios-observability"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "axum",
@@ -3582,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "helios-persistence"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3621,6 +3650,8 @@ dependencies = [
  "regex",
  "rusqlite",
  "rust_decimal",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3630,6 +3661,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-stream",
  "tokio-test",
  "tokio-util",
@@ -3644,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "helios-rest"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -3713,7 +3745,7 @@ dependencies = [
 
 [[package]]
 name = "helios-serde"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "helios-fhir",
  "helios-fhir-macro",
@@ -3729,7 +3761,7 @@ dependencies = [
 
 [[package]]
 name = "helios-serde-support"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "erased-serde",
  "serde",
@@ -3738,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "helios-sof"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3783,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "helios-subscriptions"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3806,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "helios-ui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "askama",
  "async-stream",
@@ -3850,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "helios-ui-chrome"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "askama",
  "fluent-bundle",
@@ -6277,7 +6309,7 @@ dependencies = [
 
 [[package]]
 name = "pysof"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "chrono",
  "csv",
@@ -7591,6 +7623,16 @@ dependencies = [
 
 [[package]]
 name = "spki"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+dependencies = [
+ "base64ct",
+ "der 0.7.10",
+]
+
+[[package]]
+name = "spki"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef958a98b9d5da290cfc78946e9f3e61e1e62a18db0d92cac0b83cc161491a9"
@@ -8010,6 +8052,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "tls_codec"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de2e01245e2bb89d6f05801c564fa27624dbd7b1846859876c7dad82e90bf6b"
+dependencies = [
+ "tls_codec_derive",
+ "zeroize",
+]
+
+[[package]]
+name = "tls_codec_derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d2e76690929402faae40aebdda620a2c0e25dd6d3b9afe48867dfd95991f4bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8071,6 +8134,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-postgres-rustls"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c2ad44aa0ae96db89c4742212ed41645b2f597311ff6e1945542a4d9fadc2fb"
+dependencies = [
+ "rustls",
+ "sha2 0.11.1",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "x509-cert",
 ]
 
 [[package]]
@@ -9218,6 +9295,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "x509-cert"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+dependencies = [
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "tls_codec",
 ]
 
 [[package]]

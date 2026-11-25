@@ -114,6 +114,7 @@
 mod context;
 mod id;
 mod permissions;
+mod segment;
 mod tenancy;
 
 pub use context::{TenantContext, TenantContextBuilder};
@@ -124,4 +125,5 @@ pub use id::{
 pub use permissions::{
     CompartmentRestriction, Operation, TenantPermissions, TenantPermissionsBuilder,
 };
+pub use segment::tenant_path_segment;
 pub use tenancy::{CustomResourceTenancy, DefaultResourceTenancy, ResourceTenancy, TenancyModel};

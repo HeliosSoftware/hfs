@@ -1246,6 +1246,14 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Entries per ingest transaction (`HFS_BULK_SUBMIT_BATCH_SIZE`, #1127).
     /// `None` keeps the engine's default.
     batch_size: Option<u32>,
+    /// Wall-clock budget for fetching the remote manifest
+    /// (`HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`): the one request of a run
+    /// that the idle read timeout cannot bound, since a body that keeps
+    /// producing bytes never idles.
+    manifest_fetch_timeout: Duration,
+    /// Longest NDJSON line buffered before parsing
+    /// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). `None` keeps the engine's default.
+    max_line_bytes: Option<u64>,
     /// Batches of one output file written concurrently
     /// (`HFS_BULK_SUBMIT_BATCH_WRITERS`). `None` keeps the engine's default
     /// of one; the engine caps it (SQLite: always one).
@@ -1840,6 +1848,9 @@ fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
     }
 }
 
+/// Default for [`DefaultSubmitWorker::with_manifest_fetch_timeout`].
+pub const DEFAULT_MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Logs a run abandoned because its lease is gone. A lost lease is never
 /// silent: whoever reclaims the manifest walks it again from its first file,
 /// which on a large corpus costs hours (#1127).
@@ -1881,6 +1892,8 @@ where
             file_concurrency: 1,
             owned_file_executor: None,
             batch_size: None,
+            manifest_fetch_timeout: DEFAULT_MANIFEST_FETCH_TIMEOUT,
+            max_line_bytes: None,
             batch_writers: None,
             skip_unchanged: false,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1909,6 +1922,31 @@ where
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size.max(1));
         self
+    }
+
+    /// Sets the wall-clock budget for fetching the remote manifest
+    /// (`HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`). Past it the manifest fails
+    /// with a fetch error and the worker moves on.
+    pub fn with_manifest_fetch_timeout(mut self, timeout: Duration) -> Self {
+        self.manifest_fetch_timeout = timeout.max(Duration::from_secs(1));
+        self
+    }
+
+    /// Sets the longest NDJSON line the ingest buffers before parsing it
+    /// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). Values below 1 are treated as 1.
+    pub fn with_max_line_bytes(mut self, max_line_bytes: u64) -> Self {
+        self.max_line_bytes = Some(max_line_bytes.max(1));
+        self
+    }
+
+    /// The line ceiling in force for this worker.
+    fn max_line_bytes(&self) -> usize {
+        usize::try_from(
+            self.max_line_bytes
+                .unwrap_or(crate::core::bulk_submit::DEFAULT_MAX_LINE_BYTES),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1)
     }
 
     /// Sets how many batches of one output file the ingest writes
@@ -2048,16 +2086,34 @@ where
         // 1. Fetch the remote Bulk Export Manifest.
         self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
             .await;
-        let manifest = match self
-            .fetcher
-            .fetch_manifest(
-                &manifest_url,
-                &view.file_request_headers,
-                &view.oauth_metadata_urls,
-                view.file_encryption_key.as_ref(),
-            )
-            .await
-        {
+        // Bounded by the fetch budget, and abandoned the moment the lease is
+        // lost or the submission aborted: neither the read timeout nor the
+        // batch-boundary checks reach this request.
+        let fetched = tokio::select! {
+            biased;
+            _ = keeper.lost() => {
+                warn_lease_lost(&lease, "fetching the manifest");
+                return Ok(());
+            }
+            fetched = tokio::time::timeout(
+                self.manifest_fetch_timeout,
+                self.fetcher.fetch_manifest(
+                    &manifest_url,
+                    &view.file_request_headers,
+                    &view.oauth_metadata_urls,
+                    view.file_encryption_key.as_ref(),
+                ),
+            ) => fetched.unwrap_or_else(|_elapsed| {
+                Err(StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: format!(
+                        "manifest fetch exceeded {} s (HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT)",
+                        self.manifest_fetch_timeout.as_secs()
+                    ),
+                    source: None,
+                }))
+            }),
+        };
+        let manifest = match fetched {
             Ok(m) => m,
             Err(e) => {
                 let failure_message = e.to_string();
@@ -2118,6 +2174,10 @@ where
             .with_cancel(cancel.clone());
         let opts = match self.batch_size {
             Some(batch_size) => opts.with_batch_size(batch_size),
+            None => opts,
+        };
+        let opts = match self.max_line_bytes {
+            Some(max_line_bytes) => opts.with_max_line_bytes(max_line_bytes),
             None => opts,
         };
         let opts = match self.batch_writers {
@@ -2240,8 +2300,18 @@ where
                         .await;
                 })
                 .buffer_unordered(self.file_concurrency.max(1));
-            while sizing.next().await.is_some() {}
+            let lost = tokio::select! {
+                biased;
+                _ = keeper.lost() => true,
+                _ = async {
+                    while sizing.next().await.is_some() {}
+                } => false,
+            };
             drop(sizing);
+            if lost {
+                warn_lease_lost(&lease, "sizing the output files");
+                return Ok(());
+            }
 
             // A zero sum (every file empty, or a source misreporting sizes)
             // presizes nothing — the lazy path below stays the authority.
@@ -2932,11 +3002,22 @@ where
         reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         refs: &mut Vec<String>,
     ) -> std::io::Result<()> {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = reader.lines();
+        use crate::core::bulk_submit_stream::{LineRead, read_line_capped};
+        let mut reader = reader;
+        let max_line_bytes = self.max_line_bytes();
+        let mut buf = Vec::new();
         // A read error used to end the loop exactly like end-of-file, so a
         // deleted file cut short mid-stream went unnoticed (#1127).
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            buf.clear();
+            match read_line_capped(&mut reader, &mut buf, max_line_bytes).await? {
+                LineRead::Eof => break,
+                LineRead::TooLong => continue,
+                LineRead::Line(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -4625,6 +4706,105 @@ mod tests {
                     "diagnostics": "2 submitted resource(s) could not be parsed or did not match the declared resource type"
                 }]}),
             ]
+        );
+    }
+
+    /// A manifest whose origin accepts the request and never answers fails
+    /// within the fetch budget instead of holding the worker.
+    #[tokio::test]
+    async fn a_stalled_manifest_fetch_fails_within_its_budget() {
+        struct StalledFetcher;
+
+        #[async_trait]
+        impl SubmitInputFetcher for StalledFetcher {
+            async fn fetch_manifest(
+                &self,
+                _url: &str,
+                _headers: &[(String, String)],
+                _oauth: &[String],
+                _encryption_key: Option<&Value>,
+            ) -> StorageResult<RemoteManifest> {
+                std::future::pending().await
+            }
+
+            async fn open_file_stream(
+                &self,
+                _url: &str,
+                _headers: &[(String, String)],
+                _requires_access_token: bool,
+                _oauth: &[String],
+                _encryption_key: Option<&Value>,
+            ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)>
+            {
+                unreachable!("no file is opened when the manifest never arrives")
+            }
+
+            async fn file_size(
+                &self,
+                _url: &str,
+                _headers: &[(String, String)],
+                _requires_access_token: bool,
+                _oauth: &[String],
+            ) -> StorageResult<Option<u64>> {
+                unreachable!("no file is sized when the manifest never arrives")
+            }
+        }
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("stalled-fetch");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/stalled.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("stalled-fetch"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            Arc::new(StalledFetcher),
+            Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("stalled-fetch"),
+        )
+        .with_manifest_fetch_timeout(StdDuration::from_secs(1));
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(StdDuration::from_secs(30), worker.run_job(lease))
+            .await
+            .expect("the run is bounded by the fetch budget, not by this test")
+            .unwrap();
+        assert!(started.elapsed() < StdDuration::from_secs(20));
+
+        let manifests = backend.list_manifests(&tenant, &sub).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Failed);
+        let message: Option<String> = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT publication_error_message FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                params![
+                    tenant.tenant_id().as_str(),
+                    sub.submitter,
+                    sub.submission_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            message.as_deref().unwrap_or("").contains("exceeded"),
+            "{message:?}"
         );
     }
 

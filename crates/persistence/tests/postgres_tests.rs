@@ -59,6 +59,10 @@ mod tenant_id_fidelity_suite;
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 
+/// TLS connections against a real server (#2746).
+#[path = "tls/postgres_tls.rs"]
+mod postgres_tls;
+
 #[path = "common/sof_terminology_suite.rs"]
 mod sof_terminology_suite;
 
@@ -2340,6 +2344,20 @@ mod postgres_integration {
         claim_contract::unleased_processing_is_not_claimable(
             &create_backend().await,
             &create_tenant("unleased-processing"),
+        )
+        .await;
+    }
+
+    /// See `claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others`
+    /// (#2760). A database of its own: the shared one carries other tests'
+    /// claimable manifests, and this asserts on what the next claims return.
+    #[tokio::test]
+    async fn postgres_bulk_submit_a_tenant_with_work_in_flight_waits_behind_the_others() {
+        let (backend, _dbname) = isolated_reindex_backend().await;
+        claim_contract::a_tenant_with_work_in_flight_waits_behind_the_others(
+            &backend,
+            &create_tenant("claim-fairness-busy"),
+            &create_tenant("claim-fairness-other"),
         )
         .await;
     }

@@ -155,9 +155,10 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
         );
     }
 
-    let resource_store = PostgresBackend::from_connection_string(&config.database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open PostgreSQL resource store: {e}"))?;
+    let resource_store =
+        PostgresBackend::from_named_connection_string(&config.database_url, "HTS_DATABASE_URL")
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open PostgreSQL resource store: {e}"))?;
     resource_store.init_schema().await.map_err(|e| {
         anyhow::anyhow!("Failed to initialize PostgreSQL resource store schema: {e}")
     })?;

@@ -485,7 +485,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Was `100` before #945. Honoured by the worker since #1127 (before, every run used `100` whatever this said). An older measurement (index-during-ingest on, before the Elasticsearch recipe below) found `1000` slower than `100`. The recipe below, measured later on the same 133,527-resource slice, uses `1000` as part of a combined setting and was the better combination; batch size alone was not isolated again. |
+| `HFS_BULK_SUBMIT_MAX_LINE_BYTES` | `134217728` | Longest line of an NDJSON input file the ingest buffers before parsing it (bytes). A longer line is rejected like a malformed one, its bytes are discarded up to the next newline, and the file continues or aborts under the `max_errors` rules, so one provider-served line can never take more than this much memory in the server process. The default is the REST API body ceiling, so a submitted resource may be as large as one the API accepts. |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
+| `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT` | `600` | Wall-clock budget, in seconds, for fetching one remote Bulk Export manifest. The read timeout above only bounds idle time, so a body that keeps producing bytes never trips it; past this budget the manifest fails with a fetch error and the worker moves on to the next claim. The claim itself prefers tenants holding no live lease, so one tenant cannot take every worker while another tenant waits. |
 | `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES` | `67108864` (64 MiB) | Ceiling, in decoded bytes, on a Bulk Export manifest the worker fetches; the manifest is read whole, and a body that passes the ceiling fails the manifest as soon as it does. |
 | `HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES` | `1073741824` (1 GiB) | Ceiling, in decoded bytes, on a JWE-encrypted input file, which is buffered whole (the authentication tag trails the ciphertext). Unencrypted NDJSON streams and has no ceiling. |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions. |
@@ -1018,6 +1020,16 @@ Likewise `search-type` and the `searchParam`, `searchInclude` and
 (`SearchProvider::supports_search`, #514): a standalone S3 deployment answers
 every search `501`, and its `/metadata` lists none of them. A composite answers
 for the provider its search reaches, so `s3-elasticsearch` advertises search.
+
+Where the storage searches, `searchParam` lists only the parameters it serves
+(`SearchProvider::serves_search_param`, #2593), the common `_text` and
+`_content` included, and `searchInclude` / `searchRevInclude` drop each
+`Type:code` whose reference parameter it does not serve. `_list` and `_in`,
+which this layer resolves into an `_id` filter, are listed where the storage
+serves `_id`. A composite is listed only when each of its components is in the
+registry and served. No backend evaluates `Location.near` (or, from R5,
+`Location.contains` and `Composition.section-text`), so none lists them, and
+MongoDB, which answers `_text` and `_content` with `501`, lists neither.
 
 ### Current Limitations
 

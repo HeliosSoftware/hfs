@@ -141,8 +141,9 @@ fn error_chain(err: &(dyn Error + 'static)) -> String {
 /// error chain, so the log shows a stall, a reset, a truncation or a checksum
 /// mismatch even when a retry then succeeds.
 ///
-/// The `Unavailable` message is shown to clients verbatim, so it carries the
-/// source chain only: not the object key, and not the `Debug` tail.
+/// The `Unavailable` message carries the source chain only: the `warn` lines
+/// above already name the object, and `map_client_error` sends the message to
+/// the log and a fixed sentence to the client.
 pub(super) async fn get_with_body_retry<F, Fut>(
     policy: &GetRetryPolicy,
     bucket: &str,
