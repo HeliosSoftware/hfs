@@ -343,6 +343,37 @@ fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
 /// drains every page.
 const RESOLVER_PAGE: u32 = 1000;
 
+/// Most ids one hop may collect ([`search_all_ids`]). Every hop is drained
+/// whole into memory and then turned into an `_id` filter, so without a
+/// ceiling one chained search, `Patient?_has:Observation:subject:status=final`
+/// on a large tenant, holds every match of every hop at once. The same
+/// ceiling MongoDB puts on its result id sets.
+const MAX_HOP_IDS: usize = 300_000;
+
+/// Most resources one hop may collect ([`search_all_pages`]), which keeps
+/// whole resource bodies rather than ids.
+const MAX_HOP_RESOURCES: usize = 100_000;
+
+#[cfg(test)]
+tokio::task_local! {
+    static HOP_CAP_OVERRIDE: usize;
+}
+
+/// `cap`, or a lower ceiling a test installed for the duration of one future.
+fn hop_cap(cap: usize) -> usize {
+    #[cfg(test)]
+    if let Ok(lowered) = HOP_CAP_OVERRIDE.try_with(|c| *c) {
+        return lowered;
+    }
+    cap
+}
+
+/// The error for a hop whose matches pass its ceiling: the search is refused
+/// (`422`) rather than answered from a truncated hop.
+fn hop_too_large(count: usize, max: usize) -> StorageError {
+    StorageError::Search(SearchError::TooManyResults { count, max })
+}
+
 /// Maximum number of reference values passed to a single intermediate hop
 /// search. A backend expands a multi-value reference param into an OR of one
 /// condition per value; the SQLite builder folds them with a helper that
@@ -386,6 +417,10 @@ where
         let has_next = result.has_next();
         let next_cursor = result.next_cursor().cloned();
         items.extend(result.resources.items);
+        let max = hop_cap(MAX_HOP_RESOURCES);
+        if items.len() > max {
+            return Err(hop_too_large(items.len(), max));
+        }
         if !has_next {
             return Ok(items);
         }
@@ -449,6 +484,10 @@ where
         let has_next = result.page_info.has_next;
         let next_cursor = result.page_info.next_cursor.clone();
         ids.extend(result.items);
+        let max = hop_cap(MAX_HOP_IDS);
+        if ids.len() > max {
+            return Err(hop_too_large(ids.len(), max));
+        }
         if !has_next {
             return Ok(ids);
         }
@@ -3490,6 +3529,39 @@ mod tests {
             N,
             "every observation whose encounter's patient is female matches"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hop_past_its_ceiling_is_refused_not_truncated() {
+        for ids_only in [true, false] {
+            let storage = ScriptedPages::new(vec![
+                scripted_page(&["a", "b"], Some("c1"), true),
+                scripted_page(&["c", "d"], None, false),
+            ]);
+            let result = HOP_CAP_OVERRIDE
+                .scope(3, drain_scripted(&storage, ids_only))
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::Search(SearchError::TooManyResults {
+                        count: 4,
+                        max: 3
+                    }))
+                ),
+                "ids_only={ids_only}: {result:?}"
+            );
+
+            let storage = ScriptedPages::new(vec![
+                scripted_page(&["a", "b"], Some("c1"), true),
+                scripted_page(&["c"], None, false),
+            ]);
+            let drained = HOP_CAP_OVERRIDE
+                .scope(3, drain_scripted(&storage, ids_only))
+                .await
+                .unwrap();
+            assert_eq!(drained, ["a", "b", "c"], "ids_only={ids_only}");
+        }
     }
 
     #[tokio::test]
