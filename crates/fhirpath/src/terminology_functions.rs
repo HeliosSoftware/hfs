@@ -1598,6 +1598,25 @@ mod tests {
         assert_eq!(ctx.terminology_session().state.lock().remote_calls, 2);
     }
 
+    /// aggregate() evaluates each iteration in a child of the caller's
+    /// context, so its terminology calls share the caller's session and count
+    /// against one budget instead of starting a fresh one per iteration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aggregate_iterations_share_the_terminology_budget() {
+        let server = terminology_stub().await;
+        let mut ctx = context_for(&server);
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(Some(2)));
+
+        let expression = format!("('a' | 'b' | 'c' | 'd').aggregate($this.memberOf('{VS}'))");
+        let parsed = crate::parse_expression(&expression).unwrap();
+        let result = crate::evaluator::evaluate(&parsed, &ctx, None);
+        assert!(
+            matches!(result, Err(EvaluationError::TerminologyCallLimit(_))),
+            "{result:?}"
+        );
+        assert_eq!(request_count(&server).await, 2);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn server_errors_are_resent_and_count_against_the_cap() {
         let server = status_stub(500).await;
