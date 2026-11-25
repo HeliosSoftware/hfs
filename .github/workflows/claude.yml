@@ -12,11 +12,29 @@ on:
 
 jobs:
   claude:
+    # Mention of @claude by a repository owner, member or collaborator. The
+    # gate is evaluated here, before any step runs, because a step that exits
+    # 0 does not stop the steps after it.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      ) && (
+        (
+          (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+        ) ||
+        (
+          github.event_name == 'pull_request_review' &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
+        ) ||
+        (
+          github.event_name == 'issues' &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+        )
+      )
     runs-on: [self-hosted, Linux]
     permissions:
       contents: read
@@ -25,33 +43,23 @@ jobs:
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:
-      - name: Check permissions
-        if: >
-          github.event.comment.author_association != 'OWNER' &&
-          github.event.comment.author_association != 'MEMBER' &&
-          github.event.comment.author_association != 'COLLABORATOR'
-        run: |
-          echo "Unauthorized user, skipping"
-          exit 0
-
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
-
-      - name: Import GPG key and configure signing
-        run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          git config --global user.signingkey ${{ secrets.GPG_KEY_ID }}
-          git config --global commit.gpgsign true
-          git config --global user.email "claude-bot@heliossoftware.com"
-          git config --global user.name "Claude Bot"
 
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Every branch requires signed commits (the "Enforce Only Signed
+          # Commits" ruleset). The action commits through the GitHub API, so
+          # GitHub signs for claude[bot] and no signing key is ever on the
+          # runner, which is persistent and shared with pull-request jobs.
+          # The cost: no rebase, cherry-pick or other history rewriting.
+          use_commit_signing: true
 
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
