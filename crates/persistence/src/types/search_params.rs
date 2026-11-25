@@ -933,14 +933,18 @@ pub fn absolute_reference_target(reference: &str) -> Option<String> {
 }
 
 /// Deepest `_offset` the ordered date-index walk serves (#2731). Past it the
-/// walk reads and probes every skipped row (about 27 us each on SQLite against
-/// 3-9 us for the general sort), so the general statement keeps those requests.
+/// general statement keeps the request.
 ///
-/// 1,000 is a conservative value, not a calibrated one: at 191,797 rows the walk
-/// still won at offset 10,000 (274 ms against 1,331 ms descending), but on
-/// types of fewer than about 80,000 resources it can lose there. Recalibrate it
-/// with offsets 1,000 / 10,000 / 50,000 on a 1M data set (tracking issue #2180).
-pub const DATE_WALK_MAX_OFFSET: usize = 1_000;
+/// The walk reads and probes every skipped row (about 34 us each on SQLite at
+/// 1M resources), while the general sort touches each resource of the type
+/// once (about 4 us each), so the walk loses on a type of fewer than roughly
+/// eight times the offset in resources. On 1,000,000 Observations it won at
+/// every offset measured up to 100,000: at offset 10,000 SQLite took 340 ms
+/// against 4.5 s and PostgreSQL 114 ms against about 5 s, and the pages were
+/// identical (tracking issue #2180). 10,000 keeps the loss on a small type to
+/// a few hundred milliseconds (an estimate from those per-row costs, not
+/// measured on a small type) and leaves the gain on large ones.
+pub const DATE_WALK_MAX_OFFSET: usize = 10_000;
 
 /// Most rows of one equal-key group the ordered date-index walk reads for the
 /// head of a page (#2731). The walk orders `key, id` inside a group, so a group
