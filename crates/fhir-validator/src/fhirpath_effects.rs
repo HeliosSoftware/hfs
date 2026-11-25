@@ -48,9 +48,17 @@ use std::sync::Mutex;
 /// cache.
 #[derive(Default)]
 pub struct FhirPathConstraintEvaluator {
-    /// Parse cache, keyed by expression text (focus paths and invariants).
+    /// Parse cache of invariant expressions, keyed by their text, holding at
+    /// most [`MAX_CACHED_ASTS`] entries. Focus paths are not cached: they carry
+    /// the array indices of the resource being validated (`contact[3]`), so
+    /// every caller could add entries that live as long as the process.
     asts: Mutex<HashMap<String, std::sync::Arc<helios_fhirpath::parser::Expression>>>,
 }
+
+/// The most invariant ASTs the cache keeps. Past it a new expression is
+/// parsed for its own evaluation and not kept, so stored tenant profiles
+/// with ever more distinct invariants cannot grow the cache without bound.
+const MAX_CACHED_ASTS: usize = 4096;
 
 impl FhirPathConstraintEvaluator {
     pub fn new() -> Self {
@@ -105,9 +113,9 @@ impl FhirPathConstraintEvaluator {
         };
 
         // Phase 1: the focused nodes. Phase 2: the invariant per node.
-        let focus = match self.parse(&relative) {
+        let focus = match helios_fhirpath::parse_expression(&relative) {
             Ok(ast) => ast,
-            Err(outcome) => return outcome,
+            Err(e) => return ConstraintOutcome::NotEvaluable(format!("parse error: {e}")),
         };
         let nodes = match helios_fhirpath::evaluator::evaluate(&focus, context, None) {
             Ok(EvaluationResult::Collection { items, .. }) => items,
@@ -152,7 +160,9 @@ impl FhirPathConstraintEvaluator {
         match helios_fhirpath::parse_expression(expression) {
             Ok(ast) => {
                 let ast = std::sync::Arc::new(ast);
-                cache.insert(expression.to_string(), std::sync::Arc::clone(&ast));
+                if cache.len() < MAX_CACHED_ASTS {
+                    cache.insert(expression.to_string(), std::sync::Arc::clone(&ast));
+                }
                 Ok(ast)
             }
             Err(e) => Err(ConstraintOutcome::NotEvaluable(format!("parse error: {e}"))),
@@ -235,6 +245,37 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
 #[cfg(test)]
 mod tests {
     use super::relative_path;
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn focus_paths_do_not_grow_the_ast_cache_and_invariants_are_capped() {
+        use super::{FhirPathConstraintEvaluator, MAX_CACHED_ASTS, parse_typed};
+        use helios_fhir::FhirVersion;
+
+        let contacts: Vec<_> = (0..50)
+            .map(|i| serde_json::json!({"name": {"family": format!("c{i}")}}))
+            .collect();
+        let patient = serde_json::json!({"resourceType": "Patient", "contact": contacts});
+        let typed = parse_typed(&patient, FhirVersion::R4).unwrap();
+        let context = helios_fhirpath::EvaluationContext::new(vec![typed]);
+        let evaluator = FhirPathConstraintEvaluator::new();
+
+        for i in 0..50 {
+            let outcome =
+                evaluator.evaluate_one(&format!("Patient.contact.{i}"), "name.exists()", &context);
+            assert_eq!(outcome, super::ConstraintOutcome::Passed, "contact {i}");
+        }
+        assert_eq!(
+            evaluator.asts.lock().unwrap().len(),
+            1,
+            "only the invariant is cached, not 50 focus paths"
+        );
+
+        for i in 0..MAX_CACHED_ASTS + 10 {
+            let _ = evaluator.evaluate_one("Patient", &format!("{i} = {i}"), &context);
+        }
+        assert_eq!(evaluator.asts.lock().unwrap().len(), MAX_CACHED_ASTS);
+    }
 
     #[test]
     fn renders_relative_focus_paths() {
