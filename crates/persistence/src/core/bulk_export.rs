@@ -1065,6 +1065,13 @@ pub trait BulkExportStorage: Send + Sync {
         output_ttl: std::time::Duration,
         limit: u32,
     ) -> StorageResult<Vec<ExpiredExportRef>>;
+
+    /// Deletes every export job of `tenant_id`, with its file and progress
+    /// rows, and returns how many jobs were removed. A tenant purge calls it
+    /// on the export job store as well as on the primary: on a MongoDB or S3
+    /// primary the jobs live in an embedded SQLite sidecar that
+    /// `purge_tenant_data` does not reach. Idempotent.
+    async fn purge_tenant_exports(&self, tenant_id: &str) -> StorageResult<u64>;
 }
 
 /// Data provider for export operations.

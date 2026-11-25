@@ -57,6 +57,73 @@ async fn create_test_server() -> TestServer {
     TestServer::new(router).expect("Failed to create test server")
 }
 
+/// A purge also empties the bulk export job store when it is not the primary,
+/// as on a MongoDB or S3 primary with its embedded SQLite sidecar.
+#[tokio::test]
+async fn delete_with_purge_empties_a_separate_export_job_store() {
+    use helios_persistence::backends::local_fs::LocalFsOutputStore;
+    use helios_persistence::core::{
+        BulkExportJobStore, BulkExportStorage, ExportOutputStore, ExportRequest, StartExportInput,
+    };
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    let primary = SqliteBackend::in_memory().expect("primary");
+    primary.init_schema().expect("schema");
+    let primary = Arc::new(primary);
+    let sidecar = SqliteBackend::in_memory().expect("sidecar");
+    sidecar.init_schema().expect("schema");
+    let sidecar = Arc::new(sidecar);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+    let state = helios_rest::AppState::new(Arc::clone(&primary), config).with_bulk_export(
+        sidecar.clone() as Arc<dyn BulkExportJobStore>,
+        output as Arc<dyn ExportOutputStore>,
+        Arc::new(helios_rest::bulk_export_auth::BearerScopeAuth),
+    );
+    let server =
+        TestServer::new(helios_rest::routing::admin_tenants::routes(state)).expect("test server");
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+    let job = sidecar
+        .start_export(
+            &acme,
+            StartExportInput {
+                request: ExportRequest::system(),
+                transaction_time: chrono::Utc::now(),
+                request_url: "http://localhost:8080/$export".to_string(),
+                owner_subject: None,
+                fhir_version: helios_fhir::FhirVersion::default(),
+            },
+        )
+        .await
+        .expect("job in the sidecar");
+
+    server
+        .delete("/admin/tenants/acme?purge=true")
+        .await
+        .assert_status(StatusCode::OK);
+    assert!(
+        sidecar.get_export_status(&acme, &job).await.is_err(),
+        "the sidecar still holds the purged tenant's export job"
+    );
+}
+
 /// Seeds a resource for a specific tenant via the normal REST create path.
 async fn seed_for(server: &TestServer, tenant: &str, resource_type: &str) {
     let response = server

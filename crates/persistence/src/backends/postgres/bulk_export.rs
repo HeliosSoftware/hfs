@@ -554,6 +554,35 @@ impl BulkExportStorage for PostgresBackend {
             .collect())
     }
 
+    async fn purge_tenant_exports(&self, tenant_id: &str) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to start export purge: {}", e)))?;
+        for sql in [
+            "DELETE FROM bulk_export_files WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+            "DELETE FROM bulk_export_progress WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+        ] {
+            tx.execute(sql, &[&tenant_id])
+                .await
+                .map_err(|e| internal_error(format!("Failed to purge export rows: {}", e)))?;
+        }
+        let jobs = tx
+            .execute(
+                "DELETE FROM bulk_export_jobs WHERE tenant_id = $1",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge export jobs: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit export purge: {}", e)))?;
+        Ok(jobs)
+    }
+
     async fn list_exports(
         &self,
         tenant: &TenantContext,

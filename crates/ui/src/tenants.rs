@@ -55,9 +55,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use helios_persistence::core::{
-    CountBasis, DiscoveryCoverage, ErasedScope, ExportOutputStore, ResourceStorage,
-    TenantDataEvidence, TenantRecord, WriteEvent, delete_tenant_outputs_everywhere,
+    BulkExportJobStore, CountBasis, DiscoveryCoverage, ErasedScope, ExportOutputStore,
+    ResourceStorage, TenantDataEvidence, TenantRecord, WriteEvent,
+    delete_tenant_outputs_everywhere,
 };
+use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1146,6 +1148,35 @@ pub fn register_tenant_purge_output(store: Arc<dyn ExportOutputStore>) {
     }
 }
 
+/// The bulk export job stores a tenant purge must empty as well as the
+/// primary: on a MongoDB or S3 primary the jobs live in a SQLite sidecar
+/// that `purge_tenant_data` does not reach.
+static PURGE_EXPORT_JOB_STORES: RwLock<Vec<Arc<dyn BulkExportJobStore>>> = RwLock::new(Vec::new());
+
+/// Registers the bulk export job store whose rows a tenant purge from this
+/// page must delete. Process-wide, as [`register_tenant_purge_output`] is.
+pub fn register_tenant_purge_export_jobs(store: Arc<dyn BulkExportJobStore>) {
+    match PURGE_EXPORT_JOB_STORES.write() {
+        Ok(mut guard) => guard.push(store),
+        Err(poisoned) => poisoned.into_inner().push(store),
+    }
+}
+
+fn purge_export_job_stores() -> Vec<Arc<dyn BulkExportJobStore>> {
+    match PURGE_EXPORT_JOB_STORES.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Purges `id`'s rows from every registered export job store.
+async fn purge_export_jobs(id: &str) -> StorageResult<()> {
+    for jobs in purge_export_job_stores() {
+        jobs.purge_tenant_exports(id).await?;
+    }
+    Ok(())
+}
+
 /// The registered output stores, cloned out so no lock is held across an await.
 fn purge_output_stores() -> Vec<Arc<dyn ExportOutputStore>> {
     match PURGE_OUTPUT_STORES.read() {
@@ -1237,7 +1268,10 @@ pub async fn delete(
         // find the files again, so a failure here stops before the purge and a
         // retry still reaches both.
         let purged = match delete_tenant_outputs_everywhere(&purge_output_stores(), &id).await {
-            Ok(()) => storage.purge_tenant_data(&id).await,
+            Ok(()) => match storage.purge_tenant_data(&id).await {
+                Ok(removed) => purge_export_jobs(&id).await.map(|()| removed),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         };
         match purged {
