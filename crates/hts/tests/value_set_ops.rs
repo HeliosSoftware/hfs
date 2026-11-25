@@ -797,6 +797,149 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
     assert_eq!(issue_code, "too-costly");
 }
 
+/// An app whose configured limit is `limit` and whose header ceiling is
+/// `ceiling`, with `bundle` imported.
+#[cfg(feature = "sqlite")]
+async fn capped_app(limit: u32, ceiling: u32, bundle: &str) -> axum::Router {
+    use axum::{body::Body, http::Request};
+    use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+    use tower::ServiceExt;
+
+    let backend = SqliteTerminologyBackend::in_memory().unwrap();
+    let state = AppState::new(backend)
+        .with_max_expansion_size(limit)
+        .with_max_expansion_size_ceiling(ceiling);
+    let app = helios_hts::server::create_app(&HtsConfig::default(), state);
+    let import_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/import")
+                .header("content-type", "application/fhir+json")
+                .body(Body::from(bundle.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(import_response.status().is_success());
+    app
+}
+
+#[cfg(feature = "sqlite")]
+async fn expand_status(
+    app: axum::Router,
+    body: serde_json::Value,
+    threshold_header: Option<&str>,
+) -> StatusCode {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/ValueSet/$expand")
+        .header("content-type", "application/fhir+json");
+    if let Some(threshold) = threshold_header {
+        request = request.header("x-too-costly-threshold", threshold);
+    }
+    app.oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn the_threshold_header_raises_the_limit_only_up_to_the_ceiling() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "url", "valueUri": bundles::LIMBS_VS_URL}]
+    });
+
+    // The limbs value set has three codes: a header within the ceiling lifts the limit.
+    let app = capped_app(1, 5, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body.clone(), Some("5")).await,
+        StatusCode::OK
+    );
+
+    // Above the ceiling the header is clamped, so three codes still exceed it.
+    let app = capped_app(1, 2, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, Some("10")).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_body_parameter_cannot_raise_the_expansion_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::LIMBS_VS_URL},
+            {"name": "__max_expansion_size__", "valueInteger": 10}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_tree_expansion_is_subject_to_the_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+            {"name": "hierarchical", "valueBoolean": true}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::ecl_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// `count` pages a flat expansion, but a tree ignores it and returns every
+/// code, so a tree with `count` must still be held to the limit.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_tree_expansion_with_count_is_subject_to_the_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+            {"name": "hierarchical", "valueBoolean": true},
+            {"name": "count", "valueInteger": 1}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::ecl_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// A ceiling configured below the limit must not let the header, which asks
+/// for more codes, lower the limit instead.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_ceiling_below_the_limit_never_lowers_it() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "url", "valueUri": bundles::LIMBS_VS_URL}]
+    });
+    // Limit 5 lets the three limbs codes through; a ceiling of 2 would cut
+    // the header's 10 down to 2 if it were taken as is.
+    let app = capped_app(5, 2, bundles::r4_bundle()).await;
+    assert_eq!(expand_status(app, body, Some("10")).await, StatusCode::OK);
+}
+
 // ── negative cache vs tx-resource ─────────────────────────────────────────────
 
 /// A url-only miss is remembered so later url-only requests skip the store;
