@@ -981,6 +981,60 @@ async fn a_url_only_miss_does_not_poison_a_tx_resource_expansion() {
     );
 }
 
+/// A miss for one version, or for a `date` the ValueSet does not reach, says
+/// nothing about the url: the stored ValueSet keeps expanding for everyone.
+#[tokio::test]
+async fn a_version_or_date_miss_does_not_hide_the_stored_value_set() {
+    let url = bundles::LIMBS_VS_URL;
+    for narrowed in [
+        format!("url={url}%7C9.9.9"),
+        format!("url={url}&valueSetVersion=9.9.9"),
+        format!("url={url}&date=1900-01-01"),
+    ] {
+        let app = TestApp::new();
+        app.import_bundle_ok(bundles::r4_bundle()).await;
+
+        let (status, _) = app.get_fhir(&format!("/ValueSet/$expand?{narrowed}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{narrowed}");
+
+        let (status, body) = app.get_fhir(&format!("/ValueSet/$expand?url={url}")).await;
+        assert_eq!(status, StatusCode::OK, "after {narrowed}: {body}");
+        let (status, body) = app
+            .get_fhir(&format!("/ValueSet/$expand?url={url}%7C1.0"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "after {narrowed}: {body}");
+    }
+}
+
+/// A miss answered from the negative cache reads the same as the miss that
+/// filled it, for every way of naming the ValueSet.
+#[tokio::test]
+async fn a_cached_expand_miss_reads_like_a_fresh_one() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    let url = "http://hts.test/vs/not-in-store";
+
+    let (_, bare) = app.get_fhir(&format!("/ValueSet/$expand?url={url}")).await;
+    assert_eq!(
+        bare["issue"][0]["details"]["text"],
+        format!("A definition for the value Set '{url}' could not be found")
+    );
+    for request in [
+        format!("url={url}"),
+        format!("url={url}%7C2.0"),
+        format!("url={url}&valueSetVersion=2.0"),
+        format!("url={url}&date=2020-01-01"),
+    ] {
+        let (status, fresh) = app.get_fhir(&format!("/ValueSet/$expand?{request}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{request}");
+        // Errors are never in the response caches, so the repeat is answered
+        // by the negative cache.
+        let (status, cached) = app.get_fhir(&format!("/ValueSet/$expand?{request}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{request}");
+        assert_eq!(cached, fresh, "{request}");
+    }
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]

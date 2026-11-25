@@ -34,7 +34,8 @@ use std::sync::Arc;
 
 use crate::error::HtsError;
 use crate::state::{
-    AppState, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX, NotFoundCache,
+    AppState, CacheEpoch, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX,
+    NotFoundCache,
 };
 use crate::traits::{SupplementInfo, TerminologyBackend};
 use crate::types::{DesignationValue, LookupRequest, ResourceIdentity};
@@ -92,31 +93,37 @@ fn lookup_cache_get(cache: &LookupHandlerCache, key: &str) -> Option<Arc<Value>>
 /// Insert a successfully-built `$lookup` response into the per-AppState cache.
 /// Drops new entries silently once the cache reaches
 /// [`LOOKUP_HANDLER_CACHE_MAX`].
-fn lookup_cache_put(cache: &LookupHandlerCache, key: String, value: Arc<Value>) {
+fn lookup_cache_put(
+    cache: &LookupHandlerCache,
+    epoch: &CacheEpoch,
+    key: String,
+    value: Arc<Value>,
+) {
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= LOOKUP_HANDLER_CACHE_MAX {
+        if !epoch.is_current() || guard.len() >= LOOKUP_HANDLER_CACHE_MAX {
             return;
         }
         guard.insert(key, value);
     }
 }
 
-/// Iter 7i — Is this canonical request key in the negative cache (the last
-/// observation was `NotFound`)?
-fn lookup_not_found_contains(cache: &NotFoundCache, key: &str) -> bool {
-    cache.read().map(|g| g.contains(key)).unwrap_or(false)
+/// The NotFound message a previous identical request produced, if that
+/// request is in the negative cache.
+fn lookup_not_found_get(cache: &NotFoundCache, key: &str) -> Option<String> {
+    cache.read().ok()?.get(key).cloned()
 }
 
-/// Iter 7i — Mark this canonical request key as definitively unknown until
-/// the next bundle import wipes the cache. Bounded to
+/// Record that a canonical request key resolved to `NotFound(message)` so
+/// subsequent identical requests can short-circuit with the same message
+/// until the next terminology write wipes the cache. Bounded to
 /// [`NOT_FOUND_CACHE_MAX`] entries so an adversary probing many unique
 /// codes cannot grow the cache without bound.
-fn lookup_not_found_put(cache: &NotFoundCache, key: String) {
+fn lookup_not_found_put(cache: &NotFoundCache, epoch: &CacheEpoch, key: String, message: String) {
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= NOT_FOUND_CACHE_MAX {
+        if !epoch.is_current() || guard.len() >= NOT_FOUND_CACHE_MAX {
             return;
         }
-        guard.insert(key);
+        guard.insert(key, message);
     }
 }
 
@@ -178,23 +185,28 @@ async fn process_lookup_selected<B: TerminologyBackend>(
         if let Some(cached) = lookup_cache_get(&state.lookup_handler_cache, key) {
             return Ok((*cached).clone());
         }
-        if lookup_not_found_contains(&state.lookup_not_found_cache, key) {
-            // Reconstruct the same NotFound the slow path would have
-            // produced. Both backends (postgres/code_system.rs:1456 and
-            // sqlite/code_system.rs:1795) use the same `"Concept not found:
-            // {code}"` shape, so match that exactly to keep the cached
-            // negative response byte-identical to a fresh slow-path miss.
-            let code = find_str_param(&params, "code").unwrap_or_default();
-            return Err(HtsError::NotFound(format!("Concept not found: {code}")));
+        // The cache keeps the message of the miss it recorded (an unknown
+        // code and an unknown CodeSystem read differently), so the cached
+        // answer is the one a fresh miss would give.
+        if let Some(message) = lookup_not_found_get(&state.lookup_not_found_cache, key) {
+            return Err(HtsError::NotFound(message));
         }
     }
+    // Taken before the store is read: a write that lands while this request
+    // runs must keep its result out of the caches.
+    let epoch = state.cache_epoch();
     let result = process_lookup_inner(state, params, instance).await;
     match (&result, cache_key) {
         (Ok(value), Some(key)) => {
-            lookup_cache_put(&state.lookup_handler_cache, key, Arc::new(value.clone()));
+            lookup_cache_put(
+                &state.lookup_handler_cache,
+                &epoch,
+                key,
+                Arc::new(value.clone()),
+            );
         }
-        (Err(HtsError::NotFound(_)), Some(key)) => {
-            lookup_not_found_put(&state.lookup_not_found_cache, key);
+        (Err(HtsError::NotFound(message)), Some(key)) => {
+            lookup_not_found_put(&state.lookup_not_found_cache, &epoch, key, message.clone());
         }
         _ => {}
     }
@@ -560,6 +572,41 @@ pub async fn get_lookup_by_id<B: TerminologyBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hit or a miss computed before a terminology write is not cached
+    /// after it.
+    #[test]
+    fn a_result_computed_before_a_write_is_not_cached_after_it() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let before = state.cache_epoch();
+        state.clear_expand_cache(); // the write
+        let value = Arc::new(json!({}));
+        lookup_cache_put(
+            &state.lookup_handler_cache,
+            &before,
+            "k".into(),
+            value.clone(),
+        );
+        lookup_not_found_put(
+            &state.lookup_not_found_cache,
+            &before,
+            "k".into(),
+            "m".into(),
+        );
+        assert!(state.lookup_handler_cache.read().unwrap().is_empty());
+        assert!(state.lookup_not_found_cache.read().unwrap().is_empty());
+
+        let now = state.cache_epoch();
+        lookup_cache_put(&state.lookup_handler_cache, &now, "k".into(), value);
+        lookup_not_found_put(&state.lookup_not_found_cache, &now, "k".into(), "m".into());
+        assert_eq!(state.lookup_handler_cache.read().unwrap().len(), 1);
+        assert_eq!(
+            lookup_not_found_get(&state.lookup_not_found_cache, "k").as_deref(),
+            Some("m")
+        );
+    }
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 

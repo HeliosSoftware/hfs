@@ -8,7 +8,8 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -63,13 +64,43 @@ pub const EXPAND_CACHE_MAX: usize = 2048;
 /// Maximum number of ValueSet URLs to remember as definitively absent.
 pub const NOT_FOUND_CACHE_MAX: usize = 10_000;
 
-/// Negative-result cache: ValueSet URLs that returned 404 on the last expand.
+/// Negative-result cache: canonical request key → the NotFound message that
+/// request produced, so a repeat is answered without touching the store and
+/// with the same text as the first miss.
 ///
-/// Keyed on the canonical ValueSet URL only (filter/count/offset are irrelevant
-/// — a missing URL is always missing).  Bounded to avoid unbounded growth when
-/// a client probes many non-existent URLs.  Cleared together with
-/// [`ExpandCache`] after every successful bundle import.
-pub type NotFoundCache = Arc<RwLock<HashSet<String>>>;
+/// Two instances exist. `$expand` keys on the ValueSet URL together with every
+/// parameter that decides *which* definition is looked up (version, `date`):
+/// a miss for one version or one date says nothing about the URL as a whole.
+/// `$lookup` keys on its canonical request key.  Both are bounded to
+/// [`NOT_FOUND_CACHE_MAX`] entries and cleared together with [`ExpandCache`]
+/// after every terminology write.
+pub type NotFoundCache = Arc<RwLock<HashMap<String, String>>>;
+
+/// The handler-cache epoch a request started in.
+///
+/// A request computes its response from the store and then offers it to a
+/// handler cache. If a terminology write lands in between, that response
+/// describes the store as it was before the write, and inserting it after the
+/// write's [`AppState::clear_expand_cache`] would serve it until the next
+/// write. Each request therefore takes a `CacheEpoch` before it reads the
+/// store and inserts only while [`CacheEpoch::is_current`] holds, checked
+/// under the cache's write lock.
+#[derive(Clone, Debug)]
+pub struct CacheEpoch {
+    counter: Arc<AtomicU64>,
+    seen: u64,
+}
+
+impl CacheEpoch {
+    /// `true` while no [`AppState::clear_expand_cache`] has run since this
+    /// epoch was taken. Call it while holding the write lock of the cache
+    /// being filled: the clear advances the counter before it takes that
+    /// lock, so an insert that passes this check is either wiped by the clear
+    /// or was computed after it.
+    pub fn is_current(&self) -> bool {
+        self.counter.load(Ordering::SeqCst) == self.seen
+    }
+}
 
 /// Thread-safe per-AppState cache for fully-assembled `$validate-code` JSON
 /// responses (both `CodeSystem/$validate-code` and `ValueSet/$validate-code`).
@@ -177,13 +208,13 @@ pub struct AppState<B: TerminologyBackend> {
     /// CRUD write.
     pub expand_cache: ExpandCache,
 
-    /// Negative cache for ValueSet URLs that are definitively absent.
+    /// Negative cache for `$expand` requests whose ValueSet was not found.
     ///
-    /// A URL in this set returned `HtsError::NotFound` on its last expand
-    /// attempt.  Subsequent requests skip all backend queries and return 404
-    /// immediately, eliminating the 5+ SQLite round-trips that a cold miss
-    /// costs for each uncached URL.  Cleared together with `expand_cache`
-    /// after every successful bundle import.
+    /// Keyed on the URL plus the version and `date` the request pinned, so a
+    /// miss answers only repeats of the same request. Those skip all backend
+    /// queries and return 404 immediately, eliminating the 5+ SQLite
+    /// round-trips a cold miss costs.  Cleared together with `expand_cache`
+    /// after every terminology write.
     pub not_found_urls: NotFoundCache,
 
     /// Handler-level response cache for `POST /CodeSystem/$validate-code` (both
@@ -223,7 +254,7 @@ pub struct AppState<B: TerminologyBackend> {
     /// Iter 7i — targets LK05 (PG ~50% of SQLite). The positive
     /// [`LookupHandlerCache`] populates only on `Ok(_)`, so each not-found
     /// request paid supplement-resolve + backend lookup + per-system
-    /// language fetch + Parameters builder anyway. This `HashSet<String>`
+    /// language fetch + Parameters builder anyway. This map
     /// of canonical [`build_lookup_cache_key`] strings short-circuits ALL
     /// of that — same key space as the positive cache, no risk of
     /// stale-positive shadowing because the negative cache is only
@@ -233,6 +264,9 @@ pub struct AppState<B: TerminologyBackend> {
     /// [`AppState::clear_expand_cache`] — a newly-imported supplement
     /// might define a previously-unknown code.
     pub lookup_not_found_cache: NotFoundCache,
+
+    /// Advanced by every [`AppState::clear_expand_cache`]; see [`CacheEpoch`].
+    cache_epoch: Arc<AtomicU64>,
 
     /// Serialises concept-closure rebuilds started by `POST /import?finalize=true`.
     ///
@@ -266,13 +300,14 @@ impl<B: TerminologyBackend> AppState<B> {
             max_expansion_size: 10_000,
             max_expansion_size_ceiling: 100_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
-            not_found_urls: Arc::new(RwLock::new(HashSet::new())),
+            not_found_urls: Arc::new(RwLock::new(HashMap::new())),
             cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
-            lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
+            lookup_not_found_cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_epoch: Arc::new(AtomicU64::new(0)),
             closure_rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             import_finalize_wait: DEFAULT_IMPORT_FINALIZE_WAIT,
         }
@@ -292,6 +327,9 @@ impl<B: TerminologyBackend> AppState<B> {
     /// `operations::crud::evict_caches_after_write`, which clears both tiers.
     /// See [`crate::traits::TerminologyCaches`].
     pub fn clear_expand_cache(&self) {
+        // Advance the epoch before touching any cache, so a request that read
+        // the store before this write cannot insert its response afterwards.
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut cache) = self.expand_cache.write() {
             cache.clear();
         }
@@ -315,6 +353,15 @@ impl<B: TerminologyBackend> AppState<B> {
         }
         if let Ok(mut neg) = self.lookup_not_found_cache.write() {
             neg.clear();
+        }
+    }
+
+    /// The current handler-cache epoch. Take it before reading the store and
+    /// pass it to the cache insert; see [`CacheEpoch`].
+    pub fn cache_epoch(&self) -> CacheEpoch {
+        CacheEpoch {
+            counter: Arc::clone(&self.cache_epoch),
+            seen: self.cache_epoch.load(Ordering::SeqCst),
         }
     }
 
