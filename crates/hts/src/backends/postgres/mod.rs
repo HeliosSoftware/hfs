@@ -1144,6 +1144,15 @@ async fn write_code_system(
     // sqlite/import/fhir_bundle.rs:189-215.
     // [`resource_identity::ImportIdentities::assign`] makes the choice from
     // rows read once for the whole write.
+    check_stored_authority(
+        client,
+        "code_systems",
+        "CodeSystem",
+        &cs.url,
+        cs.version.as_deref(),
+        cs.authority_rank,
+    )
+    .await?;
     let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::CodeSystem,
         &cs.id,
@@ -1381,6 +1390,30 @@ async fn insert_hierarchy(
     Ok(())
 }
 
+/// Refuse an import that would put weaker-ranked content on a stored
+/// `(url, version)` row (see [`bundle_parser::check_authority`]).
+async fn check_stored_authority(
+    client: &impl GenericClient,
+    table: &str,
+    kind: &str,
+    url: &str,
+    version: Option<&str>,
+    incoming_rank: i32,
+) -> Result<(), HtsError> {
+    let query = format!(
+        "SELECT authority_rank FROM {table} \
+         WHERE url = $1 AND COALESCE(version, '') = COALESCE($2, '')"
+    );
+    let existing = client
+        .query_opt(&query, &[&url, &version])
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    if let Some(existing_rank) = existing.and_then(|row| row.get::<_, Option<i32>>(0)) {
+        bundle_parser::check_authority(kind, url, version, existing_rank, incoming_rank)?;
+    }
+    Ok(())
+}
+
 async fn write_value_set(
     client: &impl GenericClient,
     vs: &ParsedValueSet,
@@ -1418,6 +1451,15 @@ async fn write_value_set(
     // Mirrors sqlite/import/fhir_bundle.rs:443-478.
     // [`resource_identity::ImportIdentities::assign`] makes the choice from
     // rows read once for the whole write.
+    check_stored_authority(
+        client,
+        "value_sets",
+        "ValueSet",
+        &vs.url,
+        vs.version.as_deref(),
+        vs.authority_rank,
+    )
+    .await?;
     let (storage_id, public_id) = identities.assign(
         crate::backends::resource_identity::ResourceKind::ValueSet,
         &vs.id,
