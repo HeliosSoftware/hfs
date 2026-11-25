@@ -321,13 +321,13 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
             return truncated;
         } else if value > Decimal::ZERO {
             // Positive integer: return value - 1
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         } else if value < Decimal::ZERO && value != truncated {
             // Negative non-integer: return the next lower integer
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         } else {
             // Negative integer: return value - 1
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         }
     }
 
@@ -419,7 +419,10 @@ fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
         // For integer precision
         if value >= Decimal::ZERO {
             // Positive: next integer
-            return value.trunc() + Decimal::ONE;
+            return value
+                .trunc()
+                .checked_add(Decimal::ONE)
+                .unwrap_or(value.trunc());
         } else {
             // Negative: truncate towards zero (ceiling)
             return value.trunc();

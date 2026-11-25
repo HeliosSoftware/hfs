@@ -708,7 +708,30 @@ impl SearchParameterExtractor {
     ///
     /// `context` must have `resource` as its `this`; `resource` itself is still
     /// read for the `resourceType` the expression is filtered against.
+    ///
+    /// A parameter whose evaluation panics fails like one whose evaluation
+    /// returns an error: its expression is tenant-authored, and a panic would
+    /// otherwise unwind through the write that is indexing the resource.
     fn extract_for_param_in(
+        &self,
+        resource: &Value,
+        context: &EvaluationContext,
+        composite_bases: &mut HashMap<String, Vec<BaseContext>>,
+        param: &SearchParameterDefinition,
+    ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.extract_for_param_unguarded(resource, context, composite_bases, param)
+        }))
+        .unwrap_or_else(|_| {
+            Err(ExtractionError::EvaluationFailed {
+                param_name: param.code.clone(),
+                expression: param.expression.clone(),
+                error: "evaluating the expression panicked".to_string(),
+            })
+        })
+    }
+
+    fn extract_for_param_unguarded(
         &self,
         resource: &Value,
         context: &EvaluationContext,
@@ -2149,6 +2172,53 @@ mod tests {
 
     fn create_test_extractor() -> SearchParameterExtractor {
         create_test_extractor_for(FhirVersion::R4)
+    }
+
+    /// A tenant SearchParameter whose expression overflows (a decimal product
+    /// past the range, which used to panic in the evaluator) is recorded as a
+    /// failure, and the resource's other parameters are still extracted.
+    #[test]
+    fn an_overflowing_parameter_fails_alone() {
+        let extractor = create_test_extractor();
+        for (name, expression) in [
+            ("overflow-test", "79228162514264337593543950335.0 * 2"),
+            ("overflow-test-power", "10.power(40)"),
+        ] {
+            extractor
+                .registry
+                .write()
+                .register(
+                    SearchParameterDefinition::new(
+                        format!("http://example.org/{name}"),
+                        name,
+                        SearchParamType::Number,
+                        expression,
+                    )
+                    .with_base(vec!["Patient"]),
+                )
+                .unwrap();
+        }
+        let resource = json!({
+            "resourceType": "Patient", "id": "p", "name": [{"family": "Kept"}]
+        });
+        let extraction = extractor
+            .extract_with_missing(&resource, "Patient")
+            .unwrap();
+        assert!(
+            extraction
+                .failures
+                .iter()
+                .any(|failure| failure.code == "overflow-test"),
+            "{:?}",
+            extraction.failures
+        );
+        assert!(
+            extraction
+                .values
+                .iter()
+                .any(|value| value.param_name == "family"),
+            "the other parameters are still extracted"
+        );
     }
 
     #[test]
