@@ -381,7 +381,7 @@ Options:
 | `HTS_DATABASE_URL` | ./data/hts.db | SQLite database file path |
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` or `postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
-| `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+| `HTS_CORS_ORIGINS` | * | Allowed CORS origins. A write (`POST /import`, resource create, update or delete, `$closure`) sent by a page on another origin is refused with `403` unless its origin is listed here explicitly; `*` lists none. Reads and non-browser clients are not affected. |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
