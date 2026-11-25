@@ -42,6 +42,19 @@ test("a deep link loads the history straight away", async ({ history, request })
   await expect(history.versions).toHaveCount(2);
 });
 
+test("a deep link that is not a type and an id fetches nothing", async ({ page }) => {
+  const fetched: string[] = [];
+  page.on("request", (r) => {
+    if (r.resourceType() === "fetch") fetched.push(r.url());
+  });
+  const type = encodeURIComponent("/example.invalid/x");
+  await page.goto(`/ui/history?type=${type}&id=y`, { waitUntil: "networkidle" });
+  await expect(page.locator("#history-diff .history__empty")).toBeVisible();
+  expect(fetched.filter((u) => u.includes("example.invalid") || u.includes("_history"))).toEqual(
+    [],
+  );
+});
+
 test("the 'show metadata' checkbox re-renders the diff with the metadata flag", async ({
   page,
   history,

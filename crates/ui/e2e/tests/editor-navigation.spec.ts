@@ -345,3 +345,14 @@ test("standalone format-only raw edit cannot bypass a failed unapplied guided mu
   await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
   expect(writes).toBe(0);
 });
+
+test("an editor link that is not a type and an id fetches nothing", async ({ page }) => {
+  const fetched: string[] = [];
+  page.on("request", (r) => {
+    if (r.resourceType() === "fetch") fetched.push(r.url());
+  });
+  const type = encodeURIComponent("/example.invalid/x");
+  await page.goto(`/ui/editor?type=${type}&id=y`, { waitUntil: "networkidle" });
+  await expect(page.locator("#editor-status")).toHaveClass(/editor__status--error/);
+  expect(fetched.filter((u) => u.includes("example.invalid"))).toEqual([]);
+});
