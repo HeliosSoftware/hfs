@@ -46,7 +46,10 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{AppState, ExpandCacheKey, ExpandHandlerCache, NOT_FOUND_CACHE_MAX};
+use crate::state::{
+    AppState, CACHE_MAX_KEY_BYTES, ExpandCacheKey, ExpandHandlerCache, NOT_FOUND_CACHE_MAX,
+    NotFoundCache,
+};
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -1454,11 +1457,26 @@ fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Byt
 }
 
 /// Insert a successfully-built `$expand` response into the per-AppState cache.
-/// Drops new entries silently once the cache reaches
-/// [`EXPAND_HANDLER_CACHE_MAX`].
+/// The entry is dropped silently when the cache refuses it: see
+/// [`crate::state::BoundedCache::insert`].
 fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
     if let Ok(mut guard) = cache.write() {
         guard.insert(key, value);
+    }
+}
+
+/// Remember `url` as a ValueSet that does not exist. Bounded to
+/// [`NOT_FOUND_CACHE_MAX`] entries; a URL above [`CACHE_MAX_KEY_BYTES`] is
+/// not remembered, because the caller chooses its length up to the request
+/// body limit.
+fn not_found_url_put(cache: &NotFoundCache, url: &str) {
+    if url.len() > CACHE_MAX_KEY_BYTES {
+        return;
+    }
+    if let Ok(mut neg) = cache.write() {
+        if neg.len() < NOT_FOUND_CACHE_MAX {
+            neg.insert(url.to_string());
+        }
     }
 }
 
@@ -2019,11 +2037,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
                 if msg_names_top {
-                    if let Ok(mut neg) = state.not_found_urls.write() {
-                        if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(url_str.clone());
-                        }
-                    }
+                    not_found_url_put(&state.not_found_urls, url_str);
                 }
             }
             // The IG fixtures format VS-not-found errors as
@@ -4599,6 +4613,25 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn negative_cache_does_not_remember_an_oversized_key() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+
+        let cache: crate::state::NotFoundCache = Arc::new(RwLock::new(HashSet::new()));
+        let at_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES);
+        let over_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES + 1);
+        super::not_found_url_put(&cache, &at_limit.clone());
+        super::not_found_url_put(&cache, &over_limit.clone());
+        let guard = cache.read().unwrap();
+        assert!(
+            guard.contains(&at_limit),
+            "a key at the limit is remembered"
+        );
+        assert!(!guard.contains(&over_limit), "a key above it is not");
+        assert_eq!(guard.len(), 1);
+    }
     use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
