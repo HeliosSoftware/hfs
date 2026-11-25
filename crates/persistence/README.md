@@ -406,6 +406,27 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ‡✓  |
 
+**What `/metadata` lists.** Each resource's `searchParam` list keeps only the parameters the
+configured backend's `SearchProvider::serves_search_param` serves (#2593). For the common `_text`
+and `_content` it follows the Special Parameters rows above. `_filter` is not listed on any
+backend, SQLite included: `/metadata` lists no registered parameter whose code starts with `_`
+other than the common ones.
+
+- SQLite, PostgreSQL and Elasticsearch list `_text` and `_content` but no `special` parameter
+  they build no condition for: `Location.near`, and from R5 `Location.contains` and
+  `Composition.section-text`. A search for one answers `400`.
+- MongoDB lists no `special` parameter except `_list`: `_text` and `_content` answer `501` (the
+  ○ cells above), and `near`, `contains` and `section-text` answer `400`.
+- `_list`, and from R5 `_in`, are listed wherever the backend serves `_id`: the REST layer
+  resolves both into an `_id` filter before the backend runs.
+- A composite parameter is listed only when each of its components is in the registry and
+  served. So no backend lists `Composition.section-code-text` (R5 and later), whose
+  `section-text` component no backend evaluates, nor the R5 and R6 composites whose component
+  definitions the spec bundles do not publish (`Ingredient.strength-concentration-ratio` in
+  both, `ResearchStudy.progress-status-state-actual` in R5 only, ...; #2774 lists them).
+- A composite backend answers for the backend its search reaches, so `sqlite-elasticsearch`
+  follows Elasticsearch.
+
 **Notes on partial cells:**
 
 - **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
@@ -2857,7 +2878,7 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] History provider traits (instance, type, system)
 - [x] Search provider traits (basic, chained, \_include, terminology)
 - [x] Transaction traits (ACID, bundles)
-- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
+- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `SearchProvider::serves_search_param`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
 
 ### Phase 3: Tenant Isolation
 

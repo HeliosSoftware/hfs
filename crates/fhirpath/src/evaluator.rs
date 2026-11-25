@@ -6714,7 +6714,7 @@ fn call_function(
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
         "section" | "entry" | "entryIn" | "resources" | "resourcesIn" | "sameSubject"
-        | "hasCoding" => {
+        | "isKnown" | "hasData" | "hasCoding" => {
             // FHIR document functions: an extension of the HL7 Java reference
             // implementation, not FHIRPath or the FHIR specification. See
             // document_functions.rs.
@@ -6976,6 +6976,8 @@ fn call_function(
                 "resources",
                 "resourcesIn",
                 "sameSubject",
+                "isKnown",
+                "hasData",
                 "hasCoding",
                 "sum",
                 "min",
