@@ -7,6 +7,11 @@ use crate::parser::Expression;
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 use std::collections::HashSet;
 
+/// Most items `repeat()` may produce, as for `repeatAll()`. A projection that
+/// derives a new value from every item (`$this + 1`) never reaches a round
+/// without new items, so without a bound the loop would not end.
+const MAX_ITEMS: usize = 10_000;
+
 /// Implements the FHIRPath repeat() function
 ///
 /// The repeat() function repeatedly applies a projection to a collection and
@@ -75,6 +80,11 @@ pub fn repeat_function(
 
                 // Only add items we haven't seen before
                 if !seen_items.contains(&item_key) {
+                    if result.len() >= MAX_ITEMS {
+                        return Err(EvaluationError::InvalidArgument(format!(
+                            "repeat() exceeded safety limit of {MAX_ITEMS} items"
+                        )));
+                    }
                     // Add to result
                     result.push(projected_item.clone());
                     // Add to items to process in next iteration
