@@ -62,11 +62,14 @@ with `HFS_S3_SYSTEM_BUCKET` set. Bucket-per-tenant with no system bucket returns
 sessions in process.
 
 ² The ViewDefinition runner is in-DB (SQL or an aggregation pipeline) on the
-non-S3 backends. A SQL Query or SQL View subject is different: each of its
-dependencies is first materialized into an embedded per-request SQLite by this
-runner, and the query's joins and `WHERE` then run in that SQLite, on every
-backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
-applies to that materialization.
+non-S3 backends. A SQL Query or SQL View subject runs inside the primary
+database on the SQLite and PostgreSQL backends (one read-only statement over
+the compiled views, in that database's SQL dialect, nothing materialized). On
+MongoDB and S3, which have no SQL engine, each dependency is first materialized
+into an embedded per-request SQLite by this runner, and the query's joins and
+`WHERE` then run in that SQLite; the per-dependency row cap
+(`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`) applies to that materialization
+only.
 
 ³ Same expectations as the `s3` row, plus: the tenants named in
 `HFS_S3_TENANT_BUCKETS` appear on `/ui/tenants` and `GET /admin/tenants` after
@@ -1234,8 +1237,9 @@ reaches **Complete**; the files parse in their declared format with the stated c
 row counts; 7.e cancels; 7.f and 7.l are rejected; the subjects table controls,
 Run again / Retry / Remove / Copy job id, and the restart behave as described. This step is expected to
 pass on **all eight backends**. The ViewDefinition runner is in-DB on
-SQLite/Postgres/Mongo and in-process on S3; SQL Query joins run in embedded SQLite
-on every backend, after each dependency has been materialized.
+SQLite/Postgres/Mongo and in-process on S3; SQL Query joins run inside the primary
+database on SQLite and Postgres, and in embedded SQLite on Mongo and S3, after each
+dependency has been materialized.
 
 ---
 
