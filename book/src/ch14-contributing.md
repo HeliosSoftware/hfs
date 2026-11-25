@@ -48,7 +48,7 @@
 1. Implement `ResourceStorage` as the baseline (CRUD operations, TenantContext required for every call)
 2. Optionally implement `VersionedStorage`, `SearchProvider`, `TransactionProvider` for additional capabilities
 3. Register the backend in `CompositeStorage` if it can be combined with other backends
-4. Answer what the backend really serves through the per-capability methods the CapabilityStatement is built from: `SearchProvider::supports_search` (keep the default `true` only if `search` is implemented; a backend whose `search` returns `UnsupportedCapability` overrides it, as S3 does from its declared `BackendCapability` list), `ConditionalStorage::supports_conditional`, and `BundleProvider::supports_atomic_transactions`
+4. Answer what the backend really serves through the per-capability methods the CapabilityStatement is built from: `SearchProvider::supports_search` (keep the default `true` only if `search` is implemented; a backend whose `search` returns `UnsupportedCapability` overrides it, as S3 does from its declared `BackendCapability` list), `SearchProvider::serves_search_param` (default `true`; answer `false` for each parameter `search` refuses, and `/metadata` drops it from `searchParam`, and from `searchInclude`/`searchRevInclude` for a reference parameter), `ConditionalStorage::supports_conditional`, and `BundleProvider::supports_atomic_transactions`
 
 ---
 
