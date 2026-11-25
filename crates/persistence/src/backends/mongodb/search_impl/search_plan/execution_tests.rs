@@ -2076,19 +2076,30 @@ async fn capped_predicates_are_counted_in_full_to_choose_the_driver() {
     assert_eq!(
         (facts.requests, facts.reuses),
         (4, 0),
-        "two bounded probes and two full counts"
+        "two bounded probes, one full count and one count up to it"
     );
-    for (filter, rows) in filters.iter().zip([status_rows, code_rows]) {
+    // #2601: the later predicate is counted only up to one row past the
+    // smallest count, which proves it is not smaller; it is never recorded as
+    // a full count.
+    for (filter, limit, rows) in [
+        (&filters[0], FULL_COUNT, status_rows),
+        (&filters[1], status_rows + 1, status_rows + 1),
+    ] {
         let key = ProbeFacts::key(
             &fixture.db,
             &filter.filter,
             None,
-            FULL_COUNT,
+            limit,
             Some(fixture.backend.probe_timeout()),
         )
         .unwrap();
         assert_eq!(facts.peek(&key), Some(Some(rows)));
     }
+    let code_full = ProbeKey::full_count(filters[1].probe_key.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        fixture.backend.probe_cache.get(&code_full),
+        Some(ProbeEstimate::AtLeast(status_rows + 1))
+    );
     let again = plan(&fixture, &filters, &mut facts).await;
     assert_eq!(driver_name(&again), "status");
     assert_eq!((facts.requests, facts.reuses), (4, 4));
@@ -2103,8 +2114,25 @@ async fn capped_predicates_are_counted_in_full_to_choose_the_driver() {
     );
     let mut reversed = filters.clone();
     reversed.reverse();
-    let reverse_plan = plan(&fixture, &reversed, &mut ProbeFacts::default()).await;
+    fixture.backend.probe_cache.clear();
+    let mut reverse_facts = ProbeFacts::default();
+    let reverse_plan = plan(&fixture, &reversed, &mut reverse_facts).await;
     assert_eq!(driver_name(&reverse_plan), "status");
+    // Counted first, `code` is counted in full; `status` stays under its limit.
+    for (filter, limit, rows) in [
+        (&reversed[0], FULL_COUNT, code_rows),
+        (&reversed[1], code_rows + 1, status_rows),
+    ] {
+        let key = ProbeFacts::key(
+            &fixture.db,
+            &filter.filter,
+            None,
+            limit,
+            Some(fixture.backend.probe_timeout()),
+        )
+        .unwrap();
+        assert_eq!(reverse_facts.peek(&key), Some(Some(rows)));
+    }
     for total in [TotalMode::None, TotalMode::Accurate] {
         for parameters in [
             parameters.to_vec(),
@@ -2204,7 +2232,11 @@ async fn capped_page_planning_requires_complete_cached_counts_and_never_counts()
         )
         .await
         .unwrap();
-        let expected = if matches!(second, Some(ProbeEstimate::Completed(_))) {
+        // A lower bound past the first count (#2601) settles the choice too.
+        let expected = if matches!(
+            second,
+            Some(ProbeEstimate::Completed(_) | ProbeEstimate::AtLeast(10_001))
+        ) {
             "status"
         } else {
             "code"

@@ -1662,13 +1662,21 @@ async fn count_capped_predicates(
     let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
     let started = tokio::time::Instant::now();
     let mut completed = Vec::with_capacity(filters.len());
+    // The smallest exact count so far. A later predicate only needs counting
+    // up to one row past it: reaching that limit proves it is not smaller, and
+    // the first predicate still wins a tie. The choice is the one full counts
+    // make, for at most twice the smallest count instead of the sum of all
+    // (#2601: 706k keys to pick a 17k-row driver). A count stopped at its
+    // limit is a lower bound, kept as `AtLeast` and never as a full count.
+    let mut smallest: Option<u64> = None;
     for filter in filters {
+        let limit = smallest.map_or(FULL_COUNT, |smallest| smallest + 1);
         // Use the configured budget in the key so observations remain reusable.
         let key = ProbeFacts::key(
             db,
             &filter.filter,
             filter.hint(),
-            FULL_COUNT,
+            limit,
             Some(probe_timeout),
         );
         let cache_key = filter.probe_key.as_ref().and_then(ProbeKey::full_count);
@@ -1677,6 +1685,10 @@ async fn count_capped_predicates(
             match estimate {
                 ProbeEstimate::Completed(count) => Some(Some(count)),
                 ProbeEstimate::Unknown => Some(None),
+                // A known lower bound past the smallest count settles it.
+                ProbeEstimate::AtLeast(rows) if smallest.is_some_and(|s| rows > s) => {
+                    Some(Some(rows))
+                }
                 ProbeEstimate::AtLeast(_) => None,
             }
         });
@@ -1693,9 +1705,12 @@ async fn count_capped_predicates(
                 }
                 facts.requests += 1;
                 let operation = |hint| {
-                    let count = index
+                    let mut count = index
                         .count_documents(filter.filter.clone())
                         .max_time(remaining);
+                    if limit != FULL_COUNT {
+                        count = count.limit(limit);
+                    }
                     match hint {
                         Some(hint) => count.hint(hint),
                         None => count,
@@ -1727,6 +1742,9 @@ async fn count_capped_predicates(
                     cache.insert(
                         cache_key,
                         match count {
+                            Some(count) if limit != FULL_COUNT && count >= limit => {
+                                ProbeEstimate::AtLeast(count)
+                            }
                             Some(count) => ProbeEstimate::Completed(count),
                             None => ProbeEstimate::Unknown,
                         },
@@ -1741,6 +1759,9 @@ async fn count_capped_predicates(
         let Some(count) = count else {
             return Ok(None);
         };
+        if smallest.is_none_or(|smallest| count < smallest) {
+            smallest = Some(count);
+        }
         completed.push(Some(count));
     }
     let driver = smallest_counted(&completed);
