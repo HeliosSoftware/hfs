@@ -749,3 +749,36 @@ async fn a_session_without_a_tenant_claim_is_confined_to_the_default_tenant() {
     let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=acme").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// A session whose access token the provider does not accept has no verified
+/// tenant. It is not shown the default tenant's process-held figures: the
+/// Home dashboard and the subscription inventory refuse it, while a page whose
+/// data comes through the API still renders (and the API answers it `401`).
+#[tokio::test]
+async fn a_session_with_an_unverified_token_reads_no_tenant_state() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions) = tenant_app("user/*.cruds", Some("acme")).await;
+    let mut session = seeded_session(&sessions);
+    session.access_token = "a-token-the-provider-refuses".to_string();
+    sessions.insert(session);
+
+    for page in ["/ui", "/ui/subscriptions"] {
+        let (status, body) = signed_in_body(&router, "GET", page, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+        assert!(
+            body.contains("could not verify the access token"),
+            "{page}: {body}"
+        );
+    }
+    let (status, _) = signed_in_body(&router, "GET", "/ui/resources", "").await;
+    assert_eq!(status, StatusCode::OK, "self-call pages still render");
+
+    let (status, options) = signed_in_body(&router, "GET", "/ui/tenant/options", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !options.contains("acme") && !options.contains("beta"),
+        "{options}"
+    );
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=acme").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

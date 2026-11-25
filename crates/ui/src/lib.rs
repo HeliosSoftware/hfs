@@ -303,6 +303,24 @@ pub(crate) struct RequestTenant {
     /// tenant, because it is the same per-request rendering context the
     /// topbar draws from.
     pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
+    /// The session's token was not accepted by the provider
+    /// (`login::Unverified`), so `id` is not backed by a verified claim and
+    /// nothing may be read for it from process state: see
+    /// [`RequestTenant::live_counts`].
+    pub(crate) unverified: bool,
+}
+
+impl RequestTenant {
+    /// The tenant's live per-type figures for a type rail, read from process
+    /// state. `None` for a session with no verified tenant, so the rail
+    /// renders without counts instead of with the default tenant's.
+    pub(crate) async fn live_counts(&self) -> Option<DashboardSnapshot> {
+        if self.unverified {
+            return None;
+        }
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &self.id, &[], false)
+            .await
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -324,14 +342,11 @@ where
                 display: None,
                 multi: false,
                 signed_in: None,
+                unverified: false,
             }))
     }
 }
 
-/// Middleware: stamps [`RequestVersion`] and [`RequestTenant`] from the user's
-/// stored settings â€” one settings read per page load, the documented cost model
-/// of that store â€” falling back to the server defaults. A stored tenant that is
-/// no longer provisioned falls back too, keeping the provisioned-only model.
 /// The tenant a signed-in principal is bound to: its token's tenant claim,
 /// else the server default. Without a login installed there is no principal
 /// to bind, and the default applies.
@@ -371,6 +386,10 @@ fn tenant_allowed(
     }
 }
 
+/// Middleware: stamps [`RequestVersion`] and [`RequestTenant`] from the user's
+/// stored settings â€” one settings read per page load, the documented cost model
+/// of that store â€” falling back to the server defaults. A stored tenant that is
+/// no longer provisioned falls back too, keeping the provisioned-only model.
 async fn resolve_prefs(
     State(state): State<WebState>,
     mut request: axum::extract::Request,
@@ -395,12 +414,14 @@ async fn resolve_prefs(
         .extensions()
         .get::<login::SignedIn>()
         .map(|s| s.0.clone());
+    let unverified = request.extensions().get::<login::Unverified>().is_some();
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
         id: claimed_tenant(&state, principal.as_ref()),
         display: None,
         multi: false,
         signed_in: signed_in.clone(),
+        unverified,
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -429,6 +450,7 @@ async fn resolve_prefs(
                 display: record.display_name,
                 multi: false,
                 signed_in: signed_in.clone(),
+                unverified,
             };
         }
     }
@@ -2031,6 +2053,12 @@ pub fn mount_with_conformance_source_and_runtime(
             state.clone(),
             login::require_system_scope,
         ))
+        // A session whose token the provider did not accept has no verified
+        // tenant, so the pages that read a tenant's figures from process
+        // state refuse it rather than fall back to the default tenant.
+        // Inside the locale layer so the refusal is worded in the request's
+        // language.
+        .layer(middleware::from_fn(login::refuse_unverified_tenant_reads))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -2909,9 +2937,7 @@ async fn search(
     let selected_type = explicit_type
         .map(str::to_string)
         .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
+    let live = rt.live_counts().await;
     let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/search",
@@ -3014,9 +3040,7 @@ async fn resources(
     } else {
         i18n.t_arg("resources-create-typed", "type", selected_type.clone())
     };
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
+    let live = rt.live_counts().await;
     let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/resources",
