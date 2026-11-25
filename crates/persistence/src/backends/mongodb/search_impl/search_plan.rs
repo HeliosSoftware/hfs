@@ -11,7 +11,7 @@ use super::super::search_index_catalog::{SEARCH_DATE_END_INDEX, SEARCH_DATE_RANG
 use super::collect_documents;
 use super::search_access::{
     CandidateSource, CompositeMembership, IndexAccess, PredicateAccess, aggregate_membership,
-    date_hint_rejected, matching_index_ids, membership_pipeline, with_hint_fallback,
+    date_hint_rejected, liveness_hint, matching_index_ids, membership_pipeline, with_hint_fallback,
 };
 
 use super::{
@@ -3908,22 +3908,26 @@ impl BatchedIndexPlan {
         };
         let candidates = ids.len();
         let live_filter = doc! { "$and": [resource_filter.clone(), { "id": { "$in": ids } }] };
-        // The batch bounds `id`, so the identity index answers with one seek
-        // per candidate. Left to itself the planner can choose the type-scan
+        // The batch bounds `id`, so an id-led index answers with one seek per
+        // candidate. Left to itself the planner can choose the type-scan
         // index, whose `last_updated` key sits before `id`, and walk every
         // live row of the type to find a batch of old resources; it did so in
-        // 329 of 467 unhinted counts and pages (#2601).
-        let identity = || Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned());
+        // 329 of 467 unhinted counts and pages (#2601). The liveness index
+        // holds `is_deleted` before `id`, so the check reads no document;
+        // a rejected hint runs again on the identity index.
         if count_only {
             // Seed IDs are globally deduplicated and resource identity is
             // unique within tenant/type. Count live matches server-side;
             // returning their IDs would add transfer without new information.
-            result.count += resources
-                .count_documents(live_filter)
-                .search_deadline()?
-                .hint(identity())
-                .await
-                .or_query_error("Failed to count live candidates")?;
+            result.count += with_hint_fallback(liveness_hint(), |hint| {
+                let count = resources.count_documents(live_filter.clone());
+                match hint {
+                    Some(hint) => count.hint(hint),
+                    None => count,
+                }
+            })
+            .await?
+            .or_query_error("Failed to count live candidates")?;
             return Ok(false);
         }
         if let BatchSelection::PageAndCount {
@@ -3946,19 +3950,23 @@ impl BatchedIndexPlan {
                 doc! { "$sort": { "id": *direction } },
                 doc! { "$limit": limit },
             ]);
-            let mut cursor = resources
-                .aggregate(vec![
-                    doc! { "$match": live_filter },
-                    doc! { "$project": { "_id": 0, "id": 1 } },
-                    doc! { "$facet": {
-                        "total": [{ "$count": "n" }],
-                        "page": page_stages,
-                    } },
-                ])
-                .search_deadline()?
-                .hint(identity())
-                .await
-                .or_query_error("Failed to count and select live candidates")?;
+            let pipeline = vec![
+                doc! { "$match": live_filter },
+                doc! { "$project": { "_id": 0, "id": 1 } },
+                doc! { "$facet": {
+                    "total": [{ "$count": "n" }],
+                    "page": page_stages,
+                } },
+            ];
+            let mut cursor = with_hint_fallback(liveness_hint(), |hint| {
+                let aggregate = resources.aggregate(pipeline.clone());
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await?
+            .or_query_error("Failed to count and select live candidates")?;
             let facet = cursor
                 .try_next()
                 .await
@@ -3978,14 +3986,18 @@ impl BatchedIndexPlan {
                 .collect::<StorageResult<Vec<_>>>()?;
             return Ok(false);
         }
-        let mut cursor = resources
-            .find(live_filter)
-            .search_deadline()?
-            .projection(doc! { "_id": 0, "id": 1 })
-            .hint(identity())
-            .batch_size(super::in_reply_rows(candidates))
-            .await
-            .or_query_error("Failed to validate live candidates")?;
+        let mut cursor = with_hint_fallback(liveness_hint(), |hint| {
+            let find = resources
+                .find(live_filter.clone())
+                .projection(doc! { "_id": 0, "id": 1 })
+                .batch_size(super::in_reply_rows(candidates));
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();
         while cursor
             .advance()

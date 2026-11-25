@@ -3,6 +3,7 @@
 //! Callers choose candidates, ordering and totals. This module chooses indexes,
 //! bounds membership to those candidates and applies operation-specific retries.
 
+use super::super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_LIVENESS_INDEX};
 use super::super::search_deadline::{self, SearchCommand};
 use super::super::search_index_catalog::{
     SEARCH_COMPOSITE_INDEX, SEARCH_DATE_END_INDEX, SEARCH_DATE_RANGE_INDEX,
@@ -240,11 +241,34 @@ pub(super) fn date_hint_rejected(hint: &Option<Hint>, error: &mongodb::error::Er
         && hint_rejected(error)
 }
 
+/// The liveness index, hinted by every read that asks which candidate ids
+/// are live (#2601).
+pub(super) fn liveness_hint() -> Option<Hint> {
+    Some(Hint::Name(RESOURCES_LIVENESS_INDEX.to_owned()))
+}
+
+/// The hint to run again with when the server rejects `hint` because its
+/// index is missing, or `None` when the rejection must propagate: no hint
+/// for a date index, the required identity index for the liveness index.
+fn fallback_for_rejected(
+    hint: &Option<Hint>,
+    error: &mongodb::error::Error,
+) -> Option<Option<Hint>> {
+    if date_hint_rejected(hint, error) {
+        return Some(None);
+    }
+    (*hint == liveness_hint() && hint_rejected(error))
+        .then(|| Some(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())))
+}
+
 /// Runs `operation` with `hint`. When the hint names a date index and
 /// the server rejects it because the index is gone, which happens on a node
 /// still hinting a superseded value index that a newer node has dropped
-/// (rolling upgrade), runs the operation once more without it. The identity
-/// index is required, so a rejection of that hint propagates.
+/// (rolling upgrade), runs the operation once more without it. A rejected
+/// liveness hint (an index dropped by hand, or a store that has not booted
+/// this build) runs once more on the identity index, which reads the same
+/// ids with a fetch. The identity index is required, so a rejection of that
+/// hint propagates.
 ///
 /// Not an `async fn`: `#[track_caller]` has no effect on one, and the command
 /// is tagged with the line that called this helper, not with a line in here.
@@ -262,11 +286,11 @@ where
             // Build a fresh command budget for the unhinted retry as well.
             let result = operation(hint.clone()).search_deadline_at(site)?.await;
             if let Err(error) = &result
-                && date_hint_rejected(&hint, error)
+                && let Some(fallback) = fallback_for_rejected(&hint, error)
             {
                 search_deadline::check()?;
-                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-                hint = None;
+                tracing::warn!(error = %error, ?hint, ?fallback, "Hinted index is missing; running again");
+                hint = fallback;
                 continue;
             }
             return Ok(result);
@@ -625,6 +649,41 @@ mod tests {
         for hint in [None, Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))] {
             assert!(!date_hint_rejected(&hint, &command_error(2, missing)));
         }
+    }
+
+    /// #2601: a rejected liveness hint runs again on the identity index, a
+    /// rejected date hint unhinted; any other rejection propagates.
+    #[test]
+    fn rejected_hints_fall_back_by_index() {
+        let command_error = |code, message| {
+            let command: mongodb::error::CommandError =
+                mongodb::bson::from_document(doc! {"code": code, "errmsg": message}).unwrap();
+            mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command))
+        };
+        let missing = command_error(2, "hint provided does not correspond to an existing index");
+        let identity = Some(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()));
+        assert_eq!(
+            fallback_for_rejected(&liveness_hint(), &missing),
+            Some(identity.clone())
+        );
+        assert_eq!(
+            fallback_for_rejected(
+                &Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned())),
+                &missing
+            ),
+            Some(None)
+        );
+        for hint in [
+            identity,
+            None,
+            Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+        ] {
+            assert_eq!(fallback_for_rejected(&hint, &missing), None, "{hint:?}");
+        }
+        assert_eq!(
+            fallback_for_rejected(&liveness_hint(), &command_error(2, "invalid query")),
+            None
+        );
     }
 
     #[test]

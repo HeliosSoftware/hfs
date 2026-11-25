@@ -46,7 +46,9 @@ const DEFAULT_PAGE_SIZE: u32 = 100;
 
 mod search_access;
 mod search_plan;
-use search_access::{CandidateSource, PredicateAccess, matching_index_ids, with_hint_fallback};
+use search_access::{
+    CandidateSource, PredicateAccess, liveness_hint, matching_index_ids, with_hint_fallback,
+};
 pub(super) use search_plan::DEFAULT_PROBE_TIMEOUT_MS;
 use search_plan::{
     BatchSelection, NoTotalPagePolicy, PageTotalExecution, ProbeFacts, SearchFilterPlan,
@@ -4164,19 +4166,25 @@ impl MongoBackend {
             None,
         )?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let mut find = resources
-            .find(filter)
-            .search_deadline()?
-            .projection(doc! { "_id": 0, "id": 1 })
-            .limit(result_id_cap() as i64 + 1);
-        if let Some(ids) = matched_ids {
-            // One reply for the whole `$in` instead of 101 rows and a getMore
-            // (#2601: one extra command per liveness batch).
-            find = find.batch_size(in_reply_rows(ids.len()));
-        }
-        let cursor = find
-            .await
-            .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
+        // With ids to check, one reply for the whole `$in` instead of 101 rows
+        // and a getMore, read from the keys of the liveness index (#2601).
+        let batch = matched_ids.map(|ids| in_reply_rows(ids.len()));
+        let hint = matched_ids.and_then(|_| liveness_hint());
+        let cursor = with_hint_fallback(hint, |hint| {
+            let mut find = resources
+                .find(filter.clone())
+                .projection(doc! { "_id": 0, "id": 1 })
+                .limit(result_id_cap() as i64 + 1);
+            if let Some(batch) = batch {
+                find = find.batch_size(batch);
+            }
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
         let ids = collect_id_set(cursor, "id").await?;
         if ids.len() > result_id_cap() {
             return Err(StorageError::Search(SearchError::TooManyResults {
@@ -5359,23 +5367,31 @@ impl MongoBackend {
             return Ok(Some(window.into_iter().skip(offset).take(take).collect()));
         }
 
-        let mut cursor = db
-            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
-            .find(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "is_deleted": false,
-            })
-            .search_deadline()?
-            .projection(doc! { "_id": 0, "id": 1 })
-            .sort(doc! { "id": match id_direction {
-                SortDirection::Ascending => 1,
-                SortDirection::Descending => -1,
-            } })
-            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
-            .batch_size(CANDIDATE_BATCH_SIZE as u32)
-            .await
-            .or_query_error("Failed to open the unkeyed resource cursor")?;
+        // Live ids in id order straight from the liveness index's keys
+        // (#2601); the identity index fetched each document for `is_deleted`.
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let live_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+        let order = match id_direction {
+            SortDirection::Ascending => 1,
+            SortDirection::Descending => -1,
+        };
+        let mut cursor = with_hint_fallback(liveness_hint(), |hint| {
+            let find = resources
+                .find(live_filter.clone())
+                .projection(doc! { "_id": 0, "id": 1 })
+                .sort(doc! { "id": order })
+                .batch_size(CANDIDATE_BATCH_SIZE as u32);
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to open the unkeyed resource cursor")?;
         loop {
             let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
             let docs_read = batch.len();
@@ -6494,19 +6510,24 @@ impl MongoBackend {
         let mut live = HashSet::new();
         for chunk in sorted.chunks(SORT_ID_CHUNK) {
             let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
-            let cursor = resources
-                .find(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "is_deleted": false,
-                    "id": { "$in": Bson::Array(ids) },
-                })
-                .search_deadline()?
-                .projection(doc! { "_id": 0, "id": 1 })
-                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
-                .batch_size(in_reply_rows(chunk.len()))
-                .await
-                .or_query_error("Failed to check candidate liveness")?;
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "id": { "$in": Bson::Array(ids) },
+            };
+            let cursor = with_hint_fallback(liveness_hint(), |hint| {
+                let find = resources
+                    .find(filter.clone())
+                    .projection(doc! { "_id": 0, "id": 1 })
+                    .batch_size(in_reply_rows(chunk.len()));
+                match hint {
+                    Some(hint) => find.hint(hint),
+                    None => find,
+                }
+            })
+            .await?
+            .or_query_error("Failed to check candidate liveness")?;
             live.extend(collect_id_set(cursor, "id").await?);
         }
         Ok(live)

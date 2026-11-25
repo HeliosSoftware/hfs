@@ -826,6 +826,84 @@ async fn batch_modes_preserve_repeated_filters_global_totals_and_live_cursor_pag
     fixture.close().await;
 }
 
+/// #2601: the live-id reads of a candidate batch hint the liveness index and
+/// answer the same counts and pages through the identity index when that
+/// index is gone (dropped by hand, or a store this build has not booted).
+#[tokio::test]
+async fn liveness_reads_fall_back_to_the_identity_index_with_the_same_answers() {
+    let Some(mut fixture) = Fixture::new("liveness-fallback", 300).await else {
+        return;
+    };
+    fixture.mark_deleted(10, 40).await;
+    let resources = fixture.db.collection::<Document>("resources");
+    let liveness = super::super::super::schema::RESOURCES_LIVENESS_INDEX;
+    let plan = batched_plan(vec![predicate("status", "final")]);
+    let live_final = fixture.expected(true, 1, 0, usize::MAX);
+    let selections = |direction| {
+        [
+            BatchSelection::Count,
+            BatchSelection::PageAndCount {
+                direction,
+                offset: 2,
+                limit: 5,
+                boundary: None,
+            },
+            BatchSelection::Page {
+                direction,
+                offset: 2,
+                limit: 5,
+            },
+        ]
+    };
+    let mut answers = Vec::new();
+    for present in [true, false] {
+        let names = resources.list_index_names().await.unwrap();
+        assert_eq!(names.iter().any(|name| name == liveness), present);
+        let mut round = Vec::new();
+        for direction in [1, -1] {
+            for selection in selections(direction) {
+                let result = plan
+                    .execute(&fixture.db, resource_filter(), None, selection)
+                    .await
+                    .unwrap();
+                round.push((result.count, result.ids));
+            }
+        }
+        let count = round[0].0;
+        assert_eq!(count, live_final.len() as u64, "present={present}");
+        assert_eq!(
+            round[1].1,
+            fixture.expected(true, 1, 2, 5),
+            "present={present}"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .live_ids_among(
+                    &fixture.db,
+                    PLAN_TENANT,
+                    "Observation",
+                    &fixture
+                        .rows
+                        .iter()
+                        .map(|row| row.id.clone())
+                        .collect::<std::collections::HashSet<_>>(),
+                )
+                .await
+                .unwrap()
+                .len(),
+            fixture.expected(false, 1, 0, usize::MAX).len(),
+            "present={present}"
+        );
+        answers.push(round);
+        if present {
+            resources.drop_index(liveness).await.unwrap();
+        }
+    }
+    assert_eq!(answers[0], answers[1]);
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn ordered_short_and_duplicate_windows_replay_complete_live_pages() {
     for (label, count, duplicates) in [("short", 80, 0), ("duplicates", 600, 300)] {

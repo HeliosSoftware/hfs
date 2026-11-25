@@ -2250,8 +2250,13 @@ async fn first_group_reads(db: &mongodb::Database) -> Vec<Document> {
 /// also those whose command the profiler truncated (a `$in` of thousands of
 /// ids), which keeps only the start of the command as text.
 async fn liveness_checks(db: &mongodb::Database) -> usize {
-    let identity = super::super::super::RESOURCES_IDENTITY_INDEX;
-    let truncated_prefix = format!("{{ find: \"resources\", hint: \"{identity}\"");
+    // The liveness index since #2601; the identity index is its fallback.
+    let indexes = [
+        super::super::super::RESOURCES_IDENTITY_INDEX,
+        super::super::super::super::schema::RESOURCES_LIVENESS_INDEX,
+    ];
+    let truncated_prefixes =
+        indexes.map(|index| format!("{{ find: \"resources\", hint: \"{index}\""));
     collect_documents(
         db.collection::<Document>("system.profile")
             .find(doc! { "ns": format!("{}.resources", db.name()), "op": "query" })
@@ -2263,14 +2268,21 @@ async fn liveness_checks(db: &mongodb::Database) -> usize {
     .iter()
     .filter_map(|entry| entry.get_document("command").ok())
     .filter(|command| {
-        (command.get_str("hint") == Ok(identity)
+        // `resource_level_ids` is limited to the id cap; it is a batch check.
+        (!command.contains_key("limit")
+            && command
+                .get_str("hint")
+                .is_ok_and(|hint| indexes.contains(&hint))
             && command
                 .get_document("filter")
                 .and_then(|filter| filter.get_document("id"))
                 .is_ok_and(|id| id.contains_key("$in")))
-            || command
-                .get_str("$truncated")
-                .is_ok_and(|text| text.starts_with(&truncated_prefix) && text.contains("$in"))
+            || command.get_str("$truncated").is_ok_and(|text| {
+                truncated_prefixes
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix.as_str()))
+                    && text.contains("$in")
+            })
     })
     .count()
 }
@@ -3219,16 +3231,17 @@ async fn sort_key_getmores(db: &mongodb::Database, parameter: &str) -> usize {
         .count()
 }
 
-/// The walk's checks of its batches (`resource_level_ids`): unhinted finds
-/// on `resources`, projected to the id, whose filter holds an id `$in`; the
-/// page's read of its resources is not projected.
+/// The walk's checks of its batches (`resource_level_ids`): finds on
+/// `resources`, projected to the id and limited to the id cap, whose filter
+/// holds an id `$in` (hinted to the liveness index since #2601); the page's
+/// read of its resources is not projected.
 async fn walk_batch_checks(db: &mongodb::Database) -> usize {
     collect_documents(
         db.collection::<Document>("system.profile")
             .find(doc! {
                 "ns": format!("{}.resources", db.name()),
                 "op": "query",
-                "command.hint": { "$exists": false },
+                "command.limit": { "$exists": true },
                 "command.projection.id": 1,
             })
             .await
