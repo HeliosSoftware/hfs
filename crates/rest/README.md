@@ -1022,6 +1022,16 @@ Likewise `search-type` and the `searchParam`, `searchInclude` and
 every search `501`, and its `/metadata` lists none of them. A composite answers
 for the provider its search reaches, so `s3-elasticsearch` advertises search.
 
+Where the storage searches, `searchParam` lists only the parameters it serves
+(`SearchProvider::serves_search_param`, #2593), the common `_text` and
+`_content` included, and `searchInclude` / `searchRevInclude` drop each
+`Type:code` whose reference parameter it does not serve. `_list` and `_in`,
+which this layer resolves into an `_id` filter, are listed where the storage
+serves `_id`. A composite is listed only when each of its components is in the
+registry and served. No backend evaluates `Location.near` (or, from R5,
+`Location.contains` and `Composition.section-text`), so none lists them, and
+MongoDB, which answers `_text` and `_content` with `501`, lists neither.
+
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
