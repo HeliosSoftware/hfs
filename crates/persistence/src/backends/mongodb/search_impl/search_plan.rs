@@ -3885,6 +3885,7 @@ impl BatchedIndexPlan {
             }
             _ => false,
         };
+        let candidates = ids.len();
         let live_filter = doc! { "$and": [resource_filter.clone(), { "id": { "$in": ids } }] };
         // The batch bounds `id`, so the identity index answers with one seek
         // per candidate. Left to itself the planner can choose the type-scan
@@ -3961,6 +3962,7 @@ impl BatchedIndexPlan {
             .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
             .hint(identity())
+            .batch_size(super::in_reply_rows(candidates))
             .await
             .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();
