@@ -98,6 +98,9 @@ fn server(sessions: Option<Arc<SessionStore>>) -> TestServer {
             "/Patient",
             get(|Extension(principal): Extension<Principal>| async move {
                 principal.subject().to_string()
+            })
+            .post(|Extension(principal): Extension<Principal>| async move {
+                principal.subject().to_string()
             }),
         )
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware));
@@ -151,6 +154,49 @@ async fn a_cross_site_request_never_rides_the_session_cookie() {
         .add_header(SEC_FETCH_SITE, HeaderValue::from_static("cross-site"))
         .await;
     response.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// `SameSite=Lax` sends the cookie on a sibling subdomain's POST; a write
+/// must come from this origin to ride it. Reads are unaffected.
+#[tokio::test]
+async fn a_write_from_a_sibling_site_never_rides_the_session_cookie() {
+    let (store, id) = store_with_session();
+    let server = server(Some(store));
+    let cookie = HeaderValue::from_str(&format!("hfs_session={id}")).unwrap();
+
+    server
+        .post("/Patient")
+        .add_header(COOKIE, cookie.clone())
+        .add_header(SEC_FETCH_SITE, HeaderValue::from_static("same-site"))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    server
+        .post("/Patient")
+        .add_header(COOKIE, cookie.clone())
+        .add_header(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://sibling.example.com"),
+        )
+        .add_header(
+            axum::http::header::HOST,
+            HeaderValue::from_static("hfs.example.com"),
+        )
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    let same_origin = server
+        .post("/Patient")
+        .add_header(COOKIE, cookie.clone())
+        .add_header(SEC_FETCH_SITE, HeaderValue::from_static("same-origin"))
+        .await;
+    same_origin.assert_status(StatusCode::OK);
+    assert_eq!(same_origin.text(), "demo-sub");
+    server
+        .get("/Patient")
+        .add_header(COOKIE, cookie)
+        .add_header(SEC_FETCH_SITE, HeaderValue::from_static("same-site"))
+        .await
+        .assert_status(StatusCode::OK);
 }
 
 #[tokio::test]

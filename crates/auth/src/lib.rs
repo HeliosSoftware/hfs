@@ -55,5 +55,5 @@ pub use scope::{ScopeSet, SmartPermissions};
 pub use session::{
     AccessOutcome, LoginConfig, PENDING_COOKIE, PersistedPending, PersistedSession, SESSION_COOKIE,
     SaveOutcome, Session, SessionPersistence, SessionPrincipal, SessionStore, cookie_value,
-    discover_endpoints, is_cross_site, store_timestamp,
+    discover_endpoints, is_cross_site, is_foreign_write, store_timestamp,
 };
