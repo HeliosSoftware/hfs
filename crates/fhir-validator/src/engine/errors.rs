@@ -250,6 +250,11 @@ pub(crate) fn msg_primitive_type(type_name: &str, json_type: &str) -> String {
     format!("expected {type_name}, got {json_type}")
 }
 
+/// [helios] an integer-class value lies outside the type's range.
+pub(crate) fn msg_primitive_range(type_name: &str, value: i128, min: i64, max: i64) -> String {
+    format!("value {value} is outside the range of {type_name} ({min} to {max})")
+}
+
 /// [helios] a primitive string value failed the type's regex.
 pub(crate) fn msg_primitive_regex(type_name: &str, value: &str) -> String {
     format!("value '{value}' is not a valid {type_name}")

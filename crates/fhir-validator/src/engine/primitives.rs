@@ -81,6 +81,20 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         return;
     }
 
+    if let Some((min, max)) = integer_range(type_name)
+        && let Some(value) = data
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| data.as_u64().map(i128::from))
+        && !(i128::from(min)..=i128::from(max)).contains(&value)
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            errors::msg_primitive_range(type_name, value, min, max),
+        );
+        return;
+    }
+
     if let Some(pattern) = &schema.regex
         && let Some(s) = data.as_str()
         && let Some(re) = compiled(pattern)
@@ -111,6 +125,20 @@ impl JsonClass {
             JsonClass::String => v.is_string(),
         }
     }
+}
+
+/// The range of the 32-bit integer primitives: `integer` is a signed 32-bit
+/// value, `positiveInt` 1 to its maximum and `unsignedInt` 0 to it. A value
+/// past it is invalid FHIR, and the typed model, which stores these as `i32`,
+/// cannot hold it.
+fn integer_range(type_name: &str) -> Option<(i64, i64)> {
+    let max = i64::from(i32::MAX);
+    Some(match type_name {
+        "integer" => (i64::from(i32::MIN), max),
+        "positiveInt" => (1, max),
+        "unsignedInt" => (0, max),
+        _ => return None,
+    })
 }
 
 fn expected_json_class(type_name: &str) -> Option<JsonClass> {
