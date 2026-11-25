@@ -144,6 +144,7 @@ fn write_parsed_bundle(
             Ok(())
         };
         if let Err(error) = ownership {
+            stats.count_owner_refusal(&error);
             stats
                 .errors
                 .push(format!("CodeSystem '{url}' import failed: {error}"));
@@ -179,6 +180,9 @@ fn write_parsed_bundle(
         } else {
             Ok(())
         };
+        if let Err(e) = &ownership {
+            stats.count_owner_refusal(e);
+        }
         if let Err(e) = ownership.and_then(|()| write_value_set(conn, vs, stats)) {
             stats
                 .errors
@@ -198,6 +202,9 @@ fn write_parsed_bundle(
         } else {
             Ok(())
         };
+        if let Err(e) = &ownership {
+            stats.count_owner_refusal(e);
+        }
         if let Err(e) = ownership.and_then(|()| write_concept_map(conn, cm, stats)) {
             stats
                 .errors
@@ -235,16 +242,25 @@ fn write_code_system(
     // letting the second import collide on the primary key and silently get
     // dropped by INSERT OR IGNORE.
     let preferred_id = storage_id_for(&cs.id, cs.version.as_deref());
-    let existing_for_url_version: Option<String> = conn
+    let existing_for_url_version: Option<(String, Option<i32>)> = conn
         .query_row(
-            "SELECT id FROM code_systems \
+            "SELECT id, authority_rank FROM code_systems \
              WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
             rusqlite::params![cs.url, cs.version],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let storage_id = if let Some(id) = existing_for_url_version {
+    if let Some((_, Some(existing_rank))) = &existing_for_url_version {
+        bundle_parser::check_authority(
+            "CodeSystem",
+            &cs.url,
+            cs.version.as_deref(),
+            *existing_rank,
+            cs.authority_rank,
+        )?;
+    }
+    let storage_id = if let Some((id, _)) = existing_for_url_version {
         id
     } else {
         let preferred_taken: bool = conn
@@ -569,16 +585,25 @@ fn write_value_set(
     // existing row for the matching (url, version) or mint a fresh UUID so
     // the second import doesn't silently get dropped by INSERT OR IGNORE.
     let preferred_id = storage_id_for(&vs.id, vs.version.as_deref());
-    let existing_for_url_version: Option<String> = conn
+    let existing_for_url_version: Option<(String, Option<i32>)> = conn
         .query_row(
-            "SELECT id FROM value_sets \
+            "SELECT id, authority_rank FROM value_sets \
              WHERE url = ?1 AND COALESCE(version, '') = COALESCE(?2, '')",
             rusqlite::params![vs.url, vs.version],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let storage_id = if let Some(id) = existing_for_url_version {
+    if let Some((_, Some(existing_rank))) = &existing_for_url_version {
+        bundle_parser::check_authority(
+            "ValueSet",
+            &vs.url,
+            vs.version.as_deref(),
+            *existing_rank,
+            vs.authority_rank,
+        )?;
+    }
+    let storage_id = if let Some((id, _)) = existing_for_url_version {
         id
     } else {
         let preferred_taken: bool = conn

@@ -1375,6 +1375,19 @@ impl SearchProvider for MongoBackend {
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
     }
+
+    /// Every parameter except a `special` one: `build_index_value_filter`
+    /// refuses each, `_text` and `_content` with `501`
+    /// (`TextSearchNotAvailable`) and the rest (`near`, and from R5
+    /// `contains`, `section-text` and `_filter`) with `400`.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        _code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+    }
 }
 
 impl MongoBackend {
@@ -8246,6 +8259,50 @@ mod query_support_tests {
         });
 
         assert!(backend.validate_query_support(&query).is_ok());
+    }
+
+    /// `serves_search_param`, which `/metadata` reads, answers `false` for each
+    /// `special` parameter `build_index_value_filter` refuses (#2593): every one
+    /// the enabled specs register, and `_text` and `_content`, which answer
+    /// `501`.
+    #[test]
+    fn serves_search_param_is_false_for_each_special_parameter_the_filter_refuses() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        for code in crate::core::search::special_search_param_codes() {
+            let served = backend.serves_search_param("Location", &code, SearchParamType::Special);
+            assert!(!served, "{code}");
+            let param = SearchParameter {
+                name: code.clone(),
+                param_type: SearchParamType::Special,
+                values: vec![SearchValue::eq("x")],
+                ..Default::default()
+            };
+            let refused = backend
+                .build_index_value_filter(&param, &param.values[0], &[])
+                .unwrap_err();
+            let expected_501 = matches!(code.as_str(), "_text" | "_content");
+            assert!(
+                matches!(
+                    (&refused, expected_501),
+                    (
+                        StorageError::Search(SearchError::TextSearchNotAvailable),
+                        true
+                    ) | (
+                        StorageError::Search(SearchError::UnsupportedParameterType { .. }),
+                        false
+                    )
+                ),
+                "{code}: {refused:?}"
+            );
+        }
+        for param_type in [
+            SearchParamType::String,
+            SearchParamType::Token,
+            SearchParamType::Reference,
+            SearchParamType::Composite,
+        ] {
+            assert!(backend.serves_search_param("Patient", "x", param_type));
+        }
     }
 
     #[test]

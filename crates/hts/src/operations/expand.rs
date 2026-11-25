@@ -4275,7 +4275,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4308,7 +4308,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4469,17 +4469,19 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
 /// `big/big-echo-no-limit` test (and the wider HL7 tx-ecosystem fixtures).
 /// The header carries a per-request maximum expansion size — when set, the
 /// server must return an `OperationOutcome` with `code=too-costly` if the
-/// expansion would exceed it, regardless of the configured global limit.
-/// We surface the value as a synthetic `__max_expansion_size__` parameter so
-/// `process_expand` can override `state.max_expansion_size` for this request.
-fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>) {
+/// expansion would exceed it. We surface the value as a synthetic
+/// `__max_expansion_size__` parameter so `process_expand` can override
+/// `state.max_expansion_size` for this request, clamped to `ceiling`
+/// ([`AppState::expansion_size_ceiling`]). The synthetic parameter is only
+/// ever set here: one arriving in the request body is dropped.
+fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>, ceiling: u32) {
+    params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
     if let Some(v) = headers
         .get("x-too-costly-threshold")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
     {
-        params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
-        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v}));
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v.min(ceiling)}));
     }
 }
 
@@ -4554,7 +4556,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     let mut params = instance_expand_params(raw_params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,
@@ -4586,7 +4588,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     let mut params = instance_expand_params(params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,
@@ -5840,6 +5842,46 @@ mod tests {
                 .any(|s| s["url"] == "value" && s["valueCode"] == "deprecated"),
             "valueCode preserved for status property"
         );
+    }
+
+    fn threshold_param(params: &[Value]) -> Option<u64> {
+        params
+            .iter()
+            .find(|p| p["name"] == "__max_expansion_size__")
+            .and_then(|p| p["valueInteger"].as_u64())
+    }
+
+    #[test]
+    fn the_threshold_header_is_clamped_to_the_ceiling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-too-costly-threshold", "5000".parse().unwrap());
+        let mut params = vec![json!({"name": "url", "valueUri": "http://example.org/vs"})];
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(2000));
+
+        let mut params = vec![json!({"name": "url", "valueUri": "http://example.org/vs"})];
+        headers.insert("x-too-costly-threshold", "7".parse().unwrap());
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(7));
+    }
+
+    #[test]
+    fn a_body_parameter_cannot_set_the_threshold() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://example.org/vs"}),
+            json!({"name": "__max_expansion_size__", "valueInteger": 4_000_000_000u64}),
+        ];
+        inject_too_costly_threshold(&HeaderMap::new(), &mut params, 2000);
+        assert_eq!(threshold_param(&params), None);
+        assert_eq!(params.len(), 1);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-too-costly-threshold", "10".parse().unwrap());
+        let mut params =
+            vec![json!({"name": "__max_expansion_size__", "valueInteger": 4_000_000_000u64})];
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(10));
+        assert_eq!(params.len(), 1);
     }
 }
 // rebuild marker
