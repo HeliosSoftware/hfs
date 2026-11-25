@@ -1025,7 +1025,11 @@ fn split_missing_stages<'a>(
     Some(stages.as_slice())
 }
 
-/// The hint both split counts carry: one candidate plan with fixed bounds.
+/// The hint both split counts carry: the index is fixed, so neither count can
+/// fall back to a full scan. The unstamped count and a single-name stamped
+/// count have fixed bounds; with several names the stamped count is bounded
+/// on one name and filters the others after the fetch, as the single
+/// aggregation did.
 fn missing_split_hint() -> Hint {
     Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned())
 }
