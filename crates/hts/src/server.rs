@@ -95,6 +95,15 @@ where
 {
     let cors = build_cors(config);
 
+    if state.max_expansion_size_ceiling < state.max_expansion_size {
+        tracing::warn!(
+            max_expansion_size = state.max_expansion_size,
+            max_expansion_size_ceiling = state.max_expansion_size_ceiling,
+            "HTS_MAX_EXPANSION_SIZE_CEILING is below HTS_MAX_EXPANSION_SIZE; \
+             the X-TOO-COSTLY-THRESHOLD header is capped at HTS_MAX_EXPANSION_SIZE instead"
+        );
+    }
+
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
     // the `/hts` prefix internally so this mount point stays `/ui`, the same
@@ -128,6 +137,10 @@ where
             helios_hts_ui::UpstreamClient::new("http://127.0.0.1:1")
                 .expect("closed loopback URL should always parse")
         });
+        // The expand workbench offers thresholds up to the ceiling this
+        // server enforces, not a compiled-in copy of its default.
+        let upstream =
+            upstream.with_expansion_size_ceiling(u64::from(state.expansion_size_ceiling()));
         let bundled_data_bytes = if config.bootstrap_dir.is_empty() {
             None
         } else {
