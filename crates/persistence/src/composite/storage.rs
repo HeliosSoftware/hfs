@@ -1813,6 +1813,29 @@ impl SearchProvider for CompositeStorage {
             .unwrap_or_default()
     }
 
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider. No provider at all means
+        // `search` answers `UnsupportedCapability`, so `false`.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.serves_search_param(resource_type, code, param_type);
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .is_some_and(|p| p.serves_search_param(resource_type, code, param_type))
+    }
+
     /// A composite's search lags its primary on two axes, and this closes
     /// both: writes still sitting in the asynchronous sync queue, and writes
     /// the search backend has accepted but not yet made searchable (#1047).
@@ -3784,6 +3807,17 @@ mod tests {
             !self.unsupported.load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        /// Serves only the parameter named like the provider, so a test can
+        /// tell which provider answered.
+        fn serves_search_param(
+            &self,
+            _resource_type: &str,
+            code: &str,
+            _param_type: SearchParamType,
+        ) -> bool {
+            code == self.name
+        }
+
         fn supports_native_reverse_chains(&self, _: &TenantContext, _: &SearchQuery) -> bool {
             self.native_reverse
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -5094,6 +5128,7 @@ mod tests {
         // No provider at all: `search` is `UnsupportedCapability`.
         composite.search_providers.remove("primary");
         assert!(!composite.supports_search());
+        assert!(!composite.serves_search_param("Patient", "primary", SearchParamType::Token));
         assert!(is_unsupported(composite.search(&tenant, &query).await));
 
         // No Search backend configured: the primary's provider answers.
@@ -5104,6 +5139,34 @@ mod tests {
         primary.unsupported.store(true, Ordering::Relaxed);
         assert!(!composite.supports_search());
         assert!(is_unsupported(composite.search(&tenant, &query).await));
+    }
+
+    /// `serves_search_param` follows the provider `search` reaches, as
+    /// `supports_search` does: the dedicated Search backend when one is
+    /// configured, the primary's provider otherwise, and `false` with none.
+    #[test]
+    fn serves_search_param_follows_the_provider_search_reaches() {
+        let serves = |composite: &CompositeStorage, code: &str| {
+            composite.serves_search_param("Patient", code, SearchParamType::Token)
+        };
+        let (mut composite, _primary, _search) = make_composite_with_dedicated_search(
+            vec![fake_patient("primary-id")],
+            vec![fake_patient("search-id")],
+        );
+        assert!(serves(&composite, "search"));
+        assert!(!serves(&composite, "primary"));
+
+        composite.search_providers.remove("search");
+        assert!(serves(&composite, "primary"));
+        assert!(!serves(&composite, "search"));
+
+        composite.search_providers.remove("primary");
+        assert!(!serves(&composite, "primary"));
+
+        let (composite, _primary) =
+            make_composite_no_search_backend(vec![fake_patient("primary-id")]);
+        assert!(serves(&composite, "primary"));
+        assert!(!serves(&composite, "search"));
     }
 
     #[test]
