@@ -447,12 +447,6 @@ fn invalid_number_value(
 const MAX_SEARCH_PARAM_SORT_KEYS: usize = 15;
 
 const CANDIDATE_BATCH_SIZE: usize = 512;
-/// Rows per reply of the `matching_resource_ids` driver cursor (#2601). The
-/// server default (101 rows, then 16 MB getMores of ~250k projected rows)
-/// read 504k keys for a driver that crosses the 300k id cap after 300k; a
-/// fixed batch bounds that overshoot to one batch, and a driver of up to this
-/// many rows is answered by its first reply, with no getMore.
-const DRIVER_BATCH_ROWS: u32 = 65_536;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
 const MAX_RESULT_ID_SET: usize = 300_000;
@@ -6099,8 +6093,7 @@ impl MongoBackend {
         let mut driver_cursor = with_hint_fallback(access.discovery_hint(), |hint| {
             let find = search_index
                 .find(driver_filter.clone())
-                .projection(doc! { "resource_id": 1, "_id": 0 })
-                .batch_size(DRIVER_BATCH_ROWS);
+                .projection(doc! { "resource_id": 1, "_id": 0 });
             match hint {
                 Some(hint) => find.hint(hint),
                 None => find,
