@@ -1023,6 +1023,15 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
     fn supports_search(&self) -> bool {
         self.inner.supports_search()
     }
+    fn serves_search_param(
+        &self,
+        resource_type: &str,
+        code: &str,
+        param_type: helios_persistence::types::SearchParamType,
+    ) -> bool {
+        self.inner
+            .serves_search_param(resource_type, code, param_type)
+    }
     fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
         self.inner.supports_native_reverse_chains(tenant, query)
     }

@@ -550,6 +550,16 @@ fn composite_pair_rows(
     ))
 }
 
+/// The `special` parameters [`QueryBuilder::build`] evaluates: the ones
+/// `build_special_parameter_condition` has an arm for. `parameter_condition`
+/// gives every other `special` parameter with a value no condition, which
+/// `build` refuses ([`unevaluable_parameter`]): `near`, and from R5
+/// `contains`, `section-text`, `_query` and `_type`. The backend's
+/// `SearchProvider::serves_search_param` reads the same list, so `/metadata`
+/// lists only what this builder evaluates (#2593); a test pins the list to the
+/// name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 3] = ["_text", "_content", "_filter"];
+
 /// The refusal for a parameter [`QueryBuilder::build`] has values for but no
 /// condition to build from (#866): the `_ => None` arm of
 /// `build_special_parameter_condition` (`_query`, `_type`, any `_` name nothing
@@ -1197,6 +1207,20 @@ impl QueryBuilder {
         // parameter, since under `:not` "nothing" negates into "everything".
         if crate::search::has_empty_value(param) {
             return Some(ParameterCondition::Other(SqlFragment::new("1 = 0")));
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together. `_id`,
+        // `_lastUpdated` and `_in` have arms there too, and are built by name
+        // whatever type the parameter carries, so the gate is not theirs.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+            && !matches!(param.name.as_str(), "_id" | "_lastUpdated" | "_in")
+        {
+            return None;
         }
 
         // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
@@ -2453,6 +2477,74 @@ mod tests {
                 &SearchQuery::new("Patient").with_parameter(param("_id", SearchParamType::Token)),
             )
             .expect("_id has a condition");
+    }
+
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what `build` evaluates (#2593): of every `special`
+    /// parameter the enabled specs register, and `_text` and `_content`, the
+    /// ones it names build and every other is refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_build_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let value = if code == "_filter" { "name eq x" } else { "x" };
+            let query = SearchQuery::new("Location").with_parameter(SearchParameter {
+                name: code.clone(),
+                param_type: SearchParamType::Special,
+                values: vec![SearchValue::eq(value)],
+                ..Default::default()
+            });
+            let built = QueryBuilder::new("tenant1", "Location").build(&query);
+            if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+            } else {
+                match built {
+                    Err(SearchError::QueryParseError { message }) => {
+                        assert!(message.contains("widen"), "{code}: {message}")
+                    }
+                    other => panic!("{code} is not listed as evaluated, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id`, `_lastUpdated` and
+    /// `_in`, typed `special`, build the same condition as with their registry
+    /// type, as they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, SearchValue::eq("p1")),
+            (
+                "_lastUpdated",
+                SearchParamType::Date,
+                SearchValue::new(crate::types::SearchPrefix::Gt, "2020-01-01"),
+            ),
+            (
+                "_in",
+                SearchParamType::Reference,
+                SearchValue::eq("List/42"),
+            ),
+        ] {
+            let build = |param_type| {
+                let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    values: vec![value.clone()],
+                    ..Default::default()
+                });
+                let built = QueryBuilder::new("tenant1", "Patient")
+                    .build(&query)
+                    .unwrap_or_else(|e| panic!("{name} as {param_type:?}: {e:?}"));
+                format!("{built:?}")
+            };
+            assert_eq!(
+                build(SearchParamType::Special),
+                build(registry_type),
+                "{name}"
+            );
+        }
     }
 
     #[test]

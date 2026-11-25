@@ -782,6 +782,14 @@ fn is_relative_type_id(value: &str) -> bool {
     !value.starts_with("http://") && !value.starts_with("https://")
 }
 
+/// The `special` parameters `build_parameter_condition` evaluates, by name.
+/// `build_parameter_condition` gives every other `special` parameter with a
+/// value no condition, which the caller refuses ([`unevaluable_parameter`]).
+/// The backend's `SearchProvider::serves_search_param` reads the same list, so
+/// `/metadata` lists only what this builder evaluates (#2593); a test pins the
+/// list to the name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 2] = ["_text", "_content"];
+
 /// The refusal for a parameter the builders have values for but no condition to
 /// build from (#2508): a `special`-typed parameter no arm of
 /// `build_parameter_condition` evaluates (`near`, and from R5 `_type`,
@@ -2131,12 +2139,28 @@ impl PostgresQueryBuilder {
             return Some(match_nothing());
         }
 
-        // Handle special parameters
+        // `_id` and `_lastUpdated` are built from `resources` by name, whatever
+        // type the parameter carries, so the gate below is not theirs.
         match param.name.as_str() {
             "_id" => return Self::build_id_condition(param, param_offset),
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
+            _ => {}
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+        {
+            return None;
+        }
+
+        match param.name.as_str() {
             // Full text over the generated narrative (`_text`) and over the whole
             // serialized resource (`_content`), against the same `resource_fts`
             // tsvector columns the write path populates.
@@ -5976,6 +6000,70 @@ mod tests {
                 message.contains(&format!("every {resource_type}")),
                 "{message}"
             );
+        }
+    }
+
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what the builder evaluates (#2593), in both index
+    /// layouts: of every `special` parameter the enabled specs register, and
+    /// `_text` and `_content`, the ones it names build and every other is
+    /// refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_the_builder_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let query = SearchQuery::new("Location")
+                .with_parameter(special_param(&code, vec![SearchValue::eq("x")]));
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout);
+                if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                    built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+                } else {
+                    match built {
+                        Err(SearchError::QueryParseError { message }) => {
+                            assert!(message.contains("widen"), "{code}: {message}")
+                        }
+                        other => panic!("{code} is not listed as evaluated, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id` and `_lastUpdated`,
+    /// typed `special`, build the same condition as with their registry type,
+    /// in both index layouts, as they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, SearchValue::eq("p1")),
+            (
+                "_lastUpdated",
+                SearchParamType::Date,
+                SearchValue::new(crate::types::SearchPrefix::Gt, "2020-01-01"),
+            ),
+        ] {
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let build = |param_type| {
+                    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                        name: name.to_string(),
+                        param_type,
+                        modifier: None,
+                        values: vec![value.clone()],
+                        chain: vec![],
+                        components: vec![],
+                    });
+                    let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout)
+                        .unwrap_or_else(|e| panic!("{name} as {param_type:?} ({layout:?}): {e:?}"));
+                    format!("{built:?}")
+                };
+                assert_eq!(
+                    build(SearchParamType::Special),
+                    build(registry_type),
+                    "{name} ({layout:?})"
+                );
+            }
         }
     }
 

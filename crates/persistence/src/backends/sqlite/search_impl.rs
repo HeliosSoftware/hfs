@@ -1732,6 +1732,21 @@ impl SearchProvider for SqliteBackend {
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
     }
+
+    /// Every parameter except a `special` one the query builder builds no
+    /// condition for, which `search` refuses with `400` rather than widen the
+    /// result (#866): `near`, and from R5 `contains` and `section-text`.
+    /// `_text`, `_content` and `_filter` are evaluated, and the builder refuses
+    /// a `special` parameter from the same list.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+            || super::search::query_builder::EVALUATED_SPECIAL_PARAMETERS.contains(&code)
+    }
 }
 
 #[async_trait]
