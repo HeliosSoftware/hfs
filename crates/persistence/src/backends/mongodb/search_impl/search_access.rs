@@ -94,8 +94,18 @@ impl PredicateAccess {
         } else {
             IndexAccess::DateRange
         };
+        // `ap` bounds the start from above and the end from below. The v3
+        // hint seeks the start only and reads every row that starts before the
+        // window's end: 27,973 keys where `idx_search_date_end` read 2
+        // (#2601). Which side is narrower depends on the value, so once the
+        // end index is ready MongoDB chooses.
+        let approximate = parameter
+            .values
+            .iter()
+            .all(|value| value.prefix == SearchPrefix::Ap);
         let date_hint = match discovery {
             IndexAccess::Automatic => None,
+            IndexAccess::DateRange if approximate && date_end_ready => None,
             IndexAccess::DateRange => Some(SEARCH_DATE_RANGE_INDEX),
             IndexAccess::DateEndRange if !date_end_ready => Some(SEARCH_DATE_RANGE_INDEX),
             IndexAccess::DateEndRange if filter.contains_key("$or") => None,

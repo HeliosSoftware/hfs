@@ -5447,9 +5447,14 @@ mod index_intersection_tests {
             assert_eq!(date_predicate(raw).hint(), None, "{raw}");
             assert_eq!(date_predicate_with(raw, false).hint(), v3, "{raw}");
         }
+        // `ap` bounds both sides: once the end index is ready MongoDB picks
+        // the narrower one (#2601); before that it keeps the v3 hint.
+        let ap = date_predicate_with("ap2024-11-01", true);
+        assert_eq!(ap.access.discovery, IndexAccess::DateRange);
+        assert_eq!(ap.hint(), None);
+        assert_eq!(date_predicate_with("ap2024-11-01", false).hint(), v3);
         // Start-bounded prefixes keep the v3 hint whatever the end index does.
         for raw in [
-            "ap2024-11-01",
             "eq2024-11-01",
             "lt2024-11-01",
             "le2024-11-01",
