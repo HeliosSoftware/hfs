@@ -4163,7 +4163,17 @@ impl MongoBackend {
         // With ids to check, one reply for the whole `$in` instead of 101 rows
         // and a getMore, read from the keys of the liveness index (#2601).
         let batch = matched_ids.map(|ids| in_reply_rows(ids.len()));
-        let hint = matched_ids.and_then(|_| liveness_hint());
+        // The liveness index covers only the scope and the ids. Any other
+        // resource-level predicate (`_lastUpdated`, `_id`, a stored version,
+        // `missing_params`) would make the hinted read fetch every candidate
+        // document, where the planner can answer from another index
+        // (`idx_resources_type_scan` for `_lastUpdated`).
+        let ids_only = filter
+            .get_array("$and")
+            .is_ok_and(|conditions| conditions.len() == 2);
+        let hint = matched_ids
+            .filter(|_| ids_only)
+            .and_then(|_| liveness_hint());
         let cursor = with_hint_fallback(hint, |hint| {
             let mut find = resources
                 .find(filter.clone())
