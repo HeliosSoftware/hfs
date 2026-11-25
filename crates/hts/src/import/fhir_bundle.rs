@@ -144,6 +144,7 @@ fn write_parsed_bundle(
             Ok(())
         };
         if let Err(error) = ownership {
+            stats.count_owner_refusal(&error);
             stats
                 .errors
                 .push(format!("CodeSystem '{url}' import failed: {error}"));
@@ -179,6 +180,9 @@ fn write_parsed_bundle(
         } else {
             Ok(())
         };
+        if let Err(e) = &ownership {
+            stats.count_owner_refusal(e);
+        }
         if let Err(e) = ownership.and_then(|()| write_value_set(conn, vs, stats)) {
             stats
                 .errors
@@ -198,6 +202,9 @@ fn write_parsed_bundle(
         } else {
             Ok(())
         };
+        if let Err(e) = &ownership {
+            stats.count_owner_refusal(e);
+        }
         if let Err(e) = ownership.and_then(|()| write_concept_map(conn, cm, stats)) {
             stats
                 .errors

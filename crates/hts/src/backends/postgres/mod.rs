@@ -737,6 +737,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("CodeSystem '{}' import failed: {error}", cs.url));
+                    stats.count_owner_refusal(&error);
                     systems_needing_closure
                         .retain(|(url, version)| url != &cs.url || version != &cs.version);
                     continue;
@@ -761,6 +762,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ValueSet '{}' import failed: {error}", vs.url));
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
@@ -781,6 +783,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     stats
                         .errors
                         .push(format!("ConceptMap '{}' import failed: {error}", cm.url));
+                    stats.count_owner_refusal(&error);
                     continue;
                 }
             }
