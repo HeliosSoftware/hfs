@@ -12,8 +12,44 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use helios_auth::{LoginConfig, Session, SessionPrincipal, SessionStore};
+use helios_auth::{
+    AuthError, AuthProvider, LoginConfig, Principal, ScopeSet, Session, SessionPrincipal,
+    SessionStore,
+};
+use helios_persistence::ResourceStorage;
+use helios_persistence::backends::sqlite::SqliteBackend;
 use tower::ServiceExt;
+
+/// A validator that accepts the seeded session's token as `demo-sub` carrying
+/// exactly the given scopes, and refuses every other bearer.
+struct ScopedProvider(String);
+
+#[async_trait::async_trait]
+impl AuthProvider for ScopedProvider {
+    async fn authenticate(&self, authorization_header: &str) -> Result<Principal, AuthError> {
+        if authorization_header != "Bearer access-token-1" {
+            return Err(AuthError::InvalidTokenFormat("not the seeded token".into()));
+        }
+        Ok(Principal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp.example.com/realms/fhir".to_string(),
+            scopes: ScopeSet::parse(&self.0),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        })
+    }
+
+    fn name(&self) -> &str {
+        "scoped-test-provider"
+    }
+}
+
+fn runtime(sessions: &Arc<SessionStore>, scopes: &str) -> helios_ui::LoginRuntime {
+    helios_ui::LoginRuntime {
+        sessions: Arc::clone(sessions),
+        provider: Arc::new(ScopedProvider(scopes.to_string())),
+    }
+}
 
 /// The login runtime is process-wide and `mount` captures it at construction,
 /// so a test that installs a store and then seeds it must not interleave with
@@ -37,9 +73,7 @@ fn login_config() -> LoginConfig {
 /// UI on it. Returns the store so a test can seed sessions.
 fn app() -> (Router, Arc<SessionStore>) {
     let sessions = Arc::new(SessionStore::new(login_config()));
-    helios_ui::set_interactive_login(helios_ui::LoginRuntime {
-        sessions: Arc::clone(&sessions),
-    });
+    helios_ui::set_interactive_login(runtime(&sessions, ""));
     let router = helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -427,9 +461,7 @@ async fn a_signed_in_page_self_calls_with_the_session_bearer_not_the_service_tok
 
     let _serial = SERIAL.lock().await;
     let sessions = Arc::new(SessionStore::new(login_config()));
-    helios_ui::set_interactive_login(helios_ui::LoginRuntime {
-        sessions: Arc::clone(&sessions),
-    });
+    helios_ui::set_interactive_login(runtime(&sessions, ""));
     let session = seeded_session(&sessions);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -478,4 +510,123 @@ async fn a_signed_in_page_self_calls_with_the_session_bearer_not_the_service_tok
         "the session's bearer"
     );
     assert!(!html.contains("Bearer service-token"));
+}
+
+// ── Administrative routes need a system scope (run-4) ────────────────────────
+
+/// A login whose provider grants `scopes` to the seeded session, mounted over
+/// an in-memory registry holding tenant `beta`.
+async fn admin_app(scopes: &str) -> (Router, Arc<SessionStore>, Arc<dyn ResourceStorage>) {
+    let sessions = Arc::new(SessionStore::new(login_config()));
+    helios_ui::set_interactive_login(runtime(&sessions, scopes));
+    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    backend.init_schema().expect("init schema");
+    let store: Arc<dyn ResourceStorage> = Arc::new(backend);
+    store.register_tenant("beta", Some("Beta")).await.unwrap();
+    let router = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        Some(Arc::clone(&store)),
+        None,
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+    (router, sessions, store)
+}
+
+async fn signed_in(router: &Router, method: &str, uri: &str, body: &str) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, "hfs_session=sess-test-1")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn a_session_without_a_system_scope_cannot_administer_tenants_or_bulk_import() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions, store) = admin_app("user/*.cruds").await;
+    seeded_session(&sessions);
+
+    assert_eq!(
+        signed_in(&router, "DELETE", "/ui/tenants/beta?purge=true", "").await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        store.get_tenant("beta").await.unwrap().is_some(),
+        "the refused purge must leave the tenant intact"
+    );
+    assert_eq!(
+        signed_in(
+            &router,
+            "POST",
+            "/ui/tenants",
+            "id=newco&display_name=NewCo"
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(store.get_tenant("newco").await.unwrap().is_none());
+    assert_eq!(
+        signed_in(&router, "GET", "/ui/tenants/rows", "").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        signed_in(&router, "GET", "/ui/bulk-import", "").await,
+        StatusCode::FORBIDDEN
+    );
+    // Ordinary pages are untouched by the gate.
+    assert_ne!(
+        signed_in(&router, "GET", "/ui/settings", "").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_a_system_scope_still_administers() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions, store) = admin_app("system/*.cruds").await;
+    seeded_session(&sessions);
+
+    assert_eq!(
+        signed_in(&router, "GET", "/ui/tenants/rows", "").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        signed_in(&router, "DELETE", "/ui/tenants/beta?purge=true", "").await,
+        StatusCode::OK
+    );
+    assert!(store.get_tenant("beta").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_method_bit_is_checked_not_just_the_system_context() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions, store) = admin_app("system/*.r").await;
+    seeded_session(&sessions);
+
+    assert_eq!(
+        signed_in(&router, "GET", "/ui/tenants/rows", "").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        signed_in(&router, "DELETE", "/ui/tenants/beta?purge=true", "").await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(store.get_tenant("beta").await.unwrap().is_some());
 }

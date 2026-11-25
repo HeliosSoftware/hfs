@@ -689,12 +689,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         if cap_enforced {
                             if let Some(limit) = req.max_expansion_size {
                                 if codes.len() as u64 > u64::from(limit) {
-                                    return Err(HtsError::TooCostly(format!(
-                                        "Implicit ValueSet expansion contains {} codes which exceeds \
-                                         the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
+                                    return Err(HtsError::expansion_too_costly(
+                                        "Implicit ValueSet expansion",
                                         codes.len(),
-                                        limit
-                                    )));
+                                        limit,
+                                    ));
                                 }
                             }
                         }
@@ -1016,6 +1015,15 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // requested it. The IG `parameters/parameters-expand-enum-*`
         // fixtures rely on this. Mirrors sqlite/value_set.rs:1144.
         if req.hierarchical == Some(true) && !compose_is_enumerated {
+            // A tree ignores count and offset and returns every code, so the
+            // cap applies even when count was sent (`cap_enforced` is false
+            // then, and the checks above let the full set through).
+            enforce_cap(
+                &filtered,
+                true,
+                req.max_expansion_size,
+                /*implicit=*/ false,
+            )?;
             let total = filtered.len() as u32;
             let tree = build_hierarchical_expansion(&client, filtered).await?;
             return Ok(ExpandResponse {
@@ -5384,12 +5392,7 @@ fn enforce_cap(
             } else {
                 "ValueSet expansion"
             };
-            return Err(HtsError::TooCostly(format!(
-                "{prefix} contains {} codes which exceeds \
-                     the server limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                codes.len(),
-                limit
-            )));
+            return Err(HtsError::expansion_too_costly(prefix, codes.len(), limit));
         }
     }
     Ok(())
