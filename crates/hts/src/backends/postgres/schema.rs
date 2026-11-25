@@ -528,20 +528,20 @@ pub async fn migrate_concept_closure_pg(
     let systems_needing_closure: Vec<String> = client
         .query(
             "SELECT cs.id FROM code_systems cs
-             WHERE EXISTS (
+             WHERE (EXISTS (
                        SELECT 1 FROM concept_hierarchy h
                        WHERE  h.system_id = cs.id
                        LIMIT  1
                    )
-               AND (NOT EXISTS (
+               AND NOT EXISTS (
                        SELECT 1 FROM concept_closure c
                        WHERE  c.system_id = cs.id
                        LIMIT  1
-                   )
-                    OR EXISTS (
+                   ))
+                OR EXISTS (
                        SELECT 1 FROM concept_closure_stale s
                        WHERE  s.system_id = cs.id
-                   ))",
+                   )",
             &[],
         )
         .await?
@@ -551,6 +551,18 @@ pub async fn migrate_concept_closure_pg(
 
     for sid in &systems_needing_closure {
         build_concept_closure_pg(client, sid).await?;
+        // Expansions answered from the stale closure were stored; drop them
+        // so the rebuilt closure is what the next `$expand` reads.
+        client
+            .execute(
+                "DELETE FROM value_set_expansions WHERE value_set_id IN (
+                     SELECT e.value_set_id FROM value_set_expansions e
+                     JOIN code_systems cs ON cs.url = e.system_url
+                     WHERE cs.id = $1
+                 )",
+                &[sid],
+            )
+            .await?;
     }
     Ok(systems_needing_closure.len())
 }

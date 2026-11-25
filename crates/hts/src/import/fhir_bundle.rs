@@ -491,10 +491,12 @@ fn write_code_system(
     // until the load's finalize or the next startup rebuilds it, instead of
     // answering not-subsumed for every pair while the load is in flight.
     if defer_closure {
-        let _ = conn.execute(
+        // Not ignored: a kept closure with no marker would never be rebuilt.
+        conn.execute(
             "INSERT OR IGNORE INTO concept_closure_stale (system_id) VALUES (?1)",
             rusqlite::params![system_id],
-        );
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
     } else {
         let _ = conn.execute(
             "DELETE FROM concept_closure WHERE system_id = ?1",
@@ -1493,6 +1495,56 @@ mod tests {
             SubsumptionOutcome::Subsumes,
             "re-import must rebuild the closure it deletes"
         );
+    }
+
+    /// A deferred batch that removes the system's last hierarchy edge must
+    /// still be rebuilt on finalize. The rebuild used to select only systems
+    /// that still had edges, so the kept closure went on answering `subsumes`
+    /// for the removed edge through every later finalize and restart. The
+    /// expansions persisted from the kept closure go with it.
+    #[tokio::test]
+    async fn deferred_reimport_dropping_last_edge_rebuilds_on_finalize() {
+        use crate::types::SubsumptionOutcome;
+        let b = backend();
+        b.import_bundle(&ctx(), hierarchical_cs_bundle().as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::Subsumes);
+
+        // A.0 again, now with no parent: the only edge is gone.
+        let mut cs = hierarchical_cs();
+        cs["concept"] = serde_json::json!([{ "code": "A.0" }]);
+        let flat = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{ "resource": cs }]
+        })
+        .to_string();
+        b.import_bundle_deferred(&ctx(), flat.as_bytes())
+            .await
+            .unwrap();
+        // An `is-a` expansion answered from the kept closure, as persisted.
+        b.pool()
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO implicit_expansion_cache (url, system_url, code, display)
+                 VALUES ('http://ex.org/s3?fhir_vs=isa/A', 'http://ex.org/s3', 'A.0', NULL)",
+                [],
+            )
+            .unwrap();
+
+        b.finalize_after_bootstrap().unwrap();
+        let count = |sql: &str| -> i64 {
+            b.pool()
+                .get()
+                .unwrap()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM concept_closure_stale"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM implicit_expansion_cache"), 0);
+        assert_eq!(subsumes_a_a0(&b).await, SubsumptionOutcome::NotSubsumed);
     }
 
     /// A deferred batch of an existing system keeps the closure it has, marks

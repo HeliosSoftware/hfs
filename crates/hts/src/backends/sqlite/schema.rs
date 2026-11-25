@@ -460,10 +460,8 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
                         WHERE  c.system_id = h.system_id
                         LIMIT  1
                     )
-                OR EXISTS (
-                        SELECT 1 FROM concept_closure_stale s
-                        WHERE  s.system_id = h.system_id
-                    )",
+             UNION
+             SELECT system_id FROM concept_closure_stale",
         )?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -471,6 +469,20 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
 
     for sid in &systems_needing_closure {
         build_concept_closure(conn, sid)?;
+        // Expansions answered from the stale closure were persisted; drop
+        // them so the rebuilt closure is what the next `$expand` reads.
+        let url: Option<String> = conn
+            .query_row("SELECT url FROM code_systems WHERE id = ?1", [sid], |r| {
+                r.get(0)
+            })
+            .ok();
+        if let Some(url) = url {
+            if let Err(e) =
+                crate::import::fhir_bundle::invalidate_expansion_cache_for_system(conn, &url)
+            {
+                tracing::warn!(system_id = %sid, error = %e, "Failed to invalidate expansions after closure rebuild");
+            }
+        }
     }
 
     Ok(systems_needing_closure.len())
