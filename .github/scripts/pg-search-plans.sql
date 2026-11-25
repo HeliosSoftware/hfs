@@ -1423,6 +1423,14 @@ LIMIT 21;
 -- plan flip on an untouched shape is the hypothesis; this section is what can
 -- confirm or kill it.
 --
+-- Since #2602 a quantity row is the closed interval [value_quantity_value,
+-- value_quantity_high], and gt/ge/eb compare `value_quantity_high` ONLY. The
+-- predicates below are the ones the query builder emits; before v56 rebuilt
+-- `idx_search_quantity_recent` (high in the payload, partial on value OR high)
+-- the broad one fell off the recent-first scan onto `idx_search_quantity_high`
+-- plus a sort (0.1 ms -> 200-300 ms). EXPECT an Index Only Scan using
+-- idx_search_quantity_recent for AM1 and no Sort node.
+--
 -- Three values spanning the selectivity range the benchmark actually sends
 -- (k6/searchConfig.js: value-quantity uses gt/lt over 0-200 plus a no-match
 -- sentinel), because a plan that is right for one end can be wrong for the
@@ -1432,7 +1440,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, r.last_updated AS sort_key
 FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
        WHERE tenant_id = 'default' AND resource_type = 'Observation'
-         AND param_name = 'value-quantity' AND value_quantity_value > 0
+         AND param_name = 'value-quantity' AND value_quantity_high > 0
        ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) s
 JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
                 AND r.id = s.resource_id AND NOT r.is_deleted;
@@ -1442,7 +1450,20 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, r.last_updated AS sort_key
 FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
        WHERE tenant_id = 'default' AND resource_type = 'Observation'
-         AND param_name = 'value-quantity' AND value_quantity_value > 900000
+         AND param_name = 'value-quantity' AND value_quantity_high > 900000
+       ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) s
+JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
+                AND r.id = s.resource_id AND NOT r.is_deleted;
+
+\echo '-- AM2b: ap (#2602) — two groups; EXPECT idx_search_quantity (or the recent index) for the point arm and idx_search_quantity_range for the Range-only arm'
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, r.last_updated AS sort_key
+FROM ( SELECT DISTINCT resource_id, last_updated FROM search_index
+       WHERE tenant_id = 'default' AND resource_type = 'Observation'
+         AND param_name = 'value-quantity'
+         AND ((value_quantity_value >= 95 AND value_quantity_value <= 105)
+              OR (value_quantity_value < 95 AND value_quantity_high >= 95
+                  AND value_quantity_high > value_quantity_value))
        ORDER BY last_updated DESC, resource_id ASC LIMIT 22 ) s
 JOIN resources r ON r.tenant_id = 'default' AND r.resource_type = 'Observation'
                 AND r.id = s.resource_id AND NOT r.is_deleted;

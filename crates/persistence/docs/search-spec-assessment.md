@@ -38,7 +38,7 @@ Neo4j are not implemented.
 | reference | ✓ | ✓ | ✓ | ✓ | type modifier + `:identifier` (SQLite/PG/ES) |
 | date | ✓ | ✓ | ✓ | ✓ | precision-aware ranges + all prefixes |
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
-| quantity | ✓ | ✓ | ✓ | ✓ | value comparison + optional system/unit on all backends |
+| quantity | ✓ | ✓ | ✓ | ✓ | value comparison + optional system/unit on all backends; `Range` targets indexed as an interval (#2602) |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
 | composite | ✓ | ✓ | ✓ | ✓ | Group/slot matching in unfolded SQL and Mongo; folded PostgreSQL ordinary rows; ES nested instances |
 
@@ -249,7 +249,22 @@ Ordered roughly by impact:
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
 6. **REST result params** — `_maxresults`, `_score`, `_query` unsupported; Bundles omit
    `first`/`last` paging links.
-7. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
+7. **Quantity `Range` targets** (#2602) — `onset-age`, `abatement-age` and `context-quantity` also
+   select a `Range`. It is indexed as the closed interval `[low, high]` on one row (a missing bound
+   is open, stored as `f64::MIN`/`f64::MAX`; a `Quantity`/`Age` is a point with `high = value`), and
+   the prefixes compare against the interval the way date prefixes do for a `Period`: `eq` when the
+   search range contains it, `gt`/`ge` on `high`, `lt`/`le` on `low`, `sa` on `low`, `eb` on `high`,
+   `ap` on overlap with `[v-m, v+m]`. All four backends store a high bound with an index leading
+   with it. Elasticsearch rewrites nothing: `Quantity`/`Age` need no reindex (filters fall back to `value`
+   for an entry without `high`, and sorts read `value`), a `Range` with `low != high` adds one sort-only
+   nested entry (`sort_name`, upper bound as `value`, no `name`) for descending sorts, and only `Range`
+   values stored before the upgrade need `POST /<type>/$reindex`. On the other backends a pre-#2602 writer leaves rows without `high` (missing `eq`/`gt`/`ge`/`eb`/`ap`, and `ne` only matches below the range): PostgreSQL covers it with a temporary insert trigger (`trg_search_index_quantity_high`, removed by a later migration), MongoDB refuses to start an old binary (schema 18) and repairs such rows at every startup, SQLite refuses an old build (schema 49). See the README, "Mixed versions during the upgrade". SQLite
+   `_filter` evaluates quantity comparisons against the interval and supports `onset-age`,
+   `abatement-age` and `context-quantity`. Known limits: composite token+quantity parameters index
+   only `Quantity`/`Age` points and `Range` values with `low == high` (a `Range` with `low != high`,
+   including an open side, is skipped in a composite row), and an ascending sort uses `low` so a
+   range with no `low` sorts first.
+8. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
    value/unit (`value_quantity_canonical_value`/`_unit`) computed via
    `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.
    - **SQLite: complete** — writer populates canonical columns; the quantity handler matches the
@@ -265,7 +280,7 @@ Ordered roughly by impact:
      resources written before the upgrade; un-reindexed rows fall back to raw unit matching.
 
    All three searchable backends (SQLite, Postgres, Elasticsearch) now match UCUM-equivalent units.
-8. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
+9. **Accent-insensitive string search** (schema v10) — string search folds case **and** accents via
    NFD + combining-mark stripping (`unicode-normalization`, shared `search::fold_text`), stored in
    `value_string_folded`.
    - **SQLite: complete** — default/`:contains`/`:text` match the folded column ORed with the raw
@@ -275,7 +290,7 @@ Ordered roughly by impact:
    - **Elasticsearch: complete** — a `folded` keyword field (written via `fold_text`) is matched
      (wildcard) ORed with the raw field; integration-tested against a live ES container.
    - Pre-reindex rows need the **reindex backfill** for accent-insensitivity.
-9. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
+10. **Canonical `url|version` references** — versioned reference matching is now version-agnostic
    (`Patient/1/_history/2` ⇄ `Patient/1`, via `strip_reference_version`, on SQLite/PG/ES). The
    remaining gap is canonical `url|version` hierarchy for reference `:above`/`:below`; `:identifier`
    also assumes a `Type/id` reference shape.
@@ -291,7 +306,7 @@ Ordered roughly by impact:
      for such references (`_history`/`N`, or none), so run a tenant-wide `POST /$reindex` after
      upgrading for `:Type` and bare-id reference searches to find them (the same limitation applies
      to the `reference_target` field added by #2394).
-10. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
+11. **Ordered-value boundary semantics** — **done** (SQLite, Postgres, Elasticsearch). Comparator
     prefixes now match against the search value's implicit-precision range boundaries per spec:
     `ge → x≥lo`, `le → x<hi`, `gt`/`sa → x≥hi`, `lt`/`eb → x<lo` (range `[lo, hi)`), for number,
     quantity, and date (date falls back to scalar for full-precision instants). Postgres also gained

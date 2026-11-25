@@ -1002,6 +1002,46 @@ async fn expand_hierarchical_false_returns_flat_list() {
     }
 }
 
+/// A tree ignores `count` and returns every code, so `count` must not lift
+/// the expansion limit for it. The header lowers the limit to one code for
+/// this request; the ECL is-a value set has more.
+#[tokio::test(flavor = "multi_thread")]
+async fn expand_tree_with_count_is_subject_to_the_limit() {
+    let app = TestAppPg::new().await;
+    app.import_bundle_ok(bundles::ecl_bundle()).await;
+
+    let tree_page = |hierarchical: bool| {
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+                {"name": "hierarchical", "valueBoolean": hierarchical},
+                {"name": "count", "valueInteger": 1}
+            ]
+        })
+        .to_string()
+    };
+
+    let status = app
+        .post_fhir_status_with_header(
+            "/ValueSet/$expand",
+            tree_page(true),
+            ("x-too-costly-threshold", "1"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A flat page of the same size is bounded by `count` and still allowed.
+    let status = app
+        .post_fhir_status_with_header(
+            "/ValueSet/$expand",
+            tree_page(false),
+            ("x-too-costly-threshold", "1"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Multi-version ConceptMap translate
 // ═══════════════════════════════════════════════════════════════════════════════

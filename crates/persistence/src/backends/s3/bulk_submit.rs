@@ -30,6 +30,11 @@ use crate::types::StoredResource;
 /// S3's own maximum, so one receipt page rarely needs more than one LIST.
 const RECEIPT_LIST_PAGE_KEYS: i32 = 1000;
 
+/// Diagnostics of a per-entry failure record for a backend fault: the fault's
+/// own text stays in the server log.
+pub(super) const ENTRY_BACKEND_FAULT_TEXT: &str =
+    "an internal error occurred while storing the entry; the server log has the detail";
+
 /// A receipt as a result object stores it: the entry result, plus the manifest
 /// output file it came from (#2184). The object key only holds a digest of
 /// that file, so without the field the receipt writer could not name the input
@@ -1665,15 +1670,32 @@ impl S3Backend {
 
     /// Builds a minimal OperationOutcome from a storage error for use in
     /// per-entry failure records.
-    fn bulk_submit_operation_outcome(err: &StorageError) -> serde_json::Value {
-        let code = match err {
-            StorageError::Validation(_) => "invalid",
-            StorageError::Tenant(_) => "forbidden",
-            StorageError::Resource(ResourceError::NotFound { .. }) => "not-found",
-            StorageError::Resource(ResourceError::Gone { .. }) => "deleted",
-            StorageError::Resource(ResourceError::AlreadyExists { .. }) => "conflict",
-            StorageError::Concurrency(_) => "conflict",
-            _ => "exception",
+    ///
+    /// The record is served to the submitter, so a backend fault is worded as
+    /// the REST layer words a 500: its text (the S3 error code and the
+    /// provider's sentence, a serialization detail) goes to the log. A
+    /// transient fault keeps its message, which `map_client_error` has already
+    /// reduced to a fixed sentence.
+    pub(super) fn bulk_submit_operation_outcome(err: &StorageError) -> serde_json::Value {
+        let (code, diagnostics) = match err {
+            StorageError::Validation(_) => ("invalid", err.to_string()),
+            StorageError::Tenant(_) => ("forbidden", err.to_string()),
+            StorageError::Resource(ResourceError::NotFound { .. }) => {
+                ("not-found", err.to_string())
+            }
+            StorageError::Resource(ResourceError::Gone { .. }) => ("deleted", err.to_string()),
+            StorageError::Resource(ResourceError::AlreadyExists { .. }) => {
+                ("conflict", err.to_string())
+            }
+            StorageError::Concurrency(_) => ("conflict", err.to_string()),
+            StorageError::Backend(backend) if backend.is_unavailable() => {
+                ("transient", err.to_string())
+            }
+            StorageError::Backend(_) => {
+                tracing::warn!(error = %err, "bulk-submit entry failed on a backend fault");
+                ("exception", ENTRY_BACKEND_FAULT_TEXT.to_string())
+            }
+            _ => ("exception", err.to_string()),
         };
 
         serde_json::json!({
@@ -1681,7 +1703,7 @@ impl S3Backend {
             "issue": [{
                 "severity": "error",
                 "code": code,
-                "diagnostics": err.to_string()
+                "diagnostics": diagnostics
             }]
         })
     }

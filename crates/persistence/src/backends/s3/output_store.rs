@@ -24,7 +24,7 @@ use crate::core::bulk_export_output::{
     DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, tenant_path_segment};
 
 use super::client::S3Api;
 
@@ -92,9 +92,8 @@ impl S3OutputStore {
     /// The S3 object key for a finalized part.
     fn object_key(key: &ExportPartKey) -> String {
         format!(
-            "{}/exports/{}/{}-{}-{}-{}.ndjson",
-            key.tenant_id,
-            key.job_id,
+            "{}/{}-{}-{}-{}.ndjson",
+            Self::job_prefix(&key.tenant_id, &key.job_id).trim_end_matches('/'),
             key.file_type,
             key.resource_type,
             key.part_index,
@@ -102,9 +101,15 @@ impl S3OutputStore {
         )
     }
 
+    /// The S3 key prefix covering every export of a tenant: one component per
+    /// tenant id, so a hierarchical id never sits inside another's sweep.
+    fn tenant_prefix(tenant_id: &str) -> String {
+        format!("{}/exports/", tenant_path_segment(tenant_id))
+    }
+
     /// The S3 key prefix covering all parts of a job.
     fn job_prefix(tenant_id: &str, job_id: &ExportJobId) -> String {
-        format!("{}/exports/{}/", tenant_id, job_id)
+        format!("{}{}/", Self::tenant_prefix(tenant_id), job_id)
     }
 
     /// The local scratch directory holding every in-flight part of a job.
@@ -114,7 +119,9 @@ impl S3OutputStore {
     /// leftovers in one call, including parts whose writer was cancelled
     /// before `finalize_part` could clean up.
     fn job_scratch_dir(&self, tenant_id: &str, job_id: &ExportJobId) -> PathBuf {
-        self.scratch_dir.join(tenant_id).join(job_id.as_str())
+        self.scratch_dir
+            .join(tenant_path_segment(tenant_id))
+            .join(job_id.as_str())
     }
 
     /// The local scratch path for an in-flight part.
@@ -273,13 +280,12 @@ impl ExportOutputStore for S3OutputStore {
     }
 
     async fn delete_tenant_outputs(&self, tenant_id: &str) -> StorageResult<()> {
-        if tenant_id.is_empty() || tenant_id.contains('/') || tenant_id == ".." || tenant_id == "."
-        {
+        if tenant_id.is_empty() || tenant_id == ".." || tenant_id == "." {
             return Err(s3_err(format!(
                 "refusing tenant output prefix {tenant_id:?}"
             )));
         }
-        let prefix = format!("{tenant_id}/exports/");
+        let prefix = Self::tenant_prefix(tenant_id);
         let mut continuation: Option<String> = None;
         loop {
             let page = self
@@ -298,7 +304,7 @@ impl ExportOutputStore for S3OutputStore {
                 None => break,
             }
         }
-        delete_dir_idempotent(&self.scratch_dir.join(tenant_id)).await
+        delete_dir_idempotent(&self.scratch_dir.join(tenant_path_segment(tenant_id))).await
     }
 }
 
@@ -482,6 +488,32 @@ mod tests {
             store.scratch_path(&key),
             expected_dir.join("output-Patient-0-1.tmp")
         );
+    }
+
+    #[tokio::test]
+    async fn purging_a_tenant_leaves_a_hierarchical_siblings_objects() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (store, client) = test_store(scratch.path());
+        let mut keys = Vec::new();
+        for tenant in ["t1", "t1/exports"] {
+            let key = ExportPartKey::output(tenant, ExportJobId::new(), "Patient", 0, 1);
+            let mut writer = store.open_writer(&key).await.unwrap();
+            writer.write_line("{}").await.unwrap();
+            store.finalize_part(&key, writer).await.unwrap();
+            keys.push(key);
+        }
+        let child_key = S3OutputStore::object_key(&keys[1]);
+        assert!(
+            child_key.starts_with("t1%2Fexports/exports/"),
+            "{child_key}"
+        );
+
+        store.delete_tenant_outputs("t1").await.unwrap();
+        assert_eq!(client.keys(), vec![child_key.clone()]);
+        assert!(!scratch.path().join("t1").exists());
+
+        store.delete_tenant_outputs("t1/exports").await.unwrap();
+        assert!(client.keys().is_empty());
     }
 
     #[tokio::test]

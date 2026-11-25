@@ -5366,10 +5366,12 @@ fn call_function(
             } else if args.len() == 1 {
                 match &args[0] {
                     EvaluationResult::Integer(p, _, _) => {
-                        if *p < 0 {
-                            return Err(EvaluationError::InvalidArgument(
-                                "round precision must be >= 0".to_string(),
-                            ));
+                        // A precision outside what a Decimal can hold (negative, or more
+                        // than rust_decimal's 28 fractional digits) yields empty, matching
+                        // lowBoundary()/highBoundary() (tests-fhir-r5.xml
+                        // testNegativeRoundPrecision / testHugeRoundPrecision).
+                        if !(0..=28).contains(p) {
+                            return Ok(EvaluationResult::Empty);
                         }
                         *p as u32
                     }
@@ -6672,7 +6674,7 @@ fn call_function(
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
         "section" | "entry" | "entryIn" | "resources" | "resourcesIn" | "sameSubject"
-        | "hasCoding" => {
+        | "isKnown" | "hasData" | "hasCoding" => {
             // FHIR document functions: an extension of the HL7 Java reference
             // implementation, not FHIRPath or the FHIR specification. See
             // document_functions.rs.
@@ -6934,6 +6936,8 @@ fn call_function(
                 "resources",
                 "resourcesIn",
                 "sameSubject",
+                "isKnown",
+                "hasData",
                 "hasCoding",
                 "sum",
                 "min",
@@ -7229,14 +7233,10 @@ fn add_duration_to_time(
 
 /// Rounds a decimal value to the specified number of decimal places
 fn round_to_precision(value: Decimal, precision: u32) -> Decimal {
-    // Calculate scaling factor (10^precision)
-    let mut scaling_factor = Decimal::from(1);
-    for _ in 0..precision {
-        scaling_factor *= Decimal::from(10);
-    }
-
-    // Multiply by scaling factor, round, and divide by scaling factor
-    (value * scaling_factor).round() / scaling_factor
+    // Same midpoint rule as the former `(value * 10^p).round() / 10^p`, without
+    // building 10^p: that overflowed (and panicked) once 10^p or value * 10^p
+    // passed Decimal::MAX, e.g. any precision above 28.
+    value.round_dp(precision)
 }
 
 /// Computes the square root of a Decimal value using the Newton-Raphson method

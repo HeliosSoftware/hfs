@@ -677,6 +677,12 @@ where
                         }
                     }
                 }
+                // An instance read runs inside the storage transaction on
+                // `bundle_entry.url`; it reads the address judged above and
+                // nothing else.
+                if let Some(GetEntryTarget::Read { resource_type, id }) = &get_target {
+                    bundle_entry.url = format!("{resource_type}/{id}");
+                }
                 // Everything but an instance read runs after the commit (see
                 // below), with the compartment judged above.
                 let deferred = get_target
@@ -3008,31 +3014,6 @@ impl EntryParseError {
     }
 }
 
-/// Interprets a bundle-entry GET url as a type-level search, if it is one.
-///
-/// Per the FHIR spec, a GET entry may carry any read OR search URL
-/// (`Patient?name=x`, or bare `Patient` for an unfiltered type search).
-/// Returns the resource type and the parsed query pairs, or `None` when the
-/// url addresses a specific instance (`Patient/123`) and should be a read.
-fn parse_search_entry_url(url: &str) -> Option<(String, Vec<(String, String)>)> {
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (url, None),
-    };
-    let parts: Vec<&str> = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    match parts.as_slice() {
-        [resource_type] => Some((
-            resource_type.to_string(),
-            crate::extractors::query_pairs::parse_query_pairs(query),
-        )),
-        _ => None,
-    }
-}
-
 /// What a `GET` entry's `request.url` asks for, decided once before dispatch the
 /// way the router decides the direct request (#478, #2380).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3071,13 +3052,14 @@ struct DeferredGet {
 
 /// Classifies a `GET` entry's `request.url`.
 ///
-/// The path is read as [`parse_search_entry_url`] reads it: a leading `/` is
-/// tolerated and empty segments are dropped. The history shapes are `_history`,
-/// `[type]/_history`, `[type]/[id]/_history` and `[type]/[id]/_history/[vid]`;
-/// a path with a `_history` segment in any other place is an error, because
-/// answering it as a read of its first two segments would return different data
-/// from what the URL asks for. Anything else is a search (one segment) or a read
-/// of the first two segments, as before; a query on a read or vread is ignored.
+/// A leading `/` is tolerated and empty segments are dropped. The history
+/// shapes are `_history`, `[type]/_history`, `[type]/[id]/_history` and
+/// `[type]/[id]/_history/[vid]`; a path with a `_history` segment in any other
+/// place is an error, because answering it as a read of its first two segments
+/// would return different data from what the URL asks for. One segment is a
+/// search and exactly two are a read; a deeper path is an error for the same
+/// reason, since the storage layer reads the last two segments of an entry
+/// URL. A query on a read or vread is ignored.
 ///
 /// The error is the message of the `400` / `value` entry (batch) or of the
 /// failed bundle (transaction).
@@ -3129,16 +3111,20 @@ fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
             "GET {url} is not a read, vread, history or search URL: _history may only end a \
              [type]/[id], [type] or system URL, or be followed by a version id"
         )),
-        _ => Ok(match parse_search_entry_url(url) {
-            Some((resource_type, pairs)) => GetEntryTarget::Search {
-                resource_type,
-                pairs,
-            },
-            None => GetEntryTarget::Read {
-                resource_type: segments[0].to_string(),
-                id: segments[1].to_string(),
-            },
+        [resource_type] => Ok(GetEntryTarget::Search {
+            resource_type: (*resource_type).to_string(),
+            pairs: pairs(),
         }),
+        // Exactly the address the scope check judges: the storage layer
+        // parsers take the last two segments of an entry URL, so a deeper
+        // path would be judged on one type and read on another.
+        [resource_type, id] => Ok(GetEntryTarget::Read {
+            resource_type: (*resource_type).to_string(),
+            id: (*id).to_string(),
+        }),
+        _ => Err(format!(
+            "GET {url} is not a read, vread, history or search URL: a read is [type]/[id]"
+        )),
     }
 }
 
@@ -4257,25 +4243,6 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    /// #478: the read-or-search split on a bundle GET url. Instance addresses
-    /// stay reads; type-level urls (with or without a query) are searches.
-    #[test]
-    fn parse_search_entry_url_splits_reads_from_searches() {
-        let (rt, pairs) = parse_search_entry_url("Patient?name=x&gender=female").expect("search");
-        assert_eq!(rt, "Patient");
-        assert_eq!(pairs.len(), 2);
-
-        // Bare type: an unfiltered type search, leading slash tolerated.
-        let (rt, pairs) = parse_search_entry_url("/Patient").expect("bare type search");
-        assert_eq!(rt, "Patient");
-        assert!(pairs.is_empty());
-
-        // Instance reads and deeper paths are not searches.
-        assert!(parse_search_entry_url("Patient/123").is_none());
-        assert!(parse_search_entry_url("Patient/123/_history/1").is_none());
-        assert!(parse_search_entry_url("").is_none());
-    }
-
     /// #2380: every GET entry shape is sorted once, before dispatch. A
     /// `_history` URL of none of the history shapes is an error, not a read of
     /// its first two segments.
@@ -4315,10 +4282,10 @@ mod tests {
             ("Patient", search("Patient", &[])),
             ("/Patient", search("Patient", &[])),
             ("Patient?name=x", search("Patient", &[("name", "x")])),
-            // Reads, whatever follows the id that is not a history.
+            // Reads: exactly [type]/[id].
             ("Patient/p1", read("Patient", "p1")),
+            ("/Patient/p1", read("Patient", "p1")),
             ("Patient/p1?_format=json", read("Patient", "p1")),
-            ("Patient/p1/foo", read("Patient", "p1")),
             // Vreads.
             ("Patient/p1/_history/2", vread("2")),
             ("/Patient/p1/_history/2?_format=json", vread("2")),
@@ -4361,6 +4328,12 @@ mod tests {
 
         for url in [
             "Patient/p1/_history/2/extra",
+            // Judged on the first two segments, executed on the last two:
+            // a deeper path is no read.
+            "Patient/p1/foo",
+            "Patient/any/Observation/obs-1",
+            "Patient/Observation/obs-1",
+            "http://localhost:8080/Patient/p1",
             "_history/x",
             "Patient/_history/x",
             "_history/_history",

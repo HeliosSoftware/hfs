@@ -22,9 +22,9 @@ R6 = ["helios-fhir/R6"]
 otel = ["helios-observability/otel"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.9", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.9" }
-helios-observability = { path = "../observability", version = "0.2.9" }
+helios-fhir = { path = "../fhir", version = "0.2.10", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.10" }
+helios-observability = { path = "../observability", version = "0.2.10" }
 chumsky = "0.10"
 chrono = { workspace = true } # For date/time parsing and functions
 rust_decimal = { version = "1.0", features = ["serde-with-float", "macros"] }
@@ -36,7 +36,7 @@ once_cell = "1.0" # For lazy initialization of static values
 lazy_static = "1.4" # For lazy static initialization of tokio runtime
 base64 = "0.22" # For encode/decode functions
 hex = "0.4" # For hex encode/decode functions
-octofhir-ucum = { version = "0.5", features = ["fhir"] } # For UCUM unit handling and conversion
+octofhir-ucum = { version = "0.9.3", features = ["fhir"] } # For UCUM unit handling and conversion
 reqwest = { version = "0.12", features = ["json"] } # For terminology server HTTP calls
 httpdate = "1" # Retry-After HTTP-date parsing for terminology rate limits (#1856)
 parking_lot = "0.12" # For better mutexes than std

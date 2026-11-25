@@ -1100,7 +1100,8 @@ async fn create_audit_postgres_storage(
                 "HFS_AUDIT_DATABASE_URL must be a PostgreSQL connection string when primary backend is postgres"
             );
         }
-        let mut backend_config = PostgresBackend::config_from_connection_string(url)?;
+        let mut backend_config =
+            PostgresBackend::config_from_named_connection_string(url, "HFS_AUDIT_DATABASE_URL")?;
         backend_config.fhir_version = server_config.default_fhir_version;
         backend_config.data_dir = server_config.data_dir.clone();
         PostgresBackend::new(backend_config).await?
@@ -1358,11 +1359,11 @@ async fn create_postgres_backend(
             backend_config
         } else {
             info!("Initializing PostgreSQL backend from environment variables");
-            PostgresBackend::config_from_env()
+            PostgresBackend::config_from_env()?
         }
     } else {
         info!("Initializing PostgreSQL backend from environment variables");
-        PostgresBackend::config_from_env()
+        PostgresBackend::config_from_env()?
     };
     backend_config.fhir_version = config.default_fhir_version;
     backend_config.data_dir = config.data_dir.clone();
@@ -1927,18 +1928,20 @@ async fn init_auth_with_audit(
     // The web UI's browser login (#1449) shares one session store between the
     // REST auth layer (which turns the session cookie into a bearer) and the
     // UI (which establishes sessions). Built here, before either is mounted.
+    let provider: Arc<dyn helios_auth::AuthProvider> = Arc::new(provider);
     let sessions = init_login_sessions(&auth_config, public_base_url).await?;
     #[cfg(feature = "ui")]
     if let Some(sessions) = &sessions {
         helios_ui::set_interactive_login(helios_ui::LoginRuntime {
             sessions: Arc::clone(sessions),
+            provider: Arc::clone(&provider),
         });
     }
     #[cfg(feature = "ui")]
     helios_ui::set_bearer_only_auth(sessions.is_none());
 
     let auth_state = Arc::new(AuthMiddlewareState {
-        provider: Arc::new(provider),
+        provider,
         config: Arc::new(auth_config.clone()),
         audit_sink,
         audit_source_observer: audit_config.source_observer.clone(),
@@ -3580,6 +3583,8 @@ fn spawn_submit_workers(
         }
     }
     let batch_size = cfg.batch_size;
+    let manifest_fetch_timeout = std::time::Duration::from_secs(cfg.manifest_fetch_timeout_secs);
+    let max_line_bytes = cfg.max_line_bytes;
     // Batches of one file written concurrently; the engine caps it (SQLite
     // keeps one, PostgreSQL half its pool), and the stream driver keeps the
     // file watermark in file order whatever the width.
@@ -3663,7 +3668,9 @@ fn spawn_submit_workers(
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
+                    .with_manifest_fetch_timeout(manifest_fetch_timeout)
                     .with_batch_writers(batch_writers)
+                    .with_max_line_bytes(max_line_bytes)
                     .with_skip_unchanged(skip_unchanged)
                     .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {

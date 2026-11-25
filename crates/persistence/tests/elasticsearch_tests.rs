@@ -697,6 +697,11 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for quantity `Range` targets (#2602).
+/// Same `#[path]` arrangement.
+#[path = "search/quantity_range_suite.rs"]
+mod quantity_range_suite;
+
 /// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
 /// Same `#[path]` arrangement.
 #[path = "search/sort_missing_suite.rs"]
@@ -2068,6 +2073,15 @@ mod es_integration {
     async fn es_date_period_targets_are_ranges() {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
+    /// #2602: a `Range` was not indexed for quantity parameters. It is one
+    /// nested `{value, high}` interval now.
+    #[tokio::test]
+    async fn es_quantity_range_targets_are_intervals() {
+        let backend = create_backend().await;
+        super::quantity_range_suite::quantity_ranges_are_intervals(&backend, "quantity-range-2602")
+            .await;
     }
 
     /// #1606: a missing value came first on a descending sort. It comes last

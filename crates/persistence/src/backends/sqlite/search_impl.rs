@@ -411,6 +411,36 @@ impl SqliteBackend {
         self.search_with_connection_probe(conn, tenant, query, total, probe_enabled())
     }
 
+    /// The tenant's search-parameter registry for a query that carries a
+    /// `_filter`, the only clause that classifies parameters by registered
+    /// type; `None` for every other query, so they pay nothing.
+    ///
+    /// On a cache miss the tenant's stored overlay is read from `conn`, the
+    /// connection this search already holds, instead of asking the pool for a
+    /// second one (the #787 hazard, and a deadlock on a one-connection pool).
+    /// A failed read yields `None`: `_filter` then uses the name-list fallback.
+    pub(crate) fn filter_registry(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>> {
+        if !query.parameters.iter().any(|p| p.name == "_filter") {
+            return None;
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        if let Some(registry) = self.tenant_registries().cached(tenant_id) {
+            return Some(registry);
+        }
+        let stored = super::backend::load_tenant_stored_params_with_conn(
+            conn,
+            self.config().fhir_version,
+            tenant_id,
+        )
+        .ok()?;
+        Some(self.tenant_registries().build_and_cache(tenant_id, stored))
+    }
+
     /// [`Self::search_with_connection`] with the bounded probe forced on or
     /// off (`HFS_SQLITE_SEARCH_PROBE` decides in production).
     #[allow(clippy::type_complexity)]
@@ -471,6 +501,10 @@ impl SqliteBackend {
             let builder = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
                 .with_composite_rewrite(composite_rewrite);
+            let builder = match self.filter_registry(conn, tenant, query) {
+                Some(registry) => builder.with_registry(registry),
+                None => builder,
+            };
             let fragment = builder.build(query)?;
             if !fragment.sql.is_empty() {
                 Some(fragment)
@@ -941,9 +975,17 @@ fn search_ids_on(
     tenant: &TenantContext,
     query: &SearchQuery,
     cursor: Option<PageCursor>,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Page<String>> {
     with_composite_rewrite(conn, query, |rewrite| {
-        search_ids_on_plan(conn, tenant, query, cursor.clone(), rewrite)
+        search_ids_on_plan(
+            conn,
+            tenant,
+            query,
+            cursor.clone(),
+            rewrite,
+            registry.clone(),
+        )
     })
 }
 
@@ -953,15 +995,19 @@ fn search_ids_on_plan(
     query: &SearchQuery,
     cursor: Option<PageCursor>,
     composite_rewrite: bool,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Page<String>> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
     let param_offset = if cursor.is_some() { 4 } else { 2 };
     let search_filter = if !query.parameters.is_empty() {
-        let fragment = QueryBuilder::new(tenant_id, resource_type)
+        let mut builder = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(param_offset)
-            .with_composite_rewrite(composite_rewrite)
-            .build(query)?;
+            .with_composite_rewrite(composite_rewrite);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
+        let fragment = builder.build(query)?;
         if fragment.sql.is_empty() {
             None
         } else {
@@ -1061,9 +1107,10 @@ fn search_reference_values_on(
     tenant: &TenantContext,
     query: &SearchQuery,
     reference_param: &str,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<Vec<String>> {
     reject_legacy_composites(conn, tenant, query)?;
-    let (sql, params) = reference_values_statement(tenant, query, reference_param)?;
+    let (sql, params) = reference_values_statement(tenant, query, reference_param, registry)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn
         .prepare(&sql)
@@ -1081,6 +1128,7 @@ fn reference_values_statement(
     tenant: &TenantContext,
     query: &SearchQuery,
     reference_param: &str,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
@@ -1088,11 +1136,11 @@ fn reference_values_statement(
     let fragment = if query.parameters.is_empty() {
         None
     } else {
-        Some(
-            QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(2)
-                .build(query)?,
-        )
+        let mut builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
+        Some(builder.build(query)?)
     };
     let filter = fragment
         .as_ref()
@@ -1138,9 +1186,10 @@ fn search_count_on(
     conn: &rusqlite::Connection,
     tenant: &TenantContext,
     query: &SearchQuery,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<u64> {
     with_composite_rewrite(conn, query, |rewrite| {
-        search_count_on_plan(conn, tenant, query, rewrite)
+        search_count_on_plan(conn, tenant, query, rewrite, registry.clone())
     })
 }
 
@@ -1149,6 +1198,7 @@ fn search_count_on_plan(
     tenant: &TenantContext,
     query: &SearchQuery,
     composite_rewrite: bool,
+    registry: Option<std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
 ) -> StorageResult<u64> {
     reject_legacy_composites(conn, tenant, query)?;
     let tenant_id = tenant.tenant_id().as_str();
@@ -1159,9 +1209,12 @@ fn search_count_on_plan(
     let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
         || query.compartment.is_some()
     {
-        let builder = QueryBuilder::new(tenant_id, resource_type)
+        let mut builder = QueryBuilder::new(tenant_id, resource_type)
             .with_param_offset(2)
             .with_composite_rewrite(composite_rewrite);
+        if let Some(registry) = registry {
+            builder = builder.with_registry(registry);
+        }
         let fragment = builder.build(query)?;
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -1280,8 +1333,17 @@ impl SearchProvider for SqliteBackend {
         reject_unsupported_metadata_modifier(query)?;
         let tenant = tenant.clone();
         let query = query.clone();
-        self.run_blocking(move |conn| search_ids_on(conn, &tenant, &query, cursor))
-            .await
+        let this = self.clone();
+        self.run_blocking(move |conn| {
+            search_ids_on(
+                conn,
+                &tenant,
+                &query,
+                cursor,
+                this.filter_registry(conn, &tenant, &query),
+            )
+        })
+        .await
     }
 
     async fn search_count(
@@ -1301,8 +1363,16 @@ impl SearchProvider for SqliteBackend {
 
         let tenant = tenant.clone();
         let query = query.clone();
-        self.run_blocking(move |conn| search_count_on(conn, &tenant, &query))
-            .await
+        let this = self.clone();
+        self.run_blocking(move |conn| {
+            search_count_on(
+                conn,
+                &tenant,
+                &query,
+                this.filter_registry(conn, &tenant, &query),
+            )
+        })
+        .await
     }
 
     async fn search_reference_values(
@@ -1333,8 +1403,15 @@ impl SearchProvider for SqliteBackend {
         let tenant = tenant.clone();
         let query = query.clone();
         let reference_param = reference_param.to_string();
+        let this = self.clone();
         self.run_blocking(move |conn| {
-            search_reference_values_on(conn, &tenant, &query, &reference_param)
+            search_reference_values_on(
+                conn,
+                &tenant,
+                &query,
+                &reference_param,
+                this.filter_registry(conn, &tenant, &query),
+            )
         })
         .await
         .map(Some)
@@ -1356,6 +1433,21 @@ impl SearchProvider for SqliteBackend {
         param_type: crate::types::SearchParamType,
     ) -> Vec<&'static str> {
         Self::modifiers_for_type(param_type)
+    }
+
+    /// Every parameter except a `special` one the query builder builds no
+    /// condition for, which `search` refuses with `400` rather than widen the
+    /// result (#866): `near`, and from R5 `contains` and `section-text`.
+    /// `_text`, `_content` and `_filter` are evaluated, and the builder refuses
+    /// a `special` parameter from the same list.
+    fn serves_search_param(
+        &self,
+        _resource_type: &str,
+        code: &str,
+        param_type: crate::types::SearchParamType,
+    ) -> bool {
+        param_type != crate::types::SearchParamType::Special
+            || super::search::query_builder::EVALUATED_SPECIAL_PARAMETERS.contains(&code)
     }
 }
 
@@ -3696,7 +3788,7 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let (sql, params) = reference_values_statement(&tenant, &query, "patient").unwrap();
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient", None).unwrap();
         let conn = backend.get_connection().unwrap();
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -5316,8 +5408,8 @@ mod tests {
             }
             let query = SearchQuery::new("Observation").with_parameter(cvq(&values));
             assert_eq!(
-                search_count_on_plan(&conn, &tenant, &query, false).unwrap(),
-                search_count_on_plan(&conn, &tenant, &query, true).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, false, None).unwrap(),
+                search_count_on_plan(&conn, &tenant, &query, true, None).unwrap(),
                 "{values:?} total"
             );
         }
@@ -5400,8 +5492,8 @@ mod tests {
         let forced = backend.search_with_connection_plan(&conn, &tenant, &query, None, false, true);
         assert!(forced.unwrap_err().to_string().contains("no such index"));
         assert_eq!(
-            search_count_on(&conn, &tenant, &query).unwrap(),
-            search_count_on_plan(&conn, &tenant, &query, false).unwrap()
+            search_count_on(&conn, &tenant, &query, None).unwrap(),
+            search_count_on_plan(&conn, &tenant, &query, false, None).unwrap()
         );
     }
 

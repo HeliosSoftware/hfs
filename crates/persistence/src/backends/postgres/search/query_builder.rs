@@ -25,12 +25,6 @@ use crate::types::{
 // Keep generated SQL and bind counts small well before PostgreSQL's 65,535-parameter limit.
 const LARGE_ID_SET_THRESHOLD: usize = 1_000;
 
-/// Returns the implicit precision of a decimal search value from its string form
-/// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
-fn quantity_implicit_precision(num_str: &str) -> f64 {
-    crate::search::implicit_precision(num_str)
-}
-
 /// Escapes LIKE metacharacters in a user-supplied search value.
 ///
 /// Without this, `?name=100%` is a wildcard rather than a literal — the value is
@@ -276,33 +270,105 @@ impl QuantityPredicate {
     }
 }
 
+/// Renders an interval predicate over the columns `low_col` / `high_col`,
+/// mapping every bound through `map` (the identity for the raw columns, the
+/// UCUM conversion for the canonical ones; `None` aborts the whole predicate).
+/// Returns `None` when a bound cannot be mapped (`next` is then restored and
+/// `params` may hold stale binds the caller must discard); otherwise the SQL,
+/// with its binds pushed on `params` and `next` advanced by exactly that many.
+///
+/// Every comparison is strict (`IS NOT NULL` is implied), which is what lets
+/// the partial indexes on `value_quantity_value` / `value_quantity_high` serve
+/// it, and `idx_search_quantity_recent` (partial on `value IS NOT NULL OR high
+/// IS NOT NULL`) serve every prefix on the newest-first fast path. A conversion
+/// is assumed increasing, as every UCUM unit here is.
+///
+/// `ap` is two OR-ed groups. The first, `a <= value <= b`, is a two-sided range
+/// on `idx_search_quantity` and finds every point whatever its `high`. The
+/// second, `value < a AND high >= a AND high > value`, can only match a proper
+/// Range; its literal `high > value` conjunct (the `RangeOnly` bound) is what
+/// proves the predicate of the tiny `idx_search_quantity_range` /
+/// `idx_search_quantity_canonical_range` indexes, so the planner ORs the two
+/// indexes in a bitmap (measured: a selective `ap` reads ~100 buffers instead of
+/// walking every point in the window, and a broad one is served by the
+/// recent-first index).
+fn interval_sql(
+    predicate: &crate::search::QuantityIntervalPredicate,
+    low_col: &str,
+    high_col: &str,
+    map: impl Fn(f64) -> Option<f64>,
+    params: &mut Vec<SqlParam>,
+    next: &mut usize,
+) -> Option<String> {
+    use crate::search::{Cmp, QuantityBound};
+    let start = *next;
+    let mut groups = Vec::with_capacity(predicate.any_of.len());
+    for group in &predicate.any_of {
+        let mut terms = Vec::with_capacity(group.len());
+        for bound in group {
+            let (col, cmp, v) = match *bound {
+                QuantityBound::Low(c, v) => (low_col, c, v),
+                QuantityBound::High(c, v) => (high_col, c, v),
+                // Rendered with both columns, verbatim: the planner needs the
+                // exact `high > value` text to match the range indexes' WHERE.
+                QuantityBound::RangeOnly => {
+                    terms.push(format!("{high_col} > {low_col}"));
+                    continue;
+                }
+            };
+            let Some(v) = map(v) else {
+                *next = start;
+                return None;
+            };
+            let op = match cmp {
+                Cmp::Lt => "<",
+                Cmp::Le => "<=",
+                Cmp::Gt => ">",
+                Cmp::Ge => ">=",
+            };
+            *next += 1;
+            params.push(SqlParam::Float(v));
+            terms.push(format!("{col} {op} ${next}"));
+        }
+        groups.push(terms.join(" AND "));
+    }
+    Some(match groups.as_slice() {
+        [only] => only.clone(),
+        _ => format!(
+            "({})",
+            groups
+                .iter()
+                .map(|g| format!("({g})"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    })
+}
+
 fn quantity_predicate_parts(
     table: &str,
     prefix: SearchPrefix,
     raw_value: &str,
     next: &mut usize,
 ) -> Option<QuantityPredicate> {
-    /// Binds one float and returns its placeholder number.
-    fn bind(v: f64, params: &mut Vec<SqlParam>, next: &mut usize) -> usize {
-        *next += 1;
-        params.push(SqlParam::Float(v));
-        *next
-    }
-
     // Parse quantity: number|system|code (or number|code, or number), by the
     // grammar every backend shares — only an unescaped `|` separates.
     let quantity = unvalidated(crate::search::FhirQuantityValue::parse(raw_value))?;
-    let (num_str, num) = (quantity.number.text(), quantity.number.value);
+    let num = quantity.number.value;
     let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
-    // Raw branch: value comparison (exact for comparators, implicit-precision
-    // range for eq/ne, the shared window for ap) + the stored unit/system.
-    let (mut raw, mut params) = numeric_predicate(
-        &format!("{table}value_quantity_value"),
-        prefix,
-        &quantity.number,
-        next,
-    );
+    // The stored value is a closed interval `[value_quantity_value,
+    // value_quantity_high]` (a point for `Quantity`/`Age`, #2602); each prefix
+    // is a comparison of that interval with the search value, as the shared
+    // `quantity_interval_predicate` defines it.
+    let interval = quantity.number.interval_predicate(prefix);
+
+    // Raw branch: the interval comparison + the stored unit/system.
+    let mut params: Vec<SqlParam> = Vec::new();
+    let low_col = format!("{table}value_quantity_value");
+    let high_col = format!("{table}value_quantity_high");
+    let mut raw = interval_sql(&interval, &low_col, &high_col, Some, &mut params, next)
+        .unwrap_or_else(|| "FALSE".to_string());
     if let Some(c) = code {
         *next += 1;
         params.push(SqlParam::text(c));
@@ -314,68 +380,27 @@ fn quantity_predicate_parts(
         raw.push_str(&format!(" AND {table}value_quantity_system = ${next}"));
     }
 
-    // Canonical branch on the canonical columns so unit equivalents
-    // match (g ⇄ mg). Bounds are canonicalized in the search unit before
+    // Canonical branch on the canonical columns so unit equivalents match
+    // (g ⇄ mg). The bounds are canonicalized in the search unit before
     // comparison. Skipped for non-convertible units; `ne` also uses this
-    // branch (negated range) so it matches the raw-OR-canonical `eq`
-    // semantics inverted, same as SQLite's `build_canonical_condition`.
+    // branch so it matches the raw-OR-canonical `eq` semantics inverted, same
+    // as SQLite's `build_canonical_condition`.
     let mut canonical = None;
     if let Some(c) = code {
         if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
             let canon = |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
-            // Both ends of a window, canonicalized and put in order (a
-            // conversion may be decreasing).
-            let canon_window = |a: f64, b: f64| match (canon(a), canon(b)) {
-                (Some(a), Some(b)) => Some(if a <= b { (a, b) } else { (b, a) }),
-                _ => None,
-            };
-            let col = format!("{table}value_quantity_canonical_value");
-            // Comparators match the exact canonicalized value:
-            // gt/sa → > canon(num), lt/eb → < canon(num),
-            // ge → ≥ canon(num), le → ≤ canon(num). Precision
-            // only bounds `eq`/`ne` (below).
-            let range: Option<String> = match prefix {
-                SearchPrefix::Gt | SearchPrefix::Sa => {
-                    canon(num).map(|b| format!("{col} > ${}", bind(b, &mut params, next)))
-                }
-                SearchPrefix::Lt | SearchPrefix::Eb => {
-                    canon(num).map(|b| format!("{col} < ${}", bind(b, &mut params, next)))
-                }
-                SearchPrefix::Ge => {
-                    canon(num).map(|b| format!("{col} >= ${}", bind(b, &mut params, next)))
-                }
-                SearchPrefix::Le => {
-                    canon(num).map(|b| format!("{col} <= ${}", bind(b, &mut params, next)))
-                }
-                SearchPrefix::Ap => {
-                    let (lo, hi) = quantity.number.approx_range();
-                    canon_window(lo, hi).map(|(lo, hi)| {
-                        let lo_p = bind(lo, &mut params, next);
-                        let hi_p = bind(hi, &mut params, next);
-                        format!("{col} BETWEEN ${lo_p} AND ${hi_p}")
-                    })
-                }
-                // Ne: negated implicit-precision range, mirroring the raw
-                // branch's `numeric_predicate` shape for `Ne`.
-                SearchPrefix::Ne => {
-                    let half = quantity_implicit_precision(num_str) / 2.0;
-                    canon_window(num - half, num + half).map(|(lo, hi)| {
-                        let lo_p = bind(lo, &mut params, next);
-                        let hi_p = bind(hi, &mut params, next);
-                        format!("({col} < ${lo_p} OR {col} >= ${hi_p})")
-                    })
-                }
-                // Eq: implicit-precision range.
-                SearchPrefix::Eq => {
-                    let half = quantity_implicit_precision(num_str) / 2.0;
-                    canon_window(num - half, num + half).map(|(lo, hi)| {
-                        let lo_p = bind(lo, &mut params, next);
-                        let hi_p = bind(hi, &mut params, next);
-                        format!("{col} >= ${lo_p} AND {col} < ${hi_p}")
-                    })
-                }
-            };
-            if let Some(range) = range {
+            let mut canon_params = Vec::new();
+            let low_col = format!("{table}value_quantity_canonical_value");
+            let high_col = format!("{table}value_quantity_canonical_high");
+            if let Some(range) = interval_sql(
+                &interval,
+                &low_col,
+                &high_col,
+                canon,
+                &mut canon_params,
+                next,
+            ) {
+                params.extend(canon_params);
                 *next += 1;
                 params.push(SqlParam::text(&cunit));
                 canonical = Some(format!(
@@ -756,6 +781,14 @@ pub struct PostgresQueryBuilder;
 fn is_relative_type_id(value: &str) -> bool {
     !value.starts_with("http://") && !value.starts_with("https://")
 }
+
+/// The `special` parameters `build_parameter_condition` evaluates, by name.
+/// `build_parameter_condition` gives every other `special` parameter with a
+/// value no condition, which the caller refuses ([`unevaluable_parameter`]).
+/// The backend's `SearchProvider::serves_search_param` reads the same list, so
+/// `/metadata` lists only what this builder evaluates (#2593); a test pins the
+/// list to the name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 2] = ["_text", "_content"];
 
 /// The refusal for a parameter the builders have values for but no condition to
 /// build from (#2508): a `special`-typed parameter no arm of
@@ -1884,6 +1917,11 @@ impl PostgresQueryBuilder {
                     crate::types::SortDirection::Descending if col == "value_date" => {
                         ("MAX", "value_date_end")
                     }
+                    // Likewise a quantity row covers `[value, high]` (#2602): a
+                    // `Range` sorts descending by its upper end.
+                    crate::types::SortDirection::Descending if col == "value_quantity_value" => {
+                        ("MAX", "value_quantity_high")
+                    }
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
@@ -1928,12 +1966,28 @@ impl PostgresQueryBuilder {
             return Some(match_nothing());
         }
 
-        // Handle special parameters
+        // `_id` and `_lastUpdated` are built from `resources` by name, whatever
+        // type the parameter carries, so the gate below is not theirs.
         match param.name.as_str() {
             "_id" => return Self::build_id_condition(param, param_offset),
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
+            _ => {}
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+        {
+            return None;
+        }
+
+        match param.name.as_str() {
             // Full text over the generated narrative (`_text`) and over the whole
             // serialized resource (`_content`), against the same `resource_fts`
             // tsvector columns the write path populates.
@@ -3706,7 +3760,7 @@ mod tests {
                         .contains("WITH scoped_quantity AS MATERIALIZED")
                 );
                 assert!(fragment.sql.contains("resource_id = resources.id"));
-                assert!(fragment.sql.contains("value_quantity_canonical_value"));
+                assert!(fragment.sql.contains("value_quantity_canonical_"));
                 assert!(fragment.sql.contains(" OR "));
                 let mut next = offset;
                 let mut expected = vec![];
@@ -5228,7 +5282,7 @@ mod tests {
         let frag = accepted(&query, 2).expect("condition");
 
         assert!(
-            frag.sql.contains("value_quantity_canonical_value > $"),
+            frag.sql.contains("value_quantity_canonical_high > $"),
             "{}",
             frag.sql
         );
@@ -5259,7 +5313,7 @@ mod tests {
 
         assert!(
             frag.sql.contains(
-                "(value_quantity_canonical_value < $7 OR value_quantity_canonical_value >= $8)"
+                "((value_quantity_canonical_value < $7) OR (value_quantity_canonical_high >= $8))"
             ),
             "expected a negated canonical range: {}",
             frag.sql
@@ -5302,7 +5356,7 @@ mod tests {
 
         assert!(
             frag.sql
-                .contains("value_quantity_value >= $3 AND value_quantity_value < $4"),
+                .contains("value_quantity_value >= $3 AND value_quantity_high < $4"),
             "{}",
             frag.sql
         );
@@ -5312,6 +5366,64 @@ mod tests {
                 assert_eq!(*hi, 60.05);
             }
             other => panic!("expected two float params, got {other:?}"),
+        }
+    }
+
+    /// A quantity row is the closed interval `[value, high]` (#2602): the
+    /// prefixes that look above the interval read `high`, those that look
+    /// below read the low end, and `ap` overlaps both.
+    #[test]
+    fn quantity_prefixes_compare_the_stored_interval() {
+        for (prefix, expect) in [
+            (SearchPrefix::Gt, "value_quantity_high > $3"),
+            (SearchPrefix::Ge, "value_quantity_high >= $3"),
+            (SearchPrefix::Eb, "value_quantity_high < $3"),
+            (SearchPrefix::Lt, "value_quantity_value < $3"),
+            (SearchPrefix::Le, "value_quantity_value <= $3"),
+            (SearchPrefix::Sa, "value_quantity_value > $3"),
+            (
+                SearchPrefix::Ap,
+                "((value_quantity_value >= $3 AND value_quantity_value <= $4) OR \
+                 (value_quantity_value < $5 AND value_quantity_high >= $6 \
+                 AND value_quantity_high > value_quantity_value))",
+            ),
+        ] {
+            let query = SearchQuery::new("Condition").with_parameter(quantity_param(prefix, "45"));
+            let frag = accepted(&query, 2).expect("condition");
+            assert!(frag.sql.contains(expect), "{prefix:?}: {}", frag.sql);
+        }
+    }
+
+    /// `ap` is two disjoint groups (#2602): every point by a two-sided range on
+    /// the value column, then only proper Ranges by the literal `high > value`
+    /// conjunct the range indexes' partial predicate needs. Bind order is the
+    /// groups' order: `a`, `b`, `a`.
+    #[test]
+    fn quantity_ap_splits_points_from_ranges() {
+        let query =
+            SearchQuery::new("Condition").with_parameter(quantity_param(SearchPrefix::Ap, "45"));
+        let frag = accepted(&query, 2).expect("condition");
+        assert!(
+            frag.sql.contains(
+                "((value_quantity_value >= $3 AND value_quantity_value <= $4) OR \
+                 (value_quantity_value < $5 AND value_quantity_high >= $6 \
+                 AND value_quantity_high > value_quantity_value))"
+            ),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 4, "{}", frag.sql);
+        // With a unit the canonical branch repeats the shape on its own columns.
+        let with_unit = SearchQuery::new("Condition").with_parameter(quantity_param(
+            SearchPrefix::Ap,
+            "45|http://unitsofmeasure.org|mg",
+        ));
+        let frag = accepted(&with_unit, 2).expect("condition");
+        for needle in [
+            "value_quantity_high > value_quantity_value",
+            "value_quantity_canonical_high > value_quantity_canonical_value",
+        ] {
+            assert!(frag.sql.contains(needle), "{needle}: {}", frag.sql);
         }
     }
 
@@ -5715,6 +5827,70 @@ mod tests {
                 message.contains(&format!("every {resource_type}")),
                 "{message}"
             );
+        }
+    }
+
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what the builder evaluates (#2593), in both index
+    /// layouts: of every `special` parameter the enabled specs register, and
+    /// `_text` and `_content`, the ones it names build and every other is
+    /// refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_the_builder_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let query = SearchQuery::new("Location")
+                .with_parameter(special_param(&code, vec![SearchValue::eq("x")]));
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout);
+                if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                    built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+                } else {
+                    match built {
+                        Err(SearchError::QueryParseError { message }) => {
+                            assert!(message.contains("widen"), "{code}: {message}")
+                        }
+                        other => panic!("{code} is not listed as evaluated, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id` and `_lastUpdated`,
+    /// typed `special`, build the same condition as with their registry type,
+    /// in both index layouts, as they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, SearchValue::eq("p1")),
+            (
+                "_lastUpdated",
+                SearchParamType::Date,
+                SearchValue::new(crate::types::SearchPrefix::Gt, "2020-01-01"),
+            ),
+        ] {
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let build = |param_type| {
+                    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                        name: name.to_string(),
+                        param_type,
+                        modifier: None,
+                        values: vec![value.clone()],
+                        chain: vec![],
+                        components: vec![],
+                    });
+                    let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout)
+                        .unwrap_or_else(|e| panic!("{name} as {param_type:?} ({layout:?}): {e:?}"));
+                    format!("{built:?}")
+                };
+                assert_eq!(
+                    build(SearchParamType::Special),
+                    build(registry_type),
+                    "{name} ({layout:?})"
+                );
+            }
         }
     }
 
@@ -7139,15 +7315,17 @@ mod tests {
     #[test]
     fn valid_quantity_forms_still_build() {
         // The number part decides validity; system and code are free text.
+        // `eq` binds its window twice (the implied bounds on the low and high
+        // columns, #2602): four numbers, then the unit and system.
         for (value, binds) in [
-            ("5.4", 2),
-            ("-5.4", 2),
-            ("+5.4", 2),
-            ("1e3", 2),
-            ("1.5E-2", 2),
+            ("5.4", 4),
+            ("-5.4", 4),
+            ("+5.4", 4),
+            ("1e3", 4),
+            ("1.5E-2", 4),
             // Non-convertible unit: raw branch only (value range + unit).
-            ("5.4|a\\|b", 3),
-            ("5.4|http://unitsofmeasure.org|a\\|b", 4),
+            ("5.4|a\\|b", 5),
+            ("5.4|http://unitsofmeasure.org|a\\|b", 6),
         ] {
             let query = SearchQuery::new("Observation")
                 .with_parameter(quantity_param(SearchPrefix::Eq, value));
@@ -7161,7 +7339,7 @@ mod tests {
             .with_parameter(quantity_param(SearchPrefix::Eq, "5.4||a\\|b"));
         let frag = accepted(&query, 2).expect("condition");
         assert!(
-            matches!(frag.params.get(2), Some(SqlParam::Text(unit)) if unit == "a|b"),
+            matches!(frag.params.get(4), Some(SqlParam::Text(unit)) if unit == "a|b"),
             "{:?}",
             frag.params
         );
@@ -7199,8 +7377,9 @@ mod tests {
         let frag = accepted(&query, 2).expect("condition");
 
         assert!(frag.sql.starts_with("(FALSE) OR ("), "{}", frag.sql);
+        // `gt` compares the interval's upper end (#2602).
         assert!(
-            frag.sql.contains("value_quantity_value > $3"),
+            frag.sql.contains("value_quantity_high > $3"),
             "{}",
             frag.sql
         );

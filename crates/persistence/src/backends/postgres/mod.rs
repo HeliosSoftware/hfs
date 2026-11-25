@@ -90,6 +90,7 @@ mod search_impl;
 mod sof_terminology;
 mod storage;
 mod sync_failures;
+pub mod tls;
 mod transaction;
 mod user_settings;
 
@@ -98,5 +99,6 @@ pub use backend::{PostgresBackend, PostgresConfig};
 /// [`PostgresBackend::pool_status`], re-exported so callers need no direct
 /// deadpool dependency.
 pub use deadpool_postgres::Status as PoolStatus;
+pub use tls::{PostgresSslMode, PostgresTlsSettings};
 
 pub use transaction::PostgresTransaction;

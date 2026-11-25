@@ -81,6 +81,14 @@ fn es_order(direction: SortDirection, paging: CursorDirection) -> &'static str {
     if ascending { "asc" } else { "desc" }
 }
 
+/// The `special` parameters [`EsQueryBuilder::build`] evaluates, by name.
+/// `build_parameter_clause` gives every other `special` parameter with a value
+/// no clause, which `build` refuses ([`unevaluable_parameter`]). The backend's
+/// `SearchProvider::serves_search_param` reads the same list, so `/metadata`
+/// lists only what this builder evaluates (#2593); a test pins the list to the
+/// name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 2] = ["_text", "_content"];
+
 /// The refusal for a parameter [`EsQueryBuilder::build`] has values for but no
 /// clause to build from (#2510): a `special`-typed parameter (`Location.near`,
 /// `_type` on R5/R6, `_filter`), which no handler evaluates and nothing
@@ -386,10 +394,26 @@ impl<'a> EsQueryBuilder<'a> {
         }
 
         // Handle special parameters. Each returns `None` only for a parameter
-        // with no values.
+        // with no values. `_id` and `_lastUpdated` are built by name, whatever
+        // type the parameter carries, so the gate below is not theirs.
         match param.name.as_str() {
             "_id" => return Ok(self.build_id_clause(param)),
             "_lastUpdated" => return Ok(self.build_last_updated_clause(param)),
+            _ => {}
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+        {
+            return Ok(None);
+        }
+
+        match param.name.as_str() {
             "_text" => return Ok(fts::build_text_clause(param)),
             "_content" => return Ok(fts::build_content_clause(param)),
             _ => {}
@@ -621,6 +645,10 @@ impl<'a> EsQueryBuilder<'a> {
                         }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
+                        // A quantity is an interval `[value, high]` (#2602).
+                        // Both directions sort on `value`: a Range also
+                        // indexes its upper bound as a sort-only entry (see
+                        // `sort_name`), which only a descending sort selects.
                         Some(SearchParamType::Quantity) => {
                             ("quantity", "search_params.quantity.value")
                         }
@@ -652,14 +680,29 @@ impl<'a> EsQueryBuilder<'a> {
                     } else {
                         "_last"
                     };
+                    let mut nested_filter =
+                        json!({ "term": { format!("search_params.{group}.name"): name } });
+                    // A descending quantity sort also selects the sort-only
+                    // entry holding a Range's upper bound. It has no `name`,
+                    // so no filter sees it; a term on `sort_name` matches
+                    // nothing in an index that does not map the field yet.
+                    if group == "quantity"
+                        && matches!(directive.direction, SortDirection::Descending)
+                    {
+                        nested_filter = json!({ "bool": {
+                            "should": [
+                                nested_filter,
+                                { "term": { "search_params.quantity.sort_name": name } }
+                            ],
+                            "minimum_should_match": 1
+                        }});
+                    }
                     let mut clause = json!({
                         "order": order,
                         "mode": mode,
                         "nested": {
                             "path": format!("search_params.{group}"),
-                            "filter": {
-                                "term": { format!("search_params.{group}.name"): name }
-                            }
+                            "filter": nested_filter
                         },
                         "missing": missing
                     });
@@ -1355,6 +1398,54 @@ mod tests {
         );
     }
 
+    /// #2602: a quantity sorts on `value` in both directions; only the
+    /// descending one also selects the sort-only entry holding a Range's
+    /// upper bound, and it keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_quantity_sort_reads_value_in_both_directions() {
+        let builder =
+            EsQueryBuilder::new("acme", "Observation", "hfs_acme_observation".to_string());
+        for (direction, order, mode) in [
+            (SortDirection::Ascending, "asc", "min"),
+            (SortDirection::Descending, "desc", "max"),
+        ] {
+            let descending = matches!(direction, SortDirection::Descending);
+            let query = SearchQuery::new("Observation").with_sort(SortDirective {
+                parameter: "value-quantity".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Quantity),
+            });
+            let sort = &builder.build(&query).unwrap().body["sort"][0];
+            let clause = &sort["search_params.quantity.value"];
+            assert!(!clause.is_null(), "quantity sorts on value, got {sort}");
+            assert!(sort["search_params.quantity.high"].is_null());
+            assert_eq!(clause["order"], order);
+            assert_eq!(clause["mode"], mode);
+            assert_eq!(clause["missing"], "_last");
+            assert_eq!(clause["nested"]["path"], "search_params.quantity");
+            let filter = &clause["nested"]["filter"];
+            if descending {
+                let should = filter["bool"]["should"].as_array().unwrap();
+                assert_eq!(should.len(), 2);
+                assert_eq!(
+                    should[0]["term"]["search_params.quantity.name"],
+                    "value-quantity"
+                );
+                assert_eq!(
+                    should[1]["term"]["search_params.quantity.sort_name"],
+                    "value-quantity"
+                );
+                assert_eq!(filter["bool"]["minimum_should_match"], 1);
+            } else {
+                assert_eq!(
+                    filter["term"]["search_params.quantity.name"],
+                    "value-quantity"
+                );
+                assert!(filter["bool"].is_null());
+            }
+        }
+    }
+
     #[test]
     fn test_token_sort_descending_uses_max_mode() {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
@@ -1712,6 +1803,62 @@ mod tests {
         ] {
             let message = refusal(builder.build(&query), label);
             assert!(message.contains("'near'"), "{label}: {message}");
+        }
+    }
+
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what `build` evaluates (#2593): of every `special`
+    /// parameter the enabled specs register, and `_text` and `_content`, the
+    /// ones it names build and every other is refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_build_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let query = SearchQuery::new("Location").with_parameter(param_with(
+                &code,
+                SearchParamType::Special,
+                None,
+                &["x"],
+            ));
+            let built = es_builder("Location").build(&query);
+            if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+            } else {
+                assert!(
+                    refusal(built, &code).contains("widen"),
+                    "{code} is not listed as evaluated"
+                );
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id` and `_lastUpdated`,
+    /// typed `special`, build the same clause as with their registry type, as
+    /// they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, "p1"),
+            ("_lastUpdated", SearchParamType::Date, "2020-01-01"),
+        ] {
+            let build = |param_type| {
+                let query = SearchQuery::new("Patient").with_parameter(param_with(
+                    name,
+                    param_type,
+                    None,
+                    &[value],
+                ));
+                let built = es_builder("Patient")
+                    .build(&query)
+                    .unwrap_or_else(|e| panic!("{name} as {param_type:?}: {e:?}"));
+                format!("{built:?}")
+            };
+            assert_eq!(
+                build(SearchParamType::Special),
+                build(registry_type),
+                "{name}"
+            );
         }
     }
 

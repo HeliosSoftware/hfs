@@ -406,6 +406,27 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
 | [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ‡✓  |
 
+**What `/metadata` lists.** Each resource's `searchParam` list keeps only the parameters the
+configured backend's `SearchProvider::serves_search_param` serves (#2593). For the common `_text`
+and `_content` it follows the Special Parameters rows above. `_filter` is not listed on any
+backend, SQLite included: `/metadata` lists no registered parameter whose code starts with `_`
+other than the common ones.
+
+- SQLite, PostgreSQL and Elasticsearch list `_text` and `_content` but no `special` parameter
+  they build no condition for: `Location.near`, and from R5 `Location.contains` and
+  `Composition.section-text`. A search for one answers `400`.
+- MongoDB lists no `special` parameter except `_list`: `_text` and `_content` answer `501` (the
+  ○ cells above), and `near`, `contains` and `section-text` answer `400`.
+- `_list`, and from R5 `_in`, are listed wherever the backend serves `_id`: the REST layer
+  resolves both into an `_id` filter before the backend runs.
+- A composite parameter is listed only when each of its components is in the registry and
+  served. So no backend lists `Composition.section-code-text` (R5 and later), whose
+  `section-text` component no backend evaluates, nor the R5 and R6 composites whose component
+  definitions the spec bundles do not publish (`Ingredient.strength-concentration-ratio` in
+  both, `ResearchStudy.progress-status-state-actual` in R5 only, ...; #2774 lists them).
+- A composite backend answers for the backend its search reaches, so `sqlite-elasticsearch`
+  follows Elasticsearch.
+
 **Notes on partial cells:**
 
 - **Sorting** — SQLite and PostgreSQL sort by any indexed search parameter (string, token,
@@ -685,6 +706,8 @@ SQLite handles CRUD, versioning, history, and transactions. Elasticsearch handle
 
 **Upgrading from a build before #2394.** The Elasticsearch mapping gains `search_params.reference.reference_target` (schema version 3), added to existing indices at startup. Documents indexed before that have no such field, so references stored as absolute URLs (`http(s)://host/fhir/Patient/p1`) are not found by `Type/id` searches or by `_revinclude` until you run `POST /$reindex`. Relative references are unaffected, nothing is lost, and the startup log warns once per affected index. Run `$reindex` once after upgrading.
 
+**Upgrading from a build before #2602.** The mapping also gains `search_params.quantity.high`, `quantity.canonical_high` and `quantity.sort_name` (schema version 4), added in place; no document is rewritten. `Quantity` and `Age` need nothing: filters fall back to `value` for an entry without `high`, and every quantity sort reads `value`. A `Range` with `low != high` also indexes a second, sort-only nested entry (`sort_name` and its upper bound as `value`, no `name`, so no filter or `:missing` sees it) that a descending sort selects. Only `Range` values (`onset-age`, `abatement-age`, `context-quantity`) stored before the upgrade were never indexed, so run `POST /<type>/$reindex` (per tenant) once to make them searchable and sortable by their upper bound. See [Quantity prefix semantics](#sqlite-search-implementation) and the mixed-version notes under "Mixed versions during the upgrade" and [Rolling back from #2602](#rolling-back-from-2602).
+
 ```bash
 # Build with Elasticsearch support
 cargo build --bin hfs --features sqlite,elasticsearch --release
@@ -829,7 +852,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with PostgreSQL and Elasticsearch support
@@ -1819,7 +1842,7 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with MongoDB and Elasticsearch support
@@ -1865,7 +1888,7 @@ S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (inge
 
 **Prerequisites:** An AWS S3 bucket (or S3-compatible service) and a running Elasticsearch 8.x instance.
 
-**Upgrading from a build before #2394:** run `POST /$reindex` once; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
+**Upgrading from a build before #2394:** run `POST /$reindex` once. From a build before #2602, `$reindex` is needed only to make stored `Range` values searchable; see [SQLite + Elasticsearch](#sqlite--elasticsearch).
 
 ```bash
 # Build with S3 and Elasticsearch support
@@ -2855,7 +2878,7 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] History provider traits (instance, type, system)
 - [x] Search provider traits (basic, chained, \_include, terminology)
 - [x] Transaction traits (ACID, bundles)
-- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
+- [x] `CapabilityProvider` summary trait (not what `/metadata` is built from: the REST layer reads `SearchProvider::supports_search`, `SearchProvider::serves_search_param`, `ConditionalStorage::supports_conditional` and the other per-capability methods)
 
 ### Phase 3: Tenant Isolation
 
@@ -2948,12 +2971,165 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   the search value as written, and filters on the unit code verbatim, so on
   MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
   stored as `kg`.
+- Cross-unit `Range` values (for example `1 a`..`20 mo`) rely on the UCUM
+  canonical values. They are only correct once the `octofhir-ucum` upgrade
+  described under "Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump" below
+  is in place and the data has been reindexed; before that, a `Range` whose
+  bounds canonicalize wrongly can be dropped as inverted.
 - The eq/ne-vs-comparator precision rule itself (implicit-precision range for
   `eq`/`ne`, exact value for the other comparators) is unified across
-  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
-  (approximately equal), whose tolerance is not unified across backends.
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. `ap` (approximately equal)
+  shares one margin too: `m = max(0.1 * |v|, implicit_precision / 2)`, matching
+  `[v - m, v + m]` (#1390).
 - Date parameters are unaffected by this rule and keep their own
   calendar-precision range comparison.
+
+**Quantity prefix semantics (`Range` targets, #2602):**
+
+A quantity parameter whose expression selects a `Range` (`onset-age`,
+`abatement-age`, `context-quantity`) indexes it as the closed interval
+`[L, H]` from `low` to `high`, with unit and system taken from the bound that
+has a value. A missing bound leaves that side open (stored as the finite
+sentinels `f64::MIN` / `f64::MAX`). A `Quantity` or `Age` is a point, `L = H`,
+so its results are unchanged. A `Range` with `low > high`, or whose bounds
+carry different systems or codes, is skipped with a warning. With `v` the
+search number, `[s, e)` its implicit-precision range, and `m` the `ap` margin:
+
+| Prefix | Matches when the stored interval `[L, H]` ... | For a point `x` |
+|---|---|---|
+| `eq` | lies inside the search range: `s <= L` and `H < e` | `s <= x < e` |
+| `ne` | is not inside it: `L < s` or `H >= e` | `x < s` or `x >= e` |
+| `gt` | extends above `v`: `H > v` | `x > v` |
+| `lt` | extends below `v`: `L < v` | `x < v` |
+| `ge` | `H >= v` | `x >= v` |
+| `le` | `L <= v` | `x <= v` |
+| `sa` | starts after `v`: `L > v` | `x > v` |
+| `eb` | ends before `v`: `H < v` | `x < v` |
+| `ap` | overlaps `[v - m, v + m]`: `L <= v + m` and `H >= v - m` | `v - m <= x <= v + m` |
+
+So `onset-age=45` does not match an `onsetRange` of 40 to 50 years (the
+search range does not contain the whole interval), while `gt45`, `lt45`,
+`ge45`, `le45` and `ap45` all do. Sorting ascending
+uses the low bound and descending the high bound, so a range with no `low`
+sorts first. Composite token+quantity parameters index only `Quantity`/`Age`
+points and `Range` values with `low == high`; a `Range` with `low != high`
+(including one with an open side) is skipped in a composite row.
+
+On SQLite, `_filter` evaluates quantity comparisons against the same interval
+and resolves every Quantity-typed parameter from the search-parameter registry
+(`onset-age`, `abatement-age`, `context-quantity`, `component-value-quantity`,
+custom ones); a builder without a registry falls back to the spec's quantity
+names.
+
+**Upgrading from a build before #2602.** Each backend gains a high bound on the
+quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill
+`high = value`; MongoDB backfills at startup under search index generation 8, in
+batches by `_id` with progress logging; Elasticsearch adds
+`quantity.high` / `quantity.canonical_high` / `quantity.sort_name`, schema
+version 4, rewriting no document: `Quantity` and `Age` match and sort correctly
+without `$reindex`, since filters fall back to `value` and sorts read it).
+Existing `Quantity` and `Age`
+values keep working unchanged, but `Range` values stored earlier were never
+indexed, so they are searchable only after you run `POST /$reindex` once.
+
+**Mixed versions during the upgrade.** A pre-#2602 instance writes quantity
+rows without an upper bound. On SQLite, PostgreSQL and MongoDB such a row does
+not match `eq`, `gt`, `ge`, `eb` or `ap`, matches `ne` only below the searched
+range, and counts as missing in a descending sort. Per backend:
+
+- **PostgreSQL.** Migration v56 installs, when it upgrades an existing database,
+  a temporary `BEFORE INSERT` trigger,
+  `trg_search_index_quantity_high` (function `hfs_search_index_quantity_high`),
+  that fills `value_quantity_high` (and the canonical one) when an old writer
+  leaves it `NULL`. Its `WHEN` clause means current builds never run it
+  (measured: no cost for current writers; +10-50% on inserts only from an old
+  writer), so a rolling update is safe. A database created by a build that already has
+  v56 has no older writer and gets no trigger and no function. The trigger is temporary: a later
+  migration (v57: `DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index; DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();`)
+  removes it, no earlier than the second release after the one that ships
+  #2602 and only once the upgrade notes forbid skipping that release. Until
+  then, skipping the #2602 release in a rolling update is unsupported.
+  Planned removal: trigger `trg_search_index_quantity_high` (see migration v57 note) — tracked in the follow-up task.
+  To check, `SELECT count(*) FROM search_index WHERE value_quantity_value IS NOT NULL AND value_quantity_high IS NULL`
+  returns 0 once healed.
+- **MongoDB.** The schema version is now 18, so a pre-#2602 binary (schema 17)
+  refuses to start against an upgraded database (a binary already running is
+  not stopped). Every startup of a current build looks for quantity rows
+  without `value_quantity_high` and repairs them in batches, logging a warning
+  with the number of rows healed; a non-zero count means an old writer was
+  active. Rows written by an old instance after the last current instance
+  started are repaired at the next startup, so after stopping the last old
+  instance, restart one current instance. For the effect of
+  `HFS_MONGODB_INDEX_BUILD=off` on the repair, see the index build setting in
+  [search-indexes.md](mongodb/search-indexes.md#hfs_mongodb_index_build).
+  The same `count` check, as `countDocuments({ value_quantity_value: { $exists: true }, value_quantity_high: { $exists: false } })`, returns 0 once healed.
+- **SQLite.** One process per file; an older build is refused by the schema
+  version (49). Never run two builds against one file.
+- **Elasticsearch.** Nothing to do: filters fall back to `value` for a
+  document without `high`, and sorts read `value`. A `Range` stored by a build
+  that lacks the sort-only entry sorts by its low bound until `$reindex`.
+
+#### Rolling back from #2602
+
+SQLite (schema 49) and PostgreSQL (schema 56) refuse to start an older binary
+on an upgraded database, so a rollback needs the schema lowered by hand first.
+Take a backup and stop every HFS instance before running any of this.
+
+SQLite (`DROP COLUMN` needs SQLite 3.35 or later and a column no index uses, so
+drop the indexes first; both columns exist only on `search_index`):
+
+```sql
+DROP INDEX IF EXISTS idx_search_quantity_high;
+DROP INDEX IF EXISTS idx_search_quantity_canonical_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+UPDATE schema_version SET version = 48;
+```
+
+PostgreSQL (`DROP INDEX CONCURRENTLY` cannot run inside a transaction block;
+the columns exist only on `search_index`):
+
+```sql
+DROP TRIGGER IF EXISTS trg_search_index_quantity_high ON search_index;
+DROP FUNCTION IF EXISTS hfs_search_index_quantity_high();
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_high;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_range;
+DROP INDEX CONCURRENTLY IF EXISTS idx_search_quantity_canonical_range;
+ALTER TABLE search_index DROP COLUMN value_quantity_high;
+ALTER TABLE search_index DROP COLUMN value_quantity_canonical_high;
+-- v56 rebuilt idx_search_quantity_recent with value_quantity_high in its
+-- payload, so DROP COLUMN above dropped it; restore the v20 definition.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_quantity_recent
+  ON search_index (tenant_id, resource_type, param_name, last_updated DESC, resource_id ASC)
+  INCLUDE (value_quantity_value, value_quantity_unit)
+  WHERE value_quantity_value IS NOT NULL;
+UPDATE schema_version SET version = 55;
+```
+
+MongoDB: run `mongosh "$HFS_MONGODB_URL" --file crates/persistence/mongodb/quantity-high-rollback.mongosh.js`
+with `HFS_MONGODB_DATABASE` exported (see [Downgrading](mongodb/search-indexes.md#downgrading)).
+The script also lowers the recorded schema version from 18 back to 17, so an
+older binary then runs again.
+**Warning:** an older binary reads a `Range`'s low as a plain point value, and
+an open-low `Range` stores `f64::MIN`. Before running the old binary, delete the
+`Range` rows (`db.search_index.deleteMany({ value_quantity_high: { $exists: true }, $expr: { $ne: ["$value_quantity_high", "$value_quantity_value"] } })`,
+and the same on `search_index_contained`), or run `$reindex` on the old binary.
+
+**Upgrading across the `octofhir-ucum` 0.5 → 0.9 bump:** the UCUM library
+that fills the `*_canonical_value` / `*_canonical_unit` columns (SQLite,
+PostgreSQL) and fields (Elasticsearch) was upgraded. 0.5.2 computed wrong
+canonical factors for many units (`mo` was 219,150 s instead of 2,629,800 s,
+`L` was 1 m³, `%` was 1, plus `mol`, `[oz_av]`, `10*3/uL` and roughly 140
+`X/N`-defined units), and labelled mass as `kg` where 0.9 uses UCUM's base
+unit `g`. Rows indexed by an older build keep the old canonical value and
+unit until they are rewritten, so a cross-unit search (`5|…|mg` against data
+stored as `g`, or any search in months) misses them. Searches in the same
+unit the data was stored in are unaffected, because the raw value/unit branch
+still matches. Run `POST /$reindex` once per tenant after upgrading every
+writer. There is no in-place migration: the SQLite and PostgreSQL rows do not
+keep the UCUM code that canonicalization used, and Elasticsearch documents are
+only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
 
 **Date prefix semantics (range targets, #1391):**
 
