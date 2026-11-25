@@ -121,13 +121,63 @@ async fn read_response(response: Response, failure: &str) -> RequestResult<Value
         // Read the header before `text()` consumes the response.
         let retry_after = retry_after(status, response.headers(), SystemTime::now());
         let body = response.text().await.unwrap_or_default();
+        tracing::debug!(
+            %status,
+            body = %truncate_chars(&body, LOGGED_ERROR_BODY_CHARS),
+            "{failure}"
+        );
+        let message = match operation_outcome_text(&body) {
+            Some(detail) => format!("{failure} with status {status}: {detail}"),
+            None => format!("{failure} with status {status}"),
+        };
         Err(RequestError {
             error: FhirPathError::TerminologyHttpError {
                 status: status.as_u16(),
-                message: format!("{failure} with status {status}: {body}"),
+                message,
             },
             retry_after,
         })
+    }
+}
+
+/// How much of a failed response's body the error carries, in characters.
+const ERROR_DETAIL_CHARS: usize = 500;
+
+/// How much of a failed response's body the debug log carries, in characters.
+const LOGGED_ERROR_BODY_CHARS: usize = 2048;
+
+/// The text a failed terminology response explains itself with, for the
+/// evaluating caller: the `diagnostics` (else `details.text`) of each issue
+/// of an OperationOutcome body, joined and cut to [`ERROR_DETAIL_CHARS`].
+/// Any other body (an HTML error page, a proxy's message, a stack trace) is
+/// not relayed: the error reaches fhirpath-server and HFS clients, and the
+/// body is whatever the upstream chose to send. The debug log keeps it.
+fn operation_outcome_text(body: &str) -> Option<String> {
+    let outcome: Value = serde_json::from_str(body).ok()?;
+    if outcome["resourceType"] != "OperationOutcome" {
+        return None;
+    }
+    let texts: Vec<&str> = outcome["issue"]
+        .as_array()?
+        .iter()
+        .filter_map(|issue| {
+            issue["diagnostics"]
+                .as_str()
+                .or_else(|| issue["details"]["text"].as_str())
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if texts.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&texts.join("; "), ERROR_DETAIL_CHARS))
+}
+
+/// `text` cut to at most `max` characters, with an ellipsis when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
     }
 }
 
@@ -796,7 +846,7 @@ mod tests {
             .error;
         assert!(
             matches!(&error, FhirPathError::TerminologyHttpError { status: 530, message }
-            if message.contains("530") && message.contains(body))
+            if message.contains("530") && !message.contains("Cloudflare"))
         );
         assert_eq!(server.requests().await.len(), 4);
     }
@@ -812,7 +862,7 @@ mod tests {
             .error;
         assert!(
             matches!(&error, FhirPathError::TerminologyHttpError { status: 504, message }
-            if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable"))
+            if message.contains("504 Gateway Timeout") && !message.contains("gateway unavailable"))
         );
         assert_eq!(server.requests().await.len(), 4);
     }
@@ -1022,6 +1072,61 @@ mod tests {
             .error;
         assert!(matches!(error, FhirPathError::ConfigError(_)), "{error:?}");
         assert!(!is_transient(&error));
+    }
+
+    #[tokio::test]
+    async fn an_error_relays_only_operation_outcome_text_cut_short() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn message_for(body: String, content_type: &str) -> String {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_raw(body, content_type))
+                .mount(&server)
+                .await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+            match client
+                .expand("http://example.org/vs", None)
+                .await
+                .unwrap_err()
+                .error
+            {
+                FhirPathError::TerminologyHttpError { status, message } => {
+                    assert_eq!(status, 404);
+                    message
+                }
+                other => panic!("expected TerminologyHttpError, got {other:?}"),
+            }
+        }
+
+        let outcome = serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "not-found",
+                       "diagnostics": "ValueSet http://example.org/vs not found"}]
+        });
+        let message = message_for(outcome.to_string(), "application/fhir+json").await;
+        assert!(
+            message.ends_with(": ValueSet http://example.org/vs not found"),
+            "{message}"
+        );
+
+        let page = "<html><body>internal-host.corp: stack trace at db.rs:12</body></html>";
+        let message = message_for(page.to_string(), "text/html").await;
+        assert!(message.ends_with("with status 404 Not Found"), "{message}");
+        assert!(!message.contains("internal-host"), "{message}");
+
+        let long = serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "processing", "diagnostics": "x".repeat(5000)}]
+        });
+        let message = message_for(long.to_string(), "application/fhir+json").await;
+        assert!(
+            message.chars().count() < 600,
+            "{} chars",
+            message.chars().count()
+        );
+        assert!(message.ends_with('…'));
     }
 
     #[tokio::test]
