@@ -228,6 +228,12 @@ pub struct EvaluationContext {
     /// Debug tracer for step-by-step evaluation tracing.
     /// When set (gated by FHIRPATH_DEBUG_TRACE env var), records every evaluate() step.
     pub debug_tracer: Option<Arc<Mutex<crate::debug_trace::DebugTracer>>>,
+
+    /// The `(resourceType, id)` of the record being evaluated when
+    /// [`Self::set_resolution_scope`] widened `resources` to a pool of several
+    /// records. `resolve()` matches a `#id` reference only against what this
+    /// record contains, never against another record's contained resources.
+    pub(crate) resolution_root: Option<(Option<String>, Option<String>)>,
 }
 
 impl Clone for EvaluationContext {
@@ -249,6 +255,7 @@ impl Clone for EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(),
             terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget across clones
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
+            resolution_root: self.resolution_root.clone(),
         }
     }
 }
@@ -315,6 +322,7 @@ impl EvaluationContext {
             terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
+            resolution_root: None,
         }
     }
 
@@ -350,6 +358,7 @@ impl EvaluationContext {
             terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
+            resolution_root: None,
         }
     }
 
@@ -382,6 +391,7 @@ impl EvaluationContext {
             terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
+            resolution_root: None,
         }
     }
 
@@ -516,7 +526,27 @@ impl EvaluationContext {
     /// (and per-iteration) contexts SOF creates, and it survives `Clone` into
     /// lambda/child contexts.
     pub fn set_resolution_scope(&mut self, resources: Arc<Vec<FhirResource>>) {
+        if self.resolution_root.is_none() {
+            self.resolution_root = self.resources.first().map(|record| {
+                let EvaluationResult::Object { map, .. } = record.to_evaluation_result() else {
+                    return (None, None);
+                };
+                let field = |name: &str| match map.get(name) {
+                    Some(EvaluationResult::String(value, _, _)) => Some(value.clone()),
+                    _ => None,
+                };
+                (field("resourceType"), field("id"))
+            });
+        }
         self.resources = resources;
+    }
+
+    /// Takes `parent`'s record under evaluation (see [`Self::set_resolution_scope`])
+    /// for a context built for one of its elements, such as a SQL-on-FHIR
+    /// `forEach` item, so `resolve()` there keeps to that record's contained
+    /// resources.
+    pub fn inherit_resolution_root(&mut self, parent: &EvaluationContext) {
+        self.resolution_root = parent.resolution_root.clone();
     }
 
     /// Sets a variable in the context to a string value
@@ -639,6 +669,7 @@ impl EvaluationContext {
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget with child
             debug_tracer: self.debug_tracer.clone(),                    // Share tracer with child
+            resolution_root: self.resolution_root.clone(),
         }
     }
 
@@ -663,6 +694,7 @@ impl EvaluationContext {
             terminology_server_url: None,
             terminology_session: Arc::clone(&self.terminology_session),
             debug_tracer: None,
+            resolution_root: None,
         }
     }
 

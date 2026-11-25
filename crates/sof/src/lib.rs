@@ -4016,6 +4016,7 @@ fn evaluate_path_on_item(
     // then a column that resolves a nested reference) can still reach sibling
     // resources, and terminology lookups share the run's cache and call budget.
     temp_context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    temp_context.inherit_resolution_root(parent);
     temp_context.set_terminology_session(parent.terminology_session());
 
     // Add variables to the temporary context
@@ -4062,6 +4063,7 @@ fn create_iteration_context(
     // against this iteration item, so `resolve()` still works here, and share the
     // run's terminology session so lookups use one cache and call budget.
     context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    context.inherit_resolution_root(parent);
     context.set_terminology_session(parent.terminology_session());
 
     // Preserve variables from the parent context

@@ -33,13 +33,14 @@ pub fn resolve_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Build the candidate pool once and reuse it for every reference being resolved.
     let candidates = build_candidate_pool(context);
+    let root = context.resolution_root.as_ref();
 
     match invocation_base {
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         EvaluationResult::Collection { items, .. } => {
             let mut resolved = Vec::new();
             for item in items {
-                match resolve_one(item, &candidates) {
+                match resolve_one_in(item, &candidates, root) {
                     EvaluationResult::Empty => {}
                     other => resolved.push(other),
                 }
@@ -54,7 +55,7 @@ pub fn resolve_function(
                 }),
             }
         }
-        single => Ok(resolve_one(single, &candidates)),
+        single => Ok(resolve_one_in(single, &candidates, root)),
     }
 }
 
@@ -65,8 +66,14 @@ struct Candidate {
     /// Whether this candidate came from a `contained` array (eligible for
     /// fragment / bare-id matching).
     is_contained: bool,
+    /// For a contained resource, the `(resourceType, id)` of the top-level
+    /// resource that contains it.
+    container: Option<RecordIdentity>,
     value: EvaluationResult,
 }
+
+/// The `(resourceType, id)` of a top-level record.
+type RecordIdentity = (Option<String>, Option<String>);
 
 /// Flattens the context resources and their `contained` children into a pool of
 /// candidates that can be matched against a reference.
@@ -79,22 +86,32 @@ fn build_candidate_pool(context: &EvaluationContext) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for resource in context.resources.iter() {
         let result = resource.to_evaluation_result();
-        collect_candidates(&result, false, &mut candidates);
+        collect_candidates(&result, None, &mut candidates);
     }
     candidates
 }
 
 /// Adds `value` (if it is a resource object) and its `contained` children to the pool.
-fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Vec<Candidate>) {
+/// `container` is `None` for a top-level resource and the identity of its
+/// top-level ancestor for a contained one.
+fn collect_candidates(
+    value: &EvaluationResult,
+    container: Option<&RecordIdentity>,
+    out: &mut Vec<Candidate>,
+) {
     if let EvaluationResult::Object { map, .. } = value {
         let resource_type = string_field(map, "resourceType");
         let id = string_field(map, "id");
+        let is_contained = container.is_some();
+        let own_identity = (resource_type.clone(), id.clone());
+        let children_container = container.unwrap_or(&own_identity).clone();
         // Only treat objects that look like resources (have a resourceType) as candidates.
         if resource_type.is_some() {
             out.push(Candidate {
                 resource_type: resource_type.clone(),
                 id: id.clone(),
                 is_contained,
+                container: container.cloned(),
                 value: value.clone(),
             });
         }
@@ -105,11 +122,11 @@ fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Ve
             match contained {
                 EvaluationResult::Collection { items, .. } => {
                     for item in items {
-                        collect_candidates(item, true, out);
+                        collect_candidates(item, Some(&children_container), out);
                     }
                 }
                 obj @ EvaluationResult::Object { .. } => {
-                    collect_candidates(obj, true, out);
+                    collect_candidates(obj, Some(&children_container), out);
                 }
                 _ => {}
             }
@@ -118,14 +135,25 @@ fn collect_candidates(value: &EvaluationResult, is_contained: bool, out: &mut Ve
 }
 
 /// Resolves a single reference item against the candidate pool.
+#[cfg(test)]
 fn resolve_one(item: &EvaluationResult, candidates: &[Candidate]) -> EvaluationResult {
+    resolve_one_in(item, candidates, None)
+}
+
+/// [`resolve_one`] for the record `root` of a pooled scope (see
+/// [`ParsedReference::find`]).
+fn resolve_one_in(
+    item: &EvaluationResult,
+    candidates: &[Candidate],
+    root: Option<&RecordIdentity>,
+) -> EvaluationResult {
     let Some(reference) = extract_reference_string(item) else {
         return EvaluationResult::Empty;
     };
 
     let parsed = ParsedReference::parse(&reference);
 
-    if let Some(found) = parsed.find(candidates) {
+    if let Some(found) = parsed.find(candidates, root) {
         return found.clone();
     }
 
@@ -168,6 +196,12 @@ impl ParsedReference {
             return ParsedReference::Fragment(fragment.to_string());
         }
 
+        // `Type/id/_history/vid` names a version of `Type/id`.
+        let reference = match reference.split_once("/_history/") {
+            Some((unversioned, _version)) => unversioned,
+            None => reference,
+        };
+
         // Find the last `Type/id` pair. For absolute URLs this naturally takes the
         // final two path segments (e.g. ".../Patient/123").
         if let Some((resource_type, id)) = split_type_id(reference) {
@@ -192,16 +226,32 @@ impl ParsedReference {
     }
 
     /// Finds the matching candidate, if any.
-    fn find<'a>(&self, candidates: &'a [Candidate]) -> Option<&'a EvaluationResult> {
+    ///
+    /// A `#id` (or bare id) matches a resource contained in the record under
+    /// evaluation (`root`), never one contained in another record of a pooled
+    /// scope; without a root (a single-resource context) any contained one. A
+    /// `Type/id`, and the best-effort trailing-id match, only match top-level
+    /// resources: a contained resource is addressed by `#id`, so another
+    /// record's contained resource must not stand in for a real one.
+    fn find<'a>(
+        &self,
+        candidates: &'a [Candidate],
+        root: Option<&RecordIdentity>,
+    ) -> Option<&'a EvaluationResult> {
         match self {
             ParsedReference::Fragment(id) => candidates
                 .iter()
-                .find(|c| c.is_contained && c.id.as_deref() == Some(id.as_str()))
+                .find(|c| {
+                    c.is_contained
+                        && c.id.as_deref() == Some(id.as_str())
+                        && root.is_none_or(|root| c.container.as_ref() == Some(root))
+                })
                 .map(|c| &c.value),
             ParsedReference::Typed { resource_type, id } => candidates
                 .iter()
                 .find(|c| {
-                    c.resource_type.as_deref() == Some(resource_type.as_str())
+                    !c.is_contained
+                        && c.resource_type.as_deref() == Some(resource_type.as_str())
                         && c.id.as_deref() == Some(id.as_str())
                 })
                 .map(|c| &c.value),
@@ -210,7 +260,7 @@ impl ParsedReference {
                 let tail = reference.rsplit('/').next().unwrap_or(reference);
                 candidates
                     .iter()
-                    .find(|c| c.id.as_deref() == Some(tail))
+                    .find(|c| !c.is_contained && c.id.as_deref() == Some(tail))
                     .map(|c| &c.value)
             }
         }
@@ -294,7 +344,7 @@ mod tests {
     fn pool(roots: &[EvaluationResult]) -> Vec<Candidate> {
         let mut out = Vec::new();
         for root in roots {
-            collect_candidates(root, false, &mut out);
+            collect_candidates(root, None, &mut out);
         }
         out
     }
