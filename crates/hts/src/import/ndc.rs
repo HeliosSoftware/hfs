@@ -22,7 +22,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const NDC_URL: &str = "http://hl7.org/fhir/sid/ndc";
+pub(crate) const NDC_URL: &str = "http://hl7.org/fhir/sid/ndc";
 const NDC_ID: &str = "ndc";
 const NDC_NAME: &str = "NDC";
 const NDC_TITLE: &str = "NDC (National Drug Code Directory)";
@@ -119,7 +119,7 @@ pub async fn import_ndc(
         });
     }
     let seed = build_code_system_bundle(&meta, &seed_concepts);
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -142,7 +142,7 @@ pub async fn import_ndc(
             .collect();
 
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(

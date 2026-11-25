@@ -39,6 +39,26 @@ pub mod snomed_rf2;
 pub mod tgz;
 pub mod ucum;
 
+/// The canonical URLs of the CodeSystems the native importers load from their
+/// publisher's own distribution, and so own: rows they write are ranked
+/// [`bundle_parser::AUTHORITY_OWNER`] (see
+/// [`BundleImportBackend::import_native_bundle`]). The HL7 v2 tables importer
+/// is not listed: its URLs sit under `http://terminology.hl7.org`, which the
+/// THO package owns.
+pub(crate) const NATIVE_OWNED_SYSTEMS: [&str; 11] = [
+    snomed_rf2::SNOMED_URL,
+    loinc_csv::LOINC_URL,
+    rxnorm_rrf::RXNORM_URL,
+    ucum::UCUM_URL,
+    icd10_cm::ICD10CM_URL,
+    icd9_cm::ICD9CM_URL,
+    ndc::NDC_URL,
+    mesh::MESH_URL,
+    nci_thesaurus::NCI_URL,
+    nucc::NUCC_URL,
+    dicom::DICOM_URL,
+];
+
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 
@@ -306,6 +326,28 @@ pub trait BundleImportBackend: Send + Sync {
     ) -> Result<ImportStats, HtsError> {
         let mut parsed = bundle_parser::parse_bundle(data)?;
         parsed.defer_closure = true;
+        self.import_parsed(ctx, parsed).await
+    }
+
+    /// [`Self::import_bundle`] (or [`Self::import_bundle_deferred`] with
+    /// `defer_closure`) for a bundle a native importer built from a
+    /// publisher's own distribution. Its CodeSystems are ranked
+    /// [`bundle_parser::AUTHORITY_OWNER`], as
+    /// `bundle_builder::build_parsed_code_system` ranks SNOMED CT and LOINC,
+    /// so an unattributed import of the same `(url, version)` cannot replace
+    /// them. A parsed bundle has no package canonical, which would rank them
+    /// [`bundle_parser::AUTHORITY_UNKNOWN`], the rank of any other bundle.
+    async fn import_native_bundle(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+        defer_closure: bool,
+    ) -> Result<ImportStats, HtsError> {
+        let mut parsed = bundle_parser::parse_bundle(data)?;
+        for cs in &mut parsed.code_systems {
+            cs.authority_rank = bundle_parser::AUTHORITY_OWNER;
+        }
+        parsed.defer_closure = defer_closure;
         self.import_parsed(ctx, parsed).await
     }
 

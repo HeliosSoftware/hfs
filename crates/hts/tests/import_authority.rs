@@ -188,6 +188,63 @@ where
     assert_eq!(stored_title(&backend), "Owner update");
 }
 
+/// A CodeSystem a native importer loaded is owned: an unattributed bundle
+/// with the same `(url, version)` cannot replace it.
+async fn native_import_contract<B>(backend: B)
+where
+    B: TerminologyBackend + BundleImportBackend + Clone + 'static,
+{
+    let importer: Arc<dyn BundleImportBackend> = Arc::new(backend.clone());
+    let icd10 = |title: &str| {
+        json!({
+            "resourceType": "CodeSystem",
+            "id": "icd-10-cm",
+            "url": "http://hl7.org/fhir/sid/icd-10-cm",
+            "version": "2026",
+            "status": "active",
+            "content": "complete",
+            "title": title,
+            "concept": [{"code": "A00", "display": "Cholera"}]
+        })
+    };
+
+    let stats = importer
+        .import_native_bundle(
+            &TenantContext::system(),
+            &bundle(&[icd10("Native title")]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+
+    let errors = import_as(&importer, &[icd10("Replaced")], None).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("authoritative source"), "{errors:?}");
+    let stored = backend
+        .resource_by_id("CodeSystem", "icd-10-cm")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored["title"], "Native title");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_unattributed_import_cannot_replace_a_native_import() {
+    native_import_contract(helios_hts::backends::SqliteTerminologyBackend::in_memory().unwrap())
+        .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_unattributed_import_cannot_replace_a_native_import() {
+    let url = common::pg_http_url().await;
+    let backend = helios_hts::backends::PostgresTerminologyBackend::new(url)
+        .await
+        .unwrap();
+    native_import_contract(backend).await;
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_unattributed_import_cannot_replace_owned_content() {

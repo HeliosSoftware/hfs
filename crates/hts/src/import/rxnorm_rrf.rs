@@ -24,7 +24,7 @@ use crate::import::bundle_builder::{
 
 // ── RxNorm constants ──────────────────────────────────────────────────────────
 
-const RXNORM_URL: &str = "http://www.nlm.nih.gov/research/umls/rxnorm";
+pub(crate) const RXNORM_URL: &str = "http://www.nlm.nih.gov/research/umls/rxnorm";
 const RXNORM_ID: &str = "rxnorm";
 const RXNORM_NAME: &str = "RxNorm";
 const RXNORM_TITLE: &str = "RxNorm — NLM Drug Terminology";
@@ -167,7 +167,7 @@ pub async fn import_rxnorm_rrf(
 
     // Seed empty CodeSystem.
     let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -227,7 +227,7 @@ pub async fn import_rxnorm_rrf(
             .collect();
 
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
         stats.errors.extend(chunk.errors);
     }
 
