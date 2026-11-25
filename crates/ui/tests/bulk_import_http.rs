@@ -1805,7 +1805,119 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     .await;
     assert!(html.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{html}");
 
+    // Phase 10 — a listed endpoint that redirects does not carry the
+    // assertion anywhere else: a 307 would post it again to `Location`.
+    unsafe { std::env::set_var("HFS_BULK_SUBMIT_PRIVATE_KEY", TEST_EC_KEY) };
+    let (elsewhere, hits) = counting_token_endpoint().await;
+    let redirecting = redirecting_token_endpoint(&elsewhere).await;
+    helios_ui::set_bulk_submit_trusted_providers([&redirecting]);
+    let (_, _, html) = post_form(
+        &ctx,
+        "/ui/bulk-import/test-auth",
+        &format!("client_id=alice&token_url={}", urlencode(&redirecting)),
+    )
+    .await;
+    assert!(html.contains("answered 307"), "redirect reported: {html}");
+    assert!(!html.contains("✓"), "{html}");
+    assert_eq!(
+        *hits.lock().unwrap(),
+        0,
+        "the redirect target was contacted"
+    );
+
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PRIVATE_KEY") };
+}
+
+/// A token endpoint that answers every POST with a 307 to `target`.
+async fn redirecting_token_endpoint(target: &str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target = target.to_string();
+    let app = Router::new().route(
+        "/token",
+        axum::routing::post(move || {
+            let target = target.clone();
+            async move { (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]) }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/token")
+}
+
+/// A token endpoint that counts the requests reaching it.
+async fn counting_token_endpoint() -> (String, Arc<std::sync::Mutex<u32>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(std::sync::Mutex::new(0u32));
+    let counter = hits.clone();
+    let app = Router::new().route(
+        "/token",
+        axum::routing::post(move || {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().unwrap() += 1;
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"access_token":"tok-elsewhere"}"#,
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/token"), hits)
+}
+
+/// A form posted by a page on another site is refused before any handler
+/// runs; the same post from the UI's own pages, or from a non-browser client
+/// that sends neither header, goes through.
+#[tokio::test]
+async fn cross_site_form_posts_are_refused() {
+    let ctx = ctx("http://localhost:9/");
+    let send = |headers: &'static [(&'static str, &'static str)]| {
+        let mut request = Request::post("/ui/bulk-import/test-auth")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app(&ctx).oneshot(request.body(Body::from("client_id=&token_url=")).unwrap())
+    };
+
+    for refused in [
+        &[("sec-fetch-site", "cross-site")][..],
+        &[("sec-fetch-site", "same-site")][..],
+        &[
+            ("origin", "https://evil.example"),
+            ("host", "localhost:8080"),
+        ][..],
+        &[("origin", "null"), ("host", "localhost:8080")][..],
+    ] {
+        let res = send(refused).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{refused:?}");
+    }
+    for allowed in [
+        &[][..],
+        &[("sec-fetch-site", "same-origin")][..],
+        &[
+            ("origin", "http://localhost:8080"),
+            ("host", "localhost:8080"),
+        ][..],
+    ] {
+        let res = send(allowed).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{allowed:?}");
+    }
+
+    // Reads are not affected.
+    let res = app(&ctx)
+        .oneshot(
+            Request::get("/ui/bulk-import")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
 
 /// An RSA-2048 key generated for this test alone; it protects nothing.

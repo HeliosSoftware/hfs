@@ -1137,7 +1137,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
-    let response = http_client()
+    let response = token_client()
         .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -1157,10 +1157,10 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
             upstream_failure_detail(&e, 10, "the token endpoint did not answer in time")
         })?;
     let status = response.status();
-    let body: Value = response.json().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         return Err(format!("token endpoint answered {status}"));
     }
+    let body: Value = response.json().await.map_err(|e| e.to_string())?;
     body.get("access_token")
         .and_then(Value::as_str)
         .map(String::from)
@@ -1304,6 +1304,21 @@ const STATUS_POLL_TIMEOUT_SECS: u64 = 30;
 /// another poll — the exact hammering the recipient's rate limit (#790)
 /// rejects (#957).
 const STATUS_POLL_FAILURE_BACKOFF_SECS: u64 = 30;
+
+/// Client for the token request only: it follows no redirect. The listed
+/// origin is the only one the assertion may reach, and a 307/308 would post it
+/// again to wherever `Location` points (a 301/302/303 would report on a
+/// destination nobody listed). A token endpoint has no reason to redirect, so
+/// a 3xx is reported as the endpoint's answer.
+fn token_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a reqwest client without redirects builds")
+    })
+}
 
 /// Shared HTTP client. A per-request `reqwest::Client::new()` rebuilds the
 /// connection pool and resolver every call, so every poll paid a fresh TCP
