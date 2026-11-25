@@ -3886,16 +3886,20 @@ impl BatchedIndexPlan {
             _ => false,
         };
         let live_filter = doc! { "$and": [resource_filter.clone(), { "id": { "$in": ids } }] };
+        // The batch bounds `id`, so the identity index answers with one seek
+        // per candidate. Left to itself the planner can choose the type-scan
+        // index, whose `last_updated` key sits before `id`, and walk every
+        // live row of the type to find a batch of old resources; it did so in
+        // 329 of 467 unhinted counts and pages (#2601).
+        let identity = || Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned());
         if count_only {
             // Seed IDs are globally deduplicated and resource identity is
             // unique within tenant/type. Count live matches server-side;
             // returning their IDs would add transfer without new information.
-            // Leave index selection to MongoDB: the type-scan index places
-            // last_updated before id, so forcing it can repeatedly scan many
-            // timestamp partitions for an otherwise bounded ID lookup.
             result.count += resources
                 .count_documents(live_filter)
                 .search_deadline()?
+                .hint(identity())
                 .await
                 .or_query_error("Failed to count live candidates")?;
             return Ok(false);
@@ -3930,6 +3934,7 @@ impl BatchedIndexPlan {
                     } },
                 ])
                 .search_deadline()?
+                .hint(identity())
                 .await
                 .or_query_error("Failed to count and select live candidates")?;
             let facet = cursor
@@ -3951,17 +3956,11 @@ impl BatchedIndexPlan {
                 .collect::<StorageResult<Vec<_>>>()?;
             return Ok(false);
         }
-        // The batch bounds `id`, so the identity index answers with one seek
-        // per candidate. Left to itself the planner can choose the type-scan
-        // index, whose `last_updated` key sits before `id`, and walk every
-        // live row of the type to find a batch of old resources.
         let mut cursor = resources
             .find(live_filter)
             .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
-            .hint(Hint::Name(
-                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
-            ))
+            .hint(identity())
             .await
             .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();

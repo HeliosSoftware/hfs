@@ -2925,6 +2925,11 @@ impl MongoBackend {
             return Ok(Vec::new());
         }
         let filter = with_cursor_condition(scope_filter, cursor_condition);
+        // The ids are chosen, so the identity index answers with one seek per
+        // id. Left to itself the planner could walk `idx_resources_type_scan`
+        // from the cursor to the end of the type (#2601: 33k-328k keys
+        // against 2k), which a sort on that index makes look cheap.
+        let limit = ids.len() as i64;
         collect_documents(
             resources
                 .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
@@ -2933,6 +2938,8 @@ impl MongoBackend {
                 })
                 .search_deadline()?
                 .sort(sort)
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+                .limit(limit)
                 .await
                 .or_query_error("Failed to fetch resource-filtered page")?,
         )
@@ -4054,14 +4061,19 @@ impl MongoBackend {
             None,
         )?;
         let resources_coll = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let docs = collect_documents(
-            resources_coll
-                .find(filter)
-                .search_deadline()?
-                .await
-                .or_query_error("Failed to execute MongoDB search")?,
-        )
-        .await?;
+        // An empty page has no bodies to read: skip the round trip (#2601).
+        let docs = if id_set.is_empty() {
+            Vec::new()
+        } else {
+            collect_documents(
+                resources_coll
+                    .find(filter)
+                    .search_deadline()?
+                    .await
+                    .or_query_error("Failed to execute MongoDB search")?,
+            )
+            .await?
+        };
         let mut by_id: std::collections::HashMap<String, StoredResource> = docs
             .into_iter()
             .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
