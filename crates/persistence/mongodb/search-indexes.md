@@ -80,7 +80,8 @@ When MongoDB runs with search offloaded to Elasticsearch, every search goes to E
 
 - the inline `search_index` indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) and the `search_index_contained` indexes, which are not created at boot;
 - the twelve generation-7 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
-- `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`.
+- `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`;
+- `idx_resources_live_id`, which only standard search reads (see [Liveness of candidate ids](#liveness-of-candidate-ids-resourcesidx_resources_live_id)), and which boot does not create in this mode.
 
 Readiness requires only the `resources` indexes (`idx_resources_identity`, `idx_resources_type_scan`). A node whose `search_index` indexes are missing or dropped stays ready. The standalone MongoDB backend is unchanged: it still builds and requires all of them, because `:missing` and standard search read them.
 
@@ -93,6 +94,28 @@ HFS does not drop indexes that already exist, so a deployment moved to this mode
 
 `dropIndexes()` with no argument drops every index on the collection except `_id`; the two collections are empty in this mode. If you only want the missing-params saving, drop the last two and leave the others. `dropIndex` fails with "index not found" for an index that was never built; that is safe to ignore. If you later switch the database back to the standalone backend, the next boot recreates the inline indexes and rebuilds the rest, and you must run `$reindex` because the search rows were never written.
 
+
+## Liveness of candidate ids (`resources.idx_resources_live_id`)
+
+A search that has chosen resource ids from `search_index` still asks which of them are live. Those reads filter `resources` on tenant, type, `is_deleted: false` and an `id` list, and read back only `id`:
+
+- the liveness check of a filtered or deep parameter sort (`resource_level_ids`, `live_ids_among`);
+- the walk over resources without a sort key, in `id` order (`param_sorted_filtered_window_over`);
+- the count, the count-and-page and the live-id find of each candidate batch (`BatchedIndexPlan::match_batch`).
+
+`idx_resources_identity` (`tenant_id, resource_type, id`) has no `is_deleted`, so each of them fetched the whole document to read one boolean: `/Observation?_sort=-date&_offset=290000` fetched 290,046 documents for 20 entries (#2601). Since #2601 boot creates
+
+    { tenant_id: 1, resource_type: 1, is_deleted: 1, id: 1 }   name: idx_resources_live_id
+
+and those reads hint it, so they are covered index scans (`docsExamined: 0`). It is not a `search_index` generation and records no schema version: an older build neither reads nor drops it. With search offloaded to Elasticsearch it is not created, because no search reads it.
+
+**Build.** Boot creates it inline with the other `resources` indexes, before the server serves, so the first boot of an existing store waits for one scan of `resources`. Measured on a `mongo:9.0.8` copy of the benchmark store (2,273,836 `resources` documents, 2.4 KB average, 3.5 GB WiredTiger cache): 4.8 s, and the index takes 91 MB on disk (`idx_resources_identity`: 196 MB). The scan also pushes part of the search working set out of the cache, so the first searches after that boot are slower until it is read back.
+
+**Write cost.** One more index entry per resource insert and per deletion or restore (`is_deleted` is a key); an update that keeps `is_deleted` leaves its key unchanged. Measured on the same `mongo:9.0.8` server, copying 100,000 benchmark resources into a collection with the `resources` indexes HFS creates, without and with the index (order A, B, B, A, batches of 1,000): inserts took 4,909 and 4,917 ms without it and 5,321 and 4,840 ms with it (mean +3%, inside the run-to-run noise), and 10,000 deletion flips by id 33.7 s and 31.2 s without it against 50.3 s and 31.3 s with it (the first run with it was an outlier; the second pair is equal). The index holds about 70 bytes per resource (6-7 MB per 100,000).
+
+**Without the index.** The hint is not required for readiness. If the index is missing (dropped by hand), a hinted read is rejected and runs once more on `idx_resources_identity`, which returns the same ids with a fetch, and logs a warning. The next boot recreates the index. To remove it on purpose (an older build ignores it):
+
+    db.resources.dropIndex("idx_resources_live_id")
 
 ## Downgrading
 
