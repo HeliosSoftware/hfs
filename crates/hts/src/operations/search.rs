@@ -79,7 +79,7 @@ fn parse_search_query(raw: Option<&str>) -> Result<ResourceSearchQuery, HtsError
                 set_once(&mut query.status, value, "status")?;
             }
             "_count" if modifier.is_none() => {
-                let count = parse_u32("_count", &value)?;
+                let count = parse_u32("_count", &value)?.min(MAX_PAGE_SIZE);
                 set_once(&mut query.count, count, "_count")?;
             }
             "_offset" if modifier.is_none() => {
@@ -153,6 +153,12 @@ fn parse_u32(parameter: &str, value: &str) -> Result<u32, HtsError> {
 
 /// Default page size when `_count` is absent, matching the backends.
 const DEFAULT_PAGE_SIZE: u32 = 20;
+
+/// The largest page a search returns, as HFS caps it by default
+/// (`HFS_MAX_PAGE_SIZE`). A larger `_count` is lowered to it, which FHIR
+/// allows; the page links carry the lowered value. Without it a client could
+/// ask for every stored resource, with its full JSON, in one response.
+const MAX_PAGE_SIZE: u32 = 1000;
 
 /// Where the search was addressed, used to build `Bundle.link` URLs.
 struct SearchLinkBase {

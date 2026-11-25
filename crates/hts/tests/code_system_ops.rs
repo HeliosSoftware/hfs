@@ -449,6 +449,24 @@ async fn search_code_systems_pagination_count_and_offset() {
     assert!(entries2.is_empty());
 }
 
+/// A `_count` above the page cap is lowered to it, and the links say so.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_count_above_the_page_cap_is_lowered() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem?_count=4294967295").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let links = body["link"].as_array().expect("link array");
+    let self_link = links
+        .iter()
+        .find(|l| l["relation"] == "self")
+        .and_then(|l| l["url"].as_str())
+        .expect("self link");
+    assert!(self_link.contains("_count=1000&"), "{self_link}");
+}
+
 // ── Phase 8: XML format support ───────────────────────────────────────────────
 
 /// $lookup with `Accept: application/fhir+xml` should return valid FHIR XML.
