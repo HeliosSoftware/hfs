@@ -287,6 +287,109 @@ fn scoped_date_alternatives(scope: &Document, value_filters: Vec<Document>) -> D
     doc! { "$or": arms }
 }
 
+/// `:below` on a reference: `base` itself or anything under `base/`.
+///
+/// The regex alone (`^base(/|$)`) holds an alternation, so MongoDB derives no
+/// index bounds from its literal prefix and read every row of the parameter
+/// (#2601: 689,081 keys for 394 rows). The range `[base, base0)` (`0` is the
+/// character after `/`) holds every string that starts with `base` and goes on
+/// with nothing or a character up to `/`, so it bounds the scan to about the
+/// matches; the regex stays as the exact test, applied to the keys walked.
+fn reference_below_filter(base: &str) -> Document {
+    doc! {
+        "value_reference": {
+            "$gte": base,
+            "$lt": format!("{base}0"),
+            "$regex": format!("^{}(/|$)", regex_escape(base)),
+        }
+    }
+}
+
+/// Whether the alternatives of a parameter's value filters (each filter, or
+/// each arm of its `$or`) test more than one field, so that no single partial
+/// value index is implied by their disjunction.
+fn alternatives_span_fields(value_filters: &[Document]) -> bool {
+    let mut fields: HashSet<&str> = HashSet::new();
+    for filter in value_filters {
+        match filter.get_array("$or") {
+            Ok(arms) => {
+                for arm in arms {
+                    if let Bson::Document(arm) = arm {
+                        fields.extend(arm.keys().map(String::as_str));
+                    }
+                }
+            }
+            Err(_) => fields.extend(filter.keys().map(String::as_str)),
+        }
+    }
+    fields.len() > 1
+}
+
+/// Joins a parameter's value filters to its `scope` (tenant, resource type,
+/// parameter name) in the shape `build_search_index_filter` returns.
+fn scope_value_filters(
+    mut filter: Document,
+    param_type: SearchParamType,
+    value_filters: Vec<Document>,
+) -> Document {
+    // #1391: a date value can be several alternatives of its own (`ge`,
+    // `le`, `ne`), and a comma list adds more. MongoDB 5.0 answers an
+    // `$or` nested under the shared tenant/type/param conjuncts by
+    // reading the documents, not as a covered scan; an `$or` at the top,
+    // every arm carrying the scope itself, plans one index scan per arm.
+    // The alternatives and their OR are unchanged; only where they sit.
+    // #2602: a quantity is an interval, so `ap` and `ne` are alternatives
+    // of their own, and the same placement lets each arm seek its index.
+    if matches!(
+        param_type,
+        SearchParamType::Date | SearchParamType::Quantity
+    ) && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
+    {
+        return scoped_date_alternatives(&filter, value_filters);
+    }
+    // #2601: a bare-id reference on normalized rows is one arm on
+    // `value_reference` and one on `value_reference_target`. Nested under
+    // the shared scope, the `$or` implies neither partial index, so the
+    // planner read every row of the parameter through
+    // `idx_search_composite` and fetched it (2.8 M examined for 20 rows).
+    // At the top, each arm carries the scope and implies its own index.
+    if param_type == SearchParamType::Reference && alternatives_span_fields(&value_filters) {
+        return scoped_date_alternatives(&filter, value_filters);
+    }
+
+    if value_filters.len() == 1 {
+        if let Some(single) = value_filters.into_iter().next() {
+            for (key, value) in single {
+                filter.insert(key, value);
+            }
+        }
+        return filter;
+    }
+
+    // #1062: FHIR comma-separated values are OR for every parameter type
+    // (https://build.fhir.org/search.html#combining) — Date and Number
+    // used to get `$and` here, which was not merely stricter but wrong
+    // in a way that emptied the whole result. This filter is evaluated
+    // against a single `search_index` document (one value of one
+    // parameter, for one resource), so a disjoint AND can never be
+    // satisfied by any row: `distinct_resource_ids` then returns
+    // nothing, and `matching_resource_ids`'s empty-set short circuit
+    // empties the *entire* search result, not just this parameter. The
+    // AND semantics callers actually want is the *repeated*-parameter
+    // form (`?date=ge2020&date=le2021`), which arrives as separate
+    // `SearchParameter`s and is intersected in `matching_resource_ids` —
+    // unaffected by this change. Behavior change: a range-shaped comma
+    // list (`?date=ge2020,le2021`) widens from "in 2020-2021" to "any
+    // date >= 2020 OR any date <= 2021"; use the repeated form above for
+    // a closed range.
+    filter.insert(
+        "$or",
+        Bson::Array(value_filters.into_iter().map(Bson::Document).collect()),
+    );
+
+    filter
+}
+
 /// Drops the `tenant_id` / `resource_type` scope from a filter built by
 /// `build_search_index_filter`: at the top and, for a date filter, in each arm
 /// of its top-level `$or` ([`scoped_date_alternatives`]).
@@ -295,7 +398,7 @@ fn strip_index_scope(filter: &mut Document, param_type: SearchParamType) {
     filter.remove("resource_type");
     if !matches!(
         param_type,
-        SearchParamType::Date | SearchParamType::Quantity
+        SearchParamType::Date | SearchParamType::Quantity | SearchParamType::Reference
     ) {
         return;
     }
@@ -6513,7 +6616,7 @@ impl MongoBackend {
             return Ok(missing_presence_filter(tenant_id, resource_type, param));
         }
 
-        let mut filter = doc! {
+        let filter = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "param_name": &param.name,
@@ -6540,53 +6643,7 @@ impl MongoBackend {
             .map(|value| self.build_index_value_filter(param, value, &targets))
             .collect::<StorageResult<Vec<_>>>()?;
 
-        // #1391: a date value can be several alternatives of its own (`ge`,
-        // `le`, `ne`), and a comma list adds more. MongoDB 5.0 answers an
-        // `$or` nested under the shared tenant/type/param conjuncts by
-        // reading the documents, not as a covered scan; an `$or` at the top,
-        // every arm carrying the scope itself, plans one index scan per arm.
-        // The alternatives and their OR are unchanged; only where they sit.
-        // #2602: a quantity is an interval, so `ap` and `ne` are alternatives
-        // of their own, and the same placement lets each arm seek its index.
-        if matches!(
-            param.param_type,
-            SearchParamType::Date | SearchParamType::Quantity
-        ) && (value_filters.len() > 1 || value_filters.iter().any(|f| f.contains_key("$or")))
-        {
-            return Ok(scoped_date_alternatives(&filter, value_filters));
-        }
-
-        if value_filters.len() == 1 {
-            if let Some(single) = value_filters.into_iter().next() {
-                for (key, value) in single {
-                    filter.insert(key, value);
-                }
-            }
-            return Ok(filter);
-        }
-
-        // #1062: FHIR comma-separated values are OR for every parameter type
-        // (https://build.fhir.org/search.html#combining) — Date and Number
-        // used to get `$and` here, which was not merely stricter but wrong
-        // in a way that emptied the whole result. This filter is evaluated
-        // against a single `search_index` document (one value of one
-        // parameter, for one resource), so a disjoint AND can never be
-        // satisfied by any row: `distinct_resource_ids` then returns
-        // nothing, and `matching_resource_ids`'s empty-set short circuit
-        // empties the *entire* search result, not just this parameter. The
-        // AND semantics callers actually want is the *repeated*-parameter
-        // form (`?date=ge2020&date=le2021`), which arrives as separate
-        // `SearchParameter`s and is intersected in `matching_resource_ids` —
-        // unaffected by this change. Behavior change: a range-shaped comma
-        // list (`?date=ge2020,le2021`) widens from "in 2020-2021" to "any
-        // date >= 2020 OR any date <= 2021"; use the repeated form above for
-        // a closed range.
-        filter.insert(
-            "$or",
-            Bson::Array(value_filters.into_iter().map(Bson::Document).collect()),
-        );
-
-        Ok(filter)
+        Ok(scope_value_filters(filter, param.param_type, value_filters))
     }
 
     /// Builds every component's scoped `search_index` filter for a composite
@@ -7435,14 +7492,7 @@ impl MongoBackend {
         // the shapes `build_uri_filter` uses (#1408). Canonical `|version`
         // comparison is not implemented, as on the other backends.
         if matches!(param.modifier.as_ref(), Some(SearchModifier::Below)) {
-            return Ok(doc! {
-                "value_reference": {
-                    "$regex": format!(
-                        "^{}(/|$)",
-                        regex_escape(value.value.trim_end_matches('/'))
-                    )
-                }
-            });
+            return Ok(reference_below_filter(value.value.trim_end_matches('/')));
         }
         if matches!(param.modifier.as_ref(), Some(SearchModifier::Above)) {
             return Ok(doc! {
@@ -10383,6 +10433,122 @@ mod reference_filter_tests {
         );
     }
 
+    /// #2601: the two fields of a normalized bare id go to a root `$or`, each
+    /// arm scoped, so each arm implies its own partial value index; one field
+    /// keeps today's nested shape. Comma lists flatten the same way.
+    #[test]
+    fn normalized_bare_id_filters_put_each_field_in_a_scoped_root_arm() {
+        let backend = backend_with_subject_targets();
+        let targets = vec!["Patient".to_string(), "Group".to_string()];
+        let scope =
+            doc! { "tenant_id": "t1", "resource_type": "Observation", "param_name": "subject" };
+        let values = |param: &SearchParameter, normalized: bool| -> Vec<Document> {
+            param
+                .values
+                .iter()
+                .map(|value| {
+                    backend
+                        .build_reference_filter_for(param, value, &targets, normalized)
+                        .unwrap()
+                })
+                .collect()
+        };
+        let scoped = |param: &SearchParameter, normalized: bool| {
+            scope_value_filters(
+                scope.clone(),
+                SearchParamType::Reference,
+                values(param, normalized),
+            )
+        };
+        let arm = |condition: Document| {
+            let mut arm = scope.clone();
+            arm.extend(condition);
+            Bson::Document(arm)
+        };
+        assert_eq!(
+            scoped(&subject_param("123"), true),
+            doc! { "$or": [
+                arm(doc! { "value_reference": { "$in": ["123", "Patient/123", "Group/123"] } }),
+                arm(doc! { "value_reference_target": { "$in": ["Patient/123", "Group/123"] } }),
+            ] }
+        );
+
+        let mut list = subject_param("123");
+        list.values.push(SearchValue::eq("Patient/456"));
+        assert_eq!(
+            scoped(&list, true),
+            doc! { "$or": [
+                arm(doc! { "value_reference": { "$in": ["123", "Patient/123", "Group/123"] } }),
+                arm(doc! { "value_reference_target": { "$in": ["Patient/123", "Group/123"] } }),
+                arm(doc! { "value_reference": "Patient/456" }),
+            ] }
+        );
+
+        let mut stripped = scope_value_filters(
+            doc! { "tenant_id": "", "resource_type": "", "param_name": "subject" },
+            SearchParamType::Reference,
+            values(&subject_param("123"), true),
+        );
+        strip_index_scope(&mut stripped, SearchParamType::Reference);
+        for arm in or_arms(&stripped) {
+            assert!(!arm.contains_key("tenant_id") && !arm.contains_key("resource_type"));
+            assert_eq!(arm.get_str("param_name"), Ok("subject"));
+        }
+
+        // One field: the scope stays at the top, as before.
+        let mut expected = scope.clone();
+        expected.insert("value_reference", "Patient/123");
+        assert_eq!(scoped(&subject_param("Patient/123"), true), expected);
+        let legacy = scoped(&subject_param("123"), false);
+        assert_eq!(legacy.get_str("param_name"), Ok("subject"));
+        assert!(legacy.contains_key("$or"));
+        // The registry-driven builder still returns the legacy shape here.
+        assert_eq!(
+            backend
+                .build_search_index_filter("t1", "Observation", &subject_param("123"))
+                .unwrap(),
+            legacy
+        );
+    }
+
+    /// #2601: the `:below` range admits every string the regex matches, so
+    /// adding it changes the index bounds and never the matches.
+    #[test]
+    fn reference_below_range_admits_every_regex_match() {
+        let base = "Patient/1.5";
+        let filter = reference_below_filter(base);
+        let condition = filter.get_document("value_reference").unwrap();
+        let (low, high) = (
+            condition.get_str("$gte").unwrap(),
+            condition.get_str("$lt").unwrap(),
+        );
+        let regex = regex::Regex::new(condition.get_str("$regex").unwrap()).unwrap();
+        for candidate in [
+            "Patient/1.5",
+            "Patient/1.5/",
+            "Patient/1.5/_history/2",
+            "Patient/1.5\n",
+            "Patient/1.5-a",
+            "Patient/1.5.6",
+            "Patient/1.50",
+            "Patient/1.5a",
+            "Patient/1x5",
+            "Patient/1",
+            "Patient/1.5/\u{e9}",
+            "Patient/1.4",
+            "Patient/1.6",
+        ] {
+            if regex.is_match(candidate) {
+                assert!(
+                    low <= candidate && candidate < high,
+                    "{candidate:?} matches the regex but not [{low}, {high})"
+                );
+            }
+        }
+        assert!(regex.is_match("Patient/1.5") && regex.is_match("Patient/1.5/_history/2"));
+        assert!(!regex.is_match("Patient/1.5-a") && !regex.is_match("Patient/1x5"));
+    }
+
     fn or_arms(filter: &Document) -> Vec<Document> {
         filter
             .get_array("$or")
@@ -11761,7 +11927,11 @@ mod modifier_parity_filter_tests {
             subject(SearchModifier::Below, "http://example.org/fhir/"),
             with(
                 envelope("subject"),
-                doc! { "value_reference": { "$regex": "^http://example\\.org/fhir(/|$)" } }
+                doc! { "value_reference": {
+                    "$gte": "http://example.org/fhir",
+                    "$lt": "http://example.org/fhir0",
+                    "$regex": "^http://example\\.org/fhir(/|$)",
+                } }
             )
         );
         let above = subject(SearchModifier::Above, "http://example.org/fhir/Patient/1");
