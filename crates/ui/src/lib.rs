@@ -66,11 +66,13 @@ mod sql_views;
 mod subscriptions;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+mod cross_site;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use bulk_import::set_bulk_submit_trusted_providers;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 pub use tenants::register_tenant_purge_output;
 
@@ -254,6 +256,17 @@ const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
 
+/// Whether the settings document `user_key` names is withheld from this
+/// request (#2802): in the bearer-only posture no principal ever reaches
+/// `/ui`, so every caller resolves to the `l2:` document reserved for the
+/// auth-disabled deployment. The pages that stay open there neither read it
+/// (the stored FHIR version, tenant, rail and dashboard state) nor write it
+/// (a page load recording a rail or chart selection); they render from the
+/// server defaults instead.
+pub(crate) fn settings_withheld(user_key: &str) -> bool {
+    user_key == LOCAL_USER_KEY && bearer_only_auth()
+}
+
 fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
     match principal {
         Some(p) => format!("u2:{}:{}:{}", p.issuer().len(), p.issuer(), p.subject()),
@@ -427,8 +440,10 @@ async fn resolve_prefs(
     // stamped below) is built from too — reading it again per page would break
     // that module's zero-extra-reads contract.
     let stored = match &state.settings {
-        Some(store) => store.get_settings(&user_key).await.ok().flatten(),
-        None => None,
+        Some(store) if !settings_withheld(&user_key) => {
+            store.get_settings(&user_key).await.ok().flatten()
+        }
+        _ => None,
     };
     if let Some(stored) = &stored {
         let document = &stored.document;
@@ -2084,6 +2099,13 @@ pub fn mount_with_conformance_source_and_runtime(
             state.clone(),
             login::require_session,
         ))
+        // Outside the session gate: a form posted by a page on another site
+        // is refused before it can ride the browser's session or, with
+        // authentication off, act for anyone who can reach the UI.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cross_site::refuse_cross_site_writes,
+        ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
         // the redirect needs none, and `POST /` (FHIR batch) must reach the
@@ -2188,18 +2210,33 @@ fn acts_on_storage_directly(path: &str) -> bool {
         || path == "/ui/subscriptions"
 }
 
+/// The UI routes that read or write the caller's settings document with
+/// nothing but the request to key it on: the SQL Export workspace (its job
+/// records live in that document) and the preference writes. In the
+/// bearer-only posture no principal ever reaches `/ui`, so every caller,
+/// including one presenting a bearer, would share the `l2:` document that
+/// is reserved for the auth-disabled deployment; these are refused there.
+fn keeps_shared_settings(method: &axum::http::Method, path: &str) -> bool {
+    path == "/ui/sql/export"
+        || path.starts_with("/ui/sql/export/")
+        || (*method == axum::http::Method::POST
+            && matches!(path, "/ui/version" | "/ui/sql/views" | "/ui/sql/queries"))
+}
+
 /// Middleware (#1619): in the bearer-only posture — authentication enabled,
 /// no interactive login installed, so no session principal can ever be
-/// stamped — a request for a route that acts on storage directly is refused
-/// with `401` and the same notice the shell shows. With a login installed
-/// `require_session` gates every page instead, and with authentication off
-/// there is nothing to refuse.
+/// stamped — a request for a route that acts on storage directly, or that
+/// keeps settings for a caller it cannot name, is refused with `401` and the
+/// same notice the shell shows. With a login installed `require_session`
+/// gates every page instead, and with authentication off there is nothing to
+/// refuse.
 async fn refuse_anonymous_storage_access(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
     if bearer_only_auth()
-        && acts_on_storage_directly(request.uri().path())
+        && (acts_on_storage_directly(request.uri().path())
+            || keeps_shared_settings(request.method(), request.uri().path()))
         && request.extensions().get::<login::SignedIn>().is_none()
     {
         let locale = request
