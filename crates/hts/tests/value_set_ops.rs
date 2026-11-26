@@ -797,6 +797,149 @@ async fn expand_exceeds_limit_returns_422_too_costly() {
     assert_eq!(issue_code, "too-costly");
 }
 
+/// An app whose configured limit is `limit` and whose header ceiling is
+/// `ceiling`, with `bundle` imported.
+#[cfg(feature = "sqlite")]
+async fn capped_app(limit: u32, ceiling: u32, bundle: &str) -> axum::Router {
+    use axum::{body::Body, http::Request};
+    use helios_hts::{backends::SqliteTerminologyBackend, config::HtsConfig, state::AppState};
+    use tower::ServiceExt;
+
+    let backend = SqliteTerminologyBackend::in_memory().unwrap();
+    let state = AppState::new(backend)
+        .with_max_expansion_size(limit)
+        .with_max_expansion_size_ceiling(ceiling);
+    let app = helios_hts::server::create_app(&HtsConfig::default(), state);
+    let import_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/import")
+                .header("content-type", "application/fhir+json")
+                .body(Body::from(bundle.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(import_response.status().is_success());
+    app
+}
+
+#[cfg(feature = "sqlite")]
+async fn expand_status(
+    app: axum::Router,
+    body: serde_json::Value,
+    threshold_header: Option<&str>,
+) -> StatusCode {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/ValueSet/$expand")
+        .header("content-type", "application/fhir+json");
+    if let Some(threshold) = threshold_header {
+        request = request.header("x-too-costly-threshold", threshold);
+    }
+    app.oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn the_threshold_header_raises_the_limit_only_up_to_the_ceiling() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "url", "valueUri": bundles::LIMBS_VS_URL}]
+    });
+
+    // The limbs value set has three codes: a header within the ceiling lifts the limit.
+    let app = capped_app(1, 5, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body.clone(), Some("5")).await,
+        StatusCode::OK
+    );
+
+    // Above the ceiling the header is clamped, so three codes still exceed it.
+    let app = capped_app(1, 2, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, Some("10")).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_body_parameter_cannot_raise_the_expansion_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::LIMBS_VS_URL},
+            {"name": "__max_expansion_size__", "valueInteger": 10}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::r4_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_tree_expansion_is_subject_to_the_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+            {"name": "hierarchical", "valueBoolean": true}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::ecl_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// `count` pages a flat expansion, but a tree ignores it and returns every
+/// code, so a tree with `count` must still be held to the limit.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_tree_expansion_with_count_is_subject_to_the_limit() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+            {"name": "hierarchical", "valueBoolean": true},
+            {"name": "count", "valueInteger": 1}
+        ]
+    });
+    let app = capped_app(1, 100, bundles::ecl_bundle()).await;
+    assert_eq!(
+        expand_status(app, body, None).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// A ceiling configured below the limit must not let the header, which asks
+/// for more codes, lower the limit instead.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_ceiling_below_the_limit_never_lowers_it() {
+    let body = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "url", "valueUri": bundles::LIMBS_VS_URL}]
+    });
+    // Limit 5 lets the three limbs codes through; a ceiling of 2 would cut
+    // the header's 10 down to 2 if it were taken as is.
+    let app = capped_app(5, 2, bundles::r4_bundle()).await;
+    assert_eq!(expand_status(app, body, Some("10")).await, StatusCode::OK);
+}
+
 // ── valueCoding / valueCodeableConcept inputs ─────────────────────────────────
 
 #[cfg(feature = "sqlite")]
@@ -1049,4 +1192,87 @@ async fn expand_implicit_vs_total_matches_concept_count() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["expansion"]["total"], 3);
+}
+
+// ── $expand: implicit ValueSets over the expansion limit ─────────────────────
+
+#[cfg(feature = "sqlite")]
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The anatomy code system has more concepts than the limit of one. Whether
+/// such a set is answered depends only on the request, never on whether an
+/// earlier request left it in the server's derived cache: none of these
+/// requests may persist it, and each is answered the same on every repeat.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn an_implicit_value_set_over_the_limit_is_answered_per_request_shape() {
+    let app = capped_app(1, 1, bundles::r4_bundle()).await;
+    let base = "/ValueSet/$expand?url=http%3A%2F%2Fhts.test%2Fanatomy%3Ffhir_vs";
+
+    for round in 0..2 {
+        // A count of zero asks for the total alone.
+        let (status, body) = get_json(app.clone(), &format!("{base}&count=0")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        let total = body["expansion"]["total"].as_u64().unwrap_or(0);
+        assert!(total > 1, "round {round}: {body}");
+        assert!(
+            body["expansion"]["contains"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+
+        // No page size and no filter: over the limit.
+        let (status, body) = get_json(app.clone(), base).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "round {round}");
+        assert_eq!(body["issue"][0]["code"], "too-costly", "round {round}");
+
+        // The limit applies to what a filter leaves.
+        let (status, body) = get_json(app.clone(), &format!("{base}&filter=arm")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        let contains = body["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 1, "round {round}: {body}");
+        assert_eq!(contains[0]["code"], "arm");
+
+        // A page of a large set is always served.
+        let (status, body) = get_json(app.clone(), &format!("{base}&count=1&offset=1")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        assert_eq!(body["expansion"]["contains"].as_array().unwrap().len(), 1);
+    }
+}
+
+/// `$validate-code` against a `CodeSystem.valueSet` link answers from the
+/// code system itself.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_against_a_code_system_value_set_link() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
+
+    for (code, expected) in [("bone", true), ("femur", false)] {
+        let req = TestApp::params(&[
+            ("url", "valueUri", bundles::IMPLICIT_VS_URL),
+            ("system", "valueUri", "http://hts.test/anatomy-implicit"),
+            ("code", "valueCode", code),
+        ]);
+        let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result = body["parameter"]
+            .as_array()
+            .and_then(|p| p.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool());
+        assert_eq!(result, Some(expected), "{code}: {body}");
+    }
 }

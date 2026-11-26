@@ -633,7 +633,7 @@ where
                             message: format!("Entry {}: {}", index, e),
                         }
                     })?;
-                    let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
+                    let operation = entry_operation(&bundle_entry.method, get_target.as_ref());
                     let scope = SmartScopePolicy::check(principal, &resource_type, operation)
                         .map_err(|_| RestError::Forbidden {
                             message: format!(
@@ -1367,7 +1367,7 @@ where
         // safe while an unsupported method was caught further down — with the
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
-        let operation = bundle_method_to_fhir_operation(&method);
+        let operation = entry_operation(&method, get_target.as_ref());
         match SmartScopePolicy::check(principal, &resource_type, operation) {
             Ok(AccessScope::Unrestricted) => {}
             // A grant confined to a patient compartment (#1618): a GET entry
@@ -3272,7 +3272,7 @@ where
                     resource_type: resource_type.clone(),
                     id: id.clone(),
                 }),
-                Err(e) => entry_storage_failure(e),
+                Err(e) => entry_failure(RestError::gone_as_configured(e, state.return_gone())),
             }
         }
         GetEntryTarget::Vread {
@@ -3766,6 +3766,16 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
         BundleMethod::Post => FhirOperation::Create,
         BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
         BundleMethod::Delete => FhirOperation::Delete,
+    }
+}
+
+/// The interaction a bundle entry is authorized for: a GET entry whose URL is
+/// a search is a `Search`, as the direct `GET [type]?query` is; every other
+/// GET (read, vread, history) is a `Read`; the writes follow the method.
+fn entry_operation(method: &BundleMethod, get_target: Option<&GetEntryTarget>) -> FhirOperation {
+    match get_target {
+        Some(GetEntryTarget::Search { .. }) => FhirOperation::Search,
+        _ => bundle_method_to_fhir_operation(method),
     }
 }
 

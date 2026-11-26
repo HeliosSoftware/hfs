@@ -27,6 +27,10 @@ use crate::types::{
 };
 
 use super::SqliteBackend;
+use super::search::query_builder::{
+    DateTailRange, DateTieProbe, DateWalkRange, date_walk_index, date_walk_keyed_count_sql,
+    date_walk_page_sql, date_walk_tail_sql, date_walk_tie_probe_sql,
+};
 use super::search::{
     DEFAULT_ORDER_BY, KeysetKey, QueryBuilder, SortValueKind, SqlParam, is_parameter_rows,
     membership_exists_predicate,
@@ -497,6 +501,45 @@ impl SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
+        // An unfiltered sort by one date parameter reads the date index in
+        // order instead of computing the key of every resource of the type
+        // (#2731). It needs the index: a bulk rebuild drops it for its
+        // duration, and the correlated-subquery statement below serves then.
+        if let Some((directive, desc)) = query.unfiltered_single_date_sort()
+            && date_walk_index_present(conn, desc)
+        {
+            match walk_date_page(
+                conn,
+                tenant_id,
+                resource_type,
+                &directive.parameter,
+                desc,
+                cursor.as_ref(),
+                query.offset.unwrap_or(0) as usize,
+                count,
+                tie_group_cap(),
+            ) {
+                Ok(Some((raw_rows, has_previous))) => {
+                    return assemble_page(
+                        tenant,
+                        resource_type,
+                        raw_rows,
+                        cursor.as_ref(),
+                        true,
+                        count,
+                        has_previous,
+                        total,
+                    );
+                }
+                // The page starts in an equal-key group too large to walk: the
+                // general statement below serves it.
+                Ok(None) => {}
+                // The index was dropped between the probe and the prepare.
+                Err(error) if error.to_string().contains("no such index") => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder = QueryBuilder::new(tenant_id, resource_type)
                 .with_param_offset(param_offset)
@@ -708,96 +751,351 @@ impl SqliteBackend {
             None => run(&sql)?,
         };
 
-        // Parse rows, carrying the sort key for cursor construction.
-        let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
-        for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
-            let json_data: serde_json::Value = serde_json::from_slice(&data)
-                .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
-
-            let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated_str)
-                .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
-                .with_timezone(&Utc);
-
-            let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-            let resource = StoredResource::from_storage(
-                resource_type.clone(),
-                id,
-                version_id,
-                tenant.tenant_id().clone(),
-                json_data,
-                last_updated,
-                last_updated,
-                None,
-                fhir_version,
-            );
-
-            parsed.push((resource, sort_key));
-        }
-
-        let backward = cursor
-            .as_ref()
-            .is_some_and(|c| c.direction() == CursorDirection::Previous);
-
-        // Forward: the extra row (if any) is the *last* one and proves a next page.
-        // Backward: rows arrive in reversed order, so the extra row is also the
-        // last one fetched but it is the *farthest* from the cursor — it belongs to
-        // page N-2, not to the page we return — and it proves a previous page. It
-        // must be dropped before `reverse()` restores the sort order. See #1079
-        // and the Elasticsearch `backward` branch (#1015).
-        let (has_next, has_previous) = if backward {
-            let has_previous = parsed.len() > count;
-            if has_previous {
-                parsed.pop();
-            }
-            parsed.reverse();
-            (!parsed.is_empty(), has_previous)
-        } else {
-            let has_next = parsed.len() > count;
-            if has_next {
-                parsed.pop();
-            }
-            (has_next, has_previous)
-        };
-
-        // A sort with no keyset (multi-field) pages by offset, which is what
-        // the REST layer's `next` link falls back to without a cursor. A
-        // cursor minted here would be ignored on the way back in and return
-        // the first page again (#1606, as MongoDB since #1058).
-        let next_cursor = if has_next && keyset.is_some() {
-            parsed.last().map(|(r, sk)| {
-                PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
-            })
-        } else {
-            None
-        };
-        let previous_cursor = if has_previous && keyset.is_some() {
-            parsed.first().map(|(r, sk)| {
-                PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
-            })
-        } else {
-            None
-        };
-
-        let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
-        let page_info = PageInfo {
-            next_cursor,
-            previous_cursor,
-            total,
-            has_next,
+        assemble_page(
+            tenant,
+            resource_type,
+            raw_rows,
+            cursor.as_ref(),
+            keyset.is_some(),
+            count,
             has_previous,
-        };
-
-        let page = Page::new(resources, page_info);
-
-        Ok(SearchResult {
-            resources: page,
-            included: Vec::new(),
             total,
-            scores: Default::default(),
-        })
+        )
     }
+}
+
+/// Parses the page statement's rows into a [`SearchResult`]: the extra row's
+/// `has_next` / `has_previous`, the cursors from the sort key, the total.
+#[allow(clippy::too_many_arguments)]
+fn assemble_page(
+    tenant: &TenantContext,
+    resource_type: &str,
+    raw_rows: Vec<RawRow>,
+    cursor: Option<&PageCursor>,
+    has_keyset: bool,
+    count: usize,
+    has_previous: bool,
+    total: Option<u64>,
+) -> StorageResult<SearchResult> {
+    // Parse rows, carrying the sort key for cursor construction.
+    let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
+    for (id, version_id, data, last_updated_str, fhir_version_str, sort_key) in raw_rows {
+        let json_data: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
+
+        let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated_str)
+            .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
+            .with_timezone(&Utc);
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        let resource = StoredResource::from_storage(
+            resource_type.to_string(),
+            id,
+            version_id,
+            tenant.tenant_id().clone(),
+            json_data,
+            last_updated,
+            last_updated,
+            None,
+            fhir_version,
+        );
+
+        parsed.push((resource, sort_key));
+    }
+
+    let backward = cursor.is_some_and(|c| c.direction() == CursorDirection::Previous);
+
+    // Forward: the extra row (if any) is the *last* one and proves a next page.
+    // Backward: rows arrive in reversed order, so the extra row is also the
+    // last one fetched but it is the *farthest* from the cursor — it belongs to
+    // page N-2, not to the page we return — and it proves a previous page. It
+    // must be dropped before `reverse()` restores the sort order. See #1079
+    // and the Elasticsearch `backward` branch (#1015).
+    let (has_next, has_previous) = if backward {
+        let has_previous = parsed.len() > count;
+        if has_previous {
+            parsed.pop();
+        }
+        parsed.reverse();
+        (!parsed.is_empty(), has_previous)
+    } else {
+        let has_next = parsed.len() > count;
+        if has_next {
+            parsed.pop();
+        }
+        (has_next, has_previous)
+    };
+
+    // A sort with no keyset (multi-field) pages by offset, which is what
+    // the REST layer's `next` link falls back to without a cursor. A
+    // cursor minted here would be ignored on the way back in and return
+    // the first page again (#1606, as MongoDB since #1058).
+    let next_cursor = if has_next && has_keyset {
+        parsed.last().map(|(r, sk)| {
+            PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
+        })
+    } else {
+        None
+    };
+    let previous_cursor = if has_previous && has_keyset {
+        parsed.first().map(|(r, sk)| {
+            PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
+        })
+    } else {
+        None
+    };
+
+    let resources: Vec<StoredResource> = parsed.into_iter().map(|(r, _)| r).collect();
+    let page_info = PageInfo {
+        next_cursor,
+        previous_cursor,
+        total,
+        has_next,
+        has_previous,
+    };
+
+    let page = Page::new(resources, page_info);
+
+    Ok(SearchResult {
+        resources: page,
+        included: Vec::new(),
+        total,
+        scores: Default::default(),
+    })
+}
+
+/// The equal-key group size the date walk tolerates: the constant, or what a
+/// test sets for its own thread.
+fn tie_group_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = tests::TIE_CAP.with(|cap| cap.get()) {
+        return cap;
+    }
+    crate::types::DATE_WALK_MAX_TIE_GROUP
+}
+
+/// Whether the index the date walk reads exists. A bulk rebuild drops the
+/// value indexes for its duration (`BULK_REBUILD_DROPPED_INDEXES`); without
+/// them the walk would scan `search_index`, so the caller keeps the correlated
+/// subquery.
+fn date_walk_index_present(conn: &rusqlite::Connection, desc: bool) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [date_walk_index(desc)],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// One page of an unfiltered date sort read from the date index (#2731): the
+/// resources with a value in key order, then those without in `id` order, the
+/// order of the correlated-subquery sort. Returns the page rows (`count + 1`
+/// at most, the extra one proving a further page) and `has_previous`.
+///
+/// An `_offset` past every resource with a value places the offset of the
+/// tail from a `COUNT` of them, which is linear in the resources of the type
+/// (as the correlated sort was). An `_offset` above `DATE_WALK_MAX_OFFSET` never
+/// reaches here: `unfiltered_single_date_sort` refuses it and the general
+/// statement serves the page.
+///
+/// `None` means the page starts in an equal-key group of more than `tie_cap`
+/// rows, which the walk would read, probe and sort whole for every page; the
+/// caller serves it with the general statement. Only the group the page
+/// starts at is measured: with an `_offset` (at most `DATE_WALK_MAX_OFFSET`)
+/// the page can start in a later group that this does not see.
+#[allow(clippy::too_many_arguments)]
+fn walk_date_page(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    param: &str,
+    desc: bool,
+    cursor: Option<&PageCursor>,
+    offset: usize,
+    count: usize,
+    tie_cap: usize,
+) -> StorageResult<Option<(Vec<RawRow>, bool)>> {
+    let probe = match cursor {
+        None => Some(DateTieProbe::Head { reverse: false }),
+        Some(cursor) => {
+            let backward = cursor.direction() == CursorDirection::Previous;
+            match (backward, cursor_value_is_null(cursor)) {
+                // Forward from a resource with no value: only the tail.
+                (false, true) => None,
+                // Backward from one: reads the keyed resources from the end.
+                (true, true) => Some(DateTieProbe::Head { reverse: true }),
+                _ => Some(DateTieProbe::Value),
+            }
+        }
+    };
+    if let Some(probe) = probe {
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        if probe == DateTieProbe::Value
+            && let Some(cursor) = cursor
+        {
+            bind_cursor_value(&mut bound, SortValueKind::Timestamp, cursor)?;
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
+        let group: i64 = conn
+            .query_row(
+                &date_walk_tie_probe_sql(param, desc, probe, tie_cap),
+                refs.as_slice(),
+                |row| row.get(0),
+            )
+            .or_query_error("Failed to measure the date tie group")?;
+        if group as usize > tie_cap {
+            return Ok(None);
+        }
+    }
+    walk_date_rows(
+        conn,
+        tenant_id,
+        resource_type,
+        param,
+        desc,
+        cursor,
+        offset,
+        count,
+    )
+    .map(Some)
+}
+
+/// The rows of [`walk_date_page`] once its first group is known to be small.
+#[allow(clippy::too_many_arguments)]
+fn walk_date_rows(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    param: &str,
+    desc: bool,
+    cursor: Option<&PageCursor>,
+    offset: usize,
+    count: usize,
+) -> StorageResult<(Vec<RawRow>, bool)> {
+    type Bound = Vec<Box<dyn rusqlite::ToSql>>;
+    let limit = count + 1;
+    let run = |sql: &str, bound: Bound| -> StorageResult<Vec<RawRow>> {
+        let mut all: Bound = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        all.extend(bound);
+        let refs: Vec<&dyn rusqlite::ToSql> = all.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn
+            .prepare(sql)
+            .or_query_error("Failed to prepare search query")?;
+        stmt.query_map(refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?.map(CursorValue::String),
+            ))
+        })
+        .or_query_error("Failed to execute search")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read row")
+    };
+    let walk = |range: DateWalkRange, limit: usize, offset: usize, bound: Bound| {
+        run(
+            &date_walk_page_sql(param, desc, range, limit, offset),
+            bound,
+        )
+    };
+    let tail = |range: DateTailRange, limit: usize, offset: usize, bound: Bound| {
+        run(
+            &date_walk_tail_sql(param, desc, range, limit, offset),
+            bound,
+        )
+    };
+
+    let Some(cursor) = cursor else {
+        let mut rows = walk(DateWalkRange::All, limit, offset, Vec::new())?;
+        if rows.len() < limit {
+            // Rows came back, so the keyed set ends at `offset + rows.len()`
+            // and the tail starts at its own first row; with none, it ended
+            // at or before `offset`.
+            let keyed = if rows.is_empty() && offset > 0 {
+                let sql = date_walk_keyed_count_sql(param, desc);
+                run_count(conn, &sql, tenant_id, resource_type)?.min(offset)
+            } else {
+                offset + rows.len()
+            };
+            let more = tail(
+                DateTailRange::All,
+                limit - rows.len(),
+                offset.saturating_sub(keyed),
+                Vec::new(),
+            )?;
+            rows.extend(more);
+        }
+        return Ok((rows, offset > 0));
+    };
+
+    let backward = cursor.direction() == CursorDirection::Previous;
+    let at_missing = cursor_value_is_null(cursor);
+    let mut bound: Bound = Vec::new();
+    if !at_missing {
+        bind_cursor_value(&mut bound, SortValueKind::Timestamp, cursor)?;
+    }
+    let id = || -> Box<dyn rusqlite::ToSql> { Box::new(cursor.resource_id().to_string()) };
+    let rows = match (backward, at_missing) {
+        // Forward from a resource with a value: the rest of the keyed
+        // resources, then the tail.
+        (false, false) => {
+            bound.push(id());
+            let mut rows = walk(DateWalkRange::After, limit, 0, bound)?;
+            if rows.len() < limit {
+                rows.extend(tail(DateTailRange::All, limit - rows.len(), 0, Vec::new())?);
+            }
+            rows
+        }
+        // Forward from one without: the rest of the tail by id.
+        (false, true) => tail(DateTailRange::After, limit, 0, vec![id()])?,
+        // Backward from a resource with a value: only keyed resources lie
+        // before it.
+        (true, false) => {
+            bound.push(id());
+            walk(DateWalkRange::Before, limit, 0, bound)?
+        }
+        // Backward from one without: the tail before it by id, then every
+        // keyed resource, the order reversed.
+        (true, true) => {
+            let mut rows = tail(DateTailRange::Before, limit, 0, vec![id()])?;
+            if rows.len() < limit {
+                rows.extend(walk(
+                    DateWalkRange::Reversed,
+                    limit - rows.len(),
+                    0,
+                    Vec::new(),
+                )?);
+            }
+            rows
+        }
+    };
+    Ok((rows, !backward))
+}
+
+/// A single `COUNT(*)` statement bound to `?1` tenant and `?2` type.
+fn run_count(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    tenant_id: &str,
+    resource_type: &str,
+) -> StorageResult<usize> {
+    conn.query_row(sql, params![tenant_id, resource_type], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n.max(0) as usize)
+    .or_query_error("Failed to count resources with a value")
 }
 
 /// One `resources` row as the page statements return it, with its sort key.
@@ -4350,6 +4648,10 @@ mod tests {
     thread_local! {
         static TRACED_SQL: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// Equal-key group size the date walk tolerates on this thread; `None`
+        /// is the production constant.
+        pub(super) static TIE_CAP: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// `Connection::trace_v2` callback: keeps each statement as it starts,
@@ -4359,6 +4661,390 @@ mod tests {
             && let Some(sql) = statement.expanded_sql()
         {
             TRACED_SQL.with(|traced| traced.borrow_mut().push(sql));
+        }
+    }
+
+    /// Seeds Observations for the date-walk tests: several date rows per
+    /// resource (a Period and a DateTime), ties, and resources with no date.
+    async fn seed_date_walk(backend: &SqliteBackend, tenant: &TenantContext) {
+        for i in 0..9usize {
+            let mut resource = json!({
+                "resourceType": "Observation",
+                "id": format!("w{i}"),
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "X"}]},
+            });
+            match i % 3 {
+                0 => {
+                    resource["effectiveDateTime"] =
+                        json!(format!("20{:02}-03-01T10:00:00Z", 10 + i % 4))
+                }
+                1 => {
+                    resource["effectivePeriod"] = json!({
+                        "start": format!("20{:02}-01-01T00:00:00Z", 10 + i % 4),
+                        "end": format!("20{:02}-06-01T00:00:00Z", 12 + i % 4),
+                    })
+                }
+                _ => {}
+            }
+            backend
+                .create(tenant, "Observation", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn date_sort_query(desc: bool, count: usize) -> SearchQuery {
+        use crate::types::{SortDirection, SortDirective};
+        let mut query = SearchQuery::new("Observation");
+        query.sort = vec![SortDirective {
+            parameter: "date".to_string(),
+            direction: if desc {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            },
+            param_type: Some(SearchParamType::Date),
+        }];
+        query.count = Some(count as u32);
+        query
+    }
+
+    /// #2731: an unfiltered date sort reads `idx_search_date_end` (descending)
+    /// or `idx_search_date` (ascending) in order, with no correlated subquery
+    /// over `resources` and no scan of `resources` or `search_index`.
+    #[tokio::test]
+    async fn unfiltered_date_sort_walks_the_date_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let mut tail_seen = false;
+        for (desc, index) in [(true, "idx_search_date_end"), (false, "idx_search_date")] {
+            let query = date_sort_query(desc, 2);
+            let mut pages = Vec::new();
+            let mut cursor_query = query.clone();
+            for _ in 0..3 {
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let result = backend
+                    .search_with_connection_probe(&conn, &tenant, &cursor_query, None, false)
+                    .unwrap();
+                let sql = TRACED_SQL
+                    .with(|traced| {
+                        traced
+                            .borrow()
+                            .iter()
+                            .find(|sql| sql.starts_with("SELECT r.id, r.version_id"))
+                            .cloned()
+                    })
+                    .expect("the date walk statement");
+                let plan: Vec<String> = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().any(
+                        |line| line.contains(&format!("USING COVERING INDEX {index}"))
+                            || line.contains(&format!("USING INDEX {index}"))
+                    ),
+                    "{sql}\n{plan:#?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("CORRELATED SCALAR SUBQUERY")
+                            && line.contains("resources")),
+                    "{sql}\n{plan:#?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line.starts_with("SCAN resources")
+                        || line.starts_with("SCAN r")
+                        || line.starts_with("SCAN search_index")
+                        || line.starts_with("SCAN si")),
+                    "{sql}\n{plan:#?}"
+                );
+                // The key order comes from the index; only the ties on it are
+                // ordered by id, so the sort stops with the page.
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("USE TEMP B-TREE FOR ORDER BY")),
+                    "{sql}\n{plan:#?}"
+                );
+                // The tail (resources with no value) runs when a page is
+                // short; its probe must seek by resource, not read the
+                // parameter's whole index for each one.
+                let tail = TRACED_SQL.with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT id, version_id"))
+                        .cloned()
+                });
+                if let Some(tail) = tail {
+                    tail_seen = true;
+                    assert_seeks_by_resource(&conn, &tail);
+                }
+                pages.push(result.resources.items.len());
+                match result.resources.page_info.next_cursor {
+                    Some(next) => cursor_query.cursor = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(pages[0], 2);
+
+            // An `_offset` past every resource with a value counts them.
+            let mut past = date_sort_query(desc, 2);
+            past.offset = Some(8);
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            backend
+                .search_with_connection_probe(&conn, &tenant, &past, None, false)
+                .unwrap();
+            let count = TRACED_SQL
+                .with(|traced| {
+                    traced
+                        .borrow()
+                        .iter()
+                        .find(|sql| sql.starts_with("SELECT COUNT(*) FROM resources"))
+                        .cloned()
+                })
+                .expect("the count of resources with a value");
+            assert_seeks_by_resource(&conn, &count);
+        }
+        assert!(tail_seen, "no page reached the resources with no value");
+    }
+
+    /// The `search_index` probes of `sql` (the tail or the count of the date
+    /// walk) seek `idx_search_composite` by `resource_key`; the partial date
+    /// indexes have no such prefix and would be read whole per resource, which
+    /// made the descending tail and count quadratic (#2731).
+    fn assert_seeks_by_resource(conn: &rusqlite::Connection, sql: &str) {
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let probes: Vec<&String> = plan
+            .iter()
+            .filter(|line| line.contains("search_index") || line.starts_with("SEARCH s "))
+            .collect();
+        assert!(
+            !probes.is_empty(),
+            "{sql}
+{plan:#?}"
+        );
+        for line in probes {
+            assert!(
+                line.contains("resource_key=?"),
+                "probe without resource_key: {line}
+{sql}
+{plan:#?}"
+            );
+            assert!(
+                !line.contains("idx_search_date"),
+                "probe on a date index: {line}
+{sql}
+{plan:#?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|line| line.contains("USE TEMP B-TREE")),
+            "{sql}
+{plan:#?}"
+        );
+    }
+
+    /// #2731: with the date index gone (a bulk rebuild drops it), the page is
+    /// the correlated-subquery statement again, and the same one.
+    #[tokio::test]
+    async fn unfiltered_date_sort_falls_back_without_the_date_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect()
+        };
+        for (desc, index) in [(true, "idx_search_date_end"), (false, "idx_search_date")] {
+            let query = date_sort_query(desc, 20);
+            let walked = backend
+                .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                .unwrap();
+            conn.execute(&format!("DROP INDEX {index}"), []).unwrap();
+            TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+            let fallback = backend
+                .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                .unwrap();
+            let walked_sql = TRACED_SQL.with(|traced| {
+                traced
+                    .borrow()
+                    .iter()
+                    .any(|sql| sql.contains("FROM search_index si CROSS JOIN resources r"))
+            });
+            assert!(!walked_sql, "the walk ran without {index}");
+            assert_eq!(ids(&walked), ids(&fallback), "{index}");
+            assert_eq!(ids(&walked).len(), 9);
+        }
+    }
+
+    /// Seeds `ties` Observations at one instant (the latest) and `others` at
+    /// distinct earlier ones, so the head of a descending sort is one big
+    /// equal-key group.
+    async fn seed_date_ties(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        ties: usize,
+        others: usize,
+    ) {
+        for i in 0..ties + others {
+            let instant = if i < ties {
+                "2030-01-01T00:00:00Z".to_string()
+            } else {
+                format!("20{:02}-01-01T00:00:00Z", 10 + (i - ties))
+            };
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": format!("t{i:03}"),
+                           "status": "final", "effectiveDateTime": instant}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Every id of an unfiltered date sort, one cursor page at a time.
+    fn date_sort_ids(
+        backend: &SqliteBackend,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut paged = query.clone();
+        loop {
+            let result = backend
+                .search_with_connection_probe(conn, tenant, &paged, None, false)
+                .unwrap();
+            ids.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            match result.resources.page_info.next_cursor {
+                Some(next) => paged.cursor = Some(next),
+                None => return ids,
+            }
+        }
+    }
+
+    fn walk_statement_ran() -> bool {
+        TRACED_SQL.with(|traced| {
+            traced
+                .borrow()
+                .iter()
+                .any(|sql| sql.contains("FROM search_index si CROSS JOIN resources r"))
+        })
+    }
+
+    /// #2731: a page that starts in an equal-key group above the tolerated size
+    /// is served by the general statement, with the same ids and order; below
+    /// it the walk serves it. A cursor paging through the big group and out of
+    /// it gives the same list on either path.
+    #[tokio::test]
+    async fn a_large_equal_key_group_is_served_by_the_general_statement() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_ties(&backend, &tenant, 12, 6).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            let general = {
+                let mut query = date_sort_query(desc, 100);
+                query.fhir_version = Some(FhirVersion::default());
+                date_sort_ids(&backend, &conn, &tenant, &query)
+            };
+            assert_eq!(general.len(), 18);
+            for (cap, walked) in [(5usize, false), (100, true)] {
+                TIE_CAP.with(|c| c.set(Some(cap)));
+                // The first page starts in the 12 ties when descending, and in
+                // the single earliest rows when ascending.
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let first = backend
+                    .search_with_connection_probe(
+                        &conn,
+                        &tenant,
+                        &date_sort_query(desc, 5),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                let expect_walk = walked || !desc;
+                assert_eq!(walk_statement_ran(), expect_walk, "desc={desc} cap={cap}");
+                let first: Vec<String> = first
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(first, general[..5], "desc={desc} cap={cap}");
+                // Paged by cursor across the group boundary: the same list.
+                let paged = date_sort_ids(&backend, &conn, &tenant, &date_sort_query(desc, 5));
+                assert_eq!(paged, general, "desc={desc} cap={cap}");
+            }
+            TIE_CAP.with(|c| c.set(None));
+        }
+    }
+
+    /// #2731: an `_offset` up to `DATE_WALK_MAX_OFFSET` is walked; one past it
+    /// is served by the general statement.
+    #[tokio::test]
+    async fn an_offset_past_the_cap_is_served_by_the_general_statement() {
+        use crate::types::DATE_WALK_MAX_OFFSET;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_date_walk(&backend, &tenant).await;
+        let mut conn = backend.get_connection().unwrap();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        )
+        .unwrap();
+        for desc in [true, false] {
+            for (offset, walked) in [
+                (DATE_WALK_MAX_OFFSET, true),
+                (DATE_WALK_MAX_OFFSET + 1, false),
+            ] {
+                let mut query = date_sort_query(desc, 2);
+                query.offset = Some(offset as u32);
+                TRACED_SQL.with(|traced| traced.borrow_mut().clear());
+                let page = backend
+                    .search_with_connection_probe(&conn, &tenant, &query, None, false)
+                    .unwrap();
+                assert_eq!(walk_statement_ran(), walked, "desc={desc} offset={offset}");
+                assert!(page.resources.items.is_empty(), "past the 9 resources");
+            }
         }
     }
 

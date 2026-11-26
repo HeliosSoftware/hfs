@@ -123,6 +123,9 @@ pub mod tiebreak_order_suite;
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
 pub mod token_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
+/// `#[path]` (#2731).
+pub mod unfiltered_date_sort_suite;
 
 /// The shared Period table (#1391): a Period is one range, a missing side is
 /// unbounded, and every prefix follows the FHIR rules for range targets.
@@ -167,6 +170,19 @@ async fn empty_compartment_membership_matches_nothing() {
 async fn sort_missing_values_sort_last() {
     let backend = make_sqlite_backend();
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing", true).await;
+}
+
+/// An unfiltered sort by a date parameter read from the date index returns what
+/// the general path returns, page by page and cursor by cursor (#2731).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn unfiltered_date_sort_matches_the_general_path() {
+    let backend = make_sqlite_backend();
+    unfiltered_date_sort_suite::unfiltered_date_sort_matches_the_general_path(
+        &backend,
+        "unfiltered-date-sort",
+    )
+    .await;
 }
 
 /// `_sort` on `_tag`, `_security`, `_profile` and `_source` orders by the

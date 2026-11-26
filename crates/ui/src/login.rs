@@ -42,12 +42,17 @@ use crate::WebState;
 pub struct LoginRuntime {
     /// The session store shared with the REST auth middleware.
     pub sessions: Arc<SessionStore>,
+    /// The server's token validator, so the administrative UI routes decide
+    /// on the session's verified access token rather than on the session
+    /// alone (see [`require_system_scope`]).
+    pub provider: Arc<dyn helios_auth::AuthProvider>,
 }
 
 impl std::fmt::Debug for LoginRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginRuntime")
             .field("sessions", &self.sessions)
+            .field("provider", &self.provider.name())
             .finish()
     }
 }
@@ -104,14 +109,28 @@ pub(crate) async fn require_session(
     // the session's fate before anything renders.
     let session = match helios_auth::cookie_value(request.headers(), SESSION_COOKIE) {
         Some(id) => match login.sessions.access_token(&id).await {
-            AccessOutcome::Token(_) => login.sessions.get(&id),
+            AccessOutcome::Token(token) => login.sessions.get(&id).map(|session| (session, token)),
             AccessOutcome::NoSession => None,
         },
         None => None,
     };
     match session {
-        Some(session) => {
-            request.extensions_mut().insert(session_principal(&session));
+        Some((session, token)) => {
+            // The verified token is what the FHIR layer will decide on for
+            // the page's self-calls; its scopes and tenant claim are what the
+            // UI's own authority checks read. A token the provider does not
+            // accept leaves an identity-only principal: pages still render,
+            // the API answers their calls 401, and nothing administrative
+            // is granted.
+            let principal = match login
+                .provider
+                .authenticate(&format!("Bearer {token}"))
+                .await
+            {
+                Ok(verified) => verified,
+                Err(_) => session_principal(&session),
+            };
+            request.extensions_mut().insert(principal);
             request.extensions_mut().insert(SignedIn(session.principal));
             next.run(request).await
         }
@@ -159,6 +178,67 @@ fn session_principal(session: &helios_auth::Session) -> helios_auth::Principal {
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
         ..Default::default()
+    }
+}
+
+/// The UI routes that act on storage with the server's own authority across
+/// every tenant: the tenant registry and the bulk-import workspace. The JSON
+/// `/admin/tenants` API gates the same operations on a `system/*` scope that
+/// carries the method's permission; these routes are held to the same rule.
+pub(crate) fn is_administrative_path(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// The permission bit an administrative request needs, by method: `r` to
+/// view, `c` to create, `u` to change, `d` to delete or purge.
+fn administrative_permission(method: &axum::http::Method) -> helios_auth::SmartPermissions {
+    use axum::http::Method;
+    use helios_auth::SmartPermissions;
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => SmartPermissions::READ,
+        Method::POST => SmartPermissions::CREATE,
+        Method::PUT | Method::PATCH => SmartPermissions::UPDATE,
+        _ => SmartPermissions::DELETE,
+    }
+}
+
+/// Middleware: with a login installed, an administrative route is reached
+/// only when the principal [`require_session`] stamped from the session's
+/// verified token carries a `system/*` scope with the method's permission.
+/// Anything else is answered `403` with the shell's notice. Without a login
+/// installed this is a no-op: the bearer-only posture refuses these routes
+/// elsewhere, and with authentication off nothing can be asked.
+pub(crate) async fn require_system_scope(
+    State(state): State<WebState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.login.is_none() || !is_administrative_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let permission = administrative_permission(request.method());
+    let allowed = request
+        .extensions()
+        .get::<helios_auth::Principal>()
+        .is_some_and(|principal| principal.scopes.has_system_scope(permission));
+    match allowed {
+        true => next.run(request).await,
+        false => {
+            let locale = request
+                .extensions()
+                .get::<crate::i18n::RequestLocale>()
+                .copied()
+                .unwrap_or_default();
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                crate::i18n::I18n::new(locale).t("auth-admin-scope"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -471,7 +551,29 @@ mod selfcall_tests {
             bulk_provider: None,
             write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            login: sessions.map(|sessions| Arc::new(LoginRuntime { sessions })),
+            login: sessions.map(|sessions| {
+                Arc::new(LoginRuntime {
+                    sessions,
+                    provider: Arc::new(NoScopes),
+                })
+            }),
+        }
+    }
+
+    /// A validator that accepts every bearer as an identity with no scopes.
+    struct NoScopes;
+
+    #[async_trait::async_trait]
+    impl helios_auth::AuthProvider for NoScopes {
+        async fn authenticate(
+            &self,
+            _authorization_header: &str,
+        ) -> Result<helios_auth::Principal, helios_auth::AuthError> {
+            Ok(helios_auth::Principal::default())
+        }
+
+        fn name(&self) -> &str {
+            "no-scopes"
         }
     }
 
