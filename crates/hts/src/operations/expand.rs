@@ -1964,6 +1964,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .map(|v| v as u32)
                 .unwrap_or(state.max_expansion_size),
         ),
+        persisted_expansion_limit: Some(state.max_expansion_size),
         date: find_str_param(&params, "date"),
         hierarchical,
         hierarchical_explicit,
