@@ -2175,6 +2175,7 @@ impl MongoBackend {
     /// A value extractor over a tenant's registry.
     pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.tenant_registry(tenant_id))
+            .with_fhir_version(self.config.fhir_version)
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.

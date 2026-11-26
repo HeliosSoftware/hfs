@@ -695,6 +695,7 @@ impl SqliteBackend {
     /// resources.
     pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.tenant_registry(tenant_id))
+            .with_fhir_version(self.config.fhir_version)
     }
 
     /// Configure connection settings.

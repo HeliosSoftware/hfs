@@ -794,6 +794,7 @@ impl ElasticsearchBackend {
     /// index, so Elasticsearch's extractor is the only one in that deployment.
     pub fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.registries.for_tenant(tenant_id))
+            .with_fhir_version(self.config.fhir_version)
     }
 
     /// The rayon pool for `$reindex` page extraction, or `None` when the

@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use helios_fhir::FhirVersion;
 use helios_fhir::search::ABSTRACT_BASE_TYPES;
 use helios_fhirpath::EvaluationContext;
 use helios_fhirpath::parser::Expression as FhirPathExpression;
@@ -283,6 +284,20 @@ struct PreparedExpression {
     /// is absent (see [`skippable_root_keys`]). `None` when the shape is
     /// anything else, in which case the expression is always evaluated.
     root_keys: Option<Vec<String>>,
+    /// `filtered` split by whether a member reaches an `instant` element, when
+    /// one does (#2962). `None` when none does, which is almost always. Only
+    /// a `date` parameter reads it.
+    instant_split: Option<InstantSplit>,
+}
+
+/// The union members of a prepared expression, split into those that reach
+/// an `instant` element and the rest (#2962). See [`split_instant_members`].
+struct InstantSplit {
+    /// The members that reach an `instant`, joined back into one union, and
+    /// parsed.
+    instant: Arc<FhirPathExpression>,
+    /// The other members, joined and parsed; `None` when there are none.
+    rest: Option<Arc<FhirPathExpression>>,
 }
 
 /// One base instance of a composite parameter: the resource's own root
@@ -315,8 +330,12 @@ struct PreparedComponent {
 /// as `&str` and a cache hit allocates nothing.
 type PreparedMap = HashMap<String, HashMap<String, Arc<PreparedExpression>>>;
 
-fn prepared_cache() -> &'static RwLock<PreparedMap> {
-    static CACHE: OnceLock<RwLock<PreparedMap>> = OnceLock::new();
+/// One [`PreparedMap`] per FHIR version: which members of an expression reach
+/// an `instant` depends on the version's element types (R6 made
+/// `DiagnosticReport.issued` a `dateTime`), so the same expression and
+/// resource type can prepare differently (#2962).
+fn prepared_cache() -> &'static RwLock<HashMap<FhirVersion, PreparedMap>> {
+    static CACHE: OnceLock<RwLock<HashMap<FhirVersion, PreparedMap>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -360,12 +379,28 @@ pub(crate) struct MissingFingerprint {
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
+    /// The FHIR version of the resources indexed, whose element types decide
+    /// which values are `instant`s (#2962).
+    fhir_version: FhirVersion,
 }
 
 impl SearchParameterExtractor {
-    /// Creates a new extractor with the given registry.
+    /// Creates a new extractor with the given registry, for resources of the
+    /// first enabled FHIR version. A backend indexes with
+    /// [`Self::with_fhir_version`] set to its configured version.
     pub fn new(registry: Arc<RwLock<SearchParameterRegistry>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            fhir_version: FhirVersion::default_enabled(),
+        }
+    }
+
+    /// The same extractor for resources of `fhir_version`. The version's
+    /// element types decide which date values are `instant`s, indexed as a
+    /// point rather than one unit of their precision (#2962).
+    pub fn with_fhir_version(mut self, fhir_version: FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
     }
 
     /// Extracts all searchable values from a resource.
@@ -760,12 +795,38 @@ impl SearchParameterExtractor {
             return Ok(Vec::new());
         }
 
-        let values = Self::evaluate_prepared(context, ast, &prepared.filtered)?;
+        // A date parameter whose members reach an `instant` evaluates those
+        // members on their own, and indexes what they return as points
+        // (#2962). Every other parameter evaluates the whole expression.
+        let (values, instants) = match &prepared.instant_split {
+            Some(split) if param.param_type == SearchParamType::Date => {
+                let rest = match &split.rest {
+                    Some(rest) => Self::evaluate_prepared(context, rest, &prepared.filtered)?,
+                    None => Vec::new(),
+                };
+                let instants =
+                    Self::evaluate_prepared(context, &split.instant, &prepared.filtered)?;
+                (rest, instants)
+            }
+            _ => (
+                Self::evaluate_prepared(context, ast, &prepared.filtered)?,
+                Vec::new(),
+            ),
+        };
 
         let mut results = Vec::new();
-        for value in values {
-            let converted = ValueConverter::convert(&value, param.param_type, &param.code)?;
+        let tagged = values
+            .iter()
+            .map(|value| (value, false))
+            .chain(instants.iter().map(|value| (value, true)));
+        for (value, is_instant) in tagged {
+            let converted = ValueConverter::convert(value, param.param_type, &param.code)?;
             for idx_value in converted {
+                let idx_value = if is_instant {
+                    idx_value.into_instant()
+                } else {
+                    idx_value
+                };
                 results.push(ExtractedValue::new(
                     &param.code,
                     &param.url,
@@ -1214,7 +1275,8 @@ impl SearchParameterExtractor {
     fn prepared(&self, expression: &str, resource_type: &str) -> Arc<PreparedExpression> {
         if let Some(hit) = prepared_cache()
             .read()
-            .get(resource_type)
+            .get(&self.fhir_version)
+            .and_then(|by_type| by_type.get(resource_type))
             .and_then(|by_expr| by_expr.get(expression))
         {
             return Arc::clone(hit);
@@ -1228,15 +1290,22 @@ impl SearchParameterExtractor {
         let ast = (!filtered.is_empty()).then(|| parse_prepared(&filtered));
         let target_types = self.resolve_target_types(&rewritten, resource_type);
         let root_keys = skippable_root_keys(&filtered, resource_type);
+        let instant_split = match &ast {
+            Some(Ok(_)) => split_instant_members(&filtered, resource_type, self.fhir_version),
+            _ => None,
+        };
 
         let entry = Arc::new(PreparedExpression {
             filtered,
             ast,
             target_types,
             root_keys,
+            instant_split,
         });
         prepared_cache()
             .write()
+            .entry(self.fhir_version)
+            .or_default()
             .entry(resource_type.to_string())
             .or_default()
             .insert(expression.to_string(), Arc::clone(&entry));
@@ -1424,6 +1493,161 @@ fn strip_abstract_base_prefix(part: &str) -> Option<Cow<'_, str>> {
         });
     }
     None
+}
+
+/// Where one union member of a prepared expression ends up, for
+/// [`split_instant_members`].
+enum MemberType {
+    /// The member is a plain path to an `instant` element.
+    Instant,
+    /// The member is a plain path to a choice element (`effective[x]`) one of
+    /// whose types is `instant`: its typed variants, each a member of its own,
+    /// and whether that one is the `instant`.
+    Choice(Vec<(String, bool)>),
+    /// Anything else, evaluated as it is.
+    Other,
+}
+
+/// Splits the union members of `filtered`, an expression already rewritten
+/// and filtered for `resource_type`, into the members that reach an `instant`
+/// element of `version` and the rest (#2962).
+///
+/// The extractor evaluates untyped JSON, so it cannot tell an `instant` from a
+/// `dateTime` with the same text by the value. The element type is read off
+/// the path instead, from the version's generated `FIELD_TYPES` table: a
+/// member that is a plain dotted path (`DiagnosticReport.issued`, and the
+/// `Observation.effectiveInstant` that `ofType(instant)` is rewritten to) is
+/// followed field by field. A path ending at a choice element with an
+/// `instant` type (`Observation.effective` in R4) is expanded into its typed
+/// variants, so the `effectiveInstant` arm is told from the `effectiveDateTime`
+/// one. Any other shape (a function call, an operator) is not followed and
+/// keeps the range of its written precision, as before.
+///
+/// `None` when no member reaches an `instant`, or when the split forms do not
+/// parse; then the whole expression is evaluated as before.
+fn split_instant_members(
+    filtered: &str,
+    resource_type: &str,
+    version: FhirVersion,
+) -> Option<InstantSplit> {
+    let table = helios_fhir::field_types(version)?;
+    let mut instant = Vec::new();
+    let mut rest = Vec::new();
+    for member in split_union_members(filtered) {
+        match member_type(member, resource_type, version, table) {
+            MemberType::Instant => instant.push(member.to_string()),
+            MemberType::Choice(variants) => {
+                for (variant, is_instant) in variants {
+                    if is_instant {
+                        instant.push(variant);
+                    } else {
+                        rest.push(variant);
+                    }
+                }
+            }
+            MemberType::Other => rest.push(member.to_string()),
+        }
+    }
+    if instant.is_empty() {
+        return None;
+    }
+    let instant = parse_prepared(&instant.join(" | ")).ok()?;
+    let rest = match rest.is_empty() {
+        true => None,
+        false => Some(parse_prepared(&rest.join(" | ")).ok()?),
+    };
+    Some(InstantSplit { instant, rest })
+}
+
+/// See [`split_instant_members`]. `member` is one union member, `table` the
+/// version's `FIELD_TYPES`.
+fn member_type(
+    member: &str,
+    resource_type: &str,
+    version: FhirVersion,
+    table: &[(&str, &str, &str, bool)],
+) -> MemberType {
+    let mut path = member.trim();
+    while path.starts_with('(') && path.ends_with(')') {
+        path = path[1..path.len() - 1].trim();
+    }
+    // Rooted at the resource type, or relative to it (an abstract-base member
+    // such as `meta.lastUpdated` after `Resource.` is stripped).
+    let relative = match path.strip_prefix(resource_type) {
+        Some(rest) => match rest.strip_prefix('.') {
+            Some(rest) => rest,
+            None => return MemberType::Other,
+        },
+        None => path,
+    };
+    let segments: Vec<&str> = relative.split('.').collect();
+    if resource_type.is_empty()
+        || !segments
+            .iter()
+            .all(|s| is_ident(s) && s.starts_with(|c: char| c.is_ascii_lowercase()))
+    {
+        return MemberType::Other;
+    }
+    let (leaf, parents) = segments.split_last().expect("split yields one segment");
+    let mut parent = resource_type;
+    for segment in parents {
+        match helios_fhir::get_field_type(version, parent, segment) {
+            Some((field_type, _)) => parent = field_type,
+            None => return MemberType::Other,
+        }
+    }
+    match helios_fhir::get_field_type(version, parent, leaf) {
+        Some(("instant", _)) => return MemberType::Instant,
+        // A choice element is either absent from the table or listed with the
+        // generated choice enum as its type (`Observation.effective` is
+        // `ObservationEffective`). Any other type is an ordinary element,
+        // whatever fields happen to extend its name.
+        Some((field_type, _))
+            if field_type
+                .strip_prefix(parent)
+                .is_none_or(|rest| !is_type_suffix(rest, leaf)) =>
+        {
+            return MemberType::Other;
+        }
+        _ => {}
+    }
+    // A choice element: its typed variants are the fields named the element
+    // plus the type, capitalized (`effective` → `effectiveInstant`).
+    let variants: Vec<(&str, &str)> = table
+        .iter()
+        .filter(|(p, field, field_type, _)| {
+            *p == parent
+                && field
+                    .strip_prefix(*leaf)
+                    .is_some_and(|suffix| is_type_suffix(suffix, field_type))
+        })
+        .map(|(_, field, field_type, _)| (*field, *field_type))
+        .collect();
+    if !variants.iter().any(|(_, t)| *t == "instant") {
+        return MemberType::Other;
+    }
+    let prefix = &path[..path.len() - leaf.len()];
+    MemberType::Choice(
+        variants
+            .into_iter()
+            .map(|(field, field_type)| (format!("{prefix}{field}"), field_type == "instant"))
+            .collect(),
+    )
+}
+
+/// Whether `suffix` is `field_type` with its first letter capitalized: the
+/// suffix of a choice variant's name (`Instant` for `instant`, `Period` for
+/// `Period`).
+fn is_type_suffix(suffix: &str, field_type: &str) -> bool {
+    let mut chars = field_type.chars();
+    match chars.next() {
+        Some(first) => {
+            suffix.len() == field_type.len()
+                && suffix.starts_with(first.to_ascii_uppercase())
+                && suffix[first.len_utf8()..] == *chars.as_str()
+        }
+        None => false,
+    }
 }
 
 /// Rewrites FHIRPath choice-type casts to concrete element names.
@@ -1853,6 +2077,203 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    /// The date index values `param` extracts from `resource`, as
+    /// `(value, end)`.
+    fn date_ends(
+        extractor: &SearchParameterExtractor,
+        resource: &Value,
+        param: &str,
+    ) -> Vec<(String, crate::search::DateEnd)> {
+        let resource_type = resource["resourceType"].as_str().unwrap();
+        let mut ends: Vec<_> = extractor
+            .extract(resource, resource_type)
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.param_name == param)
+            .filter_map(|v| match v.value {
+                IndexValue::Date { value, end, .. } => Some((value, end)),
+                _ => None,
+            })
+            .collect();
+        ends.sort_by(|a, b| a.0.cmp(&b.0));
+        ends
+    }
+
+    /// #2962: a value of an `instant` element is indexed as a point, a
+    /// `dateTime` with the same text as its whole second. The element type
+    /// comes from the version's `FIELD_TYPES`: a plain path, and the
+    /// `instant` arm of a choice in the same parameter as a `dateTime` arm.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn instant_elements_are_indexed_as_points_r4() {
+        use crate::search::DateEnd::{Point, Precision};
+        let extractor = create_test_extractor_for(FhirVersion::R4);
+        let at = "2020-01-01T10:00:00Z";
+        let point = vec![(at.to_string(), Point)];
+        let range = vec![(at.to_string(), Precision)];
+
+        let report = json!({
+            "resourceType": "DiagnosticReport", "id": "r", "status": "final",
+            "code": {"text": "c"}, "issued": at, "effectiveDateTime": at,
+        });
+        assert_eq!(date_ends(&extractor, &report, "issued"), point);
+        assert_eq!(date_ends(&extractor, &report, "date"), range);
+
+        for (field, expected) in [("effectiveInstant", &point), ("effectiveDateTime", &range)] {
+            let observation = json!({
+                "resourceType": "Observation", "id": "o", "status": "final",
+                "code": {"text": "c"}, field: at,
+            });
+            assert_eq!(
+                &date_ends(&extractor, &observation, "date"),
+                expected,
+                "Observation.{field}"
+            );
+        }
+        // The choice is still read in full: a Period arm is still a range.
+        let observation = json!({
+            "resourceType": "Observation", "id": "o", "status": "final",
+            "code": {"text": "c"},
+            "effectivePeriod": {"start": "2020-01-01", "end": "2020-02-01"},
+        });
+        assert_eq!(
+            date_ends(&extractor, &observation, "date"),
+            vec![(
+                "2020-01-01".to_string(),
+                crate::search::DateEnd::At("2020-02-01".to_string())
+            )]
+        );
+
+        // The other R4 `instant` targets #2962 names.
+        for (resource, param) in [
+            (
+                json!({"resourceType": "DocumentReference", "id": "d", "status": "current",
+                    "content": [{"attachment": {"url": "x"}}], "date": at}),
+                "date",
+            ),
+            (
+                json!({"resourceType": "Appointment", "id": "a", "status": "booked",
+                    "participant": [], "start": at}),
+                "date",
+            ),
+            (
+                json!({"resourceType": "Slot", "id": "s", "status": "free",
+                    "schedule": {"reference": "Schedule/x"}, "start": at, "end": at}),
+                "start",
+            ),
+            (
+                json!({"resourceType": "Bundle", "id": "b", "type": "collection",
+                    "timestamp": at}),
+                "timestamp",
+            ),
+            (
+                json!({"resourceType": "AuditEvent", "id": "e", "type": {"code": "x"},
+                    "recorded": at, "agent": [], "source": {"observer": {}}}),
+                "date",
+            ),
+            (
+                json!({"resourceType": "Provenance", "id": "p", "target": [],
+                    "recorded": at, "agent": []}),
+                "recorded",
+            ),
+        ] {
+            assert_eq!(
+                date_ends(&extractor, &resource, param),
+                point,
+                "{}?{param}",
+                resource["resourceType"]
+            );
+        }
+
+        // An `instant` too coarse to be valid keeps the range it says.
+        let report = json!({
+            "resourceType": "DiagnosticReport", "id": "r", "status": "final",
+            "code": {"text": "c"}, "issued": "2020-01-01",
+        });
+        assert_eq!(
+            date_ends(&extractor, &report, "issued"),
+            vec![("2020-01-01".to_string(), Precision)]
+        );
+    }
+
+    /// R5 writes the choice as `Observation.effective.ofType(instant)`, which
+    /// the choice rewrite turns into `Observation.effectiveInstant`.
+    #[cfg(feature = "R5")]
+    #[test]
+    fn instant_elements_are_indexed_as_points_r5() {
+        use crate::search::DateEnd::{Point, Precision};
+        let extractor = create_test_extractor_for(FhirVersion::R5);
+        let at = "2020-01-01T10:00:00Z";
+        for (field, end) in [
+            ("effectiveInstant", Point),
+            ("effectiveDateTime", Precision),
+        ] {
+            let observation = json!({
+                "resourceType": "Observation", "id": "o", "status": "final",
+                "code": {"text": "c"}, field: at,
+            });
+            assert_eq!(
+                date_ends(&extractor, &observation, "date"),
+                vec![(at.to_string(), end)],
+                "Observation.{field}"
+            );
+        }
+        let report = json!({
+            "resourceType": "DiagnosticReport", "id": "r", "status": "final",
+            "code": {"text": "c"}, "issued": at,
+        });
+        assert_eq!(
+            date_ends(&extractor, &report, "issued"),
+            vec![(at.to_string(), Point)]
+        );
+    }
+
+    /// R6 makes `DiagnosticReport.issued` a `dateTime`, so the same report
+    /// keeps its one-second range there: the element type is the version's.
+    #[cfg(feature = "R6")]
+    #[test]
+    fn diagnostic_report_issued_is_a_date_time_in_r6() {
+        let extractor = create_test_extractor_for(FhirVersion::R6);
+        let at = "2020-01-01T10:00:00Z";
+        let report = json!({
+            "resourceType": "DiagnosticReport", "id": "r", "status": "final",
+            "code": {"text": "c"}, "issued": at,
+        });
+        assert_eq!(
+            date_ends(&extractor, &report, "issued"),
+            vec![(at.to_string(), crate::search::DateEnd::Precision)]
+        );
+    }
+
+    #[test]
+    fn member_types_follow_the_field_types() {
+        let version = FhirVersion::default_enabled();
+        let table = helios_fhir::field_types(version).unwrap();
+        let kind = |member: &str, rt: &str| match member_type(member, rt, version, table) {
+            MemberType::Instant => "instant".to_string(),
+            MemberType::Choice(variants) => variants
+                .iter()
+                .map(|(v, i)| format!("{v}{}", if *i { "!" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(","),
+            MemberType::Other => "other".to_string(),
+        };
+        // `meta` is inherited from Resource; `lastUpdated` is an `instant`.
+        assert_eq!(kind("meta.lastUpdated", "Patient"), "instant");
+        assert_eq!(kind("Patient.meta.lastUpdated", "Patient"), "instant");
+        assert_eq!(kind("(Bundle.timestamp)", "Bundle"), "instant");
+        assert_eq!(kind("Patient.birthDate", "Patient"), "other");
+        // A choice without an `instant` type is not expanded.
+        assert_eq!(kind("Patient.deceased", "Patient"), "other");
+        // Shapes that are not a plain path, or not rooted at the type.
+        assert_eq!(kind("Bundle.timestamp.first()", "Bundle"), "other");
+        assert_eq!(kind("Slot.start", "Bundle"), "other");
+        assert_eq!(kind("BundleX.timestamp", "Bundle"), "other");
+        assert_eq!(kind("Bundle", "Bundle"), "other");
+        assert_eq!(kind("$this.timestamp", "Bundle"), "other");
+        assert_eq!(kind("Bundle.nope.timestamp", "Bundle"), "other");
+    }
+
     #[test]
     fn skippable_root_keys_accepts_pure_navigation_only() {
         let k = |e: &str| skippable_root_keys(e, "Patient");
@@ -2273,7 +2694,7 @@ mod tests {
             }
         }
 
-        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry))).with_fhir_version(version)
     }
 
     /// Same as [`create_test_extractor_for`], but also loads the custom
@@ -2308,7 +2729,7 @@ mod tests {
             }
         }
 
-        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry))).with_fhir_version(version)
     }
 
     /// Regression test for the composite `context-type-quantity` and
