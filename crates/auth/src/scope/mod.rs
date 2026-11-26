@@ -217,6 +217,13 @@ mod tests {
     fn test_read_only_wildcard_does_not_grant_write_operations() {
         for scopes in ["system/*.r", "system/*.rs", "system/*.s"] {
             let set = ScopeSet::parse(scopes);
+            // Positive control: the scope parsed as a system wildcard, so the
+            // refusals below are about the bits, not about a dropped scope.
+            assert!(
+                set.has_system_scope(SmartPermissions::READ)
+                    || set.has_system_scope(SmartPermissions::SEARCH),
+                "{scopes}"
+            );
             assert!(!set.has_system_scope(SmartPermissions::DELETE), "{scopes}");
             assert!(
                 !set.grants_operation("purge", SmartPermissions::DELETE),
