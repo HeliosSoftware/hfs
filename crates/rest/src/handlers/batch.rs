@@ -2264,7 +2264,11 @@ fn admit_bundle_mutation(
         admit_resource_type(resource_type, resource, fhir_version)?;
     }
 
-    if matches!(method, BundleMethod::Patch)
+    // A DELETE entry has no payload to admit the type through, and a URL
+    // deeper than `[type]/[id]` is read as its last two segments, so without
+    // this `DELETE Patient/p1/foo` deleted id `foo` of type `p1` and answered
+    // 204 for a resource type that does not exist.
+    if matches!(method, BundleMethod::Patch | BundleMethod::Delete)
         && !is_valid_resource_type_for_version(resource_type, fhir_version)
     {
         return Err(RestError::UnknownResourceType {
@@ -6191,6 +6195,18 @@ mod tests {
     /// mutation URL is canonicalized to its last one or two segments and a GET
     /// URL is passed on as written, so each would act on part of an operation
     /// URL if it were not refused first.
+    #[test]
+    fn a_delete_entry_needs_a_resource_type_of_the_version() {
+        let version = FhirVersion::default_enabled();
+        let refused = admit_bundle_mutation(&BundleMethod::Delete, "p1", None, version)
+            .expect_err("p1 is not a resource type");
+        assert!(
+            matches!(refused, RestError::UnknownResourceType { .. }),
+            "{refused:?}"
+        );
+        assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
+    }
+
     #[test]
     fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
         for (method, url) in [
