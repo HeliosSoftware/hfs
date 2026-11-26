@@ -1288,3 +1288,86 @@ async fn expand_implicit_vs_total_matches_concept_count() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["expansion"]["total"], 3);
 }
+
+// ── $expand: implicit ValueSets over the expansion limit ─────────────────────
+
+#[cfg(feature = "sqlite")]
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The anatomy code system has more concepts than the limit of one. Whether
+/// such a set is answered depends only on the request, never on whether an
+/// earlier request left it in the server's derived cache: none of these
+/// requests may persist it, and each is answered the same on every repeat.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn an_implicit_value_set_over_the_limit_is_answered_per_request_shape() {
+    let app = capped_app(1, 1, bundles::r4_bundle()).await;
+    let base = "/ValueSet/$expand?url=http%3A%2F%2Fhts.test%2Fanatomy%3Ffhir_vs";
+
+    for round in 0..2 {
+        // A count of zero asks for the total alone.
+        let (status, body) = get_json(app.clone(), &format!("{base}&count=0")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        let total = body["expansion"]["total"].as_u64().unwrap_or(0);
+        assert!(total > 1, "round {round}: {body}");
+        assert!(
+            body["expansion"]["contains"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+
+        // No page size and no filter: over the limit.
+        let (status, body) = get_json(app.clone(), base).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "round {round}");
+        assert_eq!(body["issue"][0]["code"], "too-costly", "round {round}");
+
+        // The limit applies to what a filter leaves.
+        let (status, body) = get_json(app.clone(), &format!("{base}&filter=arm")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        let contains = body["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 1, "round {round}: {body}");
+        assert_eq!(contains[0]["code"], "arm");
+
+        // A page of a large set is always served.
+        let (status, body) = get_json(app.clone(), &format!("{base}&count=1&offset=1")).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        assert_eq!(body["expansion"]["contains"].as_array().unwrap().len(), 1);
+    }
+}
+
+/// `$validate-code` against a `CodeSystem.valueSet` link answers from the
+/// code system itself.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_against_a_code_system_value_set_link() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::implicit_vs_bundle()).await;
+
+    for (code, expected) in [("bone", true), ("femur", false)] {
+        let req = TestApp::params(&[
+            ("url", "valueUri", bundles::IMPLICIT_VS_URL),
+            ("system", "valueUri", "http://hts.test/anatomy-implicit"),
+            ("code", "valueCode", code),
+        ]);
+        let (status, body) = app.post_fhir("/ValueSet/$validate-code", req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result = body["parameter"]
+            .as_array()
+            .and_then(|p| p.iter().find(|p| p["name"] == "result"))
+            .and_then(|p| p["valueBoolean"].as_bool());
+        assert_eq!(result, Some(expected), "{code}: {body}");
+    }
+}

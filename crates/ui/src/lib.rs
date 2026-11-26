@@ -66,11 +66,13 @@ mod sql_views;
 mod subscriptions;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+mod cross_site;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use bulk_import::set_bulk_submit_trusted_providers;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 pub use tenants::register_tenant_purge_output;
 
@@ -2011,6 +2013,13 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             login::require_session,
+        ))
+        // Outside the session gate: a form posted by a page on another site
+        // is refused before it can ride the browser's session or, with
+        // authentication off, act for anyone who can reach the UI.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cross_site::refuse_cross_site_writes,
         ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:

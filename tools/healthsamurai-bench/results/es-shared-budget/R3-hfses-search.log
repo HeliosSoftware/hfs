@@ -1,0 +1,443 @@
+Running test: /k6/search.js on server: hfses with run ID: R3-hfses
+================================================
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+time="2026-11-18T22:43:07Z" level=warning msg="experimental-prometheus-rw output has been deprecated and is planned for removal in k6 v3. We recommend using opentelemetry for all your metrics output."
+
+     execution: local
+        script: /k6/search.js
+        output: Prometheus remote write (http://prometheus:9090/api/v1/write)
+
+     scenarios: (100.00%) 1 scenario, 30 max VUs, 2m30s max duration (incl. graceful stop):
+              * search: 30 looping VUs for 2m0s (gracefulStop: 30s)
+
+time="2026-11-18T22:43:07Z" level=info msg="sampled Patient: 20 ids" source=console
+time="2026-11-18T22:43:07Z" level=info msg="sampled Encounter: 20 ids" source=console
+time="2026-11-18T22:43:07Z" level=info msg="sampled Practitioner: 20 ids" source=console
+
+running (0m01.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   1% ] 30 VUs  0m00.9s/2m0s
+
+running (0m02.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   2% ] 30 VUs  0m01.9s/2m0s
+
+running (0m03.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   2% ] 30 VUs  0m02.9s/2m0s
+
+running (0m04.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   3% ] 30 VUs  0m03.9s/2m0s
+
+running (0m05.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   4% ] 30 VUs  0m04.9s/2m0s
+
+running (0m06.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   5% ] 30 VUs  0m05.9s/2m0s
+
+running (0m07.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   6% ] 30 VUs  0m06.9s/2m0s
+
+running (0m08.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   7% ] 30 VUs  0m07.9s/2m0s
+
+running (0m09.0s), 30/30 VUs, 0 complete and 0 interrupted iterations
+search   [   7% ] 30 VUs  0m08.9s/2m0s
+
+running (0m10.0s), 30/30 VUs, 28 complete and 0 interrupted iterations
+search   [   8% ] 30 VUs  0m09.9s/2m0s
+
+running (0m11.0s), 30/30 VUs, 30 complete and 0 interrupted iterations
+search   [   9% ] 30 VUs  0m10.9s/2m0s
+
+running (0m12.0s), 30/30 VUs, 30 complete and 0 interrupted iterations
+search   [  10% ] 30 VUs  0m11.9s/2m0s
+
+running (0m13.0s), 30/30 VUs, 30 complete and 0 interrupted iterations
+search   [  11% ] 30 VUs  0m12.9s/2m0s
+
+running (0m14.0s), 30/30 VUs, 46 complete and 0 interrupted iterations
+search   [  12% ] 30 VUs  0m13.9s/2m0s
+
+running (0m15.0s), 30/30 VUs, 60 complete and 0 interrupted iterations
+search   [  12% ] 30 VUs  0m14.9s/2m0s
+
+running (0m16.0s), 30/30 VUs, 60 complete and 0 interrupted iterations
+search   [  13% ] 30 VUs  0m15.9s/2m0s
+
+running (0m17.0s), 30/30 VUs, 60 complete and 0 interrupted iterations
+search   [  14% ] 30 VUs  0m16.9s/2m0s
+
+running (0m18.0s), 30/30 VUs, 85 complete and 0 interrupted iterations
+search   [  15% ] 30 VUs  0m17.9s/2m0s
+
+running (0m19.0s), 30/30 VUs, 90 complete and 0 interrupted iterations
+search   [  16% ] 30 VUs  0m18.9s/2m0s
+
+running (0m20.0s), 30/30 VUs, 90 complete and 0 interrupted iterations
+search   [  17% ] 30 VUs  0m19.9s/2m0s
+
+running (0m21.0s), 30/30 VUs, 90 complete and 0 interrupted iterations
+search   [  17% ] 30 VUs  0m20.9s/2m0s
+
+running (0m22.0s), 30/30 VUs, 106 complete and 0 interrupted iterations
+search   [  18% ] 30 VUs  0m21.9s/2m0s
+
+running (0m23.0s), 30/30 VUs, 120 complete and 0 interrupted iterations
+search   [  19% ] 30 VUs  0m22.9s/2m0s
+
+running (0m24.0s), 30/30 VUs, 120 complete and 0 interrupted iterations
+search   [  20% ] 30 VUs  0m23.9s/2m0s
+
+running (0m25.0s), 30/30 VUs, 122 complete and 0 interrupted iterations
+search   [  21% ] 30 VUs  0m24.9s/2m0s
+
+running (0m26.0s), 30/30 VUs, 150 complete and 0 interrupted iterations
+search   [  22% ] 30 VUs  0m25.9s/2m0s
+
+running (0m27.0s), 30/30 VUs, 150 complete and 0 interrupted iterations
+search   [  22% ] 30 VUs  0m26.9s/2m0s
+
+running (0m28.0s), 30/30 VUs, 174 complete and 0 interrupted iterations
+search   [  23% ] 30 VUs  0m27.9s/2m0s
+
+running (0m29.0s), 30/30 VUs, 180 complete and 0 interrupted iterations
+search   [  24% ] 30 VUs  0m28.9s/2m0s
+
+running (0m30.0s), 30/30 VUs, 183 complete and 0 interrupted iterations
+search   [  25% ] 30 VUs  0m29.9s/2m0s
+
+running (0m31.0s), 30/30 VUs, 209 complete and 0 interrupted iterations
+search   [  26% ] 30 VUs  0m30.9s/2m0s
+
+running (0m32.0s), 30/30 VUs, 210 complete and 0 interrupted iterations
+search   [  27% ] 30 VUs  0m31.9s/2m0s
+
+running (0m33.0s), 30/30 VUs, 220 complete and 0 interrupted iterations
+search   [  27% ] 30 VUs  0m32.9s/2m0s
+
+running (0m34.0s), 30/30 VUs, 240 complete and 0 interrupted iterations
+search   [  28% ] 30 VUs  0m33.9s/2m0s
+
+running (0m35.0s), 30/30 VUs, 240 complete and 0 interrupted iterations
+search   [  29% ] 30 VUs  0m34.9s/2m0s
+
+running (0m36.0s), 30/30 VUs, 262 complete and 0 interrupted iterations
+search   [  30% ] 30 VUs  0m35.9s/2m0s
+
+running (0m37.0s), 30/30 VUs, 270 complete and 0 interrupted iterations
+search   [  31% ] 30 VUs  0m36.9s/2m0s
+
+running (0m38.0s), 30/30 VUs, 277 complete and 0 interrupted iterations
+search   [  32% ] 30 VUs  0m37.9s/2m0s
+
+running (0m39.0s), 30/30 VUs, 300 complete and 0 interrupted iterations
+search   [  32% ] 30 VUs  0m38.9s/2m0s
+
+running (0m40.0s), 30/30 VUs, 300 complete and 0 interrupted iterations
+search   [  33% ] 30 VUs  0m39.9s/2m0s
+
+running (0m41.0s), 30/30 VUs, 326 complete and 0 interrupted iterations
+search   [  34% ] 30 VUs  0m40.9s/2m0s
+
+running (0m42.0s), 30/30 VUs, 330 complete and 0 interrupted iterations
+search   [  35% ] 30 VUs  0m41.9s/2m0s
+
+running (0m43.0s), 30/30 VUs, 351 complete and 0 interrupted iterations
+search   [  36% ] 30 VUs  0m42.9s/2m0s
+
+running (0m44.0s), 30/30 VUs, 360 complete and 0 interrupted iterations
+search   [  37% ] 30 VUs  0m43.9s/2m0s
+
+running (0m45.0s), 30/30 VUs, 360 complete and 0 interrupted iterations
+search   [  37% ] 30 VUs  0m44.9s/2m0s
+
+running (0m46.0s), 30/30 VUs, 388 complete and 0 interrupted iterations
+search   [  38% ] 30 VUs  0m45.9s/2m0s
+
+running (0m47.0s), 30/30 VUs, 390 complete and 0 interrupted iterations
+search   [  39% ] 30 VUs  0m46.9s/2m0s
+
+running (0m48.0s), 30/30 VUs, 407 complete and 0 interrupted iterations
+search   [  40% ] 30 VUs  0m47.9s/2m0s
+
+running (0m49.0s), 30/30 VUs, 420 complete and 0 interrupted iterations
+search   [  41% ] 30 VUs  0m48.9s/2m0s
+
+running (0m50.0s), 30/30 VUs, 425 complete and 0 interrupted iterations
+search   [  42% ] 30 VUs  0m49.9s/2m0s
+
+running (0m51.0s), 30/30 VUs, 450 complete and 0 interrupted iterations
+search   [  42% ] 30 VUs  0m50.9s/2m0s
+
+running (0m52.0s), 30/30 VUs, 450 complete and 0 interrupted iterations
+search   [  43% ] 30 VUs  0m51.9s/2m0s
+
+running (0m53.0s), 30/30 VUs, 472 complete and 0 interrupted iterations
+search   [  44% ] 30 VUs  0m52.9s/2m0s
+
+running (0m54.0s), 30/30 VUs, 480 complete and 0 interrupted iterations
+search   [  45% ] 30 VUs  0m53.9s/2m0s
+
+running (0m55.0s), 30/30 VUs, 503 complete and 0 interrupted iterations
+search   [  46% ] 30 VUs  0m54.9s/2m0s
+
+running (0m56.0s), 30/30 VUs, 510 complete and 0 interrupted iterations
+search   [  47% ] 30 VUs  0m55.9s/2m0s
+
+running (0m57.0s), 30/30 VUs, 511 complete and 0 interrupted iterations
+search   [  47% ] 30 VUs  0m56.9s/2m0s
+
+running (0m58.0s), 30/30 VUs, 537 complete and 0 interrupted iterations
+search   [  48% ] 30 VUs  0m57.9s/2m0s
+
+running (0m59.0s), 30/30 VUs, 540 complete and 0 interrupted iterations
+search   [  49% ] 30 VUs  0m58.9s/2m0s
+
+running (1m00.0s), 30/30 VUs, 556 complete and 0 interrupted iterations
+search   [  50% ] 30 VUs  0m59.9s/2m0s
+
+running (1m01.0s), 30/30 VUs, 570 complete and 0 interrupted iterations
+search   [  51% ] 30 VUs  1m00.9s/2m0s
+
+running (1m02.0s), 30/30 VUs, 578 complete and 0 interrupted iterations
+search   [  52% ] 30 VUs  1m01.9s/2m0s
+
+running (1m03.0s), 30/30 VUs, 599 complete and 0 interrupted iterations
+search   [  52% ] 30 VUs  1m02.9s/2m0s
+
+running (1m04.0s), 30/30 VUs, 601 complete and 0 interrupted iterations
+search   [  53% ] 30 VUs  1m03.9s/2m0s
+
+running (1m05.0s), 30/30 VUs, 629 complete and 0 interrupted iterations
+search   [  54% ] 30 VUs  1m04.9s/2m0s
+
+running (1m06.0s), 30/30 VUs, 631 complete and 0 interrupted iterations
+search   [  55% ] 30 VUs  1m05.9s/2m0s
+
+running (1m07.0s), 30/30 VUs, 641 complete and 0 interrupted iterations
+search   [  56% ] 30 VUs  1m06.9s/2m0s
+
+running (1m08.0s), 30/30 VUs, 659 complete and 0 interrupted iterations
+search   [  57% ] 30 VUs  1m07.9s/2m0s
+
+running (1m09.0s), 30/30 VUs, 662 complete and 0 interrupted iterations
+search   [  57% ] 30 VUs  1m08.9s/2m0s
+
+running (1m10.0s), 30/30 VUs, 687 complete and 0 interrupted iterations
+search   [  58% ] 30 VUs  1m09.9s/2m0s
+
+running (1m11.0s), 30/30 VUs, 691 complete and 0 interrupted iterations
+search   [  59% ] 30 VUs  1m10.9s/2m0s
+
+running (1m12.0s), 30/30 VUs, 713 complete and 0 interrupted iterations
+search   [  60% ] 30 VUs  1m11.9s/2m0s
+
+running (1m13.0s), 30/30 VUs, 720 complete and 0 interrupted iterations
+search   [  61% ] 30 VUs  1m12.9s/2m0s
+
+running (1m14.0s), 30/30 VUs, 730 complete and 0 interrupted iterations
+search   [  62% ] 30 VUs  1m13.9s/2m0s
+
+running (1m15.0s), 30/30 VUs, 748 complete and 0 interrupted iterations
+search   [  62% ] 30 VUs  1m14.9s/2m0s
+
+running (1m16.0s), 30/30 VUs, 754 complete and 0 interrupted iterations
+search   [  63% ] 30 VUs  1m15.9s/2m0s
+
+running (1m17.0s), 30/30 VUs, 775 complete and 0 interrupted iterations
+search   [  64% ] 30 VUs  1m16.9s/2m0s
+
+running (1m18.0s), 30/30 VUs, 780 complete and 0 interrupted iterations
+search   [  65% ] 30 VUs  1m17.9s/2m0s
+
+running (1m19.0s), 30/30 VUs, 797 complete and 0 interrupted iterations
+search   [  66% ] 30 VUs  1m18.9s/2m0s
+
+running (1m20.0s), 30/30 VUs, 809 complete and 0 interrupted iterations
+search   [  67% ] 30 VUs  1m19.9s/2m0s
+
+running (1m21.0s), 30/30 VUs, 816 complete and 0 interrupted iterations
+search   [  67% ] 30 VUs  1m20.9s/2m0s
+
+running (1m22.0s), 30/30 VUs, 834 complete and 0 interrupted iterations
+search   [  68% ] 30 VUs  1m21.9s/2m0s
+
+running (1m23.0s), 30/30 VUs, 839 complete and 0 interrupted iterations
+search   [  69% ] 30 VUs  1m22.9s/2m0s
+
+running (1m24.0s), 30/30 VUs, 857 complete and 0 interrupted iterations
+search   [  70% ] 30 VUs  1m23.9s/2m0s
+
+running (1m25.0s), 30/30 VUs, 869 complete and 0 interrupted iterations
+search   [  71% ] 30 VUs  1m24.9s/2m0s
+
+running (1m26.0s), 30/30 VUs, 877 complete and 0 interrupted iterations
+search   [  72% ] 30 VUs  1m25.9s/2m0s
+
+running (1m27.0s), 30/30 VUs, 896 complete and 0 interrupted iterations
+search   [  72% ] 30 VUs  1m26.9s/2m0s
+
+running (1m28.0s), 30/30 VUs, 901 complete and 0 interrupted iterations
+search   [  73% ] 30 VUs  1m27.9s/2m0s
+
+running (1m29.0s), 30/30 VUs, 921 complete and 0 interrupted iterations
+search   [  74% ] 30 VUs  1m28.9s/2m0s
+
+running (1m30.0s), 30/30 VUs, 930 complete and 0 interrupted iterations
+search   [  75% ] 30 VUs  1m29.9s/2m0s
+
+running (1m31.0s), 30/30 VUs, 948 complete and 0 interrupted iterations
+search   [  76% ] 30 VUs  1m30.9s/2m0s
+
+running (1m32.0s), 30/30 VUs, 959 complete and 0 interrupted iterations
+search   [  77% ] 30 VUs  1m31.9s/2m0s
+
+running (1m33.0s), 30/30 VUs, 977 complete and 0 interrupted iterations
+search   [  77% ] 30 VUs  1m32.9s/2m0s
+
+running (1m34.0s), 30/30 VUs, 989 complete and 0 interrupted iterations
+search   [  78% ] 30 VUs  1m33.9s/2m0s
+
+running (1m35.0s), 30/30 VUs, 999 complete and 0 interrupted iterations
+search   [  79% ] 30 VUs  1m34.9s/2m0s
+
+running (1m36.0s), 30/30 VUs, 1017 complete and 0 interrupted iterations
+search   [  80% ] 30 VUs  1m35.9s/2m0s
+
+running (1m37.0s), 30/30 VUs, 1024 complete and 0 interrupted iterations
+search   [  81% ] 30 VUs  1m36.9s/2m0s
+
+running (1m38.0s), 30/30 VUs, 1045 complete and 0 interrupted iterations
+search   [  82% ] 30 VUs  1m37.9s/2m0s
+
+running (1m39.0s), 30/30 VUs, 1051 complete and 0 interrupted iterations
+search   [  82% ] 30 VUs  1m38.9s/2m0s
+
+running (1m40.0s), 30/30 VUs, 1070 complete and 0 interrupted iterations
+search   [  83% ] 30 VUs  1m39.9s/2m0s
+
+running (1m41.0s), 30/30 VUs, 1079 complete and 0 interrupted iterations
+search   [  84% ] 30 VUs  1m40.9s/2m0s
+
+running (1m42.0s), 30/30 VUs, 1096 complete and 0 interrupted iterations
+search   [  85% ] 30 VUs  1m41.9s/2m0s
+
+running (1m43.0s), 30/30 VUs, 1109 complete and 0 interrupted iterations
+search   [  86% ] 30 VUs  1m42.9s/2m0s
+
+running (1m44.0s), 30/30 VUs, 1121 complete and 0 interrupted iterations
+search   [  87% ] 30 VUs  1m43.9s/2m0s
+
+running (1m45.0s), 30/30 VUs, 1129 complete and 0 interrupted iterations
+search   [  87% ] 30 VUs  1m44.9s/2m0s
+
+running (1m46.0s), 30/30 VUs, 1140 complete and 0 interrupted iterations
+search   [  88% ] 30 VUs  1m45.9s/2m0s
+
+running (1m47.0s), 30/30 VUs, 1156 complete and 0 interrupted iterations
+search   [  89% ] 30 VUs  1m46.9s/2m0s
+
+running (1m48.0s), 30/30 VUs, 1168 complete and 0 interrupted iterations
+search   [  90% ] 30 VUs  1m47.9s/2m0s
+
+running (1m49.0s), 30/30 VUs, 1180 complete and 0 interrupted iterations
+search   [  91% ] 30 VUs  1m48.9s/2m0s
+
+running (1m50.0s), 30/30 VUs, 1190 complete and 0 interrupted iterations
+search   [  92% ] 30 VUs  1m49.9s/2m0s
+
+running (1m51.0s), 30/30 VUs, 1199 complete and 0 interrupted iterations
+search   [  92% ] 30 VUs  1m50.9s/2m0s
+
+running (1m52.0s), 30/30 VUs, 1214 complete and 0 interrupted iterations
+search   [  93% ] 30 VUs  1m51.9s/2m0s
+
+running (1m53.0s), 30/30 VUs, 1223 complete and 0 interrupted iterations
+search   [  94% ] 30 VUs  1m52.9s/2m0s
+
+running (1m54.0s), 30/30 VUs, 1232 complete and 0 interrupted iterations
+search   [  95% ] 30 VUs  1m53.9s/2m0s
+
+running (1m55.0s), 30/30 VUs, 1247 complete and 0 interrupted iterations
+search   [  96% ] 30 VUs  1m54.9s/2m0s
+
+running (1m56.0s), 30/30 VUs, 1259 complete and 0 interrupted iterations
+search   [  97% ] 30 VUs  1m55.9s/2m0s
+
+running (1m57.0s), 30/30 VUs, 1274 complete and 0 interrupted iterations
+search   [  97% ] 30 VUs  1m56.9s/2m0s
+
+running (1m58.0s), 30/30 VUs, 1282 complete and 0 interrupted iterations
+search   [  98% ] 30 VUs  1m57.9s/2m0s
+
+running (1m59.0s), 30/30 VUs, 1290 complete and 0 interrupted iterations
+search   [  99% ] 30 VUs  1m58.9s/2m0s
+
+running (2m00.0s), 30/30 VUs, 1304 complete and 0 interrupted iterations
+search   [ 100% ] 30 VUs  1m59.9s/2m0s
+
+running (2m01.0s), 18/30 VUs, 1316 complete and 0 interrupted iterations
+search ↓ [ 100% ] 30 VUs  2m0s
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 32016   263.543756/s
+    checks_succeeded...: 100.00% 32016 out of 32016
+    checks_failed......: 0.00%   0 out of 32016
+
+    ✓ Encounter?date
+    ✓ Encounter?participant
+    ✓ Observation?encounter
+    ✓ Observation?code-value-quantity
+    ✓ Encounter?class
+    ✓ Organization?name
+    ✓ Observation?combo-value-quantity
+    ✓ Observation?date
+    ✓ Observation?performer
+    ✓ Encounter?status
+    ✓ Observation?combo-code-value-quantity
+    ✓ Patient?address
+    ✓ Encounter?subject
+    ✓ Patient?birthdate
+    ✓ Observation?component-code-value-quantity
+    ✓ Observation?subject
+    ✓ MedicationRequest?subject
+    ✓ MedicationRequest?encounter
+    ✓ Patient?name
+    ✓ Observation?category
+    ✓ Observation?component-value-quantity
+    ✓ Observation?code
+    ✓ MedicationRequest?requester
+    ✓ Observation?value-quantity
+
+    HTTP
+    http_req_duration..............: avg=113.15ms min=2.15ms med=97.67ms max=2.71s  p(90)=192.04ms p(95)=216.72ms
+      { expected_response:true }...: avg=113.15ms min=2.15ms med=97.67ms max=2.71s  p(90)=192.04ms p(95)=216.72ms
+    http_req_failed................: 0.00%  0 out of 32019
+    http_reqs......................: 32019  263.56845/s
+
+    EXECUTION
+    iteration_duration.............: avg=2.72s    min=1.7s   med=2.47s   max=10.09s p(90)=3.2s     p(95)=4.18s   
+    iterations.....................: 1334   10.98099/s
+    vus............................: 18     min=18         max=30
+    vus_max........................: 30     min=30         max=30
+
+    NETWORK
+    data_received..................: 71 MB  586 kB/s
+    data_sent......................: 7.5 MB 62 kB/s
+
+
+
+
+running (2m01.5s), 00/30 VUs, 1334 complete and 0 interrupted iterations
+search ✓ [ 100% ] 30 VUs  2m0s
+
+Completed test: /k6/search.js on server: hfses
+----------------------------------------
+
+

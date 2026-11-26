@@ -896,7 +896,7 @@ mod tests {
         // negative cache. Without this assert the test would still pass if the
         // caching path stopped being reached at all, and would then silently
         // stop testing the defect it exists to catch.
-        let poisoned = { state.not_found_urls.read().unwrap().contains_key(vs_url) };
+        let poisoned = { state.not_found_urls.read().unwrap().get(vs_url).is_some() };
         assert!(
             poisoned,
             "precondition: the 404 must record the URL in not_found_urls, \

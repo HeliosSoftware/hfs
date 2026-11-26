@@ -46,10 +46,7 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{
-    AppState, CacheEpoch, EXPAND_CACHE_MAX, EXPAND_HANDLER_CACHE_MAX, ExpandCacheKey,
-    ExpandHandlerCache, NOT_FOUND_CACHE_MAX,
-};
+use crate::state::{AppState, CacheEpoch, ExpandCacheKey, ExpandHandlerCache, NotFoundCache};
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -1457,8 +1454,9 @@ fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Byt
 }
 
 /// Insert a successfully-built `$expand` response into the per-AppState cache.
-/// Drops new entries silently once the cache reaches
-/// [`EXPAND_HANDLER_CACHE_MAX`].
+/// The entry is dropped silently when the cache refuses it (see
+/// [`crate::state::BoundedCache::insert`]) or when a terminology write landed
+/// since `epoch` was taken.
 fn expand_handler_cache_put(
     cache: &ExpandHandlerCache,
     epoch: &CacheEpoch,
@@ -1466,10 +1464,25 @@ fn expand_handler_cache_put(
     value: Bytes,
 ) {
     if let Ok(mut guard) = cache.write() {
-        if !epoch.is_current() || guard.len() >= EXPAND_HANDLER_CACHE_MAX {
+        if !epoch.is_current() {
             return;
         }
         guard.insert(key, value);
+    }
+}
+
+/// Remember that the `$expand` request identified by `key` (see
+/// [`expand_not_found_key`]) missed with `message`. Bounded to
+/// [`crate::state::NOT_FOUND_CACHE_MAX`] entries; a key above
+/// [`crate::state::CACHE_MAX_KEY_BYTES`] is not remembered, because the
+/// caller chooses its length up to the request body limit. Not recorded when
+/// a terminology write landed since `epoch` was taken: the miss describes the
+/// store as it was before that write.
+fn expand_not_found_put(cache: &NotFoundCache, epoch: &CacheEpoch, key: String, message: String) {
+    if let Ok(mut neg) = cache.write() {
+        if epoch.is_current() {
+            neg.insert(key, message);
+        }
     }
 }
 
@@ -2025,6 +2038,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .map(|v| v as u32)
                 .unwrap_or(state.max_expansion_size),
         ),
+        persisted_expansion_limit: Some(state.max_expansion_size),
         date: find_str_param(&params, "date"),
         hierarchical,
         hierarchical_explicit,
@@ -2098,11 +2112,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
             // message. Not when a terminology write landed meanwhile: the
             // miss describes the store as it was before that write.
             if msg_names_top && let Some(key) = not_found_key {
-                if let Ok(mut neg) = state.not_found_urls.write() {
-                    if epoch.is_current() && neg.len() < NOT_FOUND_CACHE_MAX {
-                        neg.insert(key, msg.clone());
-                    }
-                }
+                expand_not_found_put(&state.not_found_urls, epoch, key, msg.clone());
             }
             return Err(HtsError::NotFound(msg));
         }
@@ -4155,7 +4165,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     );
 
     if let Ok(mut cache) = state.expand_cache.write() {
-        if epoch.is_current() && cache.len() < EXPAND_CACHE_MAX {
+        if epoch.is_current() {
             // `Bytes::clone` is O(1); storing it here and returning the clone
             // below means both the cache and the caller share the same buffer.
             cache.insert(cache_key, bytes.clone());
@@ -4666,7 +4676,38 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
+    #[test]
+    fn negative_cache_does_not_remember_an_oversized_key() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let cache = &state.not_found_urls;
+        let epoch = state.cache_epoch();
+        let at_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES);
+        let over_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES + 1);
+        super::expand_not_found_put(cache, &epoch, at_limit.clone(), "m".into());
+        super::expand_not_found_put(cache, &epoch, over_limit.clone(), "m".into());
+        let guard = cache.read().unwrap();
+        assert!(
+            guard.get(&at_limit).is_some(),
+            "a key at the limit is remembered"
+        );
+        assert!(guard.get(&over_limit).is_none(), "a key above it is not");
+        assert_eq!(guard.len(), 1);
+    }
+
+    /// A miss computed before a terminology write is not remembered after it.
+    #[test]
+    fn a_miss_computed_before_a_write_is_not_remembered_after_it() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let before = state.cache_epoch();
+        state.clear_expand_cache(); // the write
+        super::expand_not_found_put(&state.not_found_urls, &before, "u".into(), "m".into());
+        assert!(state.not_found_urls.read().unwrap().is_empty());
+    }
 
     /// A response computed before a terminology write is not cached after it.
     #[test]
@@ -4695,9 +4736,11 @@ mod tests {
                 .expand_handler_cache
                 .read()
                 .unwrap()
-                .contains_key("fresh")
+                .get("fresh")
+                .is_some()
         );
     }
+    use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 

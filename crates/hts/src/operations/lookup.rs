@@ -33,10 +33,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{
-    AppState, CacheEpoch, LOOKUP_HANDLER_CACHE_MAX, LookupHandlerCache, NOT_FOUND_CACHE_MAX,
-    NotFoundCache,
-};
+use crate::state::{AppState, CacheEpoch, LookupHandlerCache, NotFoundCache};
 use crate::traits::{SupplementInfo, TerminologyBackend};
 use crate::types::{DesignationValue, LookupRequest, ResourceIdentity};
 
@@ -91,8 +88,9 @@ fn lookup_cache_get(cache: &LookupHandlerCache, key: &str) -> Option<Arc<Value>>
 }
 
 /// Insert a successfully-built `$lookup` response into the per-AppState cache.
-/// Drops new entries silently once the cache reaches
-/// [`LOOKUP_HANDLER_CACHE_MAX`].
+/// The entry is dropped silently when the cache refuses it (see
+/// [`crate::state::BoundedCache::insert`]) or when a terminology write landed
+/// since `epoch` was taken.
 fn lookup_cache_put(
     cache: &LookupHandlerCache,
     epoch: &CacheEpoch,
@@ -100,7 +98,7 @@ fn lookup_cache_put(
     value: Arc<Value>,
 ) {
     if let Ok(mut guard) = cache.write() {
-        if !epoch.is_current() || guard.len() >= LOOKUP_HANDLER_CACHE_MAX {
+        if !epoch.is_current() {
             return;
         }
         guard.insert(key, value);
@@ -116,14 +114,17 @@ fn lookup_not_found_get(cache: &NotFoundCache, key: &str) -> Option<String> {
 /// Record that a canonical request key resolved to `NotFound(message)` so
 /// subsequent identical requests can short-circuit with the same message
 /// until the next terminology write wipes the cache. Bounded to
-/// [`NOT_FOUND_CACHE_MAX`] entries so an adversary probing many unique
-/// codes cannot grow the cache without bound.
+/// [`crate::state::NOT_FOUND_CACHE_MAX`] entries so an adversary probing many unique
+/// codes cannot grow the cache without bound. The key is the caller's whole
+/// parameter set, so one above [`crate::state::CACHE_MAX_KEY_BYTES`] is not
+/// remembered ([`crate::state::BoundedCache::insert`] refuses it): the entry
+/// count alone would let each of those entries be as large as the request
+/// body.
 fn lookup_not_found_put(cache: &NotFoundCache, epoch: &CacheEpoch, key: String, message: String) {
     if let Ok(mut guard) = cache.write() {
-        if !epoch.is_current() || guard.len() >= NOT_FOUND_CACHE_MAX {
-            return;
+        if epoch.is_current() {
+            guard.insert(key, message);
         }
-        guard.insert(key, message);
     }
 }
 
@@ -571,7 +572,26 @@ pub async fn get_lookup_by_id<B: TerminologyBackend>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
+    #[test]
+    fn negative_cache_does_not_remember_an_oversized_key() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let cache = &state.lookup_not_found_cache;
+        let epoch = state.cache_epoch();
+        let at_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES);
+        let over_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES + 1);
+        super::lookup_not_found_put(cache, &epoch, at_limit.clone(), "m".into());
+        super::lookup_not_found_put(cache, &epoch, over_limit.clone(), "m".into());
+        let guard = cache.read().unwrap();
+        assert!(
+            guard.get(&at_limit).is_some(),
+            "a key at the limit is remembered"
+        );
+        assert!(guard.get(&over_limit).is_none(), "a key above it is not");
+        assert_eq!(guard.len(), 1);
+    }
 
     /// A hit or a miss computed before a terminology write is not cached
     /// after it.
@@ -607,6 +627,7 @@ mod tests {
             Some("m")
         );
     }
+    use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 
