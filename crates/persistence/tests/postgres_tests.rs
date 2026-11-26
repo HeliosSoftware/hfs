@@ -134,6 +134,11 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
 /// The backend-agnostic suite for quantity `Range` targets (#2602).
 /// Same `#[path]` arrangement.
 #[path = "search/quantity_range_suite.rs"]
@@ -35741,6 +35746,19 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 µs)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn postgres_integration_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(
+            &backend,
+            &unique_base("date_instant"),
+        )
+        .await;
     }
 
     /// #2602: `gt`/`ge`/`eb` filter on `value_quantity_high`, so a selective

@@ -697,6 +697,11 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
 /// The backend-agnostic suite for quantity `Range` targets (#2602).
 /// Same `#[path]` arrangement.
 #[path = "search/quantity_range_suite.rs"]
@@ -2073,6 +2078,15 @@ mod es_integration {
     async fn es_date_period_targets_are_ranges() {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 ms)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn es_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(&backend, "date-instant-2962").await;
     }
 
     /// #2602: a `Range` was not indexed for quantity parameters. It is one

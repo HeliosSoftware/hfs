@@ -760,6 +760,24 @@ async fn mongodb_date_period_targets_are_ranges() {
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
 }
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
+/// #2962: an `instant` written to the second was indexed as the whole second,
+/// so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is the point
+/// `[t, t + 1 ms)` now; a `dateTime` keeps its range. Needs the full registry
+/// so `DiagnosticReport.issued` extracts.
+#[tokio::test]
+async fn mongodb_date_instant_targets_are_points() {
+    let Some(backend) = create_backend_with_full_registry("date_instant").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_instant_suite::instant_targets_are_points(&backend, "date-instant-2962").await;
+}
+
 /// The backend-agnostic suite for quantity `Range` targets (#2602).
 /// Same `#[path]` arrangement.
 #[path = "search/quantity_range_suite.rs"]

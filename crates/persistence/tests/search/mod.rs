@@ -58,6 +58,9 @@ pub mod chained_tests;
 /// The date component of a composite compares as a point on a Period's start,
 /// not as the range a date parameter compares (#1391).
 pub mod composite_period_pin;
+/// Backend-agnostic scenarios for `instant` targets, shared with the
+/// PostgreSQL, MongoDB and Elasticsearch test binaries via `#[path]` (#2962).
+pub mod date_instant_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1293, #1295, #1296, #1297).
 /// Backend-agnostic scenarios, shared with the PostgreSQL and MongoDB test
@@ -135,6 +138,17 @@ pub mod unfiltered_date_sort_suite;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// The shared `instant` table (#2962): an `instant` is a point, so a
+/// millisecond search finds one written to the second, and a `dateTime` with
+/// the same text keeps its one-second range. PostgreSQL, MongoDB and
+/// Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn date_instant_targets_are_points() {
+    let backend = make_sqlite_backend();
+    date_instant_suite::instant_targets_are_points(&backend, "date-instant").await;
 }
 
 /// The shared quantity `Range` table (#2602): a `Range` is one closed
