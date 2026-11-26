@@ -1,0 +1,1917 @@
+Running test: /k6/import.js on server: hfses with run ID: R2-hfses
+================================================
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+time="2026-11-18T23:04:27Z" level=warning msg="experimental-prometheus-rw output has been deprecated and is planned for removal in k6 v3. We recommend using opentelemetry for all your metrics output."
+
+     execution: local
+        script: /k6/import.js
+        output: Prometheus remote write (http://prometheus:9090/api/v1/write)
+
+     scenarios: (100.00%) 1 scenario, 20 max VUs, 1h0m30s max duration (incl. graceful stop):
+              * import: 1000 iterations shared among 20 VUs (maxDuration: 1h0m0s, gracefulStop: 30s)
+
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+Run      [ 100% ] setup()
+import   [   0% ]
+
+running (0h02m32.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m00.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m33.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m01.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m34.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m02.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m35.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m03.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m36.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m04.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m37.0s), 20/20 VUs, 0 complete and 0 interrupted iterations
+import   [   0% ] 20 VUs  0h00m05.1s/1h0m0s  0000/1000 shared iters
+
+running (0h02m38.0s), 20/20 VUs, 9 complete and 0 interrupted iterations
+import   [   1% ] 20 VUs  0h00m06.1s/1h0m0s  0009/1000 shared iters
+
+running (0h02m39.0s), 20/20 VUs, 19 complete and 0 interrupted iterations
+import   [   2% ] 20 VUs  0h00m07.1s/1h0m0s  0019/1000 shared iters
+
+running (0h02m40.0s), 20/20 VUs, 20 complete and 0 interrupted iterations
+import   [   2% ] 20 VUs  0h00m08.1s/1h0m0s  0020/1000 shared iters
+
+running (0h02m41.0s), 20/20 VUs, 21 complete and 0 interrupted iterations
+import   [   2% ] 20 VUs  0h00m09.1s/1h0m0s  0021/1000 shared iters
+
+running (0h02m42.0s), 20/20 VUs, 23 complete and 0 interrupted iterations
+import   [   2% ] 20 VUs  0h00m10.1s/1h0m0s  0023/1000 shared iters
+
+running (0h02m43.0s), 20/20 VUs, 28 complete and 0 interrupted iterations
+import   [   3% ] 20 VUs  0h00m11.1s/1h0m0s  0028/1000 shared iters
+
+running (0h02m44.0s), 20/20 VUs, 30 complete and 0 interrupted iterations
+import   [   3% ] 20 VUs  0h00m12.1s/1h0m0s  0030/1000 shared iters
+
+running (0h02m45.0s), 20/20 VUs, 31 complete and 0 interrupted iterations
+import   [   3% ] 20 VUs  0h00m13.1s/1h0m0s  0031/1000 shared iters
+
+running (0h02m46.0s), 20/20 VUs, 39 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m14.1s/1h0m0s  0039/1000 shared iters
+
+running (0h02m47.0s), 20/20 VUs, 39 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m15.1s/1h0m0s  0039/1000 shared iters
+
+running (0h02m48.0s), 20/20 VUs, 40 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m16.1s/1h0m0s  0040/1000 shared iters
+
+running (0h02m49.0s), 20/20 VUs, 40 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m17.1s/1h0m0s  0040/1000 shared iters
+
+running (0h02m50.0s), 20/20 VUs, 40 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m18.1s/1h0m0s  0040/1000 shared iters
+
+running (0h02m51.0s), 20/20 VUs, 41 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m19.1s/1h0m0s  0041/1000 shared iters
+
+running (0h02m52.0s), 20/20 VUs, 42 complete and 0 interrupted iterations
+import   [   4% ] 20 VUs  0h00m20.1s/1h0m0s  0042/1000 shared iters
+
+running (0h02m53.0s), 20/20 VUs, 46 complete and 0 interrupted iterations
+import   [   5% ] 20 VUs  0h00m21.1s/1h0m0s  0046/1000 shared iters
+
+running (0h02m54.0s), 20/20 VUs, 48 complete and 0 interrupted iterations
+import   [   5% ] 20 VUs  0h00m22.1s/1h0m0s  0048/1000 shared iters
+
+running (0h02m55.0s), 20/20 VUs, 49 complete and 0 interrupted iterations
+import   [   5% ] 20 VUs  0h00m23.1s/1h0m0s  0049/1000 shared iters
+
+running (0h02m56.0s), 20/20 VUs, 52 complete and 0 interrupted iterations
+import   [   5% ] 20 VUs  0h00m24.1s/1h0m0s  0052/1000 shared iters
+
+running (0h02m57.0s), 20/20 VUs, 56 complete and 0 interrupted iterations
+import   [   6% ] 20 VUs  0h00m25.1s/1h0m0s  0056/1000 shared iters
+
+running (0h02m58.0s), 20/20 VUs, 57 complete and 0 interrupted iterations
+import   [   6% ] 20 VUs  0h00m26.1s/1h0m0s  0057/1000 shared iters
+
+running (0h02m59.0s), 20/20 VUs, 59 complete and 0 interrupted iterations
+import   [   6% ] 20 VUs  0h00m27.1s/1h0m0s  0059/1000 shared iters
+
+running (0h03m00.0s), 20/20 VUs, 61 complete and 0 interrupted iterations
+import   [   6% ] 20 VUs  0h00m28.1s/1h0m0s  0061/1000 shared iters
+
+running (0h03m01.0s), 20/20 VUs, 66 complete and 0 interrupted iterations
+import   [   7% ] 20 VUs  0h00m29.1s/1h0m0s  0066/1000 shared iters
+
+running (0h03m02.0s), 20/20 VUs, 70 complete and 0 interrupted iterations
+import   [   7% ] 20 VUs  0h00m30.1s/1h0m0s  0070/1000 shared iters
+
+running (0h03m03.0s), 20/20 VUs, 70 complete and 0 interrupted iterations
+import   [   7% ] 20 VUs  0h00m31.1s/1h0m0s  0070/1000 shared iters
+
+running (0h03m04.0s), 20/20 VUs, 72 complete and 0 interrupted iterations
+import   [   7% ] 20 VUs  0h00m32.1s/1h0m0s  0072/1000 shared iters
+
+running (0h03m05.0s), 20/20 VUs, 76 complete and 0 interrupted iterations
+import   [   8% ] 20 VUs  0h00m33.1s/1h0m0s  0076/1000 shared iters
+
+running (0h03m06.0s), 20/20 VUs, 79 complete and 0 interrupted iterations
+import   [   8% ] 20 VUs  0h00m34.1s/1h0m0s  0079/1000 shared iters
+
+running (0h03m07.0s), 20/20 VUs, 86 complete and 0 interrupted iterations
+import   [   9% ] 20 VUs  0h00m35.1s/1h0m0s  0086/1000 shared iters
+
+running (0h03m08.0s), 20/20 VUs, 93 complete and 0 interrupted iterations
+import   [   9% ] 20 VUs  0h00m36.1s/1h0m0s  0093/1000 shared iters
+
+running (0h03m09.0s), 20/20 VUs, 94 complete and 0 interrupted iterations
+import   [   9% ] 20 VUs  0h00m37.1s/1h0m0s  0094/1000 shared iters
+
+running (0h03m10.0s), 20/20 VUs, 95 complete and 0 interrupted iterations
+import   [  10% ] 20 VUs  0h00m38.1s/1h0m0s  0095/1000 shared iters
+
+running (0h03m11.0s), 20/20 VUs, 98 complete and 0 interrupted iterations
+import   [  10% ] 20 VUs  0h00m39.1s/1h0m0s  0098/1000 shared iters
+
+running (0h03m12.0s), 20/20 VUs, 101 complete and 0 interrupted iterations
+import   [  10% ] 20 VUs  0h00m40.1s/1h0m0s  0101/1000 shared iters
+
+running (0h03m13.0s), 20/20 VUs, 104 complete and 0 interrupted iterations
+import   [  10% ] 20 VUs  0h00m41.1s/1h0m0s  0104/1000 shared iters
+
+running (0h03m14.0s), 20/20 VUs, 110 complete and 0 interrupted iterations
+import   [  11% ] 20 VUs  0h00m42.1s/1h0m0s  0110/1000 shared iters
+
+running (0h03m15.0s), 20/20 VUs, 115 complete and 0 interrupted iterations
+import   [  12% ] 20 VUs  0h00m43.1s/1h0m0s  0115/1000 shared iters
+
+running (0h03m16.0s), 20/20 VUs, 117 complete and 0 interrupted iterations
+import   [  12% ] 20 VUs  0h00m44.1s/1h0m0s  0117/1000 shared iters
+
+running (0h03m17.0s), 20/20 VUs, 121 complete and 0 interrupted iterations
+import   [  12% ] 20 VUs  0h00m45.1s/1h0m0s  0121/1000 shared iters
+
+running (0h03m18.0s), 20/20 VUs, 129 complete and 0 interrupted iterations
+import   [  13% ] 20 VUs  0h00m46.1s/1h0m0s  0129/1000 shared iters
+
+running (0h03m19.0s), 20/20 VUs, 130 complete and 0 interrupted iterations
+import   [  13% ] 20 VUs  0h00m47.1s/1h0m0s  0130/1000 shared iters
+
+running (0h03m20.0s), 20/20 VUs, 132 complete and 0 interrupted iterations
+import   [  13% ] 20 VUs  0h00m48.1s/1h0m0s  0132/1000 shared iters
+
+running (0h03m21.0s), 20/20 VUs, 135 complete and 0 interrupted iterations
+import   [  14% ] 20 VUs  0h00m49.1s/1h0m0s  0135/1000 shared iters
+
+running (0h03m22.0s), 20/20 VUs, 137 complete and 0 interrupted iterations
+import   [  14% ] 20 VUs  0h00m50.1s/1h0m0s  0137/1000 shared iters
+
+running (0h03m23.0s), 20/20 VUs, 145 complete and 0 interrupted iterations
+import   [  14% ] 20 VUs  0h00m51.1s/1h0m0s  0145/1000 shared iters
+
+running (0h03m24.0s), 20/20 VUs, 149 complete and 0 interrupted iterations
+import   [  15% ] 20 VUs  0h00m52.1s/1h0m0s  0149/1000 shared iters
+
+running (0h03m25.0s), 20/20 VUs, 154 complete and 0 interrupted iterations
+import   [  15% ] 20 VUs  0h00m53.1s/1h0m0s  0154/1000 shared iters
+
+running (0h03m26.0s), 20/20 VUs, 154 complete and 0 interrupted iterations
+import   [  15% ] 20 VUs  0h00m54.1s/1h0m0s  0154/1000 shared iters
+
+running (0h03m27.0s), 20/20 VUs, 157 complete and 0 interrupted iterations
+import   [  16% ] 20 VUs  0h00m55.1s/1h0m0s  0157/1000 shared iters
+
+running (0h03m28.0s), 20/20 VUs, 163 complete and 0 interrupted iterations
+import   [  16% ] 20 VUs  0h00m56.1s/1h0m0s  0163/1000 shared iters
+
+running (0h03m29.0s), 20/20 VUs, 166 complete and 0 interrupted iterations
+import   [  17% ] 20 VUs  0h00m57.1s/1h0m0s  0166/1000 shared iters
+
+running (0h03m30.0s), 20/20 VUs, 169 complete and 0 interrupted iterations
+import   [  17% ] 20 VUs  0h00m58.1s/1h0m0s  0169/1000 shared iters
+
+running (0h03m31.0s), 20/20 VUs, 169 complete and 0 interrupted iterations
+import   [  17% ] 20 VUs  0h00m59.1s/1h0m0s  0169/1000 shared iters
+
+running (0h03m32.0s), 20/20 VUs, 171 complete and 0 interrupted iterations
+import   [  17% ] 20 VUs  0h01m00.1s/1h0m0s  0171/1000 shared iters
+
+running (0h03m33.0s), 20/20 VUs, 172 complete and 0 interrupted iterations
+import   [  17% ] 20 VUs  0h01m01.1s/1h0m0s  0172/1000 shared iters
+
+running (0h03m34.0s), 20/20 VUs, 175 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m02.1s/1h0m0s  0175/1000 shared iters
+
+running (0h03m35.0s), 20/20 VUs, 177 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m03.1s/1h0m0s  0177/1000 shared iters
+
+running (0h03m36.0s), 20/20 VUs, 179 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m04.1s/1h0m0s  0179/1000 shared iters
+
+running (0h03m37.0s), 20/20 VUs, 179 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m05.1s/1h0m0s  0179/1000 shared iters
+
+running (0h03m38.0s), 20/20 VUs, 181 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m06.1s/1h0m0s  0181/1000 shared iters
+
+running (0h03m39.0s), 20/20 VUs, 183 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m07.1s/1h0m0s  0183/1000 shared iters
+
+running (0h03m40.0s), 20/20 VUs, 183 complete and 0 interrupted iterations
+import   [  18% ] 20 VUs  0h01m08.1s/1h0m0s  0183/1000 shared iters
+
+running (0h03m41.0s), 20/20 VUs, 186 complete and 0 interrupted iterations
+import   [  19% ] 20 VUs  0h01m09.1s/1h0m0s  0186/1000 shared iters
+
+running (0h03m42.0s), 20/20 VUs, 189 complete and 0 interrupted iterations
+import   [  19% ] 20 VUs  0h01m10.1s/1h0m0s  0189/1000 shared iters
+
+running (0h03m43.0s), 20/20 VUs, 192 complete and 0 interrupted iterations
+import   [  19% ] 20 VUs  0h01m11.1s/1h0m0s  0192/1000 shared iters
+
+running (0h03m44.0s), 20/20 VUs, 193 complete and 0 interrupted iterations
+import   [  19% ] 20 VUs  0h01m12.1s/1h0m0s  0193/1000 shared iters
+
+running (0h03m45.0s), 20/20 VUs, 194 complete and 0 interrupted iterations
+import   [  19% ] 20 VUs  0h01m13.1s/1h0m0s  0194/1000 shared iters
+
+running (0h03m46.0s), 20/20 VUs, 196 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m14.1s/1h0m0s  0196/1000 shared iters
+
+running (0h03m47.0s), 20/20 VUs, 196 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m15.1s/1h0m0s  0196/1000 shared iters
+
+running (0h03m48.0s), 20/20 VUs, 196 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m16.1s/1h0m0s  0196/1000 shared iters
+
+running (0h03m49.0s), 20/20 VUs, 198 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m17.1s/1h0m0s  0198/1000 shared iters
+
+running (0h03m50.0s), 20/20 VUs, 200 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m18.1s/1h0m0s  0200/1000 shared iters
+
+running (0h03m51.0s), 20/20 VUs, 203 complete and 0 interrupted iterations
+import   [  20% ] 20 VUs  0h01m19.1s/1h0m0s  0203/1000 shared iters
+
+running (0h03m52.0s), 20/20 VUs, 208 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m20.1s/1h0m0s  0208/1000 shared iters
+
+running (0h03m53.0s), 20/20 VUs, 208 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m21.1s/1h0m0s  0208/1000 shared iters
+
+running (0h03m54.0s), 20/20 VUs, 210 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m22.1s/1h0m0s  0210/1000 shared iters
+
+running (0h03m55.0s), 20/20 VUs, 211 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m23.1s/1h0m0s  0211/1000 shared iters
+
+running (0h03m56.0s), 20/20 VUs, 212 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m24.1s/1h0m0s  0212/1000 shared iters
+
+running (0h03m57.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m25.1s/1h0m0s  0214/1000 shared iters
+
+running (0h03m58.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m26.1s/1h0m0s  0214/1000 shared iters
+
+running (0h03m59.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m27.1s/1h0m0s  0214/1000 shared iters
+
+running (0h04m00.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m28.1s/1h0m0s  0214/1000 shared iters
+
+running (0h04m01.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m29.1s/1h0m0s  0214/1000 shared iters
+
+running (0h04m02.0s), 20/20 VUs, 214 complete and 0 interrupted iterations
+import   [  21% ] 20 VUs  0h01m30.1s/1h0m0s  0214/1000 shared iters
+
+running (0h04m03.0s), 20/20 VUs, 217 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m31.1s/1h0m0s  0217/1000 shared iters
+
+running (0h04m04.0s), 20/20 VUs, 218 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m32.1s/1h0m0s  0218/1000 shared iters
+
+running (0h04m05.0s), 20/20 VUs, 219 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m33.1s/1h0m0s  0219/1000 shared iters
+
+running (0h04m06.0s), 20/20 VUs, 222 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m34.1s/1h0m0s  0222/1000 shared iters
+
+running (0h04m07.0s), 20/20 VUs, 222 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m35.1s/1h0m0s  0222/1000 shared iters
+
+running (0h04m08.0s), 20/20 VUs, 223 complete and 0 interrupted iterations
+import   [  22% ] 20 VUs  0h01m36.1s/1h0m0s  0223/1000 shared iters
+
+running (0h04m09.0s), 20/20 VUs, 226 complete and 0 interrupted iterations
+import   [  23% ] 20 VUs  0h01m37.1s/1h0m0s  0226/1000 shared iters
+
+running (0h04m10.0s), 20/20 VUs, 229 complete and 0 interrupted iterations
+import   [  23% ] 20 VUs  0h01m38.1s/1h0m0s  0229/1000 shared iters
+
+running (0h04m11.0s), 20/20 VUs, 234 complete and 0 interrupted iterations
+import   [  23% ] 20 VUs  0h01m39.1s/1h0m0s  0234/1000 shared iters
+
+running (0h04m12.0s), 20/20 VUs, 236 complete and 0 interrupted iterations
+import   [  24% ] 20 VUs  0h01m40.1s/1h0m0s  0236/1000 shared iters
+
+running (0h04m13.0s), 20/20 VUs, 239 complete and 0 interrupted iterations
+import   [  24% ] 20 VUs  0h01m41.1s/1h0m0s  0239/1000 shared iters
+
+running (0h04m14.0s), 20/20 VUs, 243 complete and 0 interrupted iterations
+import   [  24% ] 20 VUs  0h01m42.1s/1h0m0s  0243/1000 shared iters
+
+running (0h04m15.0s), 20/20 VUs, 245 complete and 0 interrupted iterations
+import   [  24% ] 20 VUs  0h01m43.1s/1h0m0s  0245/1000 shared iters
+
+running (0h04m16.0s), 20/20 VUs, 249 complete and 0 interrupted iterations
+import   [  25% ] 20 VUs  0h01m44.1s/1h0m0s  0249/1000 shared iters
+
+running (0h04m17.0s), 20/20 VUs, 251 complete and 0 interrupted iterations
+import   [  25% ] 20 VUs  0h01m45.1s/1h0m0s  0251/1000 shared iters
+
+running (0h04m18.0s), 20/20 VUs, 253 complete and 0 interrupted iterations
+import   [  25% ] 20 VUs  0h01m46.1s/1h0m0s  0253/1000 shared iters
+
+running (0h04m19.0s), 20/20 VUs, 257 complete and 0 interrupted iterations
+import   [  26% ] 20 VUs  0h01m47.1s/1h0m0s  0257/1000 shared iters
+
+running (0h04m20.0s), 20/20 VUs, 258 complete and 0 interrupted iterations
+import   [  26% ] 20 VUs  0h01m48.1s/1h0m0s  0258/1000 shared iters
+
+running (0h04m21.0s), 20/20 VUs, 261 complete and 0 interrupted iterations
+import   [  26% ] 20 VUs  0h01m49.1s/1h0m0s  0261/1000 shared iters
+
+running (0h04m22.0s), 20/20 VUs, 262 complete and 0 interrupted iterations
+import   [  26% ] 20 VUs  0h01m50.1s/1h0m0s  0262/1000 shared iters
+
+running (0h04m23.0s), 20/20 VUs, 264 complete and 0 interrupted iterations
+import   [  26% ] 20 VUs  0h01m51.1s/1h0m0s  0264/1000 shared iters
+
+running (0h04m24.0s), 20/20 VUs, 273 complete and 0 interrupted iterations
+import   [  27% ] 20 VUs  0h01m52.1s/1h0m0s  0273/1000 shared iters
+
+running (0h04m25.0s), 20/20 VUs, 278 complete and 0 interrupted iterations
+import   [  28% ] 20 VUs  0h01m53.1s/1h0m0s  0278/1000 shared iters
+
+running (0h04m26.0s), 20/20 VUs, 281 complete and 0 interrupted iterations
+import   [  28% ] 20 VUs  0h01m54.1s/1h0m0s  0281/1000 shared iters
+
+running (0h04m27.0s), 20/20 VUs, 281 complete and 0 interrupted iterations
+import   [  28% ] 20 VUs  0h01m55.1s/1h0m0s  0281/1000 shared iters
+
+running (0h04m28.0s), 20/20 VUs, 287 complete and 0 interrupted iterations
+import   [  29% ] 20 VUs  0h01m56.1s/1h0m0s  0287/1000 shared iters
+
+running (0h04m29.0s), 20/20 VUs, 291 complete and 0 interrupted iterations
+import   [  29% ] 20 VUs  0h01m57.1s/1h0m0s  0291/1000 shared iters
+
+running (0h04m30.0s), 20/20 VUs, 296 complete and 0 interrupted iterations
+import   [  30% ] 20 VUs  0h01m58.1s/1h0m0s  0296/1000 shared iters
+
+running (0h04m31.0s), 20/20 VUs, 297 complete and 0 interrupted iterations
+import   [  30% ] 20 VUs  0h01m59.1s/1h0m0s  0297/1000 shared iters
+
+running (0h04m32.0s), 20/20 VUs, 301 complete and 0 interrupted iterations
+import   [  30% ] 20 VUs  0h02m00.1s/1h0m0s  0301/1000 shared iters
+
+running (0h04m33.0s), 20/20 VUs, 307 complete and 0 interrupted iterations
+import   [  31% ] 20 VUs  0h02m01.1s/1h0m0s  0307/1000 shared iters
+
+running (0h04m34.0s), 20/20 VUs, 311 complete and 0 interrupted iterations
+import   [  31% ] 20 VUs  0h02m02.1s/1h0m0s  0311/1000 shared iters
+
+running (0h04m35.0s), 20/20 VUs, 313 complete and 0 interrupted iterations
+import   [  31% ] 20 VUs  0h02m03.1s/1h0m0s  0313/1000 shared iters
+
+running (0h04m36.0s), 20/20 VUs, 314 complete and 0 interrupted iterations
+import   [  31% ] 20 VUs  0h02m04.1s/1h0m0s  0314/1000 shared iters
+
+running (0h04m37.0s), 20/20 VUs, 314 complete and 0 interrupted iterations
+import   [  31% ] 20 VUs  0h02m05.1s/1h0m0s  0314/1000 shared iters
+
+running (0h04m38.0s), 20/20 VUs, 316 complete and 0 interrupted iterations
+import   [  32% ] 20 VUs  0h02m06.1s/1h0m0s  0316/1000 shared iters
+
+running (0h04m39.0s), 20/20 VUs, 316 complete and 0 interrupted iterations
+import   [  32% ] 20 VUs  0h02m07.1s/1h0m0s  0316/1000 shared iters
+
+running (0h04m40.0s), 20/20 VUs, 317 complete and 0 interrupted iterations
+import   [  32% ] 20 VUs  0h02m08.1s/1h0m0s  0317/1000 shared iters
+
+running (0h04m41.0s), 20/20 VUs, 319 complete and 0 interrupted iterations
+import   [  32% ] 20 VUs  0h02m09.1s/1h0m0s  0319/1000 shared iters
+
+running (0h04m42.0s), 20/20 VUs, 323 complete and 0 interrupted iterations
+import   [  32% ] 20 VUs  0h02m10.1s/1h0m0s  0323/1000 shared iters
+
+running (0h04m43.0s), 20/20 VUs, 329 complete and 0 interrupted iterations
+import   [  33% ] 20 VUs  0h02m11.1s/1h0m0s  0329/1000 shared iters
+
+running (0h04m44.0s), 20/20 VUs, 330 complete and 0 interrupted iterations
+import   [  33% ] 20 VUs  0h02m12.1s/1h0m0s  0330/1000 shared iters
+
+running (0h04m45.0s), 20/20 VUs, 331 complete and 0 interrupted iterations
+import   [  33% ] 20 VUs  0h02m13.1s/1h0m0s  0331/1000 shared iters
+
+running (0h04m46.0s), 20/20 VUs, 333 complete and 0 interrupted iterations
+import   [  33% ] 20 VUs  0h02m14.1s/1h0m0s  0333/1000 shared iters
+
+running (0h04m47.0s), 20/20 VUs, 334 complete and 0 interrupted iterations
+import   [  33% ] 20 VUs  0h02m15.1s/1h0m0s  0334/1000 shared iters
+
+running (0h04m48.0s), 20/20 VUs, 335 complete and 0 interrupted iterations
+import   [  34% ] 20 VUs  0h02m16.1s/1h0m0s  0335/1000 shared iters
+
+running (0h04m49.0s), 20/20 VUs, 336 complete and 0 interrupted iterations
+import   [  34% ] 20 VUs  0h02m17.1s/1h0m0s  0336/1000 shared iters
+
+running (0h04m50.0s), 20/20 VUs, 338 complete and 0 interrupted iterations
+import   [  34% ] 20 VUs  0h02m18.1s/1h0m0s  0338/1000 shared iters
+
+running (0h04m51.0s), 20/20 VUs, 341 complete and 0 interrupted iterations
+import   [  34% ] 20 VUs  0h02m19.1s/1h0m0s  0341/1000 shared iters
+
+running (0h04m52.0s), 20/20 VUs, 344 complete and 0 interrupted iterations
+import   [  34% ] 20 VUs  0h02m20.1s/1h0m0s  0344/1000 shared iters
+
+running (0h04m53.0s), 20/20 VUs, 348 complete and 0 interrupted iterations
+import   [  35% ] 20 VUs  0h02m21.1s/1h0m0s  0348/1000 shared iters
+
+running (0h04m54.0s), 20/20 VUs, 349 complete and 0 interrupted iterations
+import   [  35% ] 20 VUs  0h02m22.1s/1h0m0s  0349/1000 shared iters
+
+running (0h04m55.0s), 20/20 VUs, 351 complete and 0 interrupted iterations
+import   [  35% ] 20 VUs  0h02m23.1s/1h0m0s  0351/1000 shared iters
+
+running (0h04m56.0s), 20/20 VUs, 352 complete and 0 interrupted iterations
+import   [  35% ] 20 VUs  0h02m24.1s/1h0m0s  0352/1000 shared iters
+
+running (0h04m57.0s), 20/20 VUs, 354 complete and 0 interrupted iterations
+import   [  35% ] 20 VUs  0h02m25.1s/1h0m0s  0354/1000 shared iters
+
+running (0h04m58.0s), 20/20 VUs, 356 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m26.1s/1h0m0s  0356/1000 shared iters
+
+running (0h04m59.0s), 20/20 VUs, 361 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m27.1s/1h0m0s  0361/1000 shared iters
+
+running (0h05m00.0s), 20/20 VUs, 361 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m28.1s/1h0m0s  0361/1000 shared iters
+
+running (0h05m01.0s), 20/20 VUs, 362 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m29.1s/1h0m0s  0362/1000 shared iters
+
+running (0h05m02.0s), 20/20 VUs, 363 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m30.1s/1h0m0s  0363/1000 shared iters
+
+running (0h05m03.0s), 20/20 VUs, 364 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m31.1s/1h0m0s  0364/1000 shared iters
+
+running (0h05m04.0s), 20/20 VUs, 364 complete and 0 interrupted iterations
+import   [  36% ] 20 VUs  0h02m32.1s/1h0m0s  0364/1000 shared iters
+
+running (0h05m05.0s), 20/20 VUs, 366 complete and 0 interrupted iterations
+import   [  37% ] 20 VUs  0h02m33.1s/1h0m0s  0366/1000 shared iters
+
+running (0h05m06.0s), 20/20 VUs, 366 complete and 0 interrupted iterations
+import   [  37% ] 20 VUs  0h02m34.1s/1h0m0s  0366/1000 shared iters
+
+running (0h05m07.0s), 20/20 VUs, 367 complete and 0 interrupted iterations
+import   [  37% ] 20 VUs  0h02m35.1s/1h0m0s  0367/1000 shared iters
+
+running (0h05m08.0s), 20/20 VUs, 369 complete and 0 interrupted iterations
+import   [  37% ] 20 VUs  0h02m36.1s/1h0m0s  0369/1000 shared iters
+
+running (0h05m09.0s), 20/20 VUs, 373 complete and 0 interrupted iterations
+import   [  37% ] 20 VUs  0h02m37.1s/1h0m0s  0373/1000 shared iters
+
+running (0h05m10.0s), 20/20 VUs, 375 complete and 0 interrupted iterations
+import   [  38% ] 20 VUs  0h02m38.1s/1h0m0s  0375/1000 shared iters
+
+running (0h05m11.0s), 20/20 VUs, 377 complete and 0 interrupted iterations
+import   [  38% ] 20 VUs  0h02m39.1s/1h0m0s  0377/1000 shared iters
+
+running (0h05m12.0s), 20/20 VUs, 380 complete and 0 interrupted iterations
+import   [  38% ] 20 VUs  0h02m40.1s/1h0m0s  0380/1000 shared iters
+
+running (0h05m13.0s), 20/20 VUs, 384 complete and 0 interrupted iterations
+import   [  38% ] 20 VUs  0h02m41.1s/1h0m0s  0384/1000 shared iters
+
+running (0h05m14.0s), 20/20 VUs, 387 complete and 0 interrupted iterations
+import   [  39% ] 20 VUs  0h02m42.1s/1h0m0s  0387/1000 shared iters
+
+running (0h05m15.0s), 20/20 VUs, 390 complete and 0 interrupted iterations
+import   [  39% ] 20 VUs  0h02m43.1s/1h0m0s  0390/1000 shared iters
+
+running (0h05m16.0s), 20/20 VUs, 393 complete and 0 interrupted iterations
+import   [  39% ] 20 VUs  0h02m44.1s/1h0m0s  0393/1000 shared iters
+
+running (0h05m17.0s), 20/20 VUs, 396 complete and 0 interrupted iterations
+import   [  40% ] 20 VUs  0h02m45.1s/1h0m0s  0396/1000 shared iters
+
+running (0h05m18.0s), 20/20 VUs, 401 complete and 0 interrupted iterations
+import   [  40% ] 20 VUs  0h02m46.1s/1h0m0s  0401/1000 shared iters
+
+running (0h05m19.0s), 20/20 VUs, 404 complete and 0 interrupted iterations
+import   [  40% ] 20 VUs  0h02m47.1s/1h0m0s  0404/1000 shared iters
+
+running (0h05m20.0s), 20/20 VUs, 407 complete and 0 interrupted iterations
+import   [  41% ] 20 VUs  0h02m48.1s/1h0m0s  0407/1000 shared iters
+
+running (0h05m21.0s), 20/20 VUs, 411 complete and 0 interrupted iterations
+import   [  41% ] 20 VUs  0h02m49.1s/1h0m0s  0411/1000 shared iters
+
+running (0h05m22.0s), 20/20 VUs, 411 complete and 0 interrupted iterations
+import   [  41% ] 20 VUs  0h02m50.1s/1h0m0s  0411/1000 shared iters
+
+running (0h05m23.0s), 20/20 VUs, 413 complete and 0 interrupted iterations
+import   [  41% ] 20 VUs  0h02m51.1s/1h0m0s  0413/1000 shared iters
+
+running (0h05m24.0s), 20/20 VUs, 421 complete and 0 interrupted iterations
+import   [  42% ] 20 VUs  0h02m52.1s/1h0m0s  0421/1000 shared iters
+
+running (0h05m25.0s), 20/20 VUs, 424 complete and 0 interrupted iterations
+import   [  42% ] 20 VUs  0h02m53.1s/1h0m0s  0424/1000 shared iters
+
+running (0h05m26.0s), 20/20 VUs, 428 complete and 0 interrupted iterations
+import   [  43% ] 20 VUs  0h02m54.1s/1h0m0s  0428/1000 shared iters
+
+running (0h05m27.0s), 20/20 VUs, 431 complete and 0 interrupted iterations
+import   [  43% ] 20 VUs  0h02m55.1s/1h0m0s  0431/1000 shared iters
+
+running (0h05m28.0s), 20/20 VUs, 432 complete and 0 interrupted iterations
+import   [  43% ] 20 VUs  0h02m56.1s/1h0m0s  0432/1000 shared iters
+
+running (0h05m29.0s), 20/20 VUs, 433 complete and 0 interrupted iterations
+import   [  43% ] 20 VUs  0h02m57.1s/1h0m0s  0433/1000 shared iters
+
+running (0h05m30.0s), 20/20 VUs, 437 complete and 0 interrupted iterations
+import   [  44% ] 20 VUs  0h02m58.1s/1h0m0s  0437/1000 shared iters
+
+running (0h05m31.0s), 20/20 VUs, 445 complete and 0 interrupted iterations
+import   [  44% ] 20 VUs  0h02m59.1s/1h0m0s  0445/1000 shared iters
+
+running (0h05m32.0s), 20/20 VUs, 451 complete and 0 interrupted iterations
+import   [  45% ] 20 VUs  0h03m00.1s/1h0m0s  0451/1000 shared iters
+
+running (0h05m33.0s), 20/20 VUs, 452 complete and 0 interrupted iterations
+import   [  45% ] 20 VUs  0h03m01.1s/1h0m0s  0452/1000 shared iters
+
+running (0h05m34.0s), 20/20 VUs, 454 complete and 0 interrupted iterations
+import   [  45% ] 20 VUs  0h03m02.1s/1h0m0s  0454/1000 shared iters
+
+running (0h05m35.0s), 20/20 VUs, 455 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m03.1s/1h0m0s  0455/1000 shared iters
+
+running (0h05m36.0s), 20/20 VUs, 456 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m04.1s/1h0m0s  0456/1000 shared iters
+
+running (0h05m37.0s), 20/20 VUs, 456 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m05.1s/1h0m0s  0456/1000 shared iters
+
+running (0h05m38.0s), 20/20 VUs, 457 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m06.1s/1h0m0s  0457/1000 shared iters
+
+running (0h05m39.0s), 20/20 VUs, 463 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m07.1s/1h0m0s  0463/1000 shared iters
+
+running (0h05m40.0s), 20/20 VUs, 463 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m08.1s/1h0m0s  0463/1000 shared iters
+
+running (0h05m41.0s), 20/20 VUs, 463 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m09.1s/1h0m0s  0463/1000 shared iters
+
+running (0h05m42.0s), 20/20 VUs, 464 complete and 0 interrupted iterations
+import   [  46% ] 20 VUs  0h03m10.1s/1h0m0s  0464/1000 shared iters
+
+running (0h05m43.0s), 20/20 VUs, 467 complete and 0 interrupted iterations
+import   [  47% ] 20 VUs  0h03m11.1s/1h0m0s  0467/1000 shared iters
+
+running (0h05m44.0s), 20/20 VUs, 471 complete and 0 interrupted iterations
+import   [  47% ] 20 VUs  0h03m12.1s/1h0m0s  0471/1000 shared iters
+
+running (0h05m45.0s), 20/20 VUs, 471 complete and 0 interrupted iterations
+import   [  47% ] 20 VUs  0h03m13.1s/1h0m0s  0471/1000 shared iters
+
+running (0h05m46.0s), 20/20 VUs, 475 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m14.1s/1h0m0s  0475/1000 shared iters
+
+running (0h05m47.0s), 20/20 VUs, 477 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m15.1s/1h0m0s  0477/1000 shared iters
+
+running (0h05m48.0s), 20/20 VUs, 477 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m16.1s/1h0m0s  0477/1000 shared iters
+
+running (0h05m49.0s), 20/20 VUs, 478 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m17.1s/1h0m0s  0478/1000 shared iters
+
+running (0h05m50.0s), 20/20 VUs, 478 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m18.1s/1h0m0s  0478/1000 shared iters
+
+running (0h05m51.0s), 20/20 VUs, 480 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m19.1s/1h0m0s  0480/1000 shared iters
+
+running (0h05m52.0s), 20/20 VUs, 483 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m20.1s/1h0m0s  0483/1000 shared iters
+
+running (0h05m53.0s), 20/20 VUs, 483 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m21.1s/1h0m0s  0483/1000 shared iters
+
+running (0h05m54.0s), 20/20 VUs, 484 complete and 0 interrupted iterations
+import   [  48% ] 20 VUs  0h03m22.1s/1h0m0s  0484/1000 shared iters
+
+running (0h05m55.0s), 20/20 VUs, 490 complete and 0 interrupted iterations
+import   [  49% ] 20 VUs  0h03m23.1s/1h0m0s  0490/1000 shared iters
+
+running (0h05m56.0s), 20/20 VUs, 497 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m24.1s/1h0m0s  0497/1000 shared iters
+
+running (0h05m57.0s), 20/20 VUs, 497 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m25.1s/1h0m0s  0497/1000 shared iters
+
+running (0h05m58.0s), 20/20 VUs, 497 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m26.1s/1h0m0s  0497/1000 shared iters
+
+running (0h05m59.0s), 20/20 VUs, 498 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m27.1s/1h0m0s  0498/1000 shared iters
+
+running (0h06m00.0s), 20/20 VUs, 500 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m28.1s/1h0m0s  0500/1000 shared iters
+
+running (0h06m01.0s), 20/20 VUs, 501 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m29.1s/1h0m0s  0501/1000 shared iters
+
+running (0h06m02.0s), 20/20 VUs, 504 complete and 0 interrupted iterations
+import   [  50% ] 20 VUs  0h03m30.1s/1h0m0s  0504/1000 shared iters
+
+running (0h06m03.0s), 20/20 VUs, 510 complete and 0 interrupted iterations
+import   [  51% ] 20 VUs  0h03m31.1s/1h0m0s  0510/1000 shared iters
+
+running (0h06m04.0s), 20/20 VUs, 514 complete and 0 interrupted iterations
+import   [  51% ] 20 VUs  0h03m32.1s/1h0m0s  0514/1000 shared iters
+
+running (0h06m05.0s), 20/20 VUs, 518 complete and 0 interrupted iterations
+import   [  52% ] 20 VUs  0h03m33.1s/1h0m0s  0518/1000 shared iters
+
+running (0h06m06.0s), 20/20 VUs, 523 complete and 0 interrupted iterations
+import   [  52% ] 20 VUs  0h03m34.1s/1h0m0s  0523/1000 shared iters
+
+running (0h06m07.0s), 20/20 VUs, 528 complete and 0 interrupted iterations
+import   [  53% ] 20 VUs  0h03m35.1s/1h0m0s  0528/1000 shared iters
+
+running (0h06m08.0s), 20/20 VUs, 534 complete and 0 interrupted iterations
+import   [  53% ] 20 VUs  0h03m36.1s/1h0m0s  0534/1000 shared iters
+
+running (0h06m09.0s), 20/20 VUs, 539 complete and 0 interrupted iterations
+import   [  54% ] 20 VUs  0h03m37.1s/1h0m0s  0539/1000 shared iters
+
+running (0h06m10.0s), 20/20 VUs, 543 complete and 0 interrupted iterations
+import   [  54% ] 20 VUs  0h03m38.1s/1h0m0s  0543/1000 shared iters
+
+running (0h06m11.0s), 20/20 VUs, 544 complete and 0 interrupted iterations
+import   [  54% ] 20 VUs  0h03m39.1s/1h0m0s  0544/1000 shared iters
+
+running (0h06m12.0s), 20/20 VUs, 550 complete and 0 interrupted iterations
+import   [  55% ] 20 VUs  0h03m40.1s/1h0m0s  0550/1000 shared iters
+
+running (0h06m13.0s), 20/20 VUs, 553 complete and 0 interrupted iterations
+import   [  55% ] 20 VUs  0h03m41.1s/1h0m0s  0553/1000 shared iters
+
+running (0h06m14.0s), 20/20 VUs, 560 complete and 0 interrupted iterations
+import   [  56% ] 20 VUs  0h03m42.1s/1h0m0s  0560/1000 shared iters
+
+running (0h06m15.0s), 20/20 VUs, 564 complete and 0 interrupted iterations
+import   [  56% ] 20 VUs  0h03m43.1s/1h0m0s  0564/1000 shared iters
+
+running (0h06m16.0s), 20/20 VUs, 571 complete and 0 interrupted iterations
+import   [  57% ] 20 VUs  0h03m44.1s/1h0m0s  0571/1000 shared iters
+
+running (0h06m17.0s), 20/20 VUs, 572 complete and 0 interrupted iterations
+import   [  57% ] 20 VUs  0h03m45.1s/1h0m0s  0572/1000 shared iters
+
+running (0h06m18.0s), 20/20 VUs, 577 complete and 0 interrupted iterations
+import   [  58% ] 20 VUs  0h03m46.1s/1h0m0s  0577/1000 shared iters
+
+running (0h06m19.0s), 20/20 VUs, 578 complete and 0 interrupted iterations
+import   [  58% ] 20 VUs  0h03m47.1s/1h0m0s  0578/1000 shared iters
+
+running (0h06m20.0s), 20/20 VUs, 582 complete and 0 interrupted iterations
+import   [  58% ] 20 VUs  0h03m48.1s/1h0m0s  0582/1000 shared iters
+
+running (0h06m21.0s), 20/20 VUs, 583 complete and 0 interrupted iterations
+import   [  58% ] 20 VUs  0h03m49.1s/1h0m0s  0583/1000 shared iters
+
+running (0h06m22.0s), 20/20 VUs, 587 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m50.1s/1h0m0s  0587/1000 shared iters
+
+running (0h06m23.0s), 20/20 VUs, 591 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m51.1s/1h0m0s  0591/1000 shared iters
+
+running (0h06m24.0s), 20/20 VUs, 591 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m52.1s/1h0m0s  0591/1000 shared iters
+
+running (0h06m25.0s), 20/20 VUs, 593 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m53.1s/1h0m0s  0593/1000 shared iters
+
+running (0h06m26.0s), 20/20 VUs, 593 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m54.1s/1h0m0s  0593/1000 shared iters
+
+running (0h06m27.0s), 20/20 VUs, 594 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m55.1s/1h0m0s  0594/1000 shared iters
+
+running (0h06m28.0s), 20/20 VUs, 594 complete and 0 interrupted iterations
+import   [  59% ] 20 VUs  0h03m56.1s/1h0m0s  0594/1000 shared iters
+
+running (0h06m29.0s), 20/20 VUs, 596 complete and 0 interrupted iterations
+import   [  60% ] 20 VUs  0h03m57.1s/1h0m0s  0596/1000 shared iters
+
+running (0h06m30.0s), 20/20 VUs, 599 complete and 0 interrupted iterations
+import   [  60% ] 20 VUs  0h03m58.1s/1h0m0s  0599/1000 shared iters
+
+running (0h06m31.0s), 20/20 VUs, 606 complete and 0 interrupted iterations
+import   [  61% ] 20 VUs  0h03m59.1s/1h0m0s  0606/1000 shared iters
+
+running (0h06m32.0s), 20/20 VUs, 611 complete and 0 interrupted iterations
+import   [  61% ] 20 VUs  0h04m00.1s/1h0m0s  0611/1000 shared iters
+
+running (0h06m33.0s), 20/20 VUs, 612 complete and 0 interrupted iterations
+import   [  61% ] 20 VUs  0h04m01.1s/1h0m0s  0612/1000 shared iters
+
+running (0h06m34.0s), 20/20 VUs, 613 complete and 0 interrupted iterations
+import   [  61% ] 20 VUs  0h04m02.1s/1h0m0s  0613/1000 shared iters
+
+running (0h06m35.0s), 20/20 VUs, 614 complete and 0 interrupted iterations
+import   [  61% ] 20 VUs  0h04m03.1s/1h0m0s  0614/1000 shared iters
+
+running (0h06m36.0s), 20/20 VUs, 617 complete and 0 interrupted iterations
+import   [  62% ] 20 VUs  0h04m04.1s/1h0m0s  0617/1000 shared iters
+
+running (0h06m37.0s), 20/20 VUs, 626 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m05.1s/1h0m0s  0626/1000 shared iters
+
+running (0h06m38.0s), 20/20 VUs, 628 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m06.1s/1h0m0s  0628/1000 shared iters
+
+running (0h06m39.0s), 20/20 VUs, 629 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m07.1s/1h0m0s  0629/1000 shared iters
+
+running (0h06m40.0s), 20/20 VUs, 630 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m08.1s/1h0m0s  0630/1000 shared iters
+
+running (0h06m41.0s), 20/20 VUs, 630 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m09.1s/1h0m0s  0630/1000 shared iters
+
+running (0h06m42.0s), 20/20 VUs, 630 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m10.1s/1h0m0s  0630/1000 shared iters
+
+running (0h06m43.0s), 20/20 VUs, 631 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m11.1s/1h0m0s  0631/1000 shared iters
+
+running (0h06m44.0s), 20/20 VUs, 632 complete and 0 interrupted iterations
+import   [  63% ] 20 VUs  0h04m12.1s/1h0m0s  0632/1000 shared iters
+
+running (0h06m45.0s), 20/20 VUs, 637 complete and 0 interrupted iterations
+import   [  64% ] 20 VUs  0h04m13.1s/1h0m0s  0637/1000 shared iters
+
+running (0h06m46.0s), 20/20 VUs, 642 complete and 0 interrupted iterations
+import   [  64% ] 20 VUs  0h04m14.1s/1h0m0s  0642/1000 shared iters
+
+running (0h06m47.0s), 20/20 VUs, 643 complete and 0 interrupted iterations
+import   [  64% ] 20 VUs  0h04m15.1s/1h0m0s  0643/1000 shared iters
+
+running (0h06m48.0s), 20/20 VUs, 645 complete and 0 interrupted iterations
+import   [  64% ] 20 VUs  0h04m16.1s/1h0m0s  0645/1000 shared iters
+
+running (0h06m49.0s), 20/20 VUs, 646 complete and 0 interrupted iterations
+import   [  65% ] 20 VUs  0h04m17.1s/1h0m0s  0646/1000 shared iters
+
+running (0h06m50.0s), 20/20 VUs, 648 complete and 0 interrupted iterations
+import   [  65% ] 20 VUs  0h04m18.1s/1h0m0s  0648/1000 shared iters
+
+running (0h06m51.0s), 20/20 VUs, 648 complete and 0 interrupted iterations
+import   [  65% ] 20 VUs  0h04m19.1s/1h0m0s  0648/1000 shared iters
+
+running (0h06m52.0s), 20/20 VUs, 650 complete and 0 interrupted iterations
+import   [  65% ] 20 VUs  0h04m20.1s/1h0m0s  0650/1000 shared iters
+
+running (0h06m53.0s), 20/20 VUs, 654 complete and 0 interrupted iterations
+import   [  65% ] 20 VUs  0h04m21.1s/1h0m0s  0654/1000 shared iters
+
+running (0h06m54.0s), 20/20 VUs, 657 complete and 0 interrupted iterations
+import   [  66% ] 20 VUs  0h04m22.1s/1h0m0s  0657/1000 shared iters
+
+running (0h06m55.0s), 20/20 VUs, 662 complete and 0 interrupted iterations
+import   [  66% ] 20 VUs  0h04m23.1s/1h0m0s  0662/1000 shared iters
+
+running (0h06m56.0s), 20/20 VUs, 664 complete and 0 interrupted iterations
+import   [  66% ] 20 VUs  0h04m24.1s/1h0m0s  0664/1000 shared iters
+
+running (0h06m57.0s), 20/20 VUs, 665 complete and 0 interrupted iterations
+import   [  66% ] 20 VUs  0h04m25.1s/1h0m0s  0665/1000 shared iters
+
+running (0h06m58.0s), 20/20 VUs, 666 complete and 0 interrupted iterations
+import   [  67% ] 20 VUs  0h04m26.1s/1h0m0s  0666/1000 shared iters
+
+running (0h06m59.0s), 20/20 VUs, 673 complete and 0 interrupted iterations
+import   [  67% ] 20 VUs  0h04m27.1s/1h0m0s  0673/1000 shared iters
+
+running (0h07m00.0s), 20/20 VUs, 678 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m28.1s/1h0m0s  0678/1000 shared iters
+
+running (0h07m01.0s), 20/20 VUs, 680 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m29.1s/1h0m0s  0680/1000 shared iters
+
+running (0h07m02.0s), 20/20 VUs, 680 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m30.1s/1h0m0s  0680/1000 shared iters
+
+running (0h07m03.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m31.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m04.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m32.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m05.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m33.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m06.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m34.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m07.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m35.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m08.0s), 20/20 VUs, 683 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m36.1s/1h0m0s  0683/1000 shared iters
+
+running (0h07m09.0s), 20/20 VUs, 684 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m37.1s/1h0m0s  0684/1000 shared iters
+
+running (0h07m10.0s), 20/20 VUs, 684 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m38.1s/1h0m0s  0684/1000 shared iters
+
+running (0h07m11.0s), 20/20 VUs, 685 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m39.1s/1h0m0s  0685/1000 shared iters
+
+running (0h07m12.0s), 20/20 VUs, 685 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m40.1s/1h0m0s  0685/1000 shared iters
+
+running (0h07m13.0s), 20/20 VUs, 685 complete and 0 interrupted iterations
+import   [  68% ] 20 VUs  0h04m41.1s/1h0m0s  0685/1000 shared iters
+
+running (0h07m14.0s), 20/20 VUs, 686 complete and 0 interrupted iterations
+import   [  69% ] 20 VUs  0h04m42.1s/1h0m0s  0686/1000 shared iters
+
+running (0h07m15.0s), 20/20 VUs, 686 complete and 0 interrupted iterations
+import   [  69% ] 20 VUs  0h04m43.1s/1h0m0s  0686/1000 shared iters
+
+running (0h07m16.0s), 20/20 VUs, 691 complete and 0 interrupted iterations
+import   [  69% ] 20 VUs  0h04m44.1s/1h0m0s  0691/1000 shared iters
+
+running (0h07m17.0s), 20/20 VUs, 692 complete and 0 interrupted iterations
+import   [  69% ] 20 VUs  0h04m45.1s/1h0m0s  0692/1000 shared iters
+
+running (0h07m18.0s), 20/20 VUs, 694 complete and 0 interrupted iterations
+import   [  69% ] 20 VUs  0h04m46.1s/1h0m0s  0694/1000 shared iters
+
+running (0h07m19.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m47.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m20.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m48.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m21.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m49.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m22.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m50.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m23.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m51.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m24.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m52.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m25.0s), 20/20 VUs, 696 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m53.1s/1h0m0s  0696/1000 shared iters
+
+running (0h07m26.0s), 20/20 VUs, 698 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m54.1s/1h0m0s  0698/1000 shared iters
+
+running (0h07m27.0s), 20/20 VUs, 699 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m55.1s/1h0m0s  0699/1000 shared iters
+
+running (0h07m28.0s), 20/20 VUs, 699 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m56.1s/1h0m0s  0699/1000 shared iters
+
+running (0h07m29.0s), 20/20 VUs, 699 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m57.1s/1h0m0s  0699/1000 shared iters
+
+running (0h07m30.0s), 20/20 VUs, 699 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m58.1s/1h0m0s  0699/1000 shared iters
+
+running (0h07m31.0s), 20/20 VUs, 699 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h04m59.1s/1h0m0s  0699/1000 shared iters
+
+running (0h07m32.0s), 20/20 VUs, 702 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m00.1s/1h0m0s  0702/1000 shared iters
+
+running (0h07m33.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m01.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m34.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m02.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m35.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m03.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m36.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m04.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m37.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m05.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m38.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m06.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m39.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m07.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m40.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m08.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m41.0s), 20/20 VUs, 704 complete and 0 interrupted iterations
+import   [  70% ] 20 VUs  0h05m09.1s/1h0m0s  0704/1000 shared iters
+
+running (0h07m42.0s), 20/20 VUs, 706 complete and 0 interrupted iterations
+import   [  71% ] 20 VUs  0h05m10.1s/1h0m0s  0706/1000 shared iters
+
+running (0h07m43.0s), 20/20 VUs, 709 complete and 0 interrupted iterations
+import   [  71% ] 20 VUs  0h05m11.1s/1h0m0s  0709/1000 shared iters
+
+running (0h07m44.0s), 20/20 VUs, 712 complete and 0 interrupted iterations
+import   [  71% ] 20 VUs  0h05m12.1s/1h0m0s  0712/1000 shared iters
+
+running (0h07m45.0s), 20/20 VUs, 716 complete and 0 interrupted iterations
+import   [  72% ] 20 VUs  0h05m13.1s/1h0m0s  0716/1000 shared iters
+
+running (0h07m46.0s), 20/20 VUs, 719 complete and 0 interrupted iterations
+import   [  72% ] 20 VUs  0h05m14.1s/1h0m0s  0719/1000 shared iters
+
+running (0h07m47.0s), 20/20 VUs, 720 complete and 0 interrupted iterations
+import   [  72% ] 20 VUs  0h05m15.1s/1h0m0s  0720/1000 shared iters
+
+running (0h07m48.0s), 20/20 VUs, 721 complete and 0 interrupted iterations
+import   [  72% ] 20 VUs  0h05m16.1s/1h0m0s  0721/1000 shared iters
+
+running (0h07m49.0s), 20/20 VUs, 725 complete and 0 interrupted iterations
+import   [  72% ] 20 VUs  0h05m17.1s/1h0m0s  0725/1000 shared iters
+
+running (0h07m50.0s), 20/20 VUs, 726 complete and 0 interrupted iterations
+import   [  73% ] 20 VUs  0h05m18.1s/1h0m0s  0726/1000 shared iters
+
+running (0h07m51.0s), 20/20 VUs, 731 complete and 0 interrupted iterations
+import   [  73% ] 20 VUs  0h05m19.1s/1h0m0s  0731/1000 shared iters
+
+running (0h07m52.0s), 20/20 VUs, 731 complete and 0 interrupted iterations
+import   [  73% ] 20 VUs  0h05m20.1s/1h0m0s  0731/1000 shared iters
+
+running (0h07m53.0s), 20/20 VUs, 733 complete and 0 interrupted iterations
+import   [  73% ] 20 VUs  0h05m21.1s/1h0m0s  0733/1000 shared iters
+
+running (0h07m54.0s), 20/20 VUs, 735 complete and 0 interrupted iterations
+import   [  74% ] 20 VUs  0h05m22.1s/1h0m0s  0735/1000 shared iters
+
+running (0h07m55.0s), 20/20 VUs, 735 complete and 0 interrupted iterations
+import   [  74% ] 20 VUs  0h05m23.1s/1h0m0s  0735/1000 shared iters
+
+running (0h07m56.0s), 20/20 VUs, 737 complete and 0 interrupted iterations
+import   [  74% ] 20 VUs  0h05m24.1s/1h0m0s  0737/1000 shared iters
+
+running (0h07m57.0s), 20/20 VUs, 739 complete and 0 interrupted iterations
+import   [  74% ] 20 VUs  0h05m25.1s/1h0m0s  0739/1000 shared iters
+
+running (0h07m58.0s), 20/20 VUs, 744 complete and 0 interrupted iterations
+import   [  74% ] 20 VUs  0h05m26.1s/1h0m0s  0744/1000 shared iters
+
+running (0h07m59.0s), 20/20 VUs, 748 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m27.1s/1h0m0s  0748/1000 shared iters
+
+running (0h08m00.0s), 20/20 VUs, 748 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m28.1s/1h0m0s  0748/1000 shared iters
+
+running (0h08m01.0s), 20/20 VUs, 748 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m29.1s/1h0m0s  0748/1000 shared iters
+
+running (0h08m02.0s), 20/20 VUs, 751 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m30.1s/1h0m0s  0751/1000 shared iters
+
+running (0h08m03.0s), 20/20 VUs, 751 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m31.1s/1h0m0s  0751/1000 shared iters
+
+running (0h08m04.0s), 20/20 VUs, 753 complete and 0 interrupted iterations
+import   [  75% ] 20 VUs  0h05m32.1s/1h0m0s  0753/1000 shared iters
+
+running (0h08m05.0s), 20/20 VUs, 758 complete and 0 interrupted iterations
+import   [  76% ] 20 VUs  0h05m33.1s/1h0m0s  0758/1000 shared iters
+
+running (0h08m06.0s), 20/20 VUs, 758 complete and 0 interrupted iterations
+import   [  76% ] 20 VUs  0h05m34.1s/1h0m0s  0758/1000 shared iters
+
+running (0h08m07.0s), 20/20 VUs, 763 complete and 0 interrupted iterations
+import   [  76% ] 20 VUs  0h05m35.1s/1h0m0s  0763/1000 shared iters
+
+running (0h08m08.0s), 20/20 VUs, 766 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m36.1s/1h0m0s  0766/1000 shared iters
+
+running (0h08m09.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m37.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m10.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m38.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m11.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m39.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m12.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m40.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m13.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m41.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m14.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m42.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m15.0s), 20/20 VUs, 771 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m43.1s/1h0m0s  0771/1000 shared iters
+
+running (0h08m16.0s), 20/20 VUs, 773 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m44.1s/1h0m0s  0773/1000 shared iters
+
+running (0h08m17.0s), 20/20 VUs, 774 complete and 0 interrupted iterations
+import   [  77% ] 20 VUs  0h05m45.1s/1h0m0s  0774/1000 shared iters
+
+running (0h08m18.0s), 20/20 VUs, 776 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m46.1s/1h0m0s  0776/1000 shared iters
+
+running (0h08m19.0s), 20/20 VUs, 776 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m47.1s/1h0m0s  0776/1000 shared iters
+
+running (0h08m20.0s), 20/20 VUs, 780 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m48.1s/1h0m0s  0780/1000 shared iters
+
+running (0h08m21.0s), 20/20 VUs, 780 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m49.1s/1h0m0s  0780/1000 shared iters
+
+running (0h08m22.0s), 20/20 VUs, 780 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m50.1s/1h0m0s  0780/1000 shared iters
+
+running (0h08m23.0s), 20/20 VUs, 782 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m51.1s/1h0m0s  0782/1000 shared iters
+
+running (0h08m24.0s), 20/20 VUs, 782 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m52.1s/1h0m0s  0782/1000 shared iters
+
+running (0h08m25.0s), 20/20 VUs, 782 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m53.1s/1h0m0s  0782/1000 shared iters
+
+running (0h08m26.0s), 20/20 VUs, 782 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m54.1s/1h0m0s  0782/1000 shared iters
+
+running (0h08m27.0s), 20/20 VUs, 785 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m55.1s/1h0m0s  0785/1000 shared iters
+
+running (0h08m28.0s), 20/20 VUs, 785 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m56.1s/1h0m0s  0785/1000 shared iters
+
+running (0h08m29.0s), 20/20 VUs, 785 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m57.1s/1h0m0s  0785/1000 shared iters
+
+running (0h08m30.0s), 20/20 VUs, 785 complete and 0 interrupted iterations
+import   [  78% ] 20 VUs  0h05m58.1s/1h0m0s  0785/1000 shared iters
+
+running (0h08m31.0s), 20/20 VUs, 788 complete and 0 interrupted iterations
+import   [  79% ] 20 VUs  0h05m59.1s/1h0m0s  0788/1000 shared iters
+
+running (0h08m32.0s), 20/20 VUs, 790 complete and 0 interrupted iterations
+import   [  79% ] 20 VUs  0h06m00.1s/1h0m0s  0790/1000 shared iters
+
+running (0h08m33.0s), 20/20 VUs, 793 complete and 0 interrupted iterations
+import   [  79% ] 20 VUs  0h06m01.1s/1h0m0s  0793/1000 shared iters
+
+running (0h08m34.0s), 20/20 VUs, 798 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m02.1s/1h0m0s  0798/1000 shared iters
+
+running (0h08m35.0s), 20/20 VUs, 798 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m03.1s/1h0m0s  0798/1000 shared iters
+
+running (0h08m36.0s), 20/20 VUs, 800 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m04.1s/1h0m0s  0800/1000 shared iters
+
+running (0h08m37.0s), 20/20 VUs, 802 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m05.1s/1h0m0s  0802/1000 shared iters
+
+running (0h08m38.0s), 20/20 VUs, 802 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m06.1s/1h0m0s  0802/1000 shared iters
+
+running (0h08m39.0s), 20/20 VUs, 802 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m07.1s/1h0m0s  0802/1000 shared iters
+
+running (0h08m40.0s), 20/20 VUs, 805 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m08.1s/1h0m0s  0805/1000 shared iters
+
+running (0h08m41.0s), 20/20 VUs, 805 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m09.1s/1h0m0s  0805/1000 shared iters
+
+running (0h08m42.0s), 20/20 VUs, 805 complete and 0 interrupted iterations
+import   [  80% ] 20 VUs  0h06m10.1s/1h0m0s  0805/1000 shared iters
+
+running (0h08m43.0s), 20/20 VUs, 807 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m11.1s/1h0m0s  0807/1000 shared iters
+
+running (0h08m44.0s), 20/20 VUs, 808 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m12.1s/1h0m0s  0808/1000 shared iters
+
+running (0h08m45.0s), 20/20 VUs, 810 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m13.1s/1h0m0s  0810/1000 shared iters
+
+running (0h08m46.0s), 20/20 VUs, 811 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m14.1s/1h0m0s  0811/1000 shared iters
+
+running (0h08m47.0s), 20/20 VUs, 812 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m15.1s/1h0m0s  0812/1000 shared iters
+
+running (0h08m48.0s), 20/20 VUs, 814 complete and 0 interrupted iterations
+import   [  81% ] 20 VUs  0h06m16.1s/1h0m0s  0814/1000 shared iters
+
+running (0h08m49.0s), 20/20 VUs, 816 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m17.1s/1h0m0s  0816/1000 shared iters
+
+running (0h08m50.0s), 20/20 VUs, 816 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m18.1s/1h0m0s  0816/1000 shared iters
+
+running (0h08m51.0s), 20/20 VUs, 820 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m19.1s/1h0m0s  0820/1000 shared iters
+
+running (0h08m52.0s), 20/20 VUs, 821 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m20.1s/1h0m0s  0821/1000 shared iters
+
+running (0h08m53.0s), 20/20 VUs, 821 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m21.1s/1h0m0s  0821/1000 shared iters
+
+running (0h08m54.0s), 20/20 VUs, 822 complete and 0 interrupted iterations
+import   [  82% ] 20 VUs  0h06m22.1s/1h0m0s  0822/1000 shared iters
+
+running (0h08m55.0s), 20/20 VUs, 826 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m23.1s/1h0m0s  0826/1000 shared iters
+
+running (0h08m56.0s), 20/20 VUs, 826 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m24.1s/1h0m0s  0826/1000 shared iters
+
+running (0h08m57.0s), 20/20 VUs, 826 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m25.1s/1h0m0s  0826/1000 shared iters
+
+running (0h08m58.0s), 20/20 VUs, 827 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m26.1s/1h0m0s  0827/1000 shared iters
+
+running (0h08m59.0s), 20/20 VUs, 829 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m27.1s/1h0m0s  0829/1000 shared iters
+
+running (0h09m00.0s), 20/20 VUs, 831 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m28.1s/1h0m0s  0831/1000 shared iters
+
+running (0h09m01.0s), 20/20 VUs, 832 complete and 0 interrupted iterations
+import   [  83% ] 20 VUs  0h06m29.1s/1h0m0s  0832/1000 shared iters
+
+running (0h09m02.0s), 20/20 VUs, 836 complete and 0 interrupted iterations
+import   [  84% ] 20 VUs  0h06m30.1s/1h0m0s  0836/1000 shared iters
+
+running (0h09m03.0s), 20/20 VUs, 838 complete and 0 interrupted iterations
+import   [  84% ] 20 VUs  0h06m31.1s/1h0m0s  0838/1000 shared iters
+
+running (0h09m04.0s), 20/20 VUs, 844 complete and 0 interrupted iterations
+import   [  84% ] 20 VUs  0h06m32.1s/1h0m0s  0844/1000 shared iters
+
+running (0h09m05.0s), 20/20 VUs, 846 complete and 0 interrupted iterations
+import   [  85% ] 20 VUs  0h06m33.1s/1h0m0s  0846/1000 shared iters
+
+running (0h09m06.0s), 20/20 VUs, 849 complete and 0 interrupted iterations
+import   [  85% ] 20 VUs  0h06m34.1s/1h0m0s  0849/1000 shared iters
+
+running (0h09m07.0s), 20/20 VUs, 851 complete and 0 interrupted iterations
+import   [  85% ] 20 VUs  0h06m35.1s/1h0m0s  0851/1000 shared iters
+
+running (0h09m08.0s), 20/20 VUs, 854 complete and 0 interrupted iterations
+import   [  85% ] 20 VUs  0h06m36.1s/1h0m0s  0854/1000 shared iters
+
+running (0h09m09.0s), 20/20 VUs, 860 complete and 0 interrupted iterations
+import   [  86% ] 20 VUs  0h06m37.1s/1h0m0s  0860/1000 shared iters
+
+running (0h09m10.0s), 20/20 VUs, 867 complete and 0 interrupted iterations
+import   [  87% ] 20 VUs  0h06m38.1s/1h0m0s  0867/1000 shared iters
+
+running (0h09m11.0s), 20/20 VUs, 869 complete and 0 interrupted iterations
+import   [  87% ] 20 VUs  0h06m39.1s/1h0m0s  0869/1000 shared iters
+
+running (0h09m12.0s), 20/20 VUs, 871 complete and 0 interrupted iterations
+import   [  87% ] 20 VUs  0h06m40.1s/1h0m0s  0871/1000 shared iters
+
+running (0h09m13.0s), 20/20 VUs, 874 complete and 0 interrupted iterations
+import   [  87% ] 20 VUs  0h06m41.1s/1h0m0s  0874/1000 shared iters
+
+running (0h09m14.0s), 20/20 VUs, 877 complete and 0 interrupted iterations
+import   [  88% ] 20 VUs  0h06m42.1s/1h0m0s  0877/1000 shared iters
+
+running (0h09m15.0s), 20/20 VUs, 877 complete and 0 interrupted iterations
+import   [  88% ] 20 VUs  0h06m43.1s/1h0m0s  0877/1000 shared iters
+
+running (0h09m16.0s), 20/20 VUs, 879 complete and 0 interrupted iterations
+import   [  88% ] 20 VUs  0h06m44.1s/1h0m0s  0879/1000 shared iters
+
+running (0h09m17.0s), 20/20 VUs, 885 complete and 0 interrupted iterations
+import   [  88% ] 20 VUs  0h06m45.1s/1h0m0s  0885/1000 shared iters
+
+running (0h09m18.0s), 20/20 VUs, 886 complete and 0 interrupted iterations
+import   [  89% ] 20 VUs  0h06m46.1s/1h0m0s  0886/1000 shared iters
+
+running (0h09m19.0s), 20/20 VUs, 894 complete and 0 interrupted iterations
+import   [  89% ] 20 VUs  0h06m47.1s/1h0m0s  0894/1000 shared iters
+
+running (0h09m20.0s), 20/20 VUs, 896 complete and 0 interrupted iterations
+import   [  90% ] 20 VUs  0h06m48.1s/1h0m0s  0896/1000 shared iters
+
+running (0h09m21.0s), 20/20 VUs, 898 complete and 0 interrupted iterations
+import   [  90% ] 20 VUs  0h06m49.1s/1h0m0s  0898/1000 shared iters
+
+running (0h09m22.0s), 20/20 VUs, 899 complete and 0 interrupted iterations
+import   [  90% ] 20 VUs  0h06m50.1s/1h0m0s  0899/1000 shared iters
+
+running (0h09m23.0s), 20/20 VUs, 904 complete and 0 interrupted iterations
+import   [  90% ] 20 VUs  0h06m51.1s/1h0m0s  0904/1000 shared iters
+
+running (0h09m24.0s), 20/20 VUs, 906 complete and 0 interrupted iterations
+import   [  91% ] 20 VUs  0h06m52.1s/1h0m0s  0906/1000 shared iters
+
+running (0h09m25.0s), 20/20 VUs, 911 complete and 0 interrupted iterations
+import   [  91% ] 20 VUs  0h06m53.1s/1h0m0s  0911/1000 shared iters
+
+running (0h09m26.0s), 20/20 VUs, 916 complete and 0 interrupted iterations
+import   [  92% ] 20 VUs  0h06m54.1s/1h0m0s  0916/1000 shared iters
+
+running (0h09m27.0s), 20/20 VUs, 916 complete and 0 interrupted iterations
+import   [  92% ] 20 VUs  0h06m55.1s/1h0m0s  0916/1000 shared iters
+
+running (0h09m28.0s), 20/20 VUs, 918 complete and 0 interrupted iterations
+import   [  92% ] 20 VUs  0h06m56.1s/1h0m0s  0918/1000 shared iters
+
+running (0h09m29.0s), 20/20 VUs, 925 complete and 0 interrupted iterations
+import   [  92% ] 20 VUs  0h06m57.1s/1h0m0s  0925/1000 shared iters
+
+running (0h09m30.0s), 20/20 VUs, 927 complete and 0 interrupted iterations
+import   [  93% ] 20 VUs  0h06m58.1s/1h0m0s  0927/1000 shared iters
+
+running (0h09m31.0s), 20/20 VUs, 931 complete and 0 interrupted iterations
+import   [  93% ] 20 VUs  0h06m59.1s/1h0m0s  0931/1000 shared iters
+
+running (0h09m32.0s), 20/20 VUs, 931 complete and 0 interrupted iterations
+import   [  93% ] 20 VUs  0h07m00.1s/1h0m0s  0931/1000 shared iters
+
+running (0h09m33.0s), 20/20 VUs, 931 complete and 0 interrupted iterations
+import   [  93% ] 20 VUs  0h07m01.1s/1h0m0s  0931/1000 shared iters
+
+running (0h09m34.0s), 20/20 VUs, 932 complete and 0 interrupted iterations
+import   [  93% ] 20 VUs  0h07m02.1s/1h0m0s  0932/1000 shared iters
+
+running (0h09m35.0s), 20/20 VUs, 935 complete and 0 interrupted iterations
+import   [  94% ] 20 VUs  0h07m03.1s/1h0m0s  0935/1000 shared iters
+
+running (0h09m36.0s), 20/20 VUs, 940 complete and 0 interrupted iterations
+import   [  94% ] 20 VUs  0h07m04.1s/1h0m0s  0940/1000 shared iters
+
+running (0h09m37.0s), 20/20 VUs, 945 complete and 0 interrupted iterations
+import   [  94% ] 20 VUs  0h07m05.1s/1h0m0s  0945/1000 shared iters
+
+running (0h09m38.0s), 20/20 VUs, 946 complete and 0 interrupted iterations
+import   [  95% ] 20 VUs  0h07m06.1s/1h0m0s  0946/1000 shared iters
+
+running (0h09m39.0s), 20/20 VUs, 948 complete and 0 interrupted iterations
+import   [  95% ] 20 VUs  0h07m07.1s/1h0m0s  0948/1000 shared iters
+
+running (0h09m40.0s), 20/20 VUs, 949 complete and 0 interrupted iterations
+import   [  95% ] 20 VUs  0h07m08.1s/1h0m0s  0949/1000 shared iters
+
+running (0h09m41.0s), 20/20 VUs, 950 complete and 0 interrupted iterations
+import   [  95% ] 20 VUs  0h07m09.1s/1h0m0s  0950/1000 shared iters
+
+running (0h09m42.0s), 20/20 VUs, 952 complete and 0 interrupted iterations
+import   [  95% ] 20 VUs  0h07m10.1s/1h0m0s  0952/1000 shared iters
+
+running (0h09m43.0s), 20/20 VUs, 957 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m11.1s/1h0m0s  0957/1000 shared iters
+
+running (0h09m44.0s), 20/20 VUs, 960 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m12.1s/1h0m0s  0960/1000 shared iters
+
+running (0h09m45.0s), 20/20 VUs, 960 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m13.1s/1h0m0s  0960/1000 shared iters
+
+running (0h09m46.0s), 20/20 VUs, 961 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m14.1s/1h0m0s  0961/1000 shared iters
+
+running (0h09m47.0s), 20/20 VUs, 963 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m15.1s/1h0m0s  0963/1000 shared iters
+
+running (0h09m48.0s), 20/20 VUs, 964 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m16.1s/1h0m0s  0964/1000 shared iters
+
+running (0h09m49.0s), 20/20 VUs, 965 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m17.1s/1h0m0s  0965/1000 shared iters
+
+running (0h09m50.0s), 20/20 VUs, 965 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m18.1s/1h0m0s  0965/1000 shared iters
+
+running (0h09m51.0s), 20/20 VUs, 965 complete and 0 interrupted iterations
+import   [  96% ] 20 VUs  0h07m19.1s/1h0m0s  0965/1000 shared iters
+
+running (0h09m52.0s), 20/20 VUs, 968 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m20.1s/1h0m0s  0968/1000 shared iters
+
+running (0h09m53.0s), 20/20 VUs, 968 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m21.1s/1h0m0s  0968/1000 shared iters
+
+running (0h09m54.0s), 20/20 VUs, 969 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m22.1s/1h0m0s  0969/1000 shared iters
+
+running (0h09m55.0s), 20/20 VUs, 969 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m23.1s/1h0m0s  0969/1000 shared iters
+
+running (0h09m56.0s), 20/20 VUs, 970 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m24.1s/1h0m0s  0970/1000 shared iters
+
+running (0h09m57.0s), 20/20 VUs, 970 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m25.1s/1h0m0s  0970/1000 shared iters
+
+running (0h09m58.0s), 20/20 VUs, 972 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m26.1s/1h0m0s  0972/1000 shared iters
+
+running (0h09m59.0s), 20/20 VUs, 972 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m27.1s/1h0m0s  0972/1000 shared iters
+
+running (0h10m00.0s), 20/20 VUs, 973 complete and 0 interrupted iterations
+import   [  97% ] 20 VUs  0h07m28.1s/1h0m0s  0973/1000 shared iters
+
+running (0h10m01.0s), 20/20 VUs, 975 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m29.1s/1h0m0s  0975/1000 shared iters
+
+running (0h10m02.0s), 20/20 VUs, 976 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m30.1s/1h0m0s  0976/1000 shared iters
+
+running (0h10m03.0s), 20/20 VUs, 977 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m31.1s/1h0m0s  0977/1000 shared iters
+
+running (0h10m04.0s), 20/20 VUs, 977 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m32.1s/1h0m0s  0977/1000 shared iters
+
+running (0h10m05.0s), 20/20 VUs, 978 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m33.1s/1h0m0s  0978/1000 shared iters
+
+running (0h10m06.0s), 20/20 VUs, 980 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m34.1s/1h0m0s  0980/1000 shared iters
+
+running (0h10m07.0s), 19/20 VUs, 981 complete and 0 interrupted iterations
+import   [  98% ] 20 VUs  0h07m35.1s/1h0m0s  0981/1000 shared iters
+
+running (0h10m08.0s), 14/20 VUs, 986 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m36.1s/1h0m0s  0986/1000 shared iters
+
+running (0h10m09.0s), 11/20 VUs, 989 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m37.1s/1h0m0s  0989/1000 shared iters
+
+running (0h10m10.0s), 10/20 VUs, 990 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m38.1s/1h0m0s  0990/1000 shared iters
+
+running (0h10m11.0s), 08/20 VUs, 992 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m39.1s/1h0m0s  0992/1000 shared iters
+
+running (0h10m12.0s), 07/20 VUs, 993 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m40.1s/1h0m0s  0993/1000 shared iters
+
+running (0h10m13.0s), 06/20 VUs, 994 complete and 0 interrupted iterations
+import   [  99% ] 20 VUs  0h07m41.1s/1h0m0s  0994/1000 shared iters
+
+running (0h10m14.0s), 03/20 VUs, 997 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m42.1s/1h0m0s  0997/1000 shared iters
+
+running (0h10m15.0s), 03/20 VUs, 997 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m43.1s/1h0m0s  0997/1000 shared iters
+
+running (0h10m16.0s), 02/20 VUs, 998 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m44.1s/1h0m0s  0998/1000 shared iters
+
+running (0h10m17.0s), 01/20 VUs, 999 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m45.1s/1h0m0s  0999/1000 shared iters
+
+running (0h10m18.0s), 01/20 VUs, 999 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m46.1s/1h0m0s  0999/1000 shared iters
+
+running (0h10m19.0s), 01/20 VUs, 999 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m47.1s/1h0m0s  0999/1000 shared iters
+
+running (0h10m20.0s), 01/20 VUs, 999 complete and 0 interrupted iterations
+import   [ 100% ] 20 VUs  0h07m48.1s/1h0m0s  0999/1000 shared iters
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 1000    1.611343/s
+    checks_succeeded...: 100.00% 1000 out of 1000
+    checks_failed......: 0.00%   0 out of 1000
+
+    ✓ Bundle import
+
+    CUSTOM
+    bundle_size....................: 1627336 2622.196542/s
+
+    HTTP
+    http_req_duration..............: avg=4.63s min=366.77µs med=316.82ms max=1m19s p(90)=11.42s p(95)=15.54s
+      { expected_response:true }...: avg=4.63s min=366.77µs med=316.82ms max=1m19s p(90)=11.42s p(95)=15.54s
+    http_req_failed................: 0.00%   0 out of 2005
+    http_reqs......................: 2005    3.230743/s
+
+    EXECUTION
+    iteration_duration.............: avg=9.17s min=2.69s    med=7.36s    max=1m0s  p(90)=15.57s p(95)=20.21s
+    iterations.....................: 1000    1.611343/s
+    vus............................: 1       min=0         max=20
+    vus_max........................: 20      min=20        max=20
+
+    NETWORK
+    data_received..................: 660 MB  1.1 MB/s
+    data_sent......................: 4.6 GB  7.4 MB/s
+
+
+
+
+running (0h10m20.6s), 00/20 VUs, 1000 complete and 0 interrupted iterations
+import ✓ [ 100% ] 20 VUs  0h07m48.7s/1h0m0s  1000/1000 shared iters
+
+Completed test: /k6/import.js on server: hfses
+----------------------------------------
+
+
