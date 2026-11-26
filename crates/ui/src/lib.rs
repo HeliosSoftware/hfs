@@ -256,6 +256,17 @@ const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
 
+/// Whether the settings document `user_key` names is withheld from this
+/// request (#2802): in the bearer-only posture no principal ever reaches
+/// `/ui`, so every caller resolves to the `l2:` document reserved for the
+/// auth-disabled deployment. The pages that stay open there neither read it
+/// (the stored FHIR version, tenant, rail and dashboard state) nor write it
+/// (a page load recording a rail or chart selection); they render from the
+/// server defaults instead.
+pub(crate) fn settings_withheld(user_key: &str) -> bool {
+    user_key == LOCAL_USER_KEY && bearer_only_auth()
+}
+
 fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
     match principal {
         Some(p) => format!("u2:{}:{}:{}", p.issuer().len(), p.issuer(), p.subject()),
@@ -365,8 +376,10 @@ async fn resolve_prefs(
     // stamped below) is built from too — reading it again per page would break
     // that module's zero-extra-reads contract.
     let stored = match &state.settings {
-        Some(store) => store.get_settings(&user_key).await.ok().flatten(),
-        None => None,
+        Some(store) if !settings_withheld(&user_key) => {
+            store.get_settings(&user_key).await.ok().flatten()
+        }
+        _ => None,
     };
     if let Some(stored) = &stored {
         let document = &stored.document;
