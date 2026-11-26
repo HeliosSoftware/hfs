@@ -63,6 +63,19 @@ fn retained_page_size(offset: u32, limit: usize) -> StorageResult<usize> {
         .ok_or_else(|| internal_error("Combined page offset exceeds memory bounds".to_owned()))
 }
 
+/// The hint of a candidate count or page whose resource-level filter is
+/// `resource_filter`: the liveness index (#2601) only when it is the scope.
+/// With any other predicate (`_lastUpdated`, `_id`, a stored version,
+/// `missing_params`) the hinted read fetches every candidate document, so
+/// MongoDB picks the index, as for `resource_level_ids`.
+fn candidate_count_hint(resource_filter: &Document) -> Option<Hint> {
+    resource_filter
+        .keys()
+        .all(|key| matches!(key.as_str(), "tenant_id" | "resource_type" | "is_deleted"))
+        .then(liveness_hint)
+        .flatten()
+}
+
 fn retained_page_limit(offset: u32, limit: usize) -> StorageResult<i64> {
     i64::try_from(retained_page_size(offset, limit)?)
         .map_err(|_| internal_error("Search page limit exceeds BSON range".to_owned()))
@@ -3914,12 +3927,13 @@ impl BatchedIndexPlan {
         // live row of the type to find a batch of old resources; it did so in
         // 329 of 467 unhinted counts and pages (#2601). The liveness index
         // holds `is_deleted` before `id`, so the check reads no document;
-        // a rejected hint runs again on the identity index.
+        // a rejected hint runs again on the identity index. A count or a
+        // counted page takes it only for a scope-only `resource_filter`.
         if count_only {
             // Seed IDs are globally deduplicated and resource identity is
             // unique within tenant/type. Count live matches server-side;
             // returning their IDs would add transfer without new information.
-            result.count += with_hint_fallback(liveness_hint(), |hint| {
+            result.count += with_hint_fallback(candidate_count_hint(resource_filter), |hint| {
                 let count = resources.count_documents(live_filter.clone());
                 match hint {
                     Some(hint) => count.hint(hint),
@@ -3958,7 +3972,7 @@ impl BatchedIndexPlan {
                     "page": page_stages,
                 } },
             ];
-            let mut cursor = with_hint_fallback(liveness_hint(), |hint| {
+            let mut cursor = with_hint_fallback(candidate_count_hint(resource_filter), |hint| {
                 let aggregate = resources.aggregate(pipeline.clone());
                 match hint {
                     Some(hint) => aggregate.hint(hint),
@@ -4134,6 +4148,24 @@ mod candidate_tests {
             doc! { "total": [{"n": 1}, {"n": 2}] },
         ] {
             assert!(facet_total(&document).is_err(), "{document:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_counts_take_the_liveness_index_only_for_the_scope() {
+        let scope = doc! {
+            "tenant_id": "tenant", "resource_type": "Observation", "is_deleted": false,
+        };
+        assert_eq!(candidate_count_hint(&scope), liveness_hint());
+
+        for extra in [
+            doc! { "last_updated": { "$gt": "2026-01-01" } },
+            doc! { "id": "a" },
+            doc! { "fhir_version": "R4" },
+            doc! { "missing_params": "method" },
+        ] {
+            let filter = doc! { "$and": [scope.clone(), extra] };
+            assert_eq!(candidate_count_hint(&filter), None, "{filter:?}");
         }
     }
 
