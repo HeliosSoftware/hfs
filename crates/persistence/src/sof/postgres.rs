@@ -23,6 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use helios_fhir::FhirVersion;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnKind, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
+use helios_sof::sqlquery::{NativeDialect, QueryResult, SqlQueryError};
 use serde_json::{Map, Value};
 use tokio_postgres::GenericClient;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,8 +32,8 @@ use tracing::{debug, trace};
 use helios_sof::arrow::record_batch::RecordBatch;
 
 use crate::core::sof_runner::{
-    BatchSender, BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner,
-    ViewFilters, ViewRow, row_batch_channel, row_stream, watch_row_producer,
+    BatchSender, BatchStream, NativeSqlQuery, RowBatchSender, RowBatcher, RowStream, SofError,
+    SofRunner, ViewFilters, ViewRow, row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -126,6 +127,18 @@ impl SofRunner for PgInDbRunner {
             export_page_size: self.export_page_size,
             statement_timeout: Some(budget),
         }))
+    }
+
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        Some(NativeDialect::Postgres)
+    }
+
+    async fn run_sql_query(
+        &self,
+        tenant: &TenantContext,
+        query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        super::postgres_native::run_sql_query(&self.pool, self.fhir_version, tenant, query).await
     }
 
     async fn run_view(
@@ -294,7 +307,7 @@ impl SofRunner for PgInDbRunner {
 /// preparation interprets and merges the membership of these documents. A
 /// run restricted to one stored FHIR version (#2254) reads only Groups stored
 /// under it (`stored_version`, the closed MIME form `"4.0"`, `"5.0"`, …).
-async fn load_group_documents(
+pub(super) async fn load_group_documents(
     pool: &Pool,
     tenant_id: &str,
     stored_version: Option<&'static str>,
@@ -347,7 +360,7 @@ async fn load_group_documents(
 // ============================================================================
 
 #[derive(Clone)]
-enum PgParam {
+pub(super) enum PgParam {
     Text(String),
     /// One whole reference list, bound as `text[]`.
     TextArray(Vec<String>),
@@ -359,7 +372,7 @@ enum PgParam {
 }
 
 impl PgParam {
-    fn from_runtime(value: RuntimeParam) -> Self {
+    pub(super) fn from_runtime(value: RuntimeParam) -> Self {
         match value {
             RuntimeParam::Text(value) => Self::Text(value),
             RuntimeParam::Literal(value) => Self::from_lit(&value),
@@ -583,7 +596,9 @@ async fn fetch_rows<C: GenericClient>(
 }
 
 /// Boxes runtime parameters for `tokio_postgres`.
-fn box_params(params: Vec<PgParam>) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+pub(super) fn box_params(
+    params: Vec<PgParam>,
+) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
     params
         .into_iter()
         .map(|p| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
