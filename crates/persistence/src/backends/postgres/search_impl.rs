@@ -609,6 +609,52 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        self.search_with_client_tie_cap(
+            client,
+            tenant,
+            query,
+            total,
+            crate::types::DATE_WALK_MAX_TIE_GROUP,
+        )
+        .await
+    }
+
+    /// [`SearchProvider::search`] with the date walk's tie-group cap set by
+    /// the caller instead of `DATE_WALK_MAX_TIE_GROUP` (#2731).
+    ///
+    /// `#[doc(hidden)] pub` only so the integration tests can show the
+    /// fallback past the cap without seeding thousands of equal keys.
+    #[doc(hidden)]
+    pub async fn search_with_date_walk_tie_cap(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
+        reject_contained_missing(query)?;
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+        let total = if query.wants_total() {
+            Some(self.search_count(tenant, query).await?)
+        } else {
+            None
+        };
+        let client = self.get_client().await?;
+        self.search_with_client_tie_cap(&client, tenant, query, total, tie_cap)
+            .await
+    }
+
+    /// The body of [`Self::search_with_client`], with the date walk's
+    /// tie-group cap as a parameter.
+    async fn search_with_client_tie_cap(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        total: Option<u64>,
+        tie_cap: usize,
+    ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(
             query,
             self.supports_native_reverse_chains(tenant, query),
@@ -640,6 +686,33 @@ impl PostgresBackend {
         // Param layout: $1=tenant, $2=type, then (cursor) $3=sort value, $4=id,
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
+
+        // #2731: an unfiltered sort by one date parameter walks the date
+        // index in key order instead of computing the key per resource. `None`
+        // means the general statement below serves the page (not eligible, or
+        // the index is missing or still building).
+        let walked = match query.unfiltered_single_date_sort() {
+            Some((directive, desc))
+                if keyset.is_some()
+                    && matches!(
+                        self.index_layout(),
+                        super::schema::IndexLayout::Denormalized
+                    ) =>
+            {
+                self.date_walk_rows(
+                    client,
+                    query,
+                    tenant_id,
+                    &directive.parameter,
+                    desc,
+                    cursor.as_ref(),
+                    count,
+                    tie_cap,
+                )
+                .await?
+            }
+            _ => None,
+        };
 
         let search_filter = if !query.parameters.is_empty()
             || query.compartment.is_some()
@@ -758,7 +831,14 @@ impl PostgresBackend {
         };
 
         // Index eligibility and candidate selection share one database snapshot.
-        let (sql, has_previous) = if let Some(pred) = &fast_index_pred {
+        let (sql, has_previous) = if walked.is_some() {
+            // The walk has its rows already; only the page flag is needed.
+            let has_previous = match &cursor {
+                Some(c) => c.direction() != CursorDirection::Previous,
+                None => query.offset.unwrap_or(0) > 0,
+            };
+            (String::new(), has_previous)
+        } else if let Some(pred) = &fast_index_pred {
             // Eligible sorts share the non-null `last_updated` keyset. Apply
             // the same boundary to index identities, retaining the bind layout.
             let backward = cursor
@@ -872,12 +952,15 @@ impl PostgresBackend {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let mut rows = if statement_is_reusable(query) {
-            query_dyn_cached(client, &sql, &param_refs).await
-        } else {
-            client.query(&sql, &param_refs).await
-        }
-        .or_query_error("Failed to execute search")?;
+        let mut rows = match walked {
+            Some(rows) => rows,
+            None => if statement_is_reusable(query) {
+                query_dyn_cached(client, &sql, &param_refs).await
+            } else {
+                client.query(&sql, &param_refs).await
+            }
+            .or_query_error("Failed to execute search")?,
+        };
         // Matching NULL timestamps cannot safely participate in index ordering.
         // Contained memberships normally carry NULL under their parent's identity.
         // The same-statement sentinel preserves unique parent identities and
@@ -1927,6 +2010,256 @@ pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
 
 // Helper methods for search implementations
 impl PostgresBackend {
+    /// Whether `index` exists and is fully built. A `CREATE INDEX CONCURRENTLY`
+    /// in progress, or a failed one, leaves it invalid; the planner would not
+    /// use it, and the walk would degrade to a scan of the whole parameter.
+    async fn date_walk_index_is_usable(
+        client: &deadpool_postgres::Client,
+        index: &str,
+    ) -> StorageResult<bool> {
+        let rows = query_dyn_cached(
+            client,
+            "SELECT COALESCE((SELECT i.indisvalid AND i.indisready FROM pg_index i \
+             WHERE i.indexrelid = to_regclass($1::text)), FALSE)",
+            &[&index],
+        )
+        .await
+        .or_query_error("Failed to probe the date index")?;
+        Ok(rows.first().is_some_and(|r| r.get::<_, bool>(0)))
+    }
+
+    /// The rows of an unfiltered sort by one date parameter, read as an
+    /// ordered walk of the date index (#2731); `None` when the index cannot
+    /// serve it and the general statement must.
+    ///
+    /// The page is the resources that have a value, in key order (one row each,
+    /// see [`PostgresQueryBuilder::date_walk_page_sql`]), followed by the ones
+    /// without, in id order. Rows come back in traversal order, up to
+    /// `count + 1`, with the same columns as the general statement and the key
+    /// in column 5. A cursor takes precedence over an offset, as there.
+    ///
+    /// Before the keyed part is read, the equal-key group at the head of the
+    /// page is sized up to `tie_cap` rows (`DATE_WALK_MAX_TIE_GROUP` outside
+    /// tests): the walk would read and sort all of it, so a larger one is
+    /// `None`. The head is the first key from the offset with no cursor, the
+    /// cursor's key, or, backward from a resource with no date, the last key.
+    /// Forward from such a resource only the unkeyed ones are read.
+    #[allow(clippy::too_many_arguments)]
+    async fn date_walk_rows(
+        &self,
+        client: &deadpool_postgres::Client,
+        query: &SearchQuery,
+        tenant_id: &str,
+        parameter: &str,
+        desc: bool,
+        cursor: Option<&PageCursor>,
+        count: usize,
+        tie_cap: usize,
+    ) -> StorageResult<Option<Vec<tokio_postgres::Row>>> {
+        type Params = Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>;
+        let (col, index) = PostgresQueryBuilder::date_walk_column(desc);
+        if !Self::date_walk_index_is_usable(client, index).await? {
+            return Ok(None);
+        }
+        let want = count + 1;
+        let resource_type = &query.resource_type;
+        let base = || -> Params {
+            vec![
+                Box::new(tenant_id.to_string()),
+                Box::new(resource_type.to_string()),
+            ]
+        };
+        let direction = if desc {
+            crate::types::SortDirection::Descending
+        } else {
+            crate::types::SortDirection::Ascending
+        };
+        // The keyed part never has a missing key, so the keyset is not nullable.
+        let key = KeysetKey {
+            expr: format!("si.{col}"),
+            direction,
+            kind: SortValueKind::Timestamp,
+            nullable: false,
+            tiebreak_against_key: false,
+        };
+        let run = |sql: String, params: Params, cacheable: bool| async move {
+            let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            if cacheable {
+                query_dyn_cached(client, &sql, &refs).await
+            } else {
+                client.query(&sql, &refs).await
+            }
+            .or_query_error("Failed to execute date-sort walk")
+        };
+
+        // The keyed part, forward: the order `si.col DIR, si.resource_id ASC`.
+        let forward_order = format!(
+            "si.{col} {}, si.resource_id ASC",
+            if desc { "DESC" } else { "ASC" }
+        );
+        let mut rows: Vec<tokio_postgres::Row> = Vec::new();
+
+        // The tie-group probe: whether the group of the key bound as `$3` in
+        // `params` holds more rows than the walk may read for a page head.
+        let tie_sql = PostgresQueryBuilder::date_walk_tie_group_sql(parameter, desc, tie_cap);
+        let group_too_big = |params: Params| {
+            let sql = tie_sql.clone();
+            async move {
+                let rows = run(sql, params, true).await?;
+                let size: i64 = rows.first().map_or(0, |r| r.get(0));
+                Ok::<bool, crate::error::StorageError>(usize::try_from(size).unwrap_or(0) > tie_cap)
+            }
+        };
+        // The same for the key `offset` rows in from the start (or the end)
+        // of the key order, when there is one.
+        let head_group_too_big = |from_end: bool, offset: usize| async move {
+            let sql =
+                PostgresQueryBuilder::date_walk_head_key_sql(parameter, desc, from_end, offset);
+            let Some(head) = run(sql, base(), offset == 0)
+                .await?
+                .first()
+                .map(|r| r.get::<_, chrono::DateTime<Utc>>(0))
+            else {
+                return Ok(false);
+            };
+            let mut p = base();
+            p.push(Box::new(head));
+            group_too_big(p).await
+        };
+
+        match cursor {
+            Some(cursor) => {
+                let backward = cursor.direction() == CursorDirection::Previous;
+                let missing = cursor_value_is_null(cursor);
+                let id_param = |p: &mut Params| p.push(Box::new(cursor.resource_id().to_string()));
+                if !missing {
+                    let mut p = base();
+                    Self::bind_cursor_value(&mut p, key.kind, false, cursor)?;
+                    if group_too_big(p).await? {
+                        return Ok(None);
+                    }
+                }
+                if missing && !backward {
+                    // Past the keyed part: the rest of the unkeyed ones by id.
+                    let mut p = base();
+                    id_param(&mut p);
+                    let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                        parameter,
+                        desc,
+                        Some(">"),
+                        false,
+                        want,
+                        0,
+                    );
+                    rows = run(sql, p, true).await?;
+                } else {
+                    if missing {
+                        // Backward from an unkeyed resource: the unkeyed ones
+                        // before it, nearest first, then the keyed part from its end.
+                        let mut p = base();
+                        id_param(&mut p);
+                        let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                            parameter,
+                            desc,
+                            Some("<"),
+                            true,
+                            want,
+                            0,
+                        );
+                        rows = run(sql, p, true).await?;
+                    }
+                    if rows.len() < want {
+                        if missing && head_group_too_big(true, 0).await? {
+                            // Backward into the keyed part from its far end.
+                            return Ok(None);
+                        }
+                        let remaining = want - rows.len();
+                        let mut p = base();
+                        let (condition, order) = if missing {
+                            // Everything keyed lies before the cursor; read it
+                            // in the mirror of the forward order.
+                            (
+                                None,
+                                format!(
+                                    "si.{col} {}, si.resource_id DESC",
+                                    if desc { "ASC" } else { "DESC" }
+                                ),
+                            )
+                        } else {
+                            Self::bind_cursor_value(&mut p, key.kind, false, cursor)?;
+                            id_param(&mut p);
+                            let (c, o) =
+                                keyset_page_clauses(&key, "si.resource_id", false, backward);
+                            (Some(c), o)
+                        };
+                        let sql = PostgresQueryBuilder::date_walk_page_sql(
+                            parameter,
+                            desc,
+                            condition.as_deref(),
+                            &order,
+                            remaining,
+                            0,
+                        );
+                        rows.extend(run(sql, p, remaining == want).await?);
+                    }
+                    if !missing && !backward && rows.len() < want {
+                        // Forward from a keyed resource reaches the unkeyed ones.
+                        let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                            parameter,
+                            desc,
+                            None,
+                            false,
+                            want - rows.len(),
+                            0,
+                        );
+                        rows.extend(run(sql, base(), false).await?);
+                    }
+                }
+            }
+            None => {
+                let offset = query.offset.unwrap_or(0) as usize;
+                if head_group_too_big(false, offset).await? {
+                    return Ok(None);
+                }
+                let sql = PostgresQueryBuilder::date_walk_page_sql(
+                    parameter,
+                    desc,
+                    None,
+                    &forward_order,
+                    want,
+                    offset,
+                );
+                rows = run(sql, base(), offset == 0).await?;
+                if rows.len() < want {
+                    // An offset that ended inside the keyed part leaves the
+                    // unkeyed ones from their start; one past it has to know how
+                    // many keyed resources it skipped.
+                    let tail_offset = if offset == 0 || !rows.is_empty() {
+                        0
+                    } else {
+                        let sql = PostgresQueryBuilder::date_walk_keyed_count_sql(parameter, desc);
+                        // One text per parameter and direction: cacheable.
+                        let keyed: i64 = run(sql, base(), true).await?[0].get(0);
+                        offset.saturating_sub(usize::try_from(keyed).unwrap_or(0))
+                    };
+                    let sql = PostgresQueryBuilder::date_walk_tail_sql(
+                        parameter,
+                        desc,
+                        None,
+                        false,
+                        want - rows.len(),
+                        tail_offset,
+                    );
+                    rows.extend(run(sql, base(), false).await?);
+                }
+            }
+        }
+        Ok(Some(rows))
+    }
+
     /// Extract timestamp and ID from a cursor for keyset pagination.
     /// Binds the cursor's boundary sort value as `$3`, typed per the sort key
     /// kind so PostgreSQL compares it correctly against the sort expression.
