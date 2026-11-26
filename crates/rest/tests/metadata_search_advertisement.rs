@@ -8,7 +8,9 @@
 //!
 //! Each case below asserts the two together, so the test fails if the
 //! statement and the route drift apart again: where `/metadata` lists search the
-//! route answers `200`, and where it does not the route answers `501`.
+//! route answers `200`, and where it does not the route answers `501`. Patient
+//! `$everything`, which is composed over `search`, is checked the same way
+//! (#3015).
 //!
 //! Standalone S3 is stood in for by a storage whose `supports_search()` is
 //! `false` and whose `search` returns `UnsupportedCapability`, with real SQLite
@@ -303,6 +305,30 @@ async fn search_status(server: &TestServer) -> StatusCode {
         .status_code()
 }
 
+/// Whether a `rest.resource` entry lists Patient `$everything`.
+fn lists_everything(entry: &Value) -> bool {
+    entry["operation"]
+        .as_array()
+        .is_some_and(|ops| ops.iter().any(|o| o["name"] == "everything"))
+}
+
+/// What `GET /Patient/p1/$everything` answers, with `Patient/p1` stored.
+/// `$everything` is composed over `search`, so it is served exactly where
+/// search is (#3015).
+async fn everything_status(server: &TestServer) -> StatusCode {
+    let put = server
+        .put("/Patient/p1")
+        .add_header(X_TENANT_ID, tenant())
+        .json(&serde_json::json!({"resourceType": "Patient", "id": "p1"}))
+        .await;
+    assert!(put.status_code().is_success(), "{}", put.text());
+    server
+        .get("/Patient/p1/$everything")
+        .add_header(X_TENANT_ID, tenant())
+        .await
+        .status_code()
+}
+
 /// Search is advertised for every resource type and the route serves it.
 async fn assert_search_advertised_and_served(server: &TestServer) {
     for (version, resources) in resource_entries(server).await {
@@ -328,8 +354,13 @@ async fn assert_search_advertised_and_served(server: &TestServer) {
                 .any(|p| p["name"] == "name"),
             "{version:?}: Patient lists `name`"
         );
+        assert!(
+            lists_everything(patient),
+            "{version:?}: Patient $everything"
+        );
     }
     assert_eq!(search_status(server).await, StatusCode::OK);
+    assert_eq!(everything_status(server).await, StatusCode::OK);
 }
 
 /// No resource type, `AuditEvent` included, lists `search-type` or any search
@@ -345,6 +376,10 @@ async fn assert_search_not_advertised_and_refused(server: &TestServer) {
             for key in ["searchParam", "searchInclude", "searchRevInclude"] {
                 assert!(entry.get(key).is_none(), "{version:?} {ty}: has {key}");
             }
+            assert!(
+                !lists_everything(entry),
+                "{version:?} {ty}: advertises $everything"
+            );
             // Nothing else about the entry changed.
             assert_eq!(entry["versioning"], "versioned", "{version:?} {ty}");
             assert_eq!(entry["conditionalRead"], "full-support", "{version:?} {ty}");
@@ -363,6 +398,7 @@ async fn assert_search_not_advertised_and_refused(server: &TestServer) {
         );
     }
     assert_eq!(search_status(server).await, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(everything_status(server).await, StatusCode::NOT_IMPLEMENTED);
 }
 
 /// The real SQLite backend: search is advertised and `GET /Patient?name=x`
