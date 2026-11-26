@@ -221,10 +221,10 @@ pub use remote_resolver::{
 };
 pub use sqlquery::{
     BINDABLE_PARAMETER_TYPES, BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine,
-    LibraryParameter, Placeholder, QueryResult, ScanError, ScanResult, SourcePosition,
-    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableRef, TableSchema, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
-    undeclared_tables,
+    LibraryParameter, NativeDialect, Placeholder, QueryResult, ScanError, ScanResult,
+    SourcePosition, SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableRef, TableSchema,
+    bind_supplied_params, extract_sqlquery_params_from_json, format_fhir_parameters,
+    parse_sqlquery_library, parse_sqlquery_library_for, scan_sql, undeclared_tables,
 };
 
 use chrono::{DateTime, Utc};

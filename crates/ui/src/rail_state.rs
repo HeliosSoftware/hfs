@@ -575,6 +575,9 @@ pub(crate) async fn persist(
     let Some(store) = settings else {
         return;
     };
+    if crate::settings_withheld(user_key) {
+        return;
+    }
 
     let page_value = match serde_json::to_value(state) {
         Ok(value) => value,
@@ -608,6 +611,9 @@ pub(crate) async fn persist_dashboard(
     let Some(store) = settings else {
         return;
     };
+    if crate::settings_withheld(user_key) {
+        return;
+    }
 
     let value = match serde_json::to_value(selection) {
         Ok(value) => value,

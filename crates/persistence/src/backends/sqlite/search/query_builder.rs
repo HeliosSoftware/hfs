@@ -550,6 +550,16 @@ fn composite_pair_rows(
     ))
 }
 
+/// The `special` parameters [`QueryBuilder::build`] evaluates: the ones
+/// `build_special_parameter_condition` has an arm for. `parameter_condition`
+/// gives every other `special` parameter with a value no condition, which
+/// `build` refuses ([`unevaluable_parameter`]): `near`, and from R5
+/// `contains`, `section-text`, `_query` and `_type`. The backend's
+/// `SearchProvider::serves_search_param` reads the same list, so `/metadata`
+/// lists only what this builder evaluates (#2593); a test pins the list to the
+/// name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 3] = ["_text", "_content", "_filter"];
+
 /// The refusal for a parameter [`QueryBuilder::build`] has values for but no
 /// condition to build from (#866): the `_ => None` arm of
 /// `build_special_parameter_condition` (`_query`, `_type`, any `_` name nothing
@@ -1197,6 +1207,20 @@ impl QueryBuilder {
         // parameter, since under `:not` "nothing" negates into "everything".
         if crate::search::has_empty_value(param) {
             return Some(ParameterCondition::Other(SqlFragment::new("1 = 0")));
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together. `_id`,
+        // `_lastUpdated` and `_in` have arms there too, and are built by name
+        // whatever type the parameter carries, so the gate is not theirs.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+            && !matches!(param.name.as_str(), "_id" | "_lastUpdated" | "_in")
+        {
+            return None;
         }
 
         // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`/
@@ -1942,6 +1966,209 @@ impl QueryBuilder {
     }
 }
 
+/// Which rows of the date walk a page reads (#2731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateWalkRange {
+    /// Every keyed resource, from the start of the order (`?1`, `?2` only).
+    All,
+    /// Strictly after the cursor `(?3 = key, ?4 = id)` in the forward order.
+    After,
+    /// Strictly before the cursor `(?3 = key, ?4 = id)`, read in the reversed
+    /// order (a `Previous` page).
+    Before,
+    /// Every keyed resource in the reversed order (a `Previous` page from the
+    /// first resource with no value, which lies after all of them).
+    Reversed,
+}
+
+/// The `search_index` column the walk orders by: where the latest range ends
+/// (descending) or where the earliest starts (ascending), as
+/// [`QueryBuilder::sort_expression`] does for the correlated subquery.
+pub(crate) fn date_walk_column(desc: bool) -> &'static str {
+    if desc { "value_date_end" } else { "value_date" }
+}
+
+/// The index the walk reads for a direction: `idx_search_date_end`
+/// descending, `idx_search_date` ascending.
+pub(crate) fn date_walk_index(desc: bool) -> &'static str {
+    if desc {
+        "idx_search_date_end"
+    } else {
+        "idx_search_date"
+    }
+}
+
+/// One page of the ordered date-index walk (#2731): the resources with a value
+/// for the date parameter `param`, in the order of `ORDER BY <key> <dir>, id
+/// ASC` (the correlated-subquery sort, key = `MAX(value_date_end)` descending
+/// or `MIN(value_date)` ascending), read from the date index instead of
+/// computed for every resource of the type.
+///
+/// A resource can have several date rows. A row is kept only when no other row
+/// of the same resource beats it (`NOT EXISTS`, the first row by `rowid`
+/// among equal keys), so each resource appears once with its `MAX`/`MIN` key
+/// and the walk needs no memory of what it has seen: `_offset`, a forward
+/// cursor and a backward cursor all work the same. The filters of that
+/// subquery are those of the correlated subquery it replaces (tenant, type,
+/// resource, parameter, no `is_contained` filter), so the keys agree.
+///
+/// `resources` is joined (`CROSS JOIN` pins `search_index` as the outer loop,
+/// the one that walks the index) before `LIMIT`, so deleted resources do not
+/// shorten the page. Binds `?1` tenant and `?2` type, plus `?3` key and `?4`
+/// id for [`DateWalkRange::After`] / [`DateWalkRange::Before`].
+pub(crate) fn date_walk_page_sql(
+    param: &str,
+    desc: bool,
+    range: DateWalkRange,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let col = date_walk_column(desc);
+    let literal = sql_string_literal(param);
+    // `better` is the comparison that makes another row the resource's key.
+    let (better, forward_op) = if desc { (">", "<") } else { ("<", ">") };
+    let reverse_op = if desc { ">" } else { "<" };
+    let (forward_dir, reverse_dir) = if desc {
+        ("DESC", "ASC")
+    } else {
+        ("ASC", "DESC")
+    };
+    let (condition, key_dir, id_dir) = match range {
+        DateWalkRange::All => (String::new(), forward_dir, "ASC"),
+        DateWalkRange::After => (
+            format!(" AND (si.{col} {forward_op} ?3 OR (si.{col} = ?3 AND r.id > ?4))"),
+            forward_dir,
+            "ASC",
+        ),
+        DateWalkRange::Before => (
+            format!(" AND (si.{col} {reverse_op} ?3 OR (si.{col} = ?3 AND r.id < ?4))"),
+            reverse_dir,
+            "DESC",
+        ),
+        DateWalkRange::Reversed => (String::new(), reverse_dir, "DESC"),
+    };
+    format!(
+        "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, si.{col} AS sort_key \
+         FROM search_index si CROSS JOIN resources r \
+           ON r.rowid = si.resource_key AND r.tenant_id = ?1 AND r.resource_type = ?2 \
+          AND r.is_deleted = 0 \
+         WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.param_name = {literal} \
+           AND si.{col} IS NOT NULL{condition} \
+           AND NOT EXISTS (SELECT 1 FROM search_index s2 \
+                WHERE s2.tenant_id = ?1 AND s2.resource_type = ?2 \
+                  AND s2.resource_key = si.resource_key AND s2.param_name = {literal} \
+                  AND (s2.{col} {better} si.{col} \
+                       OR (s2.{col} = si.{col} AND s2.rowid < si.rowid))) \
+         ORDER BY si.{col} {key_dir}, r.id {id_dir} LIMIT {limit} OFFSET {offset}"
+    )
+}
+
+/// Which live resources of the date walk's tail a page reads (#2731): those
+/// with no value for the parameter, which sort after every keyed resource in
+/// `id` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTailRange {
+    /// From the start of the tail (`?1`, `?2` only).
+    All,
+    /// After the cursor id `?3`.
+    After,
+    /// Before the cursor id `?3`, read in descending id order.
+    Before,
+}
+
+/// The scalar subquery whose `NULL`ness says a resource has no key for the
+/// walk: the `MAX` of the walked column over the resource's rows, as the
+/// correlated sort computes its key.
+///
+/// It must not filter on `<column> IS NOT NULL`: that predicate makes the
+/// planner pick the partial index on the walked column
+/// (`idx_search_date_end`), which has no `resource_key` prefix, so each
+/// probe would read every row of the parameter and the tail and the count
+/// would be quadratic (#2731). Without it the probe seeks
+/// `idx_search_composite` by resource, as the correlated sort does.
+fn date_key_of_resource(param: &str, desc: bool) -> String {
+    format!(
+        "(SELECT MAX(s.{}) FROM search_index s WHERE s.tenant_id = ?1 AND s.resource_type = ?2 \
+         AND s.resource_key = resources.rowid AND s.param_name = {})",
+        date_walk_column(desc),
+        sql_string_literal(param)
+    )
+}
+
+/// The resources with no value for the date parameter, in `id` order (the
+/// order the correlated sort puts them, `NULLS LAST` then `id ASC`), with a
+/// `NULL` sort key.
+pub(crate) fn date_walk_tail_sql(
+    param: &str,
+    desc: bool,
+    range: DateTailRange,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let (condition, dir) = match range {
+        DateTailRange::All => ("", "ASC"),
+        DateTailRange::After => (" AND id > ?3", "ASC"),
+        DateTailRange::Before => (" AND id < ?3", "DESC"),
+    };
+    format!(
+        "SELECT id, version_id, data, last_updated, fhir_version, NULL AS sort_key \
+         FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{condition} \
+           AND {key} IS NULL \
+         ORDER BY id {dir} LIMIT {limit} OFFSET {offset}",
+        key = date_key_of_resource(param, desc)
+    )
+}
+
+/// Which equal-key group [`date_walk_tie_probe_sql`] measures (#2731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTieProbe {
+    /// The first key of the walk's order (`reverse`: the last, where a
+    /// `Previous` page from the resources with no value starts reading).
+    Head { reverse: bool },
+    /// The cursor key `?3`.
+    Value,
+}
+
+/// Counts, up to `cap + 1`, the date rows that share the key a page starts
+/// at. More than `cap` means the walk would read, probe and sort that whole
+/// group for the page, and the general statement serves it instead. Binds
+/// `?1` tenant and `?2` type, plus `?3` key for [`DateTieProbe::Value`].
+pub(crate) fn date_walk_tie_probe_sql(
+    param: &str,
+    desc: bool,
+    probe: DateTieProbe,
+    cap: usize,
+) -> String {
+    let col = date_walk_column(desc);
+    let literal = sql_string_literal(param);
+    let key = match probe {
+        DateTieProbe::Value => "?3".to_string(),
+        DateTieProbe::Head { reverse } => {
+            let dir = if desc != reverse { "DESC" } else { "ASC" };
+            format!(
+                "(SELECT k.{col} FROM search_index k WHERE k.tenant_id = ?1                  AND k.resource_type = ?2 AND k.param_name = {literal}                  AND k.{col} IS NOT NULL ORDER BY k.{col} {dir} LIMIT 1)"
+            )
+        }
+    };
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM search_index si WHERE si.tenant_id = ?1          AND si.resource_type = ?2 AND si.param_name = {literal} AND si.{col} = {key}          LIMIT {})",
+        cap + 1
+    )
+}
+
+/// How many live resources have a key for the walk (`?1` tenant, `?2` type).
+/// Linear in the resources of the type; only an `_offset` past every keyed
+/// resource needs it, to place the tail's offset.
+pub(crate) fn date_walk_keyed_count_sql(param: &str, desc: bool) -> String {
+    format!(
+        "SELECT COUNT(*) FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+           AND {} IS NOT NULL",
+        date_key_of_resource(param, desc)
+    )
+}
+
 /// The subquery of a condition that is exactly `resource_key IN (<subquery>)`,
 /// or `None` for anything else: `NOT IN`, an `OR` of memberships, a bare
 /// predicate. The opening parenthesis must close at the very end of the
@@ -2250,6 +2477,74 @@ mod tests {
                 &SearchQuery::new("Patient").with_parameter(param("_id", SearchParamType::Token)),
             )
             .expect("_id has a condition");
+    }
+
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what `build` evaluates (#2593): of every `special`
+    /// parameter the enabled specs register, and `_text` and `_content`, the
+    /// ones it names build and every other is refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_build_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let value = if code == "_filter" { "name eq x" } else { "x" };
+            let query = SearchQuery::new("Location").with_parameter(SearchParameter {
+                name: code.clone(),
+                param_type: SearchParamType::Special,
+                values: vec![SearchValue::eq(value)],
+                ..Default::default()
+            });
+            let built = QueryBuilder::new("tenant1", "Location").build(&query);
+            if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+            } else {
+                match built {
+                    Err(SearchError::QueryParseError { message }) => {
+                        assert!(message.contains("widen"), "{code}: {message}")
+                    }
+                    other => panic!("{code} is not listed as evaluated, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id`, `_lastUpdated` and
+    /// `_in`, typed `special`, build the same condition as with their registry
+    /// type, as they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, SearchValue::eq("p1")),
+            (
+                "_lastUpdated",
+                SearchParamType::Date,
+                SearchValue::new(crate::types::SearchPrefix::Gt, "2020-01-01"),
+            ),
+            (
+                "_in",
+                SearchParamType::Reference,
+                SearchValue::eq("List/42"),
+            ),
+        ] {
+            let build = |param_type| {
+                let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: name.to_string(),
+                    param_type,
+                    values: vec![value.clone()],
+                    ..Default::default()
+                });
+                let built = QueryBuilder::new("tenant1", "Patient")
+                    .build(&query)
+                    .unwrap_or_else(|e| panic!("{name} as {param_type:?}: {e:?}"));
+                format!("{built:?}")
+            };
+            assert_eq!(
+                build(SearchParamType::Special),
+                build(registry_type),
+                "{name}"
+            );
+        }
     }
 
     #[test]

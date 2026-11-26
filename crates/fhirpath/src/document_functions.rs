@@ -1,8 +1,9 @@
 //! # FHIR document functions
 //!
 //! `section()`, `entry()`, `entryIn()`, `resources()`, `resourcesIn()`,
-//! `sameSubject()` and `hasCoding()`: functions for navigating FHIR documents
-//! (a `Bundle` of type `document` whose first entry is a `Composition`).
+//! `sameSubject()`, `isKnown()`, `hasData()` and `hasCoding()`: functions for
+//! navigating FHIR documents (a `Bundle` of type `document` whose first entry
+//! is a `Composition`).
 //!
 //! These are **not** part of FHIRPath, nor of the FHIR specification's
 //! additional FHIRPath functions. They are an extension of the HL7 Java
@@ -30,7 +31,12 @@
 //!   value set. Empty when `valueSet` is empty.
 //! - `sameSubject([other])`: whether the focus resource has the same subject
 //!   (its `subject` or `patient`) as `other`, or without `other`, as the
-//!   document's Composition. See [`same_subject`].
+//!   document's Composition. On a section, whether the section's `focus` is
+//!   that subject. See [`same_subject`].
+//! - `isKnown()`: on sections, whether each is known: it has no `emptyReason`,
+//!   or its `emptyReason` is nil known. See [`is_known`].
+//! - `hasData()`: on sections, whether each has its data: an `emptyReason`, or
+//!   else entries. See [`has_data`].
 //! - `hasCoding(system, code [, version])`: on Codings and CodeableConcepts,
 //!   whether any coding matches. See [`has_coding`].
 //!
@@ -78,8 +84,8 @@ use std::collections::HashMap;
 const CODE_ELEMENTS: [&str; 3] = ["code", "vaccineCode", "medication"];
 
 /// Evaluates one of the document functions (`section`, `entry`, `entryIn`,
-/// `resources`, `resourcesIn`, `sameSubject`, `hasCoding`) on `base`, with its
-/// arguments already evaluated.
+/// `resources`, `resourcesIn`, `sameSubject`, `isKnown`, `hasData`,
+/// `hasCoding`) on `base`, with its arguments already evaluated.
 pub fn call_document_function(
     name: &str,
     base: &EvaluationResult,
@@ -166,6 +172,8 @@ pub fn call_document_function(
             }
             Ok(collection(found))
         }
+        "isKnown" => Ok(boolean_or_empty(is_known(base, context))),
+        "hasData" => Ok(boolean_or_empty(has_data(base, context))),
         "hasCoding" => Ok(boolean_or_empty(has_coding(
             base,
             string_param(&args[0]).as_deref(),
@@ -187,6 +195,7 @@ fn check_arity(name: &str, count: usize) -> Result<(), EvaluationError> {
         "resources" | "hasCoding" => &[2, 3],
         "resourcesIn" => &[1, 2],
         "sameSubject" => &[0, 1],
+        "isKnown" | "hasData" => &[0],
         _ => &[],
     };
     if allowed.contains(&count) {
@@ -864,12 +873,28 @@ fn validation_result(response: &EvaluationResult) -> Option<bool> {
 /// identifier, whether the identifiers' system and value are identical;
 /// otherwise false. References are compared as strings, never resolved, and a
 /// reference is never compared with an identifier.
+///
+/// On a section of a Composition it is the section's `focus` that is checked:
+/// true when the section has no focus; otherwise whether the focus is the
+/// subject of `other`, or without `other`, of the section's Composition,
+/// compared as above. Empty when that has no subject, or more than one.
 pub fn same_subject(
     base: &EvaluationResult,
     other: Option<&EvaluationResult>,
     context: &EvaluationContext,
 ) -> Option<bool> {
     let focus = single_item(base)?;
+    let section_doc = Document::new(context);
+    if let Some(composition) = section_composition(&mut Resolver::new(&section_doc), focus) {
+        let Some(section_focus) = first_child(focus, "focus") else {
+            return Some(true);
+        };
+        let target = match other {
+            Some(other) => subject_of(single_item(other)?)?,
+            None => subject_of(composition)?,
+        };
+        return Some(same_reference(section_focus, target));
+    }
     let doc;
     let other = match other {
         Some(other) => single_item(other)?,
@@ -883,21 +908,85 @@ pub fn same_subject(
     };
     let a = subject_of(focus)?;
     let b = subject_of(other)?;
+    Some(same_reference(a, b))
+}
 
+/// Whether two References are to the same thing: identical reference strings
+/// when both have one; else, when both have an identifier, the same system and
+/// value; otherwise false.
+fn same_reference(a: &EvaluationResult, b: &EvaluationResult) -> bool {
     let ref_a = primitive(a, "reference").filter(|r| !r.is_empty());
     let ref_b = primitive(b, "reference").filter(|r| !r.is_empty());
     if let (Some(ref_a), Some(ref_b)) = (&ref_a, &ref_b) {
-        return Some(ref_a == ref_b);
+        return ref_a == ref_b;
     }
     if let (Some(id_a), Some(id_b)) = (first_child(a, "identifier"), first_child(b, "identifier")) {
         let value_a = primitive(id_a, "value").filter(|v| !v.is_empty());
-        return Some(
-            value_a.is_some()
-                && value_a == primitive(id_b, "value")
-                && primitive(id_a, "system") == primitive(id_b, "system"),
-        );
+        return value_a.is_some()
+            && value_a == primitive(id_b, "value")
+            && primitive(id_a, "system") == primitive(id_b, "system");
     }
-    Some(false)
+    false
+}
+
+/// The Composition `item` is a section of, at any depth: one in the document
+/// the evaluation is on, or the Composition evaluated on its own. `None` when
+/// the item is not a section of one.
+fn section_composition<'d>(
+    resolver: &mut Resolver<'d>,
+    item: &EvaluationResult,
+) -> Option<&'d EvaluationResult> {
+    match item {
+        EvaluationResult::Object { map, .. } if !map.contains_key("resourceType") => {
+            resolver.owner(item).0
+        }
+        _ => None,
+    }
+}
+
+// --- isKnown, hasData ------------------------------------------------------------
+
+const LIST_EMPTY_REASON: &str = "http://terminology.hl7.org/CodeSystem/list-empty-reason";
+
+/// Whether every input item is a section of a Composition for which `check`
+/// holds. Empty when the input is empty.
+fn every_section(
+    base: &EvaluationResult,
+    context: &EvaluationContext,
+    check: impl Fn(&EvaluationResult) -> bool,
+) -> Option<bool> {
+    let list = items(base);
+    if list.is_empty() {
+        return None;
+    }
+    let doc = Document::new(context);
+    let mut resolver = Resolver::new(&doc);
+    Some(
+        list.into_iter()
+            .all(|item| section_composition(&mut resolver, item).is_some() && check(item)),
+    )
+}
+
+/// `isKnown()`: whether every input section is known. A section is known when
+/// it has no `emptyReason`, or its `emptyReason` is nil known
+/// (`list-empty-reason#nilknown`). Any other reason (not asked, withheld,
+/// unavailable, closed, or one with only text) is not known, nor is an item
+/// that is not a section of a Composition. Empty when the input is empty.
+pub fn is_known(base: &EvaluationResult, context: &EvaluationContext) -> Option<bool> {
+    every_section(base, context, |section| {
+        first_child(section, "emptyReason").is_none_or(|reason| {
+            has_coding(reason, Some(LIST_EMPTY_REASON), Some("nilknown"), None) == Some(true)
+        })
+    })
+}
+
+/// `hasData()`: whether every input section has its data: an `emptyReason`
+/// (saying why it is empty), or else entries. An item that is not a section of
+/// a Composition has none. Empty when the input is empty.
+pub fn has_data(base: &EvaluationResult, context: &EvaluationContext) -> Option<bool> {
+    every_section(base, context, |section| {
+        first_child(section, "emptyReason").is_some() || first_child(section, "entry").is_some()
+    })
 }
 
 /// A resource's subject or patient; `None` if it has neither, or more than one

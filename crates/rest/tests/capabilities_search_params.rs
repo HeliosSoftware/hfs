@@ -1,6 +1,10 @@
 //! Integration tests for `GET /metadata` search-capability advertisement:
 //! real per-resource search parameters, `_include`/`_revinclude` targets, and
-//! per-parameter supported modifiers (carried as extensions).
+//! per-parameter supported modifiers (carried as extensions), and which
+//! parameters a storage serves (`SearchProvider::serves_search_param`).
+
+#[path = "common/capability_hooks.rs"]
+mod capability_hooks;
 
 mod capabilities_search_param_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
@@ -154,6 +158,257 @@ mod capabilities_search_param_tests {
         assert!(
             codes.contains(&"identifier"),
             "reference modifier set should include `identifier`, got: {codes:?}"
+        );
+    }
+}
+
+/// `searchParam`, `searchInclude` and `searchRevInclude` list only what the
+/// storage's `serves_search_param` serves. FHIR's `searchParam` is the "Search
+/// parameters for implementations to support and/or make use of"
+/// (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.searchParam),
+/// and an empty `searchInclude` means "the server does not support includes"
+/// (#CapabilityStatement.rest.resource.searchInclude).
+mod serves_search_param_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use helios_fhir::FhirVersion;
+    use helios_persistence::types::SearchParamType;
+    use serde_json::Value;
+
+    use crate::capability_hooks::{
+        HookStub, interaction_codes, metadata_server, serves_all, serves_token_date_uri, statement,
+    };
+
+    /// Each resource type's `searchParam` names, `searchInclude` and
+    /// `searchRevInclude`, as sorted sets.
+    type Lists = BTreeMap<String, [BTreeSet<String>; 3]>;
+
+    fn lists(statement: &Value) -> Lists {
+        let strings = |value: &Value| -> BTreeSet<String> {
+            value
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        statement["rest"][0]["resource"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .map(|entry| {
+                let params = entry["searchParam"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|p| p["name"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    entry["type"].as_str().expect("type").to_string(),
+                    [
+                        params,
+                        strings(&entry["searchInclude"]),
+                        strings(&entry["searchRevInclude"]),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn entry<'a>(statement: &'a Value, resource_type: &str) -> &'a Value {
+        statement["rest"][0]["resource"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .find(|r| r["type"] == resource_type)
+            .unwrap_or_else(|| panic!("{resource_type} not advertised"))
+    }
+
+    fn param_names(entry: &Value) -> Vec<String> {
+        entry["searchParam"]
+            .as_array()
+            .expect("searchParam")
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The default path: a storage that keeps the trait default lists what
+    /// SQLite's own statement lists, for every type and FHIR version, and also
+    /// the `special` parameters SQLite builds no condition for and so leaves
+    /// out (`near`, and from R5 `contains` and `section-text`, #2593), with the
+    /// composite `section-code-text`, whose `section-text` component SQLite
+    /// does not serve. Nothing else differs, the include lists included.
+    #[tokio::test]
+    async fn the_default_serves_every_registered_parameter() {
+        let stub = metadata_server(HookStub::with_params(serves_all));
+        let sqlite = metadata_server_over_sqlite();
+        for version in FhirVersion::enabled_versions() {
+            let from_stub = lists(&statement(&stub, *version).await);
+            let from_sqlite = lists(&statement(&sqlite, *version).await);
+            assert!(!from_stub.is_empty());
+            assert_eq!(
+                from_stub.keys().collect::<Vec<_>>(),
+                from_sqlite.keys().collect::<Vec<_>>(),
+                "{version:?}"
+            );
+            let mut only_default = BTreeSet::new();
+            for (resource_type, [params, includes, revincludes]) in &from_stub {
+                let [sqlite_params, sqlite_includes, sqlite_revincludes] =
+                    &from_sqlite[resource_type];
+                assert!(
+                    sqlite_params.is_subset(params),
+                    "{version:?} {resource_type}"
+                );
+                for name in params.difference(sqlite_params) {
+                    only_default.insert(format!("{resource_type}.{name}"));
+                }
+                assert_eq!(includes, sqlite_includes, "{version:?} {resource_type}");
+                assert_eq!(
+                    revincludes, sqlite_revincludes,
+                    "{version:?} {resource_type}"
+                );
+            }
+            let mut expected: BTreeSet<String> = ["Location.near".to_string()].into();
+            if from_stub["Location"][0].contains("contains") {
+                expected.insert("Location.contains".to_string());
+            }
+            if from_stub
+                .get("Composition")
+                .is_some_and(|lists| lists[0].contains("section-text"))
+            {
+                expected.insert("Composition.section-text".to_string());
+            }
+            if from_stub
+                .get("Composition")
+                .is_some_and(|lists| lists[0].contains("section-code-text"))
+            {
+                expected.insert("Composition.section-code-text".to_string());
+            }
+            assert_eq!(only_default, expected, "{version:?}");
+            let patient = &from_stub["Patient"];
+            assert!(patient[0].contains("name"), "{version:?}");
+            assert!(patient[1].contains("Patient:general-practitioner"));
+            assert!(patient[2].contains("Observation:subject"));
+        }
+    }
+
+    /// SQLite itself, through the full router, as every existing test serves it.
+    fn metadata_server_over_sqlite() -> axum_test::TestServer {
+        use std::sync::Arc;
+        let config = helios_rest::ServerConfig {
+            multitenancy: helios_rest::config::MultitenancyConfig {
+                routing_mode: helios_rest::config::TenantRoutingMode::HeaderOnly,
+                ..Default::default()
+            },
+            base_url: "http://localhost:8080".to_string(),
+            default_tenant: "test-tenant".to_string(),
+            ..helios_rest::ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::new(crate::capability_hooks::sqlite()), config);
+        axum_test::TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+            .expect("test server")
+    }
+
+    /// A storage that serves token, date and URI parameters only: every listed
+    /// parameter has one of those types, the common ones included, apart from
+    /// `_list` and `_in`, which REST resolves into an `_id` filter (token), and
+    /// no type lists an include, since every include names a reference
+    /// parameter. `search-type` and the rest of the entry stay.
+    #[tokio::test]
+    async fn only_served_types_are_listed_and_no_include_without_reference_params() {
+        let server = metadata_server(HookStub::with_params(serves_token_date_uri));
+        for version in FhirVersion::enabled_versions() {
+            let statement = statement(&server, *version).await;
+            for resource in statement["rest"][0]["resource"]
+                .as_array()
+                .expect("resources")
+            {
+                let ty = &resource["type"];
+                for param in resource["searchParam"].as_array().expect("searchParam") {
+                    assert!(
+                        matches!(param["type"].as_str(), Some("token" | "date" | "uri"))
+                            || matches!(param["name"].as_str(), Some("_list" | "_in")),
+                        "{version:?} {ty}: {param}"
+                    );
+                }
+                for key in ["searchInclude", "searchRevInclude"] {
+                    assert!(resource.get(key).is_none(), "{version:?} {ty}: {key}");
+                }
+                assert!(
+                    interaction_codes(&resource["interaction"]).contains(&"search-type".into()),
+                    "{version:?} {ty}"
+                );
+            }
+            let patient = param_names(entry(&statement, "Patient"));
+            for kept in [
+                "_id",
+                "_lastUpdated",
+                "_tag",
+                "_profile",
+                "_security",
+                "_list",
+            ] {
+                assert!(patient.contains(&kept.to_string()), "{version:?}: {kept}");
+            }
+            // `_in` exists from R5 on.
+            if matches!(version.as_mime_param(), "5.0" | "6.0") {
+                assert!(patient.contains(&"_in".to_string()), "{version:?}: _in");
+            }
+            for kept in ["identifier", "birthdate", "gender"] {
+                assert!(patient.contains(&kept.to_string()), "{version:?}: {kept}");
+            }
+            for dropped in [
+                "name",
+                "family",
+                "general-practitioner",
+                "_text",
+                "_content",
+            ] {
+                assert!(
+                    !patient.contains(&dropped.to_string()),
+                    "{version:?}: {dropped}"
+                );
+            }
+        }
+    }
+
+    /// The hook is per parameter, not per type: refusing one `special`
+    /// parameter (`near`, #2593) or one reference parameter
+    /// (`Observation.subject`) drops only that one, and the reference
+    /// parameter's include and reverse include with it.
+    #[tokio::test]
+    async fn one_parameter_is_dropped_without_its_type() {
+        fn serves(resource_type: &str, code: &str, _: SearchParamType) -> bool {
+            !(resource_type == "Location" && code == "near")
+                && !(resource_type == "Observation" && code == "subject")
+        }
+        let server = metadata_server(HookStub::with_params(serves));
+        let version = FhirVersion::default_enabled();
+        let statement = statement(&server, version).await;
+
+        let location = param_names(entry(&statement, "Location"));
+        assert!(!location.contains(&"near".to_string()), "{location:?}");
+        assert!(location.contains(&"_text".to_string()), "{location:?}");
+        assert!(location.contains(&"address".to_string()), "{location:?}");
+
+        let observation = entry(&statement, "Observation");
+        let params = param_names(observation);
+        assert!(!params.contains(&"subject".to_string()));
+        assert!(params.contains(&"patient".to_string()));
+        let all = lists(&statement);
+        assert!(!all["Observation"][1].contains("Observation:subject"));
+        assert!(all["Observation"][1].contains("Observation:patient"));
+        assert!(!all["Patient"][2].contains("Observation:subject"));
+        assert!(all["Patient"][2].contains("Observation:patient"));
+        assert!(
+            all.values()
+                .all(|lists| !lists[2].contains("Observation:subject")),
+            "no type keeps the reverse include of an unserved parameter"
         );
     }
 }
