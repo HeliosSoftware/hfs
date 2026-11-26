@@ -1320,6 +1320,9 @@ struct OwnedFileRunContext {
     encryption_key: Option<Value>,
     requires_access_token: bool,
     options: BulkProcessingOptions,
+    /// FHIR version the submission ingests against: an output file's declared
+    /// `type` must be one of its resource types.
+    fhir_version: FhirVersion,
     file_count: u64,
     completed_files: std::collections::HashSet<String>,
     resume_lines: std::collections::HashMap<String, u64>,
@@ -2268,7 +2271,11 @@ where
                         return;
                     }
                     let file = &manifest_ref.output[i];
-                    if completed_ref.contains(&file.url) {
+                    // A file whose type is refused is never fetched, so it
+                    // is not probed either.
+                    if completed_ref.contains(&file.url)
+                        || refused_file_type(file, view_ref.fhir_version).is_some()
+                    {
                         let done = sized_ref.fetch_add(1, Ordering::Relaxed) + 1;
                         self.report_phase(lease_ref, ManifestPhase::Sizing, done, file_count)
                             .await;
@@ -2350,6 +2357,7 @@ where
             encryption_key: view.file_encryption_key.clone(),
             requires_access_token: manifest.requires_access_token,
             options: opts,
+            fhir_version: view.fhir_version,
             file_count,
             completed_files,
             resume_lines: view.file_resume_lines.iter().cloned().collect(),
@@ -3440,6 +3448,30 @@ async fn renew_file_lease<Js: BulkSubmitJobStore + ?Sized>(
     }
 }
 
+/// Longest declared `type` quoted back in a refusal: the value is the
+/// provider's, and the error artifact and the log need only enough to find it.
+const MAX_QUOTED_TYPE_CHARS: usize = 64;
+
+/// Why an output file is refused before it is fetched, or `None` when it may
+/// be ingested: the `type` the manifest declares for it must be, exactly, a
+/// resource type of the submission's FHIR version. Every entry of the file
+/// must carry that type, so an unknown one would otherwise be stored as a
+/// resource type of its own. A file that declares no type is not judged
+/// here.
+fn refused_file_type(file: &RemoteFile, fhir_version: FhirVersion) -> Option<String> {
+    let declared = file.resource_type.as_deref()?;
+    if crate::search::ResourceTypeScope::version(fhir_version).contains(declared) {
+        return None;
+    }
+    let mut quoted: String = declared.chars().take(MAX_QUOTED_TYPE_CHARS).collect();
+    if quoted.len() < declared.len() {
+        quoted.push('…');
+    }
+    Some(format!(
+        "its type {quoted:?} is not a FHIR {fhir_version} resource type"
+    ))
+}
+
 /// Processes one output file. Inline futures and independent tasks both use
 /// this function so fetch, receipt, checkpoint, and fencing behavior cannot
 /// drift between schedulers.
@@ -3479,6 +3511,32 @@ where
             url = %redact_url(&context.file.url),
             "bulk-submit skips an output file an earlier run of this manifest walked to its end"
         );
+        return Ok(());
+    }
+    if let Some(reason) = refused_file_type(context.file, run.fhir_version) {
+        let url = redact_url(&context.file.url);
+        tracing::warn!(
+            submission = %run.lease.submission_id,
+            manifest = %run.lease.manifest_id,
+            url = %url,
+            %reason,
+            "bulk-submit refuses an output file without fetching it; the manifest will fail"
+        );
+        let file_error = write_file_error(
+            output,
+            &run.lease,
+            &run.manifest_url,
+            context.error_part_index,
+            &format!("refused file {url}: {reason}"),
+        )
+        .await?;
+        push_failure(&run.file_failures, url, reason);
+        run.error_records.lock().await.push(file_error);
+        run.failed.fetch_add(1, Ordering::Relaxed);
+        run.file_level_failed.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = jobs.add_manifest_progress(&run.lease, 0, 1, 0).await {
+            return fenced_write_outcome(&run.lease_control, e);
+        }
         return Ok(());
     }
     let (inner, file_bytes_total) = match fetcher
@@ -5742,6 +5800,7 @@ mod tests {
             encryption_key: None,
             requires_access_token: false,
             options: BulkProcessingOptions::new(),
+            fhir_version: FhirVersion::default(),
             file_count: count as u64,
             completed_files: Default::default(),
             resume_lines: Default::default(),
@@ -9452,6 +9511,108 @@ mod tests {
             self.inner
                 .open_file_stream(url, headers, requires_token, oauth, key)
                 .await
+        }
+    }
+
+    /// An output file whose declared `type` is not, exactly, a resource type
+    /// of the submission's FHIR version is refused without a request: no
+    /// probe, no download. It fails the manifest with a file-level error that
+    /// quotes the type, and the other files are ingested.
+    #[tokio::test]
+    async fn test_worker_refuses_an_output_file_of_an_unknown_type_without_fetching_it() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+        let sub_id = seed(&backend, &tenant).await;
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patients.ndjson".to_string(),
+            b"{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n".to_vec(),
+        );
+        for url in [
+            "http://provider/script.ndjson",
+            "http://provider/lower.ndjson",
+        ] {
+            files.insert(
+                url.to_string(),
+                b"{\"resourceType\":\"<script>\",\"id\":\"x\"}\n".to_vec(),
+            );
+        }
+        let remote = |resource_type: &str, url: &str| RemoteFile {
+            resource_type: Some(resource_type.to_string()),
+            url: url.to_string(),
+            count: None,
+        };
+        let fetcher = Arc::new(RecordingOpens {
+            inner: Arc::new(MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: vec![
+                        remote("Patient", "http://provider/patients.ndjson"),
+                        remote("<script>", "http://provider/script.ndjson"),
+                        remote("patient", "http://provider/lower.ndjson"),
+                    ],
+                    deleted: vec![],
+                },
+            }),
+            opened: std::sync::Mutex::new(Vec::new()),
+        });
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            Arc::clone(&fetcher),
+            output,
+            WorkerId::new("w"),
+        );
+        worker.run_job(lease).await.unwrap();
+
+        assert_eq!(
+            *fetcher.opened.lock().unwrap(),
+            vec!["http://provider/patients.ndjson".to_string()],
+            "a file of a refused type is never opened"
+        );
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Failed);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "p1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the file of a known type is ingested"
+        );
+
+        let mut artifacts = String::new();
+        let mut dirs = vec![tmp.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    artifacts.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                }
+            }
+        }
+        for declared in [r#"\"<script>\""#, r#"\"patient\""#] {
+            assert!(
+                artifacts.contains(&format!(
+                    "its type {declared} is not a FHIR {} resource type",
+                    FhirVersion::default()
+                )),
+                "{declared}: {artifacts}"
+            );
         }
     }
 
