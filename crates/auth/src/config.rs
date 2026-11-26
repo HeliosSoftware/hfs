@@ -316,11 +316,14 @@ impl AuthConfig {
     }
 }
 
-/// Reads a claim-name variable, treating a blank value as unset.
+/// Reads a claim-name variable, treating a blank value as unset and dropping
+/// surrounding whitespace: a padded name (`" tenant_id "`) matches no claim,
+/// which for the tenant claim is the same collapse as a blank one.
 fn claim_name_from_env(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
-        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -476,6 +479,33 @@ mod tests {
         assert_eq!(config.patient_claim, "patient");
         assert_eq!(config.encounter_claim, "encounter");
         assert_eq!(config.fhir_user_claim, "fhirUser");
+
+        clear_auth_env();
+    }
+
+    /// The tenant claim is read like the launch-context claims: a blank value
+    /// falls back to `tenant_id` and a padded one is trimmed, so neither names
+    /// a claim no token carries (#2706).
+    #[test]
+    fn test_from_env_tenant_claim_name() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        unsafe { env::set_var("HFS_AUTH_TENANT_CLAIM", "org") };
+        assert_eq!(AuthConfig::from_env().tenant_claim, "org");
+
+        for blank in ["", "   ", "\t"] {
+            unsafe { env::set_var("HFS_AUTH_TENANT_CLAIM", blank) };
+            assert_eq!(AuthConfig::from_env().tenant_claim, "tenant_id");
+        }
+
+        unsafe {
+            env::set_var("HFS_AUTH_TENANT_CLAIM", " org ");
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", " launch_patient\n");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.tenant_claim, "org");
+        assert_eq!(config.patient_claim, "launch_patient");
 
         clear_auth_env();
     }
