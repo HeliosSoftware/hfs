@@ -884,8 +884,17 @@ pub fn same_subject(
     context: &EvaluationContext,
 ) -> Option<bool> {
     let focus = single_item(base)?;
-    let section_doc = Document::new(context);
-    if let Some(composition) = section_composition(&mut Resolver::new(&section_doc), focus) {
+    // Only an element (not a resource) can be a section; skip building the
+    // document for a resource focus, the common case.
+    let section_doc;
+    let section = match focus {
+        EvaluationResult::Object { map, .. } if !map.contains_key("resourceType") => {
+            section_doc = Document::new(context);
+            section_composition(&mut Resolver::new(&section_doc), focus)
+        }
+        _ => None,
+    };
+    if let Some(composition) = section {
         let Some(section_focus) = first_child(focus, "focus") else {
             return Some(true);
         };
