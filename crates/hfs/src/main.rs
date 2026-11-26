@@ -3468,6 +3468,8 @@ async fn build_bulk_submit(
             "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
         );
     }
+    #[cfg(feature = "ui")]
+    helios_ui::set_bulk_submit_trusted_providers(&cfg.trusted_providers);
     let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
         cfg.client_id.as_deref(),
         cfg.private_key.as_deref(),
