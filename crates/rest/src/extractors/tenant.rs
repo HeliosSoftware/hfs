@@ -299,12 +299,16 @@ impl TenantExtractor {
             let resolved = resolver
                 .resolve(parts, &config.multitenancy, &config.default_tenant)
                 .map_err(source_error_to_rejection)?;
-            // An empty resolved tenant means nothing real was requested — e.g. an
-            // empty JWT tenant claim re-surfaced by the resolver's JwtTenantExtractor
-            // (which runs even in HeaderOnly mode), with no header/URL tenant
-            // supplied. Treat that as "no request" and fall back to the configured
-            // default. Only a genuine, non-empty, non-default header/URL tenant
-            // yields 403, preserving tenant isolation.
+            // An empty resolved tenant means nothing real was requested: no
+            // header/URL tenant was supplied. Treat that as "no request" and fall
+            // back to the configured default. Only a genuine, non-empty,
+            // non-default header/URL tenant yields 403, preserving tenant
+            // isolation.
+            //
+            // The bearer provider refuses an empty tenant claim with 401 (#2703),
+            // so `Some("")` does not reach this branch from a validated token.
+            // The `is_empty` filters here and in `JwtTenantExtractor` only cover
+            // a `Principal` built some other way (an embedder, a test).
             if !resolved.tenant_id_str().is_empty()
                 && resolved.tenant_id_str() != config.default_tenant
             {
@@ -570,8 +574,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_empty_claim_no_request_falls_back_to_default() {
-            // An empty tenant claim is treated as "no claim"; with nothing else
-            // requested, fall back to the configured default.
+            // The bearer provider refuses an empty tenant claim (#2703), so this
+            // is a `Principal` built another way. The extractor reads its empty
+            // claim as "no claim"; with nothing else requested, it falls back to
+            // the configured default.
             let state = make_state(false, "test-tenant");
             let mut parts = make_parts(None, Some(make_principal(Some(""))));
 
@@ -766,7 +772,8 @@ mod tests {
 
         #[tokio::test]
         async fn test_empty_claim_nondefault_header_is_forbidden() {
-            // An empty claim is treated as "no claim": a non-default requested
+            // As above, not reachable from the bearer provider (#2703). The
+            // extractor reads an empty claim as "no claim": a non-default requested
             // tenant still yields 403 (same fail-loud path as a missing claim).
             let state = make_state(false, "test-tenant");
             let mut parts = make_parts(Some("other-tenant"), Some(make_principal(Some(""))));
