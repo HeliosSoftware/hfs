@@ -1294,6 +1294,25 @@ fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
     has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
 }
 
+/// The hint of `resource_level_ids` for `filter`: the liveness index (#2601)
+/// only when it checks chosen ids and `filter` is the scope and those ids.
+/// The liveness index covers only the scope and the ids. Any other
+/// resource-level predicate (`_lastUpdated`, `_id`, a stored version,
+/// `missing_params`) would make the hinted read fetch every candidate
+/// document, where the planner can answer from another index
+/// (`idx_resources_type_scan` for `_lastUpdated`).
+fn resource_level_ids_hint(
+    filter: &Document,
+    matched_ids: Option<&HashSet<String>>,
+) -> Option<Hint> {
+    let ids_only = filter
+        .get_array("$and")
+        .is_ok_and(|conditions| conditions.len() == 2);
+    matched_ids
+        .filter(|_| ids_only)
+        .and_then(|_| liveness_hint())
+}
+
 /// A resource that lacks `name`: its `missing_params` lists it, or it has no
 /// `missing_params` and its rows decide (`missing_fallback_stages`). A resource
 /// created by a deferred Bundle has neither until its batch writes both, so it
@@ -4163,17 +4182,7 @@ impl MongoBackend {
         // With ids to check, one reply for the whole `$in` instead of 101 rows
         // and a getMore, read from the keys of the liveness index (#2601).
         let batch = matched_ids.map(|ids| in_reply_rows(ids.len()));
-        // The liveness index covers only the scope and the ids. Any other
-        // resource-level predicate (`_lastUpdated`, `_id`, a stored version,
-        // `missing_params`) would make the hinted read fetch every candidate
-        // document, where the planner can answer from another index
-        // (`idx_resources_type_scan` for `_lastUpdated`).
-        let ids_only = filter
-            .get_array("$and")
-            .is_ok_and(|conditions| conditions.len() == 2);
-        let hint = matched_ids
-            .filter(|_| ids_only)
-            .and_then(|_| liveness_hint());
+        let hint = resource_level_ids_hint(&filter, matched_ids);
         let cursor = with_hint_fallback(hint, |hint| {
             let mut find = resources
                 .find(filter.clone())
@@ -12429,6 +12438,157 @@ mod revinclude_reference_filter_tests {
                 1,
                 "{id} must appear in exactly one chunk"
             );
+        }
+    }
+}
+
+/// #2601: `resource_level_ids` hints `idx_resources_live_id` only for a filter
+/// that is the scope and the chosen ids. With another resource-level
+/// predicate the hinted read fetched every candidate document to test it
+/// (`code=X&_lastUpdated=gt..&_sort=-date`: 0 to 119,746 documents), where
+/// the planner answers from another index. Pinned on the filters
+/// `build_resource_filter` builds, without a live MongoDB.
+#[cfg(test)]
+mod resource_level_ids_hint_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn param(
+        name: &str,
+        param_type: SearchParamType,
+        modifier: Option<SearchModifier>,
+        value: &str,
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn code() -> SearchParameter {
+        param("code", SearchParamType::Token, None, "8867-4")
+    }
+
+    fn value_concept_missing(value: &str) -> SearchParameter {
+        param(
+            "value-concept",
+            SearchParamType::Token,
+            Some(SearchModifier::Missing),
+            value,
+        )
+    }
+
+    /// The hint for `query`, with the ids `ids` to check.
+    fn hint(query: &SearchQuery, ids: Option<&HashSet<String>>) -> Option<Hint> {
+        let missing_support = MissingSupport {
+            indexed: HashSet::from([("value-concept".to_string(), SearchParamType::Token)]),
+        };
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let filter = backend
+            .build_resource_filter("t", "Observation", query, &missing_support, ids, None)
+            .expect("filter should build");
+        resource_level_ids_hint(&filter, ids)
+    }
+
+    #[test]
+    fn scope_and_ids_take_the_liveness_index() {
+        let ids = HashSet::from(["a".to_string(), "b".to_string()]);
+        let none = HashSet::new();
+        for (label, query) in [
+            ("no parameters", SearchQuery::new("Observation")),
+            // Search-index parameters add nothing to the resources filter.
+            (
+                "search-index parameter",
+                SearchQuery::new("Observation").with_parameter(code()),
+            ),
+            // `:missing=false` is answered from the search index too.
+            (
+                ":missing=false",
+                SearchQuery::new("Observation").with_parameter(value_concept_missing("false")),
+            ),
+        ] {
+            assert_eq!(hint(&query, Some(&ids)), liveness_hint(), "{label}");
+            assert_eq!(
+                hint(&query, Some(&none)),
+                liveness_hint(),
+                "{label}, no ids"
+            );
+        }
+    }
+
+    #[test]
+    fn another_resource_level_predicate_leaves_the_index_to_mongodb() {
+        let ids = HashSet::from(["a".to_string(), "b".to_string()]);
+        let with = |extra: SearchParameter| {
+            SearchQuery::new("Observation")
+                .with_parameter(code())
+                .with_parameter(extra)
+        };
+        for (label, query) in [
+            (
+                "_lastUpdated",
+                with(param(
+                    "_lastUpdated",
+                    SearchParamType::Date,
+                    None,
+                    "gt2026-11-25",
+                )),
+            ),
+            (
+                "_lastUpdated range",
+                with(param(
+                    "_lastUpdated",
+                    SearchParamType::Date,
+                    None,
+                    "ge2026-11-20",
+                ))
+                .with_parameter(param(
+                    "_lastUpdated",
+                    SearchParamType::Date,
+                    None,
+                    "lt2026-11-25",
+                )),
+            ),
+            ("_id", with(param("_id", SearchParamType::Token, None, "a"))),
+            (
+                "_id:missing",
+                with(param(
+                    "_id",
+                    SearchParamType::Token,
+                    Some(SearchModifier::Missing),
+                    "false",
+                )),
+            ),
+            (
+                "stored version",
+                SearchQuery::new("Observation")
+                    .with_parameter(code())
+                    .with_fhir_version(FhirVersion::R4),
+            ),
+            (":missing=true", with(value_concept_missing("true"))),
+        ] {
+            assert_eq!(hint(&query, Some(&ids)), None, "{label}");
+        }
+    }
+
+    /// Without ids there is nothing to check: no hint, although scope and
+    /// one `_lastUpdated` condition are also a two-clause `$and`.
+    #[test]
+    fn no_ids_take_no_hint() {
+        for query in [
+            SearchQuery::new("Observation"),
+            SearchQuery::new("Observation").with_parameter(param(
+                "_lastUpdated",
+                SearchParamType::Date,
+                None,
+                "gt2026-11-25",
+            )),
+        ] {
+            assert_eq!(hint(&query, None), None, "{query:?}");
         }
     }
 }
