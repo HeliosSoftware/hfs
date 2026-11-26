@@ -169,7 +169,7 @@ pub async fn import_nucc(
     let imported = backend.import_bundle(ctx, &bytes).await?;
     stats.code_systems = imported.code_systems;
     stats.concepts = concepts.len() as u32;
-    stats.errors.extend(imported.errors);
+    stats.take_errors(imported);
 
     eprintln!(
         "[nucc] imported {} codes ({} synthetic nodes)",

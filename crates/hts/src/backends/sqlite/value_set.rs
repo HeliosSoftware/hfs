@@ -70,7 +70,14 @@ use super::SqliteTerminologyBackend;
 // typical operation imports happen at startup and the cache is then stable
 // for the life of the process, so the cost amortises over millions of
 // subsequent requests.
-type SystemIdCacheMap = HashMap<String, (String, Option<String>)>;
+//
+// The map is keyed by database file first, then URL: system ids are
+// server-assigned, so an id resolved against one database means nothing in
+// another. In-memory databases (`SqliteTerminologyBackend::in_memory`, used by
+// tests that each open their own) have no file name to key on and bypass the
+// cache; sharing it between them answered one test's expansions with another
+// test's ids.
+type SystemIdCacheMap = HashMap<String, HashMap<String, (String, Option<String>)>>;
 static SYSTEM_ID_CACHE: OnceLock<RwLock<SystemIdCacheMap>> = OnceLock::new();
 
 fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
@@ -120,9 +127,13 @@ fn resolve_system_id_with_version_cached(
     conn: &Connection,
     url: &str,
 ) -> Result<Option<(String, Option<String>)>, HtsError> {
-    if let Ok(read) = cs_id_cache().read() {
-        if let Some(rec) = read.get(url) {
-            return Ok(Some(rec.clone()));
+    // `path()` is `Some("")` for an in-memory database: nothing to key on.
+    let db_file = conn.path().filter(|p| !p.is_empty());
+    if let Some(db_file) = db_file {
+        if let Ok(read) = cs_id_cache().read() {
+            if let Some(rec) = read.get(db_file).and_then(|by_url| by_url.get(url)) {
+                return Ok(Some(rec.clone()));
+            }
         }
     }
 
@@ -159,9 +170,11 @@ fn resolve_system_id_with_version_cached(
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    if let Some(ref rec) = row {
+    if let (Some(db_file), Some(rec)) = (db_file, row.as_ref()) {
         if let Ok(mut w) = cs_id_cache().write() {
-            w.insert(url.to_owned(), rec.clone());
+            w.entry(db_file.to_owned())
+                .or_default()
+                .insert(url.to_owned(), rec.clone());
         }
     }
 
@@ -265,12 +278,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
                                     if u64::from(n) > u64::from(cap) {
-                                        return Err(HtsError::TooCostly(format!(
-                                            "ValueSet expansion contains {} codes which exceeds \
-                                             the server limit of {} (set \
-                                             HTS_MAX_EXPANSION_SIZE to raise it)",
-                                            n, cap
-                                        )));
+                                        return Err(HtsError::expansion_too_costly(
+                                            "ValueSet expansion",
+                                            n,
+                                            cap,
+                                        ));
                                     }
                                 }
                             }
@@ -326,12 +338,11 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         if req.count.is_none() {
                             if let Some(cap) = req.max_expansion_size {
                                 if u64::from(n) > u64::from(cap) {
-                                    return Err(HtsError::TooCostly(format!(
-                                        "ValueSet expansion contains {} codes which exceeds \
-                                         the server limit of {} (set \
-                                         HTS_MAX_EXPANSION_SIZE to raise it)",
-                                        n, cap
-                                    )));
+                                    return Err(HtsError::expansion_too_costly(
+                                        "ValueSet expansion",
+                                        n,
+                                        cap,
+                                    ));
                                 }
                             }
                         }
@@ -1135,12 +1146,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 if req.count.is_none() {
                                     if let Some(cap) = req.max_expansion_size {
                                         if u64::from(n) > u64::from(cap) {
-                                            return Err(HtsError::TooCostly(format!(
-                                                "ValueSet expansion contains {} codes which \
-                                                 exceeds the server limit of {} (set \
-                                                 HTS_MAX_EXPANSION_SIZE to raise it)",
-                                                n, cap
-                                            )));
+                                            return Err(HtsError::expansion_too_costly("ValueSet expansion", n, cap));
                                         }
                                     }
                                 }
@@ -1168,12 +1174,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             if req.count.is_none() {
                                 if let Some(cap) = req.max_expansion_size {
                                     if u64::from(n) > u64::from(cap) {
-                                        return Err(HtsError::TooCostly(format!(
-                                            "ValueSet expansion contains {} codes which exceeds \
-                                             the server limit of {} (set \
-                                             HTS_MAX_EXPANSION_SIZE to raise it)",
-                                            n, cap
-                                        )));
+                                        return Err(HtsError::expansion_too_costly("ValueSet expansion", n, cap));
                                     }
                                 }
                             }
@@ -1229,9 +1230,23 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // we suppress tree-building outright in that case.  The legacy
             // HL7-tx `hierarchical=true` convention still asks for an
             // explicit tree on non-enumerated VSes.
+            let total = filtered.len() as u32;
             let want_tree = req.hierarchical == Some(true) && !compose_is_enumerated;
+
+            // Enforce the expansion size cap only when no explicit count (page size) was
+            // requested. When count is set, the response is already bounded and the limit
+            // would only reject valid paginated requests against large code systems.
+            // A tree expansion ignores count and offset and returns every code, so it is
+            // subject to the cap whether or not count was sent.
+            if req.count.is_none() || want_tree {
+                if let Some(limit) = req.max_expansion_size {
+                    if u64::from(total) > u64::from(limit) {
+                        return Err(HtsError::expansion_too_costly("ValueSet expansion", total, limit));
+                    }
+                }
+            }
+
             if want_tree {
-                let total = filtered.len() as u32;
                 let tree = build_hierarchical_expansion(&conn, filtered)?;
                 return Ok(ExpandResponse {
                     total: Some(total),
@@ -1239,23 +1254,6 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                     contains: tree,
                     warnings,
                 });
-            }
-
-            let total = filtered.len() as u32;
-
-            // Enforce the expansion size cap only when no explicit count (page size) was
-            // requested. When count is set, the response is already bounded and the limit
-            // would only reject valid paginated requests against large code systems.
-            if req.count.is_none() {
-                if let Some(limit) = req.max_expansion_size {
-                    if u64::from(total) > u64::from(limit) {
-                        return Err(HtsError::TooCostly(format!(
-                            "ValueSet expansion contains {} codes which exceeds the server \
-                             limit of {} (set HTS_MAX_EXPANSION_SIZE to raise it)",
-                            total, limit
-                        )));
-                    }
-                }
             }
 
             let offset = req.offset.unwrap_or(0) as usize;
