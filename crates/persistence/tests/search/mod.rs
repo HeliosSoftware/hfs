@@ -122,6 +122,9 @@ pub mod tiebreak_order_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1379).
 pub mod token_code_system_suite;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#2965).
+pub mod token_system_only_suite;
 pub mod token_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
 /// `#[path]` (#2731).

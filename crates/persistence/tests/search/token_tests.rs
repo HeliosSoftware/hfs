@@ -444,3 +444,16 @@ async fn test_system_qualified_tokens_in_chains() {
     )
     .await;
 }
+
+/// The shared table for `system|` on a system-only Identifier or Coding
+/// (#2965); PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_system_only_tokens_match_system_pipe() {
+    let backend = super::make_sqlite_backend();
+    super::token_system_only_suite::system_only_tokens_match_system_pipe(
+        &backend,
+        "token-system-only",
+    )
+    .await;
+}
