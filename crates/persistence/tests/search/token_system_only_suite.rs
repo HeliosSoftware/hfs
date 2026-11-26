@@ -10,7 +10,8 @@
 //! when it had a code, so such an element left no row: `system|` missed it,
 //! and so did `:missing=false`. It now writes a row with the system and an
 //! empty code. No `code` or `|code` search can match an empty code, so the
-//! rest of the table — the controls — reads exactly as before.
+//! controls read exactly as before. A composite's token component reads the
+//! same row, so `system|` matches there too.
 //!
 //! Included by `#[path]` into each backend's test binary, like
 //! `token_code_system_suite.rs`. The backend must be built with the spec
@@ -27,7 +28,8 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    CompositeSearchComponent, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue,
 };
 
 use crate::seeding::SeedingStorage;
@@ -36,6 +38,7 @@ const MRN: &str = "http://hospital.example/mrn";
 const OTHER: &str = "http://other.example/id";
 const LOINC: &str = "http://loinc.org";
 const TAGS: &str = "http://example.org/tags";
+const COMPOSITE: &str = "http://composite.example";
 
 /// One row of the table: resource type, parameter, modifier, value, and the
 /// seeded ids it must match.
@@ -59,6 +62,8 @@ type Case = (
 /// - `ob-tag-sysonly` / `ob-tag-empty` / `ob-tag-coded`: a bare `meta.tag`
 ///   Coding of `TAGS` with no code, with `"code": ""` (what `$meta-add`
 ///   stores), and with code `t1`. None of them has a `code`.
+/// - `ob-cq-sysonly` / `ob-cq-coded`: `code` of `COMPOSITE` with no code, and
+///   with code `c1`; both have `valueQuantity` 6 mg, for `code-value-quantity`.
 fn cases() -> Vec<Case> {
     let none = None;
     let not = Some(SearchModifier::Not);
@@ -144,7 +149,7 @@ fn cases() -> Vec<Case> {
             "code",
             missing.clone(),
             "false".into(),
-            &["ob-coded", "ob-sysonly"],
+            &["ob-coded", "ob-cq-coded", "ob-cq-sysonly", "ob-sysonly"],
         ),
         // A bare Coding, `meta.tag`.
         (
@@ -208,6 +213,19 @@ where
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
 
     let tagged = |id: &str, tag: serde_json::Value| json!({"id": id, "status": "final", "meta": {"tag": [tag]}});
+    let quantified = |id: &str, coding: serde_json::Value| {
+        json!({
+            "id": id,
+            "status": "final",
+            "code": {"coding": [coding]},
+            "valueQuantity": {
+                "value": 6,
+                "unit": "mg",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg"
+            },
+        })
+    };
     let resources = [
         (
             "Patient",
@@ -250,6 +268,14 @@ where
             "Observation",
             tagged("ob-tag-coded", json!({"system": TAGS, "code": "t1"})),
         ),
+        (
+            "Observation",
+            quantified("ob-cq-sysonly", json!({"system": COMPOSITE})),
+        ),
+        (
+            "Observation",
+            quantified("ob-cq-coded", json!({"system": COMPOSITE, "code": "c1"})),
+        ),
     ];
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
@@ -271,6 +297,7 @@ where
             &["pt-other", "pt-sysvalue"][..],
         ),
         ("Observation", "code", "1234-5", &["ob-coded"][..]),
+        ("Observation", "code", "c1", &["ob-cq-coded"][..]),
         (
             "Observation",
             "_tag",
@@ -306,6 +333,44 @@ where
             Some(m) => format!("{resource_type}?{param}:{m}={value}"),
             None => format!("{resource_type}?{param}={value}"),
         };
+        println!("{shown} -> {got:?}");
+        if got != ids(expected) {
+            failures.push(format!("{shown}: got {got:?}, expected {expected:?}"));
+        }
+    }
+
+    // A composite's token component (`code-value-quantity`, token + quantity):
+    // `system|` matches the code-less coding there too. The components are
+    // passed as the REST layer resolves them.
+    for (value, expected) in [
+        (
+            format!("{COMPOSITE}|$gt5"),
+            &["ob-cq-coded", "ob-cq-sysonly"][..],
+        ),
+        // Controls: a code still has to match, and so does the quantity.
+        (format!("{COMPOSITE}|c1$gt5"), &["ob-cq-coded"][..]),
+        (format!("{COMPOSITE}|$gt7"), &[][..]),
+    ] {
+        let composite = SearchQuery::new("Observation")
+            .with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                values: vec![SearchValue::eq(&value)],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })
+            .with_count(100);
+        let got = matched(backend, &tenant, &composite).await;
+        let shown = format!("Observation?code-value-quantity={value}");
         println!("{shown} -> {got:?}");
         if got != ids(expected) {
             failures.push(format!("{shown}: got {got:?}, expected {expected:?}"));
