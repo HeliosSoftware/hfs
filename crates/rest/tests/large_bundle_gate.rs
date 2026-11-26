@@ -10,7 +10,7 @@ use serde_json::json;
 
 const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
-fn create_gated_server(large_bundle_concurrency: usize) -> TestServer {
+fn create_gated_server(large_bundle_concurrency: Option<usize>) -> TestServer {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -54,9 +54,12 @@ fn padded_transaction(id: &str) -> Vec<u8> {
     body
 }
 
+/// End-to-end smoke: gated large Bundles still all commit. The test that the
+/// gate actually parks a waiter lives in `handlers::batch::tests::
+/// large_bundle_gate`, where the semaphore is reachable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_large_bundles_all_pass_through_the_gate() {
-    let server = Arc::new(create_gated_server(1));
+async fn concurrent_large_bundles_all_complete_and_commit() {
+    let server = Arc::new(create_gated_server(Some(1)));
     let mut handles = Vec::new();
     for n in 0..3 {
         let server = Arc::clone(&server);
@@ -88,7 +91,7 @@ async fn concurrent_large_bundles_all_pass_through_the_gate() {
 
 #[tokio::test]
 async fn disabled_gate_still_processes_large_bundles() {
-    let server = create_gated_server(0);
+    let server = create_gated_server(Some(0));
     let response = server
         .post("/")
         .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))

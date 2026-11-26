@@ -208,8 +208,8 @@ impl<S> Clone for AppState<S> {
 }
 
 fn large_bundle_gate(config: &ServerConfig) -> Option<Arc<tokio::sync::Semaphore>> {
-    (config.large_bundle_concurrency > 0)
-        .then(|| Arc::new(tokio::sync::Semaphore::new(config.large_bundle_concurrency)))
+    let permits = config.effective_large_bundle_concurrency();
+    (permits > 0).then(|| Arc::new(tokio::sync::Semaphore::new(permits)))
 }
 
 impl<S: ResourceStorage> AppState<S> {

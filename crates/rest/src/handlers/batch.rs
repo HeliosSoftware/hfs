@@ -7798,4 +7798,106 @@ mod tests {
             );
         }
     }
+
+    /// #2020 review: prove the admission gate actually gates. With the only
+    /// permit held from outside, a large Bundle must stay parked (and a small
+    /// one must not), then complete once the permit is released.
+    #[cfg(feature = "sqlite")]
+    mod large_bundle_gate {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use tower::ServiceExt;
+
+        use crate::config::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
+        use crate::handlers::batch::batch_handler;
+        use crate::state::AppState;
+
+        fn gated_router() -> (Router, Arc<tokio::sync::Semaphore>) {
+            let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("data"))
+                .unwrap_or_else(|| PathBuf::from("data"));
+            let backend_config = SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                ..Default::default()
+            };
+            let backend = SqliteBackend::with_config(":memory:", backend_config)
+                .expect("Failed to create SQLite backend");
+            backend.init_schema().expect("Failed to init schema");
+
+            let config = ServerConfig {
+                multitenancy: MultitenancyConfig {
+                    routing_mode: TenantRoutingMode::HeaderOnly,
+                    ..Default::default()
+                },
+                base_url: "http://localhost:8080".to_string(),
+                default_tenant: "test-tenant".to_string(),
+                large_bundle_concurrency: Some(1),
+                ..ServerConfig::default()
+            };
+            let state = AppState::new(Arc::new(backend), config);
+            let gate = Arc::clone(state.large_bundle_gate().expect("gate must be configured"));
+            let router = Router::new()
+                .route("/", axum::routing::post(batch_handler::<SqliteBackend>))
+                .with_state(state);
+            (router, gate)
+        }
+
+        fn bundle_request(id: &str, pad_past_gate_threshold: bool) -> Request<Body> {
+            let bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "resource": {"resourceType": "Patient", "id": id},
+                    "request": {"method": "PUT", "url": format!("Patient/{id}")}
+                }]
+            });
+            let mut body = serde_json::to_vec(&bundle).unwrap();
+            if pad_past_gate_threshold {
+                body.extend(std::iter::repeat_n(b' ', 9 * 1024 * 1024));
+            }
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/fhir+json")
+                .header("x-tenant-id", "test-tenant")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn held_permit_parks_large_bundles_and_releases_them() {
+            let (router, gate) = gated_router();
+            let permit = Arc::clone(&gate).acquire_owned().await.unwrap();
+
+            let small = router
+                .clone()
+                .oneshot(bundle_request("small", false))
+                .await
+                .unwrap();
+            assert_eq!(
+                small.status(),
+                StatusCode::OK,
+                "a small Bundle must bypass the gate"
+            );
+
+            let mut parked = tokio::spawn(router.clone().oneshot(bundle_request("parked", true)));
+            let elapsed = tokio::time::timeout(Duration::from_millis(300), &mut parked).await;
+            assert!(
+                elapsed.is_err(),
+                "a large Bundle ran while the only permit was held"
+            );
+
+            drop(permit);
+            let response = parked.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
 }

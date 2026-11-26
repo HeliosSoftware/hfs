@@ -1760,10 +1760,16 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SEED_CONFORMANCE", default_value = "true")]
     pub seed_conformance: bool,
 
-    /// Most large Bundle requests (bodies of 8 MiB or more) admitted at
-    /// once; further ones wait. 0 disables the gate.
-    #[arg(long, env = "HFS_LARGE_BUNDLE_CONCURRENCY", default_value = "2")]
-    pub large_bundle_concurrency: usize,
+    /// Most large Bundle requests (bodies of 8 MiB or more) parsed and
+    /// executed at once; further ones wait. 0 disables the gate. Unset, the
+    /// gate defaults to 2 on SQLite-primary backends (where it stops
+    /// write-lock timeouts under concurrent large imports) and stays off on
+    /// every other backend, which handles that concurrency well and would
+    /// only lose throughput to it. The gate is taken after the request body
+    /// has been buffered, so it bounds parse-and-execute memory, not body
+    /// buffering, and time spent waiting counts toward HFS_REQUEST_TIMEOUT.
+    #[arg(long, env = "HFS_LARGE_BUNDLE_CONCURRENCY")]
+    pub large_bundle_concurrency: Option<usize>,
 
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
@@ -2220,6 +2226,21 @@ impl ServerConfig {
     pub fn storage_backend_mode(&self) -> Result<StorageBackendMode, String> {
         self.storage_backend.parse()
     }
+
+    /// The large-Bundle admission gate size actually in effect: the
+    /// operator's explicit `HFS_LARGE_BUNDLE_CONCURRENCY` if set, otherwise 2
+    /// on SQLite-primary backends and 0 (off) elsewhere (#2020).
+    pub fn effective_large_bundle_concurrency(&self) -> usize {
+        self.large_bundle_concurrency.unwrap_or_else(|| {
+            match self
+                .storage_backend_mode()
+                .map(StorageBackendMode::primary_backend_kind)
+            {
+                Ok(BackendKind::Sqlite) => 2,
+                _ => 0,
+            }
+        })
+    }
 }
 
 impl Default for ServerConfig {
@@ -2282,7 +2303,7 @@ impl Default for ServerConfig {
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
             seed_conformance: true,
-            large_bundle_concurrency: 2,
+            large_bundle_concurrency: None,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -2643,7 +2664,7 @@ impl ServerConfig {
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
             seed_conformance: true,
-            large_bundle_concurrency: 2,
+            large_bundle_concurrency: None,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -2703,6 +2724,29 @@ fn implicit_default_fhir_version_error_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2020 review: unset, the large-Bundle gate is on (2) only when the
+    /// primary backend is SQLite; an explicit value wins everywhere.
+    #[test]
+    fn large_bundle_gate_defaults_by_backend() {
+        let mut config = ServerConfig::default();
+        assert_eq!(config.effective_large_bundle_concurrency(), 2);
+
+        config.storage_backend = "sqlite-elasticsearch".to_string();
+        assert_eq!(config.effective_large_bundle_concurrency(), 2);
+
+        for backend in ["postgres", "postgres-elasticsearch", "mongodb", "s3"] {
+            config.storage_backend = backend.to_string();
+            assert_eq!(config.effective_large_bundle_concurrency(), 0, "{backend}");
+        }
+
+        config.large_bundle_concurrency = Some(4);
+        assert_eq!(config.effective_large_bundle_concurrency(), 4);
+
+        config.storage_backend = "sqlite".to_string();
+        config.large_bundle_concurrency = Some(0);
+        assert_eq!(config.effective_large_bundle_concurrency(), 0);
+    }
 
     #[test]
     fn auto_or_count_parses_auto_zero_and_counts() {
