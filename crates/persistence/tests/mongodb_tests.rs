@@ -16962,10 +16962,16 @@ mod bulk_submit {
                 .await
                 .unwrap()
         );
-        // A TTL later it is purged.
+        // A TTL later it is purged. The cutoff is taken after the abort
+        // stamped `updated_at`: `now` is only a second past the create, and
+        // a slow server can take longer than that to reach this line.
         assert!(
             backend
-                .purge_submission(&tenant, &abandoned, now)
+                .purge_submission(
+                    &tenant,
+                    &abandoned,
+                    chrono::Utc::now() + chrono::Duration::seconds(1)
+                )
                 .await
                 .unwrap()
         );
