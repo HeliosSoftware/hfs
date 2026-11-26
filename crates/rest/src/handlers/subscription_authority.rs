@@ -65,46 +65,67 @@ where
         return Ok(());
     };
 
-    let (subject, topic) = match resource_type {
+    match resource_type {
         "Subscription" => {
-            let Ok(topic_url) =
-                helios_subscriptions::manager::extract_topic_url(resource, fhir_version)
-            else {
-                return Ok(());
-            };
-            let Some(topic) = engine
-                .topic_registry()
-                .get_topic(tenant.tenant_id(), &topic_url)
-            else {
-                return Err(RestError::Forbidden {
-                    message: format!(
-                        "a Subscription on {topic_url} cannot be judged: the tenant has no such \
-                         topic, so the resource types it would deliver are unknown"
-                    ),
-                });
-            };
-            (format!("a Subscription on {topic_url}"), topic)
+            // Startup rehydration does not see the stored version: it reads
+            // the topic under the version the document's shape implies
+            // (`infer_fhir_version`). The write is judged under both readings,
+            // so a document shaped for another version than the request's
+            // cannot name a topic nobody judged.
+            let inferred = helios_subscriptions::rehydrate::infer_fhir_version(
+                resource,
+                state.config().default_fhir_version,
+            );
+            let mut topic_urls: Vec<String> = [fhir_version, inferred]
+                .into_iter()
+                .filter_map(|version| {
+                    helios_subscriptions::manager::extract_topic_url(resource, version).ok()
+                })
+                .collect();
+            topic_urls.sort_unstable();
+            topic_urls.dedup();
+            for topic_url in topic_urls {
+                let Some(topic) = engine
+                    .topic_registry()
+                    .get_topic(tenant.tenant_id(), &topic_url)
+                else {
+                    return Err(RestError::Forbidden {
+                        message: format!(
+                            "a Subscription on {topic_url} cannot be judged: the tenant has no \
+                             such topic, so the resource types it would deliver are unknown"
+                        ),
+                    });
+                };
+                require_search_grants(
+                    principal,
+                    &format!("a Subscription on {topic_url}"),
+                    topic_resource_types(&topic),
+                )?;
+            }
+            Ok(())
         }
         "SubscriptionTopic" => match InMemoryTopicRegistry::parse_topic_resource(resource) {
-            Ok(topic) => (
-                format!("the SubscriptionTopic {}", topic.canonical_url),
-                topic,
+            Ok(topic) => require_search_grants(
+                principal,
+                &format!("the SubscriptionTopic {}", topic.canonical_url),
+                topic_resource_types(&topic),
             ),
-            Err(_) => return Ok(()),
+            Err(_) => Ok(()),
         },
-        "Basic" if fhir_version.as_str() == "R4" => {
+        // Whatever version the request names: rehydration registers a stored
+        // backport `Basic` topic by its shape alone.
+        "Basic" if cfg!(feature = "R4") => {
             match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
-                Ok(Some(topic)) => (
-                    format!("the backport SubscriptionTopic {}", topic.canonical_url),
-                    topic,
+                Ok(Some(topic)) => require_search_grants(
+                    principal,
+                    &format!("the backport SubscriptionTopic {}", topic.canonical_url),
+                    topic_resource_types(&topic),
                 ),
-                _ => return Ok(()),
+                _ => Ok(()),
             }
         }
-        _ => return Ok(()),
-    };
-
-    require_search_grants(principal, &subject, topic_resource_types(&topic))
+        _ => Ok(()),
+    }
 }
 
 #[cfg(not(feature = "subscriptions"))]

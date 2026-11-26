@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 const TENANT: &str = "test-tenant";
 const TOPIC_URL: &str = "http://example.org/topics/encounter-start";
 const UNKNOWN_TOPIC_URL: &str = "http://example.org/topics/unknown";
+/// A topic on `Basic`, which both tokens may search.
+const PERMITTED_TOPIC_URL: &str = "http://example.org/topics/basic-create";
 
 /// Writes Subscriptions, topics and Encounters; may not read or search an
 /// Encounter.
@@ -93,26 +95,30 @@ fn mime(version: FhirVersion) -> HeaderValue {
 }
 
 fn topic(version: FhirVersion) -> Value {
+    topic_on(version, "topic-1", TOPIC_URL, "Encounter")
+}
+
+fn topic_on(version: FhirVersion, id: &str, url: &str, resource_type: &str) -> Value {
     if backport(version) {
         json!({
-            "resourceType": "Basic", "id": "topic-1",
+            "resourceType": "Basic", "id": id,
             "code": {"coding": [{"system": "http://hl7.org/fhir/fhir-types", "code": "SubscriptionTopic"}]},
             "extension": [{
                 "url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url",
-                "valueUri": TOPIC_URL
+                "valueUri": url
             }, {
                 "url": "http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger",
                 "extension": [
-                    {"url": "resource", "valueUri": "http://hl7.org/fhir/StructureDefinition/Encounter"},
+                    {"url": "resource", "valueUri": format!("http://hl7.org/fhir/StructureDefinition/{resource_type}")},
                     {"url": "supportedInteraction", "valueCode": "create"}
                 ]
             }]
         })
     } else {
         json!({
-            "resourceType": "SubscriptionTopic", "id": "topic-1", "url": TOPIC_URL,
+            "resourceType": "SubscriptionTopic", "id": id, "url": url,
             "status": "active",
-            "resourceTrigger": [{"resource": "Encounter", "supportedInteraction": ["create"]}]
+            "resourceTrigger": [{"resource": resource_type, "supportedInteraction": ["create"]}]
         })
     }
 }
@@ -146,20 +152,27 @@ async fn server(version: FhirVersion) -> TestServer {
         },
         "https://public.example/fhir".to_string(),
     ));
-    let topic = topic(version);
-    engine
-        .on_resource_event(ResourceEvent {
-            tenant_id: TenantId::new(TENANT),
-            fhir_version: version,
-            resource_type: topic["resourceType"].as_str().unwrap().to_string(),
-            resource_id: "topic-1".to_string(),
-            version_id: "1".to_string(),
-            event_type: ResourceEventType::Create,
-            resource: Some(topic),
-            previous_resource: None,
-            timestamp: Utc::now(),
-        })
-        .await;
+    for (id, topic) in [
+        ("topic-1", topic(version)),
+        (
+            "topic-2",
+            topic_on(version, "topic-2", PERMITTED_TOPIC_URL, "Basic"),
+        ),
+    ] {
+        engine
+            .on_resource_event(ResourceEvent {
+                tenant_id: TenantId::new(TENANT),
+                fhir_version: version,
+                resource_type: topic["resourceType"].as_str().unwrap().to_string(),
+                resource_id: id.to_string(),
+                version_id: "1".to_string(),
+                event_type: ResourceEventType::Create,
+                resource: Some(topic),
+                previous_resource: None,
+                timestamp: Utc::now(),
+            })
+            .await;
+    }
 
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -461,6 +474,97 @@ async fn bundle_entries_are_judged_too(version: FhirVersion) {
     )
     .await;
     assert_eq!(patched.status_code(), StatusCode::OK, "{}", patched.text());
+}
+
+/// Startup rehydration does not see the version a document was stored under:
+/// it reads a Subscription's topic under the version its shape implies and
+/// registers any topic-coded `Basic`. A write is therefore judged under that
+/// reading too, whatever `fhirVersion` the request names, or a document shaped
+/// for another version would be stored unjudged and deliver after a restart.
+#[cfg(all(feature = "R4", feature = "R4B"))]
+mod shape_and_request_version_disagree {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_backport_shaped_subscription_sent_as_a_native_version_is_judged() {
+        let server = server(FhirVersion::R4).await;
+        let refused = post(
+            &server,
+            FhirVersion::R4B,
+            WRITER,
+            "/Subscription",
+            subscription(FhirVersion::R4, TOPIC_URL),
+        )
+        .await;
+        assert_refused_for(refused, "Encounter");
+
+        let admitted = post(
+            &server,
+            FhirVersion::R4B,
+            READER,
+            "/Subscription",
+            subscription(FhirVersion::R4, TOPIC_URL),
+        )
+        .await;
+        assert_ne!(
+            admitted.status_code(),
+            StatusCode::FORBIDDEN,
+            "{}",
+            admitted.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backport_subscription_carrying_a_native_topic_is_judged_on_both() {
+        let server = server(FhirVersion::R4).await;
+        let permitted = post(
+            &server,
+            FhirVersion::R4,
+            WRITER,
+            "/Subscription",
+            subscription(FhirVersion::R4, PERMITTED_TOPIC_URL),
+        )
+        .await;
+        assert_eq!(
+            permitted.status_code(),
+            StatusCode::CREATED,
+            "{}",
+            permitted.text()
+        );
+
+        let mut both = subscription(FhirVersion::R4, PERMITTED_TOPIC_URL);
+        both["topic"] = json!(TOPIC_URL);
+        both["channelType"] = json!({
+            "system": "http://terminology.hl7.org/CodeSystem/subscription-channel-type",
+            "code": "rest-hook"
+        });
+        both["endpoint"] = json!("https://receiver.example/hook");
+        let refused = post(&server, FhirVersion::R4, WRITER, "/Subscription", both).await;
+        assert_refused_for(refused, "Encounter");
+    }
+
+    #[tokio::test]
+    async fn a_backport_topic_sent_as_a_native_version_is_judged() {
+        let server = server(FhirVersion::R4).await;
+        let widened = topic_on(FhirVersion::R4, "topic-2", PERMITTED_TOPIC_URL, "Encounter");
+        let refused = put(
+            &server,
+            FhirVersion::R4B,
+            WRITER,
+            "/Basic/topic-2",
+            widened.clone(),
+        )
+        .await;
+        assert_refused_for(refused, "Encounter");
+
+        let admitted = put(&server, FhirVersion::R4B, READER, "/Basic/topic-2", widened).await;
+        assert_ne!(
+            admitted.status_code(),
+            StatusCode::FORBIDDEN,
+            "{}",
+            admitted.text()
+        );
+    }
 }
 
 macro_rules! for_version {
