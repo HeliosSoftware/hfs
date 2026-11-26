@@ -51,6 +51,9 @@ const MIXED: &str = "mixed-token";
 const PATIENT_ONLY: &str = "patient-only-token";
 /// `user/Observation.rs` only: no scope for the types its references name.
 const OBSERVATION_ONLY: &str = "observation-only-token";
+/// `user/Patient.rs patient/Observation.rs` with `patient = p1`: Patient is
+/// unrestricted, Observation is confined to p1's compartment.
+const PATIENT_USER_OBSERVATION_P1: &str = "patient-user-observation-p1-token";
 
 struct StubProvider;
 
@@ -70,6 +73,7 @@ impl AuthProvider for StubProvider {
             MIXED => ("user/Observation.rs patient/*.rs", Some("p1")),
             PATIENT_ONLY => ("user/Patient.rs", None),
             OBSERVATION_ONLY => ("user/Observation.rs", None),
+            PATIENT_USER_OBSERVATION_P1 => ("user/Patient.rs patient/Observation.rs", Some("p1")),
             _ => return Err(AuthError::InvalidSignature),
         };
         Ok(Principal {
@@ -609,6 +613,41 @@ pub async fn included_types_outside_the_scopes_are_dropped(server: &TestServer) 
     let bundle: Value = r.json();
     assert_eq!(included_ids(&bundle), ["p1", "pr1"]);
     assert!(omitted_types(&bundle).is_empty(), "{bundle}");
+
+    // A type granted only by a `patient/` scope stays confined to the launch
+    // patient's compartment when the path type is granted by a `user/` scope,
+    // which leaves the search itself unconfined: p2's Observation is not
+    // returned through p2's `_revinclude`, p1's is.
+    let r = get(
+        server,
+        PATIENT_USER_OBSERVATION_P1,
+        "/Patient?_id=p2&_revinclude=Observation:subject",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["p2"]);
+    assert!(included_ids(&bundle).is_empty(), "{bundle}");
+    let r = get(
+        server,
+        PATIENT_USER_OBSERVATION_P1,
+        "/Patient?_id=p1&_revinclude=Observation:subject",
+    )
+    .await;
+    assert_eq!(included_ids(&r.json()), ["o1", "o3"]);
+
+    // The same the other way round: Observation unrestricted, Patient only
+    // through `patient/*` — o2's subject p2 is another patient.
+    let r = get(
+        server,
+        MIXED,
+        "/Observation?_id=o2&_include=Observation:subject",
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    assert_eq!(ids(&bundle), ["o2"]);
+    assert!(included_ids(&bundle).is_empty(), "{bundle}");
 }
 
 /// The types named by the omitted-types outcome entries, one string per entry.

@@ -879,23 +879,39 @@ where
     // An include follows references into any type; SMART scopes are granted
     // per type, so an included resource comes back only when the token may
     // read its type, as `$everything` keeps only the types it may read
-    // (#2628). A `patient/` grant counts as permitting the type: the
-    // compartment filter above has already confined it.
+    // (#2628). A type granted only by a `patient/` scope must also be a
+    // member of that grant's patient compartment: `compartment` above is the
+    // path type's grant, which is unconfined when the path type is granted by
+    // a `user/` or `system/` scope (`user/Patient.rs patient/Observation.rs`).
     let mut omitted = std::collections::BTreeSet::new();
     if let Some(principal) = chains.principal() {
+        let mut registry = None;
         result.included.retain(|resource| {
             let resource_type = resource.resource_type();
-            if helios_auth::SmartScopePolicy::check(
+            match helios_auth::SmartScopePolicy::check(
                 principal,
                 resource_type,
                 helios_auth::FhirOperation::Read,
-            )
-            .is_ok()
-            {
-                true
-            } else {
-                omitted.insert(resource_type.to_string());
-                false
+            ) {
+                Ok(helios_auth::AccessScope::Unrestricted) => true,
+                Ok(helios_auth::AccessScope::PatientCompartment { patient_id }) => {
+                    compartment.patient_id() == Some(patient_id.as_str())
+                        || PatientCompartment::confined_to(patient_id).is_member(
+                            || {
+                                registry
+                                    .get_or_insert_with(|| {
+                                        state.storage().search_param_registry(tenant.context())
+                                    })
+                                    .clone()
+                            },
+                            resource.fhir_version(),
+                            resource.content(),
+                        )
+                }
+                Err(_) => {
+                    omitted.insert(resource_type.to_string());
+                    false
+                }
             }
         });
     }
