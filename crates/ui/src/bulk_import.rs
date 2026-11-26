@@ -1063,12 +1063,62 @@ fn client_assertion_claims(client_id: &str, token_url: &str, now: i64) -> serde_
     })
 }
 
+static TRUSTED_PROVIDERS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Record the Data Provider origins (`scheme://host[:port]`) the Import page
+/// may present the server's bulk-submit client assertion to
+/// (`HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`). Called once from the server's
+/// startup; the most recent call wins. With none recorded no token endpoint
+/// is contacted: the assertion carries the server's signing identity, so its
+/// destinations are the operator's choice, never the page's.
+pub fn set_bulk_submit_trusted_providers(origins: impl IntoIterator<Item = impl AsRef<str>>) {
+    let origins = origins
+        .into_iter()
+        .filter_map(|origin| origin_of(origin.as_ref()))
+        .collect();
+    *TRUSTED_PROVIDERS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = origins;
+}
+
+/// The `scheme://host[:port]` of an absolute http(s) URL, default ports
+/// omitted, so an entry and a token URL compare the same way.
+fn origin_of(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let origin = url.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// Refuses a token URL outside the trusted Data Provider origins before
+/// anything is signed or sent, so neither the assertion nor the outcome of
+/// contacting an unlisted destination is produced for the page.
+fn trusted_token_url(token_url: &str) -> Result<(), String> {
+    let Some(origin) = origin_of(token_url) else {
+        return Err("token URL is not an absolute http or https URL".to_string());
+    };
+    let trusted = TRUSTED_PROVIDERS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if trusted.contains(&origin) {
+        Ok(())
+    } else {
+        Err(
+            "token URL is not at a trusted Data Provider origin (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS)"
+                .to_string(),
+        )
+    }
+}
+
 async fn backend_services_token(client_id: &str, token_url: &str) -> Result<String, String> {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
     if client_id.is_empty() || token_url.is_empty() {
         return Err("missing client_id or token URL".to_string());
     }
+    trusted_token_url(token_url)?;
     let pem = std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY")
         .map_err(|_| "HFS_BULK_SUBMIT_PRIVATE_KEY is not configured on this server".to_string())?;
     let alg = std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or_else(|_| "ES384".to_string());
@@ -1087,7 +1137,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
-    let response = http_client()
+    let response = token_client()
         .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -1107,10 +1157,10 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
             upstream_failure_detail(&e, 10, "the token endpoint did not answer in time")
         })?;
     let status = response.status();
-    let body: Value = response.json().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         return Err(format!("token endpoint answered {status}"));
     }
+    let body: Value = response.json().await.map_err(|e| e.to_string())?;
     body.get("access_token")
         .and_then(Value::as_str)
         .map(String::from)
@@ -1254,6 +1304,21 @@ const STATUS_POLL_TIMEOUT_SECS: u64 = 30;
 /// another poll — the exact hammering the recipient's rate limit (#790)
 /// rejects (#957).
 const STATUS_POLL_FAILURE_BACKOFF_SECS: u64 = 30;
+
+/// Client for the token request only: it follows no redirect. The listed
+/// origin is the only one the assertion may reach, and a 307/308 would post it
+/// again to wherever `Location` points (a 301/302/303 would report on a
+/// destination nobody listed). A token endpoint has no reason to redirect, so
+/// a 3xx is reported as the endpoint's answer.
+fn token_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a reqwest client without redirects builds")
+    })
+}
 
 /// Shared HTTP client. A per-request `reqwest::Client::new()` rebuilds the
 /// connection pool and resolver every call, so every poll paid a fresh TCP
@@ -2081,6 +2146,37 @@ pub async fn test_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_url_must_be_at_a_listed_origin() {
+        assert_eq!(
+            origin_of("https://idp.example:8443/realms/x/token?y=1").as_deref(),
+            Some("https://idp.example:8443")
+        );
+        assert_eq!(
+            origin_of("https://idp.example:443/token").as_deref(),
+            Some("https://idp.example")
+        );
+        assert_eq!(origin_of("ftp://idp.example/token"), None);
+        assert_eq!(origin_of("/token"), None);
+
+        set_bulk_submit_trusted_providers(["https://idp.example/", "not a url"]);
+        assert!(trusted_token_url("https://idp.example/realms/x/token").is_ok());
+        assert!(trusted_token_url("https://IDP.example:443/token").is_ok());
+        let err = trusted_token_url("https://other.example/token").unwrap_err();
+        assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
+        assert!(
+            trusted_token_url("http://idp.example/token").is_err(),
+            "scheme is part of the origin"
+        );
+        assert!(trusted_token_url("token").is_err());
+
+        set_bulk_submit_trusted_providers(Vec::<String>::new());
+        assert!(
+            trusted_token_url("https://idp.example/token").is_err(),
+            "an empty list trusts nothing"
+        );
+    }
 
     /// #1436: a submission without a client of its own authenticates its
     /// self-calls with the process's outbound credential — but only when the

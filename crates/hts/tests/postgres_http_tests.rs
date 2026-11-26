@@ -777,8 +777,8 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
     }
 
     // Chunk 1: metadata only. Chunk 2: parent + child, builds the closure.
-    // Chunk 3: another child; the system is no longer empty, so the closure is
-    // deleted and not rebuilt.
+    // Chunk 3: another child; the system is no longer empty, so the closure
+    // chunk 2 built is kept and marked stale rather than rebuilt.
     let (status, body) = app.post_fhir(DEFER, chunk("")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = app
@@ -800,9 +800,10 @@ async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    assert!(
-        isa_members(&app, &sys).await.is_empty(),
-        "chunked import should have left the closure empty"
+    assert_eq!(
+        isa_members(&app, &sys).await,
+        ["A", "A.0"],
+        "the closure chunk 2 built is kept until finalize; A.1 is not in it yet"
     );
     // Unaffected on PostgreSQL: walks concept_hierarchy, not the closure.
     assert_eq!(subsumes(&app, &sys, "A", "A.0").await, "subsumes");
@@ -1000,6 +1001,46 @@ async fn expand_hierarchical_false_returns_flat_list() {
             "flat mode should not produce nested contains, found: {entry}"
         );
     }
+}
+
+/// A tree ignores `count` and returns every code, so `count` must not lift
+/// the expansion limit for it. The header lowers the limit to one code for
+/// this request; the ECL is-a value set has more.
+#[tokio::test(flavor = "multi_thread")]
+async fn expand_tree_with_count_is_subject_to_the_limit() {
+    let app = TestAppPg::new().await;
+    app.import_bundle_ok(bundles::ecl_bundle()).await;
+
+    let tree_page = |hierarchical: bool| {
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": bundles::ECL_ISA_VS_URL},
+                {"name": "hierarchical", "valueBoolean": hierarchical},
+                {"name": "count", "valueInteger": 1}
+            ]
+        })
+        .to_string()
+    };
+
+    let status = app
+        .post_fhir_status_with_header(
+            "/ValueSet/$expand",
+            tree_page(true),
+            ("x-too-costly-threshold", "1"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A flat page of the same size is bounded by `count` and still allowed.
+    let status = app
+        .post_fhir_status_with_header(
+            "/ValueSet/$expand",
+            tree_page(false),
+            ("x-too-costly-threshold", "1"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -2686,7 +2686,7 @@ fn lower_boundary(
 /// SELECT term is not portable. Only a final line counts: recursive branches
 /// end without one and carry `ORDER BY` inside window functions and
 /// subqueries, which must stay.
-fn strip_trailing_order_by(sql: &str) -> &str {
+pub(super) fn strip_trailing_order_by(sql: &str) -> &str {
     let upper = sql.to_ascii_uppercase();
     match upper.rfind("\nORDER BY") {
         Some(pos) if !sql[pos + 1..].contains('\n') => &sql[..pos],
