@@ -121,7 +121,7 @@ pub async fn import_ndc(
     let seed = build_code_system_bundle(&meta, &seed_concepts);
     let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = products.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -143,7 +143,7 @@ pub async fn import_ndc(
 
         let bytes = build_code_system_bundle(&meta, &builder);
         let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        stats.take_errors(chunk);
 
         eprintln!(
             "[ndc] batch {}/{total_batches} — +{} products (total: {})",

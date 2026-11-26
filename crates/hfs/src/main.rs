@@ -1928,18 +1928,20 @@ async fn init_auth_with_audit(
     // The web UI's browser login (#1449) shares one session store between the
     // REST auth layer (which turns the session cookie into a bearer) and the
     // UI (which establishes sessions). Built here, before either is mounted.
+    let provider: Arc<dyn helios_auth::AuthProvider> = Arc::new(provider);
     let sessions = init_login_sessions(&auth_config, public_base_url).await?;
     #[cfg(feature = "ui")]
     if let Some(sessions) = &sessions {
         helios_ui::set_interactive_login(helios_ui::LoginRuntime {
             sessions: Arc::clone(sessions),
+            provider: Arc::clone(&provider),
         });
     }
     #[cfg(feature = "ui")]
     helios_ui::set_bearer_only_auth(sessions.is_none());
 
     let auth_state = Arc::new(AuthMiddlewareState {
-        provider: Arc::new(provider),
+        provider,
         config: Arc::new(auth_config.clone()),
         audit_sink,
         audit_source_observer: audit_config.source_observer.clone(),
@@ -3498,6 +3500,8 @@ async fn build_bulk_submit(
             "HFS_BULK_SUBMIT_PROVIDER_TENANTS has no effect: outbound OAuth is not configured (HFS_BULK_SUBMIT_CLIENT_ID and HFS_BULK_SUBMIT_PRIVATE_KEY)"
         );
     }
+    #[cfg(feature = "ui")]
+    helios_ui::set_bulk_submit_trusted_providers(&cfg.trusted_providers);
     let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> = match (
         cfg.client_id.as_deref(),
         cfg.private_key.as_deref(),
