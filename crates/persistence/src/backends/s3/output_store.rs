@@ -78,10 +78,14 @@ impl S3OutputStore {
         // be created first by another local user, who would then read the
         // files or plant links among them; a private directory (random name,
         // owner-only on Unix) cannot.
-        let (scratch_dir, private_scratch) = match tempfile::Builder::new()
-            .prefix("hfs-export-scratch-")
-            .tempdir()
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("hfs-export-scratch-");
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let (scratch_dir, private_scratch) = match builder.tempdir() {
             Ok(dir) => (dir.path().to_path_buf(), Some(Arc::new(dir))),
             Err(error) => {
                 tracing::warn!(%error, "could not create a private export scratch directory");
