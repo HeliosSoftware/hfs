@@ -2098,6 +2098,7 @@ where
             fetched = tokio::time::timeout(
                 self.manifest_fetch_timeout,
                 self.fetcher.fetch_manifest(
+                    lease.tenant.tenant_id(),
                     &manifest_url,
                     &view.file_request_headers,
                     &view.oauth_metadata_urls,
@@ -2277,6 +2278,7 @@ where
                     match self
                         .fetcher
                         .file_size(
+                            lease_ref.tenant.tenant_id(),
                             &file.url,
                             &view_ref.file_request_headers,
                             manifest_ref.requires_access_token,
@@ -2464,6 +2466,7 @@ where
             match self
                 .fetcher
                 .open_file_stream(
+                    lease.tenant.tenant_id(),
                     &file.url,
                     &view.file_request_headers,
                     manifest.requires_access_token,
@@ -3483,6 +3486,7 @@ where
     }
     let (inner, file_bytes_total) = match fetcher
         .open_file_stream(
+            run.lease.tenant.tenant_id(),
             &context.file.url,
             &run.request_headers,
             run.requires_access_token,
@@ -4719,6 +4723,7 @@ mod tests {
         impl SubmitInputFetcher for StalledFetcher {
             async fn fetch_manifest(
                 &self,
+                _tenant: &crate::tenant::TenantId,
                 _url: &str,
                 _headers: &[(String, String)],
                 _oauth: &[String],
@@ -4729,6 +4734,7 @@ mod tests {
 
             async fn open_file_stream(
                 &self,
+                _tenant: &crate::tenant::TenantId,
                 _url: &str,
                 _headers: &[(String, String)],
                 _requires_access_token: bool,
@@ -4741,6 +4747,7 @@ mod tests {
 
             async fn file_size(
                 &self,
+                _tenant: &crate::tenant::TenantId,
                 _url: &str,
                 _headers: &[(String, String)],
                 _requires_access_token: bool,
@@ -5494,6 +5501,7 @@ mod tests {
     impl SubmitInputFetcher for MockFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &crate::tenant::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -5504,6 +5512,7 @@ mod tests {
 
         async fn open_file_stream(
             &self,
+            _tenant: &crate::tenant::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -5520,6 +5529,7 @@ mod tests {
 
         async fn file_size(
             &self,
+            _tenant: &crate::tenant::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -5535,18 +5545,20 @@ mod tests {
     impl SubmitInputFetcher for BorrowedFetcher<'_> {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
             encryption_key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
             self.0
-                .fetch_manifest(url, headers, oauth, encryption_key)
+                .fetch_manifest(tenant, url, headers, oauth, encryption_key)
                 .await
         }
 
         async fn open_file_stream(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
@@ -5554,19 +5566,27 @@ mod tests {
             encryption_key: Option<&Value>,
         ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             self.0
-                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .open_file_stream(
+                    tenant,
+                    url,
+                    headers,
+                    requires_access_token,
+                    oauth,
+                    encryption_key,
+                )
                 .await
         }
 
         async fn file_size(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
             oauth: &[String],
         ) -> StorageResult<Option<u64>> {
             self.0
-                .file_size(url, headers, requires_access_token, oauth)
+                .file_size(tenant, url, headers, requires_access_token, oauth)
                 .await
         }
     }
@@ -6224,18 +6244,20 @@ mod tests {
     impl SubmitInputFetcher for SelectiveFailureFetcher {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
             encryption_key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
             self.inner
-                .fetch_manifest(url, headers, oauth, encryption_key)
+                .fetch_manifest(tenant, url, headers, oauth, encryption_key)
                 .await
         }
 
         async fn open_file_stream(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
@@ -6252,19 +6274,27 @@ mod tests {
                 ));
             }
             self.inner
-                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .open_file_stream(
+                    tenant,
+                    url,
+                    headers,
+                    requires_access_token,
+                    oauth,
+                    encryption_key,
+                )
                 .await
         }
 
         async fn file_size(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
             oauth: &[String],
         ) -> StorageResult<Option<u64>> {
             self.inner
-                .file_size(url, headers, requires_access_token, oauth)
+                .file_size(tenant, url, headers, requires_access_token, oauth)
                 .await
         }
     }
@@ -6369,6 +6399,7 @@ mod tests {
     impl SubmitInputFetcher for PhaseSpyFetcher {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
@@ -6376,12 +6407,13 @@ mod tests {
         ) -> StorageResult<RemoteManifest> {
             self.observe("fetch_manifest").await;
             self.inner
-                .fetch_manifest(url, headers, oauth, encryption_key)
+                .fetch_manifest(tenant, url, headers, oauth, encryption_key)
                 .await
         }
 
         async fn open_file_stream(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
@@ -6390,12 +6422,20 @@ mod tests {
         ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             self.observe("open_file_stream").await;
             self.inner
-                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .open_file_stream(
+                    tenant,
+                    url,
+                    headers,
+                    requires_access_token,
+                    oauth,
+                    encryption_key,
+                )
                 .await
         }
 
         async fn file_size(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_access_token: bool,
@@ -6403,7 +6443,7 @@ mod tests {
         ) -> StorageResult<Option<u64>> {
             let size = self
                 .inner
-                .file_size(url, headers, requires_access_token, oauth)
+                .file_size(tenant, url, headers, requires_access_token, oauth)
                 .await;
             self.observe("file_size").await;
             size
@@ -6781,18 +6821,20 @@ mod tests {
     impl SubmitInputFetcher for BrokenTailFetcher {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
             encryption_key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
             self.0
-                .fetch_manifest(url, headers, oauth, encryption_key)
+                .fetch_manifest(tenant, url, headers, oauth, encryption_key)
                 .await
         }
 
         async fn open_file_stream(
             &self,
+            _tenant: &crate::tenant::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -9081,6 +9123,7 @@ mod tests {
     impl SubmitInputFetcher for FailingManifestFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &crate::tenant::TenantId,
             _url: &str,
             _h: &[(String, String)],
             _o: &[String],
@@ -9096,6 +9139,7 @@ mod tests {
         }
         async fn open_file_stream(
             &self,
+            _tenant: &crate::tenant::TenantId,
             _url: &str,
             _h: &[(String, String)],
             _r: bool,
@@ -9432,16 +9476,20 @@ mod tests {
     impl SubmitInputFetcher for RecordingOpens {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
             key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
-            self.inner.fetch_manifest(url, headers, oauth, key).await
+            self.inner
+                .fetch_manifest(tenant, url, headers, oauth, key)
+                .await
         }
 
         async fn open_file_stream(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_token: bool,
@@ -9450,8 +9498,134 @@ mod tests {
         ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             self.opened.lock().unwrap().push(url.to_string());
             self.inner
-                .open_file_stream(url, headers, requires_token, oauth, key)
+                .open_file_stream(tenant, url, headers, requires_token, oauth, key)
                 .await
+        }
+    }
+
+    /// Records the tenant of every fetch it is asked for.
+    struct RecordingTenants {
+        inner: Arc<MockFetcher>,
+        seen: std::sync::Mutex<Vec<(&'static str, String)>>,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for RecordingTenants {
+        async fn fetch_manifest(
+            &self,
+            tenant: &crate::tenant::TenantId,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("manifest", tenant.as_str().to_string()));
+            self.inner
+                .fetch_manifest(tenant, url, headers, oauth, key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            tenant: &crate::tenant::TenantId,
+            url: &str,
+            headers: &[(String, String)],
+            requires_token: bool,
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("file", tenant.as_str().to_string()));
+            self.inner
+                .open_file_stream(tenant, url, headers, requires_token, oauth, key)
+                .await
+        }
+
+        async fn file_size(
+            &self,
+            tenant: &crate::tenant::TenantId,
+            _url: &str,
+            _headers: &[(String, String)],
+            _requires_token: bool,
+            _oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("size", tenant.as_str().to_string()));
+            Ok(None)
+        }
+    }
+
+    /// Every fetch of a run names the tenant of the leased manifest: the token
+    /// provider maps Data Providers to tenants (#2657), so the fetcher must
+    /// know whose submission it fetches for, inline and in independent tasks.
+    #[tokio::test]
+    async fn test_worker_fetches_for_the_leased_manifests_tenant() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            seed(&backend, &tenant).await;
+
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "http://provider/a.ndjson".to_string(),
+                b"{\"resourceType\":\"Patient\",\"id\":\"a1\"}\n".to_vec(),
+            );
+            let fetcher = Arc::new(RecordingTenants {
+                inner: Arc::new(MockFetcher {
+                    files,
+                    manifest: RemoteManifest {
+                        requires_access_token: true,
+                        output: vec![RemoteFile {
+                            resource_type: Some("Patient".to_string()),
+                            url: "http://provider/a.ndjson".to_string(),
+                            count: None,
+                        }],
+                        deleted: vec![],
+                    },
+                }),
+                seen: std::sync::Mutex::new(Vec::new()),
+            });
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    Arc::clone(&fetcher),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            );
+            worker.run_job(lease).await.unwrap();
+
+            let seen = fetcher.seen.lock().unwrap().clone();
+            let tenant_id = tenant.tenant_id().as_str().to_string();
+            assert_eq!(
+                seen,
+                vec![
+                    ("manifest", tenant_id.clone()),
+                    ("size", tenant_id.clone()),
+                    ("file", tenant_id),
+                ],
+                "independent={independent}"
+            );
         }
     }
 
@@ -9696,16 +9870,20 @@ mod tests {
     impl SubmitInputFetcher for ShutdownOnOpen {
         async fn fetch_manifest(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             oauth: &[String],
             key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
-            self.inner.fetch_manifest(url, headers, oauth, key).await
+            self.inner
+                .fetch_manifest(tenant, url, headers, oauth, key)
+                .await
         }
 
         async fn open_file_stream(
             &self,
+            tenant: &crate::tenant::TenantId,
             url: &str,
             headers: &[(String, String)],
             requires_token: bool,
@@ -9715,7 +9893,7 @@ mod tests {
             self.shutdown.cancel();
             tokio::task::yield_now().await;
             self.inner
-                .open_file_stream(url, headers, requires_token, oauth, key)
+                .open_file_stream(tenant, url, headers, requires_token, oauth, key)
                 .await
         }
     }

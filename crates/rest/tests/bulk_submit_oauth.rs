@@ -17,9 +17,10 @@ use axum::{
     Json, Router,
     routing::{get, post},
 };
+use helios_persistence::TenantId;
 use helios_persistence::core::{FileTokenError, FileTokenProvider};
 use helios_rest::bulk_submit_oauth::{
-    ClientTimeouts, JwtClientCredentialsTokenProvider, TrustedProviders,
+    ClientTimeouts, JwtClientCredentialsTokenProvider, ProviderTenants, TrustedProviders,
 };
 use serde_json::json;
 
@@ -70,14 +71,18 @@ async fn test_outbound_client_credentials_discovery_and_cache() {
     });
 
     // --- Provider acquires + caches a read-scoped token. ---
-    let provider = loopback_provider().expect("parse ES384 key");
+    let provider = loopback_provider(&[&base]).expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
 
     let file = format!("{base}/bulk/Patient.ndjson");
-    let t1 = provider.token(&discovery, "system/*.rs", &file).await;
+    let t1 = provider
+        .token(&tenant(), &discovery, "system/*.rs", &file)
+        .await;
     assert_eq!(t1.as_deref(), Ok("tok-abc"));
 
-    let t2 = provider.token(&discovery, "system/*.rs", &file).await;
+    let t2 = provider
+        .token(&tenant(), &discovery, "system/*.rs", &file)
+        .await;
     assert_eq!(t2.as_deref(), Ok("tok-abc"));
 
     // The second call is served from cache → token endpoint hit exactly once.
@@ -124,25 +129,39 @@ async fn test_outbound_unparseable_key_rejected() {
     assert!(JwtClientCredentialsTokenProvider::new("c", "not-a-key", "ES384").is_none());
 }
 
+/// The tenant every submission in these tests belongs to.
+fn tenant() -> TenantId {
+    TenantId::new("t")
+}
+
+/// [`tenant`] mapped to each of `origins` (`HFS_BULK_SUBMIT_PROVIDER_TENANTS`).
+fn mapped(origins: &[&str]) -> ProviderTenants {
+    ProviderTenants::parse(origins.iter().map(|origin| format!("{origin}=t")))
+        .expect("test origins parse")
+}
+
 /// A provider with no trusted origins listed that may reach the loopback test
-/// servers, which it would refuse by default.
-fn loopback_provider() -> Option<Arc<JwtClientCredentialsTokenProvider>> {
+/// servers, which it would refuse by default, and that may present its
+/// identity at `origins` for [`tenant`].
+fn loopback_provider(origins: &[&str]) -> Option<Arc<JwtClientCredentialsTokenProvider>> {
     JwtClientCredentialsTokenProvider::new_with(
         "client-1",
         TEST_ES384_PKCS8,
         "ES384",
         TrustedProviders::default().allowing_private_networks(true),
+        mapped(origins),
         ClientTimeouts::default(),
     )
 }
 
 #[tokio::test]
 async fn test_outbound_discovery_failure_returns_none() {
-    let provider = loopback_provider().unwrap();
+    let provider = loopback_provider(&["http://127.0.0.1:1"]).unwrap();
     // Unreachable metadata URL → no token.
     let discovery = vec!["http://127.0.0.1:1/.well-known/smart-configuration".to_string()];
     let err = provider
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             "http://127.0.0.1:1/manifest.json",
@@ -199,7 +218,9 @@ async fn other_origin() -> String {
     format!("http://{}", listener.local_addr().unwrap())
 }
 
-fn provider(trusted: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
+/// A provider trusting `trusted` that may present its identity at `origins`
+/// for [`tenant`].
+fn provider(trusted: &[&str], origins: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
     JwtClientCredentialsTokenProvider::new_with_trusted_providers(
         "client-1",
         TEST_ES384_PKCS8,
@@ -207,6 +228,7 @@ fn provider(trusted: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
         TrustedProviders::parse(trusted)
             .expect("test origins parse")
             .allowing_private_networks(true),
+        mapped(origins),
     )
     .expect("parse ES384 key")
 }
@@ -215,8 +237,9 @@ fn provider(trusted: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
 async fn token_travels_to_the_token_endpoints_origin() {
     let (idp, _, token_hits) = spawn_idp(None).await;
     let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
-    let token = provider(&[])
+    let token = provider(&[], &[&idp])
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{idp}/bulk/manifest.json"),
@@ -231,8 +254,9 @@ async fn token_is_withheld_from_a_destination_on_another_origin() {
     let (idp, metadata_hits, token_hits) = spawn_idp(None).await;
     let elsewhere = other_origin().await;
     let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
-    let err = provider(&[])
+    let err = provider(&[], &[&idp])
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{elsewhere}/bulk/manifest.json"),
@@ -257,10 +281,11 @@ async fn a_trusted_provider_origin_may_receive_the_token() {
     let (idp, _, token_hits) = spawn_idp(None).await;
     let files = other_origin().await;
     let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
-    let provider = provider(&[&idp, &files]);
+    let provider = provider(&[&idp, &files], &[&idp]);
 
     let token = provider
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{files}/bulk/Patient.ndjson"),
@@ -272,6 +297,7 @@ async fn a_trusted_provider_origin_may_receive_the_token() {
     // The list extends the destinations; it does not drop the endpoint's own origin.
     let token = provider
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{idp}/bulk/manifest.json"),
@@ -283,6 +309,7 @@ async fn a_trusted_provider_origin_may_receive_the_token() {
     let stranger = other_origin().await;
     let err = provider
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{stranger}/bulk/Patient.ndjson"),
@@ -300,8 +327,9 @@ async fn a_configured_list_refuses_an_unlisted_metadata_url_before_discovery() {
     let (idp, metadata_hits, token_hits) = spawn_idp(None).await;
     let trusted = other_origin().await;
     let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
-    let err = provider(&[&trusted])
+    let err = provider(&[&trusted], &[&idp])
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{trusted}/bulk/manifest.json"),
@@ -329,8 +357,9 @@ async fn a_configured_list_refuses_an_unlisted_token_endpoint() {
     let (real_idp, _, real_token_hits) = spawn_idp(None).await;
     let (front, front_metadata_hits, _) = spawn_idp(Some(format!("{real_idp}/token"))).await;
     let discovery = vec![format!("{front}/.well-known/smart-configuration")];
-    let err = provider(&[&front])
+    let err = provider(&[&front], &[&front, &real_idp])
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{front}/bulk/manifest.json"),
@@ -354,8 +383,9 @@ async fn a_metadata_document_cannot_redirect_a_token_to_its_own_host() {
     let (real_idp, _, real_token_hits) = spawn_idp(None).await;
     let (attacker, _, _) = spawn_idp(Some(format!("{real_idp}/token"))).await;
     let discovery = vec![format!("{attacker}/.well-known/smart-configuration")];
-    let err = provider(&[])
+    let err = provider(&[], &[&attacker, &real_idp])
         .token(
+            &tenant(),
             &discovery,
             "system/*.rs",
             &format!("{attacker}/bulk/manifest.json"),
@@ -370,6 +400,119 @@ async fn a_metadata_document_cannot_redirect_a_token_to_its_own_host() {
         }
     );
     assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
+}
+
+// ---- provider-to-tenant mapping (HFS_BULK_SUBMIT_PROVIDER_TENANTS) --------
+
+#[tokio::test]
+async fn a_provider_not_mapped_to_the_tenant_is_refused_before_discovery() {
+    let (idp, metadata_hits, token_hits) = spawn_idp(None).await;
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let destination = format!("{idp}/bulk/manifest.json");
+
+    for (label, provider) in [
+        ("no mapping", provider(&[], &[])),
+        ("mapped to another tenant", {
+            JwtClientCredentialsTokenProvider::new_with_trusted_providers(
+                "client-1",
+                TEST_ES384_PKCS8,
+                "ES384",
+                TrustedProviders::default().allowing_private_networks(true),
+                ProviderTenants::parse([format!("{idp}=other")]).unwrap(),
+            )
+            .unwrap()
+        }),
+    ] {
+        let err = provider
+            .token(&tenant(), &discovery, "system/*.rs", &destination)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            FileTokenError::UnboundProvider {
+                origin: idp.clone(),
+                tenant: "t".to_string(),
+            },
+            "{label}"
+        );
+        assert!(
+            err.to_string().contains("HFS_BULK_SUBMIT_PROVIDER_TENANTS"),
+            "{label}: {err}"
+        );
+    }
+    assert_eq!(metadata_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_unmapped_token_endpoint_gets_no_client_assertion() {
+    // The mapped metadata host names a token endpoint on another origin that
+    // is not mapped to the tenant.
+    let (real_idp, _, real_token_hits) = spawn_idp(None).await;
+    let (front, front_metadata_hits, _) = spawn_idp(Some(format!("{real_idp}/token"))).await;
+    let discovery = vec![format!("{front}/.well-known/smart-configuration")];
+    let err = provider(&[], &[&front])
+        .token(
+            &tenant(),
+            &discovery,
+            "system/*.rs",
+            &format!("{real_idp}/bulk/manifest.json"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FileTokenError::UnboundProvider {
+            origin: real_idp.clone(),
+            tenant: "t".to_string(),
+        }
+    );
+    assert_eq!(front_metadata_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(real_token_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_token_is_cached_per_tenant() {
+    let (idp, _, token_hits) = spawn_idp(None).await;
+    let provider = JwtClientCredentialsTokenProvider::new_with_trusted_providers(
+        "client-1",
+        TEST_ES384_PKCS8,
+        "ES384",
+        TrustedProviders::default().allowing_private_networks(true),
+        ProviderTenants::parse([format!("{idp}=t|u")]).unwrap(),
+    )
+    .unwrap();
+    let discovery = vec![format!("{idp}/.well-known/smart-configuration")];
+    let destination = format!("{idp}/bulk/manifest.json");
+    let token = |tenant: &'static str| {
+        let provider = provider.clone();
+        let discovery = discovery.clone();
+        let destination = destination.clone();
+        async move {
+            provider
+                .token(
+                    &TenantId::new(tenant),
+                    &discovery,
+                    "system/*.rs",
+                    &destination,
+                )
+                .await
+        }
+    };
+
+    assert_eq!(token("t").await.as_deref(), Ok("tok"));
+    assert_eq!(token("t").await.as_deref(), Ok("tok"));
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        1,
+        "served from t's cache"
+    );
+    assert_eq!(token("u").await.as_deref(), Ok("tok"));
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        2,
+        "u does not get the token obtained for t"
+    );
 }
 
 // ---- bounds on what the provider sends back -------------------------------
@@ -395,12 +538,12 @@ async fn a_huge_expires_in_is_bounded_not_a_panic() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let provider = loopback_provider().expect("parse ES384 key");
+    let provider = loopback_provider(&[&base]).expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
     let destination = format!("{base}/file.ndjson");
     assert_eq!(
         provider
-            .token(&discovery, "system/*.rs", &destination)
+            .token(&tenant(), &discovery, "system/*.rs", &destination)
             .await
             .ok()
             .as_deref(),
@@ -409,7 +552,7 @@ async fn a_huge_expires_in_is_bounded_not_a_panic() {
     // And it is cached like any other token.
     assert_eq!(
         provider
-            .token(&discovery, "system/*.rs", &destination)
+            .token(&tenant(), &discovery, "system/*.rs", &destination)
             .await
             .ok()
             .as_deref(),
@@ -435,6 +578,7 @@ async fn a_provider_that_never_answers_is_given_up_on() {
         TEST_ES384_PKCS8,
         "ES384",
         TrustedProviders::default().allowing_private_networks(true),
+        mapped(&[&base]),
         ClientTimeouts {
             connect: Duration::from_secs(1),
             read: Duration::from_secs(1),
@@ -446,7 +590,12 @@ async fn a_provider_that_never_answers_is_given_up_on() {
     let started = std::time::Instant::now();
     let token = tokio::time::timeout(
         Duration::from_secs(10),
-        provider.token(&discovery, "system/*.rs", &format!("{base}/file.ndjson")),
+        provider.token(
+            &tenant(),
+            &discovery,
+            "system/*.rs",
+            &format!("{base}/file.ndjson"),
+        ),
     )
     .await
     .expect("the request is bounded by the client timeouts, not by this test");
@@ -522,11 +671,12 @@ async fn a_configured_list_confines_the_oauth_clients_redirects() {
         axum::serve(listener, listed_app).await.unwrap();
     });
 
-    let provider = provider(&[&listed]);
+    let provider = provider(&[&listed], &[&listed]);
     let destination = format!("{listed}/bulk/file.ndjson");
 
     let err = provider
         .token(
+            &tenant(),
             &[format!("{listed}/redirecting-metadata")],
             "system/*.rs",
             &destination,
@@ -537,6 +687,7 @@ async fn a_configured_list_confines_the_oauth_clients_redirects() {
 
     let err = provider
         .token(
+            &tenant(),
             &[format!("{listed}/.well-known/smart-configuration")],
             "system/*.rs",
             &destination,

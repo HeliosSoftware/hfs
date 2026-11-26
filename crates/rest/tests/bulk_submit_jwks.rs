@@ -13,10 +13,11 @@ use axum::http::{StatusCode, header};
 use axum_test::TestServer;
 use helios_audit::ExclusionFilter;
 use helios_auth::{AuthConfig, AuthError, AuthProvider, Principal};
+use helios_persistence::TenantId;
 use helios_persistence::backends::sqlite::SqliteBackend;
 use helios_persistence::core::FileTokenProvider;
 use helios_rest::bulk_submit_oauth::{
-    ClientTimeouts, JwtClientCredentialsTokenProvider, TrustedProviders,
+    ClientTimeouts, JwtClientCredentialsTokenProvider, ProviderTenants, TrustedProviders,
 };
 use helios_rest::config::BulkSubmitConfig;
 use helios_rest::{AuthMiddlewareState, ServerConfig};
@@ -283,11 +284,13 @@ async fn the_served_key_verifies_the_assertion_the_provider_sends() {
         TEST_ES384_PEM,
         "ES384",
         TrustedProviders::default().allowing_private_networks(true),
+        ProviderTenants::parse([format!("{idp_base}=t")]).expect("origin parses"),
         ClientTimeouts::default(),
     )
     .expect("valid ES384 key");
     let token = provider
         .token(
+            &TenantId::new("t"),
             &[format!("{idp_base}/.well-known/smart-configuration")],
             "system/*.rs",
             &format!("{idp_base}/bulk/manifest.json"),

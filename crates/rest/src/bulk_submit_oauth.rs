@@ -4,7 +4,7 @@
 //! provider's `oauthMetadataUrl` (`.well-known/smart-configuration`), builds an
 //! `RS384`/`ES384` `private_key_jwt` client assertion, exchanges it for a
 //! short-lived access token via the `client_credentials` grant, and caches the
-//! token per `(token_endpoint, scope)`.
+//! token per `(tenant, token_endpoint, scope)`.
 //!
 //! **Scope:** per the Bulk Data Submit spec, file-retrieval tokens are scoped to
 //! *read the resource types in the manifest* (e.g. `system/*.rs`) — **never** the
@@ -15,6 +15,11 @@
 //! token endpoint that issued it, or to an origin the operator listed in
 //! `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` ([`TrustedProviders`]). When that list is
 //! set, discovery and the token request themselves are confined to it too.
+//!
+//! **Tenants:** HFS presents its client identity at a provider only for a
+//! submission whose tenant the operator mapped to that provider in
+//! `HFS_BULK_SUBMIT_PROVIDER_TENANTS` ([`ProviderTenants`]); with no mapping,
+//! no submission obtains a token.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use helios_persistence::core::bulk_submit_input::redact_url;
 use helios_persistence::core::{FileTokenError, FileTokenProvider};
+use helios_persistence::tenant::TenantId;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -86,6 +92,23 @@ const NOT_LISTED: &str =
 /// Redirect hops followed, as reqwest's default policy allows.
 const MAX_REDIRECTS: usize = 10;
 
+/// Reduces a configured entry to its origin. The entry must be an absolute
+/// URL with a host and nothing after it: a path, query or fragment is
+/// refused rather than silently widened to the whole origin.
+fn parse_origin(entry: &str) -> Result<String, String> {
+    let url =
+        reqwest::Url::parse(entry).map_err(|_| format!("'{entry}' is not an absolute URL"))?;
+    if !url.origin().is_tuple() {
+        return Err(format!("'{entry}' has no host"));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "'{entry}' names more than an origin; list only scheme://host[:port]"
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
 impl TrustedProviders {
     /// Parses one origin per entry. An entry must be an absolute URL with a
     /// host and nothing after it: a path, query or fragment is refused rather
@@ -97,18 +120,7 @@ impl TrustedProviders {
             if entry.is_empty() {
                 continue;
             }
-            let url = reqwest::Url::parse(entry)
-                .map_err(|_| format!("'{entry}' is not an absolute URL"))?;
-            if !url.origin().is_tuple() {
-                return Err(format!("'{entry}' has no host"));
-            }
-            if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some()
-            {
-                return Err(format!(
-                    "'{entry}' names more than an origin; list only scheme://host[:port]"
-                ));
-            }
-            let origin = url.origin().ascii_serialization();
+            let origin = parse_origin(entry)?;
             if !origins.contains(&origin) {
                 origins.push(origin);
             }
@@ -216,6 +228,97 @@ impl TrustedProviders {
     }
 }
 
+/// The Data Providers each tenant may have HFS fetch from with its outbound
+/// client identity (`HFS_BULK_SUBMIT_CLIENT_ID` and its key). Parsed from
+/// `HFS_BULK_SUBMIT_PROVIDER_TENANTS`, one `origin=tenant1|tenant2` entry per
+/// provider origin, where the origin is the `oauthMetadataUrl`'s or the token
+/// endpoint's `scheme://host[:port]`. A provider whose token endpoint sits on
+/// another origin than its metadata is listed under both.
+///
+/// The submitter names the provider, so without this mapping any caller
+/// allowed to kick off `$bulk-submit` could have HFS present its identity at
+/// any provider and ingest what that provider releases to HFS into the
+/// caller's tenant. Empty (the default) maps no provider: no submission
+/// obtains a token until the operator maps one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTenants {
+    bindings: Vec<(String, Vec<String>)>,
+}
+
+impl ProviderTenants {
+    /// Parses `origin=tenant1|tenant2` entries. The origin follows the rules
+    /// of [`TrustedProviders::parse`]; an entry naming no tenant is refused.
+    /// An origin listed twice is bound to the tenants of both entries.
+    pub fn parse<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> Result<Self, String> {
+        let mut bindings: Vec<(String, Vec<String>)> = Vec::new();
+        for entry in entries {
+            let entry = entry.as_ref().trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (origin, tenants) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("'{entry}' is not origin=tenant1|tenant2"))?;
+            let origin = parse_origin(origin.trim())?;
+            let tenants: Vec<String> = tenants
+                .split('|')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .collect();
+            if tenants.is_empty() {
+                return Err(format!("'{entry}' names no tenant"));
+            }
+            match bindings.iter_mut().find(|(listed, _)| *listed == origin) {
+                Some((_, listed)) => {
+                    for tenant in tenants {
+                        if !listed.contains(&tenant) {
+                            listed.push(tenant);
+                        }
+                    }
+                }
+                None => bindings.push((origin, tenants)),
+            }
+        }
+        Ok(Self { bindings })
+    }
+
+    /// `true` when no provider is mapped.
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    /// Whether `tenant` may have HFS use its outbound identity at `origin`.
+    pub fn permits(&self, origin: &str, tenant: &str) -> bool {
+        self.bindings
+            .iter()
+            .any(|(listed, tenants)| listed == origin && tenants.iter().any(|t| t == tenant))
+    }
+
+    /// Why a submission of `tenant` may not have HFS present its identity at
+    /// the origin of `url`, or `None` when it may.
+    pub fn refusal(&self, url: &str, tenant: &str) -> Option<String> {
+        match origin_of(url) {
+            Some(origin) if self.permits(&origin, tenant) => None,
+            Some(origin) => Some(format!(
+                "names {origin}, which is not a Data Provider of tenant '{tenant}': the server                  operator maps providers to tenants in HFS_BULK_SUBMIT_PROVIDER_TENANTS                  ({origin}={tenant})"
+            )),
+            None => Some("has no origin".to_string()),
+        }
+    }
+
+    fn require(&self, origin: &str, tenant: &TenantId) -> Result<(), FileTokenError> {
+        if self.permits(origin, tenant.as_str()) {
+            Ok(())
+        } else {
+            Err(FileTokenError::UnboundProvider {
+                origin: origin.to_string(),
+                tenant: tenant.as_str().to_string(),
+            })
+        }
+    }
+}
+
 /// The `scheme://host[:port]` of an absolute URL, or `None` when it has no
 /// host (an opaque origin such as `data:`), the form every comparison here
 /// is made on.
@@ -246,37 +349,47 @@ pub struct JwtClientCredentialsTokenProvider {
     /// RFC 7638 thumbprint of the public key, used as `kid` in assertion headers.
     kid: Option<String>,
     trusted_providers: TrustedProviders,
-    /// Cache of `(token_endpoint, scope) -> (token, expiry)`.
-    cache: Mutex<HashMap<(String, String), (String, Instant)>>,
+    provider_tenants: ProviderTenants,
+    /// Cache of `(tenant, token_endpoint, scope) -> (token, expiry)`: a
+    /// token obtained for one tenant's submission never serves another's.
+    cache: Mutex<HashMap<TokenKey, (String, Instant)>>,
 }
+
+/// A cached token is keyed by `(tenant, token_endpoint, scope)`.
+type TokenKey = (TenantId, String, String);
 
 impl JwtClientCredentialsTokenProvider {
     /// Builds a provider from a `client_id`, a PEM private key, and a signing alg
     /// (`ES384` or `RS384`) that trusts no provider origin beyond the token
-    /// endpoint's own, with the default [`ClientTimeouts`]. Returns `None` if
-    /// the key can't be parsed.
+    /// endpoint's own and maps no provider to a tenant (so it obtains no
+    /// token), with the default [`ClientTimeouts`]. Returns `None` if the key
+    /// can't be parsed.
     pub fn new(client_id: &str, private_key_pem: &str, signing_alg: &str) -> Option<Arc<Self>> {
         Self::new_with(
             client_id,
             private_key_pem,
             signing_alg,
             TrustedProviders::default(),
+            ProviderTenants::default(),
             ClientTimeouts::default(),
         )
     }
 
-    /// [`Self::new`] with the operator's trusted provider origins.
+    /// [`Self::new`] with the operator's trusted provider origins and the
+    /// providers mapped to each tenant.
     pub fn new_with_trusted_providers(
         client_id: &str,
         private_key_pem: &str,
         signing_alg: &str,
         trusted_providers: TrustedProviders,
+        provider_tenants: ProviderTenants,
     ) -> Option<Arc<Self>> {
         Self::new_with(
             client_id,
             private_key_pem,
             signing_alg,
             trusted_providers,
+            provider_tenants,
             ClientTimeouts::default(),
         )
     }
@@ -293,16 +406,19 @@ impl JwtClientCredentialsTokenProvider {
             private_key_pem,
             signing_alg,
             TrustedProviders::default(),
+            ProviderTenants::default(),
             timeouts,
         )
     }
 
-    /// [`Self::new`] with the trusted provider origins and the request bounds.
+    /// [`Self::new`] with the trusted provider origins, the providers mapped
+    /// to each tenant, and the request bounds.
     pub fn new_with(
         client_id: &str,
         private_key_pem: &str,
         signing_alg: &str,
         trusted_providers: TrustedProviders,
+        provider_tenants: ProviderTenants,
         timeouts: ClientTimeouts,
     ) -> Option<Arc<Self>> {
         let (alg, key) = match signing_alg {
@@ -333,6 +449,7 @@ impl JwtClientCredentialsTokenProvider {
             encoding_key: key,
             kid,
             trusted_providers,
+            provider_tenants,
             cache: Mutex::new(HashMap::new()),
         }))
     }
@@ -445,6 +562,7 @@ impl JwtClientCredentialsTokenProvider {
 impl FileTokenProvider for JwtClientCredentialsTokenProvider {
     async fn token(
         &self,
+        tenant: &TenantId,
         oauth_metadata_urls: &[String],
         scope: &str,
         destination: &str,
@@ -459,6 +577,7 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             ))
         })?;
         self.trusted_providers.require(&metadata_origin)?;
+        self.provider_tenants.require(&metadata_origin, tenant)?;
 
         let token_endpoint = self.discover_token_endpoint(metadata_url).await?;
         let token_origin = origin_of(&token_endpoint).ok_or_else(|| {
@@ -468,6 +587,9 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             ))
         })?;
         self.trusted_providers.require(&token_origin)?;
+        // The client assertion is presented at the token endpoint, which the
+        // metadata names: its origin must be mapped to the tenant as well.
+        self.provider_tenants.require(&token_origin, tenant)?;
 
         let destination_origin = origin_of(destination).ok_or_else(|| {
             FileTokenError::Unavailable(format!(
@@ -484,7 +606,7 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
             });
         }
 
-        let cache_key = (token_endpoint.clone(), scope.to_string());
+        let cache_key = (tenant.clone(), token_endpoint.clone(), scope.to_string());
 
         // Serve a cached, unexpired token.
         {
@@ -675,8 +797,21 @@ gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
     #[tokio::test]
     async fn without_a_list_the_oauth_client_does_not_reach_a_private_address() {
         let server = wiremock::MockServer::start().await;
-        let provider =
-            JwtClientCredentialsTokenProvider::new("cid", TEST_ES384_PEM, "ES384").unwrap();
+        // Both origins are mapped to the tenant, so what refuses them is the
+        // address rule and not the missing mapping.
+        let provider = JwtClientCredentialsTokenProvider::new_with(
+            "cid",
+            TEST_ES384_PEM,
+            "ES384",
+            TrustedProviders::default(),
+            ProviderTenants::parse([
+                format!("{}=t", server.uri()),
+                format!("http://localhost:{}=t", server.address().port()),
+            ])
+            .unwrap(),
+            ClientTimeouts::default(),
+        )
+        .unwrap();
         for metadata in [
             format!("{}/.well-known/smart-configuration", server.uri()),
             format!(
@@ -686,6 +821,7 @@ gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
         ] {
             let err = provider
                 .token(
+                    &TenantId::new("t"),
                     std::slice::from_ref(&metadata),
                     "system/*.rs",
                     "https://files.example.org/a.ndjson",

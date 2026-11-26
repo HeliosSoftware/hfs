@@ -8816,6 +8816,7 @@ mod bulk_submit_worker {
         impl SubmitInputFetcher for MockFetcher {
             async fn fetch_manifest(
                 &self,
+                _tenant: &crate::tenant::TenantId,
                 _url: &str,
                 _headers: &[(String, String)],
                 _oauth: &[String],
@@ -8826,6 +8827,7 @@ mod bulk_submit_worker {
 
             async fn open_file_stream(
                 &self,
+                _tenant: &crate::tenant::TenantId,
                 url: &str,
                 _headers: &[(String, String)],
                 _requires_access_token: bool,

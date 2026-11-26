@@ -63,6 +63,7 @@ use helios_persistence::core::{
     FileTokenError, FileTokenProvider, RemoteManifest, SubmitInputFetcher,
 };
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
+use helios_persistence::tenant::TenantId;
 use reqwest::header::{self, HeaderMap};
 use serde_json::Value;
 use tokio::io::AsyncBufRead;
@@ -271,6 +272,7 @@ impl HttpSubmitInputFetcher {
     fn file_request(
         &self,
         client: &reqwest::Client,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         with_token: bool,
@@ -280,6 +282,7 @@ impl HttpSubmitInputFetcher {
             client: client.clone(),
             token_provider: self.token_provider.clone(),
             outbound_scope: self.outbound_scope.clone(),
+            tenant: tenant.clone(),
             url: url.to_string(),
             shown_url: redact_url(url),
             request_headers: request_headers.to_vec(),
@@ -300,6 +303,7 @@ impl HttpSubmitInputFetcher {
     /// Builds a request with provider headers and (optionally) a bearer token.
     async fn build_get(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         with_token: bool,
@@ -307,6 +311,7 @@ impl HttpSubmitInputFetcher {
     ) -> StorageResult<reqwest::RequestBuilder> {
         self.file_request(
             &self.client,
+            tenant,
             url,
             request_headers,
             with_token,
@@ -579,6 +584,8 @@ struct FileRequest {
     client: reqwest::Client,
     token_provider: Option<Arc<dyn FileTokenProvider>>,
     outbound_scope: String,
+    /// The tenant the submission belongs to, the one a token is obtained for.
+    tenant: TenantId,
     url: String,
     /// `url` with its query string, fragment and credentials redacted: the
     /// only form that may appear in an error message or a log line.
@@ -613,7 +620,12 @@ impl FileRequest {
                 )));
             };
             let token = provider
-                .token(&self.oauth_metadata_urls, &self.outbound_scope, &self.url)
+                .token(
+                    &self.tenant,
+                    &self.oauth_metadata_urls,
+                    &self.outbound_scope,
+                    &self.url,
+                )
                 .await
                 .map_err(|e| {
                     let detail = format!("{shown} requires an access token: {e}");
@@ -625,7 +637,8 @@ impl FileRequest {
                             submitter_text(self.detail_to_submitter, shown, detail)
                         }
                         FileTokenError::UntrustedProvider { .. }
-                        | FileTokenError::UntrustedDestination { .. } => detail,
+                        | FileTokenError::UntrustedDestination { .. }
+                        | FileTokenError::UnboundProvider { .. } => detail,
                     };
                     HttpSubmitInputFetcher::err(text)
                 })?;
@@ -1053,6 +1066,7 @@ impl ResumableBody {
 impl SubmitInputFetcher for HttpSubmitInputFetcher {
     async fn fetch_manifest(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         oauth_metadata_urls: &[String],
@@ -1064,7 +1078,13 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         self.check_source(url)?;
         let shown = redact_url(url);
         let rb = self
-            .build_get(url, request_headers, with_token, oauth_metadata_urls)
+            .build_get(
+                tenant,
+                url,
+                request_headers,
+                with_token,
+                oauth_metadata_urls,
+            )
             .await?;
         let resp = rb.send().await.map_err(|e| {
             self.failure(
@@ -1121,6 +1141,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
     /// buffered whole (the authentication tag trails the ciphertext).
     async fn open_file_stream(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         requires_access_token: bool,
@@ -1138,6 +1159,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             // necessarily buffered; unencrypted ones stream.
             let request = self.file_request(
                 &self.client,
+                tenant,
                 url,
                 request_headers,
                 requires_access_token,
@@ -1156,6 +1178,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
 
         let request = self.file_request(
             &self.stream_client,
+            tenant,
             url,
             request_headers,
             requires_access_token,
@@ -1198,6 +1221,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
 
     async fn file_size(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         requires_access_token: bool,
@@ -1217,7 +1241,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 return Ok(None);
             };
             let token = match provider
-                .token(oauth_metadata_urls, &self.outbound_scope, url)
+                .token(tenant, oauth_metadata_urls, &self.outbound_scope, url)
                 .await
             {
                 Ok(token) => token,
@@ -1250,11 +1274,16 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use aes_gcm::aead::consts::U12;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::Engine;
     use serde_json::json;
+
+    fn tenant() -> TenantId {
+        TenantId::new("t")
+    }
 
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1306,7 +1335,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_get_no_token_succeeds() {
         let rb = fetcher()
-            .build_get("http://example.com/m.json", &[], false, &[])
+            .build_get(&tenant(), "http://example.com/m.json", &[], false, &[])
             .await;
         assert!(rb.is_ok());
     }
@@ -1315,6 +1344,7 @@ mod tests {
     async fn test_build_get_requires_token_without_provider_errors() {
         let result = fetcher()
             .build_get(
+                &tenant(),
                 "http://example.com/file.ndjson",
                 &[],
                 true,
@@ -1336,6 +1366,7 @@ mod tests {
     impl FileTokenProvider for RecordingProvider {
         async fn token(
             &self,
+            _tenant: &TenantId,
             _oauth_metadata_urls: &[String],
             _scope: &str,
             destination: &str,
@@ -1368,6 +1399,7 @@ mod tests {
         let (fetcher, provider) = fetcher_with(Ok("tok".to_string()));
         let rb = fetcher
             .build_get(
+                &tenant(),
                 "http://files.example.org/file.ndjson?sig=SECRET",
                 &[],
                 true,
@@ -1395,6 +1427,7 @@ mod tests {
         }));
         let err = fetcher
             .build_get(
+                &tenant(),
                 "http://files.example.org/file.ndjson?sig=SECRET",
                 &[],
                 true,
@@ -1417,6 +1450,7 @@ mod tests {
             fetcher_with(Err(FileTokenError::Unavailable("down".to_string())));
         let size = fetcher
             .file_size(
+                &tenant(),
                 "http://127.0.0.1:1/file.ndjson",
                 &[],
                 true,
@@ -1436,7 +1470,7 @@ mod tests {
         // Provider headers are applied even on the anonymous path.
         let headers = vec![("X-Custom".to_string(), "value".to_string())];
         let rb = fetcher()
-            .build_get("http://example.com/m.json", &headers, false, &[])
+            .build_get(&tenant(), "http://example.com/m.json", &headers, false, &[])
             .await;
         assert!(rb.is_ok());
     }
@@ -1494,7 +1528,7 @@ mod tests {
 
         let (reader, _len) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            fetcher.open_file_stream(&url, &[], false, &[], None),
+            fetcher.open_file_stream(&tenant(), &url, &[], false, &[], None),
         )
         .await
         .expect("open_file_stream must not wait for the whole body")
@@ -1647,7 +1681,7 @@ mod tests {
 
         let (mut reader, len) = tokio::time::timeout(
             Duration::from_secs(10),
-            fetcher.open_file_stream(url, &[], false, &[], key),
+            fetcher.open_file_stream(&tenant(), url, &[], false, &[], key),
         )
         .await
         .expect("open_file_stream answers")
@@ -1988,7 +2022,7 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/manifest.json?sig=secret123");
         let err = fetcher()
-            .fetch_manifest(&url, &[], &[], None)
+            .fetch_manifest(&tenant(), &url, &[], &[], None)
             .await
             .expect_err("nothing listens")
             .to_string();
@@ -2022,6 +2056,7 @@ mod tests {
 
         let err = fetcher
             .fetch_manifest(
+                &tenant(),
                 &format!("{base}/manifest.json?sig=secret123"),
                 &[],
                 &[],
@@ -2035,13 +2070,20 @@ mod tests {
 
         let err = stream_err(
             fetcher
-                .open_file_stream(&format!("{base}/file.ndjson"), &[], false, &[], None)
+                .open_file_stream(
+                    &tenant(),
+                    &format!("{base}/file.ndjson"),
+                    &[],
+                    false,
+                    &[],
+                    None,
+                )
                 .await,
         );
         assert!(err.contains("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS"), "{err}");
         assert_eq!(
             fetcher
-                .file_size(&format!("{base}/file.ndjson"), &[], false, &[])
+                .file_size(&tenant(), &format!("{base}/file.ndjson"), &[], false, &[])
                 .await
                 .unwrap(),
             None
@@ -2057,6 +2099,7 @@ mod tests {
 
         let err = fetcher
             .fetch_manifest(
+                &tenant(),
                 &format!("{base}/manifest.json?sig=secret123"),
                 &[],
                 &[],
@@ -2072,7 +2115,11 @@ mod tests {
             "http://[::ffff:10.0.0.1]/file.ndjson".to_string(),
             format!("{base}/file.ndjson"),
         ] {
-            let err = stream_err(fetcher.open_file_stream(&url, &[], false, &[], None).await);
+            let err = stream_err(
+                fetcher
+                    .open_file_stream(&tenant(), &url, &[], false, &[], None)
+                    .await,
+            );
             assert!(
                 err.contains("is not a permitted destination"),
                 "{url}: {err}"
@@ -2080,7 +2127,7 @@ mod tests {
         }
         assert_eq!(
             fetcher
-                .file_size(&format!("{base}/file.ndjson"), &[], false, &[])
+                .file_size(&tenant(), &format!("{base}/file.ndjson"), &[], false, &[])
                 .await
                 .unwrap(),
             None
@@ -2091,7 +2138,7 @@ mod tests {
         let named = format!("http://localhost:{port}/file.ndjson");
         let err = stream_err(
             fetcher
-                .open_file_stream(&named, &[], false, &[], None)
+                .open_file_stream(&tenant(), &named, &[], false, &[], None)
                 .await,
         );
         assert!(
@@ -2102,7 +2149,7 @@ mod tests {
 
         fetcher
             .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true))
-            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .fetch_manifest(&tenant(), &format!("{base}/manifest.json"), &[], &[], None)
             .await
             .expect("private networks allowed");
     }
@@ -2119,7 +2166,7 @@ mod tests {
         let (base, _) = scripted_server(vec![redirect]).await;
 
         let err = trusting(&base)
-            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .fetch_manifest(&tenant(), &format!("{base}/manifest.json"), &[], &[], None)
             .await
             .expect_err("the redirect is not followed")
             .to_string();
@@ -2142,7 +2189,7 @@ mod tests {
         let url = format!("{base}/manifest.json?sig=secret123");
 
         let withheld = fetcher()
-            .fetch_manifest(&url, &[], &[], None)
+            .fetch_manifest(&tenant(), &url, &[], &[], None)
             .await
             .expect_err("503")
             .to_string();
@@ -2155,7 +2202,7 @@ mod tests {
         assert!(!withheld.contains("secret123"), "{withheld}");
 
         let shown = trusting(&base)
-            .fetch_manifest(&url, &[], &[], None)
+            .fetch_manifest(&tenant(), &url, &[], &[], None)
             .await
             .expect_err("503")
             .to_string();
@@ -2166,13 +2213,13 @@ mod tests {
         let url = format!("{base}/file.ndjson");
         let withheld = stream_err(
             fetcher()
-                .open_file_stream(&url, &[], false, &[], None)
+                .open_file_stream(&tenant(), &url, &[], false, &[], None)
                 .await,
         );
         assert!(!withheld.contains("HTTP 503"), "{withheld}");
         let shown = stream_err(
             trusting(&base)
-                .open_file_stream(&url, &[], false, &[], None)
+                .open_file_stream(&tenant(), &url, &[], false, &[], None)
                 .await,
         );
         assert!(shown.contains("HTTP 503"), "{shown}");
@@ -2185,6 +2232,7 @@ mod tests {
         let err = fetcher()
             .with_body_limits(1024, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
             .fetch_manifest(
+                &tenant(),
                 &format!("{base}/manifest.json?sig=secret123"),
                 &[],
                 &[],
@@ -2213,7 +2261,7 @@ mod tests {
             scripted_server(vec![Scripted::ok(&gz).header("Content-Encoding: gzip")]).await;
         let err = fetcher()
             .with_body_limits(50_000, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
-            .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+            .fetch_manifest(&tenant(), &format!("{base}/manifest.json"), &[], &[], None)
             .await
             .expect_err("200 000 decoded bytes above a 50 000-byte ceiling")
             .to_string();
@@ -2232,6 +2280,7 @@ mod tests {
         let fetcher = quick_fetcher().with_body_limits(DEFAULT_MAX_MANIFEST_BYTES, 1024);
         let err = match fetcher
             .open_file_stream(
+                &tenant(),
                 &format!("{base}/f.ndjson.jwe"),
                 &[],
                 false,

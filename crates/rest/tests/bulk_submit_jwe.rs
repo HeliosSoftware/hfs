@@ -14,11 +14,16 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use axum::Router;
 use axum::routing::get;
 use base64::Engine;
+use helios_persistence::TenantId;
 use helios_persistence::core::SubmitInputFetcher;
 use helios_rest::bulk_submit_fetcher::HttpSubmitInputFetcher;
 use helios_rest::bulk_submit_oauth::TrustedProviders;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
+
+fn tenant() -> TenantId {
+    TenantId::new("t")
+}
 
 const B64URL: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -82,7 +87,7 @@ async fn serve(build: impl FnOnce(SocketAddr) -> (String, String)) -> SocketAddr
 
 async fn read_all(fetcher: &HttpSubmitInputFetcher, url: &str, key: Option<&Value>) -> String {
     let (mut reader, _len) = fetcher
-        .open_file_stream(url, &[], false, &[], key)
+        .open_file_stream(&tenant(), url, &[], false, &[], key)
         .await
         .expect("open file stream");
     let mut out = String::new();
@@ -123,6 +128,7 @@ async fn encrypted_manifest_and_file_round_trip() {
 
     let manifest = fetcher
         .fetch_manifest(
+            &tenant(),
             &format!("http://{addr}/manifest.json"),
             &[],
             &[],
@@ -146,6 +152,7 @@ async fn plaintext_manifest_is_tolerated_but_plaintext_file_is_not() {
     // Manifests carry URLs rather than PHI, so a cleartext manifest is accepted.
     let manifest = fetcher
         .fetch_manifest(
+            &tenant(),
             &format!("http://{addr}/manifest.json"),
             &[],
             &[],
@@ -157,7 +164,14 @@ async fn plaintext_manifest_is_tolerated_but_plaintext_file_is_not() {
 
     // A cleartext data file, however, is a provider conformance failure.
     let err = fetcher
-        .open_file_stream(&manifest.output[0].url, &[], false, &[], Some(&enc_key))
+        .open_file_stream(
+            &tenant(),
+            &manifest.output[0].url,
+            &[],
+            false,
+            &[],
+            Some(&enc_key),
+        )
         .await
         .err()
         .expect("plaintext file must be rejected");
@@ -170,7 +184,13 @@ async fn unencrypted_submission_is_unaffected() {
 
     let fetcher = fetcher();
     let manifest = fetcher
-        .fetch_manifest(&format!("http://{addr}/manifest.json"), &[], &[], None)
+        .fetch_manifest(
+            &tenant(),
+            &format!("http://{addr}/manifest.json"),
+            &[],
+            &[],
+            None,
+        )
         .await
         .unwrap();
     let body = read_all(&fetcher, &manifest.output[0].url, None).await;
@@ -186,6 +206,7 @@ async fn wrong_key_fails_the_authentication_tag() {
     let fetcher = fetcher();
     let manifest = fetcher
         .fetch_manifest(
+            &tenant(),
             &format!("http://{addr}/manifest.json"),
             &[],
             &[],
@@ -194,7 +215,14 @@ async fn wrong_key_fails_the_authentication_tag() {
         .await
         .unwrap();
     let err = fetcher
-        .open_file_stream(&manifest.output[0].url, &[], false, &[], Some(&wrong))
+        .open_file_stream(
+            &tenant(),
+            &manifest.output[0].url,
+            &[],
+            false,
+            &[],
+            Some(&wrong),
+        )
         .await
         .err()
         .expect("wrong key must fail");
@@ -207,6 +235,7 @@ async fn unusable_key_material_is_rejected_without_a_fetch() {
     let enc_key = json!({"coding": {"code": "pgp"}, "value": "AAAA"});
     let err = fetcher()
         .open_file_stream(
+            &tenant(),
             "http://127.0.0.1:1/never.ndjson",
             &[],
             false,
@@ -224,7 +253,7 @@ async fn unusable_key_material_is_rejected_without_a_fetch() {
 async fn fetcher_is_usable_behind_arc_as_a_trait_object() {
     let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(fetcher());
     let err = fetcher
-        .fetch_manifest("http://127.0.0.1:1/nope.json", &[], &[], None)
+        .fetch_manifest(&tenant(), "http://127.0.0.1:1/nope.json", &[], &[], None)
         .await
         .expect_err("connection refused");
     // No trusted providers are listed, so the transport detail stays in the

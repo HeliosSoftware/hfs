@@ -879,6 +879,15 @@ pub struct BulkSubmitConfig {
     /// fixtures, and providers inside the operator's own network. Set with
     /// `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`.
     pub allow_private_networks: bool,
+    /// The Data Providers each tenant may have HFS fetch from with its
+    /// outbound client identity, as `origin=tenant1|tenant2` entries
+    /// (`HFS_BULK_SUBMIT_PROVIDER_TENANTS`, comma-separated). The origin is
+    /// the `oauthMetadataUrl`'s or the token endpoint's. With outbound OAuth
+    /// configured (`client_id` and `private_key`), a kick-off that names an
+    /// `oauthMetadataUrl` at a provider not mapped to its tenant is refused,
+    /// and so is the token request; empty maps no provider. See
+    /// [`crate::bulk_submit_oauth::ProviderTenants`].
+    pub provider_tenants: Vec<String>,
     /// `Retry-After` (seconds) advertised on an in-progress status poll once
     /// ingestion is under way.
     pub retry_after_secs: u64,
@@ -945,6 +954,7 @@ impl fmt::Debug for BulkSubmitConfig {
             outbound_scope,
             trusted_providers,
             allow_private_networks,
+            provider_tenants,
             retry_after_secs,
             pre_ingest_retry_after_secs,
             manifest_page_size,
@@ -994,6 +1004,7 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("outbound_scope", outbound_scope)
             .field("trusted_providers", trusted_providers)
             .field("allow_private_networks", allow_private_networks)
+            .field("provider_tenants", provider_tenants)
             .field("retry_after_secs", retry_after_secs)
             .field("pre_ingest_retry_after_secs", pre_ingest_retry_after_secs)
             .field("manifest_page_size", manifest_page_size)
@@ -1045,6 +1056,7 @@ impl Default for BulkSubmitConfig {
             outbound_scope: "system/*.rs".to_string(),
             trusted_providers: Vec::new(),
             allow_private_networks: false,
+            provider_tenants: Vec::new(),
             retry_after_secs: 120,
             pre_ingest_retry_after_secs: 10,
             manifest_page_size: 1000,
@@ -1077,6 +1089,12 @@ fn removed_index_during_ingest_error(raw: Option<&str>) -> Option<String> {
 }
 
 impl BulkSubmitConfig {
+    /// Whether HFS has an outbound client identity to fetch protected
+    /// provider files with: both `client_id` and `private_key` are set.
+    pub fn outbound_oauth_configured(&self) -> bool {
+        self.client_id.is_some() && self.private_key.is_some()
+    }
+
     /// The `Retry-After` to advertise while a submission is pre-ingest.
     ///
     /// Two clamps keep the configured value honest. It never exceeds
@@ -1243,6 +1261,15 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS",
                 d.allow_private_networks,
             ),
+            provider_tenants: std::env::var("HFS_BULK_SUBMIT_PROVIDER_TENANTS")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or(d.provider_tenants),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
             pre_ingest_retry_after_secs: env_u64(
                 "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",
@@ -1365,6 +1392,9 @@ impl BulkSubmitConfig {
         }
         if let Err(e) = crate::bulk_submit_oauth::TrustedProviders::parse(&self.trusted_providers) {
             errors.push(format!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"));
+        }
+        if let Err(e) = crate::bulk_submit_oauth::ProviderTenants::parse(&self.provider_tenants) {
+            errors.push(format!("HFS_BULK_SUBMIT_PROVIDER_TENANTS is invalid: {e}"));
         }
         if errors.is_empty() {
             Ok(())
@@ -4102,6 +4132,34 @@ mod tests {
             trusted_providers: vec![
                 "https://auth.example.org".to_string(),
                 "https://files.example.org:8443".to_string(),
+            ],
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_provider_tenants_must_name_an_origin_and_a_tenant() {
+        for (entry, reason) in [
+            ("https://p.example", "is not origin=tenant1|tenant2"),
+            ("https://p.example=", "names no tenant"),
+            ("https://p.example/fhir=t1", "names more than an origin"),
+        ] {
+            let cfg = BulkSubmitConfig {
+                provider_tenants: vec![entry.to_string()],
+                ..BulkSubmitConfig::default()
+            };
+            let errs = cfg.validate().unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("HFS_BULK_SUBMIT_PROVIDER_TENANTS") && e.contains(reason)),
+                "{entry}: {errs:?}"
+            );
+        }
+        let cfg = BulkSubmitConfig {
+            provider_tenants: vec![
+                "https://p.example=t1|t2".to_string(),
+                "https://auth.p.example:8443=t1".to_string(),
             ],
             ..BulkSubmitConfig::default()
         };

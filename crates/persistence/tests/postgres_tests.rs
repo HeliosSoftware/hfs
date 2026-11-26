@@ -26972,6 +26972,7 @@ mod postgres_integration {
     impl helios_persistence::core::SubmitInputFetcher for FixedBookkeepingMeasurementFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -26990,6 +26991,7 @@ mod postgres_integration {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -33841,6 +33843,7 @@ mod postgres_integration {
     impl helios_persistence::core::SubmitInputFetcher for IndependentShutdownFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _request_headers: &[(String, String)],
             _oauth_metadata_urls: &[String],
@@ -33852,6 +33855,7 @@ mod postgres_integration {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             url: &str,
             _request_headers: &[(String, String)],
             _requires_access_token: bool,
