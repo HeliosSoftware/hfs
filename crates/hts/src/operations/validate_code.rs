@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{AppState, VALIDATE_CODE_HANDLER_CACHE_MAX, ValidateCodeHandlerCache};
+use crate::state::{AppState, ValidateCodeHandlerCache};
 use crate::traits::{CodeSystemOperations, SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
@@ -2152,8 +2152,8 @@ fn validate_code_cache_get(cache: &ValidateCodeHandlerCache, key: &str) -> Optio
 /// Insert a successfully-built `$validate-code` response into the per-AppState
 /// cache. Only `result=true` responses are cached so transient false negatives
 /// (e.g. during HTS bootstrap or a prior buggy request shape) are not pinned
-/// for the process lifetime. Drops new entries silently once the cache reaches
-/// [`VALIDATE_CODE_HANDLER_CACHE_MAX`].
+/// for the process lifetime. The entry is dropped silently when the cache
+/// refuses it: see [`crate::state::BoundedCache::insert`].
 fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value: Arc<Value>) {
     let result_true = value
         .get("parameter")
@@ -2169,9 +2169,6 @@ fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value:
         return;
     }
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= VALIDATE_CODE_HANDLER_CACHE_MAX {
-            return;
-        }
         guard.insert(key, value);
     }
 }
