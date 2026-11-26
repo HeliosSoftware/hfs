@@ -1528,14 +1528,15 @@ mod sof_sqlquery_tests {
             .await
     }
 
-    /// A dependency with more rows than `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`
-    /// fails with a 422 that names the dependency, the cap and the setting,
-    /// even when the query's own WHERE would have narrowed it to one row. The
-    /// message must not suggest a WHERE/LIMIT clause: a filter the query
-    /// cannot push into the view (here, one under a function) runs only after
-    /// the dependency is materialized in full.
+    /// #2902: on a backend that speaks SQL the query runs inside the primary
+    /// database, over the compiled view, so no dependency is materialized and
+    /// `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` does not apply. Five patients
+    /// over a cap of three, under a filter no pushdown could move into the
+    /// view (it sits under a function): the query answers with its one row.
+    /// (The cap, and the 422 that names the dependency and the setting, are
+    /// covered for the embedded engine by the unit tests of `graph.rs`.)
     #[tokio::test]
-    async fn dependency_over_the_source_row_cap_returns_422_naming_dependency_and_setting() {
+    async fn dependency_larger_than_the_source_row_cap_runs_in_the_primary_database() {
         let mut config = ServerConfig::for_testing();
         config.sof_sqlquery_max_source_rows_per_vd = 3;
         let (server, backend) = create_test_server_with_config(config).await;
@@ -1550,29 +1551,17 @@ mod sof_sqlquery_tests {
             "t",
             vec![],
         );
-        let response = post_inline_json(&server, lib).await;
+        let response = post_inline_json(&server, lib.clone()).await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows, json!([{ "patient_id": "p1" }]));
 
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
-        let outcome: Value = response.json();
-        let diagnostics = outcome["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap_or_default();
-        for needle in [
-            "dependency 't'",
-            "(ViewDefinition patient_flat)",
-            "exceeds 3-row limit",
-            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
-            "ViewDefinition 'where'",
-        ] {
-            assert!(
-                diagnostics.contains(needle),
-                "missing {needle:?} in: {diagnostics}"
-            );
-        }
-        assert!(
-            !diagnostics.contains("add a WHERE/LIMIT clause"),
-            "{diagnostics}"
-        );
+        // An aggregate over every row of the view is not capped either.
+        let lib = library_with_canonical_vd("SELECT count(*) AS n FROM t", &vd_url, "t", vec![]);
+        let response = post_inline_json(&server, lib).await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows, json!([{ "n": 5 }]));
     }
 
     /// #2574: a plain filter of the query's WHERE on a typed column of its one

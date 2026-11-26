@@ -934,6 +934,57 @@ async fn expand_threshold_above_ceiling_drops_header_and_warns() {
 }
 
 #[tokio::test]
+async fn expand_threshold_uses_the_ceiling_the_client_was_given() {
+    // The `hts` binary hands the UI the ceiling its server enforces
+    // (`HTS_MAX_EXPANSION_SIZE_CEILING`). A threshold below the compiled-in
+    // default but above that ceiling must be dropped, not sent and clamped.
+    let (base, state) = start_mock().await;
+    state.set_canned(CannedResponse::ok_expansion_flat()).await;
+
+    let ui_state = Arc::new(helios_hts_ui::HtsUiState {
+        fhir_version: "R4",
+        version: "9.9.9-test",
+        upstream: helios_hts_ui::UpstreamClient::new_with_timeouts(
+            &base,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .expect("test upstream base URL parses")
+        .with_expansion_size_ceiling(10),
+        bundled_data_bytes: None,
+        metrics_ring: Default::default(),
+    });
+    let response = Router::new()
+        .nest("/ui", helios_hts_ui::router(ui_state))
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/ui/hts/value-sets/example-vs/expand")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from("mode=flat&count=25&offset=0&threshold=42"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let captured = state.snapshot().await;
+    let expand = captured
+        .iter()
+        .find(|c| c.path.contains("/$expand"))
+        .expect("mock must have observed the expand POST");
+    assert!(
+        expand.headers.get("x-too-costly-threshold").is_none(),
+        "a threshold above the configured ceiling must not be attached",
+    );
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"id="expand-ceiling-warning""#),
+        "a threshold above the configured ceiling must render the warning",
+    );
+}
+
+#[tokio::test]
 async fn expand_no_members_renders_neutral_state() {
     // §7.4.1 F11 companion: empty `contains` without a filter renders
     // the `no-members` neutral state, not an error.

@@ -66,11 +66,13 @@ mod sql_views;
 mod subscriptions;
 // Public but hidden: the coordinator's counters and view are what #1849's
 // integration tests and evidence harnesses observe.
+mod cross_site;
 #[doc(hidden)]
 pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
+pub use bulk_import::set_bulk_submit_trusted_providers;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 pub use tenants::register_tenant_purge_output;
 
@@ -1978,6 +1980,15 @@ pub fn mount_with_conformance_source_and_runtime(
         // than act for an anonymous caller (#1619). Inside the locale layer
         // so the refusal is worded in the request's language.
         .layer(middleware::from_fn(refuse_anonymous_storage_access))
+        // With a login installed, the tenant registry and the bulk-import
+        // workspace act for the session only when its verified token carries
+        // a `system/*` scope with the method's permission, as `/admin/tenants`
+        // requires; a session without one is answered `403`. Inside the
+        // locale layer so the refusal is worded in the request's language.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_system_scope,
+        ))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -2002,6 +2013,13 @@ pub fn mount_with_conformance_source_and_runtime(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             login::require_session,
+        ))
+        // Outside the session gate: a form posted by a page on another site
+        // is refused before it can ride the browser's session or, with
+        // authentication off, act for anyone who can reach the UI.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cross_site::refuse_cross_site_writes,
         ))
         .with_state(state)
         // Registered after the UI layers so neither arm of `/` picks them up:
@@ -2118,10 +2136,7 @@ async fn refuse_anonymous_storage_access(
 ) -> Response {
     if bearer_only_auth()
         && acts_on_storage_directly(request.uri().path())
-        && request
-            .extensions()
-            .get::<helios_auth::SessionPrincipal>()
-            .is_none()
+        && request.extensions().get::<login::SignedIn>().is_none()
     {
         let locale = request
             .extensions()

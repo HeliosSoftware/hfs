@@ -25,10 +25,11 @@ use tracing::{debug, trace};
 use helios_sof::arrow::record_batch::RecordBatch;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::declared_columns;
+use helios_sof::sqlquery::{NativeDialect, QueryResult, SqlQueryError};
 
 use crate::core::sof_runner::{
-    BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner, ViewFilters,
-    row_batch_channel, row_stream, watch_row_producer,
+    BatchStream, NativeSqlQuery, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner,
+    ViewFilters, row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -122,6 +123,18 @@ impl SofRunner for SqliteInDbRunner {
         Ok(row_stream(rx))
     }
 
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        Some(NativeDialect::Sqlite)
+    }
+
+    async fn run_sql_query(
+        &self,
+        tenant: &TenantContext,
+        query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        super::sqlite_native::run_sql_query(&self.pool, self.fhir_version, tenant, query).await
+    }
+
     async fn run_view_columnar(
         &self,
         tenant: &TenantContext,
@@ -192,7 +205,7 @@ impl SofRunner for SqliteInDbRunner {
 /// reads and JSON decoding all run outside the async runtime. A run
 /// restricted to one stored FHIR version (#2254) reads only Groups stored
 /// under it (`stored_version`, the closed MIME form `"4.0"`, `"5.0"`, …).
-async fn load_group_documents(
+pub(super) async fn load_group_documents(
     pool: Pool<SqliteConnectionManager>,
     tenant_id: String,
     stored_version: Option<&'static str>,
@@ -239,7 +252,7 @@ async fn load_group_documents(
 }
 
 #[derive(Clone, Debug)]
-enum SqliteParam {
+pub(super) enum SqliteParam {
     Text(String),
     Bool(bool),
     Int(i64),
@@ -250,7 +263,7 @@ enum SqliteParam {
 }
 
 impl SqliteParam {
-    fn from_runtime(value: RuntimeParam) -> Self {
+    pub(super) fn from_runtime(value: RuntimeParam) -> Self {
         match value {
             RuntimeParam::Text(value) => Self::Text(value),
             RuntimeParam::Literal(value) => Self::from_lit(&value),
