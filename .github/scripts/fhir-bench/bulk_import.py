@@ -510,7 +510,11 @@ class HfsProcess(object):
 
     def start(self):
         self._log = open(self.log_path, "ab")
-        self.proc = subprocess.Popen([self.hfs_bin], env=dict(os.environ), cwd=self.cwd,
+        env = dict(os.environ)
+        # The files are served from 127.0.0.1, which $bulk-submit refuses
+        # unless private networks are allowed.
+        env.setdefault("HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS", "true")
+        self.proc = subprocess.Popen([self.hfs_bin], env=env, cwd=self.cwd,
                                      stdout=self._log, stderr=subprocess.STDOUT,
                                      start_new_session=True)
 

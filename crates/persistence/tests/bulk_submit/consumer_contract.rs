@@ -35,6 +35,7 @@ struct MemoryFetcher {
 impl SubmitInputFetcher for MemoryFetcher {
     async fn fetch_manifest(
         &self,
+        _tenant: &persistence::tenant::TenantId,
         _: &str,
         _: &[(String, String)],
         _: &[String],
@@ -45,6 +46,7 @@ impl SubmitInputFetcher for MemoryFetcher {
 
     async fn open_file_stream(
         &self,
+        _tenant: &persistence::tenant::TenantId,
         url: &str,
         _: &[(String, String)],
         _: bool,
@@ -65,6 +67,7 @@ impl SubmitInputFetcher for MemoryFetcher {
 
     async fn file_size(
         &self,
+        _tenant: &persistence::tenant::TenantId,
         url: &str,
         _: &[(String, String)],
         _: bool,

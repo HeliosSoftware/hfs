@@ -31,7 +31,7 @@ use helios_persistence::core::{
 use serde_json::{Value, json};
 
 use super::bulk_common::{first_value, parse_query_pairs};
-use crate::bulk_submit_oauth::TrustedProviders;
+use crate::bulk_submit_oauth::{ProviderTenants, TrustedProviders};
 use crate::config::BulkSubmitConfig;
 use crate::error::{RestError, RestResult};
 use crate::extractors::{PeerIp, TenantExtractor};
@@ -334,7 +334,9 @@ fn check_poll_rate_limit(
 /// the submitter learns it now rather than from a failed manifest. With no
 /// list configured every origin is accepted.
 fn check_sources(req: &SubmitRequest, cfg: &BulkSubmitConfig) -> RestResult<()> {
-    let trusted = TrustedProviders::parse(&cfg.trusted_providers).unwrap_or_default();
+    let trusted = TrustedProviders::parse(&cfg.trusted_providers)
+        .unwrap_or_default()
+        .allowing_private_networks(cfg.allow_private_networks);
     let named = req
         .manifest_url
         .iter()
@@ -345,11 +347,36 @@ fn check_sources(req: &SubmitRequest, cfg: &BulkSubmitConfig) -> RestResult<()> 
                 .map(|url| ("oauthMetadataUrl", url)),
         );
     for (parameter, url) in named {
-        if !trusted.permits_url(url) {
+        if let Some(reason) = trusted.refusal(url) {
             return Err(bad_request(format!(
-                "`{parameter}` {} is not at a trusted Data Provider origin (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS)",
+                "`{parameter}` {} {reason}",
                 redact_url(url)
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a kick-off that would have HFS present its outbound client
+/// identity at a Data Provider the operator has not mapped to the request's
+/// tenant (`HFS_BULK_SUBMIT_PROVIDER_TENANTS`), before anything is stored.
+/// HFS presents that identity only for an `oauthMetadataUrl` and only with
+/// outbound OAuth configured, so a kick-off without either is not checked.
+/// The worker checks the token endpoint the metadata names again.
+fn check_provider_tenants(
+    req: &SubmitRequest,
+    cfg: &BulkSubmitConfig,
+    tenant_id: &str,
+) -> RestResult<()> {
+    if !cfg.outbound_oauth_configured() {
+        return Ok(());
+    }
+    let bindings = ProviderTenants::parse(&cfg.provider_tenants).unwrap_or_default();
+    for url in &req.oauth_metadata_urls {
+        if let Some(reason) = bindings.refusal(url, tenant_id) {
+            return Err(RestError::Forbidden {
+                message: format!("`oauthMetadataUrl` {} {reason}", redact_url(url)),
+            });
         }
     }
     Ok(())
@@ -636,6 +663,7 @@ where
         .map_err(|e| bad_request(format!("invalid Parameters JSON: {e}")))?;
     let req = parse_submit_request(&body)?;
     check_sources(&req, cfg)?;
+    check_provider_tenants(&req, cfg, tenant.tenant_id())?;
 
     validate_import_directives(&req.import_directives, strict)?;
 
@@ -1771,6 +1799,58 @@ mod tests {
         let err = refusal(&["https://auth.example"]).expect("the manifest origin is unlisted");
         assert!(err.contains("manifestUrl"), "{err}");
         assert!(!err.contains("secret123"), "{err}");
+    }
+
+    #[test]
+    fn test_check_provider_tenants_refuses_an_unmapped_provider_with_outbound_oauth() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+                {"name": "submissionId", "valueString": "s1"},
+                {"name": "manifestUrl", "valueUrl": "https://provider.example/manifest.json"},
+                {"name": "fhirBaseUrl", "valueUrl": "https://provider.example/fhir"},
+                {"name": "oauthMetadataUrl", "valueUrl": "https://auth.example/.well-known/smart-configuration?k=secret123"}
+            ]
+        });
+        let req = parse_submit_request(&body).expect("valid");
+        let outbound = |bindings: &[&str]| BulkSubmitConfig {
+            client_id: Some("hfs".to_string()),
+            private_key: Some("pem".to_string()),
+            provider_tenants: bindings.iter().map(|s| s.to_string()).collect(),
+            ..BulkSubmitConfig::default()
+        };
+        let refusal = |cfg: &BulkSubmitConfig, tenant: &str| match check_provider_tenants(
+            &req, cfg, tenant,
+        ) {
+            Ok(()) => None,
+            Err(RestError::Forbidden { message }) => Some(message),
+            Err(other) => panic!("expected a 403, got {other:?}"),
+        };
+
+        assert_eq!(
+            refusal(&BulkSubmitConfig::default(), "t1"),
+            None,
+            "without outbound OAuth HFS presents no identity"
+        );
+
+        let err = refusal(&outbound(&[]), "t1").expect("no mapping refuses");
+        assert!(err.contains("https://auth.example"), "{err}");
+        assert!(err.contains("HFS_BULK_SUBMIT_PROVIDER_TENANTS"), "{err}");
+        assert!(err.contains("'t1'"), "{err}");
+        assert!(!err.contains("secret123"), "{err}");
+
+        let mapped = outbound(&["https://auth.example=t1|t2"]);
+        assert_eq!(refusal(&mapped, "t1"), None);
+        assert_eq!(refusal(&mapped, "t2"), None);
+        let err = refusal(&mapped, "t3").expect("another tenant is refused");
+        assert!(err.contains("'t3'"), "{err}");
+
+        let elsewhere = outbound(&["https://provider.example=t1"]);
+        assert!(
+            refusal(&elsewhere, "t1").is_some(),
+            "the metadata origin is the one that must be mapped"
+        );
     }
 
     #[test]

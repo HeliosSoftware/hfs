@@ -312,6 +312,9 @@ jobs:
             HFS_BULK_SUBMIT_BATCH_SIZE=100
             HFS_BULK_SUBMIT_FILE_URL_TTL=3600
             HFS_BULK_SUBMIT_OUTPUT_TTL=3600
+            # The provider is a local http.server, which $bulk-submit refuses
+            # unless private networks are allowed.
+            HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true
           )
 
           BULK_ENV=()

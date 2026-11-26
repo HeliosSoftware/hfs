@@ -3462,10 +3462,42 @@ async fn build_bulk_submit(
     // go (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS); empty permits every origin.
     let trusted_providers =
         helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
-            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?;
-    if trusted_providers.is_empty() {
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?
+            .allowing_private_networks(cfg.allow_private_networks);
+    if !trusted_providers.is_empty() {
+        if cfg.allow_private_networks {
+            tracing::info!(
+                "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS has no effect: HFS_BULK_SUBMIT_TRUSTED_PROVIDERS already confines $bulk-submit to the listed origins"
+            );
+        }
+    } else if cfg.allow_private_networks {
+        tracing::warn!(
+            "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS is set: $bulk-submit fetches from any origin a submitter names, loopback, private and link-local addresses included (local development and CI only); list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS instead"
+        );
+    } else {
         tracing::info!(
-            "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+            "$bulk-submit fetches from any public origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+        );
+    }
+    // Which tenants may have HFS present its outbound identity at which
+    // provider (HFS_BULK_SUBMIT_PROVIDER_TENANTS); empty maps none.
+    let provider_tenants =
+        helios_rest::bulk_submit_oauth::ProviderTenants::parse(&cfg.provider_tenants)
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_PROVIDER_TENANTS is invalid: {e}"))?;
+    if cfg.outbound_oauth_configured() {
+        if provider_tenants.is_empty() {
+            tracing::warn!(
+                "HFS_BULK_SUBMIT_CLIENT_ID and HFS_BULK_SUBMIT_PRIVATE_KEY are set but HFS_BULK_SUBMIT_PROVIDER_TENANTS maps no Data Provider to a tenant: every $bulk-submit kick-off that names an oauthMetadataUrl is refused with 403 until it does (origin=tenant1|tenant2, comma-separated)"
+            );
+        }
+        if !AuthConfig::from_env().enabled {
+            tracing::warn!(
+                "authentication is disabled and $bulk-submit outbound OAuth is configured: any caller can kick off a submission for a tenant mapped in HFS_BULK_SUBMIT_PROVIDER_TENANTS and have HFS fetch from that tenant's providers with its client identity"
+            );
+        }
+    } else if !provider_tenants.is_empty() {
+        tracing::info!(
+            "HFS_BULK_SUBMIT_PROVIDER_TENANTS has no effect: outbound OAuth is not configured (HFS_BULK_SUBMIT_CLIENT_ID and HFS_BULK_SUBMIT_PRIVATE_KEY)"
         );
     }
     #[cfg(feature = "ui")]
@@ -3480,6 +3512,7 @@ async fn build_bulk_submit(
                     pem,
                     &cfg.signing_alg,
                     trusted_providers.clone(),
+                    provider_tenants,
                 ) {
                     Some(p) => Some(p),
                     None => anyhow::bail!(

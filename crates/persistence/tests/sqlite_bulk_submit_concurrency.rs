@@ -167,6 +167,7 @@ async fn two_workers_run_whole_manifests_to_completion() {
     impl SubmitInputFetcher for MockFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -177,6 +178,7 @@ async fn two_workers_run_whole_manifests_to_completion() {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -298,6 +300,7 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
     impl SubmitInputFetcher for SlowFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -308,6 +311,7 @@ async fn a_file_slower_than_the_lease_stays_leased_to_completion() {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -524,6 +528,7 @@ async fn a_ready_heavy_stream_still_renews_the_lease() {
     impl SubmitInputFetcher for BusyFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -534,6 +539,7 @@ async fn a_ready_heavy_stream_still_renews_the_lease() {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -634,6 +640,7 @@ async fn a_lost_lease_aborts_the_run_and_is_logged_at_warn() {
     impl SubmitInputFetcher for SlowFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -644,6 +651,7 @@ async fn a_lost_lease_aborts_the_run_and_is_logged_at_warn() {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -771,6 +779,7 @@ async fn a_reclaimed_manifest_resumes_past_the_lines_the_dead_worker_committed()
     impl SubmitInputFetcher for InMemoryFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -781,6 +790,7 @@ async fn a_reclaimed_manifest_resumes_past_the_lines_the_dead_worker_committed()
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,
@@ -957,6 +967,7 @@ async fn a_pinned_wal_checkpoint_never_lets_a_rival_reclaim_the_manifest() {
     impl SubmitInputFetcher for TrickleFetcher {
         async fn fetch_manifest(
             &self,
+            _tenant: &helios_persistence::TenantId,
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
@@ -967,6 +978,7 @@ async fn a_pinned_wal_checkpoint_never_lets_a_rival_reclaim_the_manifest() {
 
         async fn open_file_stream(
             &self,
+            _tenant: &helios_persistence::TenantId,
             url: &str,
             _headers: &[(String, String)],
             _requires_access_token: bool,

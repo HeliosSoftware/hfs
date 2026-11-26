@@ -506,7 +506,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
-| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any origin the submitter names, a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status or transport error of a failed fetch stays in the server log rather than in the submitter's error artifact. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any public origin the submitter names (see `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`), a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status or transport error of a failed fetch stays in the server log rather than in the submitter's error artifact. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
+| `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS` | `false` | With no `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` listed, lets `$bulk-submit` reach loopback, private, link-local and shared addresses. Off, a kick-off naming such an address literally is `400`, and a fetch whose host resolves only to such addresses fails. For local development and CI fixtures; list an internal provider's origin in `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` instead. No effect when that list is set. |
+| `HFS_BULK_SUBMIT_PROVIDER_TENANTS` | *(none)* | Comma-separated `origin=tenant1|tenant2` entries: the Data Providers each tenant may have HFS fetch from with its outbound client identity. The origin (`scheme://host[:port]`) is the `oauthMetadataUrl`'s or the token endpoint's; list a provider whose token endpoint is on another origin under both. With `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` set, a kick-off naming an `oauthMetadataUrl` at a provider not mapped to its tenant is refused with `403`, and so is the worker's token request; unset maps no provider, so every such kick-off is refused (**breaking change**, see below). Tokens are cached per tenant. An entry that is not `origin=tenant`, or whose origin has a path, query or fragment, fails startup. No effect without outbound OAuth. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 ##### `$bulk-submit` indexing mode per storage backend
@@ -541,6 +543,32 @@ For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
 `HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
 
+That token is obtained with HFS's own client identity, at a provider the
+submitter names, and what it fetches is ingested into the submitter's tenant.
+So HFS presents its identity at a provider only for the tenants the operator
+mapped to it in `HFS_BULK_SUBMIT_PROVIDER_TENANTS`:
+
+```bash
+HFS_BULK_SUBMIT_PROVIDER_TENANTS="https://ehr.example.org=clinic-a|clinic-b,https://auth.lab.example=lab"
+```
+
+A kick-off whose `oauthMetadataUrl` is at a provider not mapped to the
+request's tenant is refused with `403`; the OperationOutcome names the origin
+and the entry to add. The worker checks again when it asks for a token, for the
+metadata's origin and for the token endpoint that the metadata names, so a
+submission queued before the mapping changed is refused too, with a
+manifest-level error. A token is cached per tenant, never shared between
+tenants. With authentication disabled any caller can kick off a submission for
+a mapped tenant, and the server logs a warning at startup.
+
+**Breaking change (outbound OAuth without a mapping).** Before this mapping
+existed, a server with `HFS_BULK_SUBMIT_CLIENT_ID` and
+`HFS_BULK_SUBMIT_PRIVATE_KEY` set used its identity at any provider for any
+tenant. It now maps no provider until `HFS_BULK_SUBMIT_PROVIDER_TENANTS` is set:
+every kick-off that names an `oauthMetadataUrl` is refused with `403`, and
+the server logs a startup warning saying so. To upgrade, list each Data Provider
+origin with the tenants that pull from it.
+
 The `oauthMetadataUrl`, the `manifestUrl` and the file URLs all come from the
 submitter, so the token never leaves for a host the submitter chose: it is
 attached only to a request whose origin is the token endpoint's own, or one
@@ -553,11 +581,20 @@ The same list confines the fetches themselves. With it set, HFS sends no
 request, redirects included, to an origin that is not listed: a kick-off whose
 `manifestUrl` or `oauthMetadataUrl` is elsewhere is refused with `400`, and a
 manifest output URL elsewhere fails that file with a manifest-level error.
-Without it, HFS fetches from any origin the submitter names, as a Data
-Provider on the same host needs, but the HTTP status or transport error of a
-failed fetch then goes to the server log only: the submitter's error artifact
-says that the fetch failed, not what the address answered, so `$bulk-submit`
-cannot be used to map the network around HFS.
+Without it, HFS fetches from any public origin the submitter names, but the
+HTTP status or transport error of a failed fetch then goes to the server log
+only: the submitter's error artifact says that the fetch failed, not what the
+address answered, so `$bulk-submit` cannot be used to map the network around
+HFS. Nor can it reach that network: without a list, no request (the manifest,
+the metadata document, the token endpoint it names, a file, or a redirect hop)
+goes to a loopback, private (RFC 1918 / RFC 4193), link-local (cloud instance
+metadata included), shared (`100.64.0.0/10`) or unspecified address. A URL
+whose host is such an address is refused before any request, a kick-off naming
+one is `400`, and a host name is resolved through a resolver that drops those
+addresses, so a name that points inward, or rebinds to an inward address,
+has nothing to connect to. Set `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true`
+for local development and for test fixtures served from `127.0.0.1`; for a
+provider inside your own network, list its origin instead.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A

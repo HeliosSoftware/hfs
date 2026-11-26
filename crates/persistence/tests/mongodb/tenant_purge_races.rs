@@ -1248,6 +1248,7 @@ struct SubmitInputFetcherOf {
 impl SubmitInputFetcher for SubmitInputFetcherOf {
     async fn fetch_manifest(
         &self,
+        _tenant: &helios_persistence::TenantId,
         _url: &str,
         _headers: &[(String, String)],
         _oauth: &[String],
@@ -1258,6 +1259,7 @@ impl SubmitInputFetcher for SubmitInputFetcherOf {
 
     async fn open_file_stream(
         &self,
+        _tenant: &helios_persistence::TenantId,
         url: &str,
         _headers: &[(String, String)],
         _requires_access_token: bool,

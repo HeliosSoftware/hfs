@@ -37,6 +37,7 @@ struct MockFetcher {
 impl SubmitInputFetcher for MockFetcher {
     async fn fetch_manifest(
         &self,
+        _tenant: &helios_persistence::TenantId,
         _url: &str,
         _headers: &[(String, String)],
         _oauth: &[String],
@@ -59,6 +60,7 @@ impl SubmitInputFetcher for MockFetcher {
 
     async fn open_file_stream(
         &self,
+        _tenant: &helios_persistence::TenantId,
         url: &str,
         _headers: &[(String, String)],
         _requires_access_token: bool,
@@ -1046,6 +1048,67 @@ async fn test_kickoff_validation_shalls() {
     assert_eq!(
         server.post("/$bulk-submit").json(&body).await.status_code(),
         StatusCode::BAD_REQUEST
+    );
+}
+
+/// With outbound OAuth configured, a kick-off that would have HFS present its
+/// client identity at a provider not mapped to the request's tenant
+/// (`HFS_BULK_SUBMIT_PROVIDER_TENANTS`) is refused with 403.
+#[tokio::test]
+async fn test_kickoff_refuses_a_provider_not_mapped_to_the_tenant() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            client_id: Some("hfs-client".to_string()),
+            private_key: Some("unused".to_string()),
+            provider_tenants: vec!["https://auth.example=test-tenant".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let body = |submission_id: &str, metadata_origin: &str| {
+        json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+                {"name": "submissionId", "valueString": submission_id},
+                {"name": "manifestUrl", "valueUrl": "https://provider/manifest.json"},
+                {"name": "fhirBaseUrl", "valueUrl": "https://provider/fhir"},
+                {"name": "oauthMetadataUrl", "valueUrl": format!("{metadata_origin}/.well-known/smart-configuration")}
+            ]
+        })
+    };
+
+    let refused = server
+        .post("/$bulk-submit")
+        .json(&body("unmapped", "https://other.example"))
+        .await;
+    assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+    let outcome = refused.text();
+    assert!(outcome.contains("https://other.example"), "{outcome}");
+    assert!(
+        outcome.contains("HFS_BULK_SUBMIT_PROVIDER_TENANTS"),
+        "{outcome}"
+    );
+
+    let other_tenant = server
+        .post("/$bulk-submit")
+        .add_header("x-tenant-id", "acme")
+        .json(&body("acme-1", "https://auth.example"))
+        .await;
+    assert_eq!(
+        other_tenant.status_code(),
+        StatusCode::FORBIDDEN,
+        "the provider is mapped to test-tenant only"
+    );
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&body("mapped", "https://auth.example"))
+            .await
+            .status_code(),
+        StatusCode::OK
     );
 }
 
@@ -2504,6 +2567,63 @@ async fn error_receipts_name_the_input_file_and_line() {
     }
 
     assert_eq!(manifest["output"][0]["count"], 1, "{manifest:#}");
+}
+
+/// Without trusted providers, a kick-off naming a loopback, private or
+/// link-local address is refused with 400 before anything is stored, unless
+/// `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS` is set.
+#[tokio::test]
+async fn test_kickoff_refuses_a_private_address_by_default() {
+    let (server, backend, ..) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+
+    for manifest in [
+        "http://127.0.0.1:9/manifest.json?sig=secret123",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[fd00::1]/manifest.json",
+    ] {
+        let refused = server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_at(manifest))
+            .await;
+        assert_eq!(
+            refused.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{manifest}: {}",
+            refused.text()
+        );
+        let text = refused.text();
+        assert!(text.contains("is not a permitted destination"), "{text}");
+        assert!(!text.contains("secret123"), "{text}");
+    }
+    let tenant = TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "it-1");
+    assert_eq!(
+        backend
+            .get_submission_status(&tenant, &sub_id)
+            .await
+            .unwrap(),
+        None,
+        "nothing was stored"
+    );
+
+    let cfg = BulkSubmitConfig {
+        allow_private_networks: true,
+        ..BulkSubmitConfig::default()
+    };
+    let (server, ..) = create_submit_server_with(mock_fetcher(), cfg).await;
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_at("http://127.0.0.1:9/manifest.json"))
+            .await
+            .status_code(),
+        StatusCode::OK,
+        "private networks allowed"
+    );
 }
 
 /// With `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` set, a kick-off naming a manifest

@@ -78,6 +78,7 @@ HFS_ENV_BASE = {
     "HFS_DEFAULT_TENANT": TENANT,
     "HFS_DEFAULT_FHIR_VERSION": "R4",
     "HFS_BULK_SUBMIT_ENABLED": "true",
+    "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS": "true",
     "HFS_BULK_SUBMIT_WORKER_CONCURRENCY": "1",
     "HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT": "1",
     # Poll rate limit defaults to 10 hits / 60 s, which would quantise the

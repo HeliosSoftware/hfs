@@ -14,6 +14,7 @@ use tokio::io::AsyncBufRead;
 use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_submit::SubmissionId;
 use crate::error::StorageResult;
+use crate::tenant::TenantId;
 
 /// A single file entry in a fetched Bulk Export Manifest (`output` / `deleted`).
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +63,15 @@ pub enum FileTokenError {
         /// Origin of the token endpoint that issued the token.
         token_origin: String,
     },
+    /// The Data Provider at `origin` is not mapped to the submission's
+    /// tenant (`HFS_BULK_SUBMIT_PROVIDER_TENANTS`), so HFS does not spend its
+    /// outbound client identity there on that tenant's behalf.
+    UnboundProvider {
+        /// The metadata URL or token endpoint, reduced to its origin.
+        origin: String,
+        /// The tenant the submission belongs to.
+        tenant: String,
+    },
     /// Discovery or the token request did not yield a token.
     Unavailable(String),
 }
@@ -80,6 +90,10 @@ impl std::fmt::Display for FileTokenError {
                 f,
                 "the token is withheld from {destination}: it is not the token endpoint's origin \
                  ({token_origin}) and HFS_BULK_SUBMIT_TRUSTED_PROVIDERS does not list it"
+            ),
+            Self::UnboundProvider { origin, tenant } => write!(
+                f,
+                "{origin} is not a Data Provider of tenant '{tenant}': map it in                  HFS_BULK_SUBMIT_PROVIDER_TENANTS ({origin}={tenant})"
             ),
             Self::Unavailable(reason) => write!(f, "no token could be obtained: {reason}"),
         }
@@ -103,9 +117,13 @@ pub trait FileTokenProvider: Send + Sync {
     /// The metadata URLs and the destination both come from the submitter, so
     /// the implementation decides whether the token may be presented to that
     /// destination at all: a token minted at one provider's endpoint must not
-    /// travel to a host the submitter chose.
+    /// travel to a host the submitter chose. `tenant` is the tenant the
+    /// submission belongs to: HFS uses its outbound identity only at a
+    /// provider the operator mapped to that tenant, and a token obtained for
+    /// one tenant is never served to another.
     async fn token(
         &self,
+        tenant: &TenantId,
         oauth_metadata_urls: &[String],
         scope: &str,
         destination: &str,
@@ -121,8 +139,13 @@ pub trait SubmitInputFetcher: Send + Sync {
     /// `encryption_key` carries the `fileEncryptionKey` descriptor: the submit
     /// spec has the Data Provider encrypt the manifest as well as the files it
     /// lists, so implementations decrypt the response before parsing it.
+    ///
+    /// `tenant` is the tenant the submission belongs to, the one any token
+    /// is obtained for (see [`FileTokenProvider::token`]); the same holds for
+    /// the other methods.
     async fn fetch_manifest(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         oauth_metadata_urls: &[String],
@@ -141,6 +164,7 @@ pub trait SubmitInputFetcher: Send + Sync {
     /// `fileEncryptionKey` descriptor for JWE-encrypted files.
     async fn open_file_stream(
         &self,
+        tenant: &TenantId,
         url: &str,
         request_headers: &[(String, String)],
         requires_access_token: bool,
@@ -160,6 +184,7 @@ pub trait SubmitInputFetcher: Send + Sync {
     /// to lazy accumulation.
     async fn file_size(
         &self,
+        _tenant: &TenantId,
         _url: &str,
         _request_headers: &[(String, String)],
         _requires_access_token: bool,
