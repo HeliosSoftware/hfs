@@ -297,10 +297,14 @@ impl SubscriptionEngine {
         }
     }
 
-    /// The tenant was deregistered or all of its data erased: every topic,
-    /// subscription and bound websocket client of it is dropped, so a later
-    /// occupant of the same tenant id starts from nothing.
-    pub(crate) fn forget_tenant(&self, tenant_id: &str) {
+    /// All of the tenant's data was erased: every topic, subscription and
+    /// bound websocket client of it is dropped, so a later occupant of the same
+    /// tenant id starts from nothing.
+    ///
+    /// Not called for a deregistration alone. That keeps the tenant's data,
+    /// and unless `HFS_TENANT_REQUIRE_PROVISIONED` is set the tenant stays
+    /// usable, so its stored subscriptions must keep delivering.
+    fn forget_tenant(&self, tenant_id: &str) {
         for resource_type in ["Subscription", "SubscriptionTopic", "Basic"] {
             self.forget_type(tenant_id, resource_type);
         }
@@ -342,13 +346,13 @@ impl SubscriptionEngine {
         ) {
             return;
         }
-        if resource_type == "Subscription" {
-            self.core.delivery_stats.remove(tenant_id, id);
-        }
         let tenant = TenantId::new(tenant_id.to_string());
         let view = EventView {
             tenant_id: &tenant,
-            fhir_version: helios_fhir::FhirVersion::default(),
+            // `default_enabled`, not `default`: this compiles without R4. It
+            // is R4 whenever R4 is enabled, the only version with `Basic`
+            // topics.
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
             resource_type,
             resource_id: id,
             version_id: "",
@@ -357,6 +361,11 @@ impl SubscriptionEngine {
             previous_resource: None,
         };
         let _ = self.handle_control(view);
+        // After the deregistration, so a delivery that was still in flight
+        // cannot record into the counters again.
+        if resource_type == "Subscription" {
+            self.core.delivery_stats.remove(tenant_id, id);
+        }
     }
 
     pub(crate) fn observe_write(&self, write: &helios_persistence::core::ResourceWrite) {

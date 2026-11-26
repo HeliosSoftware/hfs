@@ -76,14 +76,16 @@ impl WriteObserver for SubscriptionWriteObserver {
         match event {
             WriteEvent::Resource(write) => self.engine.observe_write(write),
             // A purge erases resources and their history without a
-            // per-resource delete notice, and a deregistered tenant may be
-            // provisioned again: the engine drops the state it derived from
-            // them, as it does for a FHIR delete.
+            // per-resource delete notice: the engine drops the state it
+            // derived from them, as it does for a FHIR delete.
             WriteEvent::Erased { tenant, scope } => {
                 self.engine.observe_erased(tenant.as_str(), scope)
             }
-            WriteEvent::TenantRemoved { tenant } => self.engine.forget_tenant(tenant.as_str()),
-            WriteEvent::Counts { .. } => {}
+            // A deregistration alone keeps the tenant's data, and the tenant
+            // stays usable unless `HFS_TENANT_REQUIRE_PROVISIONED` is set, so
+            // its subscriptions keep delivering. A tenant purge reports
+            // `Erased { Tenant }` first, which is what drops them.
+            WriteEvent::TenantRemoved { .. } | WriteEvent::Counts { .. } => {}
         }
     }
 }
@@ -271,11 +273,11 @@ mod tests {
         );
     }
 
-    /// A purge erases without a delete notice, and a tenant removal carries
-    /// no resource ids at all: both drop what the engine derived from the
-    /// erased data, so nothing keeps delivering to the erased endpoints.
+    /// A purge erases without a delete notice: it drops what the engine
+    /// derived from the erased data, so nothing keeps delivering to the erased
+    /// endpoints. A deregistration alone erases nothing and drops nothing.
     #[tokio::test]
-    async fn erased_and_removed_tenant_events_drop_the_engine_state() {
+    async fn erased_events_drop_the_engine_state_and_a_deregistration_does_not() {
         use crate::topics::{ResourceTrigger, TopicDefinition};
 
         let engine = engine();
@@ -358,20 +360,17 @@ mod tests {
             tenant: TenantId::new("acme".to_string()),
         });
         assert!(
-            settle(|| !registered()).await,
-            "a removed tenant is dropped"
+            registered(),
+            "a deregistered tenant keeps its data and its subscriptions"
         );
         assert!(
             engine
                 .topic_registry()
                 .get_topic("acme", topic_url)
-                .is_none(),
-            "the tenant's topics go with it"
+                .is_some(),
+            "and its topics"
         );
 
-        add_topic();
-        observer.on_write(&create());
-        assert!(settle(registered).await);
         observer.on_write(&WriteEvent::Erased {
             tenant: TenantId::new("acme".to_string()),
             scope: ErasedScope::Tenant,
