@@ -413,6 +413,8 @@ The WebSocket protocol is **unidirectional** (server → client) after binding. 
 
 **Deadlines and queueing:** a connection that sends no bind message within 10 seconds is closed (`1008 bind-timeout`). Each bound client has a queue of 256 notifications; a client that stops reading its socket is given 30 seconds to accept a frame and is dropped once its queue is full, so a stalled client retains no further notifications in the server. It reconnects with a new binding token and replays missed events through `$events`.
 
+**Limits per subscription:** at most 16 clients are bound at a time; a further bind is closed with `1008 too-many-clients` until one disconnects. At most 16 binding tokens are outstanding (issued, unused, unexpired); a further `$get-ws-binding-token` answers `429` with `Retry-After` set to the token lifetime. Each notification is serialized once and every bound client's queue shares those bytes, so the memory a notification holds does not grow with the number of clients.
+
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 
 **Subscription deletion:** Deleting the `Subscription` resource closes all connected WebSocket clients for that subscription.

@@ -3818,6 +3818,7 @@ name = "helios-subscriptions"
 version = "0.2.10"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "dashmap",
  "futures",
