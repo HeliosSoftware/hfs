@@ -26,6 +26,7 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
+//! | `HFS_RATE_LIMIT_IPV6_PREFIX` | 64 | Prefix length an unauthenticated IPv6 client is rate limited by (`$nl-search`, bulk-submit status polls); IPv4 clients are limited per address |
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 (a build without R4 uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
@@ -1907,6 +1908,19 @@ pub struct ServerConfig {
     /// Maximum accepted natural-language input length, in characters.
     #[arg(long, env = "HFS_NL_SEARCH_MAX_CHARS", default_value = "500")]
     pub nl_search_max_chars: usize,
+
+    /// Prefix length, 0 to 128, by which the per-peer rate limits bill an
+    /// unauthenticated IPv6 client (`$nl-search`, bulk-submit status polls).
+    /// A client normally holds a whole /64 and could otherwise take a fresh
+    /// budget from each of its addresses. Lower it for clients whose provider
+    /// hands out a /56 or a /48. IPv4 clients are billed per address.
+    #[arg(
+        long,
+        env = "HFS_RATE_LIMIT_IPV6_PREFIX",
+        default_value = "64",
+        value_parser = clap::value_parser!(u8).range(0..=128)
+    )]
+    pub rate_limit_ipv6_prefix: u8,
     /// Seed the spec conformance resources (SearchParameters and
     /// CompartmentDefinitions) into primary storage for every provisioned tenant
     /// — at startup and on tenant provisioning. Disable to leave storage
@@ -2138,6 +2152,7 @@ impl fmt::Debug for ServerConfig {
             nl_search_rate_window_secs,
             nl_search_daily_limit,
             nl_search_max_chars,
+            rate_limit_ipv6_prefix,
             seed_conformance,
             export_sink,
             export_dir,
@@ -2258,6 +2273,7 @@ impl fmt::Debug for ServerConfig {
             .field("nl_search_rate_window_secs", nl_search_rate_window_secs)
             .field("nl_search_daily_limit", nl_search_daily_limit)
             .field("nl_search_max_chars", nl_search_max_chars)
+            .field("rate_limit_ipv6_prefix", rate_limit_ipv6_prefix)
             .field("seed_conformance", seed_conformance)
             .field("export_sink", export_sink)
             .field("export_dir", export_dir)
@@ -2446,6 +2462,7 @@ impl Default for ServerConfig {
             nl_search_rate_window_secs: 60,
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
+            rate_limit_ipv6_prefix: 64,
             seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
@@ -2810,6 +2827,7 @@ impl ServerConfig {
             nl_search_rate_window_secs: 60,
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
+            rate_limit_ipv6_prefix: 64,
             seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),

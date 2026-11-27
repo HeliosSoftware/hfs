@@ -421,7 +421,8 @@ them, and exposes results through a status manifest.
   poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
-  (principal, else peer address) per poll token. A poll that answers `404` (a token
+  (principal, else peer address, an IPv6 peer by its /64 network per
+  `HFS_RATE_LIMIT_IPV6_PREFIX`) per poll token. A poll that answers `404` (a token
   that resolves to nothing, or to a submission the client may not see) also spends
   one of the client's `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` misses per window, shared by
   all its tokens and checked before the lookup, so inventing tokens earns a `429`
