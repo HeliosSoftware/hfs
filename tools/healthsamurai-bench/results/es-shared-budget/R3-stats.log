@@ -1,0 +1,12 @@
+perf-hfses cpu=0.16% mem=156.6MiB / 20GiB
+perf-es cpu=4.93% mem=2.525GiB / 4GiB
+perf-postgres cpu=3.69% mem=575.2MiB / 30GiB
+perf-hfses cpu=0.00% mem=272.8MiB / 20GiB
+perf-es cpu=6.10% mem=2.612GiB / 4GiB
+perf-postgres cpu=6.18% mem=738.6MiB / 30GiB
+perf-hfses cpu=0.05% mem=264.7MiB / 20GiB
+perf-es cpu=82.21% mem=3.126GiB / 4GiB
+perf-postgres cpu=0.28% mem=7.309GiB / 30GiB
+perf-hfses cpu=3.32% mem=460.5MiB / 20GiB
+perf-es cpu=2.39% mem=3.627GiB / 4GiB
+perf-postgres cpu=0.78% mem=7.309GiB / 30GiB

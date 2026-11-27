@@ -170,6 +170,19 @@ impl EmailChannel {
                 )));
             }
         };
+        // The subscriber's From override is a visible header only. The
+        // envelope reverse-path (MAIL FROM) stays the operator's configured
+        // address: lettre derives it from Sender when one is set, so mail
+        // sent through the operator's relay session is never sent on behalf
+        // of an address a subscriber chose.
+        let server_mailbox = match self.settings.from_address.parse::<Mailbox>() {
+            Ok(mb) => mb,
+            Err(e) => {
+                return Ok(DispatchResult::PermanentError(format!(
+                    "invalid configured From: address: {e}"
+                )));
+            }
+        };
         let subject = overrides.subject.clone().unwrap_or_else(|| {
             render_subject(subscription, &self.settings.default_subject, bundle)
         });
@@ -178,6 +191,7 @@ impl EmailChannel {
         // 5. Assemble the MIME message.
         let mut builder = Message::builder()
             .from(from_mailbox)
+            .sender(server_mailbox)
             .to(to_mailbox)
             .subject(subject);
 
@@ -699,6 +713,18 @@ mod tests {
         assert!(raw.contains("Subject: Custom Subject"));
         assert!(raw.contains("override@example.com"));
         assert!(raw.contains("reply@example.com"));
+        // The override changes the visible From only; the envelope sender
+        // handed to the relay stays the configured address.
+        assert_eq!(
+            sent[0]
+                .envelope()
+                .from()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("hfs@example.test"),
+            "{raw}"
+        );
+        assert!(raw.contains("Sender: hfs@example.test"), "{raw}");
     }
 
     #[tokio::test]
