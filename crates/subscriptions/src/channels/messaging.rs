@@ -229,6 +229,14 @@ impl MessagingChannel {
             if let Some((name, value)) = header.split_once(':') {
                 let name = name.trim();
                 let value = value.trim();
+                if egress::is_refused_delivery_header(name) {
+                    tracing::warn!(
+                        subscription_id = %subscription.id,
+                        header = %name,
+                        "skipping a routing or framing Subscription header"
+                    );
+                    continue;
+                }
                 if name.eq_ignore_ascii_case("authorization") {
                     subscription_supplies_auth = true;
                 }
