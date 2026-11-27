@@ -33,17 +33,51 @@ pub struct RemoteFile {
 /// Parsed leniently, so that provider-specific extensions or omitted optional
 /// fields do not fail the fetch, except for `output`: the manifest requires
 /// it, and without it any JSON object a URL answered would pass as a manifest
-/// with no files and complete the submission empty.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// with no files and complete the submission empty. Only a JSON object is a
+/// manifest: the derived deserializer would also take an array as the fields
+/// in declaration order, so `[false,[]]` would pass as one.
+#[derive(Debug, Clone, Default)]
 pub struct RemoteManifest {
     /// Whether the referenced files require an OAuth bearer token to download.
-    #[serde(rename = "requiresAccessToken", default)]
     pub requires_access_token: bool,
     /// Files containing resources to ingest (create/update).
     pub output: Vec<RemoteFile>,
     /// Files containing transaction Bundles describing resources to delete.
-    #[serde(default)]
     pub deleted: Vec<RemoteFile>,
+}
+
+impl<'de> Deserialize<'de> for RemoteManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(rename = "requiresAccessToken", default)]
+            requires_access_token: bool,
+            output: Vec<RemoteFile>,
+            #[serde(default)]
+            deleted: Vec<RemoteFile>,
+        }
+
+        struct ObjectOnly;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectOnly {
+            type Value = Fields;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Bulk Export manifest object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Fields, A::Error> {
+                Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        let fields = deserializer.deserialize_map(ObjectOnly)?;
+        Ok(Self {
+            requires_access_token: fields.requires_access_token,
+            output: fields.output,
+            deleted: fields.deleted,
+        })
+    }
 }
 
 /// Why a [`FileTokenProvider`] attached no bearer token to a request.
@@ -258,6 +292,24 @@ mod tests {
     #[test]
     fn a_manifest_needs_an_output_array() {
         assert!(serde_json::from_str::<RemoteManifest>(r#"{"status":"ok"}"#).is_err());
+        // An array is not read as the fields in order.
+        for body in ["[false,[]]", "[false,[],[]]", "[[]]", "[]", "null", "\"x\""] {
+            assert!(
+                serde_json::from_str::<RemoteManifest>(body).is_err(),
+                "{body}"
+            );
+        }
+        let full: RemoteManifest = serde_json::from_str(
+            r#"{"transactionTime":"2026-01-01T00:00:00Z","request":"https://p/$export",
+                "requiresAccessToken":true,"error":[],"extension":{"x":1},
+                "output":[{"type":"Patient","url":"https://p/a.ndjson","count":2}],
+                "deleted":[{"url":"https://p/d.ndjson"}]}"#,
+        )
+        .unwrap();
+        assert!(full.requires_access_token);
+        assert_eq!(full.output[0].url, "https://p/a.ndjson");
+        assert_eq!(full.output[0].count, Some(2));
+        assert_eq!(full.deleted.len(), 1);
         let empty: RemoteManifest = serde_json::from_str(r#"{"output":[]}"#).unwrap();
         assert!(empty.output.is_empty());
         assert!(empty.deleted.is_empty());
