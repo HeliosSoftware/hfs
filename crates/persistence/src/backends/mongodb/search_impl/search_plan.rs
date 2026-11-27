@@ -30,6 +30,7 @@ use mongodb::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    num::NonZeroUsize,
     task::Poll,
     time::Duration,
 };
@@ -47,7 +48,11 @@ const COUNT_CANDIDATE_BATCH_ROWS: usize = 4096;
 const RESOURCE_PAGE_SCAN_BUDGET: usize = 100_000;
 // Exact counts need no ordering. Overlap two bounded validations without
 // creating a task per batch or retaining the complete candidate set.
-const COUNT_BATCH_CONCURRENCY: usize = 2;
+const COUNT_BATCH_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+// A mixed `:missing` total (#2233) runs one command at a time: its id stream
+// read, each membership check and the unstamped count never overlap, so it
+// holds at most one pooled connection, as the single aggregation it replaces.
+const MISSING_CHECK_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN;
 // Deep offsets must not grow the global top-k buffer without bound. They keep
 // the streaming page path plus a separate exact count.
 const MAX_COMBINED_PAGE_IDS: usize = 10_000;
@@ -2861,7 +2866,8 @@ pub(super) async fn with_missing_check_batch_rows<F: Future>(rows: usize, future
 /// every check in `checks` (plan order).
 ///
 /// The ids go through [`stream_id_batches`] in batches of
-/// [`COUNT_CANDIDATE_BATCH_ROWS`], two at most in flight. Each batch is one
+/// [`COUNT_CANDIDATE_BATCH_ROWS`] with [`MISSING_CHECK_CONCURRENCY`]: one
+/// command in flight at a time, the next `getMore` included. Each batch is one
 /// membership command per check on `search_index` (`filter_candidates` for
 /// `Require`, `exclude_candidates` for `Exclude`), the same commands a
 /// resource page sends, so no per-resource `$lookup` runs on this side. The
@@ -2899,6 +2905,7 @@ pub(super) async fn count_checked_stamped(
             missing_id: "Stamped resource has no string id",
         },
         batch_rows,
+        MISSING_CHECK_CONCURRENCY,
         &mut total,
         |_, batch| Ok(check_stamped_batch(db, batch, checks)),
         |total, passed| *total += passed,
@@ -2963,23 +2970,32 @@ async fn advance_polling_checks<F: Future>(
 
 /// Streams the string field `id_field` of every row of `cursor` into batches
 /// of at most `batch_rows` ids and [`MAX_CANDIDATE_BYTES`], starts
-/// `start(state, batch)` for each with at most [`COUNT_BATCH_CONCURRENCY`]
-/// checks started and not yet folded, and folds every check's output into
-/// `state` with `finish`.
+/// `start(state, batch)` for each with at most `limit` checks started and
+/// not yet folded, and folds every check's output into `state` with
+/// `finish`.
 ///
-/// Every wait polls every check that has started and not finished, so the
-/// stream holds at most two pooled connections at once: one check and the
-/// cursor's `getMore`, or two checks. Outputs are folded where a single
+/// A check is started right after a cursor read, and when `limit` checks are
+/// then started the stream waits for one before it reads again. Every wait
+/// polls every check that has started and not finished, so the stream holds
+/// at most `limit` pooled connections at once: `limit - 1` checks and the
+/// cursor's `getMore`, or `limit` checks. With a limit of 1 every check
+/// finishes before the next read, so one command is in flight at a time.
+/// Outputs are folded where a single
 /// in-flight queue would fold them (when the limit is reached, and at the
 /// end), so `start` sees the same `state` it always did. The first error
-/// stops the stream; the checks still in flight are polled to completion
-/// before it is returned, so no driver call outlives the caller's admission
-/// permit.
+/// (the search deadline included) stops the stream; the checks still in
+/// flight are polled to completion before it is returned, so on those exits
+/// no driver call outlives the caller's admission permit. A caller that drops
+/// this future instead (a request timeout, a closed connection) drops the
+/// checks with it: the driver closes the connections of their unanswered
+/// commands and frees those pool slots, but a command already sent may still
+/// run on the server.
 pub(super) async fn stream_id_batches<S, T, F>(
     cursor: &mut mongodb::Cursor<Document>,
     id_field: &str,
     text: &IdStreamText,
     batch_rows: usize,
+    limit: NonZeroUsize,
     state: &mut S,
     mut start: impl FnMut(&S, Vec<String>) -> StorageResult<F>,
     mut finish: impl FnMut(&mut S, T),
@@ -3020,7 +3036,7 @@ where
                     state,
                     std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
                 )?);
-                if started.len() + finished.len() == COUNT_BATCH_CONCURRENCY {
+                if started.len() + finished.len() == limit.get() {
                     let output = match finished.pop_front() {
                         Some(output) => Some(output),
                         None => started.next().await,
@@ -3048,7 +3064,8 @@ where
     .await;
     if outcome.is_err() {
         // Another check may already be inside a driver call. Poll it to
-        // completion before releasing the search's admission permit.
+        // completion before releasing the search's admission permit (error
+        // and deadline exits; a dropped future drops the checks instead).
         while started.next().await.is_some() {}
     }
     outcome
@@ -3312,6 +3329,7 @@ impl BatchedIndexPlan {
                 missing_id: "Search candidate is missing resource_id",
             },
             batch_rows,
+            COUNT_BATCH_CONCURRENCY,
             &mut state,
             |(_, page_ids), batch| {
                 Ok(self.count_batch(
