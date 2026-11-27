@@ -877,11 +877,42 @@ impl BackendError {
     }
 }
 
+/// The client text of a server-side storage fault; the detail is logged.
+pub const INTERNAL_STORAGE_TEXT: &str = "internal storage error; the server log has the detail";
+
 impl StorageError {
     /// Whether this error is a transient backend failure; see
     /// [`BackendError::is_unavailable`].
     pub fn is_unavailable(&self) -> bool {
         matches!(self, StorageError::Backend(e) if e.is_unavailable())
+    }
+
+    /// The text a client may see for this error, by the rule the REST error
+    /// path applies: a server-side fault (internal, query, serialization,
+    /// migration, configuration, timeout) is [`INTERNAL_STORAGE_TEXT`] with the
+    /// detail logged at `warn`; an unavailable backend keeps the message its
+    /// backend worded for clients; any other error is about the request
+    /// and keeps its text. For outputs other than the HTTP error body: receipts,
+    /// job status, UI alerts, audit outcome descriptions.
+    pub fn client_text(&self) -> String {
+        match self {
+            StorageError::Backend(
+                BackendError::Internal { .. }
+                | BackendError::QueryError { .. }
+                | BackendError::SerializationError { .. }
+                | BackendError::MigrationError { .. }
+                | BackendError::InvalidConfiguration { .. }
+                | BackendError::Timeout { .. },
+            ) => {
+                tracing::warn!(error = %self, "storage error withheld from a client-visible output");
+                INTERNAL_STORAGE_TEXT.to_string()
+            }
+            StorageError::Backend(
+                BackendError::Unavailable { message, .. }
+                | BackendError::ConnectionFailed { message, .. },
+            ) => message.clone(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -1243,7 +1274,7 @@ pub(crate) fn connection_failed(
 /// the driver text in the log and the fixed client text in the message, as
 /// [`mongodb_unavailable`] does for its driver.
 #[cfg(feature = "sqlite")]
-fn sqlite_unavailable(context: &str, detail: &dyn std::fmt::Display) -> BackendError {
+pub(crate) fn sqlite_unavailable(context: &str, detail: &dyn std::fmt::Display) -> BackendError {
     tracing::warn!(context, error = %detail, "SQLite is busy or locked");
     BackendError::Unavailable {
         backend_name: "sqlite".to_string(),
@@ -1732,6 +1763,49 @@ impl<T> QueryErrorExt<T> for Result<T, mongodb::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_text_withholds_server_side_faults_and_keeps_the_rest() {
+        let withheld = [
+            BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "DispatchFailure 127.0.0.1:59759".to_string(),
+                source: None,
+            },
+            BackendError::QueryError {
+                message: "syntax error at or near SELECT".to_string(),
+            },
+            BackendError::SerializationError {
+                message: "expected value at line 1".to_string(),
+            },
+            BackendError::MigrationError {
+                message: "migration 42 failed".to_string(),
+            },
+            BackendError::InvalidConfiguration {
+                backend_name: "mongodb".to_string(),
+                message: "mongodb://user:secret@host".to_string(),
+            },
+        ];
+        for error in withheld {
+            let text = StorageError::Backend(error).client_text();
+            assert_eq!(text, INTERNAL_STORAGE_TEXT);
+        }
+
+        let unavailable = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "s3".to_string(),
+            message: "the object store could not be reached; retry the request".to_string(),
+        });
+        assert_eq!(
+            unavailable.client_text(),
+            "the object store could not be reached; retry the request"
+        );
+
+        let not_found = StorageError::Resource(ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+        });
+        assert_eq!(not_found.client_text(), not_found.to_string());
+    }
 
     #[test]
     fn test_storage_error_display() {

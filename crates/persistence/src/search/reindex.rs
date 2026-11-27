@@ -4128,7 +4128,10 @@ async fn run_page_stream(
         let page = match fetched {
             Ok(page) => page,
             Err(e) => {
-                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+                return Err(RunExit::Failed(format!(
+                    "Failed to fetch resources: {}",
+                    e.client_text()
+                )));
             }
         };
         // Fetch the next page of THIS stream while this one is written, when
@@ -4255,7 +4258,10 @@ async fn run_named_batches(
         let resources = match fetched {
             Ok(resources) => resources,
             Err(e) => {
-                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+                return Err(RunExit::Failed(format!(
+                    "Failed to fetch resources: {}",
+                    e.client_text()
+                )));
             }
         };
         let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
@@ -11471,14 +11477,16 @@ mod tests {
 
         let progress = await_finished(&op, &job_id).await;
         assert_eq!(progress.status, ReindexStatus::Failed);
+        // `errorMessage` is served by `$reindex-status`: the storage fault's
+        // own text stays in the log.
+        let message = progress.error_message.as_deref().unwrap_or_default();
         assert!(
-            progress
-                .error_message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("injected fetch failure of range p004"),
-            "{:?}",
-            progress.error_message
+            message.contains(crate::error::INTERNAL_STORAGE_TEXT),
+            "{message:?}"
+        );
+        assert!(
+            !message.contains("injected fetch failure of range p004"),
+            "{message:?}"
         );
         assert_eq!(
             source.pages_of("-"),

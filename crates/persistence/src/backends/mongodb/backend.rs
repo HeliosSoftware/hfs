@@ -77,9 +77,9 @@ pub(crate) async fn connect_client_with_stats(
     let mut client_options = ClientOptions::parse(&config.connection_string)
         .await
         .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
+            StorageError::Backend(BackendError::InvalidConfiguration {
                 backend_name: "mongodb".to_string(),
-                message: e.to_string(),
+                message: format!("the MongoDB connection string could not be parsed: {e}"),
             })
         })?;
 

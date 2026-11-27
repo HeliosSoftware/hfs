@@ -926,7 +926,7 @@ where
                     }
                     return Ok(());
                 }
-                self.emit_audit(&lease, view.as_ref(), "failed", "8", Some(&e.to_string()))
+                self.emit_audit(&lease, view.as_ref(), "failed", "8", Some(&e.client_text()))
                     .await;
                 Err(e)
             }
