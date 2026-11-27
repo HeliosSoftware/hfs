@@ -782,6 +782,14 @@ fn is_relative_type_id(value: &str) -> bool {
     !value.starts_with("http://") && !value.starts_with("https://")
 }
 
+/// The `special` parameters `build_parameter_condition` evaluates, by name.
+/// `build_parameter_condition` gives every other `special` parameter with a
+/// value no condition, which the caller refuses ([`unevaluable_parameter`]).
+/// The backend's `SearchProvider::serves_search_param` reads the same list, so
+/// `/metadata` lists only what this builder evaluates (#2593); a test pins the
+/// list to the name dispatch.
+pub(crate) const EVALUATED_SPECIAL_PARAMETERS: [&str; 2] = ["_text", "_content"];
+
 /// The refusal for a parameter the builders have values for but no condition to
 /// build from (#2508): a `special`-typed parameter no arm of
 /// `build_parameter_condition` evaluates (`near`, and from R5 `_type`,
@@ -1928,6 +1936,179 @@ impl PostgresQueryBuilder {
         }
     }
 
+    /// The `search_index` column an unfiltered date-sort walk reads, and the
+    /// name of the index that serves it: the end for a descending sort (the
+    /// key is `MAX(value_date_end)`), the start for an ascending one (the key
+    /// is `MIN(value_date)`), exactly as [`Self::sort_expression`] keys them.
+    pub(crate) fn date_walk_column(desc: bool) -> (&'static str, &'static str) {
+        if desc {
+            ("value_date_end", "idx_search_date_end")
+        } else {
+            ("value_date", "idx_search_date")
+        }
+    }
+
+    /// One page of the ordered date-index walk (#2731): the resources that
+    /// have a value for the date parameter, one row per resource, in key order.
+    ///
+    /// A resource may have several `date` rows. A row is kept only when it is
+    /// the resource's `MAX(value_date_end)` (descending) or `MIN(value_date)`
+    /// (ascending), with the row's physical position breaking a tie between two
+    /// rows of the same value, so each resource appears exactly once and its
+    /// key equals the correlated subquery's. The anti-join filters match that
+    /// subquery's (tenant, type, parameter, no `is_contained` filter).
+    ///
+    /// The join to live `resources` sits before `LIMIT`, so a deleted resource
+    /// never shortens the page.
+    ///
+    /// Bind layout: `$1` tenant, `$2` type, and `$3`/`$4` the cursor's value and
+    /// id when `keyset_condition` references them. `order` is
+    /// `ORDER BY`-ready (`si.<col> ..., si.resource_id ...`).
+    pub(crate) fn date_walk_page_sql(
+        parameter: &str,
+        desc: bool,
+        keyset_condition: Option<&str>,
+        order: &str,
+        limit: usize,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let better = if desc { ">" } else { "<" };
+        let boundary = keyset_condition
+            .map(|c| format!(" AND {c}"))
+            .unwrap_or_default();
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+             si.{col} AS sort_key \
+             FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id \
+             AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             AND r.is_deleted = FALSE \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL{boundary} \
+             AND NOT EXISTS (SELECT 1 FROM search_index s2 \
+             WHERE s2.tenant_id = $1 AND s2.resource_type = $2 \
+             AND s2.resource_id = si.resource_id AND s2.param_name = {lit} \
+             AND (s2.{col} {better} si.{col} \
+             OR (s2.{col} = si.{col} AND s2.ctid < si.ctid))) \
+             ORDER BY {order} LIMIT {limit}{offset}"
+        )
+    }
+
+    /// The resources with no value for the date parameter (#2731), in id
+    /// order, which is where the general path's `NULLS LAST` puts them.
+    ///
+    /// `id_after` is the comparison against the cursor's id (`">"` forward,
+    /// `"<"` backward), bound as `$3`; `id_descending` orders the mirror walk.
+    ///
+    /// The cursor bound is repeated on the anti-join's side
+    /// (`s.resource_id > $3`), which `s.resource_id = r.id` already implies.
+    /// Without it PostgreSQL may answer the anti-join as a merge join over
+    /// `idx_search_resource` that starts at the type's first resource, not at
+    /// the cursor: measured on 20,000 Observations with five parameters each,
+    /// a 21-row page from the middle read 50,541 index entries (19,922
+    /// buffers), so paging through the tail grew with the square of its length.
+    pub(crate) fn date_walk_tail_sql(
+        parameter: &str,
+        desc: bool,
+        id_after: Option<&str>,
+        id_descending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let boundary = id_after
+            .map(|op| format!(" AND r.id {op} $3"))
+            .unwrap_or_default();
+        let probe_boundary = id_after
+            .map(|op| format!(" AND s.resource_id {op} $3"))
+            .unwrap_or_default();
+        let dir = if id_descending { "DESC" } else { "ASC" };
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, \
+             NULL::timestamptz AS sort_key \
+             FROM resources r \
+             WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE{boundary} \
+             AND NOT EXISTS (SELECT 1 FROM search_index s \
+             WHERE s.tenant_id = $1 AND s.resource_type = $2 \
+             AND s.resource_id = r.id{probe_boundary} \
+             AND s.param_name = {lit} AND s.{col} IS NOT NULL) \
+             ORDER BY r.id {dir} LIMIT {limit}{offset}"
+        )
+    }
+
+    /// The key at the head of a walk page (#2731): the date row `offset` rows
+    /// in from the start of the key order (`from_end`: from its end), read
+    /// from the date index alone. It feeds the tie-group probe, so it skips
+    /// the walk's one-row-per-resource rule and its join to live resources:
+    /// both would make it read the very group it is sizing. No row means the
+    /// offset is past the keyed part. Bind layout: `$1` tenant, `$2` type.
+    pub(crate) fn date_walk_head_key_sql(
+        parameter: &str,
+        desc: bool,
+        from_end: bool,
+        offset: usize,
+    ) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let dir = if desc != from_end { "DESC" } else { "ASC" };
+        let offset = if offset > 0 {
+            format!(" OFFSET {offset}")
+        } else {
+            String::new()
+        };
+        format!(
+            "SELECT si.{col} FROM search_index si \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL \
+             ORDER BY si.{col} {dir} LIMIT 1{offset}"
+        )
+    }
+
+    /// The size of the equal-key group `$3` belongs to, counted up to
+    /// `cap + 1` rows (#2731): the walk orders `key, id`, so it reads and sorts
+    /// a whole group before the first row of a page in it, and a group above
+    /// `cap` sends the page to the general statement
+    /// (`DATE_WALK_MAX_TIE_GROUP`). The `LIMIT` bounds the probe itself.
+    /// Bind layout: `$1` tenant, `$2` type, `$3` the key.
+    pub(crate) fn date_walk_tie_group_sql(parameter: &str, desc: bool, cap: usize) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        let limit = cap.saturating_add(1);
+        format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM search_index si \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} = $3 LIMIT {limit}) tie"
+        )
+    }
+
+    /// How many live resources have a value for the date parameter; the size
+    /// of the walk's keyed part, which an offset past it needs (#2731).
+    pub(crate) fn date_walk_keyed_count_sql(parameter: &str, desc: bool) -> String {
+        let (col, _) = Self::date_walk_column(desc);
+        let lit = sql_string_literal(parameter);
+        format!(
+            "SELECT COUNT(DISTINCT si.resource_id) FROM search_index si \
+             JOIN resources r ON r.tenant_id = si.tenant_id \
+             AND r.resource_type = si.resource_type AND r.id = si.resource_id \
+             AND r.is_deleted = FALSE \
+             WHERE si.tenant_id = $1 AND si.resource_type = $2 \
+             AND si.param_name = {lit} AND si.{col} IS NOT NULL"
+        )
+    }
+
     /// Builds a condition for a single search parameter.
     ///
     /// `None` means "no condition for this parameter", which is only the right
@@ -1958,12 +2139,28 @@ impl PostgresQueryBuilder {
             return Some(match_nothing());
         }
 
-        // Handle special parameters
+        // `_id` and `_lastUpdated` are built from `resources` by name, whatever
+        // type the parameter carries, so the gate below is not theirs.
         match param.name.as_str() {
             "_id" => return Self::build_id_condition(param, param_offset),
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
+            _ => {}
+        }
+
+        // A `special` parameter is evaluated only when it is one of
+        // `EVALUATED_SPECIAL_PARAMETERS`, the list this backend's
+        // `serves_search_param` answers from, so `/metadata` and this refusal
+        // read one declaration (#2593). Each listed name has an arm in the
+        // name dispatch below; a test pins the two together.
+        if param.param_type == SearchParamType::Special
+            && !EVALUATED_SPECIAL_PARAMETERS.contains(&param.name.as_str())
+        {
+            return None;
+        }
+
+        match param.name.as_str() {
             // Full text over the generated narrative (`_text`) and over the whole
             // serialized resource (`_content`), against the same `resource_fts`
             // tsvector columns the write path populates.
@@ -5806,6 +6003,70 @@ mod tests {
         }
     }
 
+    /// `EVALUATED_SPECIAL_PARAMETERS`, which `serves_search_param` and so
+    /// `/metadata` read, is what the builder evaluates (#2593), in both index
+    /// layouts: of every `special` parameter the enabled specs register, and
+    /// `_text` and `_content`, the ones it names build and every other is
+    /// refused. `_list` and `_has`, which REST
+    /// resolves before `search` runs, are refused if they reach it.
+    #[test]
+    fn the_evaluated_special_parameters_are_the_ones_the_builder_evaluates() {
+        for code in crate::core::search::special_search_param_codes() {
+            let query = SearchQuery::new("Location")
+                .with_parameter(special_param(&code, vec![SearchValue::eq("x")]));
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout);
+                if EVALUATED_SPECIAL_PARAMETERS.contains(&code.as_str()) {
+                    built.unwrap_or_else(|e| panic!("{code} is listed as evaluated: {e:?}"));
+                } else {
+                    match built {
+                        Err(SearchError::QueryParseError { message }) => {
+                            assert!(message.contains("widen"), "{code}: {message}")
+                        }
+                        other => panic!("{code} is not listed as evaluated, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gate on `special` parameters is not in the way of the names the
+    /// builder builds whatever their type (#2593): `_id` and `_lastUpdated`,
+    /// typed `special`, build the same condition as with their registry type,
+    /// in both index layouts, as they did before the gate.
+    #[test]
+    fn the_names_built_by_name_are_not_gated_as_special() {
+        for (name, registry_type, value) in [
+            ("_id", SearchParamType::Token, SearchValue::eq("p1")),
+            (
+                "_lastUpdated",
+                SearchParamType::Date,
+                SearchValue::new(crate::types::SearchPrefix::Gt, "2020-01-01"),
+            ),
+        ] {
+            for layout in [IndexLayout::Denormalized, IndexLayout::Legacy] {
+                let build = |param_type| {
+                    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                        name: name.to_string(),
+                        param_type,
+                        modifier: None,
+                        values: vec![value.clone()],
+                        chain: vec![],
+                        components: vec![],
+                    });
+                    let built = PostgresQueryBuilder::build_search_query_for(&query, 2, layout)
+                        .unwrap_or_else(|e| panic!("{name} as {param_type:?} ({layout:?}): {e:?}"));
+                    format!("{built:?}")
+                };
+                assert_eq!(
+                    build(SearchParamType::Special),
+                    build(registry_type),
+                    "{name} ({layout:?})"
+                );
+            }
+        }
+    }
+
     /// #2508: beside a parameter that does filter, the unevaluable one still
     /// refuses the query. Building only the valid condition is a wider search
     /// than the one asked, which is the same defect as building none.
@@ -6255,6 +6516,63 @@ mod tests {
                 assert_eq!(next, 7);
             }
         }
+    }
+
+    /// #2731: the date-index walk keys a resource exactly as the correlated
+    /// sort subquery does: the end descending, the start ascending, over the
+    /// same (tenant, type, parameter) rows, one row per resource, with the live
+    /// join before the `LIMIT`.
+    #[test]
+    fn the_date_walk_keys_like_the_sort_subquery() {
+        let (col, index) = PostgresQueryBuilder::date_walk_column(true);
+        assert_eq!((col, index), ("value_date_end", "idx_search_date_end"));
+        let (col, index) = PostgresQueryBuilder::date_walk_column(false);
+        assert_eq!((col, index), ("value_date", "idx_search_date"));
+
+        let desc = PostgresQueryBuilder::date_walk_page_sql(
+            "date",
+            true,
+            Some("(si.value_date_end < $3 OR (si.value_date_end = $3 AND si.resource_id > $4))"),
+            "si.value_date_end DESC, si.resource_id ASC",
+            21,
+            0,
+        );
+        assert!(
+            desc.contains("s2.value_date_end > si.value_date_end"),
+            "{desc}"
+        );
+        assert!(desc.contains("s2.ctid < si.ctid"), "{desc}");
+        assert!(desc.contains("r.is_deleted = FALSE"), "{desc}");
+        assert!(desc.contains("AND si.param_name = 'date'"), "{desc}");
+        assert!(!desc.contains("is_contained"), "{desc}");
+        assert!(
+            desc.ends_with("ORDER BY si.value_date_end DESC, si.resource_id ASC LIMIT 21"),
+            "{desc}"
+        );
+        let asc = PostgresQueryBuilder::date_walk_page_sql(
+            "date",
+            false,
+            None,
+            "si.value_date ASC, si.resource_id ASC",
+            21,
+            40,
+        );
+        assert!(asc.contains("s2.value_date < si.value_date"), "{asc}");
+        assert!(asc.ends_with("LIMIT 21 OFFSET 40"), "{asc}");
+
+        // The unkeyed ones: no value in the column the key reads.
+        let tail = PostgresQueryBuilder::date_walk_tail_sql("date", true, Some(">"), false, 5, 0);
+        assert!(tail.contains("s.value_date_end IS NOT NULL"), "{tail}");
+        assert!(tail.contains("AND r.id > $3"), "{tail}");
+        // The probe side carries the cursor bound too (see the builder).
+        assert!(tail.contains("AND s.resource_id > $3"), "{tail}");
+        assert!(tail.ends_with("ORDER BY r.id ASC LIMIT 5"), "{tail}");
+        let mirror = PostgresQueryBuilder::date_walk_tail_sql("date", false, Some("<"), true, 5, 2);
+        assert!(mirror.contains("s.value_date IS NOT NULL"), "{mirror}");
+        assert!(
+            mirror.ends_with("ORDER BY r.id DESC LIMIT 5 OFFSET 2"),
+            "{mirror}"
+        );
     }
 
     /// `_sort=-date` orders by where each resource's latest range ends, so a

@@ -61,6 +61,7 @@ pub async fn create_handler<S>(
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     compartment: PatientCompartment,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
@@ -90,6 +91,15 @@ where
             fhir_version,
             &resource,
             "create",
+        )?;
+    }
+
+    if conditional.if_none_exist().is_some() {
+        super::conditional_support::require_search_grant(
+            principal.as_ref().map(|p| &p.0),
+            &resource_type,
+            helios_persistence::core::ConditionalInteraction::Create,
+            None,
         )?;
     }
 

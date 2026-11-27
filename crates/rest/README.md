@@ -442,6 +442,13 @@ them, and exposes results through a status manifest.
   the receipts and `error` artifact are still published. Per-entry errors stay
   partial success. Input URLs are redacted (query, fragment, credentials) in every
   error message, artifact and log line.
+- **`fileRequestHeader`**: sent on the manifest, size-probe and file requests, after
+  the headers HFS sets, so a provider credential (`Authorization`) wins. A header
+  that routes the request or frames the transfer is refused with `400` on the
+  kick-off: `Host`, `Range`, `If-Range`, `Accept-Encoding`, `Content-Length`,
+  `Transfer-Encoding`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive` and
+  `Proxy-*`. The trusted-provider check judges the URL, and `Host` would otherwise
+  pick the backend that answers on an origin that routes by it.
 - **Resume after a lease reclaim**: every backend records each output file the
   worker walked to its end, and the run that reclaims the manifest skips those
   files; the file that was in flight resumes past the lines its committed batches
@@ -506,7 +513,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
-| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any origin the submitter names, a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status or transport error of a failed fetch stays in the server log rather than in the submitter's error artifact. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any origin the submitter names, a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status, transport error or body detail (a manifest parse error, a failed decryption, a body above its ceiling) of a failed fetch stays in the server log rather than in the submitter's error artifact. A body that is not a JSON object with an `output` array is not a manifest and fails the manifest instead of completing it empty. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 ##### `$bulk-submit` indexing mode per storage backend
@@ -554,10 +561,12 @@ request, redirects included, to an origin that is not listed: a kick-off whose
 `manifestUrl` or `oauthMetadataUrl` is elsewhere is refused with `400`, and a
 manifest output URL elsewhere fails that file with a manifest-level error.
 Without it, HFS fetches from any origin the submitter names, as a Data
-Provider on the same host needs, but the HTTP status or transport error of a
-failed fetch then goes to the server log only: the submitter's error artifact
-says that the fetch failed, not what the address answered, so `$bulk-submit`
-cannot be used to map the network around HFS.
+Provider on the same host needs, but the detail of a failed fetch then goes to
+the server log only: the HTTP status, the transport error, a manifest that
+does not parse, a file that is not the JWE its `fileEncryptionKey` promises,
+an unsupported `Content-Encoding`, or a body above its byte ceiling. The
+submitter's error artifact says that the fetch failed, not what the address
+answered, so `$bulk-submit` cannot be used to map the network around HFS.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
@@ -663,9 +672,9 @@ which subject failed without parsing the message.
 |----------|---------|-------------|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
-| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized before the query's `WHERE` runs; a plain `column = literal` / `<>` / `IS [NOT] NULL` filter of a single-table query on a typed top-level column is pushed into the view first, so only the rows it keeps count. Otherwise narrow the view with its own `where`, or raise this limit. |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | MongoDB and S3 only: maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). There each dependency is materialized before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it (narrow the view with its own `where`, or raise this limit). Not used on SQLite and PostgreSQL, which run the query inside the primary database and materialize nothing |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
-| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs: the subject's SQL, each SQL View's SQL, and the materialization of each ViewDefinition it depends on. On PostgreSQL the view's statement runs under this budget (`SET LOCAL statement_timeout` on its own transaction), so `HFS_PG_STATEMENT_TIMEOUT_MS` does not cut it short. A query that runs out of it answers `504` with an OperationOutcome code of `timeout`. A `$sql-export` job bounds each statement the same way but not the read of a dependency as a whole, and a job that runs out of the limit fails with `504` / `timeout`. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for a SQL Query. On SQLite and PostgreSQL the query is one statement in the primary database and this bounds it (on PostgreSQL as `SET LOCAL statement_timeout`, so `HFS_PG_STATEMENT_TIMEOUT_MS` does not cut it short). On MongoDB and S3 it bounds each step: the query's own SQL, each SQL View's, and the materialization of each ViewDefinition it depends on; a `$sql-export` job there bounds each statement but not the read of a dependency as a whole. Exceeding it answers `504` with code `timeout` |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup, and `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
@@ -1020,6 +1029,16 @@ Likewise `search-type` and the `searchParam`, `searchInclude` and
 (`SearchProvider::supports_search`, #514): a standalone S3 deployment answers
 every search `501`, and its `/metadata` lists none of them. A composite answers
 for the provider its search reaches, so `s3-elasticsearch` advertises search.
+
+Where the storage searches, `searchParam` lists only the parameters it serves
+(`SearchProvider::serves_search_param`, #2593), the common `_text` and
+`_content` included, and `searchInclude` / `searchRevInclude` drop each
+`Type:code` whose reference parameter it does not serve. `_list` and `_in`,
+which this layer resolves into an `_id` filter, are listed where the storage
+serves `_id`. A composite is listed only when each of its components is in the
+registry and served. No backend evaluates `Location.near` (or, from R5,
+`Location.contains` and `Composition.section-text`), so none lists them, and
+MongoDB, which answers `_text` and `_content` with `501`, lists neither.
 
 ### Current Limitations
 

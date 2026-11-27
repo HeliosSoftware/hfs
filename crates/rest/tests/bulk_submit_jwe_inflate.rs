@@ -16,6 +16,7 @@ use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use helios_persistence::core::SubmitInputFetcher;
 use helios_rest::bulk_submit_fetcher::HttpSubmitInputFetcher;
+use helios_rest::bulk_submit_oauth::TrustedProviders;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
@@ -73,8 +74,14 @@ fn enc_key() -> Value {
     json!({"value": B64URL.encode(KEY)})
 }
 
-fn fetcher(manifest: u64, file: u64) -> HttpSubmitInputFetcher {
-    HttpSubmitInputFetcher::new(None, "system/*.rs".to_string()).with_body_limits(manifest, file)
+/// A fetcher with the given ceilings that trusts the test server, so that a
+/// refusal reads with its detail rather than the fixed sentence.
+fn fetcher(addr: &SocketAddr, manifest: u64, file: u64) -> HttpSubmitInputFetcher {
+    HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+        .with_body_limits(manifest, file)
+        .with_trusted_providers(
+            TrustedProviders::parse([format!("http://{addr}")]).expect("test origin parses"),
+        )
 }
 
 async fn open(f: &HttpSubmitInputFetcher, addr: SocketAddr) -> Result<usize, String> {
@@ -102,7 +109,7 @@ async fn open(f: &HttpSubmitInputFetcher, addr: SocketAddr) -> Result<usize, Str
 async fn file_bomb_is_refused_at_the_encrypted_file_ceiling() {
     let jwe = seal_def(&vec![b'a'; 8 * 1024 * 1024]);
     let addr = serve(String::new(), jwe).await;
-    let got = open(&fetcher(64 * 1024, 1024 * 1024), addr).await;
+    let got = open(&fetcher(&addr, 64 * 1024, 1024 * 1024), addr).await;
     let err = got.expect_err("an 8 MiB inflate must be refused at a 1 MiB ceiling");
     assert!(err.contains("ceiling"), "{err}");
 }
@@ -121,7 +128,7 @@ async fn manifest_bomb_is_refused_at_the_manifest_ceiling() {
     manifest.push_str(&" ".repeat(4 * 1024 * 1024));
     let jwe = seal_def(manifest.as_bytes());
     let addr = serve(jwe, String::new()).await;
-    let got = fetcher(64 * 1024, 1024 * 1024)
+    let got = fetcher(&addr, 64 * 1024, 1024 * 1024)
         .fetch_manifest(
             &format!("http://{addr}/manifest.json"),
             &[],

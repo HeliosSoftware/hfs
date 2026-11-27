@@ -3,8 +3,11 @@
 //! Callers choose candidates, ordering and totals. This module chooses indexes,
 //! bounds membership to those candidates and applies operation-specific retries.
 
+use super::super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_LIVENESS_INDEX};
 use super::super::search_deadline::{self, SearchCommand};
-use super::super::search_index_catalog::{SEARCH_COMPOSITE_INDEX, SEARCH_DATE_RANGE_INDEX};
+use super::super::search_index_catalog::{
+    SEARCH_COMPOSITE_INDEX, SEARCH_DATE_END_INDEX, SEARCH_DATE_RANGE_INDEX,
+};
 use super::internal_error;
 use crate::error::{QueryErrorExt, StorageResult};
 use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix};
@@ -16,17 +19,30 @@ use std::collections::HashSet;
 
 pub(super) const SEARCH_TOKEN_MEMBERSHIP_INDEX: &str = "idx_search_token_v2";
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum IndexAccess {
     Automatic,
     DateRange,
     DateEndRange,
 }
 
+/// Whether a root `$and` (a cursor frontier around the predicate) holds a
+/// `$or` among its terms.
+fn wraps_or(filter: &Document) -> bool {
+    filter.get_array("$and").is_ok_and(|terms| {
+        terms
+            .iter()
+            .any(|term| term.as_document().is_some_and(|d| d.contains_key("$or")))
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PredicateAccess {
     pub(super) discovery: IndexAccess,
     membership: MembershipAccess,
+    /// Name of the date index hinted for discovery. `None` leaves the choice
+    /// to MongoDB, which plans each arm of a root `$or` separately.
+    date_hint: Option<&'static str>,
 }
 
 impl Default for PredicateAccess {
@@ -34,12 +50,34 @@ impl Default for PredicateAccess {
         Self {
             discovery: IndexAccess::Automatic,
             membership: MembershipAccess::CandidateIds,
+            date_hint: None,
         }
     }
 }
 
 impl PredicateAccess {
+    #[cfg(test)]
     pub(super) fn new(filter: &Document, parameter: &SearchParameter, indexes_ready: bool) -> Self {
+        Self::new_with_date_end(filter, parameter, indexes_ready, false)
+    }
+
+    /// As [`Self::new`], also choosing `idx_search_date_end` for predicates
+    /// bounded on the end of the stored range when that index is ready (#2601).
+    ///
+    /// A hint applies to the whole query, so it is only used for a flat filter
+    /// whose single bound is `value_date_end`. A root `$or` (`ge`, `ne`, comma
+    /// lists) mixes end-bounded and start-bounded arms and stays unhinted so
+    /// MongoDB plans each arm. A root `$and` (a cursor frontier wrapped around
+    /// the predicate) is judged by what it wraps: a single end-bounded arm
+    /// (`gt`) keeps the end hint, which the extra `resource_id` bound does not
+    /// change (59k keys against 997k under v3); a wrapped `$or` (`ge`, `ne`)
+    /// stays unhinted. Without the end index every shape keeps the v3 hint.
+    pub(super) fn new_with_date_end(
+        filter: &Document,
+        parameter: &SearchParameter,
+        indexes_ready: bool,
+        date_end_ready: bool,
+    ) -> Self {
         if !indexes_ready {
             return Self::default();
         }
@@ -57,9 +95,30 @@ impl PredicateAccess {
         } else {
             IndexAccess::DateRange
         };
+        // `ap` bounds the start from above and the end from below. The v3
+        // hint seeks the start only and reads every row that starts before the
+        // window's end: 27,973 keys where `idx_search_date_end` read 2
+        // (#2601). Which side is narrower depends on the value, so once the
+        // end index is ready MongoDB chooses.
+        let approximate = parameter
+            .values
+            .iter()
+            .all(|value| value.prefix == SearchPrefix::Ap);
+        let date_hint = match discovery {
+            IndexAccess::Automatic => None,
+            IndexAccess::DateRange if approximate && date_end_ready => None,
+            IndexAccess::DateRange => Some(SEARCH_DATE_RANGE_INDEX),
+            IndexAccess::DateEndRange if !date_end_ready => Some(SEARCH_DATE_RANGE_INDEX),
+            IndexAccess::DateEndRange if filter.contains_key("$or") => None,
+            // A wrapped `ge`/`ne` keeps its `$or` inside the `$and`: the end
+            // hint reads ~1M keys there (#2601), v3 too, so MongoDB plans.
+            IndexAccess::DateEndRange if wraps_or(filter) => None,
+            IndexAccess::DateEndRange => Some(SEARCH_DATE_END_INDEX),
+        };
         Self {
             discovery,
             membership: token_membership_access(filter, parameter),
+            date_hint,
         }
     }
 
@@ -70,16 +129,12 @@ impl PredicateAccess {
         Self {
             discovery: IndexAccess::Automatic,
             membership: MembershipAccess::Automatic,
+            date_hint: None,
         }
     }
 
     pub(super) fn discovery_hint(self) -> Option<Hint> {
-        match self.discovery {
-            IndexAccess::Automatic => None,
-            IndexAccess::DateRange | IndexAccess::DateEndRange => {
-                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-            }
-        }
+        self.date_hint.map(|name| Hint::Name(name.to_owned()))
     }
 }
 
@@ -180,33 +235,66 @@ pub(super) fn membership_pipeline(predicate: &Document, ids: &[String]) -> Vec<D
 }
 
 pub(super) fn date_hint_rejected(hint: &Option<Hint>, error: &mongodb::error::Error) -> bool {
-    *hint == Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned())) && hint_rejected(error)
+    [SEARCH_DATE_RANGE_INDEX, SEARCH_DATE_END_INDEX]
+        .iter()
+        .any(|name| *hint == Some(Hint::Name((*name).to_owned())))
+        && hint_rejected(error)
 }
 
-/// Runs `operation` with `hint`. When the hint names the date range index and
+/// The liveness index, hinted by every read that asks which candidate ids
+/// are live (#2601).
+pub(super) fn liveness_hint() -> Option<Hint> {
+    Some(Hint::Name(RESOURCES_LIVENESS_INDEX.to_owned()))
+}
+
+/// The hint to run again with when the server rejects `hint` because its
+/// index is missing, or `None` when the rejection must propagate: no hint
+/// for a date index, the required identity index for the liveness index.
+fn fallback_for_rejected(
+    hint: &Option<Hint>,
+    error: &mongodb::error::Error,
+) -> Option<Option<Hint>> {
+    if date_hint_rejected(hint, error) {
+        return Some(None);
+    }
+    (*hint == liveness_hint() && hint_rejected(error))
+        .then(|| Some(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned())))
+}
+
+/// Runs `operation` with `hint`. When the hint names a date index and
 /// the server rejects it because the index is gone, which happens on a node
 /// still hinting a superseded value index that a newer node has dropped
-/// (rolling upgrade), runs the operation once more without it. The identity
-/// index is required, so a rejection of that hint propagates.
-pub(super) async fn with_hint_fallback<T, F>(
+/// (rolling upgrade), runs the operation once more without it. A rejected
+/// liveness hint (an index dropped by hand, or a store that has not booted
+/// this build) runs once more on the identity index, which reads the same
+/// ids with a fetch. The identity index is required, so a rejection of that
+/// hint propagates.
+///
+/// Not an `async fn`: `#[track_caller]` has no effect on one, and the command
+/// is tagged with the line that called this helper, not with a line in here.
+#[track_caller]
+pub(super) fn with_hint_fallback<T, F>(
     mut hint: Option<Hint>,
     operation: impl Fn(Option<Hint>) -> F,
-) -> StorageResult<mongodb::error::Result<T>>
+) -> impl Future<Output = StorageResult<mongodb::error::Result<T>>>
 where
     F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    loop {
-        // Build a fresh command budget for the unhinted retry as well.
-        let result = operation(hint.clone()).search_deadline()?.await;
-        if let Err(error) = &result
-            && date_hint_rejected(&hint, error)
-        {
-            search_deadline::check()?;
-            tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-            hint = None;
-            continue;
+    let site = std::panic::Location::caller();
+    async move {
+        loop {
+            // Build a fresh command budget for the unhinted retry as well.
+            let result = operation(hint.clone()).search_deadline_at(site)?.await;
+            if let Err(error) = &result
+                && let Some(fallback) = fallback_for_rejected(&hint, error)
+            {
+                search_deadline::check()?;
+                tracing::warn!(error = %error, ?hint, ?fallback, "Hinted index is missing; running again");
+                hint = fallback;
+                continue;
+            }
+            return Ok(result);
         }
-        return Ok(result);
     }
 }
 
@@ -497,6 +585,105 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn date_end_hint_needs_a_ready_index_and_a_flat_filter() {
+        let parameter = |raw: &str| SearchParameter {
+            name: "date".to_owned(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse(raw)],
+            chain: vec![],
+            components: vec![],
+        };
+        let flat = doc! { "param_name": "date", "value_date": { "$ne": null },
+        "value_date_end": { "$gt": 1 } };
+        let rooted_or = doc! { "$or": [flat.clone(), { "value_date": { "$gte": 1 } }] };
+        let wrapped = doc! { "$and": [flat.clone(), { "resource_id": { "$gt": "c" } }] };
+        let wrapped_or = doc! { "$and": [rooted_or.clone(), { "resource_id": { "$gt": "c" } }] };
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        let gt = parameter("gt2024-01-01");
+        let ge = parameter("ge2024-01-01");
+        // (filter, parameter, indexes_ready, date_end_ready, expected hint)
+        for (filter, parameter, indexes, end_ready, expected) in [
+            (&flat, &gt, true, true, end.clone()),
+            (&flat, &gt, true, false, v3.clone()),
+            (&flat, &gt, false, true, None),
+            (&flat, &gt, false, false, None),
+            (&rooted_or, &ge, true, true, None),
+            (&rooted_or, &ge, true, false, v3.clone()),
+            (&wrapped, &gt, true, true, end.clone()),
+            (&wrapped, &gt, true, false, v3.clone()),
+            (&wrapped_or, &ge, true, true, None),
+            (&wrapped_or, &ge, true, false, v3.clone()),
+        ] {
+            let access = PredicateAccess::new_with_date_end(filter, parameter, indexes, end_ready);
+            assert_eq!(
+                access.discovery_hint(),
+                expected,
+                "{filter:?} indexes={indexes} end={end_ready}"
+            );
+        }
+        // The three-argument constructor never knows the end index is ready.
+        assert_eq!(PredicateAccess::new(&flat, &gt, true).discovery_hint(), v3);
+    }
+
+    #[test]
+    fn date_hint_rejection_covers_both_date_indexes() {
+        let command_error = |code, message| {
+            let command: mongodb::error::CommandError =
+                mongodb::bson::from_document(doc! {"code": code, "errmsg": message}).unwrap();
+            mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command))
+        };
+        let missing = "hint provided does not correspond to an existing index";
+        for name in [SEARCH_DATE_RANGE_INDEX, SEARCH_DATE_END_INDEX] {
+            let hint = Some(Hint::Name(name.to_owned()));
+            assert!(date_hint_rejected(&hint, &command_error(2, missing)));
+            assert!(!date_hint_rejected(
+                &hint,
+                &command_error(2, "invalid query")
+            ));
+        }
+        for hint in [None, Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))] {
+            assert!(!date_hint_rejected(&hint, &command_error(2, missing)));
+        }
+    }
+
+    /// #2601: a rejected liveness hint runs again on the identity index, a
+    /// rejected date hint unhinted; any other rejection propagates.
+    #[test]
+    fn rejected_hints_fall_back_by_index() {
+        let command_error = |code, message| {
+            let command: mongodb::error::CommandError =
+                mongodb::bson::from_document(doc! {"code": code, "errmsg": message}).unwrap();
+            mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command))
+        };
+        let missing = command_error(2, "hint provided does not correspond to an existing index");
+        let identity = Some(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()));
+        assert_eq!(
+            fallback_for_rejected(&liveness_hint(), &missing),
+            Some(identity.clone())
+        );
+        assert_eq!(
+            fallback_for_rejected(
+                &Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned())),
+                &missing
+            ),
+            Some(None)
+        );
+        for hint in [
+            identity,
+            None,
+            Some(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned())),
+        ] {
+            assert_eq!(fallback_for_rejected(&hint, &missing), None, "{hint:?}");
+        }
+        assert_eq!(
+            fallback_for_rejected(&liveness_hint(), &command_error(2, "invalid query")),
+            None
+        );
     }
 
     #[test]
