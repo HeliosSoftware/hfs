@@ -857,6 +857,7 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_MAX_BODY_SIZE` | `--max-body-size` | Max request body size in bytes, measured after decompression | `10485760` |
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
 | `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
+| `FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS` | `--allowed-terminology-servers` | Further terminology servers a request's `terminologyServer` parameter may name, comma-separated. The server does not authenticate callers, so a request naming any other server is refused (400) rather than letting callers point it at hosts it can reach | none |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
 | `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max remote terminology server calls per evaluation: each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count (`0` disables) | `1000` |
 
@@ -965,7 +966,7 @@ Forces evaluation with a specific FHIR version (if compiled with the correspondi
 - `resource` (required): FHIR resource to evaluate against
 - `validate` (optional): Whether to validate the expression
 - `variables` (optional): Variables to pass to the expression
-- `terminologyServer` (optional): Terminology server URL
+- `terminologyServer` (optional): Terminology server URL. Accepted only when it is `FHIRPATH_TERMINOLOGY_SERVER` or listed in `FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS`; any other value is refused with 400
 
 **Additional Output Parameters** (when `validate` is true):
 - `parseDebugTree`: JSON representation of the expression AST (includes `Position` and `Length` for each node)
