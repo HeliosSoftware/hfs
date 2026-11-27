@@ -381,11 +381,13 @@ where
 /// OperationOutcome naming the deleted resource, or saying nothing matched
 /// (#1343). That is the "200 OK if the response contains a payload" branch of
 /// the same text, so the policy holds in every version.
+#[allow(clippy::too_many_arguments)]
 pub async fn conditional_delete_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
@@ -394,6 +396,12 @@ where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
     super::conditional_support::require_delete(state.storage())?;
+    super::conditional_support::require_search_grant(
+        principal.as_ref().map(|p| &p.0),
+        &resource_type,
+        helios_persistence::core::ConditionalInteraction::Delete,
+        None,
+    )?;
 
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {
