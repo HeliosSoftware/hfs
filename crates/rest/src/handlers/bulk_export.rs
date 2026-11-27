@@ -1050,7 +1050,7 @@ async fn emit_export_audit<S>(
 ///
 /// A `patient/*` wildcard is as wide as one patient's compartment, not the
 /// tenant, so it does not override ownership (#1618).
-fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
+pub(crate) fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
     match principal {
         None => true, // auth disabled — no ownership enforcement
         Some(p) => {

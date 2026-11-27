@@ -9,7 +9,13 @@
 //! queue; once the queue is full the client is dropped rather than letting
 //! every further matching write retain another bundle in the process until
 //! the socket closes. The client reconnects and replays through `$events`.
+//!
+//! A notification is serialized once per broadcast and every client's queue
+//! holds a reference-counted handle to the same bytes, so the memory a
+//! broadcast retains does not grow with the number of clients. A
+//! subscription has at most [`MAX_CLIENTS_PER_SUBSCRIPTION`] bound clients.
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -20,8 +26,16 @@ use uuid::Uuid;
 /// draining and is dropped.
 pub const CLIENT_QUEUE_CAPACITY: usize = 256;
 
+/// Clients one subscription may have bound at a time. A further bind is
+/// refused until one of them disconnects.
+pub const MAX_CLIENTS_PER_SUBSCRIPTION: usize = 16;
+
+/// One serialized notification bundle (JSON text). Cloning it shares the
+/// bytes.
+pub type WsPayload = Bytes;
+
 /// Sender half given to a connected WebSocket client.
-pub type WsClientSender = mpsc::Sender<serde_json::Value>;
+pub type WsClientSender = mpsc::Sender<WsPayload>;
 
 /// Manages connected WebSocket clients for all active subscriptions.
 pub struct WebSocketManager {
@@ -46,18 +60,32 @@ impl WebSocketManager {
     /// subscription is deregistered or the client let
     /// [`CLIENT_QUEUE_CAPACITY`] notifications pile up, while the queued ones
     /// are still buffered; the handler stops there instead of draining them.
+    ///
+    /// Returns `None` when the subscription already has
+    /// [`MAX_CLIENTS_PER_SUBSCRIPTION`] connected clients.
     pub fn register_client(
         &self,
         tenant_id: &str,
         subscription_id: &str,
-    ) -> (String, mpsc::Receiver<serde_json::Value>) {
+    ) -> Option<(String, mpsc::Receiver<WsPayload>)> {
+        let mut entry = self
+            .clients
+            .entry((tenant_id.to_string(), subscription_id.to_string()))
+            .or_default();
+        entry.retain(|(_, sender)| !sender.is_closed());
+        if entry.len() >= MAX_CLIENTS_PER_SUBSCRIPTION {
+            warn!(
+                tenant_id,
+                subscription_id,
+                limit = MAX_CLIENTS_PER_SUBSCRIPTION,
+                "WebSocket bind refused: the subscription has the most clients allowed"
+            );
+            return None;
+        }
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE_CAPACITY);
         let client_id = Uuid::new_v4().to_string();
-
-        self.clients
-            .entry((tenant_id.to_string(), subscription_id.to_string()))
-            .or_default()
-            .push((client_id.clone(), tx));
+        entry.push((client_id.clone(), tx));
+        drop(entry);
 
         debug!(
             tenant_id,
@@ -66,7 +94,7 @@ impl WebSocketManager {
             "WebSocket client registered"
         );
 
-        (client_id, rx)
+        Some((client_id, rx))
     }
 
     /// Removes a specific client by ID (called on disconnect).
@@ -107,13 +135,25 @@ impl WebSocketManager {
         let Some(mut entry) = self.clients.get_mut(&key) else {
             return 0;
         };
+        let payload = match serde_json::to_vec(notification) {
+            Ok(json) => Bytes::from(json),
+            Err(e) => {
+                warn!(
+                    tenant_id,
+                    subscription_id,
+                    error = %e,
+                    "WebSocket notification could not be serialized; not sent"
+                );
+                return 0;
+            }
+        };
 
         let mut delivered = 0;
         let initial_count = entry.len();
 
         // Send to all clients, removing those with closed or full channels.
         entry.retain(
-            |(client_id, sender)| match sender.try_send(notification.clone()) {
+            |(client_id, sender)| match sender.try_send(payload.clone()) {
                 Ok(()) => {
                     delivered += 1;
                     true
@@ -184,40 +224,84 @@ impl Default for WebSocketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json(payload: bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice(&payload).expect("a notification is JSON")
+    }
     use serde_json::json;
+
+    /// Every client's queue holds the same serialized bytes: a broadcast is
+    /// serialized once and not copied per client (#2721).
+    #[tokio::test]
+    async fn a_broadcast_shares_one_payload_between_clients() {
+        let mgr = WebSocketManager::new();
+        let (_a, mut rx_a) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_b, mut rx_b) = mgr.register_client("t1", "sub-1").unwrap();
+
+        let notification = json!({"resourceType": "Bundle", "entry": ["x"]});
+        assert_eq!(mgr.send_to_subscription("t1", "sub-1", &notification), 2);
+        let a = rx_a.recv().await.unwrap();
+        let b = rx_b.recv().await.unwrap();
+        assert_eq!(a.as_ptr(), b.as_ptr(), "both clients hold one buffer");
+        assert_eq!(json(a), notification);
+    }
+
+    /// A subscription takes at most `MAX_CLIENTS_PER_SUBSCRIPTION` clients; a
+    /// client that disconnects frees its place (#2721).
+    #[tokio::test]
+    async fn a_subscription_binds_at_most_the_client_cap() {
+        let mgr = WebSocketManager::new();
+        let mut held: Vec<_> = (0..MAX_CLIENTS_PER_SUBSCRIPTION)
+            .map(|i| {
+                mgr.register_client("t1", "sub-1")
+                    .unwrap_or_else(|| panic!("client {i} fits"))
+            })
+            .collect();
+        assert!(mgr.register_client("t1", "sub-1").is_none());
+        assert!(
+            mgr.register_client("t1", "sub-2").is_some(),
+            "the cap is per subscription"
+        );
+
+        drop(held.pop());
+        assert!(
+            mgr.register_client("t1", "sub-1").is_some(),
+            "a disconnected client's place is free again"
+        );
+    }
 
     #[tokio::test]
     async fn test_register_and_receive() {
         let mgr = WebSocketManager::new();
-        let (_client_id, mut rx) = mgr.register_client("t1", "sub-1");
+        let (_client_id, mut rx) = mgr.register_client("t1", "sub-1").unwrap();
 
         let notification = json!({"resourceType": "Bundle", "type": "history"});
         let count = mgr.send_to_subscription("t1", "sub-1", &notification);
 
         assert_eq!(count, 1);
-        let received = rx.recv().await.unwrap();
+        let received = json(rx.recv().await.unwrap());
         assert_eq!(received, notification);
     }
 
     #[tokio::test]
     async fn test_multi_client_broadcast() {
         let mgr = WebSocketManager::new();
-        let (_id1, mut rx1) = mgr.register_client("t1", "sub-1");
-        let (_id2, mut rx2) = mgr.register_client("t1", "sub-1");
+        let (_id1, mut rx1) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_id2, mut rx2) = mgr.register_client("t1", "sub-1").unwrap();
 
         let notification = json!({"type": "event-notification"});
         let count = mgr.send_to_subscription("t1", "sub-1", &notification);
 
         assert_eq!(count, 2);
-        assert_eq!(rx1.recv().await.unwrap(), notification);
-        assert_eq!(rx2.recv().await.unwrap(), notification);
+        assert_eq!(json(rx1.recv().await.unwrap()), notification);
+        assert_eq!(json(rx2.recv().await.unwrap()), notification);
     }
 
     #[tokio::test]
     async fn test_disconnected_client_pruned() {
         let mgr = WebSocketManager::new();
-        let (_id1, rx1) = mgr.register_client("t1", "sub-1");
-        let (_id2, mut rx2) = mgr.register_client("t1", "sub-1");
+        let (_id1, rx1) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_id2, mut rx2) = mgr.register_client("t1", "sub-1").unwrap();
 
         // Drop rx1 to simulate disconnect.
         drop(rx1);
@@ -226,15 +310,15 @@ mod tests {
         let count = mgr.send_to_subscription("t1", "sub-1", &notification);
 
         assert_eq!(count, 1);
-        assert_eq!(rx2.recv().await.unwrap(), notification);
+        assert_eq!(json(rx2.recv().await.unwrap()), notification);
         assert_eq!(mgr.client_count("t1", "sub-1"), 1);
     }
 
     #[test]
     fn test_remove_client() {
         let mgr = WebSocketManager::new();
-        let (id1, _rx1) = mgr.register_client("t1", "sub-1");
-        let (_id2, _rx2) = mgr.register_client("t1", "sub-1");
+        let (id1, _rx1) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_id2, _rx2) = mgr.register_client("t1", "sub-1").unwrap();
 
         assert_eq!(mgr.client_count("t1", "sub-1"), 2);
 
@@ -245,8 +329,8 @@ mod tests {
     #[test]
     fn test_remove_all_clients() {
         let mgr = WebSocketManager::new();
-        let (_id1, _rx1) = mgr.register_client("t1", "sub-1");
-        let (_id2, _rx2) = mgr.register_client("t1", "sub-1");
+        let (_id1, _rx1) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_id2, _rx2) = mgr.register_client("t1", "sub-1").unwrap();
 
         mgr.remove_all_clients("t1", "sub-1");
         assert_eq!(mgr.client_count("t1", "sub-1"), 0);
@@ -255,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_all_closes_receivers() {
         let mgr = WebSocketManager::new();
-        let (_id1, mut rx1) = mgr.register_client("t1", "sub-1");
+        let (_id1, mut rx1) = mgr.register_client("t1", "sub-1").unwrap();
 
         mgr.remove_all_clients("t1", "sub-1");
 
@@ -269,13 +353,13 @@ mod tests {
     #[tokio::test]
     async fn test_a_client_that_stops_draining_is_dropped_once_its_queue_is_full() {
         let mgr = WebSocketManager::new();
-        let (_stalled, mut stalled_rx) = mgr.register_client("t1", "sub-1");
-        let (_draining, mut draining_rx) = mgr.register_client("t1", "sub-1");
+        let (_stalled, mut stalled_rx) = mgr.register_client("t1", "sub-1").unwrap();
+        let (_draining, mut draining_rx) = mgr.register_client("t1", "sub-1").unwrap();
 
         for i in 0..CLIENT_QUEUE_CAPACITY {
             let n = json!({"type": "event-notification", "n": i});
             assert_eq!(mgr.send_to_subscription("t1", "sub-1", &n), 2, "{i}");
-            assert_eq!(draining_rx.recv().await.unwrap(), n);
+            assert_eq!(json(draining_rx.recv().await.unwrap()), n);
         }
         assert_eq!(mgr.client_count("t1", "sub-1"), 2);
 
@@ -286,7 +370,7 @@ mod tests {
             "only the draining client receives the one past the capacity"
         );
         assert_eq!(mgr.client_count("t1", "sub-1"), 1);
-        assert_eq!(draining_rx.recv().await.unwrap(), overflow);
+        assert_eq!(json(draining_rx.recv().await.unwrap()), overflow);
         // The dropped client's receiver reports closed while its queue is
         // still full: the signal the connection handler stops on, rather
         // than delivering the backlog (#2720).
@@ -294,7 +378,7 @@ mod tests {
         assert!(!draining_rx.is_closed());
 
         let mut queued = 0;
-        while let Some(n) = stalled_rx.recv().await {
+        while let Some(n) = stalled_rx.recv().await.map(json) {
             assert_ne!(n, overflow, "nothing was queued past the capacity");
             queued += 1;
         }

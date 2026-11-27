@@ -169,7 +169,7 @@ pub async fn import_rxnorm_rrf(
     let seed = build_code_system_bundle(&meta, &[]);
     let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let concept_list: Vec<(String, String, String)> = concepts
         .into_iter()
@@ -228,7 +228,7 @@ pub async fn import_rxnorm_rrf(
 
         let bytes = build_code_system_bundle(&meta, &builder);
         let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        stats.take_errors(chunk);
     }
 
     stats.concepts = total as u32;

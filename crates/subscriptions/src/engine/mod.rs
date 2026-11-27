@@ -279,6 +279,95 @@ impl SubscriptionEngine {
         self.scheduler.state.snapshot()
     }
 
+    /// A purge erased stored resources with no per-resource delete notice:
+    /// drop the topics, subscriptions and bound clients derived from them,
+    /// the way a FHIR delete notice does.
+    pub(crate) fn observe_erased(
+        &self,
+        tenant_id: &str,
+        scope: &helios_persistence::core::ErasedScope,
+    ) {
+        use helios_persistence::core::ErasedScope;
+        match scope {
+            ErasedScope::Instance { resource_type, id } => {
+                self.forget_resource(tenant_id, resource_type, id)
+            }
+            ErasedScope::Type(resource_type) => self.forget_type(tenant_id, resource_type),
+            ErasedScope::Tenant => self.forget_tenant(tenant_id),
+        }
+    }
+
+    /// All of the tenant's data was erased: every topic, subscription and
+    /// bound websocket client of it is dropped, so a later occupant of the same
+    /// tenant id starts from nothing.
+    ///
+    /// Not called for a deregistration alone. That keeps the tenant's data,
+    /// and unless `HFS_TENANT_REQUIRE_PROVISIONED` is set the tenant stays
+    /// usable, so its stored subscriptions must keep delivering.
+    fn forget_tenant(&self, tenant_id: &str) {
+        for resource_type in ["Subscription", "SubscriptionTopic", "Basic"] {
+            self.forget_type(tenant_id, resource_type);
+        }
+        for url in self.core.topic_registry.list_topics(tenant_id) {
+            self.core.topic_registry.remove_topic(tenant_id, &url);
+        }
+    }
+
+    fn forget_type(&self, tenant_id: &str, resource_type: &str) {
+        let ids: Vec<String> = match resource_type {
+            "Subscription" => self
+                .core
+                .manager
+                .all_subscriptions()
+                .into_iter()
+                .filter(|s| s.tenant_id == tenant_id)
+                .map(|s| s.id)
+                .collect(),
+            "SubscriptionTopic" | "Basic" => self
+                .core
+                .topic_resource_index
+                .iter()
+                .filter(|entry| entry.key().0 == tenant_id && entry.key().1 == resource_type)
+                .map(|entry| entry.key().2.clone())
+                .collect(),
+            _ => return,
+        };
+        for id in ids {
+            self.forget_resource(tenant_id, resource_type, &id);
+        }
+    }
+
+    /// Routes an erased Subscription, SubscriptionTopic or R4 Basic topic
+    /// through the path a payload-free delete notice takes.
+    fn forget_resource(&self, tenant_id: &str, resource_type: &str, id: &str) {
+        if !matches!(
+            resource_type,
+            "Subscription" | "SubscriptionTopic" | "Basic"
+        ) {
+            return;
+        }
+        let tenant = TenantId::new(tenant_id.to_string());
+        let view = EventView {
+            tenant_id: &tenant,
+            // `default_enabled`, not `default`: this compiles without R4. It
+            // is R4 whenever R4 is enabled, the only version with `Basic`
+            // topics.
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
+            resource_type,
+            resource_id: id,
+            version_id: "",
+            event_type: ResourceEventType::Delete,
+            resource: None,
+            previous_resource: None,
+        };
+        let _ = self.handle_control(view);
+        // After the deregistration, so a delivery that was still in flight
+        // cannot record into the counters again.
+        if resource_type == "Subscription" {
+            self.core.delivery_stats.remove(tenant_id, id);
+        }
+    }
+
     pub(crate) fn observe_write(&self, write: &helios_persistence::core::ResourceWrite) {
         let Some(notice) = write.notice.as_ref().filter(|n| !n.resource_id.is_empty()) else {
             return;
@@ -331,11 +420,13 @@ impl SubscriptionEngine {
         match event.resource_type {
             "Subscription" => {
                 let snapshot = self.core.handle_subscription_event(&event);
-                if snapshot.is_some() || event.event_type == ResourceEventType::Delete {
-                    self.scheduler
-                        .state
-                        .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
-                }
+                // Every committed Subscription write retires what was queued
+                // for the previous generation: a registration, a delete, or a
+                // rewrite the engine could not register (which retires the
+                // previous registration too).
+                self.scheduler
+                    .state
+                    .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
                 Some(
                     snapshot.filter(|s| s.subscription.status == SubscriptionStatusCode::Requested),
                 )
@@ -494,11 +585,21 @@ impl EngineCore {
                             return Some(snapshot);
                         }
                         Err(e) => {
+                            // The stored resource is the record of truth. When
+                            // the engine cannot represent it, it must hold no
+                            // serving registration for the id either: the
+                            // previous generation would otherwise keep
+                            // delivering with the previous channel while GET
+                            // shows the rewrite (status off, a new endpoint).
+                            let retired = self.manager.deregister(&tenant_id, subscription_id);
+                            self.ws_manager
+                                .remove_all_clients(&tenant_id, subscription_id);
                             warn!(
                                 tenant_id,
                                 subscription_id,
                                 error = %e,
-                                "Failed to register subscription"
+                                retired,
+                                "Failed to register subscription; previous registration retired"
                             );
                         }
                     }
@@ -1756,6 +1857,58 @@ mod tests {
         // Subscription should be registered.
         let sub = engine.manager().get_subscription("t1", "sub-1");
         assert!(sub.is_some());
+    }
+
+    /// A committed rewrite the engine cannot register (here: a topic the
+    /// tenant does not hold) retires the previous registration instead of
+    /// leaving it delivering while the stored resource says otherwise.
+    #[tokio::test]
+    async fn a_rewrite_the_engine_cannot_register_retires_the_previous_registration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let engine = make_engine("http://localhost:8080");
+        engine.topic_registry().add_topic("t1", encounter_topic());
+        let endpoint = format!("{}/webhook", server.uri());
+        let event = |version: &str, event_type: ResourceEventType, topic: &str| ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "Subscription".to_string(),
+            resource_id: "sub-1".to_string(),
+            version_id: version.to_string(),
+            event_type,
+            resource: Some(crate::manager::tests::build_subscription_json(
+                topic,
+                "rest-hook",
+                Some(&endpoint),
+            )),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine
+            .on_resource_event(event(
+                "1",
+                ResourceEventType::Create,
+                "http://example.org/topic/encounter-start",
+            ))
+            .await;
+        assert!(engine.manager().get_subscription("t1", "sub-1").is_some());
+
+        engine
+            .on_resource_event(event(
+                "2",
+                ResourceEventType::Update,
+                "http://example.org/topic/not-in-this-tenant",
+            ))
+            .await;
+        assert!(
+            engine.manager().get_subscription("t1", "sub-1").is_none(),
+            "the previous registration must not keep serving"
+        );
     }
 
     #[tokio::test]

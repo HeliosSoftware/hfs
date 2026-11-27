@@ -4,7 +4,7 @@ HFS keeps two kinds of index on the `search_index` collection.
 
 - **Inline** indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) are created at every boot before the server serves. The slot probe index is partial and includes only composite rows.
 - **Generation 8** is the current generation. It is generation 7 plus two partial indexes: `idx_search_quantity_high` on `(tenant_id, resource_type, param_name, value_quantity_high, value_quantity_value, resource_id)`, partial on `value_quantity_value` (so a row not yet backfilled is a null-high key rather than absent), and `idx_search_quantity_range` on `(tenant_id, resource_type, param_name, value_quantity_range_high, value_quantity_value, resource_id)`, partial on `value_quantity_range_high` existing. They serve quantity searches bounded on the high end of a stored interval, the Range arm of `ap`, and a descending quantity sort; see [Quantity intervals (generation 8)](#quantity-intervals-generation-8). It is built in the same background `createIndexes` as the others.
-- **Generation 7** (the base of generation 8) is generation 6 plus one partial index, `idx_search_date_end` on `(tenant_id, resource_type, param_name, value_date_end, value_date, resource_id)`, partial on `value_date` like `idx_search_date_v3`. It orders date rows by the end of their range, which is the order of a descending date sort; see [Sorting past 300,000 matches](#sorting-past-300000-matches-generation-7). It is built in the same background `createIndexes` as the others.
+- **Generation 7** (the base of generation 8) is generation 6 plus one partial index, `idx_search_date_end` on `(tenant_id, resource_type, param_name, value_date_end, value_date, resource_id)`, partial on `value_date` like `idx_search_date_v3`. It orders date rows by the end of their range. That serves the descending date sort, see [Sorting past 300,000 matches](#sorting-past-300000-matches-generation-7), and the date filters bounded on the end of the range (`gt`, and one arm of `ge`/`ne`), see [Date ranges](#date-ranges-generation-4). It is built in the same background `createIndexes` as the others.
 - **Generation 6** (the base of generation 7) is generation 5 plus one partial index, `idx_search_composite_tuple_qty`, over the `tuple_code` of token+quantity composite rows; see [Token+quantity composites (generation 6)](#tokenquantity-composites-generation-6). It is built in the same background `createIndexes` as the others.
 - **Generation 5** (the base of generation 6) is generation 4 plus one partial index, `idx_search_reference_target_v2` on `(tenant_id, resource_type, param_name, value_reference_target, resource_id)`, which holds only rows that carry `value_reference_target` (absolute `http(s)` references, #2394). It is built in the same background `createIndexes` as the others; see "Reference normalization (generation 5)" below.
 - **Generation 4** (the base of generation 5) is nine partial value indexes (`idx_search_date_v3` and eight named `idx_search_*_v2`), built by HFS **after** boot in one `createIndexes` command that scans the collection once, plus contained rows living in their own collection since generation 3 (see "Contained rows" below) rather than a partial index on `search_index`. MongoDB 4.2 and later do not block reads or writes during the value-index build. When every generation-2 value index is ready, HFS drops the nine generation-1 value indexes (`idx_search_string`, `idx_search_token`, ...); once the contained-row move is also done, HFS records `search_indexes.generation: 4` in the `schema_version` document.
@@ -13,7 +13,7 @@ Why: a generation-1 value index carried one entry for every row of the collectio
 
 ## Date ranges (generation 4)
 
-Since #1391 a date row stores the range it denotes, `[value_date, value_date_end)`, and a date search bounds either end (`gt` and `ge` bound `value_date_end`, for example). `idx_search_date_v3` carries `value_date_end` between `value_date` and `resource_id` so those searches stay covered; it is still partial on `value_date` existing. It replaces generation 2's `idx_search_date_v2`, which HFS drops once every generation-4 index is ready (under the same mode rules as the generation-1 drop). Until then date searches keep using `idx_search_date_v2`, fetching documents to check `value_date_end`. Every prefix is a covered scan of `idx_search_date_v3` (`docsExamined: 0`). The prefixes with two alternatives (`ge`, `le`, `ne`), and a comma list of date values, are sent as an `$or` at the top of the filter with every arm repeating the tenant, resource type and parameter name; nested under those shared conditions MongoDB 5.0 reads the documents instead of scanning the index.
+Since #1391 a date row stores the range it denotes, `[value_date, value_date_end)`, and a date search bounds either end (`gt` and `ge` bound `value_date_end`, for example). `idx_search_date_v3` carries `value_date_end` between `value_date` and `resource_id` so those searches stay covered; it is still partial on `value_date` existing. It replaces generation 2's `idx_search_date_v2`, which HFS drops once every generation-4 index is ready (under the same mode rules as the generation-1 drop). Until then date searches keep using `idx_search_date_v2`, fetching documents to check `value_date_end`. Every prefix is a covered scan (`docsExamined: 0`). Since #2601, once `idx_search_date_end` is built, a single-arm filter bounded only on the range end (`gt`) is hinted to `idx_search_date_end`, where `value_date_end > x` is a seek on its leading key instead of a scan of every key of the parameter in `idx_search_date_v3`. The prefixes that mix an end-bounded arm with a start-bounded one (`ge` and `ne`) are sent as a root `$or` with no hint, and so is a comma list of values that contains `gt`, `ge` or `ne`; MongoDB then plans each arm and chooses its index (typically `idx_search_date_end` for the end-bounded arm and `idx_search_date_v3` for the start-bounded one, but either may serve any arm). When the search is paged through the batched seed path, the cursor boundary is repeated inside each arm of that unhinted `$or` so it stays at the root; other paths wrap the filter with the boundary in an `$and`. A wrapped `gt` keeps the `idx_search_date_end` hint (the `resource_id` bound does not change its range on `value_date_end`); a wrapped `$or` (`ge`, `ne`, comma lists) stays unhinted. Under `idx_search_date_v3` the wrapped forms read about every key of the parameter (997k keys on 1M second-resolution rows, against 59k). `eq`, `lt`, `le`, `sa`, `eb` and `ap`, and a comma list without `gt`, `ge` or `ne`, keep the `idx_search_date_v3` hint. While `idx_search_date_end` is missing or still building, every query keeps the previous hint, and a hint the server rejects (index dropped while running) is retried without a hint. The prefixes with two alternatives (`ge`, `le`, `ne`), and a comma list of date values, are sent as an `$or` at the top of the filter with every arm repeating the tenant, resource type and parameter name; nested under those shared conditions MongoDB 5.0 reads the documents instead of scanning the index.
 
 ### Upgrading: reindex the date rows
 
@@ -80,7 +80,8 @@ When MongoDB runs with search offloaded to Elasticsearch, every search goes to E
 
 - the inline `search_index` indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) and the `search_index_contained` indexes, which are not created at boot;
 - the twelve generation-7 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
-- `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`.
+- `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`;
+- `idx_resources_live_id`, which only standard search reads (see [Liveness of candidate ids](#liveness-of-candidate-ids-resourcesidx_resources_live_id)), and which boot does not create in this mode.
 
 Readiness requires only the `resources` indexes (`idx_resources_identity`, `idx_resources_type_scan`). A node whose `search_index` indexes are missing or dropped stays ready. The standalone MongoDB backend is unchanged: it still builds and requires all of them, because `:missing` and standard search read them.
 
@@ -93,6 +94,28 @@ HFS does not drop indexes that already exist, so a deployment moved to this mode
 
 `dropIndexes()` with no argument drops every index on the collection except `_id`; the two collections are empty in this mode. If you only want the missing-params saving, drop the last two and leave the others. `dropIndex` fails with "index not found" for an index that was never built; that is safe to ignore. If you later switch the database back to the standalone backend, the next boot recreates the inline indexes and rebuilds the rest, and you must run `$reindex` because the search rows were never written.
 
+
+## Liveness of candidate ids (`resources.idx_resources_live_id`)
+
+A search that has chosen resource ids from `search_index` still asks which of them are live. Those reads filter `resources` on tenant, type, `is_deleted: false` and an `id` list, and read back only `id`:
+
+- the liveness check of a filtered or deep parameter sort (`resource_level_ids`, `live_ids_among`);
+- the walk over resources without a sort key, in `id` order (`param_sorted_filtered_window_over`);
+- the count, the count-and-page and the live-id find of each candidate batch (`BatchedIndexPlan::match_batch`).
+
+`idx_resources_identity` (`tenant_id, resource_type, id`) has no `is_deleted`, so each of them fetched the whole document to read one boolean: `/Observation?_sort=-date&_offset=290000` fetched 290,046 documents for 20 entries (#2601). Since #2601 boot creates
+
+    { tenant_id: 1, resource_type: 1, is_deleted: 1, id: 1 }   name: idx_resources_live_id
+
+and those reads hint it, so they are covered index scans (`docsExamined: 0`). It is not a `search_index` generation and records no schema version: an older build neither reads nor drops it. With search offloaded to Elasticsearch it is not created, because no search reads it.
+
+**Build.** Boot creates it inline with the other `resources` indexes, before the server serves, so the first boot of an existing store waits for one scan of `resources`. Measured on a `mongo:9.0.8` copy of the benchmark store (2,273,836 `resources` documents, 2.4 KB average, 3.5 GB WiredTiger cache): 4.8 s, and the index takes 91 MB on disk (`idx_resources_identity`: 196 MB). The scan also pushes part of the search working set out of the cache, so the first searches after that boot are slower until it is read back.
+
+**Write cost.** One more index entry per resource insert and per deletion or restore (`is_deleted` is a key); an update that keeps `is_deleted` leaves its key unchanged. Measured on the same `mongo:9.0.8` server, copying 100,000 benchmark resources into a collection with the `resources` indexes HFS creates, without and with the index (order A, B, B, A, batches of 1,000): inserts took 4,909 and 4,917 ms without it and 5,321 and 4,840 ms with it (mean +3%, inside the run-to-run noise), and 10,000 deletion flips by id 33.7 s and 31.2 s without it against 50.3 s and 31.3 s with it (the first run with it was an outlier; the second pair is equal). The index holds about 70 bytes per resource (6-7 MB per 100,000).
+
+**Without the index.** The hint is not required for readiness. If the index is missing (dropped by hand), a hinted read is rejected and runs once more on `idx_resources_identity`, which returns the same ids with a fetch, and logs a warning. The next boot recreates the index. To remove it on purpose (an older build ignores it):
+
+    db.resources.dropIndex("idx_resources_live_id")
 
 ## Downgrading
 
@@ -424,7 +447,7 @@ Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) u
 
 For standard searches without `:missing` or `:not` siblings, the planner picks, for each value, the non-`ne` component its bounded probe finds smallest (when every arm exceeds 10,000 rows, the saturated arms are recounted at doubling limits up to 100,000; the first one when none of those finishes). That arm only discovers candidates: bounded candidate ids, pages in resource order, or batches in id order, as for any other parameter. Every batch is then checked against all components within the same `composite_group`, through finds hinted onto `idx_search_composite` and bounded to the batch's ids. These planned composite searches do not collect every matching id and do not stop at 300,000 matches (#1896). Totals stay exact, so `_total=accurate` and counts still read every match. Some composite searches keep the earlier candidate collector and its 300,000-id cap: those with a `:missing` or `:not` sibling, a `_sort` on a search parameter, or a positive `_id` condition (literal, or resolved from a chain, `_has` or `_list`), and pages that no bounded plan serves. The last are broad pages, whose discovery arm is too wide for candidate ids, that sort by anything other than none, `_lastUpdated`, `_lastUpdated,_id` or a single `_id` (for example `_sort=_id,_lastUpdated`), and broad pages before the search indexes report ready that are neither a count nor sorted by `_id` alone. The collector drives from the component filter with the lowest probe count and pair-checks 512-id batches through the same hinted finds. A resource-order page whose first batches match rarely can still ask the collector for its id set, as for any parameter; when that set is over the cap, the page resumes the scan instead of returning 422. A `_sort=_id` composite page groups the discovery arm's rows on the server before its first batch, so its server-side cost follows the size of that arm. Positive reference `:identifier` (resolved to its targets first) and compartment membership are planned as plain filters, and a compartment can drive. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite and PostgreSQL unfolded composite rows now retain these per-type slots too (SQLite schema 38, PostgreSQL schema 48), so repeated-type ordinary and contained SQL searches preserve positions. PostgreSQL ordinary Denormalized searches retain folded rows with at most two Token or Number components and one of each other family; shapes beyond that remain unsupported for ordinary or `_contained=both` searches and cannot be repaired by reindexing. Its Legacy reader accepts slotted unfolded rows and valid transitional folded Token/Number rows. Contained SQL searches use unfolded rows in either layout.
 
-Bounded complement and unfiltered sort (#2285): a `:not` or `:missing=true` search with no positive parameter, with or without a compartment, no longer loads every live id of the type. It walks a cursor in 512-id batches (live resources, or compartment rows checked for liveness), filters each batch with the same `:missing`, `:not` and compartment checks, and stops as soon as more than 300,000 ids match. Past that cap, a search with a query plan falls back to the plan; one without a plan answers 422. Memory is bounded by the cap plus one batch whatever the size of the type; time is still proportional to the type when the complement is small, and is bounded by `HFS_MONGODB_SEARCH_TIMEOUT_MS`. A `_sort` by a search parameter with no filter asks the server for only the first `offset + _count + 1` ids (resources without a sort key come after those that have one, in id order) and answers 422 when `offset + _count` exceeds 300,000. These sorts issue no page cursor, so `_offset` is the only way to page; add a filter to reach deeper. `_total` is counted only when requested. No index is added or changed, so write cost and storage are unchanged.
+Bounded complement and unfiltered sort (#2285): a `:not` or `:missing=true` search with no positive parameter, with or without a compartment, no longer loads every live id of the type. It walks a cursor in 512-id batches (live resources, or compartment rows checked for liveness), filters each batch with the same `:missing`, `:not` and compartment checks, and stops as soon as more than 300,000 ids match. Past that cap, a search with a query plan falls back to the plan; one without a plan answers 422. Memory is bounded by the cap plus one batch whatever the size of the type; time is still proportional to the type when the complement is small, and is bounded by `HFS_MONGODB_SEARCH_TIMEOUT_MS`. A `_sort` by a typed search parameter with no filter walks the sort's value index (see [Sorting past 300,000 matches](#sorting-past-300000-matches-generation-7)); otherwise it asks the server for only the first `offset + _count + 1` ids (resources without a sort key come after those that have one, in id order) and answers 422 when `offset + _count` exceeds 300,000. These sorts issue no page cursor, so `_offset` is the only way to page; add a filter to reach deeper. `_total` is counted only when requested. No index is added or changed, so write cost and storage are unchanged.
 
 SQL's legacy guard is conservative for positional matching of the parameter: any ambiguous unfolded row in the tenant/type/parameter and requested top-level or contained scope causes a named 400 asking for `$reindex`, even for a value with no matches or count zero. Ordinary composite `:missing=true|false` is presence-only and bypasses SQL positional shape checks and legacy-slot probes; contained `:missing` remains unsupported. MongoDB's guard below is value-dependent. SQL startup builds sparse legacy-probe indexes; PostgreSQL's ordinary family-aware probes are created only when initializing Legacy, while its contained probe exists in both layouts. These builds can lengthen the first startup after upgrading. See [SQL composite upgrade recovery](../README.md#sql-composite-slots-and-upgrade-recovery).
 
@@ -454,9 +477,178 @@ and the range end for a descending date). If collection exceeds 300,000
 matches, the supported single-key sorts instead walk the sort parameter's
 value index (#2588). A descending date uses `idx_search_date_end`.
 
+An unfiltered sort by one typed search parameter (`_sort=<param>` or
+`_sort=-<param>` with no other parameter) skips the collection step entirely
+when the parameter's value index is built (#2601). It runs the same walk with
+no filters and stops after `offset + _count + 1` live ids, instead of grouping
+every row of the parameter with `$min`/`$max` and sorting the result. Ids, tie
+order, missing-value placement, `has_next` and the total are the same as the
+grouped path, which still serves the request when the index is missing, still
+building, or dropped while running.
+
+The walk serves both directions of every type with a value field: date
+(ascending by start through `idx_search_date_v3`, descending by end through
+`idx_search_date_end`, once the full build is done), string, token (by code),
+number, quantity (by `value_quantity_value`), reference and uri. They are
+equivalent to the grouped answer for one reason: the first row of a resource in
+key order holds its `$min` (ascending) or `$max` (descending), so the walk keeps
+each resource at its first row and ignores its later ones, however many values
+it has.
+
+The walk reads its rows from a covered index scan: the row filter is
+`<value field>: {$ne: null}` alone, which the index key answers, so the sort-key
+cursors examine index keys and no document (`docsExamined: 0`). An earlier form
+added `$exists: true`, which an index key cannot answer, and so fetched the
+`search_index` document of every row it passed; on 689,080 Observations that
+made 100,021 rows of `-date` cost 4.5 to 9 s instead of 45 to 55 ms, and turned
+the WiredTiger cache over 2.5 times per deep request. The filtered walk over the
+cap (#2588) opens the same cursors and is covered the same way.
+
+There is no limit on the offset other than the 300,000-row id cap, which still
+answers 422 past it: the covered walk is cheaper than the grouped aggregate at
+every offset up to it. Single-request server and driver time on 689,080 real
+Observations (`_sort=-date`, mongo:9.0.8, one request at a time, a replay of
+both code paths): offset 100,000 651 ms against 1,854 ms grouped, offset
+290,000 1,944 ms against 3,619 ms. Page 1 takes a few milliseconds against
+about 0.9 s grouped.
+
+The walk sizes its batches to the window. The first batch reads and checks the
+liveness of about `offset + _count + 1` ids (`unfiltered_walk_batch`: the
+window, a sixteenth more for stale rows, at least 32, at most 10,000), so page
+1 of a small type checks 32 ids, not 512; later batches follow what the window
+still lacks, and double while the window waits for an open tie or a batch
+yields less than half its ids. The sort-key cursor reads 128 to 2,048 rows per
+round trip, by the same window. Once the window holds what it needs, the walk
+stops at the first row of a new key, so it never enters the group that follows
+the page.
+
+The walk does have a guard on the equal-key groups it reads whole, to order
+them by id. A parameter with few distinct values (`status`, `gender`) has a
+group of hundreds of thousands of rows. When a group reaches 512 rows (128
+when the window already holds every id it needs, only waits for that group to
+end, and the walk reads one stream) the walk counts it once, with a covered
+count bounded just above what it may read (`sort_key_rows_upto`, about 0.13
+microseconds a key). If more of its rows remain than the window still lacks
+plus `max(UNFILTERED_WALK_TIE_ROWS, offset + _count + 1)`
+(`UNFILTERED_WALK_TIE_ROWS` is 8,192), the group is past the walk's allowance:
+unless the read by id below closes the window in it, grouping is cheaper and
+the grouped aggregate answers with the same page, after at most 512 rows of
+the group, one count and the reads by id, if tried. A group within the
+allowance that the read by id does not close is walked to its end, so a deep
+window inside a long group (`_sort=code&_offset=30000`,
+`_sort=subject&_offset=10000` on the same data) is walked instead of abandoned
+after 8,192 rows with the walk thrown away. For a descending date the count
+sees only the rows with a range end, a lower bound of the group: it can let the
+walk finish a group, never change the page.
+
+A first group that `unfiltered_first_group_window` declined because it holds
+fewer members than the window, when that showed its size (it ends in the first
+cursor batch, its bounded count, or a read that was not cut) and the size is
+within any allowance, is treated as counted: the walk neither counts it again
+nor cuts its batches at 512 rows of it, so its liveness checks are not split
+there either.
+
+The count also tells the walk when the group its window ends in is much longer
+than the window still needs: more rows than those already read, plus what the
+window lacks and a quarter more, plus 256 (`unfiltered_closes_group_by_id`),
+and the read below could hold what the window lacks (what it lacks plus a
+sixteenth is at most 10,000 rows). Then, before finishing or abandoning the
+group, the walk reads it by id (`unfiltered_group_closed_by_id`): it pushes the
+batch's rows of earlier keys, takes the ids ordered before the group (the open
+tie of the group itself is dropped), and reads the group's rows on the walk's
+own index, with the same key filter as the count, sorted by `resource_id` in
+the request's id direction. Resources the walk already met at an earlier key
+are not members and are skipped, as are a resource's repeated rows; the rest
+are checked for liveness in one command, and the first ones that fill the
+window close it. Ids the walk already knows live are not checked again, but
+only those of the current batch and of the group's open tie; members after the
+one that completes the window from those known ids are not checked at all. This
+is the grouped answer: every key before the group is complete, and the group's
+members follow in id order.
+
+There are at most two reads. The first asks for what the window lacks scaled by
+the rows the walk read of the group per member it met in them, plus a
+sixteenth (at least 32, at most 10,000): a group whose rows are mostly
+resources already met at an earlier key, or repeated, is read far enough at
+once. A read cut before enough live members is followed by one read of 10,000
+rows, which checks only the members not checked yet. When the walk met no
+member in the group's rows, what the window lacks would need more than 10,000
+rows, or the group ends with too few live members, the walk goes on exactly as
+without the reads, and still hands a group past its allowance to the grouped
+aggregate; when the index was dropped, the grouped aggregate answers. A
+descending date or quantity with any row without an end does not read by id,
+for the reason given below. This serves a window that crosses from a first
+group into a long second one (`CarePlan?_sort=status&_offset=1700`,
+`Condition?_sort=clinical-status&_offset=8600`), which used to read the
+first group by id in vain, walk it again, walk into the second group and then
+either finish it row by row or, when it was too long, group the whole
+parameter.
+
+The walk does not fetch a sort-key cursor batch only to reach the probe.
+Before a row that would cost a round trip (its stream is empty and not
+exhausted), when the walk's batch already holds what the window lacks: in the
+walk's first batch, it checks the rows in hand first; and when the window is
+full and waits for an open tie it has not counted (one stream), it reads that
+group by id at once instead of fetching more of it, and counts the group only
+if that read leaves it open, to choose between finishing it and the grouped
+aggregate as the probe's count would have. A window just past the first group
+that the first batch covers (`Patient?_sort=gender&_offset=520`) so costs the
+batch's check and one read by id, without a count or a second cursor batch.
+Later batches are not cut at the cursor's round trips: a first group of
+deleted resources is still checked in doubling batches, not once per cursor
+batch.
+
+Inside a batch, when the open tie already holds every id the window lacks, a
+row of the tie's key whose id cannot displace the tie's worst id is dropped by
+the window whatever its check says, and a row of another key completes the
+window whatever its check says; such rows are not sent to the liveness (or
+membership) check, and a batch with none left sends no command.
+
+Numeric keys compare `-0.0` equal to `0.0`, as the server orders and matches
+them; telling them apart split a group of zeros into alternating groups and
+lost its id order.
+
+A window inside the first group is not walked at all
+(`unfiltered_first_group_window`). Before the walk starts it looks at the
+sort-key cursor's first batch, which the walk requests anyway and keeps. When
+that batch opens with at least 128 rows of one key `K`
+(`UNFILTERED_WALK_MIN_CURSOR_BATCH`), does not show the group ending before
+`offset + _count + 1` distinct resources, a descending date or quantity has no
+row without an end (its null-end stream is empty), a group that goes on past
+the batch has at least `offset + _count + 1` rows (one bounded count, so a
+window that crosses the group's end costs a count instead of a read and a
+liveness check), and `offset + _count + 1` is at most 10,000,
+the group is read by id: one covered `find` of the rows with key `K` on the
+walk's own index (a descending date: `value_date_end = K` on
+`idx_search_date_end`; a descending quantity: `value_quantity_high = K` on
+`idx_search_quantity_high`), projected to `resource_id`, sorted by `resource_id`
+in the request's id direction and limited to the window plus a sixteenth
+(`unfiltered_group_read_limit`, which is not cut at 10,000, so a window close to
+it keeps room for stale rows), then one liveness check of those ids. A resource's
+repeated rows are adjacent in that order and count once. This is the grouped
+answer: no resource has a key before `K`, so the group's members are exactly
+the resources with a row of `K`, and they are ordered by id; resources after
+the group, and the keyless tail, are not reached. When the group holds fewer
+live ids than the window (a short group, stale rows of deleted resources) or the
+index was dropped, the walk runs unchanged from the buffered batch. On real data
+this serves `CarePlan?_sort=-date`, where 1,653 of 3,580 rows share the open end
+`9999-12-31` (the walk used to finish that group and check 1,655 ids in seven
+batches), and `Immunization?_sort=status` with one status over 14,927 rows (the
+walk used to give up after four batches and group). The sort by
+`resource_id` is index-provided only when nothing sits between the key and
+`resource_id` in the index (string, number, reference, uri); for the others
+(token, date, quantity) the server sorts the group's covered keys with a top-k
+sort bounded by the limit.
+
+These keep the grouped path: a sort whose parameter type is unknown
+(the `value_string` fallback), composite and special parameters, and sorts on
+more than one key.
+
 The walk reads rows in value order. The first row for a resource supplies
 its sort key; later rows for that resource are ignored. Membership and
-resource-level conditions are checked in batches of at most 512 candidates.
+resource-level conditions are checked in batches of at most 512 candidates
+(the unfiltered walk, which only checks liveness, sizes its batches to the
+window as described above).
 Equal keys retain only the matching ids needed for `offset + _count + 1`,
 ordered by the requested id tie-breaker. The extra match determines
 `has_next`. Matches without a sort value follow in id order, read from
@@ -479,13 +671,22 @@ includes a FHIR-version-restricted accurate total over the cap.
 
 Existing value-index plans remain usable while the new date-end index is
 built, provided their actual index definitions and required maintenance
-are verified. Only the new descending-date walk waits for the full build.
-If its required indexes are unavailable, an over-cap sort keeps the 422
-response. Within-cap searches keep their existing execution path.
+are verified. The new descending-date walk, the unfiltered `-date` walk and the `idx_search_date_end` hint of `gt`, `ge` and `ne` date filters wait for the full
+build: until then those filters keep the `idx_search_date_v3` hint and the
+unfiltered `-date` sort keeps the grouped path (the other unfiltered sorts need
+only their existing value index). If the walk's required
+indexes are unavailable, an over-cap sort keeps the 422 response. Other
+within-cap searches keep their existing execution path.
 
 Date rows written before #1391 have no `value_date_end`. They are null-end
 keys of `idx_search_date_end` and sort by their start, as on the collected
-path.
+path. A descending date walk reads them through a second cursor
+(`value_date_end: null`), merged with the first by key. That cursor is not
+covered: a null in the index key does not tell a null end from a missing one,
+so the server fetches each such row. It examines one key and no document once
+the date rows are reindexed; on a database that still holds many such rows, a
+deep unfiltered `-date` page fetches each of them, as every walk did before
+the cursors were covered.
 
 ## Token+quantity composites (generation 6)
 
