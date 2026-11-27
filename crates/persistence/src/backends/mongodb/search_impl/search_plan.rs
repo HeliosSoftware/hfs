@@ -7,11 +7,11 @@
 use super::super::probe_cache::{OffsetPageDecision, ProbeCache, ProbeEstimate, ProbeKey};
 use super::super::search_deadline::{self, SearchCommand};
 #[cfg(test)]
-use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
+use super::super::search_index_catalog::{SEARCH_DATE_END_INDEX, SEARCH_DATE_RANGE_INDEX};
 use super::collect_documents;
 use super::search_access::{
     CandidateSource, CompositeMembership, IndexAccess, PredicateAccess, aggregate_membership,
-    date_hint_rejected, matching_index_ids, membership_pipeline, with_hint_fallback,
+    date_hint_rejected, liveness_hint, matching_index_ids, membership_pipeline, with_hint_fallback,
 };
 
 use super::{
@@ -67,6 +67,19 @@ fn retained_page_size(offset: u32, limit: usize) -> StorageResult<usize> {
     (offset as usize)
         .checked_add(limit)
         .ok_or_else(|| internal_error("Combined page offset exceeds memory bounds".to_owned()))
+}
+
+/// The hint of a candidate count or page whose resource-level filter is
+/// `resource_filter`: the liveness index (#2601) only when it is the scope.
+/// With any other predicate (`_lastUpdated`, `_id`, a stored version,
+/// `missing_params`) the hinted read fetches every candidate document, so
+/// MongoDB picks the index, as for `resource_level_ids`.
+fn candidate_count_hint(resource_filter: &Document) -> Option<Hint> {
+    resource_filter
+        .keys()
+        .all(|key| matches!(key.as_str(), "tenant_id" | "resource_type" | "is_deleted"))
+        .then(liveness_hint)
+        .flatten()
 }
 
 fn retained_page_limit(offset: u32, limit: usize) -> StorageResult<i64> {
@@ -163,8 +176,19 @@ impl From<Document> for IndexPredicate {
 }
 
 impl IndexPredicate {
+    #[cfg(test)]
     fn new(filter: Document, parameter: &SearchParameter, indexes_ready: bool) -> Self {
-        let access = PredicateAccess::new(&filter, parameter, indexes_ready);
+        Self::new_with_date_end(filter, parameter, indexes_ready, false)
+    }
+
+    fn new_with_date_end(
+        filter: Document,
+        parameter: &SearchParameter,
+        indexes_ready: bool,
+        date_end_ready: bool,
+    ) -> Self {
+        let access =
+            PredicateAccess::new_with_date_end(&filter, parameter, indexes_ready, date_end_ready);
         Self {
             filter,
             access,
@@ -176,6 +200,26 @@ impl IndexPredicate {
 
     fn hint(&self) -> Option<Hint> {
         self.access.discovery_hint()
+    }
+
+    /// `filter` bounded by a cursor frontier. A date predicate left unhinted
+    /// over a root `$or` keeps that `$or` at the root, with the frontier in
+    /// every arm, so MongoDB still plans each arm separately (#2601).
+    fn bounded_filter(&self, boundary: Document) -> Document {
+        if self.access.discovery == IndexAccess::DateEndRange
+            && self.hint().is_none()
+            && let Ok(arms) = self.filter.get_array("$or")
+        {
+            let mut bounded = self.filter.clone();
+            bounded.insert(
+                "$or",
+                arms.iter()
+                    .map(|arm| Bson::Document(doc! { "$and": [arm.clone(), boundary.clone()] }))
+                    .collect::<Vec<_>>(),
+            );
+            return bounded;
+        }
+        doc! { "$and": [self.filter.clone(), boundary] }
     }
 
     /// Whether `filter` finds candidates only: membership pairs the
@@ -550,13 +594,14 @@ impl SearchFilterPlan {
         };
         let hint = index_filter.as_ref().and_then(IndexPredicate::hint);
         let (collection, mut pipeline) = if let Some(predicate) = index_filter {
-            let filter = predicate.filter;
             // Reject IDs outside the page before sorting and fetching resources.
             // In particular, previous-page scans must not look up every ID on
             // the far side of the cursor before reaching the requested page.
+            // `bounded_filter` keeps an unhinted date `$or` at the root so
+            // each arm is still planned separately.
             let filter = match index_cursor_filter {
-                Some(boundary) => doc! { "$and": [filter, boundary] },
-                None => filter,
+                Some(boundary) => predicate.bounded_filter(boundary),
+                None => predicate.filter,
             };
             let mut pipeline = vec![
                 doc! { "$match": filter },
@@ -753,7 +798,12 @@ impl MongoBackend {
         filter: Document,
         indexes_ready: bool,
     ) -> IndexPredicate {
-        let mut predicate = IndexPredicate::new(filter, parameter, indexes_ready);
+        let mut predicate = IndexPredicate::new_with_date_end(
+            filter,
+            parameter,
+            indexes_ready,
+            self.date_end_index_ready(),
+        );
         let registry = self.tenant_registry(tenant_id);
         let definition = registry.read().get_param(resource_type, &parameter.name);
         let definition = definition
@@ -1615,13 +1665,21 @@ async fn count_capped_predicates(
     let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
     let started = tokio::time::Instant::now();
     let mut completed = Vec::with_capacity(filters.len());
+    // The smallest exact count so far. A later predicate only needs counting
+    // up to one row past it: reaching that limit proves it is not smaller, and
+    // the first predicate still wins a tie. The choice is the one full counts
+    // make, for at most twice the smallest count instead of the sum of all
+    // (#2601: 706k keys to pick a 17k-row driver). A count stopped at its
+    // limit is a lower bound, kept as `AtLeast` and never as a full count.
+    let mut smallest: Option<u64> = None;
     for filter in filters {
+        let limit = smallest.map_or(FULL_COUNT, |smallest| smallest + 1);
         // Use the configured budget in the key so observations remain reusable.
         let key = ProbeFacts::key(
             db,
             &filter.filter,
             filter.hint(),
-            FULL_COUNT,
+            limit,
             Some(probe_timeout),
         );
         let cache_key = filter.probe_key.as_ref().and_then(ProbeKey::full_count);
@@ -1630,6 +1688,10 @@ async fn count_capped_predicates(
             match estimate {
                 ProbeEstimate::Completed(count) => Some(Some(count)),
                 ProbeEstimate::Unknown => Some(None),
+                // A known lower bound past the smallest count settles it.
+                ProbeEstimate::AtLeast(rows) if smallest.is_some_and(|s| rows > s) => {
+                    Some(Some(rows))
+                }
                 ProbeEstimate::AtLeast(_) => None,
             }
         });
@@ -1646,9 +1708,12 @@ async fn count_capped_predicates(
                 }
                 facts.requests += 1;
                 let operation = |hint| {
-                    let count = index
+                    let mut count = index
                         .count_documents(filter.filter.clone())
                         .max_time(remaining);
+                    if limit != FULL_COUNT {
+                        count = count.limit(limit);
+                    }
                     match hint {
                         Some(hint) => count.hint(hint),
                         None => count,
@@ -1680,6 +1745,9 @@ async fn count_capped_predicates(
                     cache.insert(
                         cache_key,
                         match count {
+                            Some(count) if limit != FULL_COUNT && count >= limit => {
+                                ProbeEstimate::AtLeast(count)
+                            }
                             Some(count) => ProbeEstimate::Completed(count),
                             None => ProbeEstimate::Unknown,
                         },
@@ -1694,6 +1762,9 @@ async fn count_capped_predicates(
         let Some(count) = count else {
             return Ok(None);
         };
+        if smallest.is_none_or(|smallest| count < smallest) {
+            smallest = Some(count);
+        }
         completed.push(Some(count));
     }
     let driver = smallest_counted(&completed);
@@ -1739,33 +1810,41 @@ fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>
 /// Optional probes retain their own budget, capped by the shared search
 /// deadline. The duration supplier also preserves a shared tie-break budget
 /// across a missing-index retry.
-async fn with_probe_hint_fallback<T, F>(
+///
+/// Not an `async fn`, so the command is tagged with the line that called this
+/// helper (see `search_access::with_hint_fallback`).
+#[track_caller]
+fn with_probe_hint_fallback<T, F>(
     mut hint: Option<Hint>,
     probe_timeout: impl Fn() -> Duration,
     operation: impl Fn(Option<Hint>) -> F,
-) -> StorageResult<Option<T>>
+) -> impl Future<Output = StorageResult<Option<T>>>
 where
     F: SearchCommand + IntoFuture<Output = mongodb::error::Result<T>>,
 {
-    loop {
-        search_deadline::check()?;
-        let remaining = probe_timeout();
-        if remaining < Duration::from_millis(1) {
-            return Ok(None);
-        }
-        let (command, budget) = operation(hint.clone()).search_probe_deadline(remaining)?;
-        let result = command.await;
-        budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
-        match result {
-            Err(error) if date_hint_rejected(&hint, &error) => {
-                tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
-                hint = None;
+    let site = std::panic::Location::caller();
+    async move {
+        loop {
+            search_deadline::check()?;
+            let remaining = probe_timeout();
+            if remaining < Duration::from_millis(1) {
+                return Ok(None);
             }
-            Err(error) if optional_probe_timed_out(&error) => return Ok(None),
-            result => {
-                return result
-                    .map(Some)
-                    .or_query_error("Failed to probe search candidates");
+            let (command, budget) =
+                operation(hint.clone()).search_probe_deadline_at(remaining, site)?;
+            let result = command.await;
+            budget.check_timeout(result.as_ref().is_err_and(optional_probe_timed_out))?;
+            match result {
+                Err(error) if date_hint_rejected(&hint, &error) => {
+                    tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+                    hint = None;
+                }
+                Err(error) if optional_probe_timed_out(&error) => return Ok(None),
+                result => {
+                    return result
+                        .map(Some)
+                        .or_query_error("Failed to probe search candidates");
+                }
             }
         }
     }
@@ -3808,7 +3887,7 @@ impl BatchedIndexPlan {
 
     fn seed_pipeline(&self, boundary: Option<Document>, direction: Option<i32>) -> Vec<Document> {
         let filter = match boundary {
-            Some(boundary) => doc! { "$and": [self.driver.filter.clone(), boundary] },
+            Some(boundary) => self.driver.bounded_filter(boundary),
             None => self.driver.filter.clone(),
         };
         // Group before streaming so duplicate index rows cannot cross batches.
@@ -4058,19 +4137,29 @@ impl BatchedIndexPlan {
             }
             _ => false,
         };
+        let candidates = ids.len();
         let live_filter = doc! { "$and": [resource_filter.clone(), { "id": { "$in": ids } }] };
+        // The batch bounds `id`, so an id-led index answers with one seek per
+        // candidate. Left to itself the planner can choose the type-scan
+        // index, whose `last_updated` key sits before `id`, and walk every
+        // live row of the type to find a batch of old resources; it did so in
+        // 329 of 467 unhinted counts and pages (#2601). The liveness index
+        // holds `is_deleted` before `id`, so the check reads no document;
+        // a rejected hint runs again on the identity index. A count or a
+        // counted page takes it only for a scope-only `resource_filter`.
         if count_only {
             // Seed IDs are globally deduplicated and resource identity is
             // unique within tenant/type. Count live matches server-side;
             // returning their IDs would add transfer without new information.
-            // Leave index selection to MongoDB: the type-scan index places
-            // last_updated before id, so forcing it can repeatedly scan many
-            // timestamp partitions for an otherwise bounded ID lookup.
-            result.count += resources
-                .count_documents(live_filter)
-                .search_deadline()?
-                .await
-                .or_query_error("Failed to count live candidates")?;
+            result.count += with_hint_fallback(candidate_count_hint(resource_filter), |hint| {
+                let count = resources.count_documents(live_filter.clone());
+                match hint {
+                    Some(hint) => count.hint(hint),
+                    None => count,
+                }
+            })
+            .await?
+            .or_query_error("Failed to count live candidates")?;
             return Ok(false);
         }
         if let BatchSelection::PageAndCount {
@@ -4093,18 +4182,23 @@ impl BatchedIndexPlan {
                 doc! { "$sort": { "id": *direction } },
                 doc! { "$limit": limit },
             ]);
-            let mut cursor = resources
-                .aggregate(vec![
-                    doc! { "$match": live_filter },
-                    doc! { "$project": { "_id": 0, "id": 1 } },
-                    doc! { "$facet": {
-                        "total": [{ "$count": "n" }],
-                        "page": page_stages,
-                    } },
-                ])
-                .search_deadline()?
-                .await
-                .or_query_error("Failed to count and select live candidates")?;
+            let pipeline = vec![
+                doc! { "$match": live_filter },
+                doc! { "$project": { "_id": 0, "id": 1 } },
+                doc! { "$facet": {
+                    "total": [{ "$count": "n" }],
+                    "page": page_stages,
+                } },
+            ];
+            let mut cursor = with_hint_fallback(candidate_count_hint(resource_filter), |hint| {
+                let aggregate = resources.aggregate(pipeline.clone());
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await?
+            .or_query_error("Failed to count and select live candidates")?;
             let facet = cursor
                 .try_next()
                 .await
@@ -4124,19 +4218,18 @@ impl BatchedIndexPlan {
                 .collect::<StorageResult<Vec<_>>>()?;
             return Ok(false);
         }
-        // The batch bounds `id`, so the identity index answers with one seek
-        // per candidate. Left to itself the planner can choose the type-scan
-        // index, whose `last_updated` key sits before `id`, and walk every
-        // live row of the type to find a batch of old resources.
-        let mut cursor = resources
-            .find(live_filter)
-            .search_deadline()?
-            .projection(doc! { "_id": 0, "id": 1 })
-            .hint(Hint::Name(
-                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
-            ))
-            .await
-            .or_query_error("Failed to validate live candidates")?;
+        let mut cursor = with_hint_fallback(liveness_hint(), |hint| {
+            let find = resources
+                .find(live_filter.clone())
+                .projection(doc! { "_id": 0, "id": 1 })
+                .batch_size(super::in_reply_rows(candidates));
+            match hint {
+                Some(hint) => find.hint(hint),
+                None => find,
+            }
+        })
+        .await?
+        .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();
         while cursor
             .advance()
@@ -4273,6 +4366,24 @@ mod candidate_tests {
             doc! { "total": [{"n": 1}, {"n": 2}] },
         ] {
             assert!(facet_total(&document).is_err(), "{document:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_counts_take_the_liveness_index_only_for_the_scope() {
+        let scope = doc! {
+            "tenant_id": "tenant", "resource_type": "Observation", "is_deleted": false,
+        };
+        assert_eq!(candidate_count_hint(&scope), liveness_hint());
+
+        for extra in [
+            doc! { "last_updated": { "$gt": "2026-01-01" } },
+            doc! { "id": "a" },
+            doc! { "fhir_version": "R4" },
+            doc! { "missing_params": "method" },
+        ] {
+            let filter = doc! { "$and": [scope.clone(), extra] };
+            assert_eq!(candidate_count_hint(&filter), None, "{filter:?}");
         }
     }
 
@@ -5393,6 +5504,10 @@ mod index_intersection_tests {
     use super::*;
 
     fn date_predicate(raw: &str) -> IndexPredicate {
+        date_predicate_with(raw, true)
+    }
+
+    fn date_predicate_with(raw: &str, date_end_ready: bool) -> IndexPredicate {
         let parameter = SearchParameter {
             name: "date".to_owned(),
             param_type: SearchParamType::Date,
@@ -5406,7 +5521,7 @@ mod index_intersection_tests {
         filter.extend(
             super::super::build_date_range_filter_doc(&parameter.values[0], "date").unwrap(),
         );
-        IndexPredicate::new(filter, &parameter, true)
+        IndexPredicate::new_with_date_end(filter, &parameter, true, date_end_ready)
     }
 
     #[test]
@@ -5428,10 +5543,8 @@ mod index_intersection_tests {
                 .pipeline(live.clone(), Some(doc! {"id": 1}), None)
                 .unwrap();
             assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
-            assert_eq!(
-                plan.hint,
-                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-            );
+            // A root `$or` mixes end- and start-bounded arms: MongoDB plans each.
+            assert_eq!(plan.hint, None);
             assert_eq!(plan.stages[0], doc! { "$match": ge.filter.clone() });
             assert_eq!(
                 plan.stages[1]
@@ -5466,9 +5579,11 @@ mod index_intersection_tests {
     }
 
     #[test]
-    fn resource_lookup_keeps_its_date_hint_and_cursor_bound() {
-        let predicate = date_predicate("ge2024-11-01");
+    fn resource_lookup_bounds_each_arm_of_an_unhinted_date_or_and_wraps_the_rest() {
         let boundary = doc! { "resource_id": { "$lt": "next" } };
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        let plain: IndexPredicate = doc! { "param_name": "patient" }.into();
         for resource_filter in [
             doc! { "is_deleted": false },
             doc! { "is_deleted": false, "$or": [
@@ -5476,26 +5591,172 @@ mod index_intersection_tests {
                 { "missing_params": { "$exists": false } },
             ] },
         ] {
-            let plan = SearchFilterPlan::ResourceLookups {
-                index_filter: Some(predicate.clone()),
-                stages: Vec::new(),
-            }
-            .pipeline(
-                resource_filter,
-                Some(doc! { "id": -1 }),
-                Some(boundary.clone()),
-            )
-            .unwrap();
-            assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
+            let lookup = |predicate: &IndexPredicate| {
+                SearchFilterPlan::ResourceLookups {
+                    index_filter: Some(predicate.clone()),
+                    stages: Vec::new(),
+                }
+                .pipeline(
+                    resource_filter.clone(),
+                    Some(doc! { "id": -1 }),
+                    Some(boundary.clone()),
+                )
+                .unwrap()
+            };
             assert_eq!(
-                plan.hint,
-                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+                lookup(&plain).stages[0],
+                doc! { "$match": { "$and": [plain.filter.clone(), boundary.clone()] } }
             );
+            // Unhinted `ge` (end index ready): the frontier goes in every arm
+            // and the `$or` stays at the root.
+            let ge = date_predicate("ge2024-11-01");
+            let plan = lookup(&ge);
+            assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
+            assert_eq!(plan.hint, None);
             assert_eq!(
                 plan.stages[0],
-                doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+                doc! { "$match": ge.bounded_filter(boundary.clone()) }
+            );
+            assert!(
+                plan.stages[0]
+                    .get_document("$match")
+                    .unwrap()
+                    .contains_key("$or")
+            );
+            // Hinted predicates keep their hint and wrap the whole filter.
+            for (predicate, hint) in [
+                (date_predicate("gt2024-11-01"), end.clone()),
+                (date_predicate_with("ge2024-11-01", false), v3.clone()),
+                (date_predicate("le2024-11-01"), v3.clone()),
+            ] {
+                let plan = lookup(&predicate);
+                assert_eq!(plan.hint, hint);
+                assert_eq!(
+                    plan.stages[0],
+                    doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn not_ready_date_end_index_keeps_the_v3_hint_for_ge() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let ge = date_predicate_with("ge2024-11-01", false);
+        assert_eq!(ge.access.discovery, IndexAccess::DateEndRange);
+        assert_eq!(ge.hint(), v3);
+        let plan = SearchFilterPlan::IndexIntersection(vec![ge.clone()])
+            .pipeline(
+                doc! { "tenant_id": "t", "is_deleted": false },
+                Some(doc! {"id": 1}),
+                None,
+            )
+            .unwrap();
+        assert_eq!(plan.hint, v3);
+        let lookup = SearchFilterPlan::ResourceLookups {
+            index_filter: Some(ge),
+            stages: Vec::new(),
+        }
+        .pipeline(
+            doc! { "is_deleted": false },
+            Some(doc! { "id": -1 }),
+            Some(doc! { "resource_id": { "$lt": "next" } }),
+        )
+        .unwrap();
+        assert_eq!(lookup.hint, v3);
+    }
+
+    #[test]
+    fn frontier_wrapped_date_filters_keep_the_end_hint_or_go_unhinted() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        let boundary = doc! { "resource_id": { "$gt": "cursor" } };
+        // The `_id` batch path wraps the filter before the access is chosen.
+        let wrapped = |raw: &str, ready: bool| {
+            let plain = date_predicate_with(raw, ready);
+            let parameter = SearchParameter {
+                name: "date".to_owned(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![crate::types::SearchValue::parse(raw)],
+                chain: vec![],
+                components: vec![],
+            };
+            let filter = doc! { "$and": [plain.filter, boundary.clone()] };
+            IndexPredicate::new_with_date_end(filter, &parameter, true, ready).hint()
+        };
+        assert_eq!(wrapped("gt2024-11-01", true), end);
+        assert_eq!(wrapped("ge2024-11-01", true), None);
+        assert_eq!(wrapped("ne2024-11-01", true), None);
+        assert_eq!(wrapped("eq2024-11-01", true), v3);
+        for raw in ["gt2024-11-01", "ge2024-11-01", "ne2024-11-01"] {
+            assert_eq!(wrapped(raw, false), v3, "{raw}");
+        }
+    }
+
+    #[test]
+    fn date_prefixes_choose_their_discovery_hint() {
+        let v3 = Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()));
+        let end = Some(Hint::Name(SEARCH_DATE_END_INDEX.to_owned()));
+        // `gt` is a flat filter bounded only on the range end.
+        let gt = date_predicate("gt2024-11-01");
+        assert_eq!(gt.access.discovery, IndexAccess::DateEndRange);
+        assert!(!gt.filter.contains_key("$or"));
+        assert_eq!(gt.hint(), end);
+        assert_eq!(date_predicate_with("gt2024-11-01", false).hint(), v3);
+        // Prefixes with a root `$or` leave the arms to the planner.
+        for raw in ["ge2024-11-01", "ne2024-11-01"] {
+            assert_eq!(date_predicate(raw).hint(), None, "{raw}");
+            assert_eq!(date_predicate_with(raw, false).hint(), v3, "{raw}");
+        }
+        // `ap` bounds both sides: once the end index is ready MongoDB picks
+        // the narrower one (#2601); before that it keeps the v3 hint.
+        let ap = date_predicate_with("ap2024-11-01", true);
+        assert_eq!(ap.access.discovery, IndexAccess::DateRange);
+        assert_eq!(ap.hint(), None);
+        assert_eq!(date_predicate_with("ap2024-11-01", false).hint(), v3);
+        // Start-bounded prefixes keep the v3 hint whatever the end index does.
+        for raw in [
+            "eq2024-11-01",
+            "lt2024-11-01",
+            "le2024-11-01",
+            "sa2024-11-01",
+            "eb2024-11-01",
+        ] {
+            for ready in [true, false] {
+                let predicate = date_predicate_with(raw, ready);
+                assert_eq!(predicate.access.discovery, IndexAccess::DateRange, "{raw}");
+                assert_eq!(predicate.hint(), v3, "{raw} ready={ready}");
+            }
+        }
+    }
+
+    #[test]
+    fn seed_boundary_stays_inside_each_arm_of_an_unhinted_or() {
+        let boundary = doc! { "resource_id": { "$gt": "cursor" } };
+        let ge = date_predicate("ge2024-11-01");
+        let arms = ge.filter.get_array("$or").unwrap().len();
+        let bounded = ge.bounded_filter(boundary.clone());
+        assert!(!bounded.contains_key("$and"));
+        let bounded_arms = bounded.get_array("$or").unwrap();
+        assert_eq!(bounded_arms.len(), arms);
+        for arm in bounded_arms {
+            assert_eq!(
+                arm.as_document().unwrap().get_array("$and").unwrap().len(),
+                2
             );
         }
+        // A hinted predicate wraps the whole filter, as before.
+        let gt = date_predicate("gt2024-11-01");
+        assert_eq!(
+            gt.bounded_filter(boundary.clone()),
+            doc! { "$and": [gt.filter.clone(), boundary.clone()] }
+        );
+        let unready = date_predicate_with("ge2024-11-01", false);
+        assert_eq!(
+            unready.bounded_filter(boundary.clone()),
+            doc! { "$and": [unready.filter.clone(), boundary] }
+        );
     }
 
     #[test]

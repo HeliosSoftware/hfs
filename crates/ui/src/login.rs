@@ -128,7 +128,13 @@ pub(crate) async fn require_session(
                 .await
             {
                 Ok(verified) => verified,
-                Err(_) => session_principal(&session),
+                Err(_) => {
+                    // No verified claim says which tenant this session may
+                    // read, so it is given none: see
+                    // [`refuse_unverified_tenant_reads`].
+                    request.extensions_mut().insert(Unverified);
+                    session_principal(&session)
+                }
             };
             request.extensions_mut().insert(principal);
             request.extensions_mut().insert(SignedIn(session.principal));
@@ -240,6 +246,45 @@ pub(crate) async fn require_system_scope(
                 .into_response()
         }
     }
+}
+
+/// Stamped by [`require_session`] next to the identity-only principal when
+/// the provider did not accept the session's access token. Such a session
+/// carries no verified tenant claim, so nothing may be read for it from
+/// process state under a tenant chosen on its behalf.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Unverified;
+
+/// The pages that render a tenant's figures from process state rather than
+/// through a self-call the FHIR API authorizes: the Home dashboard and the
+/// subscription inventory.
+fn reads_tenant_state_directly(path: &str) -> bool {
+    path == "/ui" || path == "/ui/subscriptions"
+}
+
+/// Middleware: a session whose token the provider did not accept is refused
+/// the pages that read a tenant's state from the process, with `403` and the
+/// shell's notice. Falling back to the server default tenant would show that
+/// tenant's figures to a user whose token may be bound to another one, while
+/// the API answers the same session `401`. Every other page still renders:
+/// its data comes through self-calls the API refuses itself.
+pub(crate) async fn refuse_unverified_tenant_reads(request: Request, next: Next) -> Response {
+    if request.extensions().get::<Unverified>().is_none()
+        || !reads_tenant_state_directly(request.uri().path())
+    {
+        return next.run(request).await;
+    }
+    let locale = request
+        .extensions()
+        .get::<crate::i18n::RequestLocale>()
+        .copied()
+        .unwrap_or_default();
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        crate::i18n::I18n::new(locale).t("auth-unverified-session"),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

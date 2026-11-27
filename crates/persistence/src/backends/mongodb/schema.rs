@@ -91,6 +91,7 @@ pub async fn initialize_schema_async(
     ensure_history_indexes(database).await?;
     if !search_offloaded {
         ensure_search_indexes(database).await?;
+        ensure_liveness_index(database).await?;
     }
     ensure_search_index_pending_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
@@ -114,6 +115,7 @@ pub async fn migrate_schema_async(
         ensure_history_indexes(database).await?;
         if !search_offloaded {
             ensure_search_indexes(database).await?;
+            ensure_liveness_index(database).await?;
         }
         ensure_search_index_pending_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
@@ -149,6 +151,13 @@ pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
 /// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
 pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
+/// Name of the `(tenant_id, resource_type, is_deleted, id)` index on
+/// `resources` (#2601). Search checks whether candidate ids are live through
+/// it as a covered scan; `idx_resources_identity` has no `is_deleted` and
+/// fetches each document for that one field. Not in
+/// [`REQUIRED_QUERY_INDEXES`]: a rejected hint retries on the identity index
+/// (`search_access::with_hint_fallback`).
+pub(crate) const RESOURCES_LIVENESS_INDEX: &str = "idx_resources_live_id";
 /// Partial `missing_params_fp` index serving the #1999 staleness probe.
 /// Built post-boot with `idx_resources_missing_params`, by the same builder.
 pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_params_fp";
@@ -345,6 +354,35 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     )
     .await?;
 
+    Ok(())
+}
+
+/// Creates [`RESOURCES_LIVENESS_INDEX`] (#2601).
+async fn ensure_liveness_index(database: &Database) -> StorageResult<()> {
+    // Liveness of candidate ids (#2601): a search that has chosen ids from
+    // `search_index` asks which of them are live (`is_deleted: false`) and
+    // reads only `id`. The identity index has no `is_deleted`, so each check
+    // fetched the whole document for one boolean: up to 290,046 documents
+    // for `_sort=-date&_offset=290000`. With `is_deleted` before `id` the
+    // check is a covered scan, and the unkeyed walk of a parameter sort
+    // reads live ids in `id` order from the keys. Created at boot like the
+    // other `resources` indexes, unless search is offloaded to Elasticsearch,
+    // where no search reads it; no schema version, because an older build
+    // neither reads nor drops it. Costs one more B-tree entry per insert and
+    // per deletion flip; see `crates/persistence/mongodb/search-indexes.md`.
+    let resources = database.collection::<Document>("resources");
+    create_index(
+        &resources,
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "id": 1_i32,
+        },
+        RESOURCES_LIVENESS_INDEX,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
