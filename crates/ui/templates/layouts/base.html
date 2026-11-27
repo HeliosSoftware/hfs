@@ -11,6 +11,9 @@
   <!-- No `defer`: the theme attribute must land on <html> before first paint,
        or the stored theme flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>
+  <!-- htmx keeps no page snapshots in localStorage, where they would outlive
+       the session and the sign-out: a back navigation reloads the page. -->
+  <meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":true}'>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
   <!-- The shared busy states (#679); ahead of every page script by defer's

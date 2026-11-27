@@ -552,3 +552,20 @@ async fn import_post_from_another_origin_is_refused_before_reaching_hts() {
         "the same-origin form reaches the handler (and renders the degraded result here)",
     );
 }
+
+/// Page snapshots must not be cached in localStorage, where they outlive the
+/// session: htmx reads its config from this meta before it loads.
+#[tokio::test]
+async fn layout_keeps_no_htmx_history_cache() {
+    let response = app()
+        .oneshot(Request::get("/ui/hts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let config = html
+        .find(r#"<meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":true}'>"#)
+        .expect("htmx-config meta in the layout");
+    let htmx = html.find("htmx.min.js").expect("htmx in the layout");
+    assert!(config < htmx, "the config must precede htmx");
+}
