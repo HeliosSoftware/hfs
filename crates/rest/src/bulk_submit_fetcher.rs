@@ -97,7 +97,11 @@ pub fn is_refused_file_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("keep-alive")
-        || name.len() >= 6 && name[..6].eq_ignore_ascii_case("proxy-")
+        // By bytes: a `str` slice panics when byte 6 is inside a character.
+        || name
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"proxy-"))
 }
 
 /// Default idle time allowed between two reads of a response before the read
@@ -1318,6 +1322,10 @@ mod tests {
             "Accept",
             "X-Proxy-Hint",
             "Proxy",
+            // Byte 6 falls inside a character: not refused, and no panic.
+            "abcde\u{e9}",
+            "prox\u{e9}-",
+            "",
         ] {
             assert!(!is_refused_file_request_header(name), "{name}");
         }
