@@ -1,0 +1,72 @@
+# Local override: HFS with Postgres (storage) + Elasticsearch (search), next to WSO2.
+# Budget decision: ES counts INSIDE the 8 CPU / 24G that WSO2 gets: HFS 6 CPU / 20G + ES 2 CPU / 4G.
+# Use with: ./runner.sh -f docker-compose.yaml -f docker-compose.hfs.yaml -f docker-compose.hfses.yaml ...
+services:
+  elasticsearch:
+    container_name: perf-es
+    image: elasticsearch:8.15.0
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g -Xlog:disable -Xlog:all=warning:stderr"
+    ports:
+      - "13132:9200"
+    volumes:
+      - perf_esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: curl -sf "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s" -o /dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  hfses:
+    container_name: perf-hfses
+    image: hfs-bench:main-c52ff36-es
+    pull_policy: never
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '6'
+          memory: 20G
+    ports:
+      - "13131:8080"
+    environment:
+      HFS_STORAGE_BACKEND: postgres-elasticsearch
+      HFS_DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/hfses"
+      HFS_ELASTICSEARCH_NODES: "http://elasticsearch:9200"
+      HFS_ELASTICSEARCH_INDEX_PREFIX: hfs
+      HFS_COMPOSITE_SYNC_MODE: synchronous
+      HFS_ELASTICSEARCH_WRITE_REFRESH: wait_for
+      HFS_ELASTICSEARCH_REFRESH_INTERVAL: 50ms
+      HFS_COMPOSITE_SYNC_REPAIR_INTERVAL: 60
+      HFS_PG_MAX_CONNECTIONS: 32
+      HFS_REQUEST_TIMEOUT: 900
+      HFS_MAX_BODY_SIZE: 209715200
+      HFS_LOG_LEVEL: info
+
+  hfses-checker:
+    container_name: perf-hfses-hc
+    image: curlimages/curl
+    command: ["-c", "trap : TERM INT; sleep infinity & wait"]
+    depends_on:
+      hfses:
+        condition: service_started
+    entrypoint: /bin/sh
+    healthcheck:
+      test: curl -f http://hfses:8080/metadata
+      interval: 10s
+      start_period: 60s
+      retries: 60
+
+volumes:
+  perf_esdata:

@@ -468,10 +468,13 @@ async fn prepare_named_sqlquery<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
-    let library =
-        helios_sof::sqlquery::parse_sqlquery_library(library_json).map_err(sqlquery_err_to_rest)?;
+    // A backend that speaks SQL runs the Library's SQL itself, so the SQL is
+    // read (and parsed) in that database's dialect.
+    let native_sql = state.sof_runner().and_then(|r| r.native_sql_dialect());
+    let library = helios_sof::sqlquery::parse_sqlquery_library_for(library_json, native_sql)
+        .map_err(sqlquery_err_to_rest)?;
 
-    validate_select_only(&library.sql)?;
+    validate_select_only(&library.sql, native_sql)?;
 
     let is_sql_view = matches!(
         super::subject::classify_subject(library_json)?,
@@ -484,6 +487,7 @@ where
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
+        native_sql,
         depends_on: &library.depends_on,
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,

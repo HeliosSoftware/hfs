@@ -417,6 +417,11 @@ async fn load_jobs_checked(
     let Some(store) = &state.settings else {
         return Ok(JobsSnapshot::default());
     };
+    // The SQL pages that stay open in the bearer-only posture list the jobs
+    // that use a view; none are read from the shared document there (#2802).
+    if crate::settings_withheld(user_key) {
+        return Ok(JobsSnapshot::default());
+    }
     let Some(stored) = store
         .get_settings(user_key)
         .await

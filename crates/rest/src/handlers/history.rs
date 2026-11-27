@@ -1013,11 +1013,13 @@ where
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// A `patient/` scope erases history inside the launch patient's compartment
-/// only (#1618), judged on the current payload as `DELETE [type]/[id]` judges
-/// it. A resource that is absent falls through to the backend's `404`; one
-/// that is deleted has no payload to judge, so a confined caller is refused.
-/// An unconfined caller reads nothing here.
+/// The authorization middleware refuses the history deletes to a `patient/`
+/// scope outright, since the versions erased may predate the resource joining
+/// the compartment. Should a confined caller reach a handler anyway, it is
+/// judged on the current payload as `DELETE [type]/[id]` judges it. A
+/// resource that is absent falls through to the backend's `404`; one that is
+/// deleted has no payload to judge, so a confined caller is refused. An
+/// unconfined caller reads nothing here.
 async fn assert_history_in_compartment<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,

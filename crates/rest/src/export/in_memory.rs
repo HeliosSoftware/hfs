@@ -24,11 +24,11 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
-use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{NativeSqlQuery, RowStream, SofRunner, ViewFilters};
 use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
 use helios_sof::sqlquery::engine::try_declared_columns;
-use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
+use helios_sof::sqlquery::{NativeDialect, QueryResult, SqlQueryError};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -962,6 +962,28 @@ async fn until_not_running(jobs: Arc<DashMap<String, JobStatus>>, jid: String) {
 
 #[async_trait]
 impl SofRunner for StopWhenNotRunning {
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        self.inner.native_sql_dialect()
+    }
+
+    /// A SQL query the backend runs itself is one statement: a cancel or
+    /// expiry drops the call, which ends the statement's transaction, and the
+    /// backend stops the statement at the query's time limit.
+    async fn run_sql_query(
+        &self,
+        tenant: &TenantContext,
+        query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        let cancelled = || SqlQueryError::SourceStream(SofError::Cancelled.to_string());
+        if !is_running(&self.jobs, &self.jid) {
+            return Err(cancelled());
+        }
+        tokio::select! {
+            result = self.inner.run_sql_query(tenant, query) => result,
+            () = until_not_running(Arc::clone(&self.jobs), self.jid.clone()) => Err(cancelled()),
+        }
+    }
+
     async fn run_view(
         &self,
         tenant: &TenantContext,
@@ -1592,7 +1614,6 @@ async fn execute_sql_query(
     query: &NamedSqlQuery,
     limits: SqlExportLimits,
 ) -> Result<QueryResult, ExportError> {
-    let engine = InMemorySqlEngine::open().map_err(|e| ExportError::Runner(e.to_string()))?;
     let exec_limits = crate::handlers::sof::graph::ExecLimits {
         max_source_rows_per_vd: limits.max_source_rows_per_vd,
         max_rows: limits.max_rows,
@@ -1604,7 +1625,6 @@ async fn execute_sql_query(
     };
 
     let (result, _leaf_schemas) = crate::handlers::sof::graph::execute_plan(
-        engine,
         runner,
         &task.tenant,
         &task.filters,
