@@ -225,8 +225,15 @@ where
     // Resolve the includes the backend did not (only MongoDB resolves them
     // inline), confine them to the patient compartment, and take out the
     // #1061 truncation markers, re-emitted below as warnings.
-    let includes =
-        finish_includes(state, tenant, compartment, chains, &query.includes, &mut result).await?;
+    let includes = finish_includes(
+        state,
+        tenant,
+        compartment,
+        chains,
+        &query.includes,
+        &mut result,
+    )
+    .await?;
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(tenant);
