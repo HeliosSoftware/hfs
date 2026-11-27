@@ -38,6 +38,11 @@ curl http://localhost:8080/clinic-b/Patient
 | `HFS_TENANT_STRICT_VALIDATION` | `false` | Return an error if URL and header tenant disagree |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim carrying the tenant id when authentication is enabled |
 
+With authentication enabled, a token that carries the tenant claim is bound to
+that tenant. It is refused `403` on the cross-tenant admin API
+(`/admin/tenants`, `/console/metrics/tenants`, `/console/metrics/traffic`)
+whatever its scopes; that API takes a `system/*` token with no tenant claim.
+
 ## Implementation Notes
 
 All persistence operations accept a `TenantContext` as their first argument. Storage backends enforce tenant boundaries at the query level — there is no application-level filtering after the fact. Data isolation is guaranteed even when backends share the same underlying database or index.

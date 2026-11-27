@@ -284,6 +284,12 @@ where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
     super::conditional_support::require_patch(state.storage())?;
+    super::conditional_support::require_search_grant(
+        principal.as_ref().map(|p| &p.0),
+        &resource_type,
+        helios_persistence::core::ConditionalInteraction::Patch,
+        None,
+    )?;
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {

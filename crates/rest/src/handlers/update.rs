@@ -428,6 +428,12 @@ where
         &resource,
         principal.as_ref().map(|p| &p.0),
     )?;
+    super::conditional_support::require_search_grant(
+        principal.as_ref().map(|p| &p.0),
+        &resource_type,
+        helios_persistence::core::ConditionalInteraction::Update,
+        None,
+    )?;
 
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {

@@ -93,6 +93,10 @@ method implies: `r` to list tenants or read the metrics, `c` to register a
 tenant, and `d` to deregister or purge one. `system/Patient.rs` and
 `user/*.cruds` are refused there with `403`.
 
+A token that carries a tenant claim (`HFS_AUTH_TENANT_CLAIM`, default
+`tenant_id`) is also refused there with `403`, whatever its scopes: it is
+bound to one tenant. Administer tenants with a token that has no tenant claim.
+
 ## 3. Register the login application
 
 The web UI signs users in through an OIDC application.

@@ -597,6 +597,20 @@ where
                 // `/metadata` says this deployment lacks (#1384, #1535).
                 if let Some(interaction) = transaction_conditional_interaction(&bundle_entry) {
                     super::conditional_support::require(state.storage(), interaction)?;
+                    if principal.is_some() {
+                        let (resource_type, _) =
+                            parse_request_url(&bundle_entry.url).map_err(|e| {
+                                RestError::InvalidElementValue {
+                                    message: format!("Entry {index}: {e}"),
+                                }
+                            })?;
+                        super::conditional_support::require_search_grant(
+                            principal,
+                            &resource_type,
+                            interaction,
+                            Some(&format!("transaction entry {index}")),
+                        )?;
+                    }
                 }
                 if !matches!(bundle_entry.method, BundleMethod::Get) {
                     match conditional_entry_criteria(
@@ -1450,6 +1464,24 @@ where
                 message: format!("Entry {index}: {method} {url} carries no usable criteria"),
             });
         }
+    }
+
+    let conditional_interaction = match method {
+        BundleMethod::Post => if_none_exist.map(|_| ConditionalInteraction::Create),
+        BundleMethod::Put => criteria.map(|_| ConditionalInteraction::Update),
+        BundleMethod::Patch => criteria.map(|_| ConditionalInteraction::Patch),
+        BundleMethod::Delete => criteria.map(|_| ConditionalInteraction::Delete),
+        BundleMethod::Get => None,
+    };
+    if let Some(interaction) = conditional_interaction
+        && let Err(error) = super::conditional_support::require_search_grant(
+            principal,
+            &resource_type,
+            interaction,
+            Some(&format!("batch entry {index}")),
+        )
+    {
+        return entry_failure(error);
     }
 
     // `ifMatch` on a conditional update or delete is honoured below, against

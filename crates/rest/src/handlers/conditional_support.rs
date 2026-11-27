@@ -12,6 +12,7 @@
 //! the refusal names the interaction the client asked for rather than whichever
 //! capability the backend happened to trip over (`'search'`, for S3).
 
+use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ConditionalInteraction, ConditionalStorage};
 
@@ -44,6 +45,44 @@ where
 }
 
 /// [`require`] for `POST [type]` with `If-None-Exist`.
+/// A conditional interaction searches `resource_type` before it writes, and
+/// its answer tells the client what that search found: whether and how many
+/// resources match, their location, and on a conditional create the matched
+/// resource itself. It therefore needs the Search grant a direct search on
+/// the type would, judged before the lookup runs. A grant that rests on a
+/// `patient/` scope is refused: the criteria cannot be confined to the launch
+/// patient's compartment. Without a principal (authentication disabled)
+/// nothing is judged. `entry` names the Bundle entry the refusal is about.
+pub(crate) fn require_search_grant(
+    principal: Option<&Principal>,
+    resource_type: &str,
+    interaction: ConditionalInteraction,
+    entry: Option<&str>,
+) -> RestResult<()> {
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    let location = entry.map(|entry| format!(" ({entry})")).unwrap_or_default();
+    match SmartScopePolicy::check(principal, resource_type, FhirOperation::Search) {
+        Ok(AccessScope::Unrestricted) => Ok(()),
+        Ok(AccessScope::PatientCompartment { .. }) => Err(RestError::Forbidden {
+            message: format!(
+                "{interaction} ({}) on {resource_type}{location} is not available under a \
+                 patient/ scope: the criteria cannot be confined to the launch patient's \
+                 compartment",
+                wire_form(interaction)
+            ),
+        }),
+        Err(_) => Err(RestError::Forbidden {
+            message: format!(
+                "Insufficient scope for search on {resource_type}{location}: {interaction} ({}) \
+                 searches the type before it writes",
+                wire_form(interaction)
+            ),
+        }),
+    }
+}
+
 pub(crate) fn require_create<S: ConditionalStorage + ?Sized>(storage: &S) -> RestResult<()> {
     require(storage, ConditionalInteraction::Create)
 }
