@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::ws::{CloseFrame, Message, WebSocket},
+    extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
     extract::{State, WebSocketUpgrade},
     response::Response,
 };
@@ -134,9 +134,13 @@ async fn handle_ws_connection(
     };
 
     // Register this client with the WebSocket manager.
-    let (client_id, mut rx) = engine
+    let Some((client_id, mut rx)) = engine
         .ws_manager()
-        .register_client(&tenant_id, &subscription_id);
+        .register_client(&tenant_id, &subscription_id)
+    else {
+        close_with_policy_violation(&mut socket, "too-many-clients").await;
+        return;
+    };
     let ws_manager = Arc::clone(engine.ws_manager());
 
     info!(
@@ -153,7 +157,7 @@ async fn handle_ws_connection(
     if let Ok(bundle) = handshake_bundle {
         match serde_json::to_string(&bundle) {
             Ok(msg) => {
-                if send_within_deadline(&mut socket, msg).await.is_err() {
+                if send_within_deadline(&mut socket, msg.into()).await.is_err() {
                     warn!(
                         client_id = %client_id,
                         "Failed to send handshake, client disconnected or not reading"
@@ -179,8 +183,8 @@ async fn handle_ws_connection(
             // Notification from the subscription engine.
             notification = rx.recv() => {
                 match notification {
-                    Some(bundle) => {
-                        match serde_json::to_string(&bundle) {
+                    Some(payload) => {
+                        match Utf8Bytes::try_from(payload) {
                             Ok(msg) => match send_within_deadline(&mut socket, msg).await {
                                 Ok(()) => {}
                                 Err(SendFailure::Disconnected) => {
@@ -203,7 +207,7 @@ async fn handle_ws_connection(
                                 warn!(
                                     client_id = %client_id,
                                     error = %e,
-                                    "Failed to serialize notification bundle"
+                                    "Notification payload is not UTF-8"
                                 );
                             }
                         }
@@ -274,8 +278,8 @@ enum SendFailure {
 
 /// Sends one text frame, giving up after [`SEND_TIMEOUT`]: a peer that stops
 /// reading leaves `send` pending once the socket buffers are full.
-async fn send_within_deadline(socket: &mut WebSocket, msg: String) -> Result<(), SendFailure> {
-    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(msg.into()))).await {
+async fn send_within_deadline(socket: &mut WebSocket, msg: Utf8Bytes) -> Result<(), SendFailure> {
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(msg))).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(SendFailure::Disconnected),
         Err(_) => Err(SendFailure::Stalled),
@@ -363,7 +367,7 @@ mod tests {
     #[test]
     fn binding_token_tenant_must_match_request_tenant() {
         let manager = helios_subscriptions::WsBindingTokenManager::new(30);
-        let (token, _) = manager.generate_token("acme", "subscription-1");
+        let (token, _) = manager.generate_token("acme", "subscription-1").unwrap();
 
         assert_eq!(
             validate_binding_token_for_request(&manager, &token, "other"),
@@ -377,7 +381,7 @@ mod tests {
     #[test]
     fn binding_token_matching_request_tenant_is_accepted() {
         let manager = helios_subscriptions::WsBindingTokenManager::new(30);
-        let (token, _) = manager.generate_token("acme", "subscription-1");
+        let (token, _) = manager.generate_token("acme", "subscription-1").unwrap();
 
         assert_eq!(
             validate_binding_token_for_request(&manager, &token, "acme"),

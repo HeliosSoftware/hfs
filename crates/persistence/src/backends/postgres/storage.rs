@@ -10018,8 +10018,12 @@ mod count_by_tenant_ownership_tests {
             data_dir: Some(data_dir),
             ..Default::default()
         };
+        // Migrate under the default statement timeout, not the short one
+        // under test: on a loaded runner a migration statement (the v7->v8
+        // backfill) can outlast 1.5 s and fail setup (#3003).
         let schema_backend = PostgresBackend::new(PostgresConfig {
             max_connections: 5,
+            statement_timeout_ms: PostgresConfig::default().statement_timeout_ms,
             ..config.clone()
         })
         .await

@@ -80,10 +80,7 @@ fn reindex_page_errors(
     (0..count)
         .map(|_| {
             Err(if busy {
-                StorageError::Backend(BackendError::Unavailable {
-                    backend_name: "sqlite".to_string(),
-                    message: message.clone(),
-                })
+                StorageError::Backend(crate::error::sqlite_unavailable(context, err))
             } else {
                 internal_error(message.clone())
             })

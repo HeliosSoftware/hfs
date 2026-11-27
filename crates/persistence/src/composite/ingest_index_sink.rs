@@ -925,7 +925,10 @@ async fn read_back(
                 resources.extend(found);
                 continue;
             }
-            Ok(Err(e)) => format!("could not read the resource back from the primary: {e}"),
+            Ok(Err(e)) => format!(
+                "could not read the resource back from the primary: {}",
+                e.client_text()
+            ),
             Err(_) => format!(
                 "reading the resource back from the primary timed out after {:?}",
                 context.config.max_wait

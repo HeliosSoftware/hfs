@@ -144,6 +144,10 @@ fn assert_bounded(snapshot: &DispatchSnapshot) {
         "{snapshot:?}"
     );
     assert!(
+        snapshot.max_pending_notifications_per_tenant <= snapshot.max_pending_notifications,
+        "{snapshot:?}"
+    );
+    assert!(
         snapshot.notification_workers <= snapshot.max_pending_notifications,
         "{snapshot:?}"
     );

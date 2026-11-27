@@ -205,10 +205,10 @@ impl AuthConfig {
             jwks_url: env::var("HFS_AUTH_JWKS_URL").ok(),
             expected_issuer: env::var("HFS_AUTH_ISSUER").ok(),
             expected_audience: env::var("HFS_AUTH_AUDIENCE").ok(),
-            tenant_claim: env::var("HFS_AUTH_TENANT_CLAIM")
-                .unwrap_or_else(|_| "tenant_id".to_string()),
             // A blank value falls back to the default: an empty claim name
-            // would match a `""` key.
+            // would match a `""` key, which for the tenant claim reads every
+            // token as claimless and serves every tenant from the default.
+            tenant_claim: claim_name_from_env("HFS_AUTH_TENANT_CLAIM", "tenant_id"),
             patient_claim: claim_name_from_env("HFS_AUTH_PATIENT_CLAIM", "patient"),
             encounter_claim: claim_name_from_env("HFS_AUTH_ENCOUNTER_CLAIM", "encounter"),
             fhir_user_claim: claim_name_from_env("HFS_AUTH_FHIR_USER_CLAIM", "fhirUser"),
@@ -217,10 +217,16 @@ impl AuthConfig {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            jwks_min_refresh_interval: env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            jwks_min_refresh_interval: match env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL") {
+                Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        value = %value,
+                        "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL is not a number of seconds; using 10"
+                    );
+                    10
+                }),
+                Err(_) => 10,
+            },
             smart_token_endpoint: env::var("HFS_SMART_TOKEN_ENDPOINT").ok(),
             smart_authorize_endpoint: env::var("HFS_SMART_AUTHORIZE_ENDPOINT").ok(),
             smart_jwks_url: env::var("HFS_SMART_JWKS_URL").ok(),
@@ -300,6 +306,20 @@ impl AuthConfig {
         if self.allowed_algorithms.is_empty() {
             errors.push("HFS_AUTH_ALGORITHMS must list at least one signing algorithm".to_string());
         }
+        if self.jwks_min_refresh_interval == 0 {
+            errors.push(
+                "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL must be at least 1 second: it bounds the \
+                 JWKS fetches an unknown kid can trigger and the background refresh's retries"
+                    .to_string(),
+            );
+        }
+        if self.tenant_claim.trim().is_empty() {
+            errors.push(
+                "HFS_AUTH_TENANT_CLAIM must not be blank (it names the claim that binds a \
+                 token to its tenant)"
+                    .to_string(),
+            );
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -309,11 +329,14 @@ impl AuthConfig {
     }
 }
 
-/// Reads a claim-name variable, treating a blank value as unset.
+/// Reads a claim-name variable, treating a blank value as unset and dropping
+/// surrounding whitespace: a padded name (`" tenant_id "`) matches no claim,
+/// which for the tenant claim is the same collapse as a blank one.
 fn claim_name_from_env(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
-        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -473,6 +496,33 @@ mod tests {
         clear_auth_env();
     }
 
+    /// The tenant claim is read like the launch-context claims: a blank value
+    /// falls back to `tenant_id` and a padded one is trimmed, so neither names
+    /// a claim no token carries (#2706).
+    #[test]
+    fn test_from_env_tenant_claim_name() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        unsafe { env::set_var("HFS_AUTH_TENANT_CLAIM", "org") };
+        assert_eq!(AuthConfig::from_env().tenant_claim, "org");
+
+        for blank in ["", "   ", "\t"] {
+            unsafe { env::set_var("HFS_AUTH_TENANT_CLAIM", blank) };
+            assert_eq!(AuthConfig::from_env().tenant_claim, "tenant_id");
+        }
+
+        unsafe {
+            env::set_var("HFS_AUTH_TENANT_CLAIM", " org ");
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", " launch_patient\n");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.tenant_claim, "org");
+        assert_eq!(config.patient_claim, "launch_patient");
+
+        clear_auth_env();
+    }
+
     #[test]
     fn test_default_config() {
         let config = AuthConfig::default();
@@ -523,6 +573,23 @@ mod tests {
         );
     }
 
+    /// Zero would let an unknown `kid` fetch per request and the background
+    /// refresh retry a failing provider in a tight loop.
+    #[test]
+    fn validate_rejects_a_zero_refresh_interval() {
+        let config = AuthConfig {
+            jwks_min_refresh_interval: 0,
+            ..enabled_config()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")),
+            "expected an interval error, got {errors:?}"
+        );
+    }
+
     /// A blank value is as absent as a missing one.
     #[test]
     fn validate_rejects_whitespace_only_values() {
@@ -533,6 +600,21 @@ mod tests {
         };
         let errors = config.validate().unwrap_err();
         assert_eq!(errors.len(), 2, "got {errors:?}");
+    }
+
+    /// The tenant claim is an isolation boundary: a blank name is refused
+    /// rather than matched against a `""` key.
+    #[test]
+    fn validate_rejects_a_blank_tenant_claim() {
+        for blank in ["", "   "] {
+            let config = AuthConfig {
+                tenant_claim: blank.to_string(),
+                ..enabled_config()
+            };
+            let errors = config.validate().unwrap_err();
+            assert_eq!(errors.len(), 1, "got {errors:?}");
+            assert!(errors[0].contains("HFS_AUTH_TENANT_CLAIM"), "{errors:?}");
+        }
     }
 
     /// Every problem is reported at once, not just the first.

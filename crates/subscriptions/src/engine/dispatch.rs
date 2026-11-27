@@ -26,6 +26,7 @@ pub struct DispatchSnapshot {
     pub event_queue_capacity: usize,
     pub max_pending_notifications: usize,
     pub per_subscription_queue_capacity: usize,
+    pub max_pending_notifications_per_tenant: usize,
     pub dispatch_concurrency: usize,
     pub handshake_concurrency: usize,
     pub ingress_queued: usize,
@@ -40,6 +41,7 @@ pub struct DispatchSnapshot {
     pub dropped_ingress_full: u64,
     pub dropped_ingress_closed: u64,
     pub dropped_global_full: u64,
+    pub dropped_tenant_full: u64,
     pub dropped_subscription_full: u64,
     pub dropped_worker_full: u64,
     /// Deliveries that panicked. Each also counts as a failed delivery.
@@ -145,6 +147,12 @@ impl Drop for ResidentGuard {
         if let Some(state) = self.state.upgrade() {
             let mut inner = state.lock();
             inner.stats.resident_notifications -= 1;
+            if let Some(count) = inner.tenant_resident.get_mut(&self.key.0) {
+                *count -= 1;
+                if *count == 0 {
+                    inner.tenant_resident.remove(&self.key.0);
+                }
+            }
             if self.active {
                 inner.stats.active_notifications -= 1;
             } else {
@@ -189,6 +197,9 @@ impl Drop for Activation {
 struct Inner {
     stats: DispatchSnapshot,
     queues: HashMap<Key, Queue>,
+    /// Resident notifications per tenant, against
+    /// `max_pending_notifications_per_tenant`.
+    tenant_resident: HashMap<String, usize>,
     activations: HashMap<Key, Activation>,
     closed: bool,
 }
@@ -338,6 +349,13 @@ impl SchedulerState {
                 warn!(tenant_id = %k.0, subscription_id = %k.1, "Subscription notification shed: global queue full (drop-new)");
                 return None;
             }
+            if inner.tenant_resident.get(&k.0).copied().unwrap_or(0)
+                >= inner.stats.max_pending_notifications_per_tenant
+            {
+                inner.stats.dropped_tenant_full += 1;
+                warn!(tenant_id = %k.0, subscription_id = %k.1, "Subscription notification shed: tenant share of the queue full (drop-new)");
+                return None;
+            }
             let capacity = inner.stats.per_subscription_queue_capacity;
             let queue = inner.queues.entry(k.clone()).or_insert_with(|| Queue {
                 generation: snapshot.generation.clone(),
@@ -354,6 +372,7 @@ impl SchedulerState {
                 return None;
             }
             queue.resident += 1;
+            *inner.tenant_resident.entry(k.0.clone()).or_default() += 1;
             inner.stats.resident_notifications += 1;
             inner.stats.queued_notifications += 1;
             return Some(ResidentGuard {
@@ -602,6 +621,9 @@ impl SchedulerOwner {
                         event_queue_capacity: config.event_queue_capacity,
                         max_pending_notifications: config.max_pending_notifications,
                         per_subscription_queue_capacity: config.per_subscription_queue_capacity,
+                        max_pending_notifications_per_tenant: config
+                            .max_pending_notifications_per_tenant
+                            .unwrap_or(config.max_pending_notifications),
                         dispatch_concurrency: config.dispatch_concurrency,
                         handshake_concurrency: config.handshake_concurrency,
                         ingress_queued: 0,
@@ -616,12 +638,14 @@ impl SchedulerOwner {
                         dropped_ingress_full: 0,
                         dropped_ingress_closed: 0,
                         dropped_global_full: 0,
+                        dropped_tenant_full: 0,
                         dropped_subscription_full: 0,
                         dropped_worker_full: 0,
                         panicked_deliveries: 0,
                         panicked_activations: 0,
                     },
                     queues: HashMap::new(),
+                    tenant_resident: HashMap::new(),
                     activations: HashMap::new(),
                     closed: false,
                 }),
@@ -818,6 +842,8 @@ mod tests {
                 event_queue_capacity: 1,
                 max_pending_notifications: limit,
                 per_subscription_queue_capacity: 1,
+                // These tests drive one tenant against the global budget.
+                max_pending_notifications_per_tenant: Some(limit),
                 dispatch_concurrency: 1,
                 handshake_concurrency: 1,
                 allow_private_endpoints: true, // receivers are on loopback
@@ -1190,6 +1216,66 @@ mod tests {
             SubscriptionStatusCode::Active,
             "the next activation gets the handshake slot"
         );
+    }
+
+    /// One tenant's resident notifications stop at its share of the global
+    /// budget, so another tenant still gets a reservation.
+    #[tokio::test]
+    async fn one_tenant_cannot_take_another_tenants_share_of_the_budget() {
+        let engine = SubscriptionEngine::new(
+            SubscriptionConfig {
+                max_pending_notifications: 4,
+                per_subscription_queue_capacity: 1,
+                allow_private_endpoints: true,
+                ..Default::default()
+            },
+            "http://localhost".into(),
+        );
+        for tenant in ["noisy", "quiet"] {
+            engine.topic_registry().add_topic(
+                tenant,
+                TopicDefinition {
+                    canonical_url: "topic".into(),
+                    title: None,
+                    resource_triggers: vec![],
+                    can_filter_by: vec![],
+                    notification_shape: vec![],
+                },
+            );
+        }
+        let subscribe = |tenant: &str, id: &str| {
+            let resource = crate::manager::tests::build_subscription_json(
+                "topic",
+                "rest-hook",
+                Some("http://localhost/hook"),
+            );
+            engine
+                .manager()
+                .register(tenant, id, &resource, FhirVersion::default())
+                .unwrap();
+            engine.manager().get_snapshot(tenant, id).unwrap()
+        };
+        let state = &engine.scheduler.state;
+        assert_eq!(state.snapshot().max_pending_notifications_per_tenant, 2);
+
+        let held: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                state
+                    .reserve(&subscribe("noisy", id))
+                    .expect("within the share")
+            })
+            .collect();
+        assert!(state.reserve(&subscribe("noisy", "c")).is_none());
+        assert_eq!(state.snapshot().dropped_tenant_full, 1);
+        assert_eq!(state.snapshot().dropped_global_full, 0);
+
+        let quiet = state.reserve(&subscribe("quiet", "a"));
+        assert!(quiet.is_some(), "the other tenant still has budget");
+
+        drop(held);
+        assert!(state.reserve(&subscribe("noisy", "d")).is_some());
+        drop(quiet);
     }
 
     #[tokio::test]

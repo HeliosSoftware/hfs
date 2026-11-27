@@ -366,6 +366,7 @@ mod sof_export_s3_restart_tests {
             submitted_at,
             completed_at,
             client_tracking_id: None,
+            owner_subject: None,
         }
     }
 
@@ -433,6 +434,7 @@ mod sof_export_s3_restart_tests {
             submitted_at: now - chrono::Duration::minutes(10),
             completed_at: now - chrono::Duration::minutes(5),
             client_tracking_id: Some("trk-1".to_string()),
+            owner_subject: None,
         };
         s3.persist_completion(&job_id, &manifest)
             .expect("persist_completion failed");
