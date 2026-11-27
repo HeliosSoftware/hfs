@@ -8954,9 +8954,23 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
         });
     };
 
+    // Diffing two posted documents is CPU work sized by the caller; keep it
+    // off the runtime's worker threads.
+    let diff = tokio::task::spawn_blocking(move || history::diff(&from, &to, show_metadata)).await;
+    let Ok(diff) = diff else {
+        return render(HistoryDiffFragment {
+            i18n,
+            diff: history::diff(&serde_json::Value::Null, &serde_json::Value::Null, true),
+            from_label: form.from_label,
+            to_label: form.to_label,
+            show_metadata,
+            deleted,
+            parse_error: true,
+        });
+    };
     render(HistoryDiffFragment {
         i18n,
-        diff: history::diff(&from, &to, show_metadata),
+        diff,
         from_label: form.from_label,
         to_label: form.to_label,
         show_metadata,
