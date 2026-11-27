@@ -2687,13 +2687,16 @@ fn parse_bundle_request_url(
             .map(|resource_type| ((*resource_type).to_string(), String::new()))
             .ok_or_else(|| "Entry request.url is empty".to_string()),
         BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete => {
-            // A control segment addresses nothing a mutation entry can act
+            // A `_history` segment addresses nothing a mutation entry can act
             // on; read as the last two segments, `Observation/o1/_history`
             // was the instance `_history` of type `o1`, which answered 204
             // and erased nothing. The history deletes have no Bundle form.
-            if let Some(control) = segments.iter().find(|segment| segment.starts_with('_')) {
+            // Only the literal segment is refused: an id or a path prefix that
+            // merely starts with `_` is addressed as before (ids are #2525's
+            // decision, prefixes #2750's).
+            if segments.contains(&"_history") {
                 return Err(format!(
-                    "{method} entry request.url cannot address '{control}': a Bundle entry \
+                    "{method} entry request.url cannot address '_history': a Bundle entry \
                      writes or deletes an instance ('[type]/[id]') or by criteria \
                      ('[type]?[parameters]'); history is erased through the instance endpoint"
                 ));
@@ -6241,9 +6244,25 @@ mod tests {
                 "Observation/o1/_history",
                 "Observation/o1/_history/3",
                 "http://h/fhir/Observation/o1/_history",
+                "Observation/_history",
+                "Observation/Patient/_history",
             ] {
                 let err = parse_bundle_request_url(&method, url).expect_err(url);
                 assert!(err.contains("_history"), "{method} {url}: {err}");
+            }
+            // Only the literal `_history` segment is refused: an id or a path
+            // prefix that starts with `_` is addressed as before.
+            for (url, id) in [
+                ("Observation/_o2", "_o2"),
+                ("Observation/_history2", "_history2"),
+                ("_t/Observation/o1", "o1"),
+                ("http://h/_fhir/Observation/o1", "o1"),
+            ] {
+                assert_eq!(
+                    parse_bundle_request_url(&method, url),
+                    Ok(("Observation".to_string(), id.to_string())),
+                    "{method} {url}"
+                );
             }
         }
         assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation/o1").is_ok());
