@@ -117,4 +117,4 @@ sent to the model (never patient data), cost, and abuse prevention.
 | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | `60` | Rate-limit window (seconds) |
 | `HFS_NL_SEARCH_DAILY_LIMIT` | `200` | Requests per caller per UTC day |
 | `HFS_NL_SEARCH_MAX_CHARS` | `500` | Maximum input length (characters) |
-| `HFS_RATE_LIMIT_IPV6_PREFIX` | `64` | Prefix length (0–128) an unauthenticated IPv6 client is rate limited by, for natural-language search and bulk-submit status polls; IPv4 clients are limited per address |
+| `HFS_RATE_LIMIT_IPV6_PREFIX` | `64` | Prefix length (0–128) an unauthenticated IPv6 client is rate limited by, for natural-language search and bulk-submit status polls; IPv4 clients are limited per address. Callers inside one prefix share a budget, so `128` bills each address (and lets address rotation buy a fresh one), while `56` or `48` suit clients known to hold that allocation; with authentication enabled callers are billed per principal instead |

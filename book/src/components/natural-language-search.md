@@ -147,6 +147,35 @@ otherwise send each request from a new address. The ceilings are:
 
 Exceeding a limit returns `429` with a FHIR `OperationOutcome` (`throttled`).
 
+### Clients that share a /64
+
+Counting a whole /64 protects the budget from address rotation, and it costs
+something: with authentication disabled, every caller inside one /64 spends the
+same budget. That groups callers the server has no reason to group together — a
+hosting provider that gives each machine a single address, or a /124, out of one
+shared /64, and a shared LAN segment that reaches the server over IPv6. One
+neighbour can then spend:
+
+- the `$nl-search` window (`HFS_NL_SEARCH_RATE_LIMIT` requests per
+  `HFS_NL_SEARCH_RATE_WINDOW_SECS`) and the daily budget
+  (`HFS_NL_SEARCH_DAILY_LIMIT` per UTC day), leaving the others with `429`
+  until the window or the day rolls over;
+- the bulk-submit status-poll misses (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` per
+  `HFS_BULK_SUBMIT_POLL_RATE_WINDOW`), which polls of unknown tokens spend.
+  Once they are gone, every status poll from that /64 is answered `429` until
+  the window rolls, including polls of valid tokens.
+
+Choose the prefix for what your clients hold:
+
+| Prefix | Bills | Choose it when |
+|--------|-------|----------------|
+| `128` | each address | Clients hold single addresses inside a shared /64 (per-address billing). Each address gets its own budget, and rotation inside the /64 buys a fresh one again. |
+| `64` (default) | each /64 | Clients hold a /64, as residential and small-office connections do. Callers that share a /64 share a budget. |
+| `56` or `48` | each /56 or /48 | Clients are known to hold an allocation that size, so each client is one bucket. |
+
+Authentication removes the question: with it enabled, requests are counted per
+principal within its tenant, whatever the prefix says.
+
 ## Using the endpoint directly
 
 ```bash

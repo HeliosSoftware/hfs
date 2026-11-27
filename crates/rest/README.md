@@ -426,8 +426,15 @@ them, and exposes results through a status manifest.
   that resolves to nothing, or to a submission the client may not see) also spends
   one of the client's `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` misses per window, shared by
   all its tokens and checked before the lookup, so inventing tokens earns a `429`
-  instead of a fresh bucket and a database read each time. A caller with neither a
-  principal nor a peer address is not billed for misses. Each limiter holds at most
+  instead of a fresh bucket and a database read each time. An unauthenticated IPv6
+  caller is billed by its `/N` network (`HFS_RATE_LIMIT_IPV6_PREFIX`), so every client
+  inside one /64 shares one miss budget: a neighbour's unknown-token polls can spend
+  it, and polls of valid tokens from that /64 then answer `429` until the window
+  rolls. Use `128` when clients hold single addresses in a shared /64 (each address
+  gets its own budget, and rotation inside the /64 buys a fresh one again), or `56` /
+  `48` for clients known to hold that allocation; with auth enabled the budget is per
+  principal and the question goes away. A caller with neither a principal nor a peer
+  address is not billed for misses. Each limiter holds at most
   100,000 buckets; a new key past that is refused with `429` for a window.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
