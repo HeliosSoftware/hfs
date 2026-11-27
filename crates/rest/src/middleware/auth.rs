@@ -530,15 +530,6 @@ fn routed_path(path: &str, tenant_url_routing: bool) -> String {
     path.to_string()
 }
 
-/// Operation endpoints whose handlers run their own scope check, so the
-/// middleware defers to them instead of classifying them by HTTP method.
-///
-/// Adding an entry here **removes** the middleware's authorization check for
-/// that path. Only add one whose handler enforces a scope itself — see
-/// `check_purge_scope` / `check_reindex_scope` in `handlers::purge` /
-/// `handlers::reindex`.
-const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
-
 /// Operations that are read-shaped regardless of HTTP method: both
 /// `GET /{type}/$op` and `POST /{type}/{id}/$op` (and their instance-level
 /// equivalents) return data and must be authorized as `FhirOperation::Read`,
@@ -546,8 +537,9 @@ const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-statu
 ///
 /// This MUST stay a narrow, explicit allowlist — add an operation only after
 /// confirming it is read-only and needs no scope of its own. A destructive or
-/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs in
-/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check.
+/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs
+/// with the handler-authorized route shapes in `extract_operation` instead,
+/// with its own handler-level check.
 ///
 /// `$export` (Bulk Data) is read-shaped: type-level `/{type}/$export` and
 /// Group-instance `/Group/{id}/$export` return the exported data and are
@@ -612,7 +604,10 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     let resource_type = first.to_string();
 
     // Type- and instance-scoped `$purge` / `$reindex` carry their own scope
-    // semantics that do not map onto the HTTP method: POST /Patient/$purge is a
+    // semantics that do not map onto the HTTP method (`check_purge_scope` /
+    // `check_reindex_scope` in `handlers::purge` / `handlers::reindex`), and
+    // adding a shape below **removes** the middleware's authorization check
+    // for it. POST /Patient/$purge is a
     // destructive delete, not a Create, and gating it as a Create would both
     // over-restrict a least-privilege token and label the audit trail
     // "Granted: Create on Patient" for what is really a purge. Their handlers
@@ -624,11 +619,20 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     // path would silently remove the only authorization check from the
     // type- and instance-level operations that run no handler-level scope
     // check of their own (the subscription operations among them).
-    if segments
-        .iter()
-        .skip(1)
-        .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
-    {
+    //
+    // The match is on the route shape, not on the segment text: only
+    // `/{type}/$purge`, `/{type}/$reindex` and `/{type}/{id}/$purge` are
+    // routed to those handlers (the system-level forms are `$`-first and
+    // declined below). A path that carries one of these names where a
+    // resource id or version id goes (`/{type}/$reindex-status`,
+    // `/{type}/{id}/_history/$purge`) is dispatched to the ordinary instance
+    // handlers, which check nothing, so it is classified like any other id.
+    let handler_authorized = match segments.as_slice() {
+        [_, op] => matches!(*op, "$purge" | "$reindex"),
+        [_, _, op] => *op == "$purge",
+        _ => false,
+    };
+    if handler_authorized {
         return None;
     }
 
@@ -1282,8 +1286,53 @@ mod tests {
     /// `tests/system_level_operation_scopes.rs`). Type- and instance-level
     /// operations without a handler-level check stay classified here.
     ///
-    /// If you are here because you added an entry to HANDLER_AUTHORIZED_OPS and
-    /// this failed: that endpoint's handler must enforce a scope itself.
+    /// If you are here because you added a handler-authorized route shape to
+    /// `extract_operation` and this failed: that endpoint's handler must
+    /// enforce a scope itself.
+    /// The handler-authorized operations are recognised by route shape. A
+    /// resource id or version id that merely spells one of their names stays
+    /// an ordinary instance request and keeps its scope check.
+    #[test]
+    fn an_id_spelled_like_a_handler_authorized_operation_keeps_its_scope_check() {
+        for (path, method) in [
+            ("/Observation/$purge", "POST"),
+            ("/Observation/$reindex", "POST"),
+            ("/Observation/o1/$purge", "POST"),
+            ("/$reindex", "POST"),
+            ("/$reindex-status/job-1", "GET"),
+            ("/$reindex-status/job-1", "DELETE"),
+        ] {
+            assert!(
+                extract_operation(path, method).is_none(),
+                "{method} {path} is authorized by its handler"
+            );
+        }
+        assert_eq!(
+            extract_operation("/Observation/$reindex-status", "PUT"),
+            Some(("Observation".to_string(), FhirOperation::Update))
+        );
+        assert_eq!(
+            extract_operation("/Observation/$reindex-status", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
+        );
+        assert_eq!(
+            extract_operation("/Observation/$reindex-status", "DELETE"),
+            Some(("Observation".to_string(), FhirOperation::Delete))
+        );
+        assert_eq!(
+            extract_operation("/Observation/o1/_history/$purge", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
+        );
+        assert_eq!(
+            extract_operation("/Observation/o1/_history/$purge", "DELETE"),
+            Some(("Observation".to_string(), FhirOperation::Delete))
+        );
+        assert_eq!(
+            extract_operation("/Observation/$reindex-status/_history", "GET"),
+            Some(("Observation".to_string(), FhirOperation::Read))
+        );
+    }
+
     #[test]
     fn test_sof_ops_are_handler_authorized_and_subscription_ops_still_require_scope() {
         assert!(extract_operation("/$sql-run", "POST").is_none());

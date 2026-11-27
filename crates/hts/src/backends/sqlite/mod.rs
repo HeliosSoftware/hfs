@@ -14,6 +14,7 @@
 pub mod schema;
 
 mod code_system;
+pub(crate) mod concept_index_cache;
 mod concept_map;
 pub(crate) mod resource_identity;
 mod value_set;
@@ -302,37 +303,35 @@ pub(crate) fn bounded_cache_insert<K, V, S>(
 ///
 /// Keyed by the implicit ValueSet URL.  Values are the combined entry list
 /// plus a trigram inverted index that enables O(k) filtered queries.
-pub(crate) type ImplicitIndex = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+pub(crate) type ImplicitIndex = Arc<concept_index_cache::ConceptIndexCache>;
 
 /// Shared in-memory index for inline-compose ValueSet expansions.
 ///
-/// Keyed by the DB-level cache key (`"inline-compose:{fnv64-hex}"`).  After
+/// Keyed by the DB-level cache key (`"inline-compose:{sha256-hex}"`).  After
 /// the first expansion for a given compose body the full result set is loaded
 /// into this map so that subsequent requests bypass `spawn_blocking` entirely,
 /// eliminating r2d2 pool contention under high concurrency (EX06 optimisation).
-pub(crate) type InlineComposeIndex =
-    Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+pub(crate) type InlineComposeIndex = Arc<concept_index_cache::ConceptIndexCache>;
 
 /// Shared in-memory index for property-filtered inline ValueSet expansions.
 ///
-/// Keyed by `"prop-result:{fnv64-hex}"` of the compose body.  Populated on
+/// Keyed by `"prop-result:{sha256-hex}"` of the compose body.  Populated on
 /// the first expansion of a compose that uses property= + hierarchy filters
 /// (EX08 pattern).  Stores the FULL property-matched concept set (no text
 /// filter); subsequent requests apply the text filter in Rust, eliminating
 /// `spawn_blocking` and r2d2 pool contention under high concurrency.
-pub(crate) type PropertyResultCache =
-    Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+pub(crate) type PropertyResultCache = Arc<concept_index_cache::ConceptIndexCache>;
 
 /// Shared in-memory corpus index for plain multi-system text-filter expansions.
 ///
-/// Keyed by `"plain-fts:{fnv64-hex}"` of the compose body.  Populated on the
+/// Keyed by `"plain-fts:{sha256-hex}"` of the compose body.  Populated on the
 /// first filtered expansion where every include is a plain full-system include
 /// (no compose filters, no explicit concept list, no nested valueSets) — the
 /// EX07 pattern.  Stores ALL concepts from the included systems (no text
 /// filter); subsequent requests for the same compose (any filter term) apply
 /// the text filter in Rust via the trigram index, eliminating `spawn_blocking`
 /// and r2d2 pool contention under high concurrency.
-pub(crate) type PlainFtsCache = Arc<RwLock<HashMap<String, Arc<value_set::ImplicitConceptIndex>>>>;
+pub(crate) type PlainFtsCache = Arc<concept_index_cache::ConceptIndexCache>;
 
 /// SQLite-backed terminology service backend.
 ///
@@ -357,15 +356,21 @@ pub struct SqliteTerminologyBackend {
 
     /// Deduplication guard for background index-population threads.
     ///
-    /// When the BFS fast path serves an EX03 request it spawns exactly one
-    /// `std::thread` per URL to populate `implicit_expansion_cache` and then
-    /// build the in-memory `implicit_index`.  This set prevents multiple
-    /// concurrent VUs from each spawning their own thread for the same URL.
+    /// When the BFS fast path serves an EX03 request it queues one fill per
+    /// URL on `implicit_fill_queue`.  This set prevents multiple concurrent
+    /// VUs from each queueing the same URL.
     pub(crate) bg_index_pending: Arc<Mutex<HashSet<String>>>,
+
+    /// Queue feeding the single background worker that fills
+    /// `implicit_expansion_cache` and warms `implicit_index` for URLs first
+    /// seen on the paged fast path. The worker starts on first use and stops
+    /// when the last clone of this backend is dropped. The queue is bounded:
+    /// when it is full the fill is skipped and a later request retries.
+    pub(crate) implicit_fill_queue: value_set::ImplicitFillQueue,
 
     /// In-process concept index for inline-compose ValueSet expansions.
     ///
-    /// Keyed by `"inline-compose:{fnv64-hex}"` — the same key used by the
+    /// Keyed by `"inline-compose:{sha256-hex}"` — the same key used by the
     /// DB-level `implicit_expansion_cache` table.  Populated during the first
     /// expansion for each unique compose body and pre-warmed at startup from any
     /// existing cache rows, so that repeated requests (e.g. k6 benchmark VUs)
@@ -374,7 +379,7 @@ pub struct SqliteTerminologyBackend {
 
     /// In-process concept index for property-filtered inline ValueSet expansions.
     ///
-    /// Keyed by `"prop-result:{fnv64-hex}"` of the compose body.  Populated on
+    /// Keyed by `"prop-result:{sha256-hex}"` of the compose body.  Populated on
     /// the first expansion that has property= + hierarchy compose filters (e.g.
     /// EX08: SNOMED finding-site + is-a + text).  The cached set contains ALL
     /// property-matched concepts (no text filter); subsequent requests with the
@@ -384,7 +389,7 @@ pub struct SqliteTerminologyBackend {
 
     /// In-process corpus index for plain multi-system text-filter expansions.
     ///
-    /// Keyed by `"plain-fts:{fnv64-hex}"` of the compose body.  Populated on
+    /// Keyed by `"plain-fts:{sha256-hex}"` of the compose body.  Populated on
     /// the first filtered expansion where every include is a plain full-system
     /// include (EX07 pattern: multi-system text filter, no compose filters).
     /// The cached set contains ALL concepts from the included systems; any
@@ -529,10 +534,10 @@ impl SqliteTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Failed to create SQLite pool: {e}")))?;
 
         // Declare early so the init block can pre-warm the in-memory indexes.
-        let implicit_index: ImplicitIndex = Arc::new(RwLock::new(HashMap::new()));
-        let inline_compose_index: InlineComposeIndex = Arc::new(RwLock::new(HashMap::new()));
-        let property_result_cache: PropertyResultCache = Arc::new(RwLock::new(HashMap::new()));
-        let plain_fts_cache: PlainFtsCache = Arc::new(RwLock::new(HashMap::new()));
+        let implicit_index: ImplicitIndex = Arc::default();
+        let inline_compose_index: InlineComposeIndex = Arc::default();
+        let property_result_cache: PropertyResultCache = Arc::default();
+        let plain_fts_cache: PlainFtsCache = Arc::default();
         // Bootstrap: apply WAL + schema on a single connection.
         {
             let mut conn = pool.get().map_err(|e| {
@@ -623,6 +628,7 @@ impl SqliteTerminologyBackend {
                 // On a warm restart (e.g. repeated benchmark runs) this lets the
                 // async hot path in expand() fire immediately without waiting for
                 // a background build thread.  No-op on first run (empty cache).
+                value_set::reconcile_implicit_cache_at_startup(&conn);
                 value_set::prebuild_implicit_index(&conn, &implicit_index);
 
                 // Pre-warm the inline-compose in-memory index from any persisted
@@ -638,6 +644,7 @@ impl SqliteTerminologyBackend {
             pool,
             implicit_index,
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
+            implicit_fill_queue: Arc::default(),
             inline_compose_index,
             property_result_cache,
             plain_fts_cache,
@@ -707,6 +714,7 @@ impl SqliteTerminologyBackend {
                  ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
             );
         }
+        value_set::reconcile_implicit_cache_at_startup(&conn);
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
         value_set::prebuild_inline_compose_index(&conn, &self.inline_compose_index);
         Ok(())
@@ -773,11 +781,12 @@ impl SqliteTerminologyBackend {
 
         Ok(Self {
             pool,
-            implicit_index: Arc::new(RwLock::new(HashMap::new())),
+            implicit_index: Arc::default(),
             bg_index_pending: Arc::new(Mutex::new(HashSet::new())),
-            inline_compose_index: Arc::new(RwLock::new(HashMap::new())),
-            property_result_cache: Arc::new(RwLock::new(HashMap::new())),
-            plain_fts_cache: Arc::new(RwLock::new(HashMap::new())),
+            implicit_fill_queue: Arc::default(),
+            inline_compose_index: Arc::default(),
+            property_result_cache: Arc::default(),
+            plain_fts_cache: Arc::default(),
             cs_abstract_prop_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_inactive_prop_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_concept_abstract_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -964,6 +973,10 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             // data — the threads it guards write to caches that this method is
             // about to empty anyway.
             bg_index_pending: _,
+            // Not a cache: the queue of pending background fills. A queued
+            // fill re-reads the tables when it runs, so it cannot write
+            // anything staler than this method leaves behind.
+            implicit_fill_queue: _,
             implicit_index,
             inline_compose_index,
             property_result_cache,
@@ -991,11 +1004,13 @@ impl TerminologyCaches for SqliteTerminologyBackend {
             };
         }
 
+        // The bounded concept-index caches clear themselves.
+        implicit_index.clear();
+        inline_compose_index.clear();
+        property_result_cache.clear();
+        plain_fts_cache.clear();
+
         clear!(
-            implicit_index,
-            inline_compose_index,
-            property_result_cache,
-            plain_fts_cache,
             cs_abstract_prop_cache,
             cs_inactive_prop_cache,
             cs_concept_abstract_cache,

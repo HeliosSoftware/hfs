@@ -98,7 +98,7 @@ pub async fn import_dicom(
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
     let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = concepts.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -115,7 +115,7 @@ pub async fn import_dicom(
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
         let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
-        stats.errors.extend(chunk.errors);
+        stats.take_errors(chunk);
 
         eprintln!(
             "[dicom] batch {}/{total_batches} — +{} codes",

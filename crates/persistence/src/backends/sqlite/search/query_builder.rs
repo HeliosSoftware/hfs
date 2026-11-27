@@ -1966,6 +1966,209 @@ impl QueryBuilder {
     }
 }
 
+/// Which rows of the date walk a page reads (#2731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateWalkRange {
+    /// Every keyed resource, from the start of the order (`?1`, `?2` only).
+    All,
+    /// Strictly after the cursor `(?3 = key, ?4 = id)` in the forward order.
+    After,
+    /// Strictly before the cursor `(?3 = key, ?4 = id)`, read in the reversed
+    /// order (a `Previous` page).
+    Before,
+    /// Every keyed resource in the reversed order (a `Previous` page from the
+    /// first resource with no value, which lies after all of them).
+    Reversed,
+}
+
+/// The `search_index` column the walk orders by: where the latest range ends
+/// (descending) or where the earliest starts (ascending), as
+/// [`QueryBuilder::sort_expression`] does for the correlated subquery.
+pub(crate) fn date_walk_column(desc: bool) -> &'static str {
+    if desc { "value_date_end" } else { "value_date" }
+}
+
+/// The index the walk reads for a direction: `idx_search_date_end`
+/// descending, `idx_search_date` ascending.
+pub(crate) fn date_walk_index(desc: bool) -> &'static str {
+    if desc {
+        "idx_search_date_end"
+    } else {
+        "idx_search_date"
+    }
+}
+
+/// One page of the ordered date-index walk (#2731): the resources with a value
+/// for the date parameter `param`, in the order of `ORDER BY <key> <dir>, id
+/// ASC` (the correlated-subquery sort, key = `MAX(value_date_end)` descending
+/// or `MIN(value_date)` ascending), read from the date index instead of
+/// computed for every resource of the type.
+///
+/// A resource can have several date rows. A row is kept only when no other row
+/// of the same resource beats it (`NOT EXISTS`, the first row by `rowid`
+/// among equal keys), so each resource appears once with its `MAX`/`MIN` key
+/// and the walk needs no memory of what it has seen: `_offset`, a forward
+/// cursor and a backward cursor all work the same. The filters of that
+/// subquery are those of the correlated subquery it replaces (tenant, type,
+/// resource, parameter, no `is_contained` filter), so the keys agree.
+///
+/// `resources` is joined (`CROSS JOIN` pins `search_index` as the outer loop,
+/// the one that walks the index) before `LIMIT`, so deleted resources do not
+/// shorten the page. Binds `?1` tenant and `?2` type, plus `?3` key and `?4`
+/// id for [`DateWalkRange::After`] / [`DateWalkRange::Before`].
+pub(crate) fn date_walk_page_sql(
+    param: &str,
+    desc: bool,
+    range: DateWalkRange,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let col = date_walk_column(desc);
+    let literal = sql_string_literal(param);
+    // `better` is the comparison that makes another row the resource's key.
+    let (better, forward_op) = if desc { (">", "<") } else { ("<", ">") };
+    let reverse_op = if desc { ">" } else { "<" };
+    let (forward_dir, reverse_dir) = if desc {
+        ("DESC", "ASC")
+    } else {
+        ("ASC", "DESC")
+    };
+    let (condition, key_dir, id_dir) = match range {
+        DateWalkRange::All => (String::new(), forward_dir, "ASC"),
+        DateWalkRange::After => (
+            format!(" AND (si.{col} {forward_op} ?3 OR (si.{col} = ?3 AND r.id > ?4))"),
+            forward_dir,
+            "ASC",
+        ),
+        DateWalkRange::Before => (
+            format!(" AND (si.{col} {reverse_op} ?3 OR (si.{col} = ?3 AND r.id < ?4))"),
+            reverse_dir,
+            "DESC",
+        ),
+        DateWalkRange::Reversed => (String::new(), reverse_dir, "DESC"),
+    };
+    format!(
+        "SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version, si.{col} AS sort_key \
+         FROM search_index si CROSS JOIN resources r \
+           ON r.rowid = si.resource_key AND r.tenant_id = ?1 AND r.resource_type = ?2 \
+          AND r.is_deleted = 0 \
+         WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.param_name = {literal} \
+           AND si.{col} IS NOT NULL{condition} \
+           AND NOT EXISTS (SELECT 1 FROM search_index s2 \
+                WHERE s2.tenant_id = ?1 AND s2.resource_type = ?2 \
+                  AND s2.resource_key = si.resource_key AND s2.param_name = {literal} \
+                  AND (s2.{col} {better} si.{col} \
+                       OR (s2.{col} = si.{col} AND s2.rowid < si.rowid))) \
+         ORDER BY si.{col} {key_dir}, r.id {id_dir} LIMIT {limit} OFFSET {offset}"
+    )
+}
+
+/// Which live resources of the date walk's tail a page reads (#2731): those
+/// with no value for the parameter, which sort after every keyed resource in
+/// `id` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTailRange {
+    /// From the start of the tail (`?1`, `?2` only).
+    All,
+    /// After the cursor id `?3`.
+    After,
+    /// Before the cursor id `?3`, read in descending id order.
+    Before,
+}
+
+/// The scalar subquery whose `NULL`ness says a resource has no key for the
+/// walk: the `MAX` of the walked column over the resource's rows, as the
+/// correlated sort computes its key.
+///
+/// It must not filter on `<column> IS NOT NULL`: that predicate makes the
+/// planner pick the partial index on the walked column
+/// (`idx_search_date_end`), which has no `resource_key` prefix, so each
+/// probe would read every row of the parameter and the tail and the count
+/// would be quadratic (#2731). Without it the probe seeks
+/// `idx_search_composite` by resource, as the correlated sort does.
+fn date_key_of_resource(param: &str, desc: bool) -> String {
+    format!(
+        "(SELECT MAX(s.{}) FROM search_index s WHERE s.tenant_id = ?1 AND s.resource_type = ?2 \
+         AND s.resource_key = resources.rowid AND s.param_name = {})",
+        date_walk_column(desc),
+        sql_string_literal(param)
+    )
+}
+
+/// The resources with no value for the date parameter, in `id` order (the
+/// order the correlated sort puts them, `NULLS LAST` then `id ASC`), with a
+/// `NULL` sort key.
+pub(crate) fn date_walk_tail_sql(
+    param: &str,
+    desc: bool,
+    range: DateTailRange,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let (condition, dir) = match range {
+        DateTailRange::All => ("", "ASC"),
+        DateTailRange::After => (" AND id > ?3", "ASC"),
+        DateTailRange::Before => (" AND id < ?3", "DESC"),
+    };
+    format!(
+        "SELECT id, version_id, data, last_updated, fhir_version, NULL AS sort_key \
+         FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{condition} \
+           AND {key} IS NULL \
+         ORDER BY id {dir} LIMIT {limit} OFFSET {offset}",
+        key = date_key_of_resource(param, desc)
+    )
+}
+
+/// Which equal-key group [`date_walk_tie_probe_sql`] measures (#2731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateTieProbe {
+    /// The first key of the walk's order (`reverse`: the last, where a
+    /// `Previous` page from the resources with no value starts reading).
+    Head { reverse: bool },
+    /// The cursor key `?3`.
+    Value,
+}
+
+/// Counts, up to `cap + 1`, the date rows that share the key a page starts
+/// at. More than `cap` means the walk would read, probe and sort that whole
+/// group for the page, and the general statement serves it instead. Binds
+/// `?1` tenant and `?2` type, plus `?3` key for [`DateTieProbe::Value`].
+pub(crate) fn date_walk_tie_probe_sql(
+    param: &str,
+    desc: bool,
+    probe: DateTieProbe,
+    cap: usize,
+) -> String {
+    let col = date_walk_column(desc);
+    let literal = sql_string_literal(param);
+    let key = match probe {
+        DateTieProbe::Value => "?3".to_string(),
+        DateTieProbe::Head { reverse } => {
+            let dir = if desc != reverse { "DESC" } else { "ASC" };
+            format!(
+                "(SELECT k.{col} FROM search_index k WHERE k.tenant_id = ?1                  AND k.resource_type = ?2 AND k.param_name = {literal}                  AND k.{col} IS NOT NULL ORDER BY k.{col} {dir} LIMIT 1)"
+            )
+        }
+    };
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM search_index si WHERE si.tenant_id = ?1          AND si.resource_type = ?2 AND si.param_name = {literal} AND si.{col} = {key}          LIMIT {})",
+        cap + 1
+    )
+}
+
+/// How many live resources have a key for the walk (`?1` tenant, `?2` type).
+/// Linear in the resources of the type; only an `_offset` past every keyed
+/// resource needs it, to place the tail's offset.
+pub(crate) fn date_walk_keyed_count_sql(param: &str, desc: bool) -> String {
+    format!(
+        "SELECT COUNT(*) FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+           AND {} IS NOT NULL",
+        date_key_of_resource(param, desc)
+    )
+}
+
 /// The subquery of a condition that is exactly `resource_key IN (<subquery>)`,
 /// or `None` for anything else: `NOT IN`, an `OR` of memberships, a bare
 /// predicate. The opening parenthesis must close at the very end of the

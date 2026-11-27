@@ -177,6 +177,14 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
 CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
     ON implicit_expansion_cache(url, code);
 
+-- One row per key of implicit_expansion_cache with the time it was last used
+-- (milliseconds since the Unix epoch). The cache keeps a fixed number of keys
+-- and drops the ones used longest ago; see trim_implicit_cache_keys.
+CREATE TABLE IF NOT EXISTS implicit_expansion_cache_keys (
+    url       TEXT PRIMARY KEY,
+    last_used INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
@@ -281,6 +289,11 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+-- Systems whose closure was kept across a deferred (chunked) write and no
+-- longer covers every concept; rebuilt at the next finalize or startup.
+CREATE TABLE IF NOT EXISTS concept_closure_stale (
+    system_id TEXT PRIMARY KEY
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -346,6 +359,10 @@ pub(crate) fn build_concept_closure_in_transaction(
     if concepts.is_empty() {
         conn.execute(
             "DELETE FROM concept_closure WHERE system_id = ?1",
+            rusqlite::params![system_id],
+        )?;
+        conn.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = ?1",
             rusqlite::params![system_id],
         )?;
         return Ok(());
@@ -421,6 +438,10 @@ pub(crate) fn build_concept_closure_in_transaction(
             }
         }
     }
+    conn.execute(
+        "DELETE FROM concept_closure_stale WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
     Ok(())
 }
 
@@ -448,7 +469,9 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
                         SELECT 1 FROM concept_closure c
                         WHERE  c.system_id = h.system_id
                         LIMIT  1
-                    )",
+                    )
+             UNION
+             SELECT system_id FROM concept_closure_stale",
         )?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -456,6 +479,20 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
 
     for sid in &systems_needing_closure {
         build_concept_closure(conn, sid)?;
+        // Expansions answered from the stale closure were persisted; drop
+        // them so the rebuilt closure is what the next `$expand` reads.
+        let url: Option<String> = conn
+            .query_row("SELECT url FROM code_systems WHERE id = ?1", [sid], |r| {
+                r.get(0)
+            })
+            .ok();
+        if let Some(url) = url {
+            if let Err(e) =
+                crate::import::fhir_bundle::invalidate_expansion_cache_for_system(conn, &url)
+            {
+                tracing::warn!(system_id = %sid, error = %e, "Failed to invalidate expansions after closure rebuild");
+            }
+        }
     }
 
     Ok(systems_needing_closure.len())
@@ -837,6 +874,7 @@ mod tests {
             "concept_maps",
             "concept_map_elements",
             "implicit_expansion_cache",
+            "implicit_expansion_cache_keys",
             "implicit_expansion_fts",
             "concepts_fts",
             "concepts_word_fts",

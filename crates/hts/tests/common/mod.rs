@@ -381,6 +381,30 @@ impl TestAppPg {
         TestAppPg { router }
     }
 
+    /// POST a FHIR JSON body to `path` with one extra request header,
+    /// returning only the status.
+    pub async fn post_fhir_status_with_header(
+        &self,
+        path: &str,
+        body: impl Into<String>,
+        header: (&str, &str),
+    ) -> StatusCode {
+        self.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/fhir+json")
+                    .header(header.0, header.1)
+                    .body(Body::from(body.into()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     /// POST a FHIR JSON body to `path`, returning `(status, response_body)`.
     pub async fn post_fhir(&self, path: &str, body: impl Into<String>) -> (StatusCode, Value) {
         let response = self

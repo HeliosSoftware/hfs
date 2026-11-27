@@ -37,8 +37,8 @@ use crate::raw_json_fragment::{
     PaneTarget, vs_expand_expand_url, vs_expand_extra_query, vs_expand_fragment_endpoint,
 };
 use crate::upstream::{
-    ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OpFailure, OutcomeView,
-    UpstreamError, ValueSetSummary, VsBrowserFilters, VsBrowserPage,
+    ExpandParams, ExpansionResult, OpFailure, OutcomeView, UpstreamError, ValueSetSummary,
+    VsBrowserFilters, VsBrowserPage,
 };
 use crate::{Chrome, HtsUiState};
 
@@ -416,7 +416,7 @@ async fn render_detail_with_tab<'a>(
             detail,
             tab,
             workbench: None,
-            ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
+            ceiling: state.upstream.expansion_size_ceiling(),
         }
         .render(),
     )
@@ -621,7 +621,7 @@ async fn respond_workbench<'a>(
                 chrome,
                 id,
                 view,
-                ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
+                ceiling: state.upstream.expansion_size_ceiling(),
             }
             .render(),
         );
@@ -634,7 +634,7 @@ async fn respond_workbench<'a>(
             detail,
             tab: VsTab::Expand,
             workbench: Some(view),
-            ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
+            ceiling: state.upstream.expansion_size_ceiling(),
         }
         .render(),
     )

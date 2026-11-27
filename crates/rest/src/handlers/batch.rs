@@ -633,7 +633,7 @@ where
                             message: format!("Entry {}: {}", index, e),
                         }
                     })?;
-                    let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
+                    let operation = entry_operation(&bundle_entry.method, get_target.as_ref());
                     let scope = SmartScopePolicy::check(principal, &resource_type, operation)
                         .map_err(|_| RestError::Forbidden {
                             message: format!(
@@ -1367,7 +1367,7 @@ where
         // safe while an unsupported method was caught further down — with the
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
-        let operation = bundle_method_to_fhir_operation(&method);
+        let operation = entry_operation(&method, get_target.as_ref());
         match SmartScopePolicy::check(principal, &resource_type, operation) {
             Ok(AccessScope::Unrestricted) => {}
             // A grant confined to a patient compartment (#1618): a GET entry
@@ -2264,7 +2264,11 @@ fn admit_bundle_mutation(
         admit_resource_type(resource_type, resource, fhir_version)?;
     }
 
-    if matches!(method, BundleMethod::Patch)
+    // A DELETE entry has no payload to admit the type through, and a URL
+    // deeper than `[type]/[id]` is read as its last two segments, so without
+    // this `DELETE Patient/p1/foo` deleted id `foo` of type `p1` and answered
+    // 204 for a resource type that does not exist.
+    if matches!(method, BundleMethod::Patch | BundleMethod::Delete)
         && !is_valid_resource_type_for_version(resource_type, fhir_version)
     {
         return Err(RestError::UnknownResourceType {
@@ -3272,7 +3276,7 @@ where
                     resource_type: resource_type.clone(),
                     id: id.clone(),
                 }),
-                Err(e) => entry_storage_failure(e),
+                Err(e) => entry_failure(RestError::gone_as_configured(e, state.return_gone())),
             }
         }
         GetEntryTarget::Vread {
@@ -3766,6 +3770,16 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
         BundleMethod::Post => FhirOperation::Create,
         BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
         BundleMethod::Delete => FhirOperation::Delete,
+    }
+}
+
+/// The interaction a bundle entry is authorized for: a GET entry whose URL is
+/// a search is a `Search`, as the direct `GET [type]?query` is; every other
+/// GET (read, vread, history) is a `Read`; the writes follow the method.
+fn entry_operation(method: &BundleMethod, get_target: Option<&GetEntryTarget>) -> FhirOperation {
+    match get_target {
+        Some(GetEntryTarget::Search { .. }) => FhirOperation::Search,
+        _ => bundle_method_to_fhir_operation(method),
     }
 }
 
@@ -6181,6 +6195,18 @@ mod tests {
     /// mutation URL is canonicalized to its last one or two segments and a GET
     /// URL is passed on as written, so each would act on part of an operation
     /// URL if it were not refused first.
+    #[test]
+    fn a_delete_entry_needs_a_resource_type_of_the_version() {
+        let version = FhirVersion::default_enabled();
+        let refused = admit_bundle_mutation(&BundleMethod::Delete, "p1", None, version)
+            .expect_err("p1 is not a resource type");
+        assert!(
+            matches!(refused, RestError::UnknownResourceType { .. }),
+            "{refused:?}"
+        );
+        assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
+    }
+
     #[test]
     fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
         for (method, url) in [

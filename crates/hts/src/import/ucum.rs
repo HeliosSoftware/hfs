@@ -136,7 +136,7 @@ pub async fn import_ucum(
     );
     let seed_stats = backend.import_native_bundle(ctx, &seed_bytes, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     for (batch_idx, batch) in concepts.chunks(batch_size).enumerate() {
         let builder_concepts: Vec<BuilderConcept<'_>> = batch
@@ -163,7 +163,7 @@ pub async fn import_ucum(
         );
 
         let chunk_stats = backend.import_native_bundle(ctx, &bytes, true).await?;
-        stats.errors.extend(chunk_stats.errors);
+        stats.take_errors(chunk_stats);
 
         eprintln!(
             "[ucum] batch {}/{total_batches} — +{} codes",
