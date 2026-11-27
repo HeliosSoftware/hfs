@@ -22,7 +22,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 
 // ── ICD-10-CM constants ───────────────────────────────────────────────────────
 
-const ICD10CM_URL: &str = "http://hl7.org/fhir/sid/icd-10-cm";
+pub(crate) const ICD10CM_URL: &str = "http://hl7.org/fhir/sid/icd-10-cm";
 const ICD10CM_ID: &str = "icd10cm";
 const ICD10CM_NAME: &str = "ICD-10-CM";
 const ICD10CM_TITLE: &str =
@@ -89,7 +89,7 @@ pub async fn import_icd10_cm(
 
     // Seed with an empty CodeSystem to register metadata.
     let seed_bytes = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed_bytes).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed_bytes, true).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.take_errors(seed_stats);
 
@@ -108,7 +108,7 @@ pub async fn import_icd10_cm(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
         stats.take_errors(chunk);
 
         eprintln!(

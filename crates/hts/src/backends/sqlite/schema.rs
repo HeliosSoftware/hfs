@@ -193,7 +193,9 @@ CREATE TABLE IF NOT EXISTS concept_maps (
     source_uri  TEXT,
     target_uri  TEXT,
     status      TEXT NOT NULL DEFAULT 'active',
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- See code_systems.authority_rank.
+    authority_rank INTEGER
 );
 
 -- ── Concept Map Elements ───────────────────────────────────────────────────────
@@ -550,8 +552,9 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
     Ok(())
 }
 
-/// Add the `authority_rank` provenance column to `code_systems` / `value_sets`,
-/// and force a re-import of packaged terminology when the column is newly added.
+/// Add the `authority_rank` provenance column to `code_systems`, `value_sets`
+/// and `concept_maps`, and force a re-import of packaged terminology when a
+/// column is newly added.
 ///
 /// `authority_rank` records whether the package that shipped a row actually owns
 /// the canonical URL it claims (see
@@ -576,6 +579,7 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
     for sql in &[
         "ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER",
         "ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER",
+        "ALTER TABLE concept_maps ADD COLUMN authority_rank INTEGER",
     ] {
         match conn.execute_batch(sql) {
             Ok(_) => column_added = true,
@@ -593,6 +597,67 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
                  re-import and record which canonical URLs they own"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// One-time backfill: rank the CodeSystem rows the native importers wrote as
+/// [`AUTHORITY_OWNER`](crate::import::bundle_parser::AUTHORITY_OWNER).
+///
+/// Those importers are authoritative for the systems in
+/// [`NATIVE_OWNED_SYSTEMS`](crate::import::NATIVE_OWNED_SYSTEMS), but their
+/// rows were not ranked so: rows written before `authority_rank` existed are
+/// NULL, and every importer but SNOMED CT and LOINC ranked its rows
+/// `AUTHORITY_UNKNOWN`, like any other bundle. Either way the import check
+/// let an unattributed bundle replace them. Their ledger entries are kept on
+/// purpose (re-importing the archives costs hours), so they are never
+/// re-imported to be ranked, and treating NULL as owner on write would block
+/// the convergence `AUTHORITY_UNCLAIMED` exists for. This promotes them once.
+///
+/// A row with `content = 'not-present'` is a package's placeholder for an
+/// external terminology (THO ships one for SNOMED CT, for instance), not the
+/// importer's, and keeps its rank. A sentinel ledger row records that the
+/// backfill ran, as [`migrate_icd9cm_reimport`] does.
+pub fn migrate_native_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use crate::import::bundle_parser::{AUTHORITY_OWNER, AUTHORITY_UNKNOWN};
+    use rusqlite::OptionalExtension;
+
+    const MARKER: &str = "#migration:native-authority-rank-2899";
+
+    let already_ran: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    let systems = crate::import::NATIVE_OWNED_SYSTEMS;
+    let placeholders = vec!["?"; systems.len()].join(", ");
+    let promoted = conn.execute(
+        &format!(
+            "UPDATE code_systems SET authority_rank = {AUTHORITY_OWNER}
+             WHERE (authority_rank IS NULL OR authority_rank = {AUTHORITY_UNKNOWN})
+               AND content <> 'not-present'
+               AND url IN ({placeholders})"
+        ),
+        rusqlite::params_from_iter(systems),
+    )?;
+    conn.execute(
+        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [MARKER],
+    )?;
+
+    if promoted > 0 {
+        tracing::info!(
+            promoted_code_systems = promoted,
+            "Ranked natively imported CodeSystems as owned by their importer"
+        );
     }
 
     Ok(())
@@ -885,6 +950,10 @@ mod tests {
                  status TEXT NOT NULL DEFAULT 'active',
                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
              );
+             CREATE TABLE concept_maps (
+                 id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, version TEXT,
+                 status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+             );
              CREATE TABLE bootstrap_imports (
                  path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
                  size_bytes INTEGER NOT NULL, mtime_unix INTEGER,
@@ -925,13 +994,15 @@ mod tests {
     #[test]
     fn authority_rank_migration_adds_columns_and_forces_package_reimport() {
         let conn = legacy_db();
-        assert!(!has_authority_rank(&conn, "code_systems"));
-        assert!(!has_authority_rank(&conn, "value_sets"));
+        for table in ["code_systems", "value_sets", "concept_maps"] {
+            assert!(!has_authority_rank(&conn, table), "{table}");
+        }
 
         migrate_authority_rank(&conn).expect("migration should succeed");
 
-        assert!(has_authority_rank(&conn, "code_systems"));
-        assert!(has_authority_rank(&conn, "value_sets"));
+        for table in ["code_systems", "value_sets", "concept_maps"] {
+            assert!(has_authority_rank(&conn, table), "{table}");
+        }
 
         // The .tgz ledger entries are dropped so the next startup re-imports
         // those packages and stamps provenance. Without this the column would
@@ -945,6 +1016,29 @@ mod tests {
             ],
             "only .tgz packages may be cleared; the bulk archives carry no \
              package provenance and re-importing them would cost hours"
+        );
+    }
+
+    /// A database migrated before ConceptMaps were ranked has the column on
+    /// `code_systems` and `value_sets` only. Adding it to `concept_maps` must
+    /// re-import the packages too, or every stored map would stay unclaimed
+    /// and any unattributed import could replace it.
+    #[test]
+    fn authority_rank_migration_ranks_concept_maps_on_a_database_ranked_before_them() {
+        let conn = legacy_db();
+        conn.execute_batch(
+            "ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER;
+             ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER;",
+        )
+        .unwrap();
+
+        migrate_authority_rank(&conn).expect("migration should succeed");
+
+        assert!(has_authority_rank(&conn, "concept_maps"));
+        assert!(
+            ledger_paths(&conn).iter().all(|p| !p.ends_with(".tgz")),
+            "packages must re-import to rank their ConceptMaps: {:?}",
+            ledger_paths(&conn)
         );
     }
 
@@ -1008,6 +1102,56 @@ mod tests {
 
         assert_eq!(ledger_paths(&conn).len(), 1);
         assert!(has_authority_rank(&conn, "code_systems"));
+    }
+
+    fn rank_of(conn: &rusqlite::Connection, id: &str) -> Option<i32> {
+        conn.query_row(
+            "SELECT authority_rank FROM code_systems WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn native_authority_backfill_ranks_importer_rows_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank) VALUES
+               ('legacy-rxnorm', 'http://www.nlm.nih.gov/research/umls/rxnorm', '2024', 'active', 'complete', 'x', 'x', NULL),
+               ('unknown-icd10', 'http://hl7.org/fhir/sid/icd-10-cm', '2026', 'active', 'complete', 'x', 'x', 1),
+               ('stub-snomed', 'http://snomed.info/sct', NULL, 'active', 'not-present', 'x', 'x', NULL),
+               ('other', 'http://example.org/cs', '1', 'active', 'complete', 'x', 'x', NULL),
+               ('v2-0001', 'http://terminology.hl7.org/CodeSystem/v2-0001', 'current', 'active', 'complete', 'x', 'x', 1);",
+        )
+        .unwrap();
+
+        migrate_native_authority_rank(&conn).unwrap();
+
+        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(0));
+        assert_eq!(rank_of(&conn, "unknown-icd10"), Some(0));
+        assert_eq!(
+            rank_of(&conn, "stub-snomed"),
+            None,
+            "a placeholder keeps its rank"
+        );
+        assert_eq!(rank_of(&conn, "other"), None);
+        assert_eq!(
+            rank_of(&conn, "v2-0001"),
+            Some(1),
+            "THO owns the v2 table URLs"
+        );
+
+        // The sentinel makes it a one-time backfill: a row ranked later is
+        // left as the import ranked it.
+        conn.execute(
+            "UPDATE code_systems SET authority_rank = 1 WHERE id = 'legacy-rxnorm'",
+            [],
+        )
+        .unwrap();
+        migrate_native_authority_rank(&conn).unwrap();
+        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(1));
     }
 
     const ICD9CM_MARKER: &str = "#migration:icd9cm-space-delimited-802";
