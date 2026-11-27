@@ -217,10 +217,16 @@ impl AuthConfig {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            jwks_min_refresh_interval: env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            jwks_min_refresh_interval: match env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL") {
+                Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        value = %value,
+                        "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL is not a number of seconds; using 10"
+                    );
+                    10
+                }),
+                Err(_) => 10,
+            },
             smart_token_endpoint: env::var("HFS_SMART_TOKEN_ENDPOINT").ok(),
             smart_authorize_endpoint: env::var("HFS_SMART_AUTHORIZE_ENDPOINT").ok(),
             smart_jwks_url: env::var("HFS_SMART_JWKS_URL").ok(),
@@ -299,6 +305,13 @@ impl AuthConfig {
         }
         if self.allowed_algorithms.is_empty() {
             errors.push("HFS_AUTH_ALGORITHMS must list at least one signing algorithm".to_string());
+        }
+        if self.jwks_min_refresh_interval == 0 {
+            errors.push(
+                "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL must be at least 1 second: it bounds the \
+                 JWKS fetches an unknown kid can trigger and the background refresh's retries"
+                    .to_string(),
+            );
         }
         if self.tenant_claim.trim().is_empty() {
             errors.push(
@@ -557,6 +570,23 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("HFS_AUTH_ISSUER")),
             "expected an issuer error, got {errors:?}"
+        );
+    }
+
+    /// Zero would let an unknown `kid` fetch per request and the background
+    /// refresh retry a failing provider in a tight loop.
+    #[test]
+    fn validate_rejects_a_zero_refresh_interval() {
+        let config = AuthConfig {
+            jwks_min_refresh_interval: 0,
+            ..enabled_config()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")),
+            "expected an interval error, got {errors:?}"
         );
     }
 

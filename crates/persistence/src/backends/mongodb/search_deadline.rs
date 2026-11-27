@@ -1,6 +1,6 @@
 //! One optional soft deadline, checked between MongoDB commands and matching batches.
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, panic::Location, sync::OnceLock, time::Duration};
 
 use mongodb::action::{Aggregate, CountDocuments, Distinct, Find, FindOne};
 use tokio::time::Instant;
@@ -105,25 +105,69 @@ pub(super) async fn run<T>(
     }
 }
 
+/// The source line that issued a search command.
+pub(super) type CallSite = &'static Location<'static>;
+
+/// `HFS_MONGODB_QUERY_TAGS=1` sends the call site of every search command as
+/// its `comment` (`hfs:<file>:<line>`), so the MongoDB profiler and the
+/// slow-query log name the code that issued it. Off by default. A comment is
+/// not part of the query shape, so plans and the plan cache are unaffected.
+fn query_tags_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("HFS_MONGODB_QUERY_TAGS")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+fn call_site_tag(site: CallSite) -> String {
+    format!("hfs:{}:{}", site.file(), site.line())
+}
+
 /// Add maxTimeMS only inside a configured search, leaving other callers alone.
 pub(super) trait SearchCommand: Sized {
-    fn search_deadline(self) -> StorageResult<Self>;
+    #[track_caller]
+    fn search_deadline(self) -> StorageResult<Self> {
+        self.search_deadline_at(Location::caller())
+    }
 
-    fn search_probe_deadline(self, probe: Duration) -> StorageResult<(Self, ProbeBudget)>;
+    /// As [`Self::search_deadline`], for a helper that runs a command on
+    /// behalf of the call site it captured.
+    fn search_deadline_at(self, site: CallSite) -> StorageResult<Self>;
+
+    fn search_probe_deadline_at(
+        self,
+        probe: Duration,
+        site: CallSite,
+    ) -> StorageResult<(Self, ProbeBudget)>;
 }
 
 macro_rules! search_command {
     ($action:ty, $($generic:tt)*) => {
         impl<$($generic)*> SearchCommand for $action {
-            fn search_probe_deadline(self, probe: Duration) -> StorageResult<(Self, ProbeBudget)> {
+            fn search_probe_deadline_at(
+                self,
+                probe: Duration,
+                site: CallSite,
+            ) -> StorageResult<(Self, ProbeBudget)> {
                 let budget = ProbeBudget::new(probe)?;
-                Ok((self.max_time(budget.duration()), budget))
+                let command = if query_tags_enabled() {
+                    self.comment(call_site_tag(site))
+                } else {
+                    self
+                };
+                Ok((command.max_time(budget.duration()), budget))
             }
 
-            fn search_deadline(self) -> StorageResult<Self> {
+            fn search_deadline_at(self, site: CallSite) -> StorageResult<Self> {
+                let command = if query_tags_enabled() {
+                    self.comment(call_site_tag(site))
+                } else {
+                    self
+                };
                 Ok(match remaining()? {
-                    Some(budget) => self.max_time(budget),
-                    None => self,
+                    Some(budget) => command.max_time(budget),
+                    None => command,
                 })
             }
         }
