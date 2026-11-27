@@ -33,6 +33,11 @@ fn decimal_arithmetic_past_the_range_does_not_panic() {
         format!("({DECIMAL_MAX} | 1.5).sum()"),
         format!("{DECIMAL_MAX}.highBoundary(0)"),
         format!("(-{DECIMAL_MAX}).lowBoundary(0)"),
+        format!("(-{DECIMAL_MAX}).lowBoundary()"),
+        format!("{DECIMAL_MAX}.highBoundary()"),
+        "(-0.0000000000000000001).highBoundary(25)".to_string(),
+        format!("{DECIMAL_MAX}.sqrt()"),
+        format!("{DECIMAL_MAX} 'mg'.sqrt()"),
     ] {
         evaluates_without_panicking(&expression);
     }
@@ -79,4 +84,19 @@ fn durations_past_the_calendar_range_do_not_panic() {
     ] {
         evaluates_without_panicking(expression);
     }
+}
+
+/// The square root of the largest decimal fits, although the first Newton
+/// step's sum does not: 2^96 - 1 has the root 2^48 to eight places.
+#[test]
+fn sqrt_at_the_top_of_the_range_keeps_its_value() {
+    let context = EvaluationContext::new_empty_with_default_version();
+    let result =
+        evaluate_expression(&format!("{DECIMAL_MAX}.sqrt()"), &context).expect("evaluates");
+    assert!(
+        format!("{result:?}").contains("281474976710656.00000000"),
+        "{result:?}"
+    );
+    let result = evaluate_expression("2.sqrt()", &context).expect("evaluates");
+    assert!(format!("{result:?}").contains("1.41421356"), "{result:?}");
 }

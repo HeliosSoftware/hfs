@@ -738,6 +738,13 @@ impl SearchParameterExtractor {
         composite_bases: &mut HashMap<String, Vec<BaseContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        // The evaluator has no expression that is meant to panic, so the test
+        // of the guard in `extract_for_param_in` asks for one here.
+        #[cfg(test)]
+        if param.expression == tests::PANICKING_EXPRESSION {
+            panic!("extraction panicked on request");
+        }
+
         if NON_INDEXABLE_PARAM_CODES.contains(&param.code.as_str()) {
             return Ok(Vec::new());
         }
@@ -2219,6 +2226,59 @@ mod tests {
                 .any(|value| value.param_name == "family"),
             "the other parameters are still extracted"
         );
+    }
+
+    /// An expression `extract_for_param_unguarded` panics on, in tests only.
+    pub(super) const PANICKING_EXPRESSION: &str = "'helios-test: panic while extracting'";
+
+    /// A parameter whose extraction panics is recorded as a failure like one
+    /// whose evaluation returns an error, and the resource's other parameters
+    /// are still extracted. Without the guard the panic unwinds through
+    /// `extract_with_missing`, as it would through a write.
+    #[test]
+    fn a_panicking_parameter_fails_alone() {
+        let extractor = create_test_extractor();
+        extractor
+            .registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/panic-test",
+                    "panic-test",
+                    SearchParamType::String,
+                    PANICKING_EXPRESSION,
+                )
+                .with_base(vec!["Patient"]),
+            )
+            .unwrap();
+        let resource = json!({
+            "resourceType": "Patient", "id": "p", "name": [{"family": "Kept"}]
+        });
+        let extraction = extractor
+            .extract_with_missing(&resource, "Patient")
+            .unwrap();
+        let failure = extraction
+            .failures
+            .iter()
+            .find(|failure| failure.code == "panic-test")
+            .unwrap_or_else(|| panic!("no failure recorded: {:?}", extraction.failures));
+        assert!(failure.error.contains("panicked"), "{}", failure.error);
+        assert!(
+            extraction
+                .values
+                .iter()
+                .any(|value| value.param_name == "family"),
+            "the other parameters are still extracted"
+        );
+        // The single-parameter entry point goes through the same guard.
+        let param = extractor
+            .registry
+            .read()
+            .get_active_params("Patient")
+            .into_iter()
+            .find(|param| param.code == "panic-test")
+            .expect("registered");
+        assert!(extractor.extract_for_param(&resource, &param).is_err());
     }
 
     #[test]

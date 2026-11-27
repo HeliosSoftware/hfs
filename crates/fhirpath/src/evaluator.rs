@@ -7306,9 +7306,19 @@ fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
     let mut x = value;
     let half = Decimal::from_str_exact("0.5").unwrap();
 
-    // Run iterations until we reach desired precision
-    loop {
-        let next_x = half * (x + value / x);
+    // Run iterations until we reach desired precision. Each step halves the
+    // error, so the bound is far above what any decimal needs; it only keeps
+    // a pair of values that round back and forth from looping forever.
+    const MAX_ITERATIONS: usize = 256;
+    for _ in 0..MAX_ITERATIONS {
+        let quotient = value.checked_div(x).ok_or("Overflow")?;
+        // `x + quotient` is past the decimal range for a value at the top of
+        // it (the first step adds 1 to the value itself), although the mean is
+        // not: take the halves separately then.
+        let next_x = match x.checked_add(quotient) {
+            Some(sum) => half * sum,
+            None => half * x + half * quotient,
+        };
 
         // Check if we've converged to our desired precision
         if (next_x - x).abs() < precision {
@@ -7317,6 +7327,7 @@ fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
 
         x = next_x;
     }
+    Ok(x)
 }
 
 /// Attempts to convert an EvaluationResult to Decimal
