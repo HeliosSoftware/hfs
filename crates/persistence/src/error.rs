@@ -1319,11 +1319,6 @@ pub(crate) const OBJECT_STORE_BUCKET_TEXT: &str =
 pub(crate) const OBJECT_STORE_ACCESS_TEXT: &str =
     "the object store refused the server's credentials; the server log has the detail";
 
-/// Client text for a request the object store rejected as invalid.
-#[cfg(feature = "s3")]
-pub(crate) const OBJECT_STORE_INVALID_TEXT: &str =
-    "the object store rejected the request as invalid; the server log has the detail";
-
 /// A [`BackendError::Unavailable`] for the S3 backend with the SDK or service
 /// text in the log and a fixed client sentence in the message, as the other
 /// backends do: the detail names the endpoint, the bucket and the provider's
