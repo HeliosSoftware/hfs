@@ -42,11 +42,12 @@
 //! `mongodb_missing_mixed_full_cross` (ignored) reads every door over the
 //! full cross and is run once per production commit.
 //!
-//! Owed (need production code that does not exist yet, so they are not
-//! written here): the batch-size cells (1, 2, 3, 7 ids per membership batch
-//! over the exhaustive states) need the batching loop to take its batch size
-//! as an argument; the failure-injection cells (a failure after batch N, and
-//! in the unstamped count) need that loop and the split counts to exist.
+//! The membership batch size of the rerouted totals can only be lowered from
+//! inside the crate (a `cfg(test)` hook), so the batch-size cells (1, 2, 3
+//! and 7 ids per batch) live in
+//! `search_impl/search_plan/missing_checks_tests.rs`. The failure-injection
+//! cells (a failure after every batch, in the stamped stream and in the
+//! unstamped count) are in [`mongodb_missing_mixed_volume_concurrency_and_deadline`].
 
 use super::*;
 use futures::{StreamExt, TryStreamExt};
@@ -567,9 +568,10 @@ impl tracing::Subscriber for PlanLog {
 /// The total strategy of the mixed totals the Stage 2 rewrite reroutes: a
 /// metadata `:missing=true` with `:not`, a metadata-supported
 /// `:missing=false` or an unsupported `:missing=true`, and no positive
-/// criterion. Today it is the single aggregation. Each production commit that
-/// reroutes these totals flips this one constant, on purpose.
-const MIXED_TOTAL: &str = "exact_aggregation";
+/// criterion. It was the single aggregation (`exact_aggregation`) until the
+/// Stage 2 commit flipped it, on purpose, to the stamped/unstamped split
+/// with batched row checks.
+const MIXED_TOTAL: &str = "exact_missing_checks";
 
 /// Pure metadata `:missing=true` totals: the single aggregation on `main`,
 /// the stamped/unstamped split since Stage 1. Both trees must stay green.
@@ -2203,9 +2205,12 @@ async fn mongodb_missing_mixed_volume_concurrency_and_deadline() {
     assert_eq!(total, want, "mixed total on one connection");
     stats.comparisons += 1;
 
-    // The k-th aggregate is blocked beyond the search deadline, or fails:
-    // the total is an error or the exact number, never another number. The
-    // failpoint is scoped to this backend's own `appName`.
+    // The k-th matching command is blocked beyond the search deadline, or
+    // fails: the total is an error or the exact number, never another number.
+    // `k` grows until the failpoint is no longer reached, so every command of
+    // the total (each membership batch, the stamped stream and the unstamped
+    // count) is hit once. The failpoint is scoped to this backend's own
+    // `appName`, and some variants to one collection.
     let app_name = format!("hfs-2233-net2-{}", uuid::Uuid::new_v4().simple());
     let mut config = net.metadata.config().clone();
     config.app_name = Some(app_name.clone());
@@ -2216,19 +2221,44 @@ async fn mongodb_missing_mixed_volume_concurrency_and_deadline() {
     };
     let shape = &shapes[3];
     let want = expected(&net.docs, shape, Route::Metadata).len() as u64;
+    let search_index = format!("{}.search_index", net.db.name());
+    let resources = format!("{}.resources", net.db.name());
+    let block = (SEARCH_DEADLINE_MS + 1_000) as i64;
     let mut outcomes = Vec::new();
     for (variant, data) in [
         (
             "block",
             doc! { "failCommands": ["aggregate"], "blockConnection": true,
-            "blockTimeMS": (SEARCH_DEADLINE_MS + 1_000) as i64 },
+            "blockTimeMS": block },
         ),
         (
             "error",
             doc! { "failCommands": ["aggregate"], "errorCode": 96_i32 },
         ),
+        (
+            "block-search_index",
+            doc! { "failCommands": ["aggregate"], "namespace": &search_index,
+            "blockConnection": true, "blockTimeMS": block },
+        ),
+        (
+            "error-search_index",
+            doc! { "failCommands": ["aggregate"], "namespace": &search_index,
+            "errorCode": 96_i32 },
+        ),
+        (
+            "error-resources-aggregate",
+            doc! { "failCommands": ["aggregate"], "namespace": &resources,
+            "errorCode": 96_i32 },
+        ),
+        (
+            "error-resources-stream",
+            doc! { "failCommands": ["find", "getMore"], "namespace": &resources,
+            "errorCode": 96_i32 },
+        ),
     ] {
-        for k in 0..4_i32 {
+        let mut errors = 0;
+        let mut last_hits = None;
+        for k in 0..200_i32 {
             let Some(failpoint) =
                 bulk_submit::FailPoint::enable(&app_name, data.clone(), doc! { "skip": k }).await
             else {
@@ -2251,16 +2281,32 @@ async fn mongodb_missing_mixed_volume_concurrency_and_deadline() {
                     );
                     "exact"
                 }
-                Err(_) => "error",
+                Err(_) => {
+                    errors += 1;
+                    "error"
+                }
             };
             outcomes.push(format!("{variant}/k={k}/hits={hits}/{outcome}"));
-            // Every total issues at least one aggregate; how many more it
-            // issues (probes may be cached) is reported, not pinned.
             if k == 0 {
                 assert!(hits > 0, "{variant} k=0: the failpoint never fired");
             }
             stats.comparisons += 1;
+            last_hits = Some(hits);
+            if hits == 0 {
+                // Past the total's last matching command: it ran untouched.
+                assert_eq!(outcome, "exact", "{variant} k={k}: nothing failed");
+                break;
+            }
         }
+        assert_eq!(
+            last_hits,
+            Some(0),
+            "{variant}: the sweep never got past the total's commands"
+        );
+        assert!(
+            errors > 0,
+            "{variant}: no command failure reached the total"
+        );
     }
     eprintln!(
         "[2233-net2] {TEST}: stamped_matches={stamped_matches} first_batch_head={head} \

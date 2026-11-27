@@ -23,6 +23,9 @@ mod composite_plan_tests;
 #[path = "complement_cap_tests.rs"]
 mod complement_cap_tests;
 
+#[path = "missing_checks_tests.rs"]
+mod missing_checks_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test

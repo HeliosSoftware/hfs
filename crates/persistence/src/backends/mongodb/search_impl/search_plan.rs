@@ -1401,23 +1401,7 @@ impl MongoBackend {
             {
                 continue;
             }
-            stages.push(doc! { "$lookup": {
-                "from": MongoBackend::SEARCH_INDEX_COLLECTION,
-                "let": { "candidate_id": "$id" },
-                "pipeline": [
-                    { "$match": { "$and": [
-                        filter,
-                        { "$expr": { "$eq": ["$resource_id", "$$candidate_id"] } },
-                    ] } },
-                    { "$limit": 1 },
-                    { "$project": { "_id": 1 } },
-                ],
-                "as": "_hfs_search_match",
-            } });
-            stages.push(doc! { "$match": {
-                "_hfs_search_match.0": { "$exists": !exclude },
-            } });
-            stages.push(doc! { "$unset": "_hfs_search_match" });
+            stages.extend(criterion_lookup_stages(filter, exclude));
         }
         if batch_page {
             // Retain selective index-driven pages; exclusion checks need only
@@ -2813,6 +2797,133 @@ impl PageIds {
             self.ids.into_iter().rev().collect()
         }
     }
+}
+
+/// The existence stages of one criterion of a driverless resource-lookup
+/// plan: a resource passes when some `search_index` row matches `filter`, or,
+/// with `exclude`, when none does.
+pub(super) fn criterion_lookup_stages(filter: Document, exclude: bool) -> Vec<Document> {
+    vec![
+        doc! { "$lookup": {
+            "from": MongoBackend::SEARCH_INDEX_COLLECTION,
+            "let": { "candidate_id": "$id" },
+            "pipeline": [
+                { "$match": { "$and": [
+                    filter,
+                    { "$expr": { "$eq": ["$resource_id", "$$candidate_id"] } },
+                ] } },
+                { "$limit": 1 },
+                { "$project": { "_id": 1 } },
+            ],
+            "as": "_hfs_search_match",
+        } },
+        doc! { "$match": {
+            "_hfs_search_match.0": { "$exists": !exclude },
+        } },
+        doc! { "$unset": "_hfs_search_match" },
+    ]
+}
+
+/// How one criterion of a mixed `:missing` total reads `search_index`: the
+/// resource passes when a row matching the criterion's filter exists
+/// (`Require`) or when none does (`Exclude`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowCheck {
+    Require,
+    Exclude,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static MISSING_CHECK_BATCH_ROWS: usize;
+}
+
+/// Ids per membership batch of a mixed `:missing` total: the count batch
+/// size, or a smaller one a test installed with
+/// `with_missing_check_batch_rows` for the duration of one future.
+fn missing_check_batch_rows() -> usize {
+    #[cfg(test)]
+    if let Ok(rows) = MISSING_CHECK_BATCH_ROWS.try_with(|rows| *rows) {
+        return rows;
+    }
+    COUNT_CANDIDATE_BATCH_ROWS
+}
+
+/// Runs `future` with membership batches of `rows` ids, so a test crosses
+/// batch boundaries with a handful of resources.
+#[cfg(test)]
+pub(super) async fn with_missing_check_batch_rows<F: Future>(rows: usize, future: F) -> F::Output {
+    MISSING_CHECK_BATCH_ROWS.scope(rows, future).await
+}
+
+/// The stamped side of a mixed `:missing` total (#2233): the resources that
+/// match `stamped_filter`, read as one stream of ids on `hint`, whose ids pass
+/// every check in `checks` (plan order).
+///
+/// The ids go through [`stream_id_batches`] in batches of
+/// [`COUNT_CANDIDATE_BATCH_ROWS`], two at most in flight. Each batch is one
+/// membership command per check on `search_index` (`filter_candidates` for
+/// `Require`, `exclude_candidates` for `Exclude`), the same commands a
+/// resource page sends, so no per-resource `$lookup` runs on this side. The
+/// deadline is checked before each batch; an error or the deadline ends the
+/// count with that error, never a partial number, after the checks in flight
+/// finished.
+pub(super) async fn count_checked_stamped(
+    db: &mongodb::Database,
+    stamped_filter: Document,
+    hint: Hint,
+    checks: &[(Document, RowCheck)],
+) -> StorageResult<u64> {
+    let checks: Vec<(IndexPredicate, RowCheck)> = checks
+        .iter()
+        .map(|(filter, check)| (IndexPredicate::from(filter.clone()), *check))
+        .collect();
+    let batch_rows = missing_check_batch_rows();
+    let mut cursor = db
+        .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+        .find(stamped_filter)
+        .projection(doc! { "_id": 0, "id": 1 })
+        .hint(hint)
+        .batch_size(batch_rows as u32)
+        .search_deadline()?
+        .await
+        .or_query_error("Failed to stream stamped resources")?;
+    let mut total = 0u64;
+    let checks = &checks;
+    stream_id_batches(
+        &mut cursor,
+        "id",
+        &IdStreamText {
+            read: "Failed to read stamped resources",
+            invalid: "Invalid stamped resource",
+            missing_id: "Stamped resource has no string id",
+        },
+        batch_rows,
+        &mut total,
+        |_, batch| Ok(check_stamped_batch(db, batch, checks)),
+        |total, passed| *total += passed,
+    )
+    .await?;
+    Ok(total)
+}
+
+/// How many ids of `batch` pass every check.
+async fn check_stamped_batch(
+    db: &mongodb::Database,
+    batch: Vec<String>,
+    checks: &[(IndexPredicate, RowCheck)],
+) -> StorageResult<u64> {
+    search_deadline::check()?;
+    let mut ids: HashSet<String> = batch.into_iter().collect();
+    for (predicate, check) in checks {
+        match check {
+            RowCheck::Require => {
+                filter_candidates(db, &mut ids, &[predicate], CandidateSource::Unfiltered).await?
+            }
+            RowCheck::Exclude => exclude_candidates(db, &mut ids, &[predicate]).await?,
+        }
+    }
+    Ok(ids.len() as u64)
 }
 
 /// The error texts of one id stream read by [`stream_id_batches`].

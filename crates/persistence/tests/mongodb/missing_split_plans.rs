@@ -14,6 +14,12 @@
 //!   full-scan cases of today's pipeline: a name no resource lacks in a type
 //!   with unstamped resources, and pairs of names in a fully stamped type;
 //! * each command has a single candidate plan (no rejected plans).
+//!
+//! The mixed totals of Stage 2 (a metadata `:missing=true` with `:not` or
+//! `:missing=false`) are pinned the same way: the stamped stream and every
+//! membership check have one bounded plan and no `$lookup`, and only the
+//! unstamped count keeps the plan's stages. With a non-primary read
+//! preference every total stays the single aggregation.
 
 use super::*;
 
@@ -507,6 +513,31 @@ impl tracing::Subscriber for TotalStrategies {
     }
 }
 
+/// `search_count` of `query` on `backend`, with the total strategies it
+/// recorded and the `$count` commands on `resources` the profiler saw.
+async fn routed_total(
+    backend: &MongoBackend,
+    db: &mongodb::Database,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> (u64, Vec<String>, Vec<Document>) {
+    pin_tracing_interest();
+    let strategies = TotalStrategies::default();
+    let dispatch = tracing::Dispatch::new(strategies.clone());
+    let (total, operations) = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        composite_plan::profiled(db, backend.search_count(tenant, query)).await
+    };
+    let counts = operations
+        .iter()
+        .filter(|operation| operation.get_str("op") == Ok("command"))
+        .map(|operation| composite_plan::command_of(operation).clone())
+        .filter(is_count_on_resources)
+        .collect();
+    let strategies = strategies.0.lock().unwrap().clone();
+    (total.unwrap(), strategies, counts)
+}
+
 /// `connection_string` with one more URI option.
 fn with_uri_option(connection_string: &str, option: &str) -> String {
     match connection_string.split_once('?') {
@@ -520,7 +551,8 @@ fn with_uri_option(connection_string: &str, option: &str) -> String {
 /// With a non-primary read preference, the commands of a split total could
 /// be served by different members, so the total stays today's single
 /// aggregation: one `$count` command, the `exact_aggregation` strategy, and
-/// the same number as the split of a primary-only backend on the same data.
+/// the same number as the split of a primary-only backend on the same data,
+/// for pure (Stage 1) and mixed (Stage 2) totals.
 /// A single-node replica set serves `secondaryPreferred` from its primary.
 #[tokio::test]
 async fn mongodb_missing_split_secondary_reads_keep_one_aggregation() {
@@ -542,33 +574,48 @@ async fn mongodb_missing_split_secondary_reads_keep_one_aggregation() {
         return;
     };
 
-    for names in [vec![0usize], vec![0, 1]] {
-        let label = format!("{names:?} secondaryPreferred");
-        // The primary-only backend splits: two counts.
-        let (split, split_counts) = captured_counts(&backend, &db, &tenant, &names).await;
+    let mut mixed = missing_true(&[0]);
+    mixed.parameters.push(SearchParameter {
+        name: NAMES[2].to_owned(),
+        param_type: SearchParamType::String,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    let cases = [
+        (
+            "[0]",
+            missing_true(&[0]),
+            expected_total(&[0], false),
+            "exact_missing_split",
+        ),
+        (
+            "[0, 1]",
+            missing_true(&[0, 1]),
+            expected_total(&[0, 1], false),
+            "exact_missing_split",
+        ),
+        (
+            "[0] + sp-c:missing=false",
+            mixed,
+            (0..DOCS)
+                .filter(|n| !rows(*n, false)[0] && rows(*n, false)[2])
+                .count() as u64,
+            "exact_missing_checks",
+        ),
+    ];
+    for (label, query, expected, primary_strategy) in cases {
+        let (primary, strategies, _) = routed_total(&backend, &db, &tenant, &query).await;
         assert_eq!(
-            split_counts.len(),
-            2,
-            "{label}: the primary-only backend splits"
+            strategies,
+            [primary_strategy.to_owned()],
+            "{label}: primary-only route"
         );
-
-        pin_tracing_interest();
-        let strategies = TotalStrategies::default();
-        let dispatch = tracing::Dispatch::new(strategies.clone());
-        let query = missing_true(&names);
-        let (total, operations) = {
-            let _guard = tracing::dispatcher::set_default(&dispatch);
-            composite_plan::profiled(&db, secondary.search_count(&tenant, &query)).await
-        };
-        let total = total.unwrap();
-        let counts: Vec<Document> = operations
-            .iter()
-            .filter(|operation| operation.get_str("op") == Ok("command"))
-            .map(|operation| composite_plan::command_of(operation).clone())
-            .filter(is_count_on_resources)
-            .collect();
+        let (total, strategies, counts) = routed_total(&secondary, &db, &tenant, &query).await;
+        let label = format!("{label} secondaryPreferred");
         assert_eq!(
-            *strategies.0.lock().unwrap(),
+            strategies,
             ["exact_aggregation".to_owned()],
             "{label}: total strategy"
         );
@@ -577,7 +624,349 @@ async fn mongodb_missing_split_secondary_reads_keep_one_aggregation() {
             format!("{:?}", counts[0]).contains("$or"),
             "{label}: the aggregation is the single `$or` count: {counts:?}"
         );
-        assert_eq!(total, split, "{label}: total differs from the split's");
-        assert_eq!(total, expected_total(&names, false), "{label}: rows");
+        assert_eq!(total, primary, "{label}: total differs from the split's");
+        assert_eq!(total, expected, "{label}: rows");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2233 Stage 2: mixed totals (stamped stream + membership checks)
+// ---------------------------------------------------------------------------
+
+const DATE_NAME: &str = "sp-d";
+const DATE_URL: &str = "urn:hfs:sp:d";
+
+/// `sp-d` of resource `n`: the first day of 2026 on every sixth resource, the
+/// second day on every other third one, absent elsewhere.
+fn date_of(n: usize) -> Option<&'static str> {
+    match n % 6 {
+        0 => Some("2026-01-01T12:00:00Z"),
+        3 => Some("2026-01-02T12:00:00Z"),
+        _ => None,
+    }
+}
+
+/// [`seed`] plus a date parameter `sp-d` ([`date_of`]), so a date `:not`
+/// (whose filter is a top-level `$or` of scoped arms) is pinned too.
+async fn seed_mixed(backend: &MongoBackend, db: &mongodb::Database, tenant: &TenantContext) {
+    register_parameters(backend, tenant).await;
+    backend
+        .seed_create(
+            tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter", "id": DATE_NAME,
+                "url": format!("urn:hfs:test:{DATE_NAME}"), "name": DATE_NAME,
+                "status": "active", "code": DATE_NAME, "base": ["Observation"],
+                "type": "date",
+                "expression": format!("Observation.extension.where(url = '{DATE_URL}').value"),
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for n in 0..DOCS {
+        let mut body = observation(n, false);
+        if let Some(date) = date_of(n) {
+            body["extension"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"url": DATE_URL, "valueDateTime": date}));
+        }
+        backend
+            .seed_create(tenant, "Observation", body, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let ids: Vec<String> = (0..DOCS).filter(|n| unstamped(*n)).map(id_of).collect();
+    let result = db
+        .collection::<Document>("resources")
+        .update_many(
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "id": { "$in": ids.clone() },
+            },
+            doc! { "$unset": { "missing_params": "" } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.matched_count as usize, ids.len());
+}
+
+fn modified(
+    name: &str,
+    kind: SearchParamType,
+    modifier: SearchModifier,
+    value: &str,
+) -> SearchParameter {
+    SearchParameter {
+        name: name.to_owned(),
+        param_type: kind,
+        modifier: Some(modifier),
+        values: vec![SearchValue::parse(value)],
+        chain: vec![],
+        components: vec![],
+    }
+}
+
+/// `sp-a:missing=true&sp-c:missing=false&sp-d:not=2026-01-01&sp-b:not=other`.
+/// The date `:not` excludes some resources that lack `sp-a`; no resource has
+/// `sp-b=other`, so that check keeps every candidate and still runs.
+fn mixed_query() -> SearchQuery {
+    let mut query = missing_true(&[0]);
+    query.parameters.push(modified(
+        NAMES[2],
+        SearchParamType::String,
+        SearchModifier::Missing,
+        "false",
+    ));
+    query.parameters.push(modified(
+        DATE_NAME,
+        SearchParamType::Date,
+        SearchModifier::Not,
+        "2026-01-01",
+    ));
+    query.parameters.push(modified(
+        NAMES[1],
+        SearchParamType::String,
+        SearchModifier::Not,
+        "other",
+    ));
+    query
+}
+
+/// The criteria of [`mixed_query`] other than the metadata `:missing=true`.
+const MIXED_CRITERIA: i64 = 3;
+
+fn mixed_expected() -> u64 {
+    (0..DOCS)
+        .filter(|n| {
+            let present = rows(*n, false);
+            !present[0] && present[2] && *n % 6 != 0
+        })
+        .count() as u64
+}
+
+/// Every `IXSCAN` of an explained plan.
+fn index_scans(planner: &Document) -> Vec<Document> {
+    let mut stages = Vec::new();
+    plan_stages(planner.get("winningPlan").unwrap(), &mut stages);
+    stages
+        .into_iter()
+        .filter(|stage| stage.get_str("stage") == Ok("IXSCAN"))
+        .collect()
+}
+
+fn planner_of(label: &str, explained: &Document) -> Document {
+    let source = source(explained);
+    let planner = source
+        .get_document("queryPlanner")
+        .unwrap_or_else(|_| panic!("{label}: no queryPlanner in {explained:?}"))
+        .clone();
+    assert_eq!(
+        planner.get_array("rejectedPlans").map_or(0, Vec::len),
+        0,
+        "{label}: more than one candidate plan: {planner:?}"
+    );
+    planner
+}
+
+/// Point intervals `[v, v]` of one key of an index scan, or `None` when a
+/// bound is a range.
+fn points(stage: &Document, key: &str) -> Option<usize> {
+    let bounds = stage
+        .get_document("indexBounds")
+        .ok()?
+        .get_array(key)
+        .ok()?;
+    bounds
+        .iter()
+        .all(|bound| {
+            let text = bound.as_str().unwrap_or("");
+            let inner = text.trim_start_matches('[').trim_end_matches(']');
+            match inner.split_once(", ") {
+                Some((low, high)) => {
+                    low == high && !low.contains("MinKey") && !low.contains("MaxKey")
+                }
+                None => false,
+            }
+        })
+        .then_some(bounds.len())
+}
+
+/// The mixed total streams the stamped ids on the missing-params index with
+/// one bounded plan, checks them with membership commands hinted onto
+/// `idx_search_composite` (point bounds on tenant, type, parameter and ids,
+/// including the date `:not`'s top-level `$or`), runs no `$lookup` on the
+/// stamped side, and keeps the plan's stages on the unstamped count alone.
+#[tokio::test]
+async fn mongodb_missing_checks_commands_have_bounded_single_plans() {
+    let Some(backend) = create_backend("missing_checks_plans").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-checks-plans");
+    let tenant_id = tenant.tenant_id().as_str().to_owned();
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    seed_mixed(&backend, &db, &tenant).await;
+    let unstamped_resources = (0..DOCS).filter(|n| unstamped(*n)).count() as i64;
+    let stamped_resources = DOCS as i64 - unstamped_resources;
+
+    let query = mixed_query();
+    let (total, strategies, _) = routed_total(&backend, &db, &tenant, &query).await;
+    assert_eq!(strategies, ["exact_missing_checks".to_owned()], "route");
+    assert_eq!(total, mixed_expected(), "total differs from the rows");
+    // `sp-a` is absent on every fifth resource (60), and the date `:not`
+    // excludes every thirtieth (10).
+    assert_eq!(total, 50, "total differs from the rows");
+    let (_, operations) =
+        composite_plan::profiled(&db, async { backend.search_count(&tenant, &query).await }).await;
+    let commands: Vec<Document> = operations
+        .iter()
+        .filter(|operation| matches!(operation.get_str("op"), Ok("command" | "query")))
+        .map(|operation| composite_plan::command_of(operation).clone())
+        .collect();
+
+    // Stamped stream: one find on resources that reads ids (the freshness
+    // probes read the fingerprint), on the missing-params index.
+    let finds: Vec<&Document> = commands
+        .iter()
+        .filter(|command| {
+            command.get_str("find") == Ok("resources")
+                && command.get_document("projection").ok() == Some(&doc! { "_id": 0, "id": 1 })
+        })
+        .collect();
+    assert_eq!(finds.len(), 1, "one stamped stream: {finds:?}");
+    assert!(
+        format!("{:?}", finds[0].get("hint")).contains(MISSING_INDEX),
+        "stream without the missing_params hint: {:?}",
+        finds[0]
+    );
+    let stream = inspect("stream", &explain(&db, finds[0]).await);
+    assert!(
+        stream.bounds.iter().all(|bound| bound.contains(NAMES[0])),
+        "stream bound is not the name: {:?}",
+        stream.bounds
+    );
+    assert!(stream.lookups.is_empty());
+
+    // No command of the stamped side (or any planning probe) on
+    // `search_index` runs a `$lookup`.
+    for command in commands
+        .iter()
+        .filter(|command| command.get_str("aggregate") == Ok("search_index"))
+    {
+        assert!(
+            !format!("{command:?}").contains("$lookup"),
+            "$lookup on search_index: {command:?}"
+        );
+    }
+    // Every search_index aggregate of the total is a membership check
+    // (`$match` on the criterion and the batch ids, then `$group` by
+    // `resource_id`) or the planner's selectivity probe of the
+    // `:missing=false` (a `$limit`ed count): one check per criterion for the
+    // one batch, and one probe.
+    let aggregates: Vec<&Document> = commands
+        .iter()
+        .filter(|command| command.get_str("aggregate") == Ok("search_index"))
+        .collect();
+    let is_membership = |command: &&Document| {
+        command.get_array("pipeline").is_ok_and(|pipeline| {
+            pipeline.len() == 2
+                && pipeline[1].as_document() == Some(&doc! { "$group": { "_id": "$resource_id" } })
+                && format!("{:?}", pipeline[0]).contains("\"resource_id\": Document({\"$in\"")
+        })
+    };
+    let is_probe = |command: &&Document| {
+        command.get_array("pipeline").is_ok_and(|pipeline| {
+            pipeline
+                .iter()
+                .filter_map(Bson::as_document)
+                .any(|stage| stage.contains_key("$limit"))
+                && format!("{:?}", pipeline[0]).contains(NAMES[2])
+        })
+    };
+    let memberships: Vec<&Document> = aggregates.iter().copied().filter(is_membership).collect();
+    let probes: Vec<&Document> = aggregates.iter().copied().filter(is_probe).collect();
+    assert_eq!(
+        (memberships.len(), probes.len(), aggregates.len()),
+        (MIXED_CRITERIA as usize, 1, MIXED_CRITERIA as usize + 1),
+        "search_index aggregates are {MIXED_CRITERIA} membership checks and one probe: {aggregates:?}"
+    );
+    let mut params = std::collections::BTreeSet::new();
+    for command in &memberships {
+        let text = format!("{command:?}");
+        assert!(
+            !text.contains("$lookup"),
+            "stamped side runs $lookup: {command:?}"
+        );
+        assert!(
+            format!("{:?}", command.get("hint")).contains("idx_search_composite"),
+            "membership without the composite hint: {command:?}"
+        );
+        let explained = explain(&db, command).await;
+        let planner = planner_of("membership", &explained);
+        let scans = index_scans(&planner);
+        assert!(
+            !scans.is_empty(),
+            "membership without an index scan: {planner:?}"
+        );
+        for scan in &scans {
+            assert_eq!(
+                scan.get_str("indexName"),
+                Ok("idx_search_composite"),
+                "{scan:?}"
+            );
+            for key in ["tenant_id", "resource_type", "param_name"] {
+                assert_eq!(
+                    points(scan, key),
+                    Some(1),
+                    "{key} is not one point: {scan:?}"
+                );
+            }
+            let ids = points(scan, "resource_id")
+                .unwrap_or_else(|| panic!("resource_id is not point intervals: {scan:?}"));
+            assert!(ids as i64 <= stamped_resources, "{ids} id points: {scan:?}");
+            let bounds = format!("{:?}", scan.get_document("indexBounds").unwrap());
+            assert!(bounds.contains(&tenant_id), "{bounds}");
+            params.insert(
+                scan.get_document("indexBounds")
+                    .unwrap()
+                    .get_array("param_name")
+                    .unwrap()[0]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    }
+    assert!(
+        params.iter().any(|bound| bound.contains(DATE_NAME)),
+        "no membership check of the date :not: {params:?}"
+    );
+
+    // Unstamped count: the only count on resources, all plan stages.
+    let counts: Vec<&Document> = commands
+        .iter()
+        .filter(|c| is_count_on_resources(c))
+        .collect();
+    assert_eq!(counts.len(), 1, "one unstamped count: {counts:?}");
+    assert!(is_unstamped_count(counts[0]));
+    let unstamped = inspect("unstamped", &explain(&db, counts[0]).await);
+    assert!(
+        unstamped.bounds.iter().all(|bound| bound.contains("null")),
+        "unstamped bound is not [null, null]: {:?}",
+        unstamped.bounds
+    );
+    assert_eq!(
+        unstamped.lookups.len() as i64,
+        1 + MIXED_CRITERIA,
+        "unstamped lookups"
+    );
+    for executed in &unstamped.lookups {
+        assert!(*executed <= unstamped_resources, "{executed} lookups");
     }
 }
