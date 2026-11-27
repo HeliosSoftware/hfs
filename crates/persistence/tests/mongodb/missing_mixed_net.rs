@@ -46,9 +46,7 @@
 //! written here): the batch-size cells (1, 2, 3, 7 ids per membership batch
 //! over the exhaustive states) need the batching loop to take its batch size
 //! as an argument; the failure-injection cells (a failure after batch N, and
-//! in the unstamped count) need that loop and the split counts to exist; the
-//! pure `:missing=true` total behind a parameter sort over the id cap lands
-//! with the gate fix, because Stage 1 already splits it.
+//! in the unstamped count) need that loop and the split counts to exist.
 
 use super::*;
 use futures::{StreamExt, TryStreamExt};
@@ -2282,7 +2280,9 @@ const CLONES: u32 = ID_CAP + 10;
 
 /// `_sort=mx-b&_total=accurate` over more matches than the id-set cap: the
 /// page walks the sort index and the total is counted by the unsorted query
-/// (`count_standard` with the sort cleared), which is the mixed exact total.
+/// (`count_standard` with the sort cleared). That count keeps the single
+/// aggregation for a mixed and for a pure `:missing=true` query alike, while
+/// `search_count` of the same query takes its own route.
 ///
 /// The `ID_CAP + 10` resources over the cap are raw copies of one resource
 /// written through the real path (with its `mx-b` row) under new ids; a
@@ -2388,6 +2388,7 @@ async fn mongodb_missing_mixed_param_sort_over_the_id_cap() {
     for crits in [
         vec![Crit::True(A), not(T, &[ALPHA])],
         vec![not(T, &[ALPHA]), Crit::True(A), Crit::False(B)],
+        vec![Crit::True(A)],
     ] {
         let shape = shape(crits, Extra::None);
         let want = expected(&net.docs, &shape, Route::Metadata);
@@ -2405,8 +2406,8 @@ async fn mongodb_missing_mixed_param_sort_over_the_id_cap() {
             .await
             .unwrap_or_else(|e| panic!("{}: {e}", label(&shape)));
         // Over the cap the total is `count_standard` of the unsorted query:
-        // its plan events are there, and it stays on the single aggregation
-        // (the pure `:missing=true` shape over the cap is owed with the gate fix).
+        // its plan events are there, and it stays on the single aggregation,
+        // the pure `:missing=true` shape included.
         assert_route(
             &label(&shape),
             Expect::Kept,
@@ -2437,7 +2438,12 @@ async fn mongodb_missing_mixed_param_sort_over_the_id_cap() {
         let (count, filters, strategies) =
             routed_count(&net.metadata, &net.tenant, &query(&shape, 1)).await;
         assert_eq!(count, want.len() as u64, "{}: search_count", label(&shape));
-        assert_route(&label(&shape), Expect::Mixed, &filters, &strategies);
+        assert_route(
+            &label(&shape),
+            intended_route(&shape),
+            &filters,
+            &strategies,
+        );
         stats.shapes += 1;
         stats.comparisons += 3;
         stats.largest = stats.largest.max(want.len());

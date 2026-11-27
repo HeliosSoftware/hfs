@@ -9,7 +9,7 @@ use mongodb::action::Action;
 use mongodb::{
     Cursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
-    options::Hint,
+    options::{Hint, ReadPreference, SelectionCriteria},
 };
 use regex::escape as regex_escape;
 use serde_json::Value;
@@ -1025,6 +1025,32 @@ fn split_missing_stages<'a>(
     Some(stages.as_slice())
 }
 
+/// What an exact total counts: the request's own query, or the unsorted copy
+/// that stands in for a `_sort=<search parameter>` query whose matches exceed
+/// the id cap (#2588). The caller says which, because the copy no longer
+/// carries the sort that distinguishes the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountOrigin {
+    /// `_summary=count`, `_total` next to a page, or `search_count`.
+    Query,
+    /// The total behind a parameter sort over the id cap. It keeps the
+    /// single aggregation it has always run; the split counts of #2233 are
+    /// not taken for it.
+    ParamSortOverCap,
+}
+
+/// Whether every command a split total issues is read from the primary: the
+/// database handle carries no read preference, or `primary`. A split total is
+/// several commands; with any other read preference each of them could reach
+/// a different member at a different point of replication, so such a
+/// deployment keeps today's single command instead (#2233).
+fn reads_from_primary(criteria: Option<&SelectionCriteria>) -> bool {
+    matches!(
+        criteria,
+        None | Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+    )
+}
+
 /// The hint both split counts carry: the index is fixed, so neither count can
 /// fall back to a full scan. The unstamped count and a single-name stamped
 /// count have fixed bounds; with several names the stamped count is bounded
@@ -1697,6 +1723,7 @@ impl MongoBackend {
                     query,
                     &missing_support,
                     facts.count_selection(),
+                    CountOrigin::Query,
                     &mut probe_facts,
                 )
                 .await?;
@@ -1998,6 +2025,7 @@ impl MongoBackend {
                     query,
                     &missing_support,
                     facts.count_selection(),
+                    CountOrigin::Query,
                     &mut probe_facts,
                 )
                 .await?,
@@ -2081,7 +2109,7 @@ impl MongoBackend {
         }
 
         let _permit = self.admit_broad_search_for(query, true).await?;
-        self.count_standard(tenant, query).await
+        self.count_standard(tenant, query, CountOrigin::Query).await
     }
 }
 
@@ -2754,6 +2782,7 @@ impl MongoBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        origin: CountOrigin,
     ) -> StorageResult<u64> {
         let selection = self.execution_facts(query).count_selection();
         let mut facts = ProbeFacts::default();
@@ -2761,13 +2790,23 @@ impl MongoBackend {
         let missing_support =
             self.classify_missing(tenant.tenant_id().as_str(), &query.resource_type, query);
         let result = self
-            .count_standard_with_facts(tenant, &db, query, &missing_support, selection, &mut facts)
+            .count_standard_with_facts(
+                tenant,
+                &db,
+                query,
+                &missing_support,
+                selection,
+                origin,
+                &mut facts,
+            )
             .await;
         facts.record();
         result
     }
 
-    /// `selection` is the batched count the request's execution facts allow.
+    /// `selection` is the batched count the request's execution facts allow;
+    /// `origin` says whether the split counts of #2233 may serve it.
+    #[allow(clippy::too_many_arguments)]
     async fn count_standard_with_facts(
         &self,
         tenant: &TenantContext,
@@ -2775,6 +2814,7 @@ impl MongoBackend {
         query: &SearchQuery,
         missing_support: &MissingSupport,
         selection: BatchSelection,
+        origin: CountOrigin,
         facts: &mut ProbeFacts,
     ) -> StorageResult<u64> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
@@ -2819,12 +2859,17 @@ impl MongoBackend {
             });
             return Ok(plan.execute(db, filter, None, selection).await?.count);
         }
-        if let Some(fallback_stages) = split_missing_stages(
-            filter_plan.as_ref(),
-            matched_ids.as_ref(),
-            query,
-            missing_support,
-        ) {
+        // The split counts serve only the request's own query, and only when
+        // all of their commands read from the primary.
+        let split = origin == CountOrigin::Query && reads_from_primary(db.selection_criteria());
+        if split
+            && let Some(fallback_stages) = split_missing_stages(
+                filter_plan.as_ref(),
+                matched_ids.as_ref(),
+                query,
+                missing_support,
+            )
+        {
             record_total_strategy("exact_missing_split");
             return self
                 .count_missing_split(
@@ -2878,9 +2923,11 @@ impl MongoBackend {
     /// The two counts are separate commands read one after the other. A
     /// resource that gains or loses `missing_params` between them can be
     /// missed or counted twice in that request; the single aggregation this
-    /// replaces runs for seconds and is not a snapshot either. Searches use
-    /// the read preference of the connection string, so with secondary reads
-    /// the two commands may reach different members. No session is added.
+    /// replaces runs for seconds and is not a snapshot either. It runs only
+    /// when the database handle reads from the primary (no read preference,
+    /// or `primary`), so both commands are read from the primary; any other
+    /// read preference, `primaryPreferred` included, keeps the single
+    /// aggregation. No session is added.
     async fn count_missing_split(
         &self,
         db: &mongodb::Database,
@@ -3805,7 +3852,10 @@ impl MongoBackend {
                 if query.wants_total() {
                     let mut unsorted = query.clone();
                     unsorted.sort.clear();
-                    total = Some(self.count_standard(tenant, &unsorted).await?);
+                    total = Some(
+                        self.count_standard(tenant, &unsorted, CountOrigin::ParamSortOverCap)
+                            .await?,
+                    );
                 }
                 self.param_sorted_filtered_window(
                     db,
@@ -11679,5 +11729,60 @@ mod build_resource_filter_identity_tests {
             missing_split_hint(),
             Hint::Name(name) if name == "idx_resources_missing_params"
         ));
+    }
+
+    /// The split counts read only from the primary: no read preference or
+    /// `primary` splits; every other mode (with or without options) and a
+    /// predicate keep the single command.
+    #[test]
+    fn split_counts_read_only_from_the_primary() {
+        use mongodb::options::ReadPreferenceOptions;
+        let options = || {
+            Some(
+                ReadPreferenceOptions::builder()
+                    .max_staleness(std::time::Duration::from_secs(90))
+                    .build(),
+            )
+        };
+        let read = |preference| Some(SelectionCriteria::ReadPreference(preference));
+        assert!(reads_from_primary(None));
+        assert!(reads_from_primary(read(ReadPreference::Primary).as_ref()));
+        for (label, criteria) in [
+            (
+                "primaryPreferred",
+                read(ReadPreference::PrimaryPreferred { options: None }),
+            ),
+            (
+                "primaryPreferred+options",
+                read(ReadPreference::PrimaryPreferred { options: options() }),
+            ),
+            (
+                "secondary",
+                read(ReadPreference::Secondary { options: None }),
+            ),
+            (
+                "secondary+options",
+                read(ReadPreference::Secondary { options: options() }),
+            ),
+            (
+                "secondaryPreferred",
+                read(ReadPreference::SecondaryPreferred { options: None }),
+            ),
+            (
+                "secondaryPreferred+options",
+                read(ReadPreference::SecondaryPreferred { options: options() }),
+            ),
+            ("nearest", read(ReadPreference::Nearest { options: None })),
+            (
+                "nearest+options",
+                read(ReadPreference::Nearest { options: options() }),
+            ),
+            (
+                "predicate",
+                Some(SelectionCriteria::Predicate(std::sync::Arc::new(|_| true))),
+            ),
+        ] {
+            assert!(!reads_from_primary(criteria.as_ref()), "{label}");
+        }
     }
 }

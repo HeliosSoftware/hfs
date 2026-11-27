@@ -466,3 +466,118 @@ async fn mongodb_missing_split_name_pairs_on_a_stamped_type_are_bounded() {
         );
     }
 }
+
+/// The `total_strategy` values the `helios_mongodb_plan` events of one
+/// search recorded.
+#[derive(Clone, Default)]
+struct TotalStrategies(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[derive(Default)]
+struct TotalVisitor(Option<String>);
+
+impl tracing::field::Visit for TotalVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "total_strategy" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl tracing::Subscriber for TotalStrategies {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "helios_mongodb_plan"
+    }
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::DEBUG)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = TotalVisitor::default();
+        event.record(&mut visitor);
+        if let Some(total) = visitor.0 {
+            self.0.lock().unwrap().push(total);
+        }
+    }
+}
+
+/// `connection_string` with one more URI option.
+fn with_uri_option(connection_string: &str, option: &str) -> String {
+    match connection_string.split_once('?') {
+        Some((base, query)) if !query.is_empty() => format!("{base}?{query}&{option}"),
+        Some((base, _)) => format!("{base}?{option}"),
+        None if connection_string.ends_with('/') => format!("{connection_string}?{option}"),
+        None => format!("{connection_string}/?{option}"),
+    }
+}
+
+/// With a non-primary read preference, the commands of a split total could
+/// be served by different members, so the total stays today's single
+/// aggregation: one `$count` command, the `exact_aggregation` strategy, and
+/// the same number as the split of a primary-only backend on the same data.
+/// A single-node replica set serves `secondaryPreferred` from its primary.
+#[tokio::test]
+async fn mongodb_missing_split_secondary_reads_keep_one_aggregation() {
+    let Some(backend) = create_backend("missing_split_secondary").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-split-secondary");
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    seed(&backend, &db, &tenant, false, true).await;
+    let mut config = backend.config().clone();
+    config.connection_string = with_uri_option(
+        &config.connection_string,
+        "readPreference=secondaryPreferred",
+    );
+    let Some(secondary) = build_backend(config).await else {
+        return;
+    };
+
+    for names in [vec![0usize], vec![0, 1]] {
+        let label = format!("{names:?} secondaryPreferred");
+        // The primary-only backend splits: two counts.
+        let (split, split_counts) = captured_counts(&backend, &db, &tenant, &names).await;
+        assert_eq!(
+            split_counts.len(),
+            2,
+            "{label}: the primary-only backend splits"
+        );
+
+        pin_tracing_interest();
+        let strategies = TotalStrategies::default();
+        let dispatch = tracing::Dispatch::new(strategies.clone());
+        let query = missing_true(&names);
+        let (total, operations) = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            composite_plan::profiled(&db, secondary.search_count(&tenant, &query)).await
+        };
+        let total = total.unwrap();
+        let counts: Vec<Document> = operations
+            .iter()
+            .filter(|operation| operation.get_str("op") == Ok("command"))
+            .map(|operation| composite_plan::command_of(operation).clone())
+            .filter(is_count_on_resources)
+            .collect();
+        assert_eq!(
+            *strategies.0.lock().unwrap(),
+            ["exact_aggregation".to_owned()],
+            "{label}: total strategy"
+        );
+        assert_eq!(counts.len(), 1, "{label}: one aggregation: {counts:?}");
+        assert!(
+            format!("{:?}", counts[0]).contains("$or"),
+            "{label}: the aggregation is the single `$or` count: {counts:?}"
+        );
+        assert_eq!(total, split, "{label}: total differs from the split's");
+        assert_eq!(total, expected_total(&names, false), "{label}: rows");
+    }
+}
