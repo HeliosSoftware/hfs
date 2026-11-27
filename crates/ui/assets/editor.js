@@ -65,6 +65,9 @@
 
   var resourceType = messages.type;
   var resourceId = messages.id;
+  /* Both come from the page's query string and go into fetch paths. */
+  var identityValid = window.HfsSaveTarget.isValidType(resourceType) &&
+    (!resourceId || window.HfsSaveTarget.isValidId(resourceId));
   var confirmed = null;
   var saving = false;
   var deleting = false;
@@ -230,6 +233,10 @@
   /* ---- loading --------------------------------------------------------- */
 
   function load() {
+    if (!identityValid) {
+      say(messages.msgLoadError, "error");
+      return Promise.resolve();
+    }
     var resource = resourceId
       ? fetch("/" + resourceType + "/" + resourceId, { headers: fhirHeaders() })
           .then(function (response) {

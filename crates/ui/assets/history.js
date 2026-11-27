@@ -42,6 +42,15 @@
   /* ---- load the history feed ------------------------------------------- */
 
   function load(type, id) {
+    /* The type and id come from the deep link or the form and go into the
+     * fetch path: anything but a resource type and an id ("/host", "x/..")
+     * would leave the FHIR API, or this origin. */
+    if (!/^[A-Z][A-Za-z]{0,63}$/.test(type) || !/^[A-Za-z0-9.-]{1,64}$/.test(id)) {
+      versionsEl.textContent = "";
+      controls.hidden = true;
+      diffEl.innerHTML = '<p class="history__empty">' + messages.msgNotFound + "</p>";
+      return;
+    }
     resourceType = type;
     resourceId = id;
     pathEl.textContent = "/" + type + "/" + id + "/_history";

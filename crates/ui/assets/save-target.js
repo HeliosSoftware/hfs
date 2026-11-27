@@ -22,6 +22,13 @@
     return typeof id === "string" && /^[A-Za-z0-9.-]{1,64}$/.test(id);
   }
 
+  /* A FHIR resource type name: what may stand in the first segment of a
+   * fetch path. Anything else ("/host", "x/..") would leave the FHIR API, or
+   * this origin. */
+  function isValidType(type) {
+    return typeof type === "string" && /^[A-Z][A-Za-z]{0,63}$/.test(type);
+  }
+
   /* -> { method, url, id }. An id with invalid characters still goes by PUT:
    * the server is the one that rejects it. */
   function forCreate(type, doc) {
@@ -45,6 +52,7 @@
 
   return {
     isValidId: isValidId,
+    isValidType: isValidType,
     forCreate: forCreate,
     notice: notice,
     existsFromStatus: existsFromStatus,
