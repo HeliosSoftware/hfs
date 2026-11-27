@@ -115,6 +115,10 @@ services:
       HFS_BULK_SUBMIT_S3_ENDPOINT: http://minio:9000
       HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE: "true"
       HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN: "false"
+      # The sample Data Provider is on the compose network, a private address,
+      # which $bulk-submit refuses by default. Local example only: in a real
+      # deployment list the provider in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS.
+      HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS: "true"
       AWS_ACCESS_KEY_ID: hfs-minio
       AWS_SECRET_ACCESS_KEY: hfs-minio-secret
       AWS_REGION: us-east-1
