@@ -1760,7 +1760,11 @@ fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8
 
     // Header (only when caller opts in, per the SoF `header` parameter).
     if include_header {
-        out.extend_from_slice(cols.join(",").as_bytes());
+        let header: Vec<String> = cols
+            .iter()
+            .map(|c| csv_cell(&serde_json::Value::String(c.clone())))
+            .collect();
+        out.extend_from_slice(header.join(",").as_bytes());
         out.push(b'\n');
     }
 
@@ -3298,6 +3302,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(view.clone()).unwrap(),
             "a,b\n'=1+2,-5\n-5,'@SUM(A1)\n\"'=x,y\",+3.5\n"
+        );
+        let query =
+            helios_sof::format_csv(helios_sof::rows_to_processed_result(rows.clone()), true)
+                .unwrap();
+        assert_eq!(view, query);
+    }
+
+    #[test]
+    fn view_and_query_csv_writers_agree_on_formula_column_names() {
+        use serde_json::json;
+        let rows = vec![json!({"=1+2": "x", "b,c": "y"})];
+        let view = format_csv(&rows, true).unwrap();
+        assert_eq!(
+            String::from_utf8(view.clone()).unwrap(),
+            "'=1+2,\"b,c\"
+x,y
+"
         );
         let query =
             helios_sof::format_csv(helios_sof::rows_to_processed_result(rows.clone()), true)
