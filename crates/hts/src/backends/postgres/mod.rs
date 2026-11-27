@@ -13,6 +13,7 @@ mod value_set;
 use async_trait::async_trait;
 use deadpool_postgres::{Config, GenericClient, Pool, Runtime};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
@@ -286,6 +287,9 @@ where
 #[derive(Clone)]
 pub struct PostgresTerminologyBackend {
     pub(super) pool: Pool,
+    /// How many [`MaintenanceGuard`]s are alive. While any is, imports and
+    /// closure rebuilds run without the statement timeout.
+    maintenance: Arc<AtomicUsize>,
     /// Process-local inline-compose expansion cache. Hot path for repeated
     /// POST $expand requests with identical compose bodies — k6 EX02/04/05/06
     /// pool entries hit the same compose hundreds of times during a 30s run.
@@ -317,12 +321,15 @@ impl PostgresTerminologyBackend {
         let (pool, target, tls_settings) = build_pool(database_url)?;
 
         {
-            let mut client = pool.get().await.map_err(|e| {
+            // Startup work is not a request: it may wait for another instance's
+            // migration, or build an index over a large table.
+            let mut client = MaintenanceConnection::unbounded(pool.get().await.map_err(|e| {
                 HtsError::StorageError(format!(
                     "Failed to acquire PG connection: {}",
                     error_chain(&e)
                 ))
-            })?;
+            })?)
+            .await?;
 
             // Say once whether the link is encrypted, read from the server (#2746).
             tls::log_connection_security(&client, "hts", &target, &tls_settings).await;
@@ -346,6 +353,7 @@ impl PostgresTerminologyBackend {
                         error_chain(&e)
                     ))
                 })?;
+            client.release().await;
         }
 
         info!(
@@ -355,6 +363,7 @@ impl PostgresTerminologyBackend {
 
         Ok(Self {
             pool,
+            maintenance: Arc::new(AtomicUsize::new(0)),
             inline_compose_cache: Arc::new(RwLock::new(HashMap::new())),
             lookup_response_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_resolved_meta_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -375,16 +384,133 @@ impl PostgresTerminologyBackend {
     /// request doesn't pay the build cost. For SNOMED CT (~20M closure pairs)
     /// this takes ~30–60 s.
     pub async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
-        let mut client = self
+        let mut client = self.import_connection().await?;
+        let rebuilt = schema::migrate_concept_closure_pg(&mut client)
+            .await
+            .map_err(|e| {
+                HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
+            })?;
+        client.release().await;
+        Ok(rebuilt)
+    }
+
+    /// Lifts the statement timeout from imports and closure rebuilds for as
+    /// long as the returned guard lives.
+    ///
+    /// For work that no HTTP request is waiting on: the bootstrap import
+    /// before the server starts listening, and the `hts import` CLI. Such an
+    /// import may wait on another import's lock or replace a large code
+    /// system, and nothing is gained by stopping it after 30 s. Imports sent
+    /// over HTTP are not maintenance and keep the timeout.
+    pub fn begin_maintenance(&self) -> MaintenanceGuard {
+        self.maintenance.fetch_add(1, Ordering::SeqCst);
+        MaintenanceGuard(Arc::clone(&self.maintenance))
+    }
+
+    /// A connection for an import or closure rebuild: without the statement
+    /// timeout during maintenance, an ordinary pooled connection otherwise.
+    async fn import_connection(&self) -> Result<MaintenanceConnection, HtsError> {
+        let client = self
             .pool
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
-        schema::migrate_concept_closure_pg(&mut client)
+        if self.maintenance.load(Ordering::SeqCst) > 0 {
+            MaintenanceConnection::unbounded(client).await
+        } else {
+            Ok(MaintenanceConnection::bounded(client))
+        }
+    }
+}
+
+/// Keeps imports and closure rebuilds free of the statement timeout; see
+/// [`PostgresTerminologyBackend::begin_maintenance`].
+#[must_use = "maintenance ends when the guard is dropped"]
+pub struct MaintenanceGuard(Arc<AtomicUsize>);
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A pooled connection that may have had its statement timeout lifted.
+///
+/// The timeout is a session setting, so a lifted connection must not go back
+/// to the pool as it is: a later request would run on it unbounded.
+/// [`release`](Self::release) restores the timeout first. A connection dropped
+/// without it (an early return, a cancelled future) is closed instead.
+struct MaintenanceConnection {
+    client: Option<deadpool_postgres::Object>,
+    lifted: bool,
+}
+
+impl MaintenanceConnection {
+    /// The connection as the pool gave it, statement timeout in place.
+    fn bounded(client: deadpool_postgres::Object) -> Self {
+        Self {
+            client: Some(client),
+            lifted: false,
+        }
+    }
+
+    /// The connection with its statement timeout lifted.
+    async fn unbounded(client: deadpool_postgres::Object) -> Result<Self, HtsError> {
+        // Marked lifted before the SET, so a SET that is cancelled part-way
+        // also ends with the connection closed.
+        let this = Self {
+            client: Some(client),
+            lifted: true,
+        };
+        this.batch_execute("SET statement_timeout = 0")
             .await
             .map_err(|e| {
-                HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
-            })
+                HtsError::StorageError(format!(
+                    "Failed to lift the statement timeout: {}",
+                    error_chain(&e)
+                ))
+            })?;
+        Ok(this)
+    }
+
+    /// Returns the connection to the pool, with the session's statement
+    /// timeout back at what the pool's connection options set.
+    async fn release(mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if self.lifted
+            && client
+                .batch_execute("RESET statement_timeout")
+                .await
+                .is_err()
+        {
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
+}
+
+impl std::ops::Deref for MaintenanceConnection {
+    type Target = deadpool_postgres::Object;
+
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("connection already released")
+    }
+}
+
+impl std::ops::DerefMut for MaintenanceConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("connection already released")
+    }
+}
+
+impl Drop for MaintenanceConnection {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take()
+            && self.lifted
+        {
+            drop(deadpool_postgres::Object::take(client));
+        }
     }
 }
 
@@ -410,6 +536,8 @@ impl TerminologyCaches for PostgresTerminologyBackend {
         let Self {
             // Not a cache: the connection pool itself.
             pool: _,
+            // Not a cache: the count of live maintenance guards.
+            maintenance: _,
             inline_compose_cache,
             lookup_response_cache,
             cs_resolved_meta_cache,
@@ -702,11 +830,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
+        let mut client = self.import_connection().await?;
 
         // Before the transaction: decide which CodeSystems get their closure
         // rebuilt once the bundle commits. `write_code_system` deletes a
@@ -872,6 +996,8 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                 }
             }
         }
+
+        client.release().await;
 
         // Invalidate per-instance response caches — they may now shadow
         // newly-imported codes.

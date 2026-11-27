@@ -450,7 +450,7 @@ hts run --storage-backend postgres \
   --database-url "postgresql://user:pass@db.example.com/hts?sslmode=verify-full&sslrootcert=/etc/hts/db-ca.pem"
 ```
 
-Terminology statements run with a 30 s `statement_timeout`, the same as the HTTP request timeout, so a statement is stopped once its request has timed out. An `options=-c statement_timeout=...` parameter in the URL takes precedence; other `options` are kept. A `regex` filter value longer than 1,024 bytes is refused with 400.
+Terminology statements run with a 30 s `statement_timeout`, the same as the HTTP request timeout, so a statement is stopped once its request has timed out. An `options=-c statement_timeout=...` parameter in the URL takes precedence; other `options` are kept. The timeout is for requests: startup migration, the bootstrap import and `hts import` run without it. A `regex` filter value longer than 1,024 bytes is refused with 400.
 
 ## API Endpoints
 
