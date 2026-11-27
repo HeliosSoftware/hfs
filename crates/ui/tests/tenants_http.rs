@@ -1,5 +1,5 @@
 //! End-to-end tests for the tenant-maintenance page (`/ui/tenants`), driving the
-//! mounted router against a real in-memory SQLite-backed store so the handlers,
+//! mounted router against a real file-backed SQLite store so the handlers,
 //! the registry read/write path, and result shaping are all exercised.
 //!
 //! Provisioning runs in the background (#581), so a single router (and the
@@ -44,12 +44,37 @@ use html::Dom;
 /// count fails the test instead of hanging it. Never a latency threshold.
 const HANG_GUARD: Duration = Duration::from_secs(10);
 
-/// An in-memory SQLite store with the schema initialised, as an
-/// `Arc<dyn ResourceStorage>` ready to hand to `mount`.
-fn store() -> Arc<dyn ResourceStorage> {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+/// A file-backed SQLite store with the schema initialised, in its own
+/// temporary directory. It derefs to the `Arc<dyn ResourceStorage>` handed to
+/// `mount`, and removes the directory when dropped.
+///
+/// Not `SqliteBackend::in_memory()`: that opens a shared-cache database,
+/// which locks whole tables and answers a contended read or write with
+/// `SQLITE_LOCKED` at once, ignoring `busy_timeout` (#3030). Background
+/// provisioning and count refreshes write while the test's next request
+/// reads, so in memory a request could fail with `database table is locked:
+/// tenants`. A file waits on `busy_timeout` the way a deployment does.
+struct TestStore {
+    storage: Arc<dyn ResourceStorage>,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestStore {
+    type Target = Arc<dyn ResourceStorage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+fn store() -> TestStore {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = SqliteBackend::open(dir.path().join("hfs.db")).expect("file sqlite");
     backend.init_schema().expect("init schema");
-    Arc::new(backend)
+    TestStore {
+        storage: Arc::new(backend),
+        _dir: dir,
+    }
 }
 
 /// Builds the UI router over the given store. Build this once per test and
@@ -195,11 +220,11 @@ async fn seed_patient(store: &Arc<dyn ResourceStorage>, tenant: &str) {
         .expect("seed a patient");
 }
 
-/// An in-memory SQLite store wrapped in [`GatedStorage`], and the UI router
-/// over the wrapper. Seed through `inner` or the wrapper alike.
-fn gated() -> (Arc<GatedStorage>, Arc<dyn ResourceStorage>, Router) {
+/// A SQLite store wrapped in [`GatedStorage`], and the UI router over the
+/// wrapper. Seed through `inner` or the wrapper alike.
+fn gated() -> (Arc<GatedStorage>, TestStore, Router) {
     let inner = store();
-    let gated = GatedStorage::new(Arc::clone(&inner));
+    let gated = GatedStorage::new(Arc::clone(&*inner));
     let router = app(&(gated.clone() as Arc<dyn ResourceStorage>));
     (gated, inner, router)
 }
@@ -888,7 +913,7 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         "9.9.9",
         None,
         helios_ui::NlSearch::default(),
-        Some(Arc::clone(&store)),
+        Some(Arc::clone(&*store)),
         None,
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
@@ -966,12 +991,13 @@ fn mount_subscribes_the_tenant_inventory_to_the_server_fan_out() {
         )
     };
     let observers = Arc::new(helios_persistence::core::WriteObservers::new());
-    let app = mount(Some(store()), observers.clone());
+    let (first, second, third) = (store(), store(), store());
+    let app = mount(Some(Arc::clone(&*first)), observers.clone());
     assert_eq!(observers.len(), 1, "the inventory subscribed");
-    let _second = mount(Some(store()), observers.clone());
+    let _second = mount(Some(Arc::clone(&*second)), observers.clone());
     assert_eq!(observers.len(), 2, "one inventory per mounted app");
     drop(app);
-    let _third = mount(Some(store()), observers.clone());
+    let _third = mount(Some(Arc::clone(&*third)), observers.clone());
     assert_eq!(
         observers.len(),
         2,
