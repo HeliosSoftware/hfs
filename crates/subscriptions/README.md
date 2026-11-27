@@ -155,6 +155,7 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY` | `1024` | Resource events waiting for evaluation |
 | `HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS` | `1024` | Global queued + active notifications, including retry sleeps |
 | `HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY` | `32` | Queued + active notifications for one `(tenant, subscription_id)` |
+| `HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT` | half the global budget | Queued + active notifications for all of one tenant's subscriptions, so one tenant's slow receivers cannot shed the others'; kept between the per-subscription capacity and the global budget |
 | `HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY` | `64` | Simultaneous channel attempts, shared by notifications and activation handshakes |
 | `HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY` | `8` | Running activation flows, shared by live writes and startup rehydration |
 | `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `$events` (number, timestamp, focus reference only; in memory, lost on restart); `0` disables the history |
