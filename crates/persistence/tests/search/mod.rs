@@ -151,6 +151,32 @@ async fn date_instant_targets_are_points() {
     date_instant_suite::instant_targets_are_points(&backend, "date-instant").await;
 }
 
+/// The backend's configured FHIR version decides which elements are
+/// `instant`s (#2962): R6 makes `DiagnosticReport.issued` a `dateTime`.
+/// PostgreSQL, MongoDB and Elasticsearch run the same three.
+#[cfg(all(feature = "sqlite", feature = "R6"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r6_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R6);
+    date_instant_suite::r6_backend_types_by_r6(&backend, "date-instant-r6").await;
+}
+
+/// The R4 control for `date_instant_types_follow_an_r6_backend`.
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r4_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R4);
+    date_instant_suite::r4_backend_types_by_r4(&backend, "date-instant-r4").await;
+}
+
+/// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+#[cfg(all(feature = "sqlite", feature = "R5"))]
+#[tokio::test]
+async fn date_instant_types_follow_an_r5_backend() {
+    let backend = make_sqlite_backend_for(FhirVersion::R5);
+    date_instant_suite::r5_backend_types_by_r5(&backend, "date-instant-r5").await;
+}
+
 /// The shared quantity `Range` table (#2602): a `Range` is one closed
 /// interval, a missing bound is open, and every prefix compares against the
 /// interval. PostgreSQL, MongoDB and Elasticsearch run the same one.

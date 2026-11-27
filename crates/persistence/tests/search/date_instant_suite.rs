@@ -139,9 +139,28 @@ async fn create<S>(backend: &S, tenant: &TenantContext, resource_type: &str, res
 where
     S: ResourceStorage + SearchProvider,
 {
+    create_as(
+        backend,
+        tenant,
+        resource_type,
+        resource,
+        FhirVersion::default(),
+    )
+    .await;
+}
+
+async fn create_as<S>(
+    backend: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    resource: Value,
+    version: FhirVersion,
+) where
+    S: ResourceStorage + SearchProvider,
+{
     let id = resource["id"].as_str().unwrap_or_default().to_string();
     backend
-        .seed_create(tenant, resource_type, resource, FhirVersion::default())
+        .seed_create(tenant, resource_type, resource, version)
         .await
         .unwrap_or_else(|e| panic!("create {resource_type}/{id} failed: {e}"));
 }
@@ -256,4 +275,193 @@ where
             "Observation?date={value} (effectiveInstant vs effectiveDateTime)"
         );
     }
+}
+
+/// One resource of `resource_type` with `field` set to `AT` (written to the
+/// second), stored as `version`.
+async fn seed_one<S>(
+    backend: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    field: &str,
+    version: FhirVersion,
+) where
+    S: ResourceStorage + SearchProvider,
+{
+    let mut resource = json!({"id": id, "status": "final", "code": {"text": "instant suite"}});
+    if resource_type == "ImagingSelection" {
+        resource["status"] = json!("available");
+    }
+    resource[field] = json!(AT);
+    create_as(backend, tenant, resource_type, resource, version).await;
+}
+
+/// Asserts the two searches #2962 reported against one resource whose
+/// `param` target is written to the second: as a point, `eq…:00.000Z` finds
+/// it and `gt…:00.500Z` does not; as a one-second range, the reverse.
+async fn assert_point_or_range<S>(
+    backend: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    param: &str,
+    id: &str,
+    point: bool,
+) where
+    S: ResourceStorage + SearchProvider,
+{
+    let found = ids(&[id]);
+    let (eq, gt) = if point {
+        (found.clone(), BTreeSet::new())
+    } else {
+        (BTreeSet::new(), found.clone())
+    };
+    let what = if point {
+        "a point"
+    } else {
+        "a one-second range"
+    };
+    for (value, expected) in [
+        ("eq2020-01-01T10:00:00.000Z", eq),
+        ("gt2020-01-01T10:00:00.500Z", gt),
+        // Either way the whole second contains it: the positive control.
+        ("eq2020-01-01T10:00:00Z", found.clone()),
+    ] {
+        assert_eq!(
+            matched(
+                backend,
+                tenant,
+                &query(resource_type, param, SearchParamType::Date, value)
+            )
+            .await,
+            expected,
+            "{resource_type}?{param}={value}: the target must be {what} for the backend's FHIR version"
+        );
+    }
+}
+
+/// The backend's configured FHIR version decides which elements are
+/// `instant`s (#2962), not the first version the build enables. The backend
+/// must be configured for R6, with R6's search parameters loaded.
+///
+/// R6 makes `DiagnosticReport.issued` a `dateTime`, so it keeps its
+/// one-second range: `issued=eq…:00.000Z` does not find a report written
+/// `…:00Z`, and `gt…:00.500Z` does. `Observation.effectiveInstant` is still an
+/// `instant` in R6, the control that the R6 backend applies the point rule.
+/// A backend that built its extractor for another version (R4, the first
+/// enabled in an all-versions build) would index `issued` as a point.
+#[cfg(feature = "R6")]
+pub async fn r6_backend_types_by_r6<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let version = FhirVersion::R6;
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    seed_one(
+        backend,
+        &tenant,
+        "DiagnosticReport",
+        DR_INSTANT_S,
+        "issued",
+        version,
+    )
+    .await;
+    seed_one(
+        backend,
+        &tenant,
+        "Observation",
+        OBS_INSTANT_S,
+        "effectiveInstant",
+        version,
+    )
+    .await;
+    wait_for(backend, &tenant, "DiagnosticReport", 1).await;
+    wait_for(backend, &tenant, "Observation", 1).await;
+    assert_point_or_range(
+        backend,
+        &tenant,
+        "DiagnosticReport",
+        "issued",
+        DR_INSTANT_S,
+        false,
+    )
+    .await;
+    assert_point_or_range(backend, &tenant, "Observation", "date", OBS_INSTANT_S, true).await;
+}
+
+/// The R4 control for [`r6_backend_types_by_r6`], in the same style: on a
+/// backend configured for R4, `DiagnosticReport.issued` is an `instant` and a
+/// point.
+#[cfg(feature = "R4")]
+pub async fn r4_backend_types_by_r4<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let version = FhirVersion::R4;
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    seed_one(
+        backend,
+        &tenant,
+        "DiagnosticReport",
+        DR_INSTANT_S,
+        "issued",
+        version,
+    )
+    .await;
+    wait_for(backend, &tenant, "DiagnosticReport", 1).await;
+    assert_point_or_range(
+        backend,
+        &tenant,
+        "DiagnosticReport",
+        "issued",
+        DR_INSTANT_S,
+        true,
+    )
+    .await;
+}
+
+/// R5 adds `ImagingSelection.issued`, an `instant` (R4 has no
+/// `ImagingSelection`). On a backend configured for R5 it is a point; an
+/// extractor built for R4 would not find the element and keep the range.
+#[cfg(feature = "R5")]
+pub async fn r5_backend_types_by_r5<S>(backend: &S, tenant_base: &str)
+where
+    S: ResourceStorage + SearchProvider,
+{
+    let version = FhirVersion::R5;
+    let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
+    seed_one(
+        backend,
+        &tenant,
+        "ImagingSelection",
+        "is-instant-s",
+        "issued",
+        version,
+    )
+    .await;
+    let control = query(
+        "ImagingSelection",
+        "status",
+        SearchParamType::Token,
+        "available",
+    );
+    for attempt in 0..60 {
+        if matched(backend, &tenant, &control).await.len() == 1 {
+            break;
+        }
+        assert!(
+            attempt < 59,
+            "the seeded ImagingSelection never became searchable by status"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_point_or_range(
+        backend,
+        &tenant,
+        "ImagingSelection",
+        "issued",
+        "is-instant-s",
+        true,
+    )
+    .await;
 }
