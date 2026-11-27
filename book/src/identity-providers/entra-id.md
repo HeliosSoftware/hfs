@@ -71,6 +71,10 @@ register a tenant, and `d` to deregister or purge one. The read-only role
 can therefore **look but not change** tenants; the full-access role can do
 both. `user/` and `patient/` scopes are refused there with `403`.
 
+A token that carries a tenant claim (`HFS_AUTH_TENANT_CLAIM`, default
+`tenant_id`) is also refused there with `403`, whatever its scopes: it is
+bound to one tenant. Administer tenants with a token that has no tenant claim.
+
 > **Use App Roles, not delegated scopes.** Entra ID does not allow `/` in the
 > name of a scope under *Expose an API*, so a SMART scope cannot be a
 > delegated permission. Grant SMART scopes to people as App Roles too.

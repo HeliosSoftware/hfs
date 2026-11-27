@@ -387,14 +387,24 @@ fn patient_compartment_path_check(
         [_type, second] if is_control(second) => refuse(routed_path),
         // Instance level: the handler checks the stored payload.
         [_type, _id] => Ok(()),
-        [_type, _id, "_history"] => Ok(()),
+        // Instance history is read through a per-version filter; the
+        // trial-use history deletes would erase versions from before the
+        // resource joined the compartment, which the same token may not read,
+        // so a patient/ scope keeps the reads only.
+        [_type, _id, "_history"] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a resource's history"),
+        },
         ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
         [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
         [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
         // Compartment search: the launch patient's own compartment only.
         ["Patient", id, _target] if *id == patient_id => Ok(()),
         [_compartment, _id, _target] => refuse("a search in another compartment"),
-        [_type, _id, "_history", _vid] => Ok(()),
+        [_type, _id, "_history", _vid] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a version of a resource"),
+        },
         _ => refuse(routed_path),
     }
 }
@@ -409,6 +419,11 @@ fn patient_compartment_path_check(
 /// bit the request's method implies (see [`admin_tier_permission`]): `system/*.r`
 /// to look, `system/*.c` to register a tenant, `system/*.d` to deregister or
 /// purge one. Anything less is rejected `403`.
+///
+/// A token that carries a tenant claim is rejected `403` on every method,
+/// whatever its scopes: the claim confines it to one tenant on the FHIR routes,
+/// so it is not a cross-tenant administrator (#2673). Only a token without a
+/// tenant claim reaches the scope check.
 ///
 /// Consistent with [`authz_middleware`], if no [`Principal`] is present (auth
 /// disabled server-wide, or an exempt path) the request passes through, so this
@@ -427,6 +442,35 @@ pub async fn admin_authz_middleware(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
     let (permission, letter) = admin_tier_permission(&method);
+
+    // A token bound to a tenant by its claim is not a cross-tenant
+    // administrator, whatever scopes it holds: the FHIR routes confine it to
+    // its own tenant, and this tier lists, registers and purges every tenant.
+    // The test is the tenant extractor's: only an empty claim counts as no
+    // claim. A blank or unparseable one is refused on the FHIR routes, so it
+    // is refused here too rather than read as a system token.
+    if let Some(tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
+        warn!(
+            sub = %principal.subject(),
+            tenant = %tenant,
+            method = %method,
+            path = %path,
+            "Console admin authorization denied: token is bound to a tenant"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!(
+                "Forbidden: console admin access to {method} {path} refused for a token bound to tenant {tenant}"
+            ))
+            .principal(&principal)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(
+            "A token bound to a tenant cannot use the cross-tenant admin API; use a \
+             system-level token that carries no tenant claim",
+        );
+    }
 
     if principal.scopes.has_system_scope(permission) {
         debug!(
@@ -780,8 +824,6 @@ mod tests {
             ("/Observation/o1", "DELETE"),
             ("/Observation/o1/_history", "GET"),
             ("/Observation/o1/_history/3", "GET"),
-            ("/Observation/o1/_history", "DELETE"),
-            ("/Observation/o1/_history/3", "DELETE"),
             ("/Patient/p1/Observation", "GET"),
             ("/Patient/p1/*", "GET"),
             ("/Patient/p1/$everything", "GET"),
@@ -804,6 +846,9 @@ mod tests {
             // Type history.
             ("/Observation/_history", "GET"),
             ("/Patient/_history", "GET"),
+            // History deletes: versions the token may not read.
+            ("/Observation/o1/_history", "DELETE"),
+            ("/Observation/o1/_history/3", "DELETE"),
             // Operations other than the two that narrow themselves.
             ("/Observation/$validate", "POST"),
             ("/ValueSet/$expand", "GET"),

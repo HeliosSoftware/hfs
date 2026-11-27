@@ -22,17 +22,35 @@ use crate::state::AppState;
 /// Returns a `SubscriptionStatus` (R4B/R5/R6) or `Parameters` (R4 backport)
 /// resource reflecting the subscription's current runtime state.
 ///
+/// The three Subscription operations are mounted under a wildcard
+/// `/{resource_type}/{id}/$op` route, and the authorization middleware judges
+/// the scope on that first segment. They exist on `Subscription` only: any
+/// other type segment is answered as an unknown path before the engine is
+/// consulted, so a grant on another type never reaches a Subscription's
+/// runtime state or binding tokens.
+fn require_subscription_route(resource_type: &str, id: &str) -> RestResult<()> {
+    if resource_type == "Subscription" {
+        Ok(())
+    } else {
+        Err(RestError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        })
+    }
+}
+
 /// # HTTP Request
 ///
 /// `GET [base]/Subscription/{id}/$status`
 pub async fn subscription_status_handler<S>(
     State(state): State<AppState<S>>,
-    Path((_resource_type, id)): Path<(String, String)>,
+    Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
+    require_subscription_route(&resource_type, &id)?;
     let engine = state
         .subscription_engine()
         .ok_or(RestError::NotImplemented {
@@ -199,13 +217,14 @@ fn parse_event_number(param: &str, raw: Option<&str>) -> RestResult<Option<u64>>
 /// `GET [base]/Subscription/{id}/$events?eventsSinceNumber=1&eventsUntilNumber=3`
 pub async fn subscription_events_handler<S>(
     State(state): State<AppState<S>>,
-    Path((_resource_type, id)): Path<(String, String)>,
+    Path((resource_type, id)): Path<(String, String)>,
     Query(params): Query<EventsParams>,
     tenant: TenantExtractor,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
+    require_subscription_route(&resource_type, &id)?;
     use helios_subscriptions::manager::{EventQuery, RangeError};
 
     let engine = state
@@ -270,12 +289,13 @@ where
 /// `GET [base]/Subscription/{id}/$get-ws-binding-token`
 pub async fn get_ws_binding_token_handler<S>(
     State(state): State<AppState<S>>,
-    Path((_resource_type, id)): Path<(String, String)>,
+    Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
+    require_subscription_route(&resource_type, &id)?;
     let engine = state
         .subscription_engine()
         .ok_or(RestError::NotImplemented {
