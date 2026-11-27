@@ -229,6 +229,38 @@ async fn sql_export_records_a_grant_and_a_refusal() {
     assert_eq!(refused["outcome"], "8", "{refused}");
 }
 
+/// A refused caller cannot write an event the size of its request: the
+/// subject's name and the type it reads come from the body, and are capped.
+#[tokio::test]
+async fn caller_supplied_names_are_capped_in_the_event() {
+    let (server, sink, _exports) = server();
+    let long_url = format!("http://example.org/{}", "a".repeat(200_000));
+    let long_type = format!("Zz{}", "b".repeat(200_000));
+    let mut view = observation_view();
+    view["url"] = json!(long_url);
+    view["resource"] = json!(long_type);
+
+    let status = server
+        .post("/$sql-export")
+        .add_header(AUTHORIZATION, bearer("openid"))
+        .add_header(PREFER, HeaderValue::from_static("respond-async"))
+        .json(&view)
+        .await
+        .status_code();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let events = sink.for_operation("sql-export");
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let event = &events[0];
+    assert_eq!(event["outcome"], "8");
+    let subject = details(event, "subject").remove(0);
+    assert!(long_url.starts_with(subject.trim_end_matches('…')));
+    assert_eq!(subject.chars().count(), 257);
+    assert_eq!(details(event, "resource-type")[0].chars().count(), 257);
+    let size = serde_json::to_string(event).unwrap().len();
+    assert!(size < 4096, "event is {size} bytes");
+}
+
 /// A Library's event names every type its dependency graph reads, once.
 #[tokio::test]
 async fn a_library_run_names_the_types_its_views_read() {

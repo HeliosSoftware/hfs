@@ -39,7 +39,7 @@ to the batch handler.
 
 | `audit-operation` | Emitted at | Outcome codes | Other details |
 |---|---|---|---|
-| `sql-run`, `sql-export` | the handler's scope check, on a grant **and** on a refusal | `0` / `8` | `resource-type` (one per type the subject reads), `subject` (its canonical, else `type/id`); `outcomeDesc` is `Granted: $sql-run reading Observation` or `Forbidden: …` |
+| `sql-run`, `sql-export` | the handler's scope check, on a grant **and** on a refusal | `0` / `8` | `resource-type` (one per type the subject reads), `subject` (its canonical, else `type/id`), each cut to 256 characters since both come from the request body; `outcomeDesc` is `Granted: $sql-run reading Observation` or `Forbidden: …` |
 
 Note the phase detail is keyed `bulk-export-operation` for export but `phase`
 for reindex — the former predates the shared helper and is kept for consumers

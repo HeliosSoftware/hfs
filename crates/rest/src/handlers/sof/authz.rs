@@ -9,6 +9,8 @@
 //! middleware judges `GET /{type}`. A grant that rests on a `patient/` scope
 //! is refused: a view cannot be confined to the launch patient's compartment.
 
+use std::borrow::Cow;
+
 use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_persistence::tenant::TenantContext;
@@ -58,6 +60,10 @@ where
     let Some(sink) = state.audit_sink() else {
         return decision;
     };
+    // The types and the subject's name come from the request body, an inline
+    // subject's included, and are recorded for a refused caller too. So each is
+    // capped: one request cannot write an event the size of its body.
+    let types: Vec<Cow<'_, str>> = types.into_iter().map(audit_label).collect();
     let reads = if types.is_empty() {
         "no resource type".to_string()
     } else {
@@ -74,16 +80,29 @@ where
         .tenant(tenant.tenant_id().as_str())
         .detail("audit-operation", operation.trim_start_matches('$'));
     for resource_type in &types {
-        event = event.detail("resource-type", *resource_type);
+        event = event.detail("resource-type", resource_type.as_ref());
     }
     if let Some(label) = subject_label(subject) {
-        event = event.detail("subject", label);
+        event = event.detail("subject", audit_label(&label));
     }
     if let Some(principal) = principal {
         event = event.principal(principal);
     }
     sink.record(event.build()).await;
     decision
+}
+
+/// The most characters of a caller-supplied value an audit event records.
+/// Longer than any resource type name and than a canonical in practical use.
+const MAX_AUDIT_LABEL_CHARS: usize = 256;
+
+/// `value` as an audit event records it: whole when it fits in
+/// [`MAX_AUDIT_LABEL_CHARS`], else its first characters and an ellipsis.
+fn audit_label(value: &str) -> Cow<'_, str> {
+    match value.char_indices().nth(MAX_AUDIT_LABEL_CHARS) {
+        None => Cow::Borrowed(value),
+        Some((end, _)) => Cow::Owned(format!("{}…", &value[..end])),
+    }
 }
 
 /// How an audit event names a subject: its canonical `url`, else
@@ -206,6 +225,15 @@ mod tests {
             subject_label(&json!({"resourceType": "ViewDefinition"})),
             None
         );
+    }
+
+    #[test]
+    fn an_audit_label_is_cut_at_the_cap_on_a_character_boundary() {
+        assert_eq!(audit_label("Observation"), "Observation");
+        let at_cap = "é".repeat(MAX_AUDIT_LABEL_CHARS);
+        assert_eq!(audit_label(&at_cap), at_cap);
+        let over = format!("{at_cap}é");
+        assert_eq!(audit_label(&over), format!("{at_cap}…"));
     }
 
     #[test]
