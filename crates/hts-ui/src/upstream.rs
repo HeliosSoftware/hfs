@@ -46,6 +46,9 @@ use std::time::Duration;
 pub struct UpstreamClient {
     client: reqwest::Client,
     base_url: String,
+    /// Largest `X-TOO-COSTLY-THRESHOLD` the expand workbench attaches. See
+    /// [`Self::with_expansion_size_ceiling`].
+    expansion_size_ceiling: u64,
 }
 
 impl UpstreamClient {
@@ -86,12 +89,32 @@ impl UpstreamClient {
             .map_err(|source| UpstreamError::ClientBuild {
                 message: source.to_string(),
             })?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            expansion_size_ceiling: HTS_UI_MAX_EXPANSION_SIZE_HINT,
+        })
     }
 
     /// The base URL the client is pointed at, without a trailing slash.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Set the largest `X-TOO-COSTLY-THRESHOLD` value the expand workbench
+    /// attaches (default [`HTS_UI_MAX_EXPANSION_SIZE_HINT`]). The `hts`
+    /// binary passes the ceiling its own server enforces
+    /// (`HTS_MAX_EXPANSION_SIZE_CEILING`), so the workbench never offers a
+    /// limit the server would clamp.
+    pub fn with_expansion_size_ceiling(mut self, ceiling: u64) -> Self {
+        self.expansion_size_ceiling = ceiling;
+        self
+    }
+
+    /// The largest `X-TOO-COSTLY-THRESHOLD` value the expand workbench
+    /// attaches.
+    pub fn expansion_size_ceiling(&self) -> u64 {
+        self.expansion_size_ceiling
     }
 
     /// `GET /health` — the liveness probe. Returns the parsed JSON body.
@@ -1652,12 +1675,13 @@ fn parse_lookup_property(param: &Value) -> Option<LookupProperty> {
 // body for `$expand` is kept on the result so the workbench's "Raw response"
 // panel can echo it verbatim (§7.4 wireframe).
 
-/// Build-time ceiling for the `X-TOO-COSTLY-THRESHOLD` request header the
+/// Default ceiling for the `X-TOO-COSTLY-THRESHOLD` request header the
 /// VS expand workbench attaches (design doc §7.6 threshold clause,
-/// §7.4.1 F1/F4). HTS does not currently publish `HTS_MAX_EXPANSION_SIZE`
-/// on `/metadata`, `/health`, or `/metrics`, so the UI mirrors the operator
-/// configuration as a compile-time constant. Values above this ceiling are
-/// dropped from the outgoing request and rendered as a warning (§7.4).
+/// §7.4.1 F1/F4), matching the default of HTS's
+/// `HTS_MAX_EXPANSION_SIZE_CEILING`. The `hts` binary replaces it with its
+/// configured ceiling through [`UpstreamClient::with_expansion_size_ceiling`].
+/// Values above the ceiling are dropped from the outgoing request and
+/// rendered as a warning (§7.4).
 pub const HTS_UI_MAX_EXPANSION_SIZE_HINT: u64 = 100_000;
 
 /// Filters accepted by the VS browser page and its rows fragment.
@@ -1895,8 +1919,8 @@ pub struct ExpandParams {
     /// `hierarchical` (§7.4.1 F7).
     pub exclude_nested: Option<bool>,
     /// Numeric ceiling attached as `X-TOO-COSTLY-THRESHOLD` when
-    /// `Some(n) && n <= HTS_UI_MAX_EXPANSION_SIZE_HINT`. Values above the
-    /// build-time ceiling are surfaced as a warning by the caller and
+    /// `Some(n) && n <= UpstreamClient::expansion_size_ceiling()`. Values
+    /// above the ceiling are surfaced as a warning by the caller and
     /// dropped before sending (§7.4 / §7.4.1 F1 / F4).
     pub threshold: Option<u64>,
 }
@@ -1960,7 +1984,7 @@ pub struct ExpansionResult {
     /// per §7.4.1 F1/F4).
     pub requested_threshold: Option<u64>,
     /// Set to `Some(requested)` when the requested threshold was above
-    /// [`HTS_UI_MAX_EXPANSION_SIZE_HINT`] and therefore not attached as a
+    /// [`UpstreamClient::expansion_size_ceiling`] and therefore not attached as a
     /// header on the outgoing request. The template renders a warning
     /// with the ceiling exposed.
     pub ceiling_warning: Option<u64>,
@@ -2131,7 +2155,7 @@ impl UpstreamClient {
     ///
     /// Header contract: attaches `X-TOO-COSTLY-THRESHOLD: {n}` iff
     /// `params.threshold` is `Some(n)` and `n <=
-    /// HTS_UI_MAX_EXPANSION_SIZE_HINT` (§7.4 threshold clause). Above
+    /// self.expansion_size_ceiling()` (§7.4 threshold clause). Above
     /// the ceiling the header is dropped and `ceiling_warning` on the
     /// returned [`ExpansionResult`] carries the requested value so the
     /// template can render its warning + ceiling tooltip.
@@ -2223,7 +2247,7 @@ impl UpstreamClient {
 
         // Ceiling test for the threshold header (§7.4 / §7.4.1 F1/F4).
         let (attach_threshold, ceiling_warning) = match params.threshold {
-            Some(n) if n <= HTS_UI_MAX_EXPANSION_SIZE_HINT => (Some(n), None),
+            Some(n) if n <= self.expansion_size_ceiling => (Some(n), None),
             Some(n) => (None, Some(n)),
             None => (None, None),
         };
@@ -2361,7 +2385,7 @@ impl UpstreamClient {
         }
 
         let (attach_threshold, ceiling_warning) = match params.threshold {
-            Some(n) if n <= HTS_UI_MAX_EXPANSION_SIZE_HINT => (Some(n), None),
+            Some(n) if n <= self.expansion_size_ceiling => (Some(n), None),
             Some(n) => (None, Some(n)),
             None => (None, None),
         };

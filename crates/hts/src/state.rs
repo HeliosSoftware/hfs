@@ -8,7 +8,9 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -50,6 +52,126 @@ pub struct ExpandCacheKey {
     pub extra_params: String,
 }
 
+/// Bytes a cache key or value is charged against its cache's budget.
+pub trait CacheCost {
+    fn cache_cost(&self) -> usize;
+}
+
+impl CacheCost for String {
+    fn cache_cost(&self) -> usize {
+        self.len()
+    }
+}
+
+impl CacheCost for Bytes {
+    fn cache_cost(&self) -> usize {
+        self.len()
+    }
+}
+
+impl CacheCost for ExpandCacheKey {
+    fn cache_cost(&self) -> usize {
+        self.selected_value_set_id.as_ref().map_or(0, String::len)
+            + self.url_or_body.len()
+            + self.filter.len()
+            + self.extra_params.len()
+    }
+}
+
+impl CacheCost for Arc<serde_json::Value> {
+    fn cache_cost(&self) -> usize {
+        json_cost(self)
+    }
+}
+
+fn json_cost(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => 8 + s.len(),
+        serde_json::Value::Array(items) => 16 + items.iter().map(json_cost).sum::<usize>(),
+        serde_json::Value::Object(map) => {
+            16 + map
+                .iter()
+                .map(|(k, v)| k.len() + json_cost(v))
+                .sum::<usize>()
+        }
+        _ => 8,
+    }
+}
+
+/// Largest key a handler-tier cache admits.
+pub const CACHE_MAX_KEY_BYTES: usize = 16 * 1024;
+/// Largest value a handler-tier cache admits.
+pub const CACHE_MAX_VALUE_BYTES: usize = 32 * 1024 * 1024;
+
+/// A map that admits an entry only while the bytes it retains stay within a
+/// budget, on top of an entry-count limit. Keys and values are charged by
+/// [`CacheCost`]; a key above [`CACHE_MAX_KEY_BYTES`], a value above
+/// [`CACHE_MAX_VALUE_BYTES`], or an entry that would overrun the budget is
+/// not stored. Entries leave only through [`BoundedCache::clear`].
+pub struct BoundedCache<K, V> {
+    map: HashMap<K, V>,
+    bytes: usize,
+    budget: usize,
+    max_entries: usize,
+}
+
+impl<K: Eq + Hash + CacheCost, V: CacheCost> BoundedCache<K, V> {
+    pub fn new(max_entries: usize, budget: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            bytes: 0,
+            budget,
+            max_entries,
+        }
+    }
+
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.get(key)
+    }
+
+    /// Store `value` under `key`; `false` when the entry was not admitted. A
+    /// key that is already present keeps its current value.
+    pub fn insert(&mut self, key: K, value: V) -> bool {
+        let key_bytes = key.cache_cost();
+        let value_bytes = value.cache_cost();
+        if key_bytes > CACHE_MAX_KEY_BYTES || value_bytes > CACHE_MAX_VALUE_BYTES {
+            return false;
+        }
+        if self.map.contains_key(&key) {
+            return true;
+        }
+        let cost = key_bytes + value_bytes;
+        if self.map.len() >= self.max_entries || self.bytes + cost > self.budget {
+            return false;
+        }
+        self.map.insert(key, value);
+        self.bytes += cost;
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Bytes currently charged to the budget.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 /// Thread-safe in-process cache for `$expand` responses.
 ///
 /// Keyed on [`ExpandCacheKey`]; values are pre-serialized FHIR JSON bytes
@@ -57,9 +179,11 @@ pub struct ExpandCacheKey {
 /// in O(1) and sent as an HTTP body without an extra allocation.
 /// Bounded to [`EXPAND_CACHE_MAX`] entries; once full, new entries are
 /// silently dropped (the benchmark never exceeds ~50 unique keys).
-pub type ExpandCache = Arc<RwLock<HashMap<ExpandCacheKey, Bytes>>>;
+pub type ExpandCache = Arc<RwLock<BoundedCache<ExpandCacheKey, Bytes>>>;
 
 pub const EXPAND_CACHE_MAX: usize = 2048;
+/// Bytes the inner `$expand` cache may retain.
+pub const EXPAND_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of ValueSet URLs to remember as definitively absent.
 pub const NOT_FOUND_CACHE_MAX: usize = 10_000;
 
@@ -88,11 +212,13 @@ pub type NotFoundCache = Arc<RwLock<HashSet<String>>>;
 /// entries are dropped silently (the benchmark never exceeds a few hundred
 /// distinct keys per cache).  Cleared alongside [`ExpandCache`] on bundle
 /// import / CRUD writes via [`AppState::clear_expand_cache`].
-pub type ValidateCodeHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::Value>>>>;
+pub type ValidateCodeHandlerCache = Arc<RwLock<BoundedCache<String, Arc<serde_json::Value>>>>;
 
 /// Maximum number of cached `$validate-code` handler responses (per direction —
 /// CS path and VS path each have their own map).
 pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 16384;
+/// Bytes each `$validate-code` handler cache may retain.
+pub const VALIDATE_CODE_HANDLER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Thread-safe per-AppState cache for fully-assembled `$expand` JSON bytes,
 /// keyed at the *handler* layer above every `process_expand` pre-flight step
@@ -108,10 +234,12 @@ pub const VALIDATE_CODE_HANDLER_CACHE_MAX: usize = 16384;
 /// Bounded to [`EXPAND_HANDLER_CACHE_MAX`] entries — once full new entries are
 /// dropped silently.  Cleared alongside [`ExpandCache`] on bundle import /
 /// CRUD writes via [`AppState::clear_expand_cache`].
-pub type ExpandHandlerCache = Arc<RwLock<HashMap<String, Bytes>>>;
+pub type ExpandHandlerCache = Arc<RwLock<BoundedCache<String, Bytes>>>;
 
 /// Maximum number of cached `$expand` handler responses.
 pub const EXPAND_HANDLER_CACHE_MAX: usize = 16384;
+/// Bytes each `$expand` handler cache may retain.
+pub const EXPAND_HANDLER_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Thread-safe per-AppState cache for fully-assembled `$lookup` JSON values,
 /// keyed at the *handler* layer above every `process_lookup` pre-flight step
@@ -128,10 +256,12 @@ pub const EXPAND_HANDLER_CACHE_MAX: usize = 16384;
 /// Bounded to [`LOOKUP_HANDLER_CACHE_MAX`] entries — once full new entries
 /// drop silently.  Cleared on bundle import / CRUD writes via
 /// [`AppState::clear_expand_cache`].
-pub type LookupHandlerCache = Arc<RwLock<HashMap<String, Arc<serde_json::Value>>>>;
+pub type LookupHandlerCache = Arc<RwLock<BoundedCache<String, Arc<serde_json::Value>>>>;
 
 /// Maximum number of cached `$lookup` handler responses.
 pub const LOOKUP_HANDLER_CACHE_MAX: usize = 16384;
+/// Bytes the `$lookup` handler cache may retain.
+pub const LOOKUP_HANDLER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shared application state injected into every Axum handler.
 ///
@@ -161,6 +291,13 @@ pub struct AppState<B: TerminologyBackend> {
     /// Requests that would exceed this limit receive `HtsError::TooCostly`.
     /// Defaults to `3_500`; override with `HTS_MAX_EXPANSION_SIZE`.
     pub max_expansion_size: u32,
+
+    /// Largest value the `X-TOO-COSTLY-THRESHOLD` header may set
+    /// [`Self::max_expansion_size`] to for one request. Defaults to
+    /// `100_000`; override with `HTS_MAX_EXPANSION_SIZE_CEILING`. Read it
+    /// through [`Self::expansion_size_ceiling`], which never goes below
+    /// [`Self::max_expansion_size`].
+    pub max_expansion_size_ceiling: u32,
 
     /// In-process LRU-style cache for `$expand` responses.
     ///
@@ -257,13 +394,32 @@ impl<B: TerminologyBackend> AppState<B> {
             #[cfg(feature = "postgres")]
             resource_store_pg: None,
             max_expansion_size: 10_000,
-            expand_cache: Arc::new(RwLock::new(HashMap::new())),
+            max_expansion_size_ceiling: 100_000,
+            expand_cache: Arc::new(RwLock::new(BoundedCache::new(
+                EXPAND_CACHE_MAX,
+                EXPAND_CACHE_BUDGET_BYTES,
+            ))),
             not_found_urls: Arc::new(RwLock::new(HashSet::new())),
-            cs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
-            vs_validate_code_handler_cache: Arc::new(RwLock::new(HashMap::new())),
-            expand_handler_cache: Arc::new(RwLock::new(HashMap::new())),
-            inline_compose_handler_cache: Arc::new(RwLock::new(HashMap::new())),
-            lookup_handler_cache: Arc::new(RwLock::new(HashMap::new())),
+            cs_validate_code_handler_cache: Arc::new(RwLock::new(BoundedCache::new(
+                VALIDATE_CODE_HANDLER_CACHE_MAX,
+                VALIDATE_CODE_HANDLER_CACHE_BUDGET_BYTES,
+            ))),
+            vs_validate_code_handler_cache: Arc::new(RwLock::new(BoundedCache::new(
+                VALIDATE_CODE_HANDLER_CACHE_MAX,
+                VALIDATE_CODE_HANDLER_CACHE_BUDGET_BYTES,
+            ))),
+            expand_handler_cache: Arc::new(RwLock::new(BoundedCache::new(
+                EXPAND_HANDLER_CACHE_MAX,
+                EXPAND_HANDLER_CACHE_BUDGET_BYTES,
+            ))),
+            inline_compose_handler_cache: Arc::new(RwLock::new(BoundedCache::new(
+                EXPAND_HANDLER_CACHE_MAX,
+                EXPAND_HANDLER_CACHE_BUDGET_BYTES,
+            ))),
+            lookup_handler_cache: Arc::new(RwLock::new(BoundedCache::new(
+                LOOKUP_HANDLER_CACHE_MAX,
+                LOOKUP_HANDLER_CACHE_BUDGET_BYTES,
+            ))),
             lookup_not_found_cache: Arc::new(RwLock::new(HashSet::new())),
             closure_rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             import_finalize_wait: DEFAULT_IMPORT_FINALIZE_WAIT,
@@ -314,6 +470,22 @@ impl<B: TerminologyBackend> AppState<B> {
     pub fn with_max_expansion_size(mut self, limit: u32) -> Self {
         self.max_expansion_size = limit;
         self
+    }
+
+    /// Override the largest per-request expansion size the
+    /// `X-TOO-COSTLY-THRESHOLD` header may ask for (default: 100 000).
+    pub fn with_max_expansion_size_ceiling(mut self, ceiling: u32) -> Self {
+        self.max_expansion_size_ceiling = ceiling;
+        self
+    }
+
+    /// The largest limit the `X-TOO-COSTLY-THRESHOLD` header may set for one
+    /// request: [`Self::max_expansion_size_ceiling`], but never below
+    /// [`Self::max_expansion_size`]. A ceiling configured under the default
+    /// limit would otherwise turn a header asking for more codes into one
+    /// that lowers the limit.
+    pub fn expansion_size_ceiling(&self) -> u32 {
+        self.max_expansion_size_ceiling.max(self.max_expansion_size)
     }
 
     /// Override [`Self::import_finalize_wait`].
@@ -367,5 +539,67 @@ impl<B: TerminologyBackend> AppState<B> {
             return Some(Arc::clone(s) as Arc<dyn ResourceStorage>);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod bounded_cache_tests {
+    use super::*;
+
+    fn bytes(n: usize) -> Bytes {
+        Bytes::from(vec![b'x'; n])
+    }
+
+    #[test]
+    fn admits_within_the_budget_and_refuses_beyond_it() {
+        let mut cache: BoundedCache<String, Bytes> = BoundedCache::new(100, 1_000);
+        assert!(cache.insert("a".into(), bytes(400)));
+        assert!(cache.insert("b".into(), bytes(400)));
+        assert_eq!(cache.bytes(), 802);
+        assert!(!cache.insert("c".into(), bytes(400)), "over budget");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("c").is_none());
+        assert!(
+            cache.insert("d".into(), bytes(100)),
+            "a smaller entry still fits"
+        );
+    }
+
+    #[test]
+    fn an_existing_key_keeps_its_value_and_is_not_charged_twice() {
+        let mut cache: BoundedCache<String, Bytes> = BoundedCache::new(100, 1_000);
+        assert!(cache.insert("a".into(), bytes(10)));
+        assert!(cache.insert("a".into(), bytes(900)));
+        assert_eq!(cache.get("a").map(Bytes::len), Some(10));
+        assert_eq!(cache.bytes(), 11);
+    }
+
+    #[test]
+    fn oversized_keys_and_values_are_never_stored() {
+        let mut cache: BoundedCache<String, Bytes> = BoundedCache::new(100, usize::MAX);
+        let long_key = "k".repeat(CACHE_MAX_KEY_BYTES + 1);
+        assert!(!cache.insert(long_key, bytes(1)));
+        assert!(!cache.insert("v".into(), bytes(CACHE_MAX_VALUE_BYTES + 1)));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn the_entry_limit_still_applies_and_clear_resets_the_charge() {
+        let mut cache: BoundedCache<String, Bytes> = BoundedCache::new(2, usize::MAX);
+        assert!(cache.insert("a".into(), bytes(1)));
+        assert!(cache.insert("b".into(), bytes(1)));
+        assert!(!cache.insert("c".into(), bytes(1)));
+        cache.clear();
+        assert_eq!((cache.len(), cache.bytes()), (0, 0));
+        assert!(cache.insert("c".into(), bytes(1)));
+    }
+
+    #[test]
+    fn json_values_are_charged_by_their_content() {
+        let small: Arc<serde_json::Value> = Arc::new(serde_json::json!({"a": 1}));
+        let large: Arc<serde_json::Value> =
+            Arc::new(serde_json::json!({"a": "x".repeat(10_000), "b": [1, 2, 3]}));
+        assert!(small.cache_cost() < 64);
+        assert!(large.cache_cost() > 10_000);
     }
 }

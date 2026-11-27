@@ -47,8 +47,8 @@ use serde_json::{Value, json};
 
 use crate::error::HtsError;
 use crate::state::{
-    AppState, EXPAND_CACHE_MAX, EXPAND_HANDLER_CACHE_MAX, ExpandCacheKey, ExpandHandlerCache,
-    NOT_FOUND_CACHE_MAX,
+    AppState, CACHE_MAX_KEY_BYTES, ExpandCacheKey, ExpandHandlerCache, NOT_FOUND_CACHE_MAX,
+    NotFoundCache,
 };
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
@@ -1457,14 +1457,26 @@ fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Byt
 }
 
 /// Insert a successfully-built `$expand` response into the per-AppState cache.
-/// Drops new entries silently once the cache reaches
-/// [`EXPAND_HANDLER_CACHE_MAX`].
+/// The entry is dropped silently when the cache refuses it: see
+/// [`crate::state::BoundedCache::insert`].
 fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
     if let Ok(mut guard) = cache.write() {
-        if guard.len() >= EXPAND_HANDLER_CACHE_MAX {
-            return;
-        }
         guard.insert(key, value);
+    }
+}
+
+/// Remember `url` as a ValueSet that does not exist. Bounded to
+/// [`NOT_FOUND_CACHE_MAX`] entries; a URL above [`CACHE_MAX_KEY_BYTES`] is
+/// not remembered, because the caller chooses its length up to the request
+/// body limit.
+fn not_found_url_put(cache: &NotFoundCache, url: &str) {
+    if url.len() > CACHE_MAX_KEY_BYTES {
+        return;
+    }
+    if let Ok(mut neg) = cache.write() {
+        if neg.len() < NOT_FOUND_CACHE_MAX {
+            neg.insert(url.to_string());
+        }
     }
 }
 
@@ -1964,6 +1976,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .map(|v| v as u32)
                 .unwrap_or(state.max_expansion_size),
         ),
+        persisted_expansion_limit: Some(state.max_expansion_size),
         date: find_str_param(&params, "date"),
         hierarchical,
         hierarchical_explicit,
@@ -2025,11 +2038,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
                 if msg_names_top {
-                    if let Ok(mut neg) = state.not_found_urls.write() {
-                        if neg.len() < NOT_FOUND_CACHE_MAX {
-                            neg.insert(url_str.clone());
-                        }
-                    }
+                    not_found_url_put(&state.not_found_urls, url_str);
                 }
             }
             // The IG fixtures format VS-not-found errors as
@@ -4096,11 +4105,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     );
 
     if let Ok(mut cache) = state.expand_cache.write() {
-        if cache.len() < EXPAND_CACHE_MAX {
-            // `Bytes::clone` is O(1); storing it here and returning the clone
-            // below means both the cache and the caller share the same buffer.
-            cache.insert(cache_key, bytes.clone());
-        }
+        // `Bytes::clone` is O(1); storing it here and returning the clone
+        // below means both the cache and the caller share the same buffer.
+        cache.insert(cache_key, bytes.clone());
     }
 
     // EX_PROBE: total wall time for the whole request including parse + post-
@@ -4283,7 +4290,7 @@ pub async fn expand_handler<B: TerminologyBackend>(
     let format = negotiate_format(raw.as_deref(), accept);
     let mut params = extract_parameter_array(&body)?;
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4316,7 +4323,7 @@ pub async fn get_expand_handler<B: TerminologyBackend>(
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let mut params = query_params_to_fhir_params(pairs);
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     match process_expand(&state, params).await {
         Ok(bytes) => Ok(expand_bytes_respond(bytes, format)),
         Err(e) => {
@@ -4477,17 +4484,19 @@ fn cyclic_reference_response(err: &HtsError) -> Option<Response> {
 /// `big/big-echo-no-limit` test (and the wider HL7 tx-ecosystem fixtures).
 /// The header carries a per-request maximum expansion size — when set, the
 /// server must return an `OperationOutcome` with `code=too-costly` if the
-/// expansion would exceed it, regardless of the configured global limit.
-/// We surface the value as a synthetic `__max_expansion_size__` parameter so
-/// `process_expand` can override `state.max_expansion_size` for this request.
-fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>) {
+/// expansion would exceed it. We surface the value as a synthetic
+/// `__max_expansion_size__` parameter so `process_expand` can override
+/// `state.max_expansion_size` for this request, clamped to `ceiling`
+/// ([`AppState::expansion_size_ceiling`]). The synthetic parameter is only
+/// ever set here: one arriving in the request body is dropped.
+fn inject_too_costly_threshold(headers: &HeaderMap, params: &mut Vec<Value>, ceiling: u32) {
+    params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
     if let Some(v) = headers
         .get("x-too-costly-threshold")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
     {
-        params.retain(|p| p.get("name").and_then(|x| x.as_str()) != Some("__max_expansion_size__"));
-        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v}));
+        params.push(json!({"name": "__max_expansion_size__", "valueInteger": v.min(ceiling)}));
     }
 }
 
@@ -4562,7 +4571,7 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
     let mut params = instance_expand_params(raw_params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,
@@ -4594,7 +4603,7 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
     let mut params = instance_expand_params(params, &resource)?;
     let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
-    inject_too_costly_threshold(&headers, &mut params);
+    inject_too_costly_threshold(&headers, &mut params, state.expansion_size_ceiling());
     Ok(expand_bytes_respond(
         process_expand_target(&state, params, Some(&instance)).await?,
         format,
@@ -4605,6 +4614,25 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn negative_cache_does_not_remember_an_oversized_key() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+
+        let cache: crate::state::NotFoundCache = Arc::new(RwLock::new(HashSet::new()));
+        let at_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES);
+        let over_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES + 1);
+        super::not_found_url_put(&cache, &at_limit.clone());
+        super::not_found_url_put(&cache, &over_limit.clone());
+        let guard = cache.read().unwrap();
+        assert!(
+            guard.contains(&at_limit),
+            "a key at the limit is remembered"
+        );
+        assert!(!guard.contains(&over_limit), "a key above it is not");
+        assert_eq!(guard.len(), 1);
+    }
     use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
@@ -5848,6 +5876,46 @@ mod tests {
                 .any(|s| s["url"] == "value" && s["valueCode"] == "deprecated"),
             "valueCode preserved for status property"
         );
+    }
+
+    fn threshold_param(params: &[Value]) -> Option<u64> {
+        params
+            .iter()
+            .find(|p| p["name"] == "__max_expansion_size__")
+            .and_then(|p| p["valueInteger"].as_u64())
+    }
+
+    #[test]
+    fn the_threshold_header_is_clamped_to_the_ceiling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-too-costly-threshold", "5000".parse().unwrap());
+        let mut params = vec![json!({"name": "url", "valueUri": "http://example.org/vs"})];
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(2000));
+
+        let mut params = vec![json!({"name": "url", "valueUri": "http://example.org/vs"})];
+        headers.insert("x-too-costly-threshold", "7".parse().unwrap());
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(7));
+    }
+
+    #[test]
+    fn a_body_parameter_cannot_set_the_threshold() {
+        let mut params = vec![
+            json!({"name": "url", "valueUri": "http://example.org/vs"}),
+            json!({"name": "__max_expansion_size__", "valueInteger": 4_000_000_000u64}),
+        ];
+        inject_too_costly_threshold(&HeaderMap::new(), &mut params, 2000);
+        assert_eq!(threshold_param(&params), None);
+        assert_eq!(params.len(), 1);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-too-costly-threshold", "10".parse().unwrap());
+        let mut params =
+            vec![json!({"name": "__max_expansion_size__", "valueInteger": 4_000_000_000u64})];
+        inject_too_costly_threshold(&headers, &mut params, 2000);
+        assert_eq!(threshold_param(&params), Some(10));
+        assert_eq!(params.len(), 1);
     }
 }
 // rebuild marker

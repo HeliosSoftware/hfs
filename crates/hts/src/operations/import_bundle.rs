@@ -350,13 +350,13 @@ mod tests {
 
     /// Import [`SYS`] in three `defer_closure=true` chunks the way a bulk
     /// loader does, leaving it with hierarchy edges (`A` > `A.0`, `A` > `A.1`)
-    /// but no closure rows.
+    /// and a stale closure.
     ///
-    /// Every batch deletes the system's closure rows, and a deferred batch
-    /// only rebuilds them when it found the system with *zero* concepts. So
-    /// chunk 2 builds the closure and chunk 3 deletes it again without
-    /// rebuilding — which silently answers `not-subsumed` for a genuine
-    /// parent/child pair until `finalize=true`.
+    /// A deferred batch only rebuilds the closure when it found the system
+    /// with *zero* concepts. So chunk 2 builds the closure and chunk 3 keeps
+    /// it, marked stale: the pair chunk 2 closed over still answers
+    /// `subsumes`, the pair chunk 3 added answers `not-subsumed` until
+    /// `finalize=true`.
     async fn chunked_import_without_closure(app: &axum::Router) {
         const DEFER: &str = "/import?defer_closure=true";
 
@@ -391,8 +391,13 @@ mod tests {
 
         assert_eq!(
             subsumes(app, "A", "A.0").await,
+            "subsumes",
+            "the closure chunk 2 built is kept while the load is in flight"
+        );
+        assert_eq!(
+            subsumes(app, "A", "A.1").await,
             "not-subsumed",
-            "chunked import should have left the closure empty"
+            "the kept closure does not cover the concept chunk 3 added"
         );
     }
 
@@ -437,22 +442,24 @@ mod tests {
         assert_eq!(json["closures_rebuild"], "pending");
         assert!(json.get("closures_rebuilt").is_none(), "{json}");
 
-        // Answered (and cached) while the rebuild is still blocked.
-        assert_eq!(subsumes(&app, "A", "A.0").await, "not-subsumed");
+        // Answered (and cached) while the rebuild is still blocked: the kept
+        // closure covers A.0 but not the concept the last chunk added.
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
+        assert_eq!(subsumes(&app, "A", "A.1").await, "not-subsumed");
 
         // Release the rebuild; no request is waiting on it any more. The stale
         // `not-subsumed` above sits in the backend's subsumes cache, so this
         // only flips once the background rebuild has finished and evicted it.
         drop(guard);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while subsumes(&app, "A", "A.0").await != "subsumes" {
+        while subsumes(&app, "A", "A.1").await != "subsumes" {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "background closure rebuild never finished"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
 
         // Polling with an empty Bundle: nothing left to rebuild, so a plain 200.
         let (status, json) = post(&app, "/import?finalize=true", EMPTY_BUNDLE.into()).await;
