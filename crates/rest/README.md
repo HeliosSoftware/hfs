@@ -506,7 +506,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
-| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any origin the submitter names, a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status or transport error of a failed fetch stays in the server log rather than in the submitter's error artifact. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any origin the submitter names, a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status, transport error or body detail (a manifest parse error, a failed decryption, a body above its ceiling) of a failed fetch stays in the server log rather than in the submitter's error artifact. A body that is not a JSON object with an `output` array is not a manifest and fails the manifest instead of completing it empty. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 ##### `$bulk-submit` indexing mode per storage backend
@@ -554,10 +554,12 @@ request, redirects included, to an origin that is not listed: a kick-off whose
 `manifestUrl` or `oauthMetadataUrl` is elsewhere is refused with `400`, and a
 manifest output URL elsewhere fails that file with a manifest-level error.
 Without it, HFS fetches from any origin the submitter names, as a Data
-Provider on the same host needs, but the HTTP status or transport error of a
-failed fetch then goes to the server log only: the submitter's error artifact
-says that the fetch failed, not what the address answered, so `$bulk-submit`
-cannot be used to map the network around HFS.
+Provider on the same host needs, but the detail of a failed fetch then goes to
+the server log only: the HTTP status, the transport error, a manifest that
+does not parse, a file that is not the JWE its `fileEncryptionKey` promises,
+an unsupported `Content-Encoding`, or a body above its byte ceiling. The
+submitter's error artifact says that the fetch failed, not what the address
+answered, so `$bulk-submit` cannot be used to map the network around HFS.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
