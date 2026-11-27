@@ -332,13 +332,18 @@ async fn websocket_notification_delivered_to_connected_client() {
         .await;
 
     // Simulate a client connecting via WebSocket by registering directly.
-    let (_client_id, mut rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_client_id, mut rx) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     // Fire an event that matches the topic.
     engine.on_resource_event(encounter_create_event()).await;
 
     // The client should receive a backport-style event notification bundle.
-    let notification = rx.recv().await.expect("should receive notification");
+    let notification: serde_json::Value =
+        serde_json::from_slice(&rx.recv().await.expect("should receive notification"))
+            .expect("a notification is JSON");
     assert_eq!(notification["resourceType"], "Bundle");
     assert_eq!(notification["type"], expected_bundle_type());
 
@@ -401,13 +406,23 @@ async fn websocket_notification_broadcast_to_multiple_clients() {
         .on_resource_event(ws_subscription_create_event())
         .await;
 
-    let (_id1, mut rx1) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
-    let (_id2, mut rx2) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_id1, mut rx1) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
+    let (_id2, mut rx2) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     engine.on_resource_event(encounter_create_event()).await;
 
-    let n1 = rx1.recv().await.expect("client 1 should receive");
-    let n2 = rx2.recv().await.expect("client 2 should receive");
+    let n1: serde_json::Value =
+        serde_json::from_slice(&rx1.recv().await.expect("client 1 should receive"))
+            .expect("a notification is JSON");
+    let n2: serde_json::Value =
+        serde_json::from_slice(&rx2.recv().await.expect("client 2 should receive"))
+            .expect("a notification is JSON");
     assert_eq!(n1["resourceType"], "Bundle");
     assert_eq!(n2["resourceType"], "Bundle");
     assert_eq!(n1["type"], expected_bundle_type());
@@ -430,23 +445,30 @@ async fn websocket_event_number_and_counter_are_monotonic() {
         .on_resource_event(ws_subscription_create_event())
         .await;
 
-    let (_client_id, mut rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_client_id, mut rx) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     engine
         .on_resource_event(encounter_create_event_with_id("enc-1"))
         .await;
-    let first = rx
-        .recv()
-        .await
-        .expect("first event notification should arrive");
+    let first: serde_json::Value = serde_json::from_slice(
+        &rx.recv()
+            .await
+            .expect("first event notification should arrive"),
+    )
+    .expect("a notification is JSON");
 
     engine
         .on_resource_event(encounter_create_event_with_id("enc-2"))
         .await;
-    let second = rx
-        .recv()
-        .await
-        .expect("second event notification should arrive");
+    let second: serde_json::Value = serde_json::from_slice(
+        &rx.recv()
+            .await
+            .expect("second event notification should arrive"),
+    )
+    .expect("a notification is JSON");
 
     assert_eq!(events_since_start(&first), Some(1));
     assert_eq!(events_since_start(&second), Some(2));
@@ -495,7 +517,10 @@ async fn websocket_disconnected_client_does_not_cause_error() {
         .on_resource_event(ws_subscription_create_event())
         .await;
 
-    let (_client_id, rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_client_id, rx) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     // Drop the receiver to simulate disconnect.
     drop(rx);
@@ -521,7 +546,8 @@ async fn websocket_binding_token_lifecycle() {
     // Generate a binding token.
     let (token, expiry) = engine
         .ws_token_manager()
-        .generate_token(TENANT_ID, "sub-ws-1");
+        .generate_token(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     assert!(!token.is_empty());
     assert!(expiry > Utc::now());
@@ -550,7 +576,10 @@ async fn websocket_subscription_delete_closes_clients() {
         .on_resource_event(ws_subscription_create_event())
         .await;
 
-    let (_client_id, mut rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_client_id, mut rx) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     // Delete the subscription.
     let delete_event = ResourceEvent {
@@ -588,7 +617,10 @@ async fn websocket_tenant_isolation() {
         .await;
 
     // Connect a client for TENANT_ID.
-    let (_client_id, mut rx) = engine.ws_manager().register_client(TENANT_ID, "sub-ws-1");
+    let (_client_id, mut rx) = engine
+        .ws_manager()
+        .register_client(TENANT_ID, "sub-ws-1")
+        .unwrap();
 
     // Fire an event from a different tenant.
     let other_tenant_event = ResourceEvent {
