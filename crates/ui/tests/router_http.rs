@@ -7466,6 +7466,54 @@ async fn seed_export_job(store: &InMemorySettingsStore, job_id: &str, job: Value
         .expect("seed sql export job");
 }
 
+/// A Library declaring more distinct dependencies than one render resolves
+/// looks up only the first 64; the rest are shown as not looked up rather
+/// than costing a read or search each on every render.
+#[tokio::test]
+async fn a_library_with_too_many_dependencies_looks_up_only_the_first_64() {
+    let deps: Vec<Value> = (0..70)
+        .map(|i| {
+            serde_json::json!({"type": "depends-on", "label": format!("t{i}"),
+                "resource": format!("http://example.org/ViewDefinition/vd-{i}")})
+        })
+        .collect();
+    let library = serde_json::json!({
+        "resourceType": "Library", "id": "wide", "name": "wide_view", "status": "active",
+        "url": "http://example.org/Library/wide_view",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+        "relatedArtifact": deps,
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![library],
+    );
+    let app = library_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=wide")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    assert_eq!(
+        reads_from.matches("Not looked up").count(),
+        6,
+        "{reads_from}"
+    );
+    assert_eq!(
+        reads_from.matches(">Not found<").count(),
+        64,
+        "{reads_from}"
+    );
+    assert!(reads_from.contains("Only the first 64 distinct dependencies are looked up."));
+}
+
 /// #842: the SQL View's own page resolves *Reads from* (one row to
 /// the stored ViewDefinition by canonical URL, one to nothing) and lists
 /// *Used by* — the SQL Query depending on it by `url`, and the export job

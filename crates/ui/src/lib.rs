@@ -5176,6 +5176,11 @@ async fn resolve_terminology_reference(
     Some((target, concept_map))
 }
 
+/// The most distinct `depends-on` references one render of a Library's
+/// Tables card resolves: the number `$sql-run` accepts per Library by default
+/// (4 × the default `HFS_SOF_SQLQUERY_MAX_VDS` of 16).
+const MAX_RESOLVED_DEPENDENCIES: usize = 64;
+
 /// Resolves every dependency in `deps` via [`resolve_table_reference`],
 /// memoizing by `resource` so a dependency repeated under two labels — or
 /// two dependencies naming the same canonical URL — is only ever resolved
@@ -5184,6 +5189,11 @@ async fn resolve_terminology_reference(
 /// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
 /// former; [`resolve_column_sources`] turns the pair into the table schemas
 /// the Columns card needs.
+///
+/// At most [`MAX_RESOLVED_DEPENDENCIES`] distinct references are looked up;
+/// each costs a read or search on the FHIR API and possibly the terminology
+/// server, so a Library declaring thousands would cost thousands of calls on
+/// every render of its page. The rest are shown as not looked up.
 async fn resolve_table_rows(
     state: &WebState,
     version: helios_fhir::FhirVersion,
@@ -5198,8 +5208,11 @@ async fn resolve_table_rows(
     let mut rows = Vec::with_capacity(deps.len());
     for dep in deps {
         if !cache.contains_key(&dep.resource) {
-            let resolved =
-                resolve_table_reference(state, version, tenant, &dep.resource, libraries).await;
+            let resolved = if cache.len() < MAX_RESOLVED_DEPENDENCIES {
+                resolve_table_reference(state, version, tenant, &dep.resource, libraries).await
+            } else {
+                (sql_libraries::TableTarget::Unresolved, None)
+            };
             cache.insert(dep.resource.clone(), resolved);
         }
         let (target, doc) = cache
@@ -5434,6 +5447,18 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> Ta
             link_href: None,
             link_label: None,
             detail: Some(i18n.t("lib-tables-target-not-a-table-detail")),
+            label: row.label,
+        },
+        sql_libraries::TableTarget::Unresolved => TableRowView {
+            chip: i18n.t("lib-tables-target-unresolved"),
+            chip_class: "failed",
+            link_href: None,
+            link_label: None,
+            detail: Some(i18n.t_arg(
+                "lib-tables-target-unresolved-detail",
+                "max",
+                MAX_RESOLVED_DEPENDENCIES as i64,
+            )),
             label: row.label,
         },
     }

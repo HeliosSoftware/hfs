@@ -633,6 +633,9 @@ pub(crate) enum TableTarget {
     /// `sql-view` Library — a `sql-query` Library, most commonly, which
     /// `$sql-run`'s own graph walk would reject the same way.
     NotATable,
+    /// Not looked up: the Library declares more distinct dependencies than
+    /// one render resolves (`MAX_RESOLVED_DEPENDENCIES` in `lib.rs`).
+    Unresolved,
 }
 
 /// Classifies a terminology `artifact` of `kind` — the expanded ValueSet or
