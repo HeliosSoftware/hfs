@@ -442,6 +442,13 @@ them, and exposes results through a status manifest.
   the receipts and `error` artifact are still published. Per-entry errors stay
   partial success. Input URLs are redacted (query, fragment, credentials) in every
   error message, artifact and log line.
+- **`fileRequestHeader`**: sent on the manifest, size-probe and file requests, after
+  the headers HFS sets, so a provider credential (`Authorization`) wins. A header
+  that routes the request or frames the transfer is refused with `400` on the
+  kick-off: `Host`, `Range`, `If-Range`, `Accept-Encoding`, `Content-Length`,
+  `Transfer-Encoding`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive` and
+  `Proxy-*`. The trusted-provider check judges the URL, and `Host` would otherwise
+  pick the backend that answers on an origin that routes by it.
 - **Resume after a lease reclaim**: every backend records each output file the
   worker walked to its end, and the run that reclaims the manifest skips those
   files; the file that was in flight resumes past the lines its committed batches

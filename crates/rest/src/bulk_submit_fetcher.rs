@@ -80,6 +80,32 @@ const FILE_ENCRYPTION_TYPE_JWE: &str = "jwe";
 /// How long establishing a connection to the provider may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Whether a `fileRequestHeader` name is refused on a kick-off and skipped
+/// on a stored submission: `Host` decides which backend answers on an origin
+/// that routes by it, so the trusted-provider check on the URL would not;
+/// the range and encoding headers are the fetcher's own resume and framing
+/// logic; the rest are hop-by-hop. Credentials (`Authorization`) stay
+/// allowed: carrying them is what the parameter is for.
+pub fn is_refused_file_request_header(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("range")
+        || name.eq_ignore_ascii_case("if-range")
+        || name.eq_ignore_ascii_case("accept-encoding")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("keep-alive")
+        // By bytes: a `str` slice panics when byte 6 is inside a character.
+        || name
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"proxy-"))
+}
+
 /// Default idle time allowed between two reads of a response before the read
 /// fails (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`). A stalled body then surfaces
 /// as a body error and is resumed like a reset connection.
@@ -642,8 +668,14 @@ impl FileRequest {
                 })?;
             rb = rb.bearer_auth(token);
         }
-        // Provider-supplied headers take precedence (applied last).
+        // Provider-supplied headers take precedence (applied last), except
+        // the ones that would route the request or reframe it: the kick-off
+        // refuses those, and a submission stored before it did is skipped.
         for (name, value) in &self.request_headers {
+            if is_refused_file_request_header(name) {
+                tracing::warn!(header = %name, "skipping a routing or framing fileRequestHeader");
+                continue;
+            }
             rb = rb.header(name.as_str(), value.as_str());
         }
         Ok(rb)
@@ -1251,6 +1283,9 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             rb = rb.bearer_auth(token);
         }
         for (name, value) in request_headers {
+            if is_refused_file_request_header(name) {
+                continue;
+            }
             rb = rb.header(name.as_str(), value.as_str());
         }
         // Strictly best-effort: providers without HEAD support (405, 4xx/5xx,
@@ -1280,6 +1315,43 @@ mod tests {
 
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn routing_and_framing_headers_are_refused_whatever_their_case() {
+        for name in [
+            "Host",
+            "host",
+            "HOST",
+            " Host ",
+            "Range",
+            "If-Range",
+            "Accept-Encoding",
+            "Connection",
+            "Transfer-Encoding",
+            "Content-Length",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Keep-Alive",
+            "Proxy-Authorization",
+            "proxy-connection",
+        ] {
+            assert!(is_refused_file_request_header(name), "{name}");
+        }
+        for name in [
+            "Authorization",
+            "X-Custom",
+            "Accept",
+            "X-Proxy-Hint",
+            "Proxy",
+            // Byte 6 falls inside a character: not refused, and no panic.
+            "abcde\u{e9}",
+            "prox\u{e9}-",
+            "",
+        ] {
+            assert!(!is_refused_file_request_header(name), "{name}");
+        }
+    }
 
     fn fetcher() -> HttpSubmitInputFetcher {
         HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())

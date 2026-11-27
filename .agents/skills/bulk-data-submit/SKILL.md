@@ -30,7 +30,7 @@ The kick-off `Parameters` resource supports:
 - `replacesManifestUrl`.
 - `outputFormat`.
 - `fhirBaseUrl`: required when `manifestUrl` is present.
-- `fileRequestHeader`: part.
+- `fileRequestHeader`: part. Applied after the headers HFS sets, so `Authorization` wins; `Host`, `Range`, `If-Range`, `Accept-Encoding`, `Content-Length`, `Transfer-Encoding`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive` and `Proxy-*` are refused with `400` (they would route the request or reframe the transfer).
 - `oauthMetadataUrl`.
 - `fileEncryptionKey`: part.
 - `metadata` / `import`: parts (`parameterUrl` + `parameterValue`, both required; `parameterUrl` SHALL be absolute).
