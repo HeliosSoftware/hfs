@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::error::HtsError;
-use crate::state::{AppState, ValidateCodeHandlerCache};
+use crate::state::{AppState, CacheEpoch, ValidateCodeHandlerCache};
 use crate::traits::{CodeSystemOperations, SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
@@ -2153,8 +2153,14 @@ fn validate_code_cache_get(cache: &ValidateCodeHandlerCache, key: &str) -> Optio
 /// cache. Only `result=true` responses are cached so transient false negatives
 /// (e.g. during HTS bootstrap or a prior buggy request shape) are not pinned
 /// for the process lifetime. The entry is dropped silently when the cache
-/// refuses it: see [`crate::state::BoundedCache::insert`].
-fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value: Arc<Value>) {
+/// refuses it (see [`crate::state::BoundedCache::insert`]) or when a
+/// terminology write landed since `epoch` was taken.
+fn validate_code_cache_put(
+    cache: &ValidateCodeHandlerCache,
+    epoch: &CacheEpoch,
+    key: String,
+    value: Arc<Value>,
+) {
     let result_true = value
         .get("parameter")
         .and_then(|p| p.as_array())
@@ -2169,6 +2175,9 @@ fn validate_code_cache_put(cache: &ValidateCodeHandlerCache, key: String, value:
         return;
     }
     if let Ok(mut guard) = cache.write() {
+        if !epoch.is_current() {
+            return;
+        }
         guard.insert(key, value);
     }
 }
@@ -2227,10 +2236,13 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
+    // Taken before the store is read; see `CacheEpoch`.
+    let epoch = state.cache_epoch();
     let result = process_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.cs_validate_code_handler_cache,
+            &epoch,
             key,
             Arc::new(value.clone()),
         );
@@ -4172,10 +4184,13 @@ async fn process_vs_validate_code_selected<B: TerminologyBackend>(
             .as_ref()
             .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
     );
+    // Taken before the store is read; see `CacheEpoch`.
+    let epoch = state.cache_epoch();
     let result = process_vs_validate_code_inner(state, params, instance).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
             &state.vs_validate_code_handler_cache,
+            &epoch,
             key,
             Arc::new(value.clone()),
         );
@@ -6353,6 +6368,41 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response computed before a terminology write is not cached after it.
+    #[test]
+    fn a_response_computed_before_a_write_is_not_cached_after_it() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let value = Arc::new(json!({"parameter": [{"name": "result", "valueBoolean": true}]}));
+        let before = state.cache_epoch();
+        state.clear_expand_cache(); // the write
+        validate_code_cache_put(
+            &state.vs_validate_code_handler_cache,
+            &before,
+            "k".to_string(),
+            value.clone(),
+        );
+        assert!(
+            state
+                .vs_validate_code_handler_cache
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+
+        validate_code_cache_put(
+            &state.vs_validate_code_handler_cache,
+            &state.cache_epoch(),
+            "k".to_string(),
+            value,
+        );
+        assert_eq!(
+            state.vs_validate_code_handler_cache.read().unwrap().len(),
+            1
+        );
+    }
     use axum::{Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 
