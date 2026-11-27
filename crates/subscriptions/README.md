@@ -228,6 +228,8 @@ A Subscription's endpoint is written by whoever can write the resource, so rest-
 
 `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS=true` lifts the first two rules for local development and CI. Deliveries made through an HTTP proxy are resolved by the proxy and are outside these checks.
 
+A channel may carry at most 64 headers; a Subscription with more is not registered. A delivery that panics counts as a failed delivery and the notifications queued behind it are dropped, and a handshake that panics sets the Subscription to `error`. Both are counted in the dispatch snapshot (`panicked_deliveries`, `panicked_activations`).
+
 ## Enabling in HFS
 
 The subscription engine is an optional feature in `helios-rest` and `helios-hfs`:
