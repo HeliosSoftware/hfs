@@ -68,12 +68,14 @@ impl ConstraintEvaluator for FhirPathConstraintEvaluator {
         let typed = match parse_typed(resource, version) {
             Ok(t) => t,
             Err(e) => {
-                // Structural errors are already on the report when the
-                // typed parse fails; constraints simply cannot run.
+                // No constraint can run. The structural walk usually has
+                // an error for whatever the typed model refused, but that is
+                // not relied on: the effects layer reports this as an error
+                // of its own.
                 let detail = format!("resource does not parse into the typed model: {e}");
                 return constraints
                     .iter()
-                    .map(|_| ConstraintOutcome::NotEvaluable(detail.clone()))
+                    .map(|_| ConstraintOutcome::ResourceNotLoaded(detail.clone()))
                     .collect();
             }
         };
@@ -123,7 +125,9 @@ impl FhirPathConstraintEvaluator {
             match helios_fhirpath::evaluator::evaluate(&invariant, context, Some(node)) {
                 Ok(result) => match coerce(result) {
                     ConstraintOutcome::Failed => return ConstraintOutcome::Failed,
-                    ConstraintOutcome::NotEvaluable(detail) => {
+                    // `coerce` does not produce `ResourceNotLoaded`.
+                    ConstraintOutcome::NotEvaluable(detail)
+                    | ConstraintOutcome::ResourceNotLoaded(detail) => {
                         if outcome == ConstraintOutcome::Passed {
                             outcome = ConstraintOutcome::NotEvaluable(detail);
                         }

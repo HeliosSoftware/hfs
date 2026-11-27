@@ -280,14 +280,19 @@ pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value
             .any(|s| s.type_.as_deref() == Some(RESOURCE_TYPE_NAME))
     {
         extended = set.clone();
-        if let Some(rt) = data.get("resourceType").and_then(Value::as_str) {
-            match ctx.resolver.resolve(rt) {
+        match data.get("resourceType") {
+            Some(Value::String(rt)) => match ctx.resolver.resolve(rt) {
                 Some(schema) => add_schemas_to_set(ctx, &mut extended, schema, rt),
                 None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(rt)),
-            }
+            },
+            // Not a string: the base `Resource` layer reports the type.
+            Some(_) => {}
+            // An inline resource has to say what it is. Without the type
+            // there is no schema to check it against, and the typed model
+            // cannot load the resource that holds it. The static layers
+            // (e.g. the base `Resource` schema) still apply.
+            None => ctx.error(ErrorKind::Required, errors::msg_required("resourceType")),
         }
-        // No resourceType on a Resource-typed node: nothing to resolve; the
-        // static layers (e.g. the base `Resource` schema) still apply.
         &extended
     } else {
         set
