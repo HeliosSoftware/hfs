@@ -636,7 +636,8 @@ pub trait ResourceStorage: Send + Sync {
     /// Deletes a resource (soft delete).
     ///
     /// The resource is marked as deleted but its history is preserved.
-    /// Subsequent reads will return `None` (or `Gone` error depending on config).
+    /// Subsequent reads will return a `Gone` error (the REST layer maps it to
+    /// 404 when `HFS_RETURN_GONE=false`).
     ///
     /// # Arguments
     ///

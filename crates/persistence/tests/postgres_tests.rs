@@ -152,6 +152,10 @@ mod tiebreak_order_suite;
 #[path = "search/sort_meta_suite.rs"]
 mod sort_meta_suite;
 
+/// The backend-agnostic parity suite for the unfiltered date sort (#2731).
+#[path = "search/unfiltered_date_sort_suite.rs"]
+mod unfiltered_date_sort_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -36172,6 +36176,709 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::sort_meta_suite::meta_params_sort_by_value(&backend, &unique_base("sort_meta"))
             .await;
+    }
+
+    /// #2731: the ordered date-index walk and the general path return the same
+    /// pages, cursors and totals.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_matches_the_general_path() {
+        let backend = create_backend().await;
+        super::unfiltered_date_sort_suite::unfiltered_date_sort_matches_the_general_path(
+            &backend,
+            &unique_base("date_walk"),
+        )
+        .await;
+    }
+
+    /// Seeds `rows` Observations with one `date` index row each (second
+    /// resolution) straight into an isolated database, and analyzes it.
+    async fn seed_date_walk_rows(backend: &PostgresBackend, tenant_id: &str, rows: i64) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'o-' || lpad(series::text, 6, '0')),
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z', FALSE
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_date, value_date_end, last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), 'date',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000) * INTERVAL '1 minute'
+                            + INTERVAL '1 second',
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+    }
+
+    /// Seeds `rows` Observations shaped like a real type: four more indexed
+    /// parameters per resource (`code`, `status`, `subject`, `category`), one
+    /// resource in ten without a `date` (`series % 10 = 0`), and one in twenty
+    /// with two `date` rows (`series % 20 = 1`); then analyzes.
+    ///
+    /// The other parameters are what a narrow seed hides: they put several
+    /// rows per resource behind `idx_search_resource` and make the date slice a
+    /// fraction of the table, which is what the planner weighs when it picks
+    /// how to probe a resource for a missing date.
+    async fn seed_realistic_date_walk_rows(backend: &PostgresBackend, tenant_id: &str, rows: i64) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation', 'id', 'o-' || lpad(series::text, 6, '0')),
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z', FALSE
+                 FROM generate_series(1, $2::bigint) series",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_date, value_date_end, last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), 'date',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000 + copy * 50000) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2018-01-01T00:00:00Z' + (series * 7919 % 100000 + copy * 50000) * INTERVAL '1 minute'
+                            + INTERVAL '1 second',
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series
+                 CROSS JOIN generate_series(0, 1) copy
+                 WHERE series % 10 <> 0 AND (copy = 0 OR series % 20 = 1)",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                                           value_token_system, value_token_code, value_reference,
+                                           last_updated)
+                 SELECT $1, 'Observation', 'o-' || lpad(series::text, 6, '0'), p.name,
+                        CASE p.name WHEN 'code' THEN 'http://loinc.org'
+                                    WHEN 'category' THEN 'http://terminology.hl7.org/CodeSystem/observation-category'
+                                    ELSE NULL END,
+                        CASE p.name WHEN 'code' THEN 'c-' || (series % 50)
+                                    WHEN 'status' THEN 'final'
+                                    WHEN 'category' THEN 'cat-' || (series % 5)
+                                    ELSE NULL END,
+                        CASE p.name WHEN 'subject' THEN 'Patient/p-' || (series % 500) ELSE NULL END,
+                        TIMESTAMPTZ '2020-01-01T00:00:00Z'
+                 FROM generate_series(1, $2::bigint) series
+                 CROSS JOIN (VALUES ('code'), ('status'), ('subject'), ('category')) p(name)",
+                &[&tenant_id, &rows],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+    }
+
+    fn date_sort_query(
+        direction: helios_persistence::types::SortDirection,
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{SearchParamType, SearchQuery, SortDirective};
+        SearchQuery::new("Observation")
+            .with_count(20)
+            .with_sort(SortDirective {
+                parameter: "date".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Date),
+            })
+    }
+
+    /// #2731: the unfiltered date sort reads the date index in order. No node
+    /// of the plan is a per-resource subplan or a sequential scan of
+    /// `resources`, the right index serves each direction, and a page reads
+    /// about a page of index entries, not the type.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_walks_the_date_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            out.push(plan);
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+
+        const ROWS: i64 = 20_000;
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("date-walk-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        seed_date_walk_rows(&backend, tenant_id, ROWS).await;
+
+        for (direction, order, index) in [
+            (
+                SortDirection::Descending,
+                "ORDER BY si.value_date_end DESC",
+                "idx_search_date_end",
+            ),
+            (
+                SortDirection::Ascending,
+                "ORDER BY si.value_date ASC",
+                "idx_search_date",
+            ),
+        ] {
+            let page = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(page.resources.items.len(), 20);
+            assert!(page.resources.page_info.has_next);
+
+            let client = backend.get_client().await.unwrap();
+            let statement: String = client
+                .query_one(
+                    "SELECT name FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT r.id, r.version_id%'
+                       AND statement LIKE '%FROM search_index si%'
+                       AND statement LIKE '%' || $1 || '%'
+                       AND cardinality(parameter_types) = 2",
+                    &[&order],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached walk statement: {e}"))
+                .get(0);
+            client
+                .batch_execute("SET plan_cache_mode = force_custom_plan")
+                .await
+                .unwrap();
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!(
+                        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ('{tenant_id}', 'Observation')",
+                        statement.replace('"', "\"\"")
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            eprintln!("[2731] {direction:?}: {plan}");
+            let mut all = vec![];
+            nodes(&plan[0]["Plan"], &mut all);
+            // The sort key is not a per-resource subplan.
+            assert!(
+                !all.iter().any(|n| n["Parent Relationship"] == "SubPlan"
+                    && n["Index Name"] == "idx_search_resource"),
+                "{direction:?}: a per-resource subplan drives the sort: {plan}"
+            );
+            assert!(
+                !all.iter()
+                    .any(|n| n["Node Type"] == "Seq Scan" && n["Relation Name"] == "resources"),
+                "{direction:?}: sequential scan of resources: {plan}"
+            );
+            let scan = all
+                .iter()
+                .find(|n| n["Index Name"] == index)
+                .unwrap_or_else(|| panic!("{direction:?}: {index} unused: {plan}"));
+            let read = scan["Actual Rows"].as_u64().unwrap()
+                * scan["Actual Loops"].as_u64().unwrap_or(1).max(1);
+            assert!(
+                read <= 200,
+                "{direction:?}: read {read} entries of {index} for a 20-row page of {ROWS}: {plan}"
+            );
+            client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        }
+    }
+
+    /// Every node of an `EXPLAIN (FORMAT JSON)` plan, subplans included.
+    fn date_walk_plan_nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        out.push(plan);
+        if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+            for child in children {
+                date_walk_plan_nodes(child, out);
+            }
+        }
+    }
+
+    /// Index entries a plan node read over all its loops: what it returned
+    /// plus what its filter threw away, both per-loop averages in the plan.
+    fn date_walk_node_reads(node: &serde_json::Value) -> u64 {
+        let per_loop = node["Actual Rows"].as_u64().unwrap_or(0)
+            + node["Rows Removed by Filter"].as_u64().unwrap_or(0)
+            + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
+        per_loop * node["Actual Loops"].as_u64().unwrap_or(1).max(1)
+    }
+
+    /// `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` of a statement the backend
+    /// cached on this session, run with `args` (SQL literals) under the
+    /// `plan_cache_mode` given.
+    async fn explain_cached_date_walk_statement(
+        client: &deadpool_postgres::Client,
+        name: &str,
+        args: &str,
+        plan_cache_mode: &str,
+    ) -> serde_json::Value {
+        client
+            .batch_execute(&format!("SET plan_cache_mode = {plan_cache_mode}"))
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{}\" ({args})",
+                    name.replace('"', "\"\"")
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        plan
+    }
+
+    /// The plan reads a bounded amount: no date-index node and no sequential
+    /// scan repeated per outer row beyond `max_reads` entries, no sequential
+    /// scan of `resources` or `search_index` at all, and at most `max_blocks`
+    /// buffers in total.
+    fn assert_date_walk_plan_bounded(
+        plan: &serde_json::Value,
+        label: &str,
+        max_reads: u64,
+        max_blocks: u64,
+    ) {
+        let mut all = vec![];
+        date_walk_plan_nodes(&plan[0]["Plan"], &mut all);
+        for node in &all {
+            // Every index, the date ones first among them: a merge join that
+            // scans the type's `idx_search_resource` from its start, or a probe
+            // of the date slice per resource, reads far past a page.
+            if let Some(index) = node["Index Name"].as_str() {
+                let reads = date_walk_node_reads(node);
+                assert!(
+                    reads <= max_reads,
+                    "{label}: {index} read {reads} entries over {} loops: {plan}",
+                    node["Actual Loops"]
+                );
+            }
+            if node["Node Type"] == "Seq Scan" {
+                let relation = node["Relation Name"].as_str().unwrap_or_default();
+                assert!(
+                    relation != "resources" && relation != "search_index",
+                    "{label}: sequential scan of {relation} ({} loops): {plan}",
+                    node["Actual Loops"]
+                );
+            }
+            // A per-resource probe must seek by resource, not scan a slice.
+            // A `Materialize` is the exception: its child reads the slice once
+            // (bounded above) and the rescans are in memory. The planner picks
+            // it for a small slice (386 rows x 210 loops, 6 ms, on the 1,000
+            // resource tenant); bound the in-memory work all the same.
+            if node["Node Type"] == "Materialize" {
+                let rescanned = date_walk_node_reads(node);
+                assert!(
+                    rescanned <= 100 * max_reads,
+                    "{label}: a Materialize rescanned {rescanned} rows: {plan}"
+                );
+            } else if node["Actual Loops"].as_u64().unwrap_or(1) > 1 {
+                let per_loop = node["Actual Rows"].as_u64().unwrap_or(0)
+                    + node["Rows Removed by Filter"].as_u64().unwrap_or(0);
+                assert!(
+                    per_loop <= 64,
+                    "{label}: a {} node repeated {} times reads {per_loop} rows each: {plan}",
+                    node["Node Type"],
+                    node["Actual Loops"]
+                );
+            }
+        }
+        let top = &plan[0]["Plan"];
+        let blocks = top["Shared Hit Blocks"].as_u64().unwrap_or(0)
+            + top["Shared Read Blocks"].as_u64().unwrap_or(0);
+        assert!(
+            blocks <= max_blocks,
+            "{label}: {blocks} buffers for one statement: {plan}"
+        );
+    }
+
+    /// #2731: the two statements of the walk that read past the keyed part
+    /// stay bounded on a realistically shaped type. The tail (resources with
+    /// no date, by id) is probed per resource, so its probe must seek the
+    /// resource's own rows; the keyed count (run only for an `_offset` past
+    /// the keyed part, so on a type of at most `DATE_WALK_MAX_OFFSET` dated
+    /// resources) must read that type's date slice, not the table.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_tail_and_count_stay_bounded() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{CursorValue, PageCursor, SortDirection};
+
+        const BIG: i64 = 20_000;
+        const SMALL: i64 = 1_000;
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let big = create_tenant("date-walk-tail-big");
+        let small = create_tenant("date-walk-tail-small");
+        seed_realistic_date_walk_rows(&backend, big.tenant_id().as_str(), BIG).await;
+        seed_realistic_date_walk_rows(&backend, small.tenant_id().as_str(), SMALL).await;
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        // Dated resources of the small tenant: nine in ten.
+        let small_keyed = (SMALL - SMALL / 10) as u32;
+        assert!(small_keyed as usize + 5 <= helios_persistence::types::DATE_WALK_MAX_OFFSET);
+
+        for (direction, desc) in [
+            (SortDirection::Descending, true),
+            (SortDirection::Ascending, false),
+        ] {
+            // The column filter tells the two directions' statements apart.
+            let column_filter = if desc {
+                "statement LIKE '%value_date_end%'"
+            } else {
+                "statement NOT LIKE '%value_date_end%'"
+            };
+
+            // --- The tail, by cursor on an undated resource, both ways --------
+            for (backward, op, first) in [(false, ">", "o-010010"), (true, "<", "o-009990")] {
+                let cursor = if backward {
+                    PageCursor::previous(vec![CursorValue::Null], "o-010000")
+                } else {
+                    PageCursor::new(vec![CursorValue::Null], "o-010000")
+                };
+                let mut walk = date_sort_query(direction);
+                walk.cursor = Some(cursor.encode());
+                let mut general = walk.clone();
+                general.fhir_version = Some(helios_fhir::FhirVersion::default());
+                let walked = backend.search(&big, &walk).await.unwrap();
+                let on_general = backend.search(&big, &general).await.unwrap();
+                let tag = format!("{direction:?} backward={backward}");
+                assert_eq!(ids(&walked), ids(&on_general), "{tag}: tail page");
+                assert_eq!(ids(&walked).len(), 20, "{tag}: tail page");
+                assert!(
+                    ids(&walked).contains(&first.to_string()),
+                    "{tag}: tail page"
+                );
+
+                let client = backend.get_client().await.unwrap();
+                let tail: String = client
+                    .query_one(
+                        &format!(
+                            "SELECT name FROM pg_prepared_statements
+                             WHERE statement LIKE '%NULL::timestamptz AS sort_key%'
+                               AND statement LIKE '%r.id {op} $3%'
+                               AND {column_filter}
+                               AND cardinality(parameter_types) = 3"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag}: no cached tail statement: {e}"))
+                    .get(0);
+                for (tenant, from, mode) in [
+                    (&big, "o-000010", "force_custom_plan"),
+                    (&big, "o-010000", "force_custom_plan"),
+                    (&big, "o-019990", "force_custom_plan"),
+                    (&big, "o-010000", "force_generic_plan"),
+                    (&small, "o-000500", "force_custom_plan"),
+                ] {
+                    let plan = explain_cached_date_walk_statement(
+                        &client,
+                        &tail,
+                        &format!("'{}', 'Observation', '{from}'", tenant.tenant_id().as_str()),
+                        mode,
+                    )
+                    .await;
+                    eprintln!("[2731 tail] {tag} from {from} {mode}: {plan}");
+                    // A 21-row page of a type where one resource in ten has
+                    // no date reads about 210 resources in id order and their
+                    // five or six index rows each (about 1,100), wherever the
+                    // cursor is. Reading from the type's first resource
+                    // instead is 50,000 entries at the middle of 20,000.
+                    assert_date_walk_plan_bounded(
+                        &plan,
+                        &format!("{tag} tail from {from} {mode}"),
+                        2_000,
+                        5_000,
+                    );
+                }
+            }
+
+            // --- The keyed count, from an offset past the keyed part ----------
+            let mut walk = date_sort_query(direction);
+            walk.offset = Some(small_keyed + 5);
+            let mut general = walk.clone();
+            general.fhir_version = Some(helios_fhir::FhirVersion::default());
+            let walked = backend.search(&small, &walk).await.unwrap();
+            let on_general = backend.search(&small, &general).await.unwrap();
+            assert_eq!(ids(&walked), ids(&on_general), "{direction:?}: offset tail");
+            assert_eq!(ids(&walked).len(), 20, "{direction:?}: offset tail");
+
+            let client = backend.get_client().await.unwrap();
+            let count: String = client
+                .query_one(
+                    &format!(
+                        "SELECT name FROM pg_prepared_statements
+                         WHERE statement LIKE 'SELECT COUNT(DISTINCT si.resource_id)%'
+                           AND {column_filter}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{direction:?}: no cached count statement: {e}"))
+                .get(0);
+            let plan = explain_cached_date_walk_statement(
+                &client,
+                &count,
+                &format!("'{}', 'Observation'", small.tenant_id().as_str()),
+                "force_custom_plan",
+            )
+            .await;
+            eprintln!("[2731 count] {direction:?}: {plan}");
+            // About 950 date rows of the small tenant, each matched to its
+            // resource; never the big tenant's 20,000.
+            assert_date_walk_plan_bounded(&plan, &format!("{direction:?} count"), 2_000, 8_000);
+        }
+    }
+
+    /// #2731: a page whose head falls in an equal-key group larger than the
+    /// tie cap is served by the general statement, with the same page; under
+    /// the cap the walk serves it. Paging by cursor across the edge of such a
+    /// group, in either direction, gives the general path's pages.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_tie_cap_falls_back() {
+        use helios_persistence::core::SearchResult;
+        use helios_persistence::types::SortDirection;
+
+        /// Resources in each of the two equal-key groups.
+        const GROUP: usize = 60;
+        /// Below `GROUP`: a page head in either group exceeds it.
+        const LOW_CAP: usize = 50;
+        const HIGH_CAP: usize = helios_persistence::types::DATE_WALK_MAX_TIE_GROUP;
+
+        type View = (Vec<String>, bool, bool, Option<String>, Option<String>);
+        fn view(r: &SearchResult) -> View {
+            (
+                r.resources
+                    .items
+                    .iter()
+                    .map(|x| x.id().to_string())
+                    .collect(),
+                r.has_next(),
+                r.has_previous(),
+                r.next_cursor().cloned(),
+                r.previous_cursor().cloned(),
+            )
+        }
+
+        let backend = hfs1407_backend(false).await;
+        // Keep one session for the cached statements, so they can be found on
+        // the pool's other one.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("date-walk-tie-cap");
+        let tenant_id = tenant.tenant_id().as_str();
+        seed_date_walk_rows(&backend, tenant_id, 300).await;
+        // The first GROUP resources share the latest key, the next GROUP the
+        // earliest: a page head in either direction starts in a group.
+        let client = backend.get_client().await.unwrap();
+        for (first, at) in [
+            (1i64, "2030-01-01T00:00:00Z"),
+            (GROUP as i64 + 1, "2000-01-01T00:00:00Z"),
+        ] {
+            client
+                .execute(
+                    "UPDATE search_index SET value_date = $3::text::timestamptz,
+                            value_date_end = $3::text::timestamptz + INTERVAL '1 second'
+                     WHERE tenant_id = $1 AND param_name = 'date'
+                       AND resource_id BETWEEN 'o-' || lpad($2::bigint::text, 6, '0')
+                                           AND 'o-' || lpad(($2::bigint + $4::bigint - 1)::text, 6, '0')",
+                    &[&tenant_id, &first, &at, &(GROUP as i64)],
+                )
+                .await
+                .unwrap();
+        }
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        drop(client);
+
+        let general = |q: &helios_persistence::types::SearchQuery| {
+            let mut q = q.clone();
+            q.fhir_version = Some(helios_fhir::FhirVersion::default());
+            q
+        };
+        // Whether this session holds a cached walk page statement.
+        let walk_statements = || async {
+            backend
+                .get_client()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT count(*) FROM pg_prepared_statements
+                     WHERE statement LIKE 'SELECT r.id, r.version_id%'
+                       AND statement LIKE '%FROM search_index si%'
+                       AND statement LIKE '%NOT EXISTS (SELECT 1 FROM search_index s2%'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+
+        // --- First pages and an offset into a group: low cap, then high -------
+        for (cap, walked) in [(LOW_CAP, false), (HIGH_CAP, true)] {
+            for direction in [SortDirection::Descending, SortDirection::Ascending] {
+                for offset in [None, Some(10u32)] {
+                    let mut q = date_sort_query(direction);
+                    q.offset = offset;
+                    let on_cap = backend
+                        .search_with_date_walk_tie_cap(&tenant, &q, cap)
+                        .await
+                        .unwrap();
+                    let on_general = backend
+                        .search_with_date_walk_tie_cap(&tenant, &general(&q), cap)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        view(&on_cap),
+                        view(&on_general),
+                        "cap {cap} {direction:?} offset {offset:?}"
+                    );
+                }
+            }
+            // The low cap never reached the walk; the high one did.
+            assert_eq!(walk_statements().await > 0, walked, "cap {cap}");
+        }
+
+        // --- Paging by cursor across the edge of a group ----------------------
+        for direction in [SortDirection::Descending, SortDirection::Ascending] {
+            for count in [7u32, 20] {
+                let tag = format!("{direction:?} count={count}");
+                let mut q = date_sort_query(direction);
+                q.count = Some(count);
+                let page = |q: helios_persistence::types::SearchQuery| {
+                    let backend = &backend;
+                    let tenant = &tenant;
+                    async move {
+                        view(
+                            &backend
+                                .search_with_date_walk_tie_cap(tenant, &q, LOW_CAP)
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                };
+                let mut forward: Vec<(View, View)> = Vec::new();
+                let mut cursor: Option<String> = None;
+                loop {
+                    assert!(forward.len() < 100, "{tag}: forward walk does not end");
+                    let mut current = q.clone();
+                    current.cursor = cursor.clone();
+                    let capped = page(current.clone()).await;
+                    let on_general = page(general(&current)).await;
+                    assert_eq!(capped, on_general, "{tag}: forward page {}", forward.len());
+                    cursor = capped.3.clone();
+                    let more = capped.1;
+                    forward.push((capped, on_general));
+                    if !more {
+                        break;
+                    }
+                }
+                let seen: usize = forward.iter().map(|(p, _)| p.0.len()).sum();
+                assert_eq!(seen, 300, "{tag}: every resource once");
+                // Back from the last page to the first.
+                let mut cursor = forward.last().unwrap().0.4.clone();
+                let mut back = 0;
+                while let Some(current_cursor) = cursor.take() {
+                    assert!(back < 100, "{tag}: backward walk does not end");
+                    let mut current = q.clone();
+                    current.cursor = Some(current_cursor);
+                    let capped = page(current.clone()).await;
+                    let on_general = page(general(&current)).await;
+                    assert_eq!(capped, on_general, "{tag}: backward page {back}");
+                    back += 1;
+                    if capped.2 {
+                        cursor = capped.4.clone();
+                    }
+                }
+                assert_eq!(back, forward.len() - 1, "{tag}: backward page count");
+            }
+        }
+    }
+
+    /// #2731: while the date index is invalid (a concurrent build in progress
+    /// or a failed one) the sort falls back to the general statement, with the
+    /// same page.
+    #[tokio::test]
+    async fn postgres_integration_unfiltered_date_sort_falls_back_without_a_valid_index() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SortDirection;
+
+        let backend = hfs1407_backend(false).await;
+        let tenant = create_tenant("date-walk-fallback");
+        seed_date_walk_rows(&backend, tenant.tenant_id().as_str(), 300).await;
+        let ids = |r: &helios_persistence::core::SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|x| x.id().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for (direction, index) in [
+            (SortDirection::Descending, "idx_search_date_end"),
+            (SortDirection::Ascending, "idx_search_date"),
+        ] {
+            let walked = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            // Marks the index invalid, as an interrupted `CREATE INDEX
+            // CONCURRENTLY` leaves it. The database is this test's own.
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let general = backend
+                .search(&tenant, &date_sort_query(direction))
+                .await
+                .unwrap();
+            assert_eq!(ids(&general), ids(&walked), "{direction:?}");
+            assert_eq!(
+                general.resources.page_info.has_next,
+                walked.resources.page_info.has_next
+            );
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE pg_index SET indisvalid = TRUE WHERE indexrelid = $1::text::regclass",
+                    &[&index],
+                )
+                .await
+                .unwrap();
+        }
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one

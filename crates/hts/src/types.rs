@@ -382,6 +382,13 @@ pub struct ExpandRequest {
     /// value the backend returns `HtsError::TooCostly`. `None` means no limit.
     #[serde(skip)]
     pub max_expansion_size: Option<u32>,
+    /// The server's configured expansion limit, which the per-request
+    /// `max_expansion_size` may exceed up to the ceiling. A backend that
+    /// persists derived expansions keeps only sets no larger than this, so a
+    /// caller cannot raise what is written to disk. `None` falls back to
+    /// `max_expansion_size`.
+    #[serde(skip)]
+    pub persisted_expansion_limit: Option<u32>,
     /// Point-in-time date for evaluation (ISO-8601).
     #[serde(default)]
     pub date: Option<String>,

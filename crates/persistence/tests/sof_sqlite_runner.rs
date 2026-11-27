@@ -22,6 +22,28 @@ mod sof_columnar;
 #[path = "common/sof_fhir_version_filter.rs"]
 mod sof_fhir_version_filter;
 
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[path = "common/sof_native_sql.rs"]
+mod sof_native_sql;
+
+/// #2902: a SQL Query Library runs inside the primary SQLite database.
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+mod native_sql_query {
+    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::ResourceStorage;
+    use helios_sof::sqlquery::NativeDialect;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_queries_run_in_the_primary_database() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let runner = backend.sof_runner().expect("runner");
+        assert_eq!(runner.native_sql_dialect(), Some(NativeDialect::Sqlite));
+        super::sof_native_sql::run_suite(&backend, runner, "native").await;
+    }
+}
+
 #[cfg(feature = "sqlite")]
 mod sqlite_runner_tests {
     use futures::StreamExt;

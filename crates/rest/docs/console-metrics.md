@@ -11,7 +11,7 @@ Endpoints fall into three trust tiers:
 |---|---|---|
 | **Public** | `uptime` | none — mounted outside auth (like `/health`) |
 | **Tenant-scoped** | `resource-counts`, `activity`, `resource-distribution` | a valid `Authorization: Bearer <token>` (else `401`); returns only the caller's own tenant |
-| **Admin (cross-tenant)** | `tenants`, `traffic` | a valid token **and** a system-context scope `system/*.r` (else `403`) |
+| **Admin (cross-tenant)** | `tenants`, `traffic` | a valid token with **no tenant claim** **and** a system-context scope `system/*.r` (else `403`) |
 
 All endpoints are covered by the server's CORS, timeout, body-limit, and tracing
 middleware.
@@ -27,6 +27,10 @@ They are therefore gated by `admin_authz_middleware`, which requires a
 system-context, all-resource scope (`system/*.r`, `system/*.rs`, `system/*.cruds`,
 …). An ordinary `user/*` or `patient/*` token — **even a wildcard one** — is
 rejected `403`.
+
+A token that carries a tenant claim (`HFS_AUTH_TENANT_CLAIM`) is rejected `403`
+on the admin endpoints whatever its scopes: the claim binds it to one tenant, so
+it is not a cross-tenant administrator. Use a token without a tenant claim.
 
 > When auth is **disabled** server-wide, all endpoints (including the admin tier)
 > are unprotected like every other route — matching existing server behaviour.

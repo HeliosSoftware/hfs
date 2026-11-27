@@ -589,7 +589,7 @@ With `HFS_TENANT_STRICT_VALIDATION=true`, a non-default header or URL tenant tha
 
 If the token does not contain the tenant claim (or carries it as `null`), the `X-Tenant-ID` header and URL tenant are still not trusted: a request naming a tenant other than `HFS_DEFAULT_TENANT` is refused with `403`, and a request naming none is served from `HFS_DEFAULT_TENANT`. In a multi-tenant deployment, make sure every user's token carries the claim named by `HFS_AUTH_TENANT_CLAIM`.
 
-A tenant claim that is present with any other JSON type (a number, boolean, array or object) is a validation error and the token is refused with `401`: an integer organisation id from a claim mapper must be emitted as a string.
+A tenant claim that is present with any other JSON type (a number, boolean, array or object), or present as an empty or whitespace-only string, is a validation error and the token is refused with `401`: an integer organisation id from a claim mapper must be emitted as a string, and a mapper that emits `""` for users without a tenant must leave the claim out instead.
 
 ## SMART Launch Context
 

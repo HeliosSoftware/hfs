@@ -1,7 +1,10 @@
-//! In-memory SQLite engine used by `$sqlquery-run`.
+//! Embedded SQLite engine for SQL Queries on storage backends that have no
+//! SQL engine of their own (MongoDB, S3).
 //!
-//! One connection per request. Each depends-on ViewDefinition is materialized
-//! into a named table; the user's SQL then runs against those tables.
+//! One in-memory database per request. Each depends-on ViewDefinition is
+//! materialized into a named table; the user's SQL then runs against those
+//! tables. SQLite and PostgreSQL backends do not use it: they run the query
+//! inside the primary database (see [`super::native`], #2902).
 
 use futures::Stream;
 use futures::StreamExt;
@@ -589,48 +592,56 @@ impl InMemorySqlEngine {
             }
         }
 
-        let columns: Vec<String> = stmt.column_names().map(String::from).collect();
-        // Pre-seed with String to be overwritten per row.
-        let mut column_types: Vec<ColumnFhirType> = columns
-            .iter()
-            .map(|_| ColumnFhirType::String("string".to_string()))
-            .collect();
-        let mut rows_out: Vec<Vec<Option<Value>>> = Vec::new();
-
-        let mut rows_iter = stmt.raw_query();
-        while let Some(row) = rows_iter.next()? {
-            if rows_out.len() >= max_rows {
-                // SoF v2: the server's hard cap silently truncates the
-                // result set instead of erroring (spec PR #353: "Servers
-                // MAY enforce a maximum value, silently capping
-                // client-supplied limits at a smaller server-defined
-                // maximum"). Caller-supplied `_limit` is also a silent
-                // cap and is enforced at the handler. Source-row caps
-                // applied during `insert_rows` remain hard errors
-                // because truncating a depends-on table would silently
-                // change query semantics (JOINs, aggregates).
-                break;
-            }
-            let mut row_vals: Vec<Option<Value>> = Vec::with_capacity(columns.len());
-            for (i, _) in columns.iter().enumerate() {
-                let v: rusqlite::types::Value = row.get(i)?;
-                let (json_val, inferred) = sqlite_value_to_json(v);
-                if matches!(column_types[i], ColumnFhirType::String(_))
-                    && let Some(ft) = inferred
-                {
-                    column_types[i] = ft;
-                }
-                row_vals.push(json_val);
-            }
-            rows_out.push(row_vals);
-        }
-
-        Ok(QueryResult {
-            columns,
-            column_types,
-            rows: rows_out,
-        })
+        read_query_result(&mut stmt, max_rows)
     }
+}
+
+/// Steps a prepared, already bound SELECT and collects at most `max_rows`
+/// rows, with each column's FHIR type inferred from its values (a column of
+/// NULLs or text is `string`).
+///
+/// A result longer than `max_rows` is cut, not an error: SoF v2 (spec PR
+/// #353) lets a server silently cap a result at a server-defined maximum.
+/// Caller-supplied `_limit` is also a silent cap, enforced by the handler.
+///
+/// Shared by the embedded engine and by the SQLite backend, which runs a SQL
+/// Query in the primary database with the same value mapping.
+pub fn read_query_result(
+    stmt: &mut rusqlite::Statement<'_>,
+    max_rows: usize,
+) -> Result<QueryResult, SqlQueryError> {
+    let columns: Vec<String> = stmt.column_names().map(String::from).collect();
+    // Pre-seed with String to be overwritten per row.
+    let mut column_types: Vec<ColumnFhirType> = columns
+        .iter()
+        .map(|_| ColumnFhirType::String("string".to_string()))
+        .collect();
+    let mut rows_out: Vec<Vec<Option<Value>>> = Vec::new();
+
+    let mut rows_iter = stmt.raw_query();
+    while let Some(row) = rows_iter.next()? {
+        if rows_out.len() >= max_rows {
+            break;
+        }
+        let mut row_vals: Vec<Option<Value>> = Vec::with_capacity(columns.len());
+        for (i, _) in columns.iter().enumerate() {
+            let v: rusqlite::types::Value = row.get(i)?;
+            let (json_val, inferred) = sqlite_value_to_json(v);
+            if matches!(column_types[i], ColumnFhirType::String(_))
+                && let Some(ft) = inferred
+            {
+                column_types[i] = ft;
+            }
+            row_vals.push(json_val);
+        }
+        rows_out.push(row_vals);
+    }
+
+    Ok(QueryResult {
+        columns,
+        column_types,
+        rows: rows_out,
+    })
 }
 
 /// Name the statement kind behind the first action the read-only authorizer
@@ -963,6 +974,7 @@ mod tests {
         let bindings = vec![BoundParam {
             name: "min".to_string(),
             value: rusqlite::types::Value::Integer(3),
+            fhir_type: "integer".to_string(),
         }];
         let result = engine
             .execute_select("SELECT n FROM t WHERE n >= :min ORDER BY n", &bindings, 100)
