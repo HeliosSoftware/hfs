@@ -25733,6 +25733,11 @@ mod composite_plan;
 #[path = "mongodb/composite_tuple.rs"]
 mod composite_tuple;
 
+/// #2233: the batched candidate consumer through every caller, above three
+/// 4,096-id batches, on the default and on a one-connection pool.
+#[path = "mongodb/batch_consumer.rs"]
+mod batch_consumer;
+
 /// #2254: searches and view runs restricted to one stored FHIR version. The
 /// same type is stored under R4 and R5, so both features are needed.
 #[cfg(all(feature = "R4", feature = "R5"))]
@@ -25831,6 +25836,11 @@ mod missing_equivalence;
 /// #2233: `explain` of the two counts that make up a `:missing=true` total.
 #[path = "mongodb/missing_split_plans.rs"]
 mod missing_split_plans;
+
+/// #2233 Stage 2: net of exact totals that mix `:missing=true` with `:not`,
+/// `:missing=false`, an unsupported `:missing` and resource-level conditions.
+#[path = "mongodb/missing_mixed_net.rs"]
+mod missing_mixed_net;
 
 /// #2006: write, storage and cache cost of `missing_params` metadata.
 #[path = "mongodb/missing_params_cost_bench.rs"]
