@@ -20,11 +20,6 @@ use crate::type_inference::{InferredType, TypeContext};
 use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
-/// Handler for the main evaluation endpoint
-///
-/// This endpoint accepts a FHIR Parameters resource and evaluates the FHIRPath
-/// expression against the provided resource, returning results in the format
-/// specified by the fhirpath-lab API.
 /// The terminology servers a request's `terminologyServer` parameter may
 /// name. The server does not authenticate its callers, and the parameter
 /// becomes the base URL of the terminology client, so an unlisted value would
@@ -86,6 +81,11 @@ fn terminology_policy(
         .unwrap_or_default()
 }
 
+/// Handler for the main evaluation endpoint
+///
+/// This endpoint accepts a FHIR Parameters resource and evaluates the FHIRPath
+/// expression against the provided resource, returning results in the format
+/// specified by the fhirpath-lab API.
 pub async fn evaluate_fhirpath(
     policy: Option<axum::Extension<std::sync::Arc<TerminologyServerPolicy>>>,
     Json(params): Json<FhirPathParameters>,
