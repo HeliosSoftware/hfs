@@ -1208,6 +1208,42 @@ pub fn is_cross_site(headers: &http::HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("cross-site"))
 }
 
+/// Whether a state-changing request (any method but `GET`, `HEAD`,
+/// `OPTIONS`, `TRACE`) came from somewhere other than this origin, so a
+/// session cookie must not authorize it.
+///
+/// [`is_cross_site`] alone is not enough for writes: `SameSite=Lax` sends
+/// the cookie on a sibling subdomain's `POST` (`same-site`), and such a
+/// sibling may be run by someone else. A browser marks a request from this
+/// origin `Sec-Fetch-Site: same-origin` (`none` for one the user started).
+/// Without that header the `Origin` must name the request's `Host`. A
+/// request with neither did not come from a browser page.
+pub fn is_foreign_write(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    if method.is_safe() {
+        return false;
+    }
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        let site = site.trim();
+        return !(site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none"));
+    }
+    let Some(origin) = headers
+        .get(http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let origin_authority = origin
+        .trim()
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.authority().map(|a| a.as_str().to_ascii_lowercase()));
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.trim().to_ascii_lowercase());
+    origin_authority.is_none() || origin_authority != host
+}
+
 /// A URL-safe random token of `bytes` random bytes.
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
@@ -1441,6 +1477,49 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(cookie_value(&headers, PENDING_COOKIE), None);
+    }
+
+    #[test]
+    fn a_write_is_foreign_unless_it_comes_from_this_origin() {
+        use http::Method;
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = http::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        let same_site = headers(&[("sec-fetch-site", "same-site")]);
+        assert!(is_foreign_write(&Method::POST, &same_site));
+        assert!(!is_foreign_write(&Method::GET, &same_site));
+        assert!(is_foreign_write(
+            &Method::DELETE,
+            &headers(&[("sec-fetch-site", "cross-site")])
+        ));
+        assert!(!is_foreign_write(
+            &Method::PUT,
+            &headers(&[("sec-fetch-site", "same-origin")])
+        ));
+        assert!(!is_foreign_write(
+            &Method::POST,
+            &headers(&[("sec-fetch-site", "none")])
+        ));
+        assert!(!is_foreign_write(
+            &Method::POST,
+            &headers(&[("origin", "https://hfs.example"), ("host", "hfs.example")])
+        ));
+        assert!(is_foreign_write(
+            &Method::POST,
+            &headers(&[
+                ("origin", "https://evil.hfs.example"),
+                ("host", "hfs.example")
+            ])
+        ));
+        assert!(is_foreign_write(
+            &Method::POST,
+            &headers(&[("origin", "null"), ("host", "hfs.example")])
+        ));
+        assert!(!is_foreign_write(&Method::POST, &headers(&[])));
     }
 
     #[test]

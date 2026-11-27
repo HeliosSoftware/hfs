@@ -96,6 +96,16 @@ pub(crate) async fn require_session(
     let Some(login) = state.login.as_ref() else {
         return next.run(request).await;
     };
+    // `SameSite=Lax` sends the session cookie on a sibling subdomain's POST,
+    // so a UI write (logout included) must come from this origin.
+    if helios_auth::is_foreign_write(request.method(), request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "cross-origin request refused",
+        )
+            .into_response();
+    }
     let path = request.uri().path().to_string();
     if !path.starts_with("/ui") || is_open_path(&path) {
         return next.run(request).await;

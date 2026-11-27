@@ -85,10 +85,11 @@ fn is_exempt_path(path: &str) -> bool {
 /// token has expired and could not be refreshed, which drops the session.
 async fn session_bearer(
     auth_state: &AuthMiddlewareState,
+    method: &axum::http::Method,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
     let sessions = auth_state.sessions.as_ref()?;
-    if helios_auth::is_cross_site(headers) {
+    if helios_auth::is_cross_site(headers) || helios_auth::is_foreign_write(method, headers) {
         return None;
     }
     let session_id = helios_auth::cookie_value(headers, helios_auth::SESSION_COOKIE)?;
@@ -133,7 +134,7 @@ pub async fn auth_middleware(
     // for a cross-site request, so another origin cannot ride the cookie.
     let auth_header = match auth_header {
         Some(h) => Some(h),
-        None => match session_bearer(&auth_state, request.headers()).await {
+        None => match session_bearer(&auth_state, request.method(), request.headers()).await {
             Some(bearer) => {
                 if let Ok(value) = bearer.parse() {
                     request.headers_mut().insert(header::AUTHORIZATION, value);

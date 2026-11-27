@@ -295,6 +295,27 @@ async fn callback_reporting_an_idp_error_is_rejected() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `SameSite=Lax` sends the session cookie on a sibling subdomain's POST, so a
+/// UI write from another origin is refused and leaves the session alone.
+#[tokio::test]
+async fn a_ui_write_from_a_sibling_site_is_refused() {
+    let _serial = SERIAL.lock().await;
+    let (app, sessions) = app();
+    let session = seeded_session(&sessions);
+    let response = app
+        .oneshot(
+            Request::post("/ui/logout")
+                .header(header::COOKIE, format!("hfs_session={}", session.id))
+                .header("sec-fetch-site", "same-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(sessions.get(&session.id).is_some(), "session is kept");
+}
+
 #[tokio::test]
 async fn logout_clears_the_session_and_sends_the_browser_to_the_idp_end_session() {
     let _serial = SERIAL.lock().await;
