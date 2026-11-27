@@ -5,7 +5,8 @@
 //! `console/metrics/tenants` endpoint — where it is wrapped in bearer-token
 //! authentication plus [`crate::middleware::auth::admin_authz_middleware`],
 //! which requires a system-context scope. An ordinary user-/patient-context
-//! token, even a wildcard one, is rejected `403`; when auth is disabled
+//! token, even a wildcard one, is rejected `403`, and so is any token that
+//! carries a tenant claim; when auth is disabled
 //! server-wide the tier is open like every other route (dev mode).
 
 use axum::{
