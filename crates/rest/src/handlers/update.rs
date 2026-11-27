@@ -396,6 +396,7 @@ pub async fn conditional_update_handler<S>(
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
@@ -410,6 +411,12 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+    super::conditional_support::require_search_grant(
+        principal.as_ref().map(|p| &p.0),
+        &resource_type,
+        helios_persistence::core::ConditionalInteraction::Update,
+        None,
+    )?;
 
     if resource_type == "AuditEvent" {
         return Err(RestError::MethodNotAllowed {

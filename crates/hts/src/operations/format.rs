@@ -106,6 +106,7 @@ pub fn json_to_fhir_xml(value: &Value) -> String {
         let rt = obj
             .get("resourceType")
             .and_then(|v| v.as_str())
+            .filter(|rt| is_xml_element_name(rt))
             .unwrap_or("Resource");
         out.push('<');
         out.push_str(rt);
@@ -118,14 +119,25 @@ pub fn json_to_fhir_xml(value: &Value) -> String {
     out
 }
 
-/// Append all child elements of a JSON object, skipping `resourceType`.
+/// Append all child elements of a JSON object, skipping `resourceType` and
+/// any key that cannot be an XML element name.
 fn write_object_children(out: &mut String, obj: &serde_json::Map<String, Value>) {
     for (key, val) in obj {
-        if key == "resourceType" {
+        if key == "resourceType" || !is_xml_element_name(key) {
             continue;
         }
         write_value(out, key, val);
     }
+}
+
+/// Whether `name` can be spliced into an element tag as is: a letter or
+/// underscore followed by letters, digits, `_`, `-` or `.`. Every FHIR
+/// element and resource name satisfies this; stored JSON keys that do not
+/// are left out of the XML form rather than written into the markup.
+fn is_xml_element_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 /// Append the XML representation of a single `(name, value)` pair.
@@ -161,7 +173,11 @@ fn write_value(out: &mut String, name: &str, value: &Value) {
         }
         Value::Object(obj) => {
             // Nested FHIR resource container: <name><ResourceType>…</ResourceType></name>
-            if let Some(rt) = obj.get("resourceType").and_then(|v| v.as_str()) {
+            if let Some(rt) = obj
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .filter(|rt| is_xml_element_name(rt))
+            {
                 out.push('<');
                 out.push_str(name);
                 out.push('>');
@@ -329,5 +345,53 @@ mod tests {
         let xml = json_to_fhir_xml(&v);
         assert!(xml.contains("<resource><Patient>"));
         assert!(xml.contains("</Patient></resource>"));
+    }
+
+    #[test]
+    fn xml_keys_that_are_not_element_names_are_left_out() {
+        let v = json!({
+            "resourceType": "CodeSystem",
+            "id": "demo",
+            "not a name": "x",
+            "a/><b": {"c": 1},
+            "1starts": true,
+            "title": "ok"
+        });
+        let xml = json_to_fhir_xml(&v);
+        assert!(xml.contains("<id value=\"demo\"/>"));
+        assert!(xml.contains("<title value=\"ok\"/>"));
+        assert!(!xml.contains("not a name"));
+        assert!(!xml.contains("<a/>"));
+        assert!(!xml.contains("<b"));
+        assert!(!xml.contains("1starts"));
+    }
+
+    #[test]
+    fn xml_resource_type_that_is_not_an_element_name_falls_back() {
+        let v = json!({"resourceType": "Code System/>", "id": "demo"});
+        let xml = json_to_fhir_xml(&v);
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Resource xmlns="));
+        assert!(xml.ends_with("</Resource>"));
+
+        let nested = json!({
+            "resourceType": "Bundle",
+            "entry": [{"resource": {"resourceType": "<x>", "id": "p1"}}]
+        });
+        let xml = json_to_fhir_xml(&nested);
+        assert!(xml.contains("<resource><id value=\"p1\"/></resource>"));
+        assert!(!xml.contains("<x>"));
+    }
+
+    #[test]
+    fn xml_element_name_rule() {
+        assert!(is_xml_element_name("id"));
+        assert!(is_xml_element_name("valueCodeableConcept"));
+        assert!(is_xml_element_name("_id"));
+        assert!(is_xml_element_name("a-b.c"));
+        assert!(!is_xml_element_name(""));
+        assert!(!is_xml_element_name("9x"));
+        assert!(!is_xml_element_name("a b"));
+        assert!(!is_xml_element_name("a:b"));
+        assert!(!is_xml_element_name("a<b"));
     }
 }

@@ -331,11 +331,13 @@ impl SubscriptionEngine {
         match event.resource_type {
             "Subscription" => {
                 let snapshot = self.core.handle_subscription_event(&event);
-                if snapshot.is_some() || event.event_type == ResourceEventType::Delete {
-                    self.scheduler
-                        .state
-                        .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
-                }
+                // Every committed Subscription write retires what was queued
+                // for the previous generation: a registration, a delete, or a
+                // rewrite the engine could not register (which retires the
+                // previous registration too).
+                self.scheduler
+                    .state
+                    .invalidate_registration(event.tenant_id.as_str(), event.resource_id);
                 Some(
                     snapshot.filter(|s| s.subscription.status == SubscriptionStatusCode::Requested),
                 )
@@ -494,11 +496,21 @@ impl EngineCore {
                             return Some(snapshot);
                         }
                         Err(e) => {
+                            // The stored resource is the record of truth. When
+                            // the engine cannot represent it, it must hold no
+                            // serving registration for the id either: the
+                            // previous generation would otherwise keep
+                            // delivering with the previous channel while GET
+                            // shows the rewrite (status off, a new endpoint).
+                            let retired = self.manager.deregister(&tenant_id, subscription_id);
+                            self.ws_manager
+                                .remove_all_clients(&tenant_id, subscription_id);
                             warn!(
                                 tenant_id,
                                 subscription_id,
                                 error = %e,
-                                "Failed to register subscription"
+                                retired,
+                                "Failed to register subscription; previous registration retired"
                             );
                         }
                     }
@@ -1756,6 +1768,58 @@ mod tests {
         // Subscription should be registered.
         let sub = engine.manager().get_subscription("t1", "sub-1");
         assert!(sub.is_some());
+    }
+
+    /// A committed rewrite the engine cannot register (here: a topic the
+    /// tenant does not hold) retires the previous registration instead of
+    /// leaving it delivering while the stored resource says otherwise.
+    #[tokio::test]
+    async fn a_rewrite_the_engine_cannot_register_retires_the_previous_registration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let engine = make_engine("http://localhost:8080");
+        engine.topic_registry().add_topic("t1", encounter_topic());
+        let endpoint = format!("{}/webhook", server.uri());
+        let event = |version: &str, event_type: ResourceEventType, topic: &str| ResourceEvent {
+            tenant_id: TenantId::new("t1"),
+            fhir_version: FhirVersion::default(),
+            resource_type: "Subscription".to_string(),
+            resource_id: "sub-1".to_string(),
+            version_id: version.to_string(),
+            event_type,
+            resource: Some(crate::manager::tests::build_subscription_json(
+                topic,
+                "rest-hook",
+                Some(&endpoint),
+            )),
+            previous_resource: None,
+            timestamp: Utc::now(),
+        };
+
+        engine
+            .on_resource_event(event(
+                "1",
+                ResourceEventType::Create,
+                "http://example.org/topic/encounter-start",
+            ))
+            .await;
+        assert!(engine.manager().get_subscription("t1", "sub-1").is_some());
+
+        engine
+            .on_resource_event(event(
+                "2",
+                ResourceEventType::Update,
+                "http://example.org/topic/not-in-this-tenant",
+            ))
+            .await;
+        assert!(
+            engine.manager().get_subscription("t1", "sub-1").is_none(),
+            "the previous registration must not keep serving"
+        );
     }
 
     #[tokio::test]

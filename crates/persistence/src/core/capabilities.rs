@@ -383,6 +383,8 @@ impl StorageCapabilities {
 /// - [`SearchProvider::supports_search`](crate::core::SearchProvider::supports_search):
 ///   `search-type` and the `searchParam` / `searchInclude` / `searchRevInclude`
 ///   lists;
+/// - [`SearchProvider::serves_search_param`](crate::core::SearchProvider::serves_search_param):
+///   which parameters those lists keep (#2593);
 /// - [`SearchProvider::supports_contained_search`](crate::core::SearchProvider::supports_contained_search):
 ///   `_contained` / `_containedType`;
 /// - [`SearchProvider::modifiers_for_param_type`](crate::core::SearchProvider::modifiers_for_param_type):

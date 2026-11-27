@@ -695,12 +695,14 @@ mod sof_sqlquery_graph_tests {
     // Per-dependency row cap on an interior SQLView (#1473)
     // =========================================================================
 
-    /// A SQLView whose result is larger than the per-dependency cap fails the
-    /// request with a 422 naming the SQLView, the label it is selected by,
-    /// the cap and the setting. Its own input (3 rows) is within the cap; the
-    /// SQLView's cross join (9 rows) is not.
+    /// #2902: a SQLView is part of the one statement the primary database
+    /// runs, so its result is not materialized and the per-dependency cap
+    /// does not apply to it. The SQLView's cross join (9 rows) is over the cap
+    /// of 5; the subject's filter keeps 3 of them and the query answers.
+    /// (The cap on a SQLView is covered for the embedded engine by the unit
+    /// tests of `graph.rs`.)
     #[tokio::test]
-    async fn sqlview_over_the_source_row_cap_returns_422_naming_sqlview_and_setting() {
+    async fn sqlview_larger_than_the_source_row_cap_runs_in_the_primary_database() {
         let mut config = ServerConfig::for_testing();
         config.sof_sqlquery_max_source_rows_per_vd = 5;
         let (server, backend) = create_test_server_with_config(config).await;
@@ -730,25 +732,11 @@ mod sof_sqlquery_graph_tests {
         );
         let response = post_sql_run(&server, &run_body_inline(subject, "json")).await;
 
-        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
-        let outcome: Value = response.json();
-        let diagnostics = outcome["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap_or_default();
-        for needle in [
-            "dependency 'pairs'",
-            "(SQL View patient_pairs)",
-            "exceeds 5-row limit",
-            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
-        ] {
-            assert!(
-                diagnostics.contains(needle),
-                "missing {needle:?} in: {diagnostics}"
-            );
-        }
-        assert!(
-            !diagnostics.contains("add a WHERE/LIMIT clause"),
-            "{diagnostics}"
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(
+            rows,
+            json!([{ "patient_id": "p1" }, { "patient_id": "p1" }, { "patient_id": "p1" }])
         );
     }
 

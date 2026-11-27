@@ -23,7 +23,8 @@ use crate::extractors::{
     unknown_search_params,
 };
 use crate::handlers::search::{
-    append_ignored_params_outcome, append_truncation_outcomes, finish_includes,
+    append_ignored_params_outcome, append_omitted_types_outcome, append_truncation_outcomes,
+    finish_includes,
 };
 use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
@@ -188,8 +189,15 @@ where
     // Resolve the includes the backend did not (only MongoDB resolves them
     // inline), confine them to the patient compartment, and take out the
     // #1061 truncation markers, re-emitted below as warnings.
-    let truncation_messages =
-        finish_includes(&state, &tenant, &compartment, &query.includes, &mut result).await?;
+    let includes = finish_includes(
+        &state,
+        &tenant,
+        &compartment,
+        &chains,
+        &query.includes,
+        &mut result,
+    )
+    .await?;
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(&tenant);
@@ -223,7 +231,8 @@ where
     if !ignored_params.is_empty() {
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
-    append_truncation_outcomes(&mut bundle_json, &truncation_messages);
+    append_truncation_outcomes(&mut bundle_json, &includes.truncation);
+    append_omitted_types_outcome(&mut bundle_json, &includes.omitted_types);
 
     Ok((StatusCode::OK, Json(bundle_json)).into_response())
 }

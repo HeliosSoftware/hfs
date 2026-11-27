@@ -265,6 +265,7 @@ pub async fn conditional_patch_handler<S>(
     headers: HeaderMap,
     tenant: TenantExtractor,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
@@ -273,6 +274,12 @@ where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
     super::conditional_support::require_patch(state.storage())?;
+    super::conditional_support::require_search_grant(
+        principal.as_ref().map(|p| &p.0),
+        &resource_type,
+        helios_persistence::core::ConditionalInteraction::Patch,
+        None,
+    )?;
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {

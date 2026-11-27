@@ -211,6 +211,7 @@ pub async fn import_tgz(
                 total.concept_maps += stats.concept_maps;
                 total.concepts += stats.concepts;
                 total.errors.extend(stats.errors);
+                total.conflicts += stats.conflicts;
             }
 
             let new_concepts = total.concepts - concepts_before;
