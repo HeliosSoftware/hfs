@@ -28,6 +28,12 @@ What is selected, for a pull request:
     cargo can only narrow those with `-p`, which changes feature resolution
     and rebuilds the workspace (see test-rust.sh), and they take about five
     minutes.
+  * `mongodb_tests`, the longest suite by far, is held to a narrower rule:
+    it runs only when helios-persistence's own files change (or a file it
+    names by path), not when helios-persistence is merely a dependent of the
+    changed crate. A helios-fhirpath change that breaks MongoDB indexing
+    therefore shows on `main`, after the merge. helios-persistence's other
+    suites (PostgreSQL, Elasticsearch, ...) still follow the general rule.
   * If none of the selected targets starts a container, the job takes no
     Docker host slot, and the library modules that start containers in their
     unit tests are skipped (the same classification as docker-free-tests.py).
@@ -207,14 +213,18 @@ class Workspace:
                             self.reads[name].add(rel_target)
                             self.path_edges.append((name, other, f.relative_to(ROOT).as_posix()))
 
-    def affected(self, changed: set[str], files: list[str]) -> set[str]:
-        """`changed`, the packages that name one of the changed `files` (or a
-        directory above it) by path, and every package that depends on one
-        of those."""
+    def direct(self, changed: set[str], files: list[str]) -> set[str]:
+        """`changed` and the packages that name one of the changed `files`
+        (or a directory above it) by path."""
         out = set(changed)
         for name, paths in self.reads.items():
             if any(f == p or f.startswith(p + "/") for p in paths for f in files):
                 out.add(name)
+        return out
+
+    def affected(self, direct: set[str]) -> set[str]:
+        """`direct` and every package that depends on one of them."""
+        out = set(direct)
         grew = True
         while grew:
             grew = False
@@ -275,11 +285,16 @@ def plan(ws: Workspace, files: list[str] | None, reason_full: str | None) -> dic
             "skipped_docker_targets": [],
         }
 
-    affected = ws.affected(changed_pkgs, files or [])
+    direct = ws.direct(changed_pkgs, files or [])
+    affected = ws.affected(direct)
     # `--test <name>` runs that name in every package that has it, so a name
     # is selected if any package with it is affected, and needs Docker if any
     # package's target of that name does.
     selected = sorted(n for n, owners in targets.items() if any(p in affected for p, _ in owners))
+    # The MongoDB lane only for a direct change to its package (see the
+    # module docstring).
+    if MONGO_LANE in selected and not any(p in direct for p, _ in targets[MONGO_LANE]):
+        selected.remove(MONGO_LANE)
     docker = any(d for n in selected for _, d in targets[n])
     not_run = sorted(
         n for n, owners in targets.items() if n not in selected and any(d for _, d in owners)
@@ -331,7 +346,7 @@ def write(p: dict, out: Path | None) -> None:
             f"| Changed crates | {', '.join(p['changed']) or 'none'} |",
             f"| Affected (changed + dependents) | {', '.join(p['affected']) or 'none'} |",
             f"| Integration test targets run | {n} of {p['total_targets']} |",
-            f"| `mongodb_tests` | {'runs' if p['mongo'] else 'not run'} |",
+            f"| `mongodb_tests` (only for a change to helios-persistence itself) | {'runs' if p['mongo'] else 'not run'} |",
             f"| Docker host slot | {'taken' if p['docker'] else 'not needed'} |",
             "",
             "Unit tests and doc-tests run for every crate"
