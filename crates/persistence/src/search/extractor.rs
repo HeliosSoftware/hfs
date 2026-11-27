@@ -1564,8 +1564,8 @@ fn member_type(
     table: &[(&str, &str, &str, bool)],
 ) -> MemberType {
     let mut path = member.trim();
-    while path.starts_with('(') && path.ends_with(')') {
-        path = path[1..path.len() - 1].trim();
+    while let Some(inner) = strip_enclosing_parens(path) {
+        path = inner.trim();
     }
     // Rooted at the resource type, or relative to it (an abstract-base member
     // such as `meta.lastUpdated` after `Resource.` is stripped).
@@ -1717,6 +1717,22 @@ const EMPTY_PRESERVING_FUNCTIONS: [&str; 10] = [
     "children",
     "is",
 ];
+
+/// `s` without its outer parentheses when the first `(` closes at the last
+/// character, as in `(Bundle.timestamp)`; `None` otherwise, as for
+/// `(start | requestedPeriod.start).first()`, whose first `(` closes earlier.
+fn strip_enclosing_parens(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0usize;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(inner)
+}
 
 fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
@@ -2258,6 +2274,10 @@ mod tests {
         assert_eq!(kind("meta.lastUpdated", "Patient"), "instant");
         assert_eq!(kind("Patient.meta.lastUpdated", "Patient"), "instant");
         assert_eq!(kind("(Bundle.timestamp)", "Bundle"), "instant");
+        assert_eq!(kind("((Bundle.timestamp))", "Bundle"), "instant");
+        assert_eq!(strip_enclosing_parens("(a | b).first()"), None);
+        assert_eq!(strip_enclosing_parens("(a) | (b)"), None);
+        assert_eq!(strip_enclosing_parens("((a) | (b))"), Some("(a) | (b)"));
         assert_eq!(kind("Patient.birthDate", "Patient"), "other");
         // A choice without an `instant` type is not expanded.
         assert_eq!(kind("Patient.deceased", "Patient"), "other");
