@@ -134,6 +134,9 @@ pub struct ServerConfig {
     pub max_body_size: usize,
     /// Terminology server URL (defaults based on FHIR version)
     pub terminology_server: Option<String>,
+    /// Further terminology servers a request's `terminologyServer` may name;
+    /// `terminology_server` is always allowed.
+    pub allowed_terminology_servers: Vec<String>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -148,6 +151,7 @@ impl std::fmt::Debug for ServerConfig {
             cors_headers,
             max_body_size,
             terminology_server,
+            allowed_terminology_servers,
         } = self;
         f.debug_struct("ServerConfig")
             .field("port", port)
@@ -161,6 +165,13 @@ impl std::fmt::Debug for ServerConfig {
             .field(
                 "terminology_server",
                 &terminology_server.as_deref().map(redact_url),
+            )
+            .field(
+                "allowed_terminology_servers",
+                &allowed_terminology_servers
+                    .iter()
+                    .map(|url| redact_url(url))
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -180,6 +191,7 @@ impl Default for ServerConfig {
                     .to_string(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             terminology_server: None,
+            allowed_terminology_servers: Vec::new(),
         }
     }
 }
@@ -190,7 +202,7 @@ impl Default for ServerConfig {
     author,
     version,
     about = "FHIRPath HTTP server",
-    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server base URL (no default; required for %terminologies and memberOf)\n  FHIRPATH_TERMINOLOGY_TIMEOUT - Terminology request timeout in seconds, 0 to disable (default: 30)\n  FHIRPATH_TERMINOLOGY_MAX_CALLS - Max remote terminology server calls per evaluation (each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with Retry-After) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count), 0 to disable (default: 1000)"
+    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server base URL (no default; required for %terminologies and memberOf)\n  FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS - Further terminology servers a request's terminologyServer parameter may name, comma-separated (default: none)\n  FHIRPATH_TERMINOLOGY_TIMEOUT - Terminology request timeout in seconds, 0 to disable (default: 30)\n  FHIRPATH_TERMINOLOGY_MAX_CALLS - Max remote terminology server calls per evaluation (each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with Retry-After) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count), 0 to disable (default: 1000)"
 )]
 pub struct ServerArgs {
     /// Port to bind the server to
@@ -250,6 +262,17 @@ pub struct ServerArgs {
     /// Terminology server URL (defaults based on FHIR version)
     #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
+
+    /// Further terminology servers a request's `terminologyServer` parameter
+    /// may name, comma-separated. Unset, a request may name only
+    /// FHIRPATH_TERMINOLOGY_SERVER.
+    #[arg(
+        long,
+        env = "FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS",
+        hide_env_values = true,
+        value_delimiter = ','
+    )]
+    pub allowed_terminology_servers: Vec<String>,
 }
 
 impl From<ServerArgs> for ServerConfig {
@@ -264,6 +287,7 @@ impl From<ServerArgs> for ServerConfig {
             cors_headers: args.cors_headers,
             max_body_size: args.max_body_size,
             terminology_server: args.terminology_server,
+            allowed_terminology_servers: args.allowed_terminology_servers,
         }
     }
 }
@@ -336,6 +360,13 @@ pub fn create_app(config: &ServerConfig) -> Router {
     {
         app = app.route("/r6", post(crate::handlers::evaluate_fhirpath_r6));
     }
+
+    app = app.layer(axum::Extension(std::sync::Arc::new(
+        crate::handlers::TerminologyServerPolicy::new(
+            config.terminology_server.as_deref(),
+            &config.allowed_terminology_servers,
+        ),
+    )));
 
     // Transparently decompress request bodies sent with `Content-Encoding`
     // (gzip, deflate, br, zstd) and compress responses when the client sends
@@ -543,6 +574,7 @@ mod tests {
             cors_headers: "Content-Type".to_string(),
             max_body_size: 2048,
             terminology_server: None,
+            allowed_terminology_servers: Vec::new(),
         };
 
         let config: ServerConfig = args.into();

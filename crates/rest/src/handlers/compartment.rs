@@ -23,7 +23,8 @@ use crate::extractors::{
     unknown_search_params,
 };
 use crate::handlers::search::{
-    append_ignored_params_outcome, append_truncation_outcomes, finish_includes,
+    append_ignored_params_outcome, append_omitted_types_outcome, append_truncation_outcomes,
+    finish_includes,
 };
 use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
@@ -82,6 +83,43 @@ where
         "Processing compartment search request"
     );
 
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+    let bundle = execute_compartment_search_bundle(
+        &state,
+        &tenant,
+        fhir_version,
+        &compartment,
+        &chains,
+        &compartment_type,
+        &compartment_id,
+        &target_type,
+        pairs,
+        strict,
+    )
+    .await?;
+    Ok((StatusCode::OK, Json(bundle)).into_response())
+}
+
+/// The searchset of `[compartment-type]/[id]/[resource-type]` (or `/*`), for
+/// the handler and for a Bundle `GET` entry naming the same URL (#2669),
+/// which must answer the search it names and not a read of
+/// `[compartment-type]/[id]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_compartment_search_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: helios_fhir::FhirVersion,
+    compartment: &PatientCompartment,
+    chains: &ChainAccess,
+    compartment_type: &str,
+    compartment_id: &str,
+    target_type: &str,
+    pairs: Vec<(String, String)>,
+    strict: bool,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
     // `GET [base]/[compartment]/[id]/*` searches every resource type that is a
     // member of the compartment, rather than a single target type.
     if target_type == "*" {
@@ -90,7 +128,7 @@ where
             compartment_type,
             compartment_id,
             tenant,
-            version,
+            fhir_version,
             compartment,
             chains,
             pairs,
@@ -100,9 +138,8 @@ where
     }
 
     // Get the reference parameters for this compartment/target combination
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let ref_params =
-        helios_fhir::get_compartment_params(fhir_version, &compartment_type, &target_type);
+        helios_fhir::get_compartment_params(fhir_version, compartment_type, target_type);
 
     // Check if the resource type is a member of the compartment
     if ref_params.is_empty() {
@@ -135,7 +172,7 @@ where
     let unknown = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        unknown_search_params(&target_type, &search_params, &registry)
+        unknown_search_params(target_type, &search_params, &registry)
     };
     let ignored_params = resolve_unknown_params(unknown, &mut search_params, strict)?;
     if !ignored_params.is_empty() {
@@ -151,7 +188,7 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        build_search_query_for_version(&target_type, &search_params, &registry, fhir_version)?
+        build_search_query_for_version(target_type, &search_params, &registry, fhir_version)?
     };
 
     // Restrict to compartment members. A resource joins a compartment if it
@@ -163,7 +200,7 @@ where
         params: ref_params.iter().map(|s| s.to_string()).collect(),
         reference: compartment_ref,
     });
-    compartment.confine_compartment_query(&compartment_type, &compartment_id, &mut query)?;
+    compartment.confine_compartment_query(compartment_type, compartment_id, &mut query)?;
 
     // Clamp page size to the configured default/maximum.
     let count = query
@@ -173,7 +210,7 @@ where
         .min(state.max_page_size());
     query.count = Some(count as u32);
 
-    let query = resolve_out_of_band(&state, &tenant, &chains, query, fhir_version).await?;
+    let query = resolve_out_of_band(state, tenant, chains, query, fhir_version).await?;
 
     // Execute the search
     let mut result = state
@@ -188,16 +225,23 @@ where
     // Resolve the includes the backend did not (only MongoDB resolves them
     // inline), confine them to the patient compartment, and take out the
     // #1061 truncation markers, re-emitted below as warnings.
-    let truncation_messages =
-        finish_includes(&state, &tenant, &compartment, &query.includes, &mut result).await?;
+    let includes = finish_includes(
+        state,
+        tenant,
+        compartment,
+        chains,
+        &query.includes,
+        &mut result,
+    )
+    .await?;
 
     // Build the self link URL
-    let public_base = state.public_base_url_for_request(&tenant);
+    let public_base = state.public_base_url_for_request(tenant);
     let self_link = build_compartment_search_url(
         &public_base,
-        &compartment_type,
-        &compartment_id,
-        &target_type,
+        compartment_type,
+        compartment_id,
+        target_type,
         &search_params,
     );
 
@@ -205,7 +249,7 @@ where
     let match_count = result.resources.len();
     let mut bundle = result.into_bundle_with_page_size(&public_base, &self_link, Some(count));
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
-        state.public_url_for_request(&tenant, [resource_type, id])
+        state.public_url_for_request(tenant, [resource_type, id])
     });
 
     debug!(
@@ -223,9 +267,10 @@ where
     if !ignored_params.is_empty() {
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
-    append_truncation_outcomes(&mut bundle_json, &truncation_messages);
+    append_truncation_outcomes(&mut bundle_json, &includes.truncation);
+    append_omitted_types_outcome(&mut bundle_json, &includes.omitted_types);
 
-    Ok((StatusCode::OK, Json(bundle_json)).into_response())
+    Ok(bundle_json)
 }
 
 /// Searches across all resource types in a compartment.
@@ -249,20 +294,19 @@ where
 /// ceiling across all member types.
 #[allow(clippy::too_many_arguments)]
 async fn compartment_search_all<S>(
-    state: AppState<S>,
-    compartment_type: String,
-    compartment_id: String,
-    tenant: TenantExtractor,
-    version: FhirVersionExtractor,
-    compartment: PatientCompartment,
-    chains: ChainAccess,
+    state: &AppState<S>,
+    compartment_type: &str,
+    compartment_id: &str,
+    tenant: &TenantExtractor,
+    fhir_version: helios_fhir::FhirVersion,
+    compartment: &PatientCompartment,
+    chains: &ChainAccess,
     pairs: Vec<(String, String)>,
     strict: bool,
-) -> RestResult<Response>
+) -> RestResult<serde_json::Value>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
@@ -283,7 +327,7 @@ where
             .iter()
             .copied()
             .filter(|target_type| {
-                !helios_fhir::get_compartment_params(fhir_version, &compartment_type, target_type)
+                !helios_fhir::get_compartment_params(fhir_version, compartment_type, target_type)
                     .is_empty()
             })
             .filter(|target_type| {
@@ -348,7 +392,7 @@ where
             .filter_map(|target_type| {
                 let ref_params = helios_fhir::get_compartment_params(
                     fhir_version,
-                    &compartment_type,
+                    compartment_type,
                     target_type,
                 );
 
@@ -380,8 +424,8 @@ where
                 // the launch patient: the compartment lists other patients
                 // through `link`.
                 if let Err(e) = compartment.confine_compartment_query(
-                    &compartment_type,
-                    &compartment_id,
+                    compartment_type,
+                    compartment_id,
                     &mut query,
                 ) {
                     confine_error.get_or_insert(e);
@@ -419,7 +463,7 @@ where
         if collected.len() >= count {
             break;
         }
-        let query = &resolve_out_of_band(&state, &tenant, &chains, query, fhir_version).await?;
+        let query = &resolve_out_of_band(state, tenant, chains, query, fhir_version).await?;
         match state.storage().search(tenant.context(), query).await {
             Ok(result) => collected.extend(result.resources.items),
             Err(e) => {
@@ -439,11 +483,11 @@ where
         helios_persistence::types::Page::new(collected, helios_persistence::types::PageInfo::end());
     let result = helios_persistence::core::SearchResult::new(page);
 
-    let public_base = state.public_base_url_for_request(&tenant);
+    let public_base = state.public_base_url_for_request(tenant);
     let self_link = build_compartment_search_url(
         &public_base,
-        &compartment_type,
-        &compartment_id,
+        compartment_type,
+        compartment_id,
         "*",
         &SearchParams::from_pairs(
             search_params
@@ -456,7 +500,7 @@ where
     let match_count = result.resources.len();
     let mut bundle = result.into_bundle(&public_base, &self_link);
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
-        state.public_url_for_request(&tenant, [resource_type, id])
+        state.public_url_for_request(tenant, [resource_type, id])
     });
 
     debug!(
@@ -471,7 +515,7 @@ where
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
 
-    Ok((StatusCode::OK, Json(bundle_json)).into_response())
+    Ok(bundle_json)
 }
 
 /// Applies the criteria a backend's `search()` does not: the ones the type

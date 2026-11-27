@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::ws::{CloseFrame, Message, WebSocket},
+    extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
     extract::{State, WebSocketUpgrade},
     response::Response,
 };
@@ -33,6 +33,17 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a bound client may take to accept one frame.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest message or frame the route reads from a client. The protocol
+/// reads one `bind-with-token <token>` message of a few dozen bytes and
+/// ignores everything after it, so the 64 MiB message and 16 MiB frame the
+/// WebSocket library allows by default would only let a peer make the server
+/// buffer that much per connection.
+const MAX_INCOMING_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// How long the close frame for an oversized message may take to send. The
+/// peer may be bound and not reading, so the send must not wait on it.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// WebSocket binding handler.
 ///
@@ -57,9 +68,15 @@ where
     let request_tenant_id = tenant.tenant_id().to_string();
 
     // Upgrade the HTTP connection to WebSocket.
-    Ok(ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, engine, request_tenant_id, base_url)
-    }))
+    Ok(ws
+        .max_message_size(MAX_INCOMING_MESSAGE_BYTES)
+        .max_frame_size(MAX_INCOMING_MESSAGE_BYTES)
+        // The library reads into a 128 KiB buffer per connection by default,
+        // which no message this route accepts can fill.
+        .read_buffer_size(MAX_INCOMING_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            handle_ws_connection(socket, engine, request_tenant_id, base_url)
+        }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,9 +151,13 @@ async fn handle_ws_connection(
     };
 
     // Register this client with the WebSocket manager.
-    let (client_id, mut rx) = engine
+    let Some((client_id, mut rx)) = engine
         .ws_manager()
-        .register_client(&tenant_id, &subscription_id);
+        .register_client(&tenant_id, &subscription_id)
+    else {
+        close_with_policy_violation(&mut socket, "too-many-clients").await;
+        return;
+    };
     let ws_manager = Arc::clone(engine.ws_manager());
 
     info!(
@@ -153,7 +174,7 @@ async fn handle_ws_connection(
     if let Ok(bundle) = handshake_bundle {
         match serde_json::to_string(&bundle) {
             Ok(msg) => {
-                if send_within_deadline(&mut socket, msg).await.is_err() {
+                if send_within_deadline(&mut socket, msg.into()).await.is_err() {
                     warn!(
                         client_id = %client_id,
                         "Failed to send handshake, client disconnected or not reading"
@@ -179,8 +200,20 @@ async fn handle_ws_connection(
             // Notification from the subscription engine.
             notification = rx.recv() => {
                 match notification {
-                    Some(bundle) => {
-                        match serde_json::to_string(&bundle) {
+                    // The manager released this client: it let its queue
+                    // fill and was dropped, or the subscription went away.
+                    // The backlog is not delivered, so a client that reads
+                    // just inside the send deadline cannot keep its queued
+                    // bundles in memory for hours after being dropped.
+                    Some(_) if rx.is_closed() => {
+                        warn!(
+                            client_id = %client_id,
+                            "WebSocket client was released by the subscription engine; closing without delivering its backlog"
+                        );
+                        break;
+                    }
+                    Some(payload) => {
+                        match Utf8Bytes::try_from(payload) {
                             Ok(msg) => match send_within_deadline(&mut socket, msg).await {
                                 Ok(()) => {}
                                 Err(SendFailure::Disconnected) => {
@@ -203,7 +236,7 @@ async fn handle_ws_connection(
                                 warn!(
                                     client_id = %client_id,
                                     error = %e,
-                                    "Failed to serialize notification bundle"
+                                    "Notification payload is not UTF-8"
                                 );
                             }
                         }
@@ -250,6 +283,9 @@ async fn handle_ws_connection(
                             error = %e,
                             "WebSocket error"
                         );
+                        if is_message_too_big(&e) {
+                            close_with_message_too_big(&mut socket).await;
+                        }
                         break;
                     }
                 }
@@ -274,8 +310,8 @@ enum SendFailure {
 
 /// Sends one text frame, giving up after [`SEND_TIMEOUT`]: a peer that stops
 /// reading leaves `send` pending once the socket buffers are full.
-async fn send_within_deadline(socket: &mut WebSocket, msg: String) -> Result<(), SendFailure> {
-    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(msg.into()))).await {
+async fn send_within_deadline(socket: &mut WebSocket, msg: Utf8Bytes) -> Result<(), SendFailure> {
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(msg))).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(SendFailure::Disconnected),
         Err(_) => Err(SendFailure::Stalled),
@@ -315,6 +351,9 @@ async fn receive_bind_token(socket: &mut WebSocket) -> Option<String> {
         }
         Some(Err(e)) => {
             warn!(error = %e, "WebSocket error before bind");
+            if is_message_too_big(&e) {
+                close_with_message_too_big(socket).await;
+            }
             None
         }
     }
@@ -334,6 +373,25 @@ async fn close_with_policy_violation(socket: &mut WebSocket, reason: &str) {
             reason: reason.to_string().into(),
         })))
         .await;
+}
+
+/// Whether `error` is the WebSocket layer refusing a message or frame larger
+/// than [`MAX_INCOMING_MESSAGE_BYTES`].
+fn is_message_too_big(error: &axum::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|source| matches!(source, tungstenite::Error::Capacity(_)))
+}
+
+/// Tells the peer its message was refused for its size (close code 1009)
+/// rather than leaving it with a dropped connection. The oversized payload is
+/// left unread, so a peer still sending it may see a reset instead.
+async fn close_with_message_too_big(socket: &mut WebSocket) {
+    let close = Message::Close(Some(CloseFrame {
+        code: 1009,
+        reason: "message-too-big".into(),
+    }));
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.send(close)).await;
 }
 
 #[cfg(test)]
@@ -363,7 +421,7 @@ mod tests {
     #[test]
     fn binding_token_tenant_must_match_request_tenant() {
         let manager = helios_subscriptions::WsBindingTokenManager::new(30);
-        let (token, _) = manager.generate_token("acme", "subscription-1");
+        let (token, _) = manager.generate_token("acme", "subscription-1").unwrap();
 
         assert_eq!(
             validate_binding_token_for_request(&manager, &token, "other"),
@@ -377,7 +435,7 @@ mod tests {
     #[test]
     fn binding_token_matching_request_tenant_is_accepted() {
         let manager = helios_subscriptions::WsBindingTokenManager::new(30);
-        let (token, _) = manager.generate_token("acme", "subscription-1");
+        let (token, _) = manager.generate_token("acme", "subscription-1").unwrap();
 
         assert_eq!(
             validate_binding_token_for_request(&manager, &token, "acme"),

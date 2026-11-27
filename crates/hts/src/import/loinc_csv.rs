@@ -340,7 +340,7 @@ pub async fn import_loinc_csv(
     seed.defer_closure = true;
     let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     // Collect concepts into a stable order so chunks across retries are
     // deterministic.
@@ -383,7 +383,7 @@ pub async fn import_loinc_csv(
         parsed.fresh_load = fresh_load;
         parsed.defer_closure = true;
         let chunk_stats = backend.import_parsed(ctx, parsed).await?;
-        stats.errors.extend(chunk_stats.errors);
+        stats.take_errors(chunk_stats);
         stats.concepts += chunk.len() as u32;
 
         eprintln!(

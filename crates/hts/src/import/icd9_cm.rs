@@ -158,7 +158,7 @@ pub async fn import_icd9_cm(
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
     let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = concepts.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -175,7 +175,7 @@ pub async fn import_icd9_cm(
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
         let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        stats.take_errors(chunk);
 
         eprintln!(
             "[icd9-cm] batch {}/{total_batches} — +{} concepts (total: {})",

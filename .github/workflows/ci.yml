@@ -104,8 +104,10 @@ jobs:
     runs-on: [self-hosted, "${{ matrix.os }}"]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. Healthy runs on the slowest runner (the old Windows
-    # agent) took ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
-    timeout-minutes: 180
+    # agent) took ~105-115 min, so 120 cancelled good runs; 180 left headroom.
+    # 300 adds the wait for a Docker host slot (up to 120 min); the test step
+    # carries its own 150-minute bound.
+    timeout-minutes: 300
     steps:
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
@@ -240,6 +242,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Cap how many testcontainer suites share the Docker host; see
+      # .github/scripts/docker-host-slot.sh. Taken after the build, which
+      # needs no containers, so a waiting job has already done that work.
+      # `vars.DOCKER_HOST_TEST_SLOTS` overrides the default of 2 (0 = no cap).
+      - name: Wait for a Docker host slot
+        shell: bash
+        env:
+          DOCKER_HOST_TEST_SLOTS: ${{ vars.DOCKER_HOST_TEST_SLOTS }}
+        run: bash .github/scripts/docker-host-slot.sh acquire
+
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
       # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
@@ -247,6 +259,8 @@ jobs:
       # instead of the suite quietly verifying nothing (issue #307).
       - name: Run tests with all features
         shell: bash
+        # The step's own bound, now that the job's has room for the slot wait.
+        timeout-minutes: 150
         env:
           HFS_REQUIRE_R5: "1"
           # Un-skips the S3+ES composite suite (s3_es_tests.rs), which had
@@ -321,6 +335,11 @@ jobs:
             echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
             exit 1
           fi
+
+      - name: Release the Docker host slot
+        if: always()
+        shell: bash
+        run: bash .github/scripts/docker-host-slot.sh release
 
       # Last step, and non-fatal by construction. `clean: false` above keeps the
       # target dir warm across runs, which is what makes this job fit in 120
@@ -1056,6 +1075,16 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
 
+      # Cap how many testcontainer suites share the Docker host; see
+      # .github/scripts/docker-host-slot.sh. Held through this step's build too,
+      # which is fine for a job that only runs on pushes.
+      # `vars.DOCKER_HOST_TEST_SLOTS` overrides the default of 2 (0 = no cap).
+      - name: Wait for a Docker host slot
+        shell: bash
+        env:
+          DOCKER_HOST_TEST_SLOTS: ${{ vars.DOCKER_HOST_TEST_SLOTS }}
+        run: bash .github/scripts/docker-host-slot.sh acquire
+
       - name: Generate code coverage
         # Enable the in-DB storage backends so their SOF conformance suites
         # (which exercise the postgres/mongodb emitters) are measured; Docker is
@@ -1136,6 +1165,11 @@ jobs:
           fi
 
           cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Release the Docker host slot
+        if: always()
+        shell: bash
+        run: bash .github/scripts/docker-host-slot.sh release
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report

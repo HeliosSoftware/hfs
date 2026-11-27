@@ -84,7 +84,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | header | boolean | 0 | 1 | CSV only. `true` (default) returns a header row. |
 /// | patient | Reference | 0 | * | Restrict the resources feeding the view to these patients' compartments. |
 /// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
-/// | source | string | 0 | 1 | External data source. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
+/// | source | string | 0 | 1 | External data source: file://, http(s)://, s3://, gs:// or azure:// URLs, only under a prefix listed in `SOF_SERVER_SOURCE_PREFIXES` (none by default, which answers 501). |
 /// | _limit | integer | 0 | 1 | Maximum rows returned. (1-10000) |
 /// | _since | instant | 0 | 1 | Only resources modified at or after this time. (RFC3339) |
 /// | resource | Resource | 0 | * | FHIR resources to transform instead of using server data. A Bundle is unwrapped one level. |
@@ -125,6 +125,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 pub async fn sql_run_handler(
     Query(params): Query<RunQueryParams>,
     headers: HeaderMap,
+    sources: Option<axum::Extension<std::sync::Arc<crate::data_source::SourcePolicy>>>,
     body: Option<Json<serde_json::Value>>,
 ) -> ServerResult<Response> {
     info!("Handling $sql-run request");
@@ -393,8 +394,21 @@ pub async fn sql_run_handler(
     let mut source_bundle = None;
     let mut source_fhir_version = None;
     if let Some(source) = &source_param {
-        info!("Loading data from source: {}", source);
-        let data_source = UniversalDataSource::new();
+        let policy = sources
+            .map(|axum::Extension(policy)| (*policy).clone())
+            .unwrap_or_default();
+        if policy.is_empty() {
+            return Err(ServerError::NotImplemented(
+                "the 'source' parameter is disabled on this server; its operator can allow \
+                 URL prefixes with SOF_SERVER_SOURCE_PREFIXES"
+                    .to_string(),
+            ));
+        }
+        info!(
+            "Loading data from source: {}",
+            helios_observability::redact::redact_url(source)
+        );
+        let data_source = UniversalDataSource::with_policy(policy);
         let loaded_bundle = data_source.load(source).await?;
 
         // Capture the FHIR version from the loaded source bundle
@@ -741,7 +755,8 @@ fn create_capability_statement() -> serde_json::Value {
 /// Omitted relative to the guide's definition, and rejected on request:
 /// - `subjectCanonical` / `subjectReference` — no resource store to resolve against
 /// - `context` — supporting artifacts only matter for SQLQuery/SQLView subjects
-/// - `source` — no external data sources
+/// - `source` — not advertised; accepted only for URLs under a prefix the
+///   operator lists in `SOF_SERVER_SOURCE_PREFIXES`
 pub async fn sql_run_operation_definition() -> ServerResult<impl IntoResponse> {
     Ok((
         StatusCode::OK,

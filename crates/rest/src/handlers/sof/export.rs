@@ -256,7 +256,40 @@ where
         return Ok(missing_subject_response());
     }
 
-    submit_export_job(&state, &tenant, work, inputs).await
+    let owner_subject = principal.map(|p| p.subject);
+    submit_export_job(&state, &tenant, work, inputs, owner_subject).await
+}
+
+/// Whether `principal` may poll, read, download or cancel job `job_id`: the
+/// subject that started it, or a wildcard reader outside `patient/`, the rule
+/// `$export` jobs follow. With auth off there is no principal and no check.
+fn may_access_job<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    job_id: &str,
+    principal: Option<&Principal>,
+) -> bool
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let owner = state
+        .export_controller()
+        .and_then(|c| c.owner_subject(tenant.tenant_id(), job_id));
+    crate::handlers::bulk_export::owns_job(principal, owner.as_deref())
+}
+
+/// The `404` a job the caller may not see answers with, the same as an
+/// unknown job's.
+fn job_not_found(job_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "not-found",
+                "diagnostics": format!("Export job '{job_id}' not found")}]
+        })),
+    )
+        .into_response()
 }
 
 /// 400 response for a request that names no subject. `subject` is `1..*`, and
@@ -307,11 +340,15 @@ where
 
     // Shorthand: a bare ViewDefinition body is a single unnamed subject.
     if rt == "ViewDefinition" {
-        super::authz::check_read_scopes(
+        super::authz::authorize_reads(
+            state,
+            tenant.context(),
             principal,
             "$sql-export",
+            body,
             super::authz::view_resource_type(body),
-        )?;
+        )
+        .await?;
         work.views.push(NamedView {
             name: subject_output_name(None, body, 0),
             view: body.clone(),
@@ -401,11 +438,15 @@ where
         let output_name = subject_output_name(name.as_deref(), &subject.resource, index);
         match subject.kind {
             SubjectKind::ViewDefinition => {
-                super::authz::check_read_scopes(
+                super::authz::authorize_reads(
+                    state,
+                    tenant.context(),
                     principal,
                     "$sql-export",
+                    &subject.resource,
                     super::authz::view_resource_type(&subject.resource),
-                )?;
+                )
+                .await?;
                 work.views.push(NamedView {
                     name: output_name,
                     view: subject.resource,
@@ -468,10 +509,13 @@ async fn prepare_named_sqlquery<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
-    let library =
-        helios_sof::sqlquery::parse_sqlquery_library(library_json).map_err(sqlquery_err_to_rest)?;
+    // A backend that speaks SQL runs the Library's SQL itself, so the SQL is
+    // read (and parsed) in that database's dialect.
+    let native_sql = state.sof_runner().and_then(|r| r.native_sql_dialect());
+    let library = helios_sof::sqlquery::parse_sqlquery_library_for(library_json, native_sql)
+        .map_err(sqlquery_err_to_rest)?;
 
-    validate_select_only(&library.sql)?;
+    validate_select_only(&library.sql, native_sql)?;
 
     let is_sql_view = matches!(
         super::subject::classify_subject(library_json)?,
@@ -484,6 +528,7 @@ where
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
+        native_sql,
         depends_on: &library.depends_on,
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,
@@ -495,11 +540,15 @@ where
     super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Every leaf ViewDefinition in the plan reads the resource type it names.
-    super::authz::check_read_scopes(
+    super::authz::authorize_reads(
+        state,
+        tenant.context(),
         principal,
         "$sql-export",
+        library_json,
         super::authz::plan_resource_types(&plan),
-    )?;
+    )
+    .await?;
 
     let bindings = helios_sof::sqlquery::bind_supplied_params(&library.parameters, supplied_params)
         .map_err(sqlquery_err_to_rest)?;
@@ -587,6 +636,7 @@ async fn submit_export_job<S>(
     tenant: &TenantExtractor,
     work: ExportWork,
     inputs: ExportInputs,
+    owner_subject: Option<String>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -671,7 +721,7 @@ where
         return Ok(resp);
     }
 
-    dispatch_export_job(state, tenant, work, inputs).await
+    dispatch_export_job(state, tenant, work, inputs, owner_subject).await
 }
 
 /// Shared tail of every export kick-off: require the controller, build the
@@ -681,6 +731,7 @@ async fn dispatch_export_job<S>(
     tenant: &TenantExtractor,
     work: ExportWork,
     inputs: ExportInputs,
+    owner_subject: Option<String>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -720,6 +771,7 @@ where
         format: inputs.format.clone(),
         header: inputs.header,
         client_tracking_id: inputs.client_tracking_id.clone(),
+        owner_subject,
     };
 
     let job_id = match controller.submit(task) {
@@ -772,11 +824,13 @@ pub async fn get_export_status_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
     headers: HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // Spec Common Operation Behavior — Asynchronous Delivery: the `Accept`
     // header on each poll governs that poll's response (interim `202 Accepted`
     // bodies and error responses). The FHIR XML representation is not supported
@@ -797,6 +851,9 @@ where
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.get_status(tenant.tenant_id(), &job_id) {
         None | Some(JobStatus::Cancelled { .. }) => Ok((
@@ -972,11 +1029,13 @@ pub async fn get_export_result_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
     headers: HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     // The result `GET`'s `Accept` header governs the manifest representation.
     // FHIR XML is not supported → 406, same as the run operations.
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
@@ -994,6 +1053,9 @@ where
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.get_status(tenant.tenant_id(), &job_id) {
         // Unknown, cancelled, or still running → no result available. The
@@ -1127,16 +1189,21 @@ pub async fn cancel_export_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     let controller = match state.export_controller() {
         Some(c) => c,
         None => {
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     if controller.cancel(tenant.tenant_id(), &job_id) {
         // Spec: cancellation responds 202 Accepted, not 204 No Content.
@@ -1171,16 +1238,21 @@ pub async fn download_export_file_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path((job_id, filename)): Path<(String, String)>,
+    principal: Option<axum::Extension<Principal>>,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let principal = principal.map(|axum::Extension(p)| p);
     let controller = match state.export_controller() {
         Some(c) => c,
         None => {
             return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
         }
     };
+    if !may_access_job(&state, &tenant, &job_id, principal.as_ref()) {
+        return Ok(job_not_found(&job_id));
+    }
 
     match controller.read_shard(tenant.tenant_id(), &job_id, &filename) {
         None => Ok((

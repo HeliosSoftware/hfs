@@ -100,7 +100,8 @@ where
     }
     // A Library the SQL parser rejects has no usable dependencies; the write
     // itself is not this module's to refuse (`$sql-run` reports the problem).
-    let Ok(library) = helios_sof::sqlquery::parse_sqlquery_library(resource) else {
+    let native_sql = state.sof_runner().and_then(|r| r.native_sql_dialect());
+    let Ok(library) = helios_sof::sqlquery::parse_sqlquery_library_for(resource, native_sql) else {
         return Ok(Some(PreparedDependencies(Vec::new())));
     };
 

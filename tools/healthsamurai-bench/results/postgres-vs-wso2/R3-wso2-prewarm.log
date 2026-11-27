@@ -1,0 +1,179 @@
+Running test: /k6/prewarm.js on server: wso2 with run ID: R3-wso2
+================================================
+time="2026-11-18T11:46:17Z" level=warning msg="experimental-prometheus-rw output has been deprecated and is planned for removal in k6 v3. We recommend using opentelemetry for all your metrics output."
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+
+     execution: local
+        script: /k6/prewarm.js
+        output: Prometheus remote write (http://prometheus:9090/api/v1/write)
+
+     scenarios: (100.00%) 1 scenario, 10 max VUs, 1m0s max duration (incl. graceful stop):
+              * warmup: 10 looping VUs for 30s (gracefulStop: 30s)
+
+
+running (0m01.0s), 10/10 VUs, 30 complete and 0 interrupted iterations
+warmup   [   3% ] 10 VUs  01.0s/30s
+
+running (0m02.0s), 10/10 VUs, 60 complete and 0 interrupted iterations
+warmup   [   7% ] 10 VUs  02.0s/30s
+
+running (0m03.0s), 10/10 VUs, 97 complete and 0 interrupted iterations
+warmup   [  10% ] 10 VUs  03.0s/30s
+
+running (0m04.0s), 10/10 VUs, 130 complete and 0 interrupted iterations
+warmup   [  13% ] 10 VUs  04.0s/30s
+
+running (0m05.0s), 10/10 VUs, 170 complete and 0 interrupted iterations
+warmup   [  17% ] 10 VUs  05.0s/30s
+
+running (0m06.0s), 10/10 VUs, 203 complete and 0 interrupted iterations
+warmup   [  20% ] 10 VUs  06.0s/30s
+
+running (0m07.0s), 10/10 VUs, 240 complete and 0 interrupted iterations
+warmup   [  23% ] 10 VUs  07.0s/30s
+
+running (0m08.0s), 10/10 VUs, 270 complete and 0 interrupted iterations
+warmup   [  27% ] 10 VUs  08.0s/30s
+
+running (0m09.0s), 10/10 VUs, 305 complete and 0 interrupted iterations
+warmup   [  30% ] 10 VUs  09.0s/30s
+
+running (0m10.0s), 10/10 VUs, 340 complete and 0 interrupted iterations
+warmup   [  33% ] 10 VUs  10.0s/30s
+
+running (0m11.0s), 10/10 VUs, 377 complete and 0 interrupted iterations
+warmup   [  37% ] 10 VUs  11.0s/30s
+
+running (0m12.0s), 10/10 VUs, 410 complete and 0 interrupted iterations
+warmup   [  40% ] 10 VUs  12.0s/30s
+
+running (0m13.0s), 10/10 VUs, 445 complete and 0 interrupted iterations
+warmup   [  43% ] 10 VUs  13.0s/30s
+
+running (0m14.0s), 10/10 VUs, 485 complete and 0 interrupted iterations
+warmup   [  47% ] 10 VUs  14.0s/30s
+
+running (0m15.0s), 10/10 VUs, 539 complete and 0 interrupted iterations
+warmup   [  50% ] 10 VUs  15.0s/30s
+
+running (0m16.0s), 10/10 VUs, 595 complete and 0 interrupted iterations
+warmup   [  53% ] 10 VUs  16.0s/30s
+
+running (0m17.0s), 10/10 VUs, 648 complete and 0 interrupted iterations
+warmup   [  57% ] 10 VUs  17.0s/30s
+
+running (0m18.0s), 10/10 VUs, 700 complete and 0 interrupted iterations
+warmup   [  60% ] 10 VUs  18.0s/30s
+
+running (0m19.0s), 10/10 VUs, 747 complete and 0 interrupted iterations
+warmup   [  63% ] 10 VUs  19.0s/30s
+
+running (0m20.0s), 10/10 VUs, 796 complete and 0 interrupted iterations
+warmup   [  67% ] 10 VUs  20.0s/30s
+
+running (0m21.0s), 10/10 VUs, 844 complete and 0 interrupted iterations
+warmup   [  70% ] 10 VUs  21.0s/30s
+
+running (0m22.0s), 10/10 VUs, 894 complete and 0 interrupted iterations
+warmup   [  73% ] 10 VUs  22.0s/30s
+
+running (0m23.0s), 10/10 VUs, 944 complete and 0 interrupted iterations
+warmup   [  77% ] 10 VUs  23.0s/30s
+
+running (0m24.0s), 10/10 VUs, 994 complete and 0 interrupted iterations
+warmup   [  80% ] 10 VUs  24.0s/30s
+
+running (0m25.0s), 10/10 VUs, 1043 complete and 0 interrupted iterations
+warmup   [  83% ] 10 VUs  25.0s/30s
+
+running (0m26.0s), 10/10 VUs, 1089 complete and 0 interrupted iterations
+warmup   [  87% ] 10 VUs  26.0s/30s
+
+running (0m27.0s), 10/10 VUs, 1134 complete and 0 interrupted iterations
+warmup   [  90% ] 10 VUs  27.0s/30s
+
+running (0m28.0s), 10/10 VUs, 1180 complete and 0 interrupted iterations
+warmup   [  93% ] 10 VUs  28.0s/30s
+
+running (0m29.0s), 10/10 VUs, 1225 complete and 0 interrupted iterations
+warmup   [  97% ] 10 VUs  29.0s/30s
+
+running (0m30.0s), 10/10 VUs, 1274 complete and 0 interrupted iterations
+warmup   [ 100% ] 10 VUs  30.0s/30s
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 46224   1530.972323/s
+    checks_succeeded...: 100.00% 46224 out of 46224
+    checks_failed......: 0.00%   0 out of 46224
+
+    ✓ Patient created
+    ✓ Location created
+    ✓ Organization created
+    ✓ Practitioner created
+    ✓ Encounter created
+    ✓ Observation created
+    ✓ MedicationRequest created
+    ✓ Claim created
+    ✓ ExplanationOfBenefit created
+    ✓ Patient read
+    ✓ Location read
+    ✓ Organization read
+    ✓ Practitioner read
+    ✓ Encounter read
+    ✓ Observation read
+    ✓ MedicationRequest read
+    ✓ Claim read
+    ✓ ExplanationOfBenefit read
+    ✓ Patient update
+    ✓ Location update
+    ✓ Organization update
+    ✓ Practitioner update
+    ✓ Encounter update
+    ✓ Observation update
+    ✓ MedicationRequest update
+    ✓ Claim update
+    ✓ ExplanationOfBenefit update
+    ✓ ExplanationOfBenefit delete
+    ✓ Claim delete
+    ✓ MedicationRequest delete
+    ✓ Observation delete
+    ✓ Encounter delete
+    ✓ Practitioner delete
+    ✓ Organization delete
+    ✓ Location delete
+    ✓ Patient delete
+
+    HTTP
+    http_req_duration..............: avg=6.3ms    min=514.64µs med=5.48ms   max=72.09ms  p(90)=8.73ms   p(95)=10.49ms 
+      { expected_response:true }...: avg=6.3ms    min=514.64µs med=5.48ms   max=72.09ms  p(90)=8.73ms   p(95)=10.49ms 
+    http_req_failed................: 0.00% 0 out of 46224
+    http_reqs......................: 46224 1530.972323/s
+
+    EXECUTION
+    iteration_duration.............: avg=234.83ms min=165.97ms med=216.03ms max=404.52ms p(90)=299.54ms p(95)=314.45ms
+    iterations.....................: 1284  42.527009/s
+    vus............................: 10    min=10         max=10
+    vus_max........................: 10    min=10         max=10
+
+    NETWORK
+    data_received..................: 60 MB 2.0 MB/s
+    data_sent......................: 45 MB 1.5 MB/s
+
+
+
+
+running (0m30.2s), 00/10 VUs, 1284 complete and 0 interrupted iterations
+warmup ✓ [ 100% ] 10 VUs  30s
+
+Completed test: /k6/prewarm.js on server: wso2
+----------------------------------------
+
+

@@ -170,9 +170,10 @@ fn fhirpath_server_handler_rejects_a_deep_expression_without_aborting() {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap();
-            let _ = rt.block_on(helios_fhirpath::handlers::evaluate_fhirpath(axum::Json(
-                params,
-            )));
+            let _ = rt.block_on(helios_fhirpath::handlers::evaluate_fhirpath(
+                None,
+                axum::Json(params),
+            ));
         })
         .unwrap()
         .join()

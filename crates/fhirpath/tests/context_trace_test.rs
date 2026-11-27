@@ -57,7 +57,7 @@ async fn test_context_with_trace_function() {
     let fhir_params: FhirPathParameters = serde_json::from_value(params).unwrap();
 
     // Call the handler
-    let response = evaluate_fhirpath(Json(fhir_params)).await;
+    let response = evaluate_fhirpath(None, Json(fhir_params)).await;
 
     // Check that we got a successful response
     assert!(response.is_ok(), "Response should be successful");
