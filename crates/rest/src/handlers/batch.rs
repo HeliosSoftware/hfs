@@ -2687,6 +2687,20 @@ fn parse_bundle_request_url(
             .map(|resource_type| ((*resource_type).to_string(), String::new()))
             .ok_or_else(|| "Entry request.url is empty".to_string()),
         BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete => {
+            // A `_history` segment addresses nothing a mutation entry can act
+            // on; read as the last two segments, `Observation/o1/_history`
+            // was the instance `_history` of type `o1`, which answered 204
+            // and erased nothing. The history deletes have no Bundle form.
+            // Only the literal segment is refused: an id or a path prefix that
+            // merely starts with `_` is addressed as before (ids are #2525's
+            // decision, prefixes #2750's).
+            if segments.contains(&"_history") {
+                return Err(format!(
+                    "{method} entry request.url cannot address '_history': a Bundle entry \
+                     writes or deletes an instance ('[type]/[id]') or by criteria \
+                     ('[type]?[parameters]'); history is erased through the instance endpoint"
+                ));
+            }
             if request_url
                 .split_once('?')
                 .is_some_and(|(_, query)| !query.is_empty())
@@ -6238,10 +6252,38 @@ mod tests {
         assert!(text.contains("'$everything'"), "{text}");
     }
 
-    /// The transaction arm's parser is the choke point for every method: a
-    /// mutation URL is canonicalized to its last one or two segments and a GET
-    /// URL is passed on as written, so each would act on part of an operation
-    /// URL if it were not refused first.
+    #[test]
+    fn a_mutation_url_with_a_control_segment_is_refused() {
+        for method in [BundleMethod::Put, BundleMethod::Patch, BundleMethod::Delete] {
+            for url in [
+                "Observation/o1/_history",
+                "Observation/o1/_history/3",
+                "http://h/fhir/Observation/o1/_history",
+                "Observation/_history",
+                "Observation/Patient/_history",
+            ] {
+                let err = parse_bundle_request_url(&method, url).expect_err(url);
+                assert!(err.contains("_history"), "{method} {url}: {err}");
+            }
+            // Only the literal `_history` segment is refused: an id or a path
+            // prefix that starts with `_` is addressed as before.
+            for (url, id) in [
+                ("Observation/_o2", "_o2"),
+                ("Observation/_history2", "_history2"),
+                ("_t/Observation/o1", "o1"),
+                ("http://h/_fhir/Observation/o1", "o1"),
+            ] {
+                assert_eq!(
+                    parse_bundle_request_url(&method, url),
+                    Ok(("Observation".to_string(), id.to_string())),
+                    "{method} {url}"
+                );
+            }
+        }
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation/o1").is_ok());
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation?code=x").is_ok());
+    }
+
     #[test]
     fn a_delete_entry_needs_a_resource_type_of_the_version() {
         let version = FhirVersion::default_enabled();
@@ -6254,6 +6296,10 @@ mod tests {
         assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
     }
 
+    /// The transaction arm's parser is the choke point for every method: a
+    /// mutation URL is canonicalized to its last one or two segments and a GET
+    /// URL is passed on as written, so each would act on part of an operation
+    /// URL if it were not refused first.
     #[test]
     fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
         for (method, url) in [
