@@ -56,8 +56,10 @@ impl WebSocketManager {
     ///
     /// Returns `(client_id, receiver)`. The caller (WebSocket handler) reads
     /// notifications from the receiver and forwards them over the socket.
-    /// The receiver ends (`None`) when the subscription is deregistered or
-    /// the client let [`CLIENT_QUEUE_CAPACITY`] notifications pile up.
+    /// The receiver is closed ([`mpsc::Receiver::is_closed`]) as soon as the
+    /// subscription is deregistered or the client let
+    /// [`CLIENT_QUEUE_CAPACITY`] notifications pile up, while the queued ones
+    /// are still buffered; the handler stops there instead of draining them.
     ///
     /// Returns `None` when the subscription already has
     /// [`MAX_CLIENTS_PER_SUBSCRIPTION`] connected clients.
@@ -369,6 +371,11 @@ mod tests {
         );
         assert_eq!(mgr.client_count("t1", "sub-1"), 1);
         assert_eq!(json(draining_rx.recv().await.unwrap()), overflow);
+        // The dropped client's receiver reports closed while its queue is
+        // still full: the signal the connection handler stops on, rather
+        // than delivering the backlog (#2720).
+        assert!(stalled_rx.is_closed());
+        assert!(!draining_rx.is_closed());
 
         let mut queued = 0;
         while let Some(n) = stalled_rx.recv().await.map(json) {
