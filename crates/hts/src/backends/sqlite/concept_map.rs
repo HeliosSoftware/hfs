@@ -469,6 +469,28 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     })
 }
 
+/// The ancestor walk of [`input_ancestors`].
+///
+/// The join order and the index are spelled out because the planner's own
+/// choice depends on statistics a code system imported into a running server
+/// does not have: it then reads every hierarchy row of the system for each
+/// ancestor found. `CROSS JOIN` keeps the recursion row on the outside and
+/// `INDEXED BY` makes each step a lookup by child code; either alone leaves
+/// the scan.
+const INPUT_ANCESTORS_SQL: &str = "
+    WITH RECURSIVE ancestors(code) AS (
+        SELECT parent_code
+        FROM concept_hierarchy INDEXED BY idx_hierarchy_child
+        WHERE system_id = ?1 AND child_code = ?2
+        UNION
+        SELECT ch.parent_code
+        FROM ancestors a
+        CROSS JOIN concept_hierarchy ch INDEXED BY idx_hierarchy_child
+        WHERE ch.system_id = ?1 AND ch.child_code = a.code
+    )
+    SELECT code FROM ancestors
+";
+
 /// The (possibly transitive) ancestors of `code` in the given code system
 /// that are among `wanted`.
 ///
@@ -479,19 +501,7 @@ fn input_ancestors(
     code: &str,
     wanted: &HashSet<&str>,
 ) -> Result<HashSet<String>, HtsError> {
-    let sql = "
-        WITH RECURSIVE ancestors(code) AS (
-            SELECT parent_code
-            FROM concept_hierarchy
-            WHERE system_id = ?1 AND child_code = ?2
-            UNION
-            SELECT ch.parent_code
-            FROM concept_hierarchy ch
-            INNER JOIN ancestors a ON ch.child_code = a.code
-            WHERE ch.system_id = ?1
-        )
-        SELECT code FROM ancestors
-    ";
+    let sql = INPUT_ANCESTORS_SQL;
     let db = |e: rusqlite::Error| HtsError::StorageError(format!("DB error: {e}"));
     let mut stmt = conn.prepare_cached(sql).map_err(db)?;
     let rows = stmt
@@ -513,6 +523,7 @@ fn input_ancestors(
 
 #[cfg(test)]
 mod tests {
+    use super::INPUT_ANCESTORS_SQL;
     use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::traits::ConceptMapOperations;
     use crate::types::{ClosureRequest, CodingConcept, TranslateRequest};
@@ -795,6 +806,40 @@ mod tests {
         assert_eq!(resp.name, "my-closure");
         let cm = resp.concept_map.unwrap();
         assert_eq!(cm["group"].as_array().unwrap().len(), 0);
+    }
+
+    /// Without planner statistics (a system imported since startup), both
+    /// steps of the ancestor walk still look hierarchy rows up by child code
+    /// rather than reading every row of the system.
+    #[test]
+    fn closure_ancestor_walk_seeks_by_child_code_without_statistics() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        seed_db(&backend);
+        let conn = backend.pool().get().unwrap();
+        let has_stats: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_stats, "the plan is checked without statistics");
+
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {INPUT_ANCESTORS_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params!["cs-src", "C"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let seeks = plan
+            .iter()
+            .filter(|step| {
+                step.contains("USING INDEX idx_hierarchy_child (system_id=? AND child_code=?)")
+            })
+            .count();
+        assert_eq!(seeks, 2, "{plan:#?}");
     }
 
     #[tokio::test]
