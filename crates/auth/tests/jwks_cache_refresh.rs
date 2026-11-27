@@ -162,6 +162,42 @@ async fn a_failed_fetch_arms_the_interval() {
     );
 }
 
+/// The background task retries a failing identity provider with backoff,
+/// never in a tight loop, whatever the interval is set to, and keeps serving
+/// the keys from the last good fetch.
+#[tokio::test]
+async fn a_failing_provider_is_retried_with_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(jwks_body())
+                .insert_header("Cache-Control", "max-age=1"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let cache = Arc::new(JwksCache::new(&format!("{}/jwks", server.uri()), 0));
+    cache.initial_fetch().await.expect("initial fetch");
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let retries = fetches(&server).await - 1;
+    assert!(
+        (1..=5).contains(&retries),
+        "{retries} background retries in six seconds: expected a handful, backing off"
+    );
+    assert!(
+        cache.get_key(KID).await.is_ok(),
+        "the keys from the last good fetch are still served"
+    );
+}
+
 /// The identity provider rotates to a new key and a burst of tokens naming it
 /// arrives once the interval has lapsed: one fetch serves them all, and the
 /// lookups that arrive while it is in flight wait for it rather than being
