@@ -449,6 +449,11 @@ fn decode_header(b64_header: &str) -> Result<Map<String, Value>> {
         .map_err(|e| format!("invalid JWE protected header: {e}"))
 }
 
+/// The most recipients a general-JSON JWE may carry. Every recipient whose key
+/// does not open the payload costs a pass over the whole ciphertext, so the
+/// count is bounded; a `$bulk-submit` body is addressed to one Data Consumer.
+const MAX_RECIPIENTS: usize = 16;
+
 fn parse_json(text: &str) -> Result<Jwe> {
     let doc: Map<String, Value> =
         serde_json::from_str(text).map_err(|e| format!("invalid JWE JSON serialization: {e}"))?;
@@ -507,6 +512,12 @@ fn parse_json(text: &str) -> Result<Jwe> {
     if recipients.is_empty() {
         return Err("JWE JSON serialization has no recipients".to_string());
     }
+    if recipients.len() > MAX_RECIPIENTS {
+        return Err(format!(
+            "JWE JSON serialization has {} recipients, above the limit of {MAX_RECIPIENTS}",
+            recipients.len()
+        ));
+    }
 
     Ok(Jwe {
         protected_b64,
@@ -546,20 +557,49 @@ pub fn decrypt_with_limit(
     let aad = jwe.aad();
     let mut last_err = None;
     for recipient in &jwe.recipients {
-        match decrypt_recipient(&jwe, recipient, &aad, keys, max_inflated) {
-            Ok(plaintext) => return Ok(plaintext),
+        match decrypt_recipient(&jwe, recipient, &aad, keys) {
+            // The tag verified, so this is the payload whichever recipient is
+            // read: what `zip` then says about it is final. Trying the next
+            // recipient would only inflate the same bytes again.
+            Ok(payload) => {
+                let zip = recipient.header.get("zip").and_then(|v| v.as_str());
+                return inflate(payload, zip, max_inflated);
+            }
             Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| "JWE has no recipients".to_string()))
 }
 
+/// Applies the `zip` header to an authenticated payload, refusing one that
+/// inflates past `max_inflated`.
+fn inflate(payload: Vec<u8>, zip: Option<&str>, max_inflated: u64) -> Result<Vec<u8>> {
+    match zip {
+        None => Ok(payload),
+        Some("DEF") => {
+            let mut out = Vec::new();
+            flate2::read::DeflateDecoder::new(&payload[..])
+                .take(max_inflated.saturating_add(1))
+                .read_to_end(&mut out)
+                .map_err(|e| format!("JWE zip=DEF decompression failed: {e}"))?;
+            if out.len() as u64 > max_inflated {
+                return Err(format!(
+                    "JWE zip=DEF payload inflates past the {max_inflated}-byte ceiling"
+                ));
+            }
+            Ok(out)
+        }
+        Some(other) => Err(format!("unsupported JWE zip '{other}' (expected DEF)")),
+    }
+}
+
+/// Recovers one recipient's CEK and returns the authenticated payload, still
+/// compressed when the header carries `zip`.
 fn decrypt_recipient(
     jwe: &Jwe,
     recipient: &Recipient,
     aad: &[u8],
     keys: &DecryptionKeys,
-    max_inflated: u64,
 ) -> Result<Vec<u8>> {
     let header = &recipient.header;
     let alg = header
@@ -584,25 +624,7 @@ fn decrypt_recipient(
     }
 
     let cek = derive_cek(alg, enc, &recipient.encrypted_key, header, keys)?;
-    let plaintext = decrypt_content(enc, &cek, &jwe.iv, &jwe.ciphertext, &jwe.tag, aad)?;
-
-    match header.get("zip").and_then(|v| v.as_str()) {
-        None => Ok(plaintext),
-        Some("DEF") => {
-            let mut out = Vec::new();
-            flate2::read::DeflateDecoder::new(&plaintext[..])
-                .take(max_inflated.saturating_add(1))
-                .read_to_end(&mut out)
-                .map_err(|e| format!("JWE zip=DEF decompression failed: {e}"))?;
-            if out.len() as u64 > max_inflated {
-                return Err(format!(
-                    "JWE zip=DEF payload inflates past the {max_inflated}-byte ceiling"
-                ));
-            }
-            Ok(out)
-        }
-        Some(other) => Err(format!("unsupported JWE zip '{other}' (expected DEF)")),
-    }
+    decrypt_content(enc, &cek, &jwe.iv, &jwe.ciphertext, &jwe.tag, aad)
 }
 
 /// Key length in bytes required by a content-encryption algorithm.
@@ -1342,6 +1364,67 @@ mod tests {
         assert!(err.contains("65536-byte ceiling"), "{err}");
         let exact = decrypt_with_limit(compact.as_bytes(), &keys, plaintext.len() as u64).unwrap();
         assert_eq!(exact, plaintext);
+    }
+
+    /// A general-JSON JWE for `key` with `recipients` identical `dir`
+    /// recipients over the deflated `plaintext`.
+    fn def_general(key: &[u8], plaintext: &[u8], recipients: usize) -> String {
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let iv = [0x55u8; 12];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let protected = B64URL.encode(r#"{"alg":"dir","enc":"A256GCM","zip":"DEF"}"#);
+        let (ct, tag) = seal_gcm(key, &iv, protected.as_bytes(), &compressed);
+        serde_json::json!({
+            "protected": protected,
+            "recipients": vec![serde_json::json!({}); recipients],
+            "iv": B64URL.encode(iv),
+            "ciphertext": B64URL.encode(ct),
+            "tag": B64URL.encode(tag),
+        })
+        .to_string()
+    }
+
+    /// The ceiling is about the payload, not about one recipient: every
+    /// recipient that opens it would inflate the same bytes, so the first
+    /// refusal is the answer. Sixteen 64 MiB inflates would take seconds; one
+    /// takes a fraction of that.
+    #[test]
+    fn a_payload_past_the_ceiling_is_inflated_once_not_once_per_recipient() {
+        let key = vec![0x44u8; 32];
+        let keys = DecryptionKeys::shared(key.clone());
+        let plaintext = vec![b'a'; 64 * 1024 * 1024];
+        let limit = 32 * 1024 * 1024;
+
+        let time = |recipients: usize| {
+            let jwe = def_general(&key, &plaintext, recipients);
+            let started = std::time::Instant::now();
+            let err = decrypt_with_limit(jwe.as_bytes(), &keys, limit).unwrap_err();
+            assert!(err.contains("33554432-byte ceiling"), "{err}");
+            started.elapsed()
+        };
+        let one = time(1);
+        let many = time(MAX_RECIPIENTS);
+        assert!(
+            many < one * 8,
+            "{MAX_RECIPIENTS} recipients took {many:?}, one took {one:?}"
+        );
+    }
+
+    #[test]
+    fn more_recipients_than_the_limit_are_refused_before_any_decryption() {
+        let key = vec![0x44u8; 32];
+        let keys = DecryptionKeys::shared(key.clone());
+
+        let at_limit = def_general(&key, b"ok", MAX_RECIPIENTS);
+        assert_eq!(decrypt(at_limit.as_bytes(), &keys).unwrap(), b"ok");
+        let over = def_general(&key, b"ok", MAX_RECIPIENTS + 1);
+        let err = decrypt(over.as_bytes(), &keys).unwrap_err();
+        assert!(err.contains("17 recipients"), "{err}");
     }
 
     #[test]
