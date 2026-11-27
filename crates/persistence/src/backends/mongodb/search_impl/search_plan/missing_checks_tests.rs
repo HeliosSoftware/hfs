@@ -678,23 +678,26 @@ async fn batch_consumer_count_keeps_two_commands_in_flight() {
     .unwrap();
     let disabled = disable_failpoint(&session).await;
     client.shutdown().await;
-    let state = state.lock().unwrap();
     let want = fixture.expected(true, 1, 0, usize::MAX).len() as u64;
     assert_eq!(result.count, want, "batched count");
     assert!(
         failpoint_hits(&disabled) - failpoint_hits(&armed) > 0,
         "no command was held"
     );
-    assert!(
-        state.started.iter().filter(|n| *n == "getMore").count() >= 2,
-        "the candidate stream crossed batches: {:?}",
-        state.started
-    );
-    assert_eq!(
-        state.max, 2,
-        "commands in flight together: {:?}; sequence {:?}",
-        state.overlaps, state.started
-    );
+    // The guard ends with this block, before the next await.
+    {
+        let state = state.lock().unwrap();
+        assert!(
+            state.started.iter().filter(|n| *n == "getMore").count() >= 2,
+            "the candidate stream crossed batches: {:?}",
+            state.started
+        );
+        assert_eq!(
+            state.max, 2,
+            "commands in flight together: {:?}; sequence {:?}",
+            state.overlaps, state.started
+        );
+    }
     fixture.close().await;
 }
 

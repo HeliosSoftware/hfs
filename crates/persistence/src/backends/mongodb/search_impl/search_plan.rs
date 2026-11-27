@@ -3069,6 +3069,7 @@ async fn advance_polling_checks<F: Future>(
 /// checks with it: the driver closes the connections of their unanswered
 /// commands and frees those pool slots, but a command already sent may still
 /// run on the server.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stream_id_batches<S, T, F>(
     cursor: &mut mongodb::Cursor<Document>,
     id_field: &str,
