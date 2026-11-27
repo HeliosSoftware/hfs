@@ -378,7 +378,8 @@ compressed and returned as-is.
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
 | `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
-| `SOF_SERVER_SOURCE_PREFIXES` | URL prefixes a `$sql-run` `source` may name, comma-separated (for example `file:///srv/fhir/,s3://my-bucket/exports/`). A source must have the same scheme, host and port and a path at or below a prefix; a `file:` source must be a regular file whose real path (symlinks resolved) is under the prefix; HTTP redirects are not followed. The server does not authenticate callers, so a source it loads is read with its own file permissions and cloud credentials. | (none: `source` is refused with 501) |
+| `SOF_SERVER_SOURCE_PREFIXES` | URL prefixes a `$sql-run` `source` may name, comma-separated (for example `file:///srv/fhir/,s3://my-bucket/exports/`). A source must have the same scheme, host and port and a path at or below a prefix; a `file:` source must be a regular file whose real path (symlinks resolved) is under the prefix; HTTP redirects are not followed. A prefix that carries user info (an `abfss://container@account…` URL names its container there) admits only the same user info, and a source cannot add any. An `http(s)` host is not checked against private or internal address ranges: a listed host is fetched wherever it resolves. The server does not authenticate callers, so a source it loads is read with its own file permissions and cloud credentials. | (none: `source` is refused with 501) |
+| `SOF_SERVER_SOURCE_MAX_BYTES` | Largest `$sql-run` `source` loaded, in bytes; a larger one is refused with 400. A source is read whole into memory, so this bounds what one request can make the server hold. `0` is no limit. | `104857600` (100 MiB) |
 | `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max remote terminology calls per ViewDefinition run: each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count (`0` disables); read by helios-fhirpath | `1000` |
 
 Terminology lookups (`memberOf()`, `%terminologies.*`) share one cache and one
@@ -810,7 +811,8 @@ curl -X POST "http://localhost:8080/$sql-run?_since=2024-01-01T00:00:00Z" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
-# Load data from S3 bucket
+# Load data from S3 bucket (needs SOF_SERVER_SOURCE_PREFIXES=s3://my-bucket/ on the server;
+# without it a source is refused with 501)
 curl -X POST "http://localhost:8080/$sql-run?source=s3://my-bucket/bundle.json" \
   -H "Content-Type: application/json" \
   -d '{
@@ -821,7 +823,7 @@ curl -X POST "http://localhost:8080/$sql-run?source=s3://my-bucket/bundle.json" 
     }]
   }'
 
-# Load data from Azure with filtering
+# Load data from Azure with filtering (needs SOF_SERVER_SOURCE_PREFIXES=azure://container/)
 curl -X POST "http://localhost:8080/$sql-run?source=azure://container/data.json&_limit=100" \
   -H "Content-Type: application/json" \
   -d '{...}'

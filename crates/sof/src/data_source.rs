@@ -121,6 +121,7 @@ use reqwest;
 use serde_json;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use url::Url;
 
 /// Trait for loading FHIR data from various sources
@@ -137,9 +138,23 @@ pub trait DataSource: Send + Sync {
 /// under a prefix its operator lists (`SOF_SERVER_SOURCE_PREFIXES`), and none
 /// by default: otherwise any caller could make it read local files or send
 /// requests to hosts only the server can reach.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SourcePolicy {
     prefixes: Vec<Url>,
+    /// The largest source loaded, in bytes; `0` is no limit.
+    max_bytes: u64,
+}
+
+/// The default largest source a server loads: 100 MiB.
+pub const DEFAULT_SOURCE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+impl Default for SourcePolicy {
+    fn default() -> Self {
+        Self {
+            prefixes: Vec::new(),
+            max_bytes: DEFAULT_SOURCE_MAX_BYTES,
+        }
+    }
 }
 
 impl SourcePolicy {
@@ -152,7 +167,23 @@ impl SourcePolicy {
                 Url::parse(raw).map_err(|e| format!("invalid source prefix '{raw}': {e}"))?;
             prefixes.push(prefix);
         }
-        Ok(Self { prefixes })
+        Ok(Self {
+            prefixes,
+            ..Self::default()
+        })
+    }
+
+    /// Sets the largest source loaded, in bytes (`SOF_SERVER_SOURCE_MAX_BYTES`);
+    /// `0` removes the limit. A source is read whole into memory, so without a
+    /// limit one large file under a prefix lets any caller exhaust it.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// The largest source loaded, in bytes, or `None` for no limit.
+    pub fn max_bytes(&self) -> Option<u64> {
+        (self.max_bytes > 0).then_some(self.max_bytes)
     }
 
     /// Whether no source is allowed.
@@ -168,45 +199,67 @@ impl SourcePolicy {
             .collect()
     }
 
-    /// Whether `url` lies under one of the prefixes: the same scheme, host and
-    /// port, and a path equal to the prefix's or below it at a `/`. Parsing
-    /// has already resolved `.` and `..` segments. A `file` URL must also name
-    /// a regular file whose path, symlinks resolved, is under a prefix's
-    /// resolved path, so a link cannot lead outside it.
+    /// Whether `url` lies under one of the prefixes: the same scheme, user
+    /// info, host and port, and a path equal to the prefix's or below it at a
+    /// `/`. Parsing has already resolved `.` and `..` segments. A `file` URL
+    /// must also name a regular file whose path, symlinks resolved, is under a
+    /// prefix's resolved path, so a link cannot lead outside it.
     pub fn admits(&self, url: &Url) -> bool {
-        let lexical = self.prefixes.iter().any(|prefix| {
+        self.admits_lexically(url) && (url.scheme() != "file" || self.real_file(url).is_some())
+    }
+
+    /// The URL comparison of [`admits`](Self::admits), without the file check.
+    ///
+    /// The user info is compared because it selects what is read: an
+    /// `abfss://container@account.dfs.core.windows.net/` URL names its
+    /// container there, so a prefix for one container must not admit another.
+    fn admits_lexically(&self, url: &Url) -> bool {
+        self.prefixes.iter().any(|prefix| {
             prefix.scheme() == url.scheme()
+                && prefix.username() == url.username()
+                && prefix.password() == url.password()
                 && prefix.host_str() == url.host_str()
                 && prefix.port_or_known_default() == url.port_or_known_default()
                 && path_is_under(prefix.path(), url.path())
-        });
-        lexical && (url.scheme() != "file" || self.admits_file(url))
+        })
     }
 
-    fn admits_file(&self, url: &Url) -> bool {
-        let Some(real) = url
+    /// The symlink-resolved path of the regular file a `file` URL names, if
+    /// that path is under a `file` prefix's resolved path. The caller reads
+    /// this path, not the URL's, so a link swapped in after the check is not
+    /// followed.
+    fn real_file(&self, url: &Url) -> Option<std::path::PathBuf> {
+        let real = url
             .to_file_path()
             .ok()
-            .and_then(|path| std::fs::canonicalize(path).ok())
-        else {
-            return false;
-        };
-        real.is_file()
+            .and_then(|path| std::fs::canonicalize(path).ok())?;
+        let admitted = real.is_file()
             && self
                 .prefixes
                 .iter()
                 .filter(|prefix| prefix.scheme() == "file")
                 .filter_map(|prefix| prefix.to_file_path().ok())
                 .filter_map(|root| std::fs::canonicalize(root).ok())
-                .any(|root| real.starts_with(&root))
+                .any(|root| real.starts_with(&root));
+        admitted.then_some(real)
     }
 }
 
 /// Lists the prefixes without their credentials.
 impl std::fmt::Debug for SourcePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.prefixes_for_log()).finish()
+        f.debug_struct("SourcePolicy")
+            .field("prefixes", &self.prefixes_for_log())
+            .field("max_bytes", &self.max_bytes)
+            .finish()
     }
+}
+
+/// The refusal for a source over a server's size limit.
+fn too_large(limit: u64) -> SofError {
+    SofError::InvalidSource(format!(
+        "source is larger than the {limit} bytes this server loads (SOF_SERVER_SOURCE_MAX_BYTES)"
+    ))
 }
 
 /// Whether `path` is `prefix` or lies below it at a `/` boundary.
@@ -260,20 +313,30 @@ impl DataSource for UniversalDataSource {
         let url = Url::parse(source).map_err(|e| {
             SofError::InvalidSource(format!("Invalid source URL '{}': {}", source, e))
         })?;
-        if let Some(policy) = &self.policy
-            && !policy.admits(&url)
-        {
-            return Err(SofError::InvalidSource(
-                "source is not under a prefix this server allows".to_string(),
-            ));
+        // Under a policy: the resolved path of an admitted file, and the size limit.
+        let mut real_file = None;
+        let mut limit = None;
+        if let Some(policy) = &self.policy {
+            let refused = || {
+                SofError::InvalidSource(
+                    "source is not under a prefix this server allows".to_string(),
+                )
+            };
+            if !policy.admits_lexically(&url) {
+                return Err(refused());
+            }
+            if url.scheme() == "file" {
+                real_file = Some(policy.real_file(&url).ok_or_else(refused)?);
+            }
+            limit = policy.max_bytes();
         }
 
         match url.scheme() {
-            "file" => load_from_file(&url).await,
-            "http" | "https" => load_from_http(&self.client, &url).await,
-            "s3" => load_from_s3(&url).await,
-            "gs" => load_from_gcs(&url).await,
-            "azure" | "abfss" | "abfs" => load_from_azure(&url).await,
+            "file" => load_from_file(&url, real_file, limit).await,
+            "http" | "https" => load_from_http(&self.client, &url, limit).await,
+            "s3" => load_from_s3(&url, limit).await,
+            "gs" => load_from_gcs(&url, limit).await,
+            "azure" | "abfss" | "abfs" => load_from_azure(&url, limit).await,
             scheme => Err(SofError::UnsupportedSourceProtocol(format!(
                 "Unsupported source protocol: {}. Supported: file://, http(s)://, s3://, gs://, azure://",
                 scheme
@@ -282,12 +345,20 @@ impl DataSource for UniversalDataSource {
     }
 }
 
-/// Load FHIR data from a local file
-async fn load_from_file(url: &Url) -> Result<SofBundle, SofError> {
+/// Load FHIR data from a local file: `real` if a policy resolved the path,
+/// otherwise the URL's own path. At most `limit` bytes are read.
+async fn load_from_file(
+    url: &Url,
+    real: Option<std::path::PathBuf>,
+    limit: Option<u64>,
+) -> Result<SofBundle, SofError> {
     // Convert file URL to path
-    let path = url
-        .to_file_path()
-        .map_err(|_| SofError::InvalidSource(format!("Invalid file URL: {}", url)))?;
+    let path = match real {
+        Some(path) => path,
+        None => url
+            .to_file_path()
+            .map_err(|_| SofError::InvalidSource(format!("Invalid file URL: {}", url)))?,
+    };
 
     // Check if file exists
     if !path.exists() {
@@ -298,18 +369,37 @@ async fn load_from_file(url: &Url) -> Result<SofBundle, SofError> {
     }
 
     // Read file contents
-    let contents = fs::read_to_string(&path)
-        .await
-        .map_err(|e| SofError::SourceReadError(format!("Failed to read file: {}", e)))?;
+    let read_error = |e| SofError::SourceReadError(format!("Failed to read file: {}", e));
+    let contents = match limit {
+        None => fs::read_to_string(&path).await.map_err(read_error)?,
+        Some(limit) => {
+            // Read one byte past the limit: the length is then over it for any
+            // larger file, however the file grows while it is read.
+            let file = fs::File::open(&path).await.map_err(read_error)?;
+            let mut contents = String::new();
+            file.take(limit.saturating_add(1))
+                .read_to_string(&mut contents)
+                .await
+                .map_err(read_error)?;
+            if contents.len() as u64 > limit {
+                return Err(too_large(limit));
+            }
+            contents
+        }
+    };
 
     // Parse and convert to bundle
     parse_fhir_content(&contents, &path.to_string_lossy())
 }
 
 /// Load FHIR data from HTTP/HTTPS URL
-async fn load_from_http(client: &reqwest::Client, url: &Url) -> Result<SofBundle, SofError> {
+async fn load_from_http(
+    client: &reqwest::Client,
+    url: &Url,
+    limit: Option<u64>,
+) -> Result<SofBundle, SofError> {
     // Fetch content from URL
-    let response = client
+    let mut response = client
         .get(url.as_str())
         .header("Accept", "application/fhir+json, application/json")
         .send()
@@ -328,17 +418,32 @@ async fn load_from_http(client: &reqwest::Client, url: &Url) -> Result<SofBundle
     }
 
     // Get content
-    let contents = response
-        .text()
-        .await
-        .map_err(|e| SofError::SourceReadError(format!("Failed to read response body: {}", e)))?;
+    let read_error = |e| SofError::SourceReadError(format!("Failed to read response body: {}", e));
+    let contents = match limit {
+        None => response.text().await.map_err(read_error)?,
+        Some(limit) => {
+            // Refuse on the declared length, then count the bytes received: a
+            // chunked or mislabelled body declares none, or the wrong one.
+            if response.content_length().is_some_and(|len| len > limit) {
+                return Err(too_large(limit));
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(read_error)? {
+                if (body.len() + chunk.len()) as u64 > limit {
+                    return Err(too_large(limit));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            String::from_utf8_lossy(&body).into_owned()
+        }
+    };
 
     // Parse and convert to bundle
     parse_fhir_content(&contents, url.as_str())
 }
 
 /// Load FHIR data from AWS S3
-async fn load_from_s3(url: &Url) -> Result<SofBundle, SofError> {
+async fn load_from_s3(url: &Url, limit: Option<u64>) -> Result<SofBundle, SofError> {
     // Parse S3 URL: s3://bucket/path/to/object
     let bucket = url.host_str().ok_or_else(|| {
         SofError::InvalidSource(format!("Invalid S3 URL '{}': missing bucket name", url))
@@ -364,11 +469,11 @@ async fn load_from_s3(url: &Url) -> Result<SofBundle, SofError> {
         ))
     })?;
 
-    load_from_object_store(Arc::new(store), path, url.as_str()).await
+    load_from_object_store(Arc::new(store), path, url.as_str(), limit).await
 }
 
 /// Load FHIR data from Google Cloud Storage
-async fn load_from_gcs(url: &Url) -> Result<SofBundle, SofError> {
+async fn load_from_gcs(url: &Url, limit: Option<u64>) -> Result<SofBundle, SofError> {
     // Parse GCS URL: gs://bucket/path/to/object
     let bucket = url.host_str().ok_or_else(|| {
         SofError::InvalidSource(format!("Invalid GCS URL '{}': missing bucket name", url))
@@ -393,12 +498,13 @@ async fn load_from_gcs(url: &Url) -> Result<SofBundle, SofError> {
             ))
         })?;
 
-    load_from_object_store(Arc::new(store), path, url.as_str()).await
+    load_from_object_store(Arc::new(store), path, url.as_str(), limit).await
 }
 
 /// Load FHIR data from Azure Blob Storage
-async fn load_from_azure(url: &Url) -> Result<SofBundle, SofError> {
+async fn load_from_azure(url: &Url, limit: Option<u64>) -> Result<SofBundle, SofError> {
     // Parse Azure URL: azure://container/path/to/object or abfss://container@account.dfs.core.windows.net/path
+    let mut builder = MicrosoftAzureBuilder::new();
     let (container, path) = if url.scheme() == "azure" {
         // Simple format: azure://container/path
         let container = url.host_str().ok_or_else(|| {
@@ -411,17 +517,20 @@ async fn load_from_azure(url: &Url) -> Result<SofBundle, SofError> {
         (container.to_string(), path.to_string())
     } else {
         // ABFSS format: abfss://container@account.dfs.core.windows.net/path
+        // URL parsing puts the container in the user info and the account's
+        // endpoint in the host; the account is the endpoint's first label.
         let host = url.host_str().ok_or_else(|| {
             SofError::InvalidSource(format!("Invalid Azure URL '{}': missing host", url))
         })?;
-        let parts: Vec<&str> = host.split('@').collect();
-        if parts.len() != 2 {
+        let container = url.username();
+        let account = host.split('.').next().unwrap_or_default();
+        if container.is_empty() || account.is_empty() || url.password().is_some() {
             return Err(SofError::InvalidSource(format!(
                 "Invalid Azure URL '{}': expected format abfss://container@account.dfs.core.windows.net/path",
                 url
             )));
         }
-        let container = parts[0];
+        builder = builder.with_account(account);
         let path = url.path().trim_start_matches('/');
         (container.to_string(), path.to_string())
     };
@@ -434,7 +543,7 @@ async fn load_from_azure(url: &Url) -> Result<SofBundle, SofError> {
     }
 
     // Create Azure client using environment variables or managed identity
-    let store = MicrosoftAzureBuilder::new()
+    let store = builder
         .with_container_name(&container)
         .build()
         .map_err(|e| {
@@ -444,7 +553,7 @@ async fn load_from_azure(url: &Url) -> Result<SofBundle, SofError> {
             ))
         })?;
 
-    load_from_object_store(Arc::new(store), &path, url.as_str()).await
+    load_from_object_store(Arc::new(store), &path, url.as_str(), limit).await
 }
 
 /// Common function to load from any object store
@@ -452,6 +561,7 @@ async fn load_from_object_store(
     store: Arc<dyn ObjectStore>,
     path: &str,
     source_name: &str,
+    limit: Option<u64>,
 ) -> Result<SofBundle, SofError> {
     // Create object path
     let object_path = ObjectPath::from(path);
@@ -463,6 +573,13 @@ async fn load_from_object_store(
         }
         _ => SofError::SourceFetchError(format!("Failed to fetch from '{}': {}", source_name, e)),
     })?;
+
+    // The store reports the object's size with the response, before its body.
+    if let Some(limit) = limit
+        && result.meta.size as u64 > limit
+    {
+        return Err(too_large(limit));
+    }
 
     // Read the bytes
     let bytes = result
@@ -978,6 +1095,23 @@ mod tests {
         if let Err(SofError::InvalidSource(msg)) = result {
             assert!(msg.contains("missing blob path"));
         }
+
+        // An abfss URL names its container before the `@`.
+        let no_container = data_source
+            .load("abfss://account.dfs.core.windows.net/data/a.json")
+            .await;
+        assert!(
+            matches!(&no_container, Err(SofError::InvalidSource(msg)) if msg.contains("expected format")),
+            "{no_container:?}"
+        );
+        // With one, the URL parses: the next refusal is the missing path.
+        let no_path = data_source
+            .load("abfss://container@account.dfs.core.windows.net/")
+            .await;
+        assert!(
+            matches!(&no_path, Err(SofError::InvalidSource(msg)) if msg.contains("missing blob path")),
+            "{no_path:?}"
+        );
     }
 
     #[tokio::test]
