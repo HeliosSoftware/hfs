@@ -46,10 +46,7 @@ use helios_persistence::tenant::TenantContext;
 use serde_json::{Value, json};
 
 use crate::error::HtsError;
-use crate::state::{
-    AppState, CACHE_MAX_KEY_BYTES, ExpandCacheKey, ExpandHandlerCache, NOT_FOUND_CACHE_MAX,
-    NotFoundCache,
-};
+use crate::state::{AppState, CacheEpoch, ExpandCacheKey, ExpandHandlerCache, NotFoundCache};
 use crate::traits::{SupplementInfo, TerminologyBackend, ValueSetOperations};
 use crate::types::{ExpandRequest, ExpansionContains};
 
@@ -1457,25 +1454,34 @@ fn expand_handler_cache_get(cache: &ExpandHandlerCache, key: &str) -> Option<Byt
 }
 
 /// Insert a successfully-built `$expand` response into the per-AppState cache.
-/// The entry is dropped silently when the cache refuses it: see
-/// [`crate::state::BoundedCache::insert`].
-fn expand_handler_cache_put(cache: &ExpandHandlerCache, key: String, value: Bytes) {
+/// The entry is dropped silently when the cache refuses it (see
+/// [`crate::state::BoundedCache::insert`]) or when a terminology write landed
+/// since `epoch` was taken.
+fn expand_handler_cache_put(
+    cache: &ExpandHandlerCache,
+    epoch: &CacheEpoch,
+    key: String,
+    value: Bytes,
+) {
     if let Ok(mut guard) = cache.write() {
+        if !epoch.is_current() {
+            return;
+        }
         guard.insert(key, value);
     }
 }
 
-/// Remember `url` as a ValueSet that does not exist. Bounded to
-/// [`NOT_FOUND_CACHE_MAX`] entries; a URL above [`CACHE_MAX_KEY_BYTES`] is
-/// not remembered, because the caller chooses its length up to the request
-/// body limit.
-fn not_found_url_put(cache: &NotFoundCache, url: &str) {
-    if url.len() > CACHE_MAX_KEY_BYTES {
-        return;
-    }
+/// Remember that the `$expand` request identified by `key` (see
+/// [`expand_not_found_key`]) missed with `message`. Bounded to
+/// [`crate::state::NOT_FOUND_CACHE_MAX`] entries; a key above
+/// [`crate::state::CACHE_MAX_KEY_BYTES`] is not remembered, because the
+/// caller chooses its length up to the request body limit. Not recorded when
+/// a terminology write landed since `epoch` was taken: the miss describes the
+/// store as it was before that write.
+fn expand_not_found_put(cache: &NotFoundCache, epoch: &CacheEpoch, key: String, message: String) {
     if let Ok(mut neg) = cache.write() {
-        if neg.len() < NOT_FOUND_CACHE_MAX {
-            neg.insert(url.to_string());
+        if epoch.is_current() {
+            neg.insert(key, message);
         }
     }
 }
@@ -1534,6 +1540,9 @@ async fn process_expand_target<B: TerminologyBackend>(
     // Either path is short-circuited on a hit.  Falling through both means
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
+    // Taken before the store is read: a write that lands while this request
+    // runs must keep its result out of every cache below.
+    let epoch = state.cache_epoch();
     if let Some(key) = build_expand_cache_key(&params) {
         let key = match instance {
             Some(instance) => format!("instance:{}:{key}", instance.id),
@@ -1542,25 +1551,51 @@ async fn process_expand_target<B: TerminologyBackend>(
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params, instance).await?;
-        expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
+        let value = process_expand_inner(state, params, instance, &epoch).await?;
+        expand_handler_cache_put(&state.expand_handler_cache, &epoch, key, value.clone());
         return Ok(value);
     }
     if let Some(key) = build_inline_compose_cache_key(&params) {
         if let Some(cached) = expand_handler_cache_get(&state.inline_compose_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params, instance).await?;
-        expand_handler_cache_put(&state.inline_compose_handler_cache, key, value.clone());
+        let value = process_expand_inner(state, params, instance, &epoch).await?;
+        expand_handler_cache_put(
+            &state.inline_compose_handler_cache,
+            &epoch,
+            key,
+            value.clone(),
+        );
         return Ok(value);
     }
-    process_expand_inner(state, params, instance).await
+    process_expand_inner(state, params, instance, &epoch).await
+}
+
+/// Key of a `$expand` miss in [`AppState::not_found_urls`]: the ValueSet URL
+/// plus everything that decides which definition of it the store is asked
+/// for. A request that names only the URL keys on the URL alone.
+///
+/// The qualifiers are kept apart, not folded into one effective version: the
+/// NotFound text differs between `url|v` and `valueSetVersion=v`, and the
+/// cached answer has to be the one this exact request gets on a miss.
+fn expand_not_found_key(url: &str, qualifiers: [Option<&str>; 4]) -> String {
+    if qualifiers.iter().all(Option::is_none) {
+        return url.to_string();
+    }
+    let mut key = url.to_string();
+    for qualifier in qualifiers {
+        // U+0000 cannot occur in a URL, a version or a date.
+        key.push('\0');
+        key.push_str(qualifier.unwrap_or(""));
+    }
+    key
 }
 
 async fn process_expand_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
     instance: Option<&InstanceValueSet>,
+    epoch: &CacheEpoch,
 ) -> Result<Bytes, HtsError> {
     // EX_PROBE: total wall time for the request, plus per-stage breakdown.
     // Stripped after the iter11 diagnosis lands.
@@ -1816,20 +1851,6 @@ async fn process_expand_inner<B: TerminologyBackend>(
         }
     }
 
-    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
-    // URLs that previously returned NotFound are remembered here so we can skip
-    // all backend queries on repeated requests (saves 5+ SQLite round-trips per
-    // hit).
-    if instance.is_none()
-        && let Some(ref url_str) = url
-    {
-        if let Ok(neg) = state.not_found_urls.read() {
-            if neg.contains(url_str.as_str()) {
-                return Err(HtsError::NotFound(url_str.clone()));
-            }
-        }
-    }
-
     // `tx-resource` parameters provide ad-hoc terminology that the caller does
     // not want to import. Each is a full FHIR resource (typically a ValueSet)
     // that the backend should treat as in-scope only for this single request —
@@ -1887,6 +1908,47 @@ async fn process_expand_inner<B: TerminologyBackend>(
     } else {
         (url, value_set)
     };
+
+    // ── Negative-cache check (URL-based 404s) ─────────────────────────────────
+    // Requests that previously returned NotFound for their ValueSet are
+    // remembered here so we can skip all backend queries on repeats (saves 5+
+    // SQLite round-trips per hit). Checked after the tx-resource shortcut: a
+    // request that supplies the ValueSet inline never consults the store for
+    // that URL, so an earlier miss recorded for a url-only request must not
+    // answer it.
+    //
+    // The key carries the version and `date` the request pinned, so a miss
+    // for one version (or for a date the ValueSet does not reach) answers
+    // only that same request and never hides the stored ValueSet.
+    let not_found_key = match (&url, instance) {
+        (Some(url_str), None) => {
+            let version_param = find_str_param(&params, "valueSetVersion");
+            let pinned_default =
+                collect_version_pins(&params, "default-valueset-version").remove(url_str.as_str());
+            let date = find_str_param(&params, "date");
+            Some(expand_not_found_key(
+                url_str,
+                [
+                    pipe_version.as_deref(),
+                    version_param.as_deref(),
+                    pinned_default.as_deref(),
+                    date.as_deref(),
+                ],
+            ))
+        }
+        _ => None,
+    };
+    if let Some(ref key) = not_found_key {
+        let cached = state
+            .not_found_urls
+            .read()
+            .ok()
+            .and_then(|neg| neg.get(key).cloned());
+        if let Some(message) = cached {
+            return Err(HtsError::NotFound(message));
+        }
+    }
+
     // Preserve the URL before it moves into ExpandRequest so we can record it
     // in the negative cache if the backend returns NotFound. Also clone the
     // inline ValueSet body (when present) so we can echo its top-level
@@ -2021,26 +2083,17 @@ async fn process_expand_inner<B: TerminologyBackend>(
             r
         }
         Err(HtsError::NotFound(msg)) => {
-            // Populate the negative cache so future requests for this URL
-            // are resolved in O(1) without touching the database.
-            //
-            // Skip the cache when the failure originated from a nested
-            // `compose.include[].valueSet[]` reference (signalled by the
-            // message naming a different URL than the top-level request).
-            // Caching the top-level URL there would be wrong: the parent VS
-            // exists, only an inner pinned ref was missing — used by the IG
+            // Skip the negative cache when the failure originated from a
+            // nested `compose.include[].valueSet[]` reference (signalled by
+            // the message naming a different URL than the top-level request).
+            // Caching the top-level request there would be wrong: the parent
+            // VS exists, only an inner pinned ref was missing — used by the IG
             // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
             // fixture which pins `default-valueset-version` to a non-existent
             // version of an imported ValueSet.
-            if instance.is_none()
-                && let Some(ref url_str) = url_for_neg_cache
-            {
-                let msg_names_top =
-                    msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
-                if msg_names_top {
-                    not_found_url_put(&state.not_found_urls, url_str);
-                }
-            }
+            let msg_names_top = url_for_neg_cache.as_ref().is_some_and(|url_str| {
+                msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"))
+            });
             // The IG fixtures format VS-not-found errors as
             //   "A definition for the value Set 'url|version' could not be found"
             // when a `valueSetVersion` was supplied. Rewrite the backend's
@@ -2054,6 +2107,13 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 } else {
                     msg
                 };
+            // Populate the negative cache so repeats of this request are
+            // resolved in O(1) without touching the database, with this same
+            // message. Not when a terminology write landed meanwhile: the
+            // miss describes the store as it was before that write.
+            if msg_names_top && let Some(key) = not_found_key {
+                expand_not_found_put(&state.not_found_urls, epoch, key, msg.clone());
+            }
             return Err(HtsError::NotFound(msg));
         }
         Err(e) => return Err(e),
@@ -4105,9 +4165,11 @@ async fn process_expand_inner<B: TerminologyBackend>(
     );
 
     if let Ok(mut cache) = state.expand_cache.write() {
-        // `Bytes::clone` is O(1); storing it here and returning the clone
-        // below means both the cache and the caller share the same buffer.
-        cache.insert(cache_key, bytes.clone());
+        if epoch.is_current() {
+            // `Bytes::clone` is O(1); storing it here and returning the clone
+            // below means both the cache and the caller share the same buffer.
+            cache.insert(cache_key, bytes.clone());
+        }
     }
 
     // EX_PROBE: total wall time for the whole request including parse + post-
@@ -4617,21 +4679,66 @@ mod tests {
 
     #[test]
     fn negative_cache_does_not_remember_an_oversized_key() {
-        use std::collections::HashSet;
-        use std::sync::{Arc, RwLock};
-
-        let cache: crate::state::NotFoundCache = Arc::new(RwLock::new(HashSet::new()));
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let cache = &state.not_found_urls;
+        let epoch = state.cache_epoch();
         let at_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES);
         let over_limit = "k".repeat(crate::state::CACHE_MAX_KEY_BYTES + 1);
-        super::not_found_url_put(&cache, &at_limit.clone());
-        super::not_found_url_put(&cache, &over_limit.clone());
+        super::expand_not_found_put(cache, &epoch, at_limit.clone(), "m".into());
+        super::expand_not_found_put(cache, &epoch, over_limit.clone(), "m".into());
         let guard = cache.read().unwrap();
         assert!(
-            guard.contains(&at_limit),
+            guard.get(&at_limit).is_some(),
             "a key at the limit is remembered"
         );
-        assert!(!guard.contains(&over_limit), "a key above it is not");
+        assert!(guard.get(&over_limit).is_none(), "a key above it is not");
         assert_eq!(guard.len(), 1);
+    }
+
+    /// A miss computed before a terminology write is not remembered after it.
+    #[test]
+    fn a_miss_computed_before_a_write_is_not_remembered_after_it() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let before = state.cache_epoch();
+        state.clear_expand_cache(); // the write
+        super::expand_not_found_put(&state.not_found_urls, &before, "u".into(), "m".into());
+        assert!(state.not_found_urls.read().unwrap().is_empty());
+    }
+
+    /// A response computed before a terminology write is not cached after it.
+    #[test]
+    fn a_response_computed_before_a_write_is_not_cached_after_it() {
+        let state = crate::state::AppState::new(
+            crate::backends::sqlite::SqliteTerminologyBackend::in_memory().unwrap(),
+        );
+        let before = state.cache_epoch();
+        state.clear_expand_cache(); // the write
+        expand_handler_cache_put(
+            &state.expand_handler_cache,
+            &before,
+            "stale".to_string(),
+            Bytes::from_static(b"{}"),
+        );
+        assert!(state.expand_handler_cache.read().unwrap().is_empty());
+
+        expand_handler_cache_put(
+            &state.expand_handler_cache,
+            &state.cache_epoch(),
+            "fresh".to_string(),
+            Bytes::from_static(b"{}"),
+        );
+        assert!(
+            state
+                .expand_handler_cache
+                .read()
+                .unwrap()
+                .get("fresh")
+                .is_some()
+        );
     }
     use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};

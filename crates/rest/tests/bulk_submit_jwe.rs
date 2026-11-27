@@ -97,6 +97,14 @@ fn fetcher() -> HttpSubmitInputFetcher {
         .with_trusted_providers(TrustedProviders::default().allowing_private_networks(true))
 }
 
+/// A fetcher that trusts the test server, so that a failure reads with its
+/// detail; without trusted providers the submitter reads a fixed sentence.
+fn trusting(addr: &SocketAddr) -> HttpSubmitInputFetcher {
+    fetcher().with_trusted_providers(
+        TrustedProviders::parse([format!("http://{addr}")]).expect("test origin parses"),
+    )
+}
+
 #[tokio::test]
 async fn encrypted_manifest_and_file_round_trip() {
     let key = [0x5cu8; 32];
@@ -141,7 +149,7 @@ async fn plaintext_manifest_is_tolerated_but_plaintext_file_is_not() {
     let addr = serve(|addr| (manifest_json(&addr), NDJSON.to_string())).await;
 
     let enc_key = json!({"value": B64URL.encode([0x2du8; 32])});
-    let fetcher = fetcher();
+    let fetcher = trusting(&addr);
 
     // Manifests carry URLs rather than PHI, so a cleartext manifest is accepted.
     let manifest = fetcher
@@ -162,6 +170,19 @@ async fn plaintext_manifest_is_tolerated_but_plaintext_file_is_not() {
         .err()
         .expect("plaintext file must be rejected");
     assert!(err.to_string().contains("is not a JWE"), "{err}");
+
+    // Without trusted providers that is what the address answered, and the
+    // submitter is not told.
+    let err = self::fetcher()
+        .open_file_stream(&manifest.output[0].url, &[], false, &[], Some(&enc_key))
+        .await
+        .err()
+        .expect("plaintext file must be rejected");
+    assert!(!err.to_string().contains("JWE"), "{err}");
+    assert!(
+        err.to_string().contains("the reason is in the server log"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -183,7 +204,7 @@ async fn wrong_key_fails_the_authentication_tag() {
     let addr = serve(|addr| (manifest_json(&addr), seal(&key, NDJSON.as_bytes()))).await;
 
     let wrong = json!({"value": B64URL.encode([0x88u8; 32])});
-    let fetcher = fetcher();
+    let fetcher = trusting(&addr);
     let manifest = fetcher
         .fetch_manifest(
             &format!("http://{addr}/manifest.json"),

@@ -79,6 +79,10 @@ impl ChannelDispatcher for WebSocketChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json(payload: bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice(&payload).expect("a notification is JSON")
+    }
     use crate::manager::{ChannelConfig, ChannelType, PayloadContent, SubscriptionStatusCode};
     use helios_fhir::FhirVersion;
     use serde_json::json;
@@ -125,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_delivers_to_clients() {
         let mgr = Arc::new(WebSocketManager::new());
-        let (_client_id, mut rx) = mgr.register_client("test", "sub-ws-1");
+        let (_client_id, mut rx) = mgr.register_client("test", "sub-ws-1").unwrap();
 
         let channel = WebSocketChannel::new(mgr);
         let bundle = test_bundle();
@@ -133,7 +137,7 @@ mod tests {
         let result = channel.dispatch(&ws_subscription(), &bundle).await.unwrap();
         assert!(matches!(result, DispatchResult::Success));
 
-        let received = rx.recv().await.unwrap();
+        let received = json(rx.recv().await.unwrap());
         assert_eq!(received, bundle);
     }
 

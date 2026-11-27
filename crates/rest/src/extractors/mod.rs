@@ -23,6 +23,7 @@ pub use fhir_resource::FhirResource;
 pub use fhir_version::FhirVersionExtractor;
 pub use pagination::Pagination;
 pub use peer::PeerIp;
+pub(crate) use peer::rate_limit_peer;
 pub use search_params::SearchParams;
 pub use search_query_builder::{
     GLOBAL_SEARCH_PARAMS, build_search_query_for_version, build_search_query_from_pairs,

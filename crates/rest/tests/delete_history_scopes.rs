@@ -1,8 +1,9 @@
 //! `DELETE [type]/[id]/_history` and `DELETE [type]/[id]/_history/[vid]`
-//! under a `patient/` scope erase history inside the launch patient's
-//! compartment only, judged on the current payload as `DELETE [type]/[id]`
-//! judges it (#1618). Over SQLite, the one standalone backend in CI that
-//! implements the two trial-use deletes.
+//! are refused to a `patient/` scope: the versions they erase may predate the
+//! resource joining the launch patient's compartment, and the same token
+//! cannot read those. A grant from a `user/` or `system/` scope is unchanged.
+//! Over SQLite, the one standalone backend in CI that implements the two
+//! trial-use deletes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +21,11 @@ use serde_json::{Value, json};
 const SYSTEM: &str = "system-token";
 /// `patient/*.cruds` with `patient = p1`.
 const P1_WRITE: &str = "p1-write-token";
+/// `patient/Observation.cruds user/Patient.rs` with `patient = p1`: the
+/// Observation grant still rests on the `patient/` scope.
+const P1_MIXED: &str = "p1-mixed-token";
+/// `user/Observation.d`: an unconfined delete grant on Observation only.
+const OBS_DELETE: &str = "obs-delete-token";
 
 struct StubProvider;
 
@@ -32,6 +38,8 @@ impl AuthProvider for StubProvider {
         let (scopes, patient) = match token {
             SYSTEM => ("system/*.cruds", None),
             P1_WRITE => ("patient/*.cruds", Some("p1")),
+            P1_MIXED => ("patient/Observation.cruds user/Patient.rs", Some("p1")),
+            OBS_DELETE => ("user/Observation.d", None),
             _ => return Err(AuthError::InvalidSignature),
         };
         Ok(Principal {
@@ -160,35 +168,63 @@ async fn a_patient_scope_cannot_erase_another_patients_history() {
     );
 }
 
+/// Even the launch patient's own history: the resource is in the compartment
+/// now, but its earlier versions may not have been.
 #[tokio::test]
-async fn a_patient_scope_erases_its_own_patients_history() {
+async fn a_patient_scope_cannot_erase_its_own_patients_history_either() {
     let server = server();
     seed(&server).await;
-
-    let one = server
-        .delete("/Observation/obs-p1/_history/1")
-        .add_header(AUTHORIZATION, bearer(P1_WRITE))
+    // obs-moved was p2's for its first two versions and is p1's now.
+    for (status, p) in [("preliminary", "p2"), ("final", "p2"), ("amended", "p1")] {
+        put(
+            &server,
+            json!({"resourceType": "Observation", "id": "obs-moved", "status": status,
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p}")}}),
+        )
         .await;
-    assert_eq!(one.status_code(), StatusCode::NO_CONTENT, "{}", one.text());
-    assert_eq!(history_total(&server, "obs-p1").await, 1);
+    }
 
-    // A third version, then the whole history.
-    put(
-        &server,
-        json!({"resourceType": "Observation", "id": "obs-p1", "status": "amended",
-            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
-    )
-    .await;
-    let all = server
-        .delete("/Observation/obs-p1/_history")
-        .add_header(AUTHORIZATION, bearer(P1_WRITE))
-        .await;
-    assert_eq!(all.status_code(), StatusCode::OK, "{}", all.text());
+    for token in [P1_WRITE, P1_MIXED] {
+        for path in [
+            "/Observation/obs-p1/_history/1",
+            "/Observation/obs-p1/_history",
+            "/Observation/obs-moved/_history/1",
+            "/Observation/obs-moved/_history",
+        ] {
+            let refused = server
+                .delete(path)
+                .add_header(AUTHORIZATION, bearer(token))
+                .await;
+            assert_eq!(
+                refused.status_code(),
+                StatusCode::FORBIDDEN,
+                "{token} DELETE {path}: {}",
+                refused.text()
+            );
+            assert!(
+                refused.text().contains("patient/ scope"),
+                "{token} DELETE {path}: {}",
+                refused.text()
+            );
+        }
+    }
     assert_eq!(
         history_total(&server, "obs-p1").await,
-        1,
-        "only the current version is left"
+        2,
+        "nothing was erased"
     );
+    assert_eq!(
+        history_total(&server, "obs-moved").await,
+        3,
+        "nothing was erased"
+    );
+
+    let one = server
+        .delete("/Observation/obs-moved/_history/1")
+        .add_header(AUTHORIZATION, bearer(OBS_DELETE))
+        .await;
+    assert_eq!(one.status_code(), StatusCode::NO_CONTENT, "{}", one.text());
+    assert_eq!(history_total(&server, "obs-moved").await, 2);
 }
 
 #[tokio::test]

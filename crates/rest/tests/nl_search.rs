@@ -195,3 +195,58 @@ async fn exceeding_the_rate_limit_returns_429_and_an_operation_outcome() {
         other_tenant.text()
     );
 }
+
+/// An anonymous IPv6 caller is billed by its /64: sending each request from a
+/// new address in its own allocation does not open a fresh budget (#2708).
+#[tokio::test]
+async fn an_ipv6_caller_rotating_addresses_in_its_prefix_shares_one_budget() {
+    const PEER: HeaderName = HeaderName::from_static("x-test-peer");
+    let backend = SqliteBackend::in_memory().expect("backend");
+    backend.init_schema().expect("schema");
+    let config = ServerConfig {
+        nl_search_enabled: true,
+        nl_search_api_key: Some("sk-test".to_string()),
+        nl_search_base_url: "http://127.0.0.1:9".to_string(),
+        nl_search_rate_limit: 2,
+        nl_search_rate_window_secs: 60,
+        ..ServerConfig::for_testing()
+    };
+    let state = helios_rest::AppState::new(Arc::new(backend), config);
+    let routes =
+        helios_rest::routing::fhir_routes::create_routes(state).layer(axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let peer: IpAddr = request.headers()[&PEER].to_str().unwrap().parse().unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::new(peer, 4321)));
+                next.run(request).await
+            },
+        ));
+    let server = TestServer::new(routes).expect("test server");
+    let search = |peer: &'static str| {
+        server
+            .post("/$nl-search")
+            .add_header(PEER, HeaderValue::from_static(peer))
+            .json(&json!({"text": "female patients over 65"}))
+    };
+
+    for peer in ["2001:db8:2708:1::1", "2001:db8:2708:1::2"] {
+        assert_ne!(
+            search(peer).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{peer} within the budget"
+        );
+    }
+    assert_eq!(
+        search("2001:db8:2708:1:ffff:ffff:ffff:ffff")
+            .await
+            .status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a third address in the same /64 is the same caller"
+    );
+    assert_ne!(
+        search("2001:db8:2708:2::1").await.status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "another /64 is another caller"
+    );
+}

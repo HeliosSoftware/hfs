@@ -682,6 +682,7 @@ bulk-import-test-auth-ok = Authentifizierung erfolgreich.
 bulk-import-create-submit = Senden
 bulk-import-advanced = Erweiterte Optionen
 bulk-import-unavailable = Das Storage-Backend hostet keinen Settings-Store; Submissions können nicht gespeichert werden.
+bulk-import-save-failed = Die Submission konnte nicht gespeichert werden. Das Server-Log enthält die Details.
 bulk-import-submissions = Submissions
 bulk-import-records = Einträge
 bulk-import-col-name = Name
@@ -1909,6 +1910,7 @@ hts-home-chart-hint-series-5xx = nur 5xx-Antworten
 ## Nur-Bearer-Authentifizierung (#1560): Auth aktiv, keine Browser-Anmeldung konfiguriert
 auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber keine Browser-Anmeldung ist konfiguriert. Seiten, die die FHIR-API aus dem Browser aufrufen — Ressourcen, Batch / Transaction, gespeicherte Abfragen und Einstellungen — werden mit 401 abgewiesen. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um die Anmeldung zu aktivieren, oder verwenden Sie die API direkt mit einem Bearer-Token.
 auth-admin-scope = Diese Seite verwaltet Mandanten und Massenimport-Übermittlungen für den gesamten Server. Ihre Anmeldung enthält keinen System-Scope mit der nötigen Berechtigung (system/*.r zum Anzeigen, system/*.c zum Anlegen, system/*.d zum Löschen), daher wurde die Anfrage abgelehnt.
+auth-unverified-session = Dieser Server konnte das Zugriffstoken Ihrer Anmeldung nicht verifizieren und kann daher nicht feststellen, welchen Mandanten Sie sehen dürfen; diese Seite wurde abgelehnt. Melden Sie sich ab und erneut an; tritt das weiterhin auf, bitten Sie die Administration, die Token-Validierung des Servers zu prüfen (Aussteller, Zielgruppe und Signaturschlüssel).
 batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.
 batch-too-large = Das Bundle ist größer, als dieser Server annimmt. Teilen Sie es in kleinere Bundles auf oder erhöhen Sie HFS_MAX_BODY_SIZE auf dem Server.
 batch-connection-dropped = Die Verbindung wurde geschlossen, bevor der Server geantwortet hat. Falls Ihre Sitzung abgelaufen ist, melden Sie sich erneut an; das Bundle kann auch größer sein, als dieser Server annimmt.

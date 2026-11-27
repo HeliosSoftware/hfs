@@ -279,6 +279,95 @@ impl SubscriptionEngine {
         self.scheduler.state.snapshot()
     }
 
+    /// A purge erased stored resources with no per-resource delete notice:
+    /// drop the topics, subscriptions and bound clients derived from them,
+    /// the way a FHIR delete notice does.
+    pub(crate) fn observe_erased(
+        &self,
+        tenant_id: &str,
+        scope: &helios_persistence::core::ErasedScope,
+    ) {
+        use helios_persistence::core::ErasedScope;
+        match scope {
+            ErasedScope::Instance { resource_type, id } => {
+                self.forget_resource(tenant_id, resource_type, id)
+            }
+            ErasedScope::Type(resource_type) => self.forget_type(tenant_id, resource_type),
+            ErasedScope::Tenant => self.forget_tenant(tenant_id),
+        }
+    }
+
+    /// All of the tenant's data was erased: every topic, subscription and
+    /// bound websocket client of it is dropped, so a later occupant of the same
+    /// tenant id starts from nothing.
+    ///
+    /// Not called for a deregistration alone. That keeps the tenant's data,
+    /// and unless `HFS_TENANT_REQUIRE_PROVISIONED` is set the tenant stays
+    /// usable, so its stored subscriptions must keep delivering.
+    fn forget_tenant(&self, tenant_id: &str) {
+        for resource_type in ["Subscription", "SubscriptionTopic", "Basic"] {
+            self.forget_type(tenant_id, resource_type);
+        }
+        for url in self.core.topic_registry.list_topics(tenant_id) {
+            self.core.topic_registry.remove_topic(tenant_id, &url);
+        }
+    }
+
+    fn forget_type(&self, tenant_id: &str, resource_type: &str) {
+        let ids: Vec<String> = match resource_type {
+            "Subscription" => self
+                .core
+                .manager
+                .all_subscriptions()
+                .into_iter()
+                .filter(|s| s.tenant_id == tenant_id)
+                .map(|s| s.id)
+                .collect(),
+            "SubscriptionTopic" | "Basic" => self
+                .core
+                .topic_resource_index
+                .iter()
+                .filter(|entry| entry.key().0 == tenant_id && entry.key().1 == resource_type)
+                .map(|entry| entry.key().2.clone())
+                .collect(),
+            _ => return,
+        };
+        for id in ids {
+            self.forget_resource(tenant_id, resource_type, &id);
+        }
+    }
+
+    /// Routes an erased Subscription, SubscriptionTopic or R4 Basic topic
+    /// through the path a payload-free delete notice takes.
+    fn forget_resource(&self, tenant_id: &str, resource_type: &str, id: &str) {
+        if !matches!(
+            resource_type,
+            "Subscription" | "SubscriptionTopic" | "Basic"
+        ) {
+            return;
+        }
+        let tenant = TenantId::new(tenant_id.to_string());
+        let view = EventView {
+            tenant_id: &tenant,
+            // `default_enabled`, not `default`: this compiles without R4. It
+            // is R4 whenever R4 is enabled, the only version with `Basic`
+            // topics.
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
+            resource_type,
+            resource_id: id,
+            version_id: "",
+            event_type: ResourceEventType::Delete,
+            resource: None,
+            previous_resource: None,
+        };
+        let _ = self.handle_control(view);
+        // After the deregistration, so a delivery that was still in flight
+        // cannot record into the counters again.
+        if resource_type == "Subscription" {
+            self.core.delivery_stats.remove(tenant_id, id);
+        }
+    }
+
     pub(crate) fn observe_write(&self, write: &helios_persistence::core::ResourceWrite) {
         let Some(notice) = write.notice.as_ref().filter(|n| !n.resource_id.is_empty()) else {
             return;

@@ -597,6 +597,20 @@ where
                 // `/metadata` says this deployment lacks (#1384, #1535).
                 if let Some(interaction) = transaction_conditional_interaction(&bundle_entry) {
                     super::conditional_support::require(state.storage(), interaction)?;
+                    if principal.is_some() {
+                        let (resource_type, _) =
+                            parse_request_url(&bundle_entry.url).map_err(|e| {
+                                RestError::InvalidElementValue {
+                                    message: format!("Entry {index}: {e}"),
+                                }
+                            })?;
+                        super::conditional_support::require_search_grant(
+                            principal,
+                            &resource_type,
+                            interaction,
+                            Some(&format!("transaction entry {index}")),
+                        )?;
+                    }
                 }
                 if !matches!(bundle_entry.method, BundleMethod::Get) {
                     match conditional_entry_criteria(
@@ -676,6 +690,17 @@ where
                             });
                         }
                     }
+                }
+                if let Some(principal) = principal {
+                    admit_subscription_authority_entry(
+                        state,
+                        &tenant,
+                        fhir_version,
+                        index,
+                        &bundle_entry,
+                        principal,
+                    )
+                    .await?;
                 }
                 // An instance read runs inside the storage transaction on
                 // `bundle_entry.url`; it reads the address judged above and
@@ -1441,6 +1466,24 @@ where
         }
     }
 
+    let conditional_interaction = match method {
+        BundleMethod::Post => if_none_exist.map(|_| ConditionalInteraction::Create),
+        BundleMethod::Put => criteria.map(|_| ConditionalInteraction::Update),
+        BundleMethod::Patch => criteria.map(|_| ConditionalInteraction::Patch),
+        BundleMethod::Delete => criteria.map(|_| ConditionalInteraction::Delete),
+        BundleMethod::Get => None,
+    };
+    if let Some(interaction) = conditional_interaction
+        && let Err(error) = super::conditional_support::require_search_grant(
+            principal,
+            &resource_type,
+            interaction,
+            Some(&format!("batch entry {index}")),
+        )
+    {
+        return entry_failure(error);
+    }
+
     // `ifMatch` on a conditional update or delete is honoured below, against
     // the resource the criteria resolve to (#1381). What is left to refuse is
     // the pairing FHIR gives no meaning: a precondition on a version beside
@@ -1510,6 +1553,16 @@ where
             if let Err(error) =
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
             {
+                return entry_failure(error);
+            }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
                 return entry_failure(error);
             }
 
@@ -1627,6 +1680,16 @@ where
             if let Err(error) =
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
             {
+                return entry_failure(error);
+            }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
                 return entry_failure(error);
             }
 
@@ -1948,6 +2011,7 @@ where
                 &id,
                 criteria,
                 if_match,
+                principal,
                 audit_target,
             )
             .await
@@ -1965,6 +2029,7 @@ async fn process_batch_patch<S>(
     id: &str,
     criteria: Option<&str>,
     if_match: Option<&str>,
+    principal: Option<&Principal>,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
@@ -2049,6 +2114,17 @@ where
             };
         (current, candidate)
     };
+
+    if let Err(error) = super::subscription_authority::admit_write(
+        state,
+        tenant,
+        current.fhir_version(),
+        resource_type,
+        &candidate,
+        principal,
+    ) {
+        return entry_failure(error);
+    }
 
     let validator = RestPatchValidator {
         validation: state.validation(),
@@ -2264,7 +2340,11 @@ fn admit_bundle_mutation(
         admit_resource_type(resource_type, resource, fhir_version)?;
     }
 
-    if matches!(method, BundleMethod::Patch)
+    // A DELETE entry has no payload to admit the type through, and a URL
+    // deeper than `[type]/[id]` is read as its last two segments, so without
+    // this `DELETE Patient/p1/foo` deleted id `foo` of type `p1` and answered
+    // 204 for a resource type that does not exist.
+    if matches!(method, BundleMethod::Patch | BundleMethod::Delete)
         && !is_valid_resource_type_for_version(resource_type, fhir_version)
     {
         return Err(RestError::UnknownResourceType {
@@ -2651,6 +2731,20 @@ fn parse_bundle_request_url(
             .map(|resource_type| ((*resource_type).to_string(), String::new()))
             .ok_or_else(|| "Entry request.url is empty".to_string()),
         BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete => {
+            // A `_history` segment addresses nothing a mutation entry can act
+            // on; read as the last two segments, `Observation/o1/_history`
+            // was the instance `_history` of type `o1`, which answered 204
+            // and erased nothing. The history deletes have no Bundle form.
+            // Only the literal segment is refused: an id or a path prefix that
+            // merely starts with `_` is addressed as before (ids are #2525's
+            // decision, prefixes #2750's).
+            if segments.contains(&"_history") {
+                return Err(format!(
+                    "{method} entry request.url cannot address '_history': a Bundle entry \
+                     writes or deletes an instance ('[type]/[id]') or by criteria \
+                     ('[type]?[parameters]'); history is erased through the instance endpoint"
+                ));
+            }
             if request_url
                 .split_once('?')
                 .is_some_and(|(_, query)| !query.is_empty())
@@ -3472,7 +3566,9 @@ fn status_text(code: &str) -> &'static str {
 /// grant confined to the launch patient's compartment confines the lookup.
 /// Every reference is judged before any lookup runs, so a token without the
 /// grant is refused whole and learns nothing about the referenced type — not
-/// whether a match exists, how many, nor its id.
+/// whether a match exists, how many, nor its id. A chained or `_has`
+/// parameter in the reference searches other types too; each of those hops
+/// is judged as that search judges it ([`ChainAccess`]).
 async fn resolve_conditional_references<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -3539,6 +3635,8 @@ where
         .await
         .map_err(RestError::from)?;
 
+    let chains = ChainAccess::for_principal(principal);
+    let hop_guard = chains.guard(fhir_version);
     for (reference, resolved) in conditionals.iter_mut() {
         let (resource_type, query_string) =
             reference.split_once('?').expect("collected with a '?'");
@@ -3578,11 +3676,22 @@ where
             .expect("judged above")
             .confine_query(fhir_version, &mut query)?;
         // `search()` does not read a chain or `_has` (#1389): resolve them
-        // into an `_id` filter first, as a type search does.
-        let mut query =
-            helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-                .await
-                .map_err(RestError::from)?;
+        // into an `_id` filter first, as a type search does, with every hop
+        // judged against the token as that search judges it (#2501).
+        let options = helios_persistence::search::ChainResolveOptions {
+            hop_guard: hop_guard
+                .as_ref()
+                .map(|g| g as &dyn helios_persistence::search::ChainHopGuard),
+            ..Default::default()
+        };
+        let mut query = helios_persistence::search::resolve_chains_with(
+            state.storage(),
+            tenant.context(),
+            &query,
+            options,
+        )
+        .await
+        .map_err(RestError::from)?;
         // Two is enough to prove the match is not unique.
         query.count = Some(2);
         let result = state
@@ -3767,6 +3876,95 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
         BundleMethod::Put | BundleMethod::Patch => FhirOperation::Update,
         BundleMethod::Delete => FhirOperation::Delete,
     }
+}
+
+/// A transaction entry that writes a Subscription or a topic is judged by the
+/// writer's authority over the resource types the topic names (see
+/// `subscription_authority`), on the document the entry will store: the
+/// submitted resource of a POST or PUT, or the patched current document of a
+/// PATCH, computed here as the batch arm computes it. An entry the
+/// transaction will refuse anyway (no resource, malformed patch, no match)
+/// is left to it.
+async fn admit_subscription_authority_entry<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    index: usize,
+    entry: &BundleEntry,
+    principal: &Principal,
+) -> RestResult<()>
+where
+    S: ResourceStorage + ConditionalStorage + Send + Sync,
+{
+    let (resource_type, id) =
+        parse_request_url(&entry.url).map_err(|e| RestError::InvalidElementValue {
+            message: format!("Entry {index}: {e}"),
+        })?;
+    if !super::subscription_authority::is_judged(&resource_type) {
+        return Ok(());
+    }
+    let document = match entry.method {
+        BundleMethod::Post | BundleMethod::Put => match &entry.resource {
+            Some(resource) => resource.clone(),
+            None => return Ok(()),
+        },
+        BundleMethod::Patch => {
+            let Some(document) = &entry.resource else {
+                return Ok(());
+            };
+            let Ok(patch) = decode_bundle_patch_resource(document, fhir_version) else {
+                return Ok(());
+            };
+            let Ok(if_match) =
+                helios_persistence::core::EntityTagPrecondition::parse(entry.if_match.as_deref())
+            else {
+                return Ok(());
+            };
+            if let Some(criteria) = conditional_criteria(&entry.url, &id) {
+                match state
+                    .storage()
+                    .prepare_conditional_patch(
+                        tenant.context(),
+                        &resource_type,
+                        criteria,
+                        &patch,
+                        &if_match,
+                    )
+                    .await
+                {
+                    Ok(ConditionalPatchPreparation::Ready { patched, .. }) => patched,
+                    _ => return Ok(()),
+                }
+            } else {
+                match state
+                    .storage()
+                    .read(tenant.context(), &resource_type, &id)
+                    .await
+                {
+                    Ok(Some(current)) => {
+                        match apply_patch_for_version(
+                            current.content(),
+                            &patch,
+                            current.fhir_version(),
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+        BundleMethod::Get | BundleMethod::Delete => return Ok(()),
+    };
+    super::subscription_authority::admit_write(
+        state,
+        tenant,
+        fhir_version,
+        &resource_type,
+        &document,
+        Some(principal),
+    )
 }
 
 /// The interaction a bundle entry is authorized for: a GET entry whose URL is
@@ -6185,6 +6383,50 @@ mod tests {
         let text = outcome["issue"][0]["details"]["text"].as_str().unwrap();
         assert!(text.starts_with("Entry 3:"), "{text}");
         assert!(text.contains("'$everything'"), "{text}");
+    }
+
+    #[test]
+    fn a_mutation_url_with_a_control_segment_is_refused() {
+        for method in [BundleMethod::Put, BundleMethod::Patch, BundleMethod::Delete] {
+            for url in [
+                "Observation/o1/_history",
+                "Observation/o1/_history/3",
+                "http://h/fhir/Observation/o1/_history",
+                "Observation/_history",
+                "Observation/Patient/_history",
+            ] {
+                let err = parse_bundle_request_url(&method, url).expect_err(url);
+                assert!(err.contains("_history"), "{method} {url}: {err}");
+            }
+            // Only the literal `_history` segment is refused: an id or a path
+            // prefix that starts with `_` is addressed as before.
+            for (url, id) in [
+                ("Observation/_o2", "_o2"),
+                ("Observation/_history2", "_history2"),
+                ("_t/Observation/o1", "o1"),
+                ("http://h/_fhir/Observation/o1", "o1"),
+            ] {
+                assert_eq!(
+                    parse_bundle_request_url(&method, url),
+                    Ok(("Observation".to_string(), id.to_string())),
+                    "{method} {url}"
+                );
+            }
+        }
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation/o1").is_ok());
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation?code=x").is_ok());
+    }
+
+    #[test]
+    fn a_delete_entry_needs_a_resource_type_of_the_version() {
+        let version = FhirVersion::default_enabled();
+        let refused = admit_bundle_mutation(&BundleMethod::Delete, "p1", None, version)
+            .expect_err("p1 is not a resource type");
+        assert!(
+            matches!(refused, RestError::UnknownResourceType { .. }),
+            "{refused:?}"
+        );
+        assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
     }
 
     /// The transaction arm's parser is the choke point for every method: a

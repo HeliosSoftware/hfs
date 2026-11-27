@@ -2366,6 +2366,41 @@ mod postgres_integration {
         .await;
     }
 
+    /// Concurrent first calls all return the token one of them stored
+    /// (#2702): a second write used to overwrite the first, and the status
+    /// URL handed to the first caller then answered 404.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_bulk_submit_concurrent_first_poll_token_calls_agree() {
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId, SubmitWorkerStorage};
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = std::sync::Arc::new(create_backend().await);
+        let tenant = create_tenant("poll-token-race");
+        for _ in 0..8 {
+            let id = SubmissionId::generate("sys");
+            backend.create_submission(&tenant, &id, None).await.unwrap();
+            let calls = (0..16).map(|_| {
+                let backend = std::sync::Arc::clone(&backend);
+                let tenant = tenant.clone();
+                let id = id.clone();
+                tokio::spawn(async move { backend.ensure_poll_token(&tenant, &id).await.unwrap() })
+            });
+            let tokens: Vec<String> = futures::future::join_all(calls)
+                .await
+                .into_iter()
+                .map(|joined| joined.unwrap())
+                .collect();
+            assert!(
+                tokens.windows(2).all(|pair| pair[0] == pair[1]),
+                "{tokens:?}"
+            );
+            assert_eq!(
+                backend.ensure_poll_token(&tenant, &id).await.unwrap(),
+                tokens[0]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;

@@ -682,6 +682,7 @@ bulk-import-test-auth-ok = Autenticación correcta.
 bulk-import-create-submit = Enviar
 bulk-import-advanced = Opciones avanzadas
 bulk-import-unavailable = El backend de almacenamiento no aloja el settings store; no se pueden guardar submissions.
+bulk-import-save-failed = No se pudo guardar la submission. El log del servidor tiene el detalle.
 bulk-import-submissions = Submissions
 bulk-import-records = registros
 bulk-import-col-name = Nombre
@@ -1905,6 +1906,7 @@ hts-home-chart-hint-series-5xx = solo respuestas 5xx
 ## Autenticación solo con bearer (#1560): auth activa, sin inicio de sesión de navegador
 auth-bearer-only = La autenticación está habilitada en este servidor, pero no hay un inicio de sesión de navegador configurado. Las páginas que llaman a la API FHIR desde el navegador — Recursos, Batch / Transaction, consultas guardadas y preferencias — se rechazan con 401. Configura HFS_UI_LOGIN_CLIENT_ID para habilitar el inicio de sesión, o usa la API directamente con un token bearer.
 auth-admin-scope = Esta página administra los tenants y los envíos de importación masiva de todo el servidor. Tu inicio de sesión no incluye un ámbito de sistema con el permiso necesario (system/*.r para ver, system/*.c para crear, system/*.d para borrar), así que la petición se ha rechazado.
+auth-unverified-session = Este servidor no ha podido verificar el token de acceso de tu inicio de sesión, así que no puede saber qué tenant puedes ver y esta página se ha rechazado. Cierra la sesión y vuelve a iniciarla; si sigue ocurriendo, pide al administrador que revise la validación de tokens del servidor (emisor, audiencia y claves de firma).
 batch-sign-in-required = Este servidor no tiene un inicio de sesión de navegador configurado, así que esta página no puede autenticar la petición. Configura HFS_UI_LOGIN_CLIENT_ID para ejecutar bundles desde aquí.
 batch-too-large = El bundle supera el tamaño que acepta este servidor. Divídelo en bundles más pequeños o aumenta HFS_MAX_BODY_SIZE en el servidor.
 batch-connection-dropped = La conexión se cerró antes de que el servidor respondiera. Si tu sesión ha caducado, vuelve a iniciar sesión; también puede que el bundle supere el tamaño que acepta este servidor.

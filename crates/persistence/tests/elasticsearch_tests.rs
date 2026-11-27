@@ -2944,18 +2944,22 @@ mod es_integration {
                 .await
                 .unwrap_or_else(|e| panic!("[{label}] create through composite: {e}"));
 
-            // The asynchronous worker indexes behind the write; poll for it.
+            // The asynchronous worker indexes behind the write: wait until it
+            // has written everything queued (a no-op without a worker). As
+            // long as an index creation may queue on the shared node.
+            let drain = composite
+                .drain_sync_queue(std::time::Duration::from_millis(
+                    SHARED_NODE_REQUEST_TIMEOUT_MS,
+                ))
+                .await;
+            assert!(
+                drain.drained,
+                "[{label}] the sync queue did not reach Elasticsearch in time ({} recorded for reindex)",
+                drain.recorded
+            );
             let by_name = param_query("Patient", &[("family", Str, "Baddate")]);
-            let mut found = std::collections::BTreeSet::new();
-            for _ in 0..50 {
-                found = found_ids(&composite, &tenant, &by_name).await;
-                if !found.is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
             assert_eq!(
-                found,
+                found_ids(&composite, &tenant, &by_name).await,
                 std::collections::BTreeSet::from(["bad-birthdate".to_string()]),
                 "[{label}] a resource with one bad date must stay searchable"
             );

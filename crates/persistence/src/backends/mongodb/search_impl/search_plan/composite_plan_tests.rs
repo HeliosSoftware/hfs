@@ -2083,7 +2083,7 @@ async fn liveness_finds(db: &mongodb::Database) -> Vec<Document> {
 }
 
 #[tokio::test]
-async fn batched_page_checks_liveness_through_the_identity_index() {
+async fn batched_page_checks_liveness_through_the_liveness_index() {
     let Some(fixture) = Fixture::with_probe_timeout("composite-live", 0, 5_000).await else {
         return;
     };
@@ -2107,13 +2107,21 @@ async fn batched_page_checks_liveness_through_the_identity_index() {
             // batch holds ids. Check the index the server actually used.
             let summary = find.get_str("planSummary").unwrap_or_default();
             assert!(
-                summary.contains("tenant_id: 1, resource_type: 1, id: 1 }"),
+                summary.contains("tenant_id: 1, resource_type: 1, is_deleted: 1, id: 1 }"),
                 "{label}: {summary}"
             );
             assert_eq!(
                 command.get_str("hint"),
-                Ok(crate::backends::mongodb::schema::RESOURCES_IDENTITY_INDEX),
+                Ok(crate::backends::mongodb::schema::RESOURCES_LIVENESS_INDEX),
                 "{label}"
+            );
+            // Covered since #2601: no document is read for `is_deleted`.
+            assert_eq!(
+                find.get_i64("docsExamined")
+                    .or_else(|_| find.get_i32("docsExamined").map(i64::from))
+                    .unwrap(),
+                0,
+                "{label}: {find:?}"
             );
             let bound = id_list_length(&Bson::Document(command.clone())).unwrap() as i64;
             let keys = find
@@ -2122,7 +2130,7 @@ async fn batched_page_checks_liveness_through_the_identity_index() {
                 .unwrap();
             assert!(
                 keys <= 2 * bound + 1,
-                "{label}: one identity seek per candidate, {keys} keys for {bound} ids"
+                "{label}: one seek per candidate, {keys} keys for {bound} ids"
             );
         }
     }

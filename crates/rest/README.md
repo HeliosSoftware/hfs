@@ -421,7 +421,14 @@ them, and exposes results through a status manifest.
   poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
-  (principal, else peer address) per poll token.
+  (principal, else peer address, an IPv6 peer by its /64 network per
+  `HFS_RATE_LIMIT_IPV6_PREFIX`) per poll token. A poll that answers `404` (a token
+  that resolves to nothing, or to a submission the client may not see) also spends
+  one of the client's `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` misses per window, shared by
+  all its tokens and checked before the lookup, so inventing tokens earns a `429`
+  instead of a fresh bucket and a database read each time. A caller with neither a
+  principal nor a peer address is not billed for misses. Each limiter holds at most
+  100,000 buckets; a new key past that is refused with `429` for a window.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
   backend — no separate job store to configure.
@@ -442,6 +449,13 @@ them, and exposes results through a status manifest.
   the receipts and `error` artifact are still published. Per-entry errors stay
   partial success. Input URLs are redacted (query, fragment, credentials) in every
   error message, artifact and log line.
+- **`fileRequestHeader`**: sent on the manifest, size-probe and file requests, after
+  the headers HFS sets, so a provider credential (`Authorization`) wins. A header
+  that routes the request or frames the transfer is refused with `400` on the
+  kick-off: `Host`, `Range`, `If-Range`, `Accept-Encoding`, `Content-Length`,
+  `Transfer-Encoding`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive` and
+  `Proxy-*`. The trusted-provider check judges the URL, and `Host` would otherwise
+  pick the backend that answers on an origin that routes by it.
 - **Resume after a lease reclaim**: every backend records each output file the
   worker walked to its end, and the run that reclaims the manifest skips those
   files; the file that was in flight resumes past the lines its committed batches
@@ -477,7 +491,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll once ingestion has started. |
 | `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` (seconds) advertised while the submission is pre-ingest (queued / reading manifest / sizing / downloading). Never above `RETRY_AFTER`, never below `POLL_RATE_WINDOW / POLL_RATE_LIMIT`. |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
-| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
+| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window, and polls answering `404` allowed per client across all tokens per window. `0` disables poll rate limiting. |
 | `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. The same value bounds automatic deferred-reindex generations to `W` active jobs and `2W` resident tenants per `ReindexOperation`; there is no separate reindex-concurrency setting. |
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | How many of a single manifest's files one worker ingests at once (fan-out). **SQLite always runs at `1` regardless of the configured value** because it serialises writers; a higher fan-out queues batch writes behind one lock until they outlast `busy_timeout` and abort the import (#942). On standalone PostgreSQL, an effective value above `1` runs admitted output files in independent Tokio tasks. Existing standalone PostgreSQL deployments configured above `1` change scheduling on upgrade. Setting `1` restores inline scheduling and also reduces concurrency to one; there is no switch that keeps inline scheduling above `1`. Every other mode, including PostgreSQL plus Elasticsearch, keeps inline scheduling at its current effective concurrency. |
@@ -506,7 +520,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. With `ES384` its public half is published, unauthenticated, at `GET /.well-known/bulk-submit-jwks.json` (see below). |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. With `RS384` no key is published and assertions carry no `kid`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
-| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any public origin the submitter names (see `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`), a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status or transport error of a failed fetch stays in the server log rather than in the submitter's error artifact. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
+| `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` | *(none)* | Comma-separated origins (`scheme://host[:port]`) trusted as Data Providers. Unset, `$bulk-submit` fetches from any public origin the submitter names (see `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`), a file-retrieval token is sent only to the origin of the token endpoint that issued it, and the HTTP status, transport error or body detail (a manifest parse error, a failed decryption, a body above its ceiling) of a failed fetch stays in the server log rather than in the submitter's error artifact. A body that is not a JSON object with an `output` array is not a manifest and fails the manifest instead of completing it empty. Set, the `manifestUrl`, the `oauthMetadataUrl`, the token endpoint it names, every manifest output URL and every redirect must be at listed origins (the token endpoint's own origin always qualifies as a token destination); a kick-off naming another origin is refused with `400`, and fetch failures then carry their detail. An entry with a path, query or fragment fails startup. The web UI's Import page presents the server's bulk-submit client assertion only to token endpoints at listed origins; unset, its backend-services authentication is refused. |
 | `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS` | `false` | With no `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` listed, lets `$bulk-submit` reach loopback, private, link-local and shared addresses. Off, a kick-off naming such an address literally is `400`, and a fetch whose host resolves only to such addresses fails. For local development and CI fixtures; list an internal provider's origin in `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` instead. No effect when that list is set. |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
@@ -555,19 +569,22 @@ request, redirects included, to an origin that is not listed: a kick-off whose
 `manifestUrl` or `oauthMetadataUrl` is elsewhere is refused with `400`, and a
 manifest output URL elsewhere fails that file with a manifest-level error.
 Without it, HFS fetches from any public origin the submitter names, but the
-HTTP status or transport error of a failed fetch then goes to the server log
-only: the submitter's error artifact says that the fetch failed, not what the
-address answered, so `$bulk-submit` cannot be used to map the network around
-HFS. Nor can it reach that network: without a list, no request (the manifest,
-the metadata document, the token endpoint it names, a file, or a redirect hop)
-goes to a loopback, private (RFC 1918 / RFC 4193), link-local (cloud instance
-metadata included), shared (`100.64.0.0/10`) or unspecified address. A URL
-whose host is such an address is refused before any request, a kick-off naming
-one is `400`, and a host name is resolved through a resolver that drops those
-addresses, so a name that points inward, or rebinds to an inward address,
-has nothing to connect to. Set `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true`
-for local development and for test fixtures served from `127.0.0.1`; for a
-provider inside your own network, list its origin instead.
+detail of a failed fetch then goes to the server log only: the HTTP status,
+the transport error, a manifest that does not parse, a file that is not the
+JWE its `fileEncryptionKey` promises, an unsupported `Content-Encoding`, or a
+body above its byte ceiling. The submitter's error artifact says that the
+fetch failed, not what the address answered, so `$bulk-submit` cannot be used
+to map the network around HFS. Nor can it reach that network: without a list,
+no request (the manifest, the metadata document, the token endpoint it names,
+a file, or a redirect hop) goes to a loopback, private (RFC 1918 / RFC 4193),
+link-local (cloud instance metadata included), shared (`100.64.0.0/10`) or
+unspecified address. A URL whose host is such an address is refused before any
+request, a kick-off naming one is `400`, and a host name is resolved through a
+resolver that drops those addresses, so a name that points inward, or rebinds
+to an inward address, has nothing to connect to. Set
+`HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true` for local development and for
+test fixtures or a Data Provider served from `127.0.0.1`; for a provider
+inside your own network, list its origin instead.
 
 HFS publishes the public half of that key at
 `GET /.well-known/bulk-submit-jwks.json`, which needs no authentication. A
