@@ -699,6 +699,31 @@ impl BulkExportStorage for SqliteBackend {
             })
             .collect())
     }
+
+    async fn purge_tenant_exports(&self, tenant_id: &str) -> StorageResult<u64> {
+        let mut conn = self.get_connection()?;
+        let tx = conn
+            .transaction()
+            .or_query_error("Failed to start export purge")?;
+        for sql in [
+            "DELETE FROM bulk_export_files
+             WHERE job_id IN (SELECT id FROM bulk_export_jobs WHERE tenant_id = ?1)",
+            "DELETE FROM bulk_export_progress
+             WHERE job_id IN (SELECT id FROM bulk_export_jobs WHERE tenant_id = ?1)",
+        ] {
+            tx.execute(sql, params![tenant_id])
+                .or_query_error("Failed to purge export rows")?;
+        }
+        let jobs = tx
+            .execute(
+                "DELETE FROM bulk_export_jobs WHERE tenant_id = ?1",
+                params![tenant_id],
+            )
+            .or_query_error("Failed to purge export jobs")?;
+        tx.commit()
+            .or_query_error("Failed to commit export purge")?;
+        Ok(jobs as u64)
+    }
 }
 
 /// Encodes an [`ExportPartKey`] into the `file_path` column.
@@ -1860,6 +1885,32 @@ mod tests {
             owner_subject: Some("test-subject".to_string()),
             fhir_version: FhirVersion::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn purge_tenant_exports_removes_only_that_tenants_jobs() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+        let gone = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let kept = backend
+            .start_export(&other, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.purge_tenant_exports("test-tenant").await.unwrap(),
+            1
+        );
+        assert!(backend.get_export_status(&tenant, &gone).await.is_err());
+        assert!(backend.get_export_status(&other, &kept).await.is_ok());
+        assert_eq!(
+            backend.purge_tenant_exports("test-tenant").await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -74,7 +74,7 @@ mod vd_complete;
 
 pub use bulk_import::set_bulk_submit_trusted_providers;
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
-pub use tenants::register_tenant_purge_output;
+pub use tenants::{register_tenant_purge_export_jobs, register_tenant_purge_output};
 
 #[doc(hidden)]
 pub use conformance::{

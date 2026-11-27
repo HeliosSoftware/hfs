@@ -2997,9 +2997,13 @@ where
     };
 
     spawn_export_workers(jobs.clone(), data, output.clone(), &cfg);
-    // A tenant purge from the web UI deletes this store's files too (#2279).
+    // A tenant purge from the web UI deletes this store's files too (#2279),
+    // and this store's job rows, which may sit outside the primary.
     #[cfg(feature = "ui")]
-    helios_ui::register_tenant_purge_output(output.clone());
+    {
+        helios_ui::register_tenant_purge_output(output.clone());
+        helios_ui::register_tenant_purge_export_jobs(jobs.clone());
+    }
 
     Ok(Some(helios_rest::BulkExportBundle {
         jobs,

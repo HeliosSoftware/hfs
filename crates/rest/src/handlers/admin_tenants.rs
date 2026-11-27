@@ -424,6 +424,11 @@ where
         )
         .await?;
         let removed = state.storage().purge_tenant_data(&id).await?;
+        // On a MongoDB or S3 primary the export jobs live in a SQLite
+        // sidecar that the purge above does not reach.
+        if let Some(jobs) = state.bulk_export_jobs() {
+            jobs.purge_tenant_exports(&id).await?;
+        }
         // The tenant's data is gone; consumers holding figures for it (the
         // dashboard counters) treat them as stale (#1078).
         state.write_observer().on_write(&WriteEvent::Erased {

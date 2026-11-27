@@ -22850,6 +22850,35 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_purge_tenant_exports_removes_only_that_tenants_jobs() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let gone_tenant = create_tenant("export-purge-gone");
+        let kept_tenant = create_tenant("export-purge-kept");
+        let gone = backend
+            .start_export(&gone_tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let kept = backend
+            .start_export(&kept_tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let removed = backend
+            .purge_tenant_exports(gone_tenant.tenant_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            backend
+                .get_export_status(&gone_tenant, &gone)
+                .await
+                .is_err()
+        );
+        assert!(backend.get_export_status(&kept_tenant, &kept).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn postgres_integration_export_claim_skip_locked() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;

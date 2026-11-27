@@ -3114,6 +3114,7 @@ mod tests {
                 output_ttl: StdDuration,
                 limit: u32,
             ) -> StorageResult<Vec<ExpiredExportRef>>;
+            async fn purge_tenant_exports(tenant_id: &str) -> StorageResult<u64>;
         }
     }
 
