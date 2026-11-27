@@ -316,6 +316,24 @@ pub(crate) struct RequestTenant {
     /// tenant, because it is the same per-request rendering context the
     /// topbar draws from.
     pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
+    /// The session's token was not accepted by the provider
+    /// (`login::Unverified`), so `id` is not backed by a verified claim and
+    /// nothing may be read for it from process state: see
+    /// [`RequestTenant::live_counts`].
+    pub(crate) unverified: bool,
+}
+
+impl RequestTenant {
+    /// The tenant's live per-type figures for a type rail, read from process
+    /// state. `None` for a session with no verified tenant, so the rail
+    /// renders without counts instead of with the default tenant's.
+    pub(crate) async fn live_counts(&self) -> Option<DashboardSnapshot> {
+        if self.unverified {
+            return None;
+        }
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &self.id, &[], false)
+            .await
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for RequestTenant
@@ -337,7 +355,47 @@ where
                 display: None,
                 multi: false,
                 signed_in: None,
+                unverified: false,
             }))
+    }
+}
+
+/// The tenant a signed-in principal is bound to: its token's tenant claim,
+/// else the server default. Without a login installed there is no principal
+/// to bind, and the default applies.
+fn claimed_tenant(state: &WebState, principal: Option<&helios_auth::Principal>) -> String {
+    match principal {
+        Some(principal) if state.login.is_some() => principal
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| state.default_tenant.clone()),
+        _ => state.default_tenant.clone(),
+    }
+}
+
+/// Whether this request may act in `choice`. With a login installed the
+/// answer comes from the verified token the session gate stamped: a
+/// `system/*.r` scope spans every registered tenant, as it does for the
+/// `/admin/tenants` roster; anything else is confined to the claimed tenant.
+/// Without a login installed every registered tenant stays selectable, as the
+/// bearer-only posture refuses the selector outright and the open posture has
+/// no principal to confine.
+fn tenant_allowed(
+    state: &WebState,
+    principal: Option<&helios_auth::Principal>,
+    choice: &str,
+) -> bool {
+    if state.login.is_none() {
+        return true;
+    }
+    match principal {
+        Some(principal) => {
+            principal
+                .scopes
+                .has_system_scope(helios_auth::SmartPermissions::READ)
+                || claimed_tenant(state, Some(principal)) == choice
+        }
+        None => false,
     }
 }
 
@@ -358,19 +416,25 @@ async fn resolve_prefs(
         return next.run(request).await;
     }
 
-    let user_key = settings_user_key(request.extensions().get::<helios_auth::Principal>());
+    let principal = request
+        .extensions()
+        .get::<helios_auth::Principal>()
+        .cloned();
+    let user_key = settings_user_key(principal.as_ref());
     // Stamped by the session gate (`login::require_session`), which runs
     // before this middleware, when the request carries a valid session.
     let signed_in = request
         .extensions()
         .get::<login::SignedIn>()
         .map(|s| s.0.clone());
+    let unverified = request.extensions().get::<login::Unverified>().is_some();
     let mut version = state.fhir_version;
     let mut tenant = RequestTenant {
-        id: state.default_tenant.clone(),
+        id: claimed_tenant(&state, principal.as_ref()),
         display: None,
         multi: false,
         signed_in: signed_in.clone(),
+        unverified,
     };
     // The single settings read every rail page's state (`rail_state::RequestSettings`,
     // stamped below) is built from too — reading it again per page would break
@@ -392,6 +456,7 @@ async fn resolve_prefs(
         }
         if let Some(choice) = document.get(SETTINGS_TENANT_KEY).and_then(|v| v.as_str())
             && choice != tenant.id
+            && tenant_allowed(&state, principal.as_ref(), choice)
             && let Some(registry) = &state.tenants
             && let Ok(Some(record)) = registry.get_tenant(choice).await
         {
@@ -400,6 +465,7 @@ async fn resolve_prefs(
                 display: record.display_name,
                 multi: false,
                 signed_in: signed_in.clone(),
+                unverified,
             };
         }
     }
@@ -2002,6 +2068,12 @@ pub fn mount_with_conformance_source_and_runtime(
             state.clone(),
             login::require_system_scope,
         ))
+        // A session whose token the provider did not accept has no verified
+        // tenant, so the pages that read a tenant's figures from process
+        // state refuse it rather than fall back to the default tenant.
+        // Inside the locale layer so the refusal is worded in the request's
+        // language.
+        .layer(middleware::from_fn(login::refuse_unverified_tenant_reads))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -2135,6 +2207,7 @@ fn acts_on_storage_directly(path: &str) -> bool {
         || path.starts_with("/ui/bulk-import/")
         || path == "/ui/bulk-export"
         || path.starts_with("/ui/bulk-export/")
+        || path == "/ui/subscriptions"
 }
 
 /// The UI routes that read or write the caller's settings document with
@@ -2293,12 +2366,20 @@ fn initials_of(label: &str) -> String {
 
 /// `GET /ui/tenant/options` â€” the registry's provisioned tenants as selector
 /// options, with the effective tenant marked current.
-async fn tenant_options(State(state): State<WebState>, rt: RequestTenant) -> Response {
+async fn tenant_options(
+    State(state): State<WebState>,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    rt: RequestTenant,
+) -> Response {
+    let principal = principal.as_ref().map(|e| &e.0);
     let mut options = Vec::new();
     if let Some(registry) = &state.tenants
         && let Ok(records) = registry.list_tenants().await
     {
-        for record in records {
+        for record in records
+            .into_iter()
+            .filter(|record| tenant_allowed(&state, principal, &record.id))
+        {
             let label = record
                 .display_name
                 .clone()
@@ -2342,6 +2423,13 @@ async fn set_tenant(
     axum::Form(form): axum::Form<TenantForm>,
 ) -> Response {
     let choice = form.tenant.trim();
+    if !tenant_allowed(&state, principal.as_ref().map(|e| &e.0), choice) {
+        return (
+            StatusCode::FORBIDDEN,
+            "tenant not permitted for this session",
+        )
+            .into_response();
+    }
     let known = choice == state.default_tenant
         || match &state.tenants {
             Some(registry) => matches!(registry.get_tenant(choice).await, Ok(Some(_))),
@@ -2886,9 +2974,7 @@ async fn search(
     let selected_type = explicit_type
         .map(str::to_string)
         .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
+    let live = rt.live_counts().await;
     let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/search",
@@ -2991,9 +3077,7 @@ async fn resources(
     } else {
         i18n.t_arg("resources-create-typed", "type", selected_type.clone())
     };
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
+    let live = rt.live_counts().await;
     let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/resources",

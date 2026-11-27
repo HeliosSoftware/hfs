@@ -21,8 +21,8 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 use tower::ServiceExt;
 
 /// A validator that accepts the seeded session's token as `demo-sub` carrying
-/// exactly the given scopes, and refuses every other bearer.
-struct ScopedProvider(String);
+/// exactly the given scopes (and tenant claim), and refuses every other bearer.
+struct ScopedProvider(String, Option<String>);
 
 #[async_trait::async_trait]
 impl AuthProvider for ScopedProvider {
@@ -34,6 +34,7 @@ impl AuthProvider for ScopedProvider {
             subject: "demo-sub".to_string(),
             issuer: "https://idp.example.com/realms/fhir".to_string(),
             scopes: ScopeSet::parse(&self.0),
+            tenant_id: self.1.clone(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             ..Default::default()
         })
@@ -45,9 +46,20 @@ impl AuthProvider for ScopedProvider {
 }
 
 fn runtime(sessions: &Arc<SessionStore>, scopes: &str) -> helios_ui::LoginRuntime {
+    runtime_for(sessions, scopes, None)
+}
+
+fn runtime_for(
+    sessions: &Arc<SessionStore>,
+    scopes: &str,
+    tenant: Option<&str>,
+) -> helios_ui::LoginRuntime {
     helios_ui::LoginRuntime {
         sessions: Arc::clone(sessions),
-        provider: Arc::new(ScopedProvider(scopes.to_string())),
+        provider: Arc::new(ScopedProvider(
+            scopes.to_string(),
+            tenant.map(str::to_string),
+        )),
     }
 }
 
@@ -629,4 +641,144 @@ async fn the_method_bit_is_checked_not_just_the_system_context() {
         StatusCode::FORBIDDEN
     );
     assert!(store.get_tenant("beta").await.unwrap().is_some());
+}
+
+// ── The tenant choice is bound to the token's claim (run-4) ──────────────────
+
+/// A login whose provider binds the seeded session to `tenant` with `scopes`,
+/// over a registry holding `acme` and `beta`.
+async fn tenant_app(scopes: &str, tenant: Option<&str>) -> (Router, Arc<SessionStore>) {
+    let sessions = Arc::new(SessionStore::new(login_config()));
+    helios_ui::set_interactive_login(runtime_for(&sessions, scopes, tenant));
+    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    backend.init_schema().expect("init schema");
+    let store: Arc<dyn ResourceStorage> = Arc::new(backend);
+    store.register_tenant("acme", Some("Acme")).await.unwrap();
+    store.register_tenant("beta", Some("Beta")).await.unwrap();
+    let router = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        Some(Arc::clone(&store)),
+        None,
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+    (router, sessions)
+}
+
+async fn signed_in_body(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, "hfs_session=sess-test-1")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn a_session_bound_to_a_tenant_sees_and_selects_only_that_tenant() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions) = tenant_app("user/*.cruds", Some("acme")).await;
+    seeded_session(&sessions);
+
+    let (status, options) = signed_in_body(&router, "GET", "/ui/tenant/options", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(options.contains("acme"), "{options}");
+    assert!(
+        !options.contains("beta"),
+        "another tenant is not offered: {options}"
+    );
+
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=beta").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=acme").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_system_read_scope_spans_every_tenant() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions) = tenant_app("system/*.r", Some("acme")).await;
+    seeded_session(&sessions);
+
+    let (status, options) = signed_in_body(&router, "GET", "/ui/tenant/options", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        options.contains("acme") && options.contains("beta"),
+        "{options}"
+    );
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=beta").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_session_without_a_tenant_claim_is_confined_to_the_default_tenant() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions) = tenant_app("user/*.cruds", None).await;
+    seeded_session(&sessions);
+
+    let (status, options) = signed_in_body(&router, "GET", "/ui/tenant/options", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !options.contains("acme") && !options.contains("beta"),
+        "{options}"
+    );
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=acme").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A session whose access token the provider does not accept has no verified
+/// tenant. It is not shown the default tenant's process-held figures: the
+/// Home dashboard and the subscription inventory refuse it, while a page whose
+/// data comes through the API still renders (and the API answers it `401`).
+#[tokio::test]
+async fn a_session_with_an_unverified_token_reads_no_tenant_state() {
+    let _serial = SERIAL.lock().await;
+    let (router, sessions) = tenant_app("user/*.cruds", Some("acme")).await;
+    let mut session = seeded_session(&sessions);
+    session.access_token = "a-token-the-provider-refuses".to_string();
+    sessions.insert(session);
+
+    for page in ["/ui", "/ui/subscriptions"] {
+        let (status, body) = signed_in_body(&router, "GET", page, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+        assert!(
+            body.contains("could not verify the access token"),
+            "{page}: {body}"
+        );
+    }
+    let (status, _) = signed_in_body(&router, "GET", "/ui/resources", "").await;
+    assert_eq!(status, StatusCode::OK, "self-call pages still render");
+
+    let (status, options) = signed_in_body(&router, "GET", "/ui/tenant/options", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !options.contains("acme") && !options.contains("beta"),
+        "{options}"
+    );
+    let (status, _) = signed_in_body(&router, "POST", "/ui/tenant", "tenant=acme").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

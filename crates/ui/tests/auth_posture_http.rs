@@ -80,6 +80,7 @@ const STORAGE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ui/bulk-import/some-id/abort"),
     ("POST", "/ui/bulk-import/some-id/complete"),
     ("POST", "/ui/bulk-import/some-id/edit"),
+    ("GET", "/ui/subscriptions"),
     ("POST", "/ui/version"),
     ("GET", "/ui/sql/export"),
     ("POST", "/ui/sql/export"),
