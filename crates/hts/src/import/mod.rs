@@ -212,6 +212,19 @@ pub struct ImportStats {
     /// The import continues past these; fatal errors are returned as `Err`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<String>,
+    /// Resources left out because a REST resource holds their canonical or
+    /// id (also listed in `errors`). Unlike a malformed resource, this is a
+    /// store condition that can change between imports of the same file.
+    ///
+    /// A refusal by the authority check is not counted: the stored row comes
+    /// from the package that owns the canonical, so importing the same file
+    /// again is refused the same way.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub conflicts: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl ImportStats {
@@ -230,6 +243,25 @@ impl ImportStats {
         self.concept_maps = self.concept_maps.saturating_add(other.concept_maps);
         self.concepts = self.concepts.saturating_add(other.concepts);
         self.errors.extend(other.errors);
+        self.conflicts = self.conflicts.saturating_add(other.conflicts);
+    }
+
+    /// Count a refusal by `check_import_owner` as a conflict. Only these are
+    /// counted; a refusal by the authority check inside the writers is listed
+    /// in `errors` only.
+    pub(crate) fn count_owner_refusal(&mut self, error: &crate::error::HtsError) {
+        if matches!(error, crate::error::HtsError::Conflict(_)) {
+            self.conflicts = self.conflicts.saturating_add(1);
+        }
+    }
+
+    /// Carry over the non-fatal errors and the conflict count of one chunk.
+    ///
+    /// For importers that write a terminology in several chunks and tally the
+    /// resource counts themselves.
+    pub fn take_errors(&mut self, chunk: ImportStats) {
+        self.errors.extend(chunk.errors);
+        self.conflicts = self.conflicts.saturating_add(chunk.conflicts);
     }
 }
 
@@ -327,23 +359,23 @@ pub trait BundleImportBackend: Send + Sync {
     }
 
     /// Build `concept_closure` for every system that has hierarchy edges but no
-    /// closure rows, and return the number of systems rebuilt.
+    /// closure rows or a stale one, and return the number of systems rebuilt.
     ///
     /// A deferred batch ([`Self::import_bundle_deferred`], or a parsed bundle
-    /// with [`bundle_parser::ParsedBundle::defer_closure`]) deletes the closure
-    /// of a system that already had concepts and does not rebuild it, because
-    /// rebuilding after every chunk of a bulk load is O(n²) — for SNOMED CT
-    /// that is hours. The CLI and bootstrap loads run this once at the end. A
-    /// *chunked import into an already-running server* (`POST
-    /// /import?defer_closure=true`) has no such end step of its own, so the
-    /// system is left with hierarchy but no closure, which silently answers
-    /// `not-subsumed` from `$subsumes` on SQLite and empties closure-backed
-    /// `is-a` expansion on PostgreSQL.
+    /// with [`bundle_parser::ParsedBundle::defer_closure`]) keeps the closure
+    /// a populated system already has and marks it stale instead of
+    /// rebuilding it, because rebuilding after every chunk of a bulk load is
+    /// O(n²) — for SNOMED CT that is hours. Readers keep answering from the
+    /// kept closure, which does not yet cover the concepts the batch added.
+    /// The CLI and bootstrap loads run this once at the end. A *chunked import
+    /// into an already-running server* (`POST /import?defer_closure=true`)
+    /// has no such end step of its own, so the stale closure stays until a
+    /// finalize or the next startup.
     ///
     /// Chunked importers close that gap by calling this once after the final
     /// chunk, which is what `POST /import?finalize=true` does. It is idempotent
-    /// and only touches systems that are actually missing closure rows, so a
-    /// call on an up-to-date database costs one query.
+    /// and only touches systems whose closure is missing or stale, so a call
+    /// on an up-to-date database costs one query.
     ///
     /// The default returns `Ok(0)`: a backend with no closure table has nothing
     /// to rebuild.

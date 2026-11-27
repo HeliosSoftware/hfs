@@ -108,6 +108,9 @@ pub struct ExportTask {
     pub header: bool,
     /// Optional client-supplied tracking identifier echoed back in the manifest.
     pub client_tracking_id: Option<String>,
+    /// Subject of the principal that started the job; `None` with auth off.
+    /// The status, result, download and cancel routes admit this subject.
+    pub owner_subject: Option<String>,
 }
 
 /// A single output file produced by an export job.
@@ -314,6 +317,15 @@ pub trait ExportJobController: Send + Sync + 'static {
     /// the job ID is unknown OR if `tenant_id` does not match the tenant
     /// that submitted the job.
     fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus>;
+
+    /// The subject that started `job_id` in `tenant_id`, if the job recorded
+    /// one. `None` for an unknown job, another tenant's job, or a job started
+    /// with auth off; only a wildcard reader may reach such a job when auth is
+    /// on.
+    fn owner_subject(&self, tenant_id: &str, job_id: &str) -> Option<String> {
+        let _ = (tenant_id, job_id);
+        None
+    }
 
     /// Requests cancellation of the given job.
     ///

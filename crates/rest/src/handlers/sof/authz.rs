@@ -16,11 +16,17 @@
 //! ([`check_terminology_reachable`]), and the resolved kind is checked with
 //! the rest of the plan ([`plan_resource_types`]).
 
+use std::borrow::Cow;
+
+use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
+use helios_persistence::tenant::TenantContext;
 use serde_json::Value;
 
 use super::graph::{GraphPlan, PlanNode};
+use crate::audit::AttributeToPrincipal;
 use crate::error::RestError;
+use crate::state::AppState;
 
 /// The resource type a ViewDefinition reads, when it names one.
 pub(super) fn view_resource_type(view: &Value) -> Option<&str> {
@@ -71,6 +77,88 @@ pub(super) fn check_terminology_reachable(
             ),
         })
     }
+}
+
+/// [`check_read_scopes`] for `subject`, with the decision recorded as an
+/// `AuditEvent` when an audit sink is configured: outcome `0` naming every
+/// resource type the operation reads, or `8` for a refusal.
+///
+/// Neither middleware records these operations. The authorization middleware
+/// leaves them to their handler, and the audit middleware leaves every `POST`
+/// without a resource type to the batch handler. So this event is their only
+/// trace in the audit trail.
+pub(super) async fn authorize_reads<'a, S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    principal: Option<&Principal>,
+    operation: &str,
+    subject: &Value,
+    resource_types: impl IntoIterator<Item = &'a str>,
+) -> Result<(), RestError>
+where
+    S: helios_persistence::core::ResourceStorage,
+{
+    let mut types: Vec<&str> = resource_types.into_iter().collect();
+    types.sort_unstable();
+    types.dedup();
+    let decision = check_read_scopes(principal, operation, types.iter().copied());
+    let Some(sink) = state.audit_sink() else {
+        return decision;
+    };
+    // The types and the subject's name come from the request body, an inline
+    // subject's included, and are recorded for a refused caller too. So each is
+    // capped: one request cannot write an event the size of its body.
+    let types: Vec<Cow<'_, str>> = types.into_iter().map(audit_label).collect();
+    let reads = if types.is_empty() {
+        "no resource type".to_string()
+    } else {
+        types.join(", ")
+    };
+    let (outcome, verdict) = match &decision {
+        Ok(()) => ("0", "Granted"),
+        Err(_) => ("8", "Forbidden"),
+    };
+    let mut event = AuditEventBuilder::new(state.audit_source_observer())
+        .action(AuditAction::Execute)
+        .outcome(outcome)
+        .outcome_desc(format!("{verdict}: {operation} reading {reads}"))
+        .tenant(tenant.tenant_id().as_str())
+        .detail("audit-operation", operation.trim_start_matches('$'));
+    for resource_type in &types {
+        event = event.detail("resource-type", resource_type.as_ref());
+    }
+    if let Some(label) = subject_label(subject) {
+        event = event.detail("subject", audit_label(&label));
+    }
+    if let Some(principal) = principal {
+        event = event.principal(principal);
+    }
+    sink.record(event.build()).await;
+    decision
+}
+
+/// The most characters of a caller-supplied value an audit event records.
+/// Longer than any resource type name and than a canonical in practical use.
+const MAX_AUDIT_LABEL_CHARS: usize = 256;
+
+/// `value` as an audit event records it: whole when it fits in
+/// [`MAX_AUDIT_LABEL_CHARS`], else its first characters and an ellipsis.
+fn audit_label(value: &str) -> Cow<'_, str> {
+    match value.char_indices().nth(MAX_AUDIT_LABEL_CHARS) {
+        None => Cow::Borrowed(value),
+        Some((end, _)) => Cow::Owned(format!("{}…", &value[..end])),
+    }
+}
+
+/// How an audit event names a subject: its canonical `url`, else
+/// `{resourceType}/{id}`; `None` for an inline subject with neither.
+fn subject_label(subject: &Value) -> Option<String> {
+    if let Some(url) = subject.get("url").and_then(Value::as_str) {
+        return Some(url.to_string());
+    }
+    let resource_type = subject.get("resourceType")?.as_str()?;
+    let id = subject.get("id")?.as_str()?;
+    Some(format!("{resource_type}/{id}"))
 }
 
 /// Requires an unrestricted Search grant on every resource type `operation`
@@ -244,6 +332,32 @@ mod tests {
                 "{scopes}"
             );
         }
+    }
+
+    #[test]
+    fn a_subject_is_named_by_its_canonical_then_its_id() {
+        assert_eq!(
+            subject_label(&json!({"resourceType": "Library", "id": "q", "url": "http://x/q"}))
+                .as_deref(),
+            Some("http://x/q")
+        );
+        assert_eq!(
+            subject_label(&json!({"resourceType": "ViewDefinition", "id": "v"})).as_deref(),
+            Some("ViewDefinition/v")
+        );
+        assert_eq!(
+            subject_label(&json!({"resourceType": "ViewDefinition"})),
+            None
+        );
+    }
+
+    #[test]
+    fn an_audit_label_is_cut_at_the_cap_on_a_character_boundary() {
+        assert_eq!(audit_label("Observation"), "Observation");
+        let at_cap = "é".repeat(MAX_AUDIT_LABEL_CHARS);
+        assert_eq!(audit_label(&at_cap), at_cap);
+        let over = format!("{at_cap}é");
+        assert_eq!(audit_label(&over), format!("{at_cap}…"));
     }
 
     #[test]

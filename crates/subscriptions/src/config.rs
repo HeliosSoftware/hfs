@@ -17,6 +17,13 @@ pub struct SubscriptionConfig {
     /// its active notification. This is capped at the global budget.
     pub per_subscription_queue_capacity: usize,
 
+    /// Share of [`Self::max_pending_notifications`] one tenant's
+    /// subscriptions may hold together, so that one tenant's slow or failing
+    /// receivers cannot shed every other tenant's notifications. `None` is
+    /// half the global budget. The effective share is kept between
+    /// [`Self::per_subscription_queue_capacity`] and the global budget.
+    pub max_pending_notifications_per_tenant: Option<usize>,
+
     /// Maximum channel attempts running simultaneously. Retry sleeps do not
     /// hold an attempt slot. A value of one serializes channel attempts.
     pub dispatch_concurrency: usize,
@@ -141,6 +148,7 @@ impl Default for SubscriptionConfig {
             event_queue_capacity: 1024,
             max_pending_notifications: 1024,
             per_subscription_queue_capacity: 32,
+            max_pending_notifications_per_tenant: None,
             dispatch_concurrency: 64,
             handshake_concurrency: 8,
             max_retries: 10,
@@ -217,6 +225,22 @@ impl SubscriptionConfig {
             );
             self.per_subscription_queue_capacity = self.max_pending_notifications;
         }
+        let share = match self.max_pending_notifications_per_tenant {
+            Some(share) if share == 0 || share > tokio::sync::Semaphore::MAX_PERMITS => {
+                tracing::warn!(
+                    setting = "max_pending_notifications_per_tenant",
+                    configured = share,
+                    "Invalid subscription dispatch limit; using half the global budget"
+                );
+                self.max_pending_notifications / 2
+            }
+            Some(share) => share,
+            None => self.max_pending_notifications / 2,
+        };
+        self.max_pending_notifications_per_tenant = Some(share.clamp(
+            self.per_subscription_queue_capacity,
+            self.max_pending_notifications,
+        ));
         self
     }
 }

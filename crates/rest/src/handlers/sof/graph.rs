@@ -26,13 +26,18 @@
 //!   further, returning the errors found so far plus [`check_max_nodes`]'s
 //!   error. On success, produces a
 //!   [`GraphPlan`] whose nodes are topologically ordered (leaves first).
-//! - **Phase 2 — execution** ([`execute_plan`]): materializes the plan's
-//!   nodes in order — leaf ViewDefinitions via the wired `SofRunner`,
-//!   interior SQLView nodes by running their own (already-validated) SQL
-//!   against the tables materialized so far — then runs the subject's own
-//!   SQL. A node shared by multiple edges is materialized once; each edge's
-//!   `relatedArtifact.label` becomes a table alias for whichever SQL
-//!   references it.
+//! - **Phase 2 — execution** ([`execute_plan`]): runs the plan and the
+//!   subject's own SQL. On a backend that speaks SQL (SQLite, PostgreSQL) the
+//!   whole plan is handed to the runner, which runs it as one read-only
+//!   statement inside the primary database: each leaf ViewDefinition and
+//!   SQLView is a common table expression, and nothing is materialized
+//!   (#2902). On a backend with no SQL engine (MongoDB, S3) the plan's nodes
+//!   are materialized in order into an embedded per-request SQLite — leaf
+//!   ViewDefinitions via the wired `SofRunner`, interior SQLView nodes by
+//!   running their own (already-validated) SQL against the tables
+//!   materialized so far — and the subject's SQL runs there. Either way a
+//!   node shared by multiple edges exists once, and each edge's
+//!   `relatedArtifact.label` is a name for it in whichever SQL references it.
 //!
 //! [`build_plan`] takes its artifact source through the [`ArtifactFetcher`]
 //! trait, so it is fully testable without HTTP or a real storage backend —
@@ -47,12 +52,15 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
 use helios_auth::Principal;
 use helios_persistence::core::search::SearchProvider;
-use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
+use helios_persistence::core::sof_runner::{
+    NativeRelation, NativeRelationSource, NativeSqlQuery, RowStream, SofError, SofRunner,
+    ViewFilters,
+};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError,
-    TableSchema, TerminologyKind, TerminologyRelation, project_view_definition,
+    BoundParam, DependencyKind, DependsOnView, InMemorySqlEngine, NativeDialect, QueryResult,
+    SqlQueryError, TableSchema, TerminologyKind, TerminologyRelation, project_view_definition,
     push_down_view_definition, pushable_predicates, referenced_identifiers,
 };
 use serde_json::{Value, json};
@@ -178,6 +186,10 @@ pub(crate) struct SubjectNode<'a> {
     /// Whether `Library.parameter` is empty on the subject. Only consulted
     /// when `is_sql_view` is `true`.
     pub parameters_empty: bool,
+    /// The SQL database the storage backend runs Library SQL in, when it
+    /// has one: it decides which `content` attachment of each SQL View is
+    /// read and the dialect its SQL is parsed in.
+    pub native_sql: Option<NativeDialect>,
     /// The subject's own `depends-on` edges.
     pub depends_on: &'a [DependsOnView],
     /// The most `relatedArtifact` depends-on entries any one Library in the
@@ -418,6 +430,7 @@ pub(crate) async fn build_plan(
     }
     let max_depends_on = subject.max_depends_on;
     let max_nodes = subject.max_nodes;
+    let native_sql = subject.native_sql;
 
     let root_identity = subject.identity.unwrap_or("<subject>").to_string();
     let mut on_stack: HashSet<String> = HashSet::new();
@@ -639,14 +652,15 @@ pub(crate) async fn build_plan(
                 }
             }
             SubjectKind::SqlView => {
-                let library = match helios_sof::sqlquery::parse_sqlquery_library(&artifact) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        errors.push(sqlquery_err_to_rest(e));
-                        failed.insert(dep.url.clone());
-                        continue;
-                    }
-                };
+                let library =
+                    match helios_sof::sqlquery::parse_sqlquery_library_for(&artifact, native_sql) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            errors.push(sqlquery_err_to_rest(e));
+                            failed.insert(dep.url.clone());
+                            continue;
+                        }
+                    };
                 if !library.parameters.is_empty() {
                     errors.push(sqlview_parameter_error(&dep.url));
                     failed.insert(dep.url.clone());
@@ -657,7 +671,7 @@ pub(crate) async fn build_plan(
                 // SELECT-only check the subject's own SQL passes before
                 // `build_plan` is called applies here too, since this SQL
                 // will run exactly the same way in Phase 2.
-                if let Err(e) = validate_select_only(&library.sql) {
+                if let Err(e) = validate_select_only(&library.sql, native_sql) {
                     errors.push(e);
                     failed.insert(dep.url.clone());
                     continue;
@@ -784,7 +798,11 @@ pub(crate) struct ExecLimits {
 /// to refine output column types against VD-declared FHIR types
 /// (`$sql-run`'s `_format=fhir`).
 ///
-/// Leaves are materialized via `runner.run_view` (async I/O against
+/// A runner with a SQL database of its own
+/// ([`SofRunner::native_sql_dialect`]) runs the whole plan itself, in one
+/// statement, and what follows does not apply: see `execute_plan_native`.
+///
+/// Otherwise leaves are materialized via `runner.run_view` (async I/O against
 /// storage). Interior SQLView nodes and the subject's own SQL run on a
 /// blocking thread under the same watchdog-timeout/interrupt mechanism, one
 /// statement at a time — `limits.timeout_secs` bounds each of them
@@ -807,7 +825,6 @@ pub(crate) struct ExecLimits {
 /// `503` (#2048).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
-    engine: InMemorySqlEngine,
     runner: &Arc<dyn SofRunner>,
     tenant: &TenantContext,
     filters: &ViewFilters,
@@ -818,7 +835,6 @@ pub(crate) async fn execute_plan(
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let materialized = AtomicUsize::new(0);
     execute_plan_counting(
-        engine,
         runner,
         tenant,
         filters,
@@ -836,7 +852,6 @@ pub(crate) async fn execute_plan(
 /// when the run fails) how much memory the engine held.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan_counting(
-    mut engine: InMemorySqlEngine,
     runner: &Arc<dyn SofRunner>,
     tenant: &TenantContext,
     filters: &ViewFilters,
@@ -846,6 +861,23 @@ pub(crate) async fn execute_plan_counting(
     limits: ExecLimits,
     materialized: &AtomicUsize,
 ) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+    // A backend that speaks SQL runs the whole query itself, as one statement
+    // over the compiled views: nothing is copied out of it first (#2902).
+    if runner.native_sql_dialect().is_some() {
+        return execute_plan_native(
+            runner,
+            tenant,
+            filters,
+            plan,
+            subject_sql,
+            subject_bindings,
+            limits,
+        )
+        .await;
+    }
+    // MongoDB and S3 have no SQL engine: their views are read out and joined
+    // in an embedded database that lives for this call.
+    let mut engine = InMemorySqlEngine::open()?;
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
     let referenced = referenced_columns(plan, subject_sql);
@@ -1152,6 +1184,134 @@ pub(crate) async fn execute_plan_counting(
     )
     .await?;
 
+    Ok((result, leaf_schemas))
+}
+
+/// [`execute_plan`] on a backend that speaks SQL (SQLite, PostgreSQL): hands
+/// the whole plan to the runner, which runs it as one read-only statement in
+/// the primary database (`SofRunner::run_sql_query`).
+///
+/// No dependency is materialized, so `max_source_rows_per_vd` does not apply:
+/// the database applies the query's filters and joins while it reads the
+/// views. `max_rows` still caps the result and `timeout_secs` the statement.
+async fn execute_plan_native(
+    runner: &Arc<dyn SofRunner>,
+    tenant: &TenantContext,
+    filters: &ViewFilters,
+    plan: &GraphPlan,
+    subject_sql: &str,
+    subject_bindings: &[BoundParam],
+    limits: ExecLimits,
+) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
+    let labels_by_target = labels_by_target(plan);
+    let referenced = referenced_columns(plan, subject_sql);
+    let labels_of = |internal_name: &str| -> Vec<String> {
+        let mut labels = labels_by_target
+            .get(internal_name)
+            .cloned()
+            .unwrap_or_default();
+        labels.sort();
+        labels
+    };
+    let mut leaf_schemas: Vec<TableSchema> = Vec::new();
+    let mut relations = Vec::with_capacity(plan.nodes.len());
+    for node in &plan.nodes {
+        match node {
+            PlanNode::Leaf {
+                internal_name,
+                view,
+            } => {
+                let display = artifact_display_name(view, internal_name).to_string();
+                // An invalid `ansi/type` tag is a client error, checked on the
+                // view as declared, so a column the SQL never reads is still
+                // validated.
+                let declared = TableSchema::try_from_view_definition(view).map_err(|e| {
+                    SqlQueryError::MalformedLibrary(format!("dependency view '{display}': {e}"))
+                })?;
+                // Compile only the columns some SQL in the plan can name.
+                let projected = referenced
+                    .as_ref()
+                    .and_then(|referenced| project_view_definition(view, referenced));
+                let (view, schema) = match projected {
+                    Some(projected) => match TableSchema::try_from_view_definition(&projected) {
+                        Ok(schema) => (projected, schema),
+                        Err(_) => (view.clone(), declared),
+                    },
+                    None => (view.clone(), declared),
+                };
+                leaf_schemas.push(schema);
+                relations.push(NativeRelation {
+                    name: internal_name.clone(),
+                    display,
+                    labels: labels_of(internal_name),
+                    source: NativeRelationSource::View(view),
+                });
+            }
+            PlanNode::SqlView {
+                internal_name,
+                sql,
+                name,
+                ..
+            } => relations.push(NativeRelation {
+                name: internal_name.clone(),
+                display: name.clone(),
+                labels: labels_of(internal_name),
+                source: NativeRelationSource::Sql(sql.clone()),
+            }),
+            PlanNode::Terminology {
+                internal_name,
+                relation,
+                name,
+            } => {
+                leaf_schemas.push(relation.kind.table_schema());
+                relations.push(NativeRelation {
+                    name: internal_name.clone(),
+                    display: name.clone(),
+                    labels: labels_of(internal_name),
+                    source: NativeRelationSource::Rows {
+                        columns: relation
+                            .kind
+                            .columns()
+                            .iter()
+                            .map(|(column, fhir_type)| {
+                                ((*column).to_string(), (*fhir_type).to_string())
+                            })
+                            .collect(),
+                        rows: relation.rows.clone(),
+                    },
+                });
+            }
+        }
+    }
+    let start = std::time::Instant::now();
+    let result = runner
+        .run_sql_query(
+            tenant,
+            NativeSqlQuery {
+                relations,
+                sql: subject_sql.to_string(),
+                bindings: subject_bindings.to_vec(),
+                filters: filters.clone(),
+                max_rows: limits.max_rows,
+                timeout: Duration::from_secs(limits.timeout_secs),
+            },
+        )
+        .await
+        .inspect_err(|e| {
+            warn!(
+                runner = runner.runner_name(),
+                error = %e,
+                elapsed_ms = start.elapsed().as_millis(),
+                "SQL query failed in the storage backend"
+            );
+        })?;
+    debug!(
+        runner = runner.runner_name(),
+        nodes = plan.nodes.len(),
+        rows = result.rows.len(),
+        elapsed_ms = start.elapsed().as_millis(),
+        "ran SQL query in the storage backend"
+    );
     Ok((result, leaf_schemas))
 }
 
@@ -1511,6 +1671,7 @@ mod tests {
             identity: Some("http://example.org/subject"),
             is_sql_view: false,
             parameters_empty: true,
+            native_sql: None,
             depends_on,
             max_depends_on: usize::MAX,
             max_nodes: usize::MAX,
@@ -2138,7 +2299,6 @@ mod tests {
         let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2179,7 +2339,6 @@ mod tests {
         let runner: Arc<dyn SofRunner> = Arc::new(RowsRunner { rows: runner_rows });
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         execute_plan_counting(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2459,7 +2618,6 @@ mod tests {
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
         execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2579,7 +2737,6 @@ mod tests {
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
         let (result, _) = execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2649,7 +2806,6 @@ mod tests {
             subject_edges,
         };
         execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2727,7 +2883,6 @@ mod tests {
         let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
         let started = std::time::Instant::now();
         let err = execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -2792,7 +2947,6 @@ mod tests {
                 delay: Duration::from_millis(1500),
             });
             let outcome = execute_plan(
-                InMemorySqlEngine::open().expect("open engine"),
                 &runner,
                 &tenant,
                 &ViewFilters::default(),
@@ -3115,7 +3269,6 @@ mod tests {
         let runner: Arc<dyn SofRunner> = recorder.clone();
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let (result, schemas) = execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),
@@ -3216,7 +3369,6 @@ mod tests {
         let runner: Arc<dyn SofRunner> = Arc::new(RecordingRunner::default());
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
         let err = execute_plan(
-            InMemorySqlEngine::open().expect("open engine"),
             &runner,
             &tenant,
             &ViewFilters::default(),

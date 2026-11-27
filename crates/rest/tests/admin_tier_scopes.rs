@@ -21,6 +21,7 @@ const USER_WILDCARD: &str = "user-token";
 const V1_READ: &str = "v1-read-token";
 const V1_WRITE: &str = "v1-write-token";
 const TENANT_BOUND_FULL: &str = "tenant-bound-full-token";
+const BLANK_CLAIM_FULL: &str = "blank-claim-full-token";
 
 /// One bearer per scope shape under test.
 struct StubProvider;
@@ -36,10 +37,14 @@ impl AuthProvider for StubProvider {
             h if h == format!("Bearer {V1_READ}") => "system/*.read",
             h if h == format!("Bearer {V1_WRITE}") => "system/*.write",
             h if h == format!("Bearer {TENANT_BOUND_FULL}") => "system/*.cruds",
+            h if h == format!("Bearer {BLANK_CLAIM_FULL}") => "system/*.cruds",
             _ => return Err(AuthError::InvalidSignature),
         };
-        let tenant_id = (authorization_header == format!("Bearer {TENANT_BOUND_FULL}"))
-            .then(|| "tenanta".to_string());
+        let tenant_id = match authorization_header {
+            h if h == format!("Bearer {TENANT_BOUND_FULL}") => Some("tenanta".to_string()),
+            h if h == format!("Bearer {BLANK_CLAIM_FULL}") => Some(" ".to_string()),
+            _ => None,
+        };
         Ok(Principal {
             subject: "demo-sub".to_string(),
             issuer: "https://idp.example.com".to_string(),
@@ -83,6 +88,20 @@ const AUTHORIZATION: HeaderName = HeaderName::from_static("authorization");
 
 fn bearer(token: &str) -> HeaderValue {
     HeaderValue::from_str(&format!("Bearer {token}")).unwrap()
+}
+
+fn assert_forbidden_as_tenant_bound(response: &axum_test::TestResponse) {
+    assert_eq!(
+        response.status_code(),
+        StatusCode::FORBIDDEN,
+        "{}",
+        response.text()
+    );
+    assert!(
+        response.text().contains("bound to a tenant"),
+        "expected the refusal to name the tenant binding: {}",
+        response.text()
+    );
 }
 
 fn assert_forbidden_for_bit(response: &axum_test::TestResponse, letter: &str) {
@@ -259,7 +278,6 @@ async fn smart_v1_scopes_grant_nothing_on_the_admin_tier() {
 }
 
 #[tokio::test]
-#[ignore = "#2673: the admin tier ignores the JWT tenant claim"]
 async fn a_tenant_bound_token_cannot_administer_other_tenants() {
     let server = server();
     let setup = server
@@ -273,30 +291,28 @@ async fn a_tenant_bound_token_cannot_administer_other_tenants() {
         .get("/admin/tenants")
         .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
         .await;
-    assert_eq!(list.status_code(), StatusCode::FORBIDDEN, "{}", list.text());
+    assert_forbidden_as_tenant_bound(&list);
+
+    for path in ["/console/metrics/tenants", "/console/metrics/traffic"] {
+        let metrics = server
+            .get(path)
+            .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
+            .await;
+        assert_forbidden_as_tenant_bound(&metrics);
+    }
 
     let create = server
         .post("/admin/tenants")
         .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
         .json(&json!({ "id": "tenantc" }))
         .await;
-    assert_eq!(
-        create.status_code(),
-        StatusCode::FORBIDDEN,
-        "{}",
-        create.text()
-    );
+    assert_forbidden_as_tenant_bound(&create);
 
     let purge = server
         .delete("/admin/tenants/tenantb?purge=true")
         .add_header(AUTHORIZATION, bearer(TENANT_BOUND_FULL))
         .await;
-    assert_eq!(
-        purge.status_code(),
-        StatusCode::FORBIDDEN,
-        "{}",
-        purge.text()
-    );
+    assert_forbidden_as_tenant_bound(&purge);
 
     let list = server
         .get("/admin/tenants")
@@ -306,4 +322,29 @@ async fn a_tenant_bound_token_cannot_administer_other_tenants() {
     let rows = list["tenants"].as_array().expect("tenants array");
     assert!(rows.iter().any(|r| r["id"] == "tenantb"), "{list}");
     assert!(rows.iter().all(|r| r["id"] != "tenantc"), "{list}");
+}
+
+#[tokio::test]
+async fn a_blank_tenant_claim_is_not_read_as_a_system_token() {
+    // The FHIR routes refuse a blank claim as invalid, so the admin tier
+    // must not treat the same token as claimless.
+    let server = server();
+    let fhir = server
+        .get("/Patient")
+        .add_header(AUTHORIZATION, bearer(BLANK_CLAIM_FULL))
+        .await;
+    assert_eq!(fhir.status_code(), StatusCode::FORBIDDEN, "{}", fhir.text());
+
+    let list = server
+        .get("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(BLANK_CLAIM_FULL))
+        .await;
+    assert_forbidden_as_tenant_bound(&list);
+
+    let create = server
+        .post("/admin/tenants")
+        .add_header(AUTHORIZATION, bearer(BLANK_CLAIM_FULL))
+        .json(&json!({ "id": "tenantc" }))
+        .await;
+    assert_forbidden_as_tenant_bound(&create);
 }

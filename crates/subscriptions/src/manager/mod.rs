@@ -1022,7 +1022,7 @@ fn is_rearm(previous: SubscriptionStatusCode, incoming: SubscriptionStatusCode) 
 // --- Version-aware field extraction ---
 
 /// Extract the topic canonical URL from a Subscription resource.
-fn extract_topic_url(
+pub fn extract_topic_url(
     resource: &serde_json::Value,
     fhir_version: FhirVersion,
 ) -> Result<String, SubscriptionError> {
