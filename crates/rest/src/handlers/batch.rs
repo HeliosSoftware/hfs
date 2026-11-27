@@ -3508,7 +3508,9 @@ fn status_text(code: &str) -> &'static str {
 /// grant confined to the launch patient's compartment confines the lookup.
 /// Every reference is judged before any lookup runs, so a token without the
 /// grant is refused whole and learns nothing about the referenced type — not
-/// whether a match exists, how many, nor its id.
+/// whether a match exists, how many, nor its id. A chained or `_has`
+/// parameter in the reference searches other types too; each of those hops
+/// is judged as that search judges it ([`ChainAccess`]).
 async fn resolve_conditional_references<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -3575,6 +3577,8 @@ where
         .await
         .map_err(RestError::from)?;
 
+    let chains = ChainAccess::for_principal(principal);
+    let hop_guard = chains.guard(fhir_version);
     for (reference, resolved) in conditionals.iter_mut() {
         let (resource_type, query_string) =
             reference.split_once('?').expect("collected with a '?'");
@@ -3614,11 +3618,22 @@ where
             .expect("judged above")
             .confine_query(fhir_version, &mut query)?;
         // `search()` does not read a chain or `_has` (#1389): resolve them
-        // into an `_id` filter first, as a type search does.
-        let mut query =
-            helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-                .await
-                .map_err(RestError::from)?;
+        // into an `_id` filter first, as a type search does, with every hop
+        // judged against the token as that search judges it (#2501).
+        let options = helios_persistence::search::ChainResolveOptions {
+            hop_guard: hop_guard
+                .as_ref()
+                .map(|g| g as &dyn helios_persistence::search::ChainHopGuard),
+            ..Default::default()
+        };
+        let mut query = helios_persistence::search::resolve_chains_with(
+            state.storage(),
+            tenant.context(),
+            &query,
+            options,
+        )
+        .await
+        .map_err(RestError::from)?;
         // Two is enough to prove the match is not unique.
         query.count = Some(2);
         let result = state
