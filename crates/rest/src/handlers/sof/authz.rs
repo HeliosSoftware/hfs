@@ -65,8 +65,9 @@ pub(super) fn check_terminology_reachable(
     } else {
         Err(RestError::Forbidden {
             message: format!(
-                "{operation} reads the terminology dependency '{url}', a ValueSet or ConceptMap, \
-                 and this token has no unrestricted search grant on either"
+                "{operation} depends on '{url}', which is not a stored ViewDefinition or Library. \
+                 Resolving it as a ValueSet or ConceptMap needs an unrestricted search grant on \
+                 one of the two, and this token has neither"
             ),
         })
     }

@@ -65,7 +65,9 @@ async fn terminology_server() -> MockServer {
     server
 }
 
-fn server(terminology: &MockServer) -> TestServer {
+/// The server under test, and the directory its `$sql-export` jobs write to:
+/// a temporary one, so a run leaves nothing in the source tree.
+fn server(terminology: &MockServer) -> (TestServer, tempfile::TempDir) {
     let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
     backend.init_schema().expect("init schema");
     let auth = Arc::new(AuthMiddlewareState {
@@ -79,9 +81,11 @@ fn server(terminology: &MockServer) -> TestServer {
     });
     let mut config = ServerConfig::for_testing();
     config.terminology_server = Some(terminology.uri());
+    let exports = tempfile::tempdir().expect("export directory");
+    config.export_dir = exports.path().to_string_lossy().into_owned();
     let app =
         helios_rest::create_app_with_auth(backend, config, AuthConfig::default(), Some(auth), None);
-    TestServer::new(app).expect("test server")
+    (TestServer::new(app).expect("test server"), exports)
 }
 
 /// A SQLQuery Library that reads one ValueSet and nothing else.
@@ -136,7 +140,7 @@ async fn sql_export(server: &TestServer, scopes: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn a_token_that_may_search_no_terminology_never_reaches_the_terminology_server() {
     let ts = terminology_server().await;
-    let server = server(&ts);
+    let (server, _exports) = server(&ts);
     for scopes in ["openid", "user/Observation.rs", "patient/*.rs"] {
         let (status, body) = sql_run(&server, scopes).await;
         assert_eq!(
@@ -165,7 +169,7 @@ async fn a_token_that_may_search_no_terminology_never_reaches_the_terminology_se
 #[tokio::test]
 async fn a_value_set_grant_reads_a_value_set_dependency() {
     let ts = terminology_server().await;
-    let server = server(&ts);
+    let (server, _exports) = server(&ts);
     for scopes in ["user/ValueSet.rs", "user/*.rs"] {
         let (status, body) = sql_run(&server, scopes).await;
         assert_eq!(status, StatusCode::OK, "{scopes}: {body}");
@@ -181,11 +185,55 @@ async fn a_value_set_grant_reads_a_value_set_dependency() {
 #[tokio::test]
 async fn a_concept_map_grant_does_not_read_a_value_set_dependency() {
     let ts = terminology_server().await;
-    let server = server(&ts);
+    let (server, _exports) = server(&ts);
     let (status, body) = sql_run(&server, "user/ConceptMap.rs").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(body.contains("ValueSet"), "{body}");
     let (status, body) = sql_export(&server, "user/ConceptMap.rs").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(body.contains("ValueSet"), "{body}");
+}
+
+/// A dependency no ViewDefinition or Library answers to is refused for a
+/// token with no terminology grant, as before, but the refusal does not claim
+/// the URL is terminology: it may simply be mistyped.
+#[tokio::test]
+async fn an_unresolved_dependency_is_not_called_terminology() {
+    let ts = MockServer::start().await;
+    let (server, _exports) = server(&ts);
+    let typo = "http://example.org/ViewDefinition/typo";
+    let mut library = value_set_library();
+    library["relatedArtifact"][0]["resource"] = json!(typo);
+    let run = |scopes: &'static str| {
+        let request = server
+            .post("/$sql-run")
+            .add_header(AUTHORIZATION, bearer(scopes))
+            .json(&json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    {"name": "_format", "valueCode": "json"},
+                    {"name": "subjectResource", "resource": library.clone()}
+                ]
+            }));
+        async move {
+            let response = request.await;
+            (response.status_code(), response.text())
+        }
+    };
+
+    let (status, body) = run("user/Patient.rs").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains(typo), "{body}");
+    assert!(
+        body.contains("not a stored ViewDefinition or Library"),
+        "{body}"
+    );
+    assert!(
+        ts.received_requests().await.unwrap_or_default().is_empty(),
+        "the terminology server was asked for a token that may read no terminology"
+    );
+
+    // A token that may read terminology learns that nothing answers.
+    let (status, body) = run("user/ValueSet.rs").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
