@@ -105,6 +105,10 @@
     <button type="button" class="editor-add__undo" data-add-undo>{{ i18n.t("editor-add-undo") }}</button>
   </p>
 
+  {% if too_large %}
+  <p class="notice notice--warn" data-editor-too-large>{{ i18n.t("editor-too-large") }}</p>
+  {% endif %}
+
   <div class="editor-tree">
     {% for row in rows %}
     <div class="editor-row{% if row.collection.is_some() %} editor-row--collection{% endif %}{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
@@ -316,7 +320,7 @@
 
   {% if !orphan_errors.is_empty() %}
   <div class="editor__orphans" role="alert">
-    <div class="editor__orphans-title">{{ i18n.t("editor-orphans-title") }}</div>
+    <div class="editor__orphans-title">{% if too_large %}{{ i18n.t("editor-too-large-issues") }}{% else %}{{ i18n.t("editor-orphans-title") }}{% endif %}</div>
     {% for message in orphan_errors %}
     <p class="editor__orphan">{{ message }}</p>
     {% endfor %}

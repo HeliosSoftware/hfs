@@ -26,8 +26,7 @@ use askama::Template;
 use axum::{
     Form,
     extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use helios_fhir_validator::{
     Addable, AddableKind, Step, SyncOutcome, ValidationOptions, Validator, editor, packs,
@@ -226,6 +225,11 @@ pub struct EditorBody {
     /// `editor.js`'s own fetch, so this is always `false` here: rendering it
     /// `true` would hide a card that page has no other way to reveal.
     pub needs_js: bool,
+    /// The document is past the guided form's budget ([`MAX_EDITOR_NODES`],
+    /// [`MAX_EDITOR_RENDER_ITEMS`]): `rows` is empty and the card says so.
+    /// The rest of the response is as usual, so the JSON view still edits,
+    /// checks and saves the document.
+    pub too_large: bool,
 }
 
 /// The `pane=form` fragment (#843): the guided-form panel alone, for a host —
@@ -263,6 +267,11 @@ pub struct EditorFormPane {
     /// leave permanently hidden. See `app.css`'s `.needs-js` for the reveal
     /// rule this flag ultimately controls.
     pub needs_js: bool,
+    /// The document is past the guided form's budget ([`MAX_EDITOR_NODES`],
+    /// [`MAX_EDITOR_RENDER_ITEMS`]): `rows` is empty and the card says so.
+    /// The rest of the response is as usual, so the JSON view still edits,
+    /// checks and saves the document.
+    pub too_large: bool,
 }
 
 #[derive(Deserialize)]
@@ -343,15 +352,20 @@ pub async fn page(
 }
 
 /// Most JSON nodes a document may have for the guided form to build rows for
-/// it. Every node becomes a row, and every row is validated and offered its
-/// schema's add picker.
+/// it. Every node becomes a row, and every row is resolved against the schema
+/// and offered its add picker.
 pub const MAX_EDITOR_NODES: usize = 5_000;
 
-/// Most rows plus picker entries one render may emit. A row's add picker
-/// lists every element its schema allows, so a few bytes of posted document
-/// (an empty object in an array) can render a whole picker; this bounds the
-/// HTML a request produces.
+/// Most rows plus picker entries one guided form may hold. A row's add picker
+/// lists every element its schema allows, so a few bytes of document (an
+/// empty object in an array) render a whole picker; this bounds the HTML a
+/// document produces.
 pub const MAX_EDITOR_RENDER_ITEMS: usize = 20_000;
+
+/// Most issues listed for a document past the budget. It has no rows to
+/// anchor them to, so they are listed under the notice instead; the validity
+/// chip still counts all of them.
+pub const MAX_EDITOR_LISTED_ISSUES: usize = 200;
 
 /// The number of JSON nodes in `value`, counting at most `limit + 1`.
 fn node_count(value: &Value, limit: usize) -> usize {
@@ -371,25 +385,19 @@ fn node_count(value: &Value, limit: usize) -> usize {
     count
 }
 
-/// The rows of a render plus every option their pickers list.
+/// The rows of a guided form plus every option their pickers list, a
+/// `value[x]` option's concrete types included.
 fn render_items(rows: &[Row]) -> usize {
+    fn options(options: &[AddOption]) -> usize {
+        options.iter().map(|option| 1 + option.arms.len()).sum()
+    }
     rows.iter()
         .map(|row| {
-            1 + row.addable.len()
+            1 + options(&row.addable)
                 + row.ext_options.len()
-                + row.collection.as_ref().map_or(0, |c| c.append.len())
+                + row.collection.as_ref().map_or(0, |c| options(&c.append))
         })
         .sum()
-}
-
-/// The answer for a document past the guided form's budget: the source view
-/// still edits it.
-fn too_large_for_the_form() -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "This document is too large for the guided form; edit it in the JSON view",
-    )
-        .into_response()
 }
 
 /// Applies a mutation and re-renders. One endpoint for every structural edit:
@@ -436,6 +444,7 @@ pub async fn render_body(
                     auto_open_add: false,
                     legend,
                     needs_js: false,
+                    too_large: false,
                 })
             } else {
                 render(EditorBody {
@@ -451,14 +460,11 @@ pub async fn render_body(
                     auto_open_add: false,
                     legend,
                     needs_js: false,
+                    too_large: false,
                 })
             };
         }
     };
-
-    if node_count(&document, MAX_EDITOR_NODES) > MAX_EDITOR_NODES {
-        return too_large_for_the_form();
-    }
 
     let resource_type = document
         .get("resourceType")
@@ -469,7 +475,7 @@ pub async fn render_body(
     let created = apply(&*registry, &resource_type, &mut document, &form, &hidden);
 
     if form_pane_only {
-        let pane = build_form_pane(
+        render(build_form_pane(
             i18n,
             registry,
             rv.0,
@@ -479,13 +485,9 @@ pub async fn render_body(
             false, // #843: this HTTP endpoint never renders needs-js — see EditorFormPane::needs_js
             &hidden,
             &form.legend,
-        );
-        if render_items(&pane.rows) > MAX_EDITOR_RENDER_ITEMS {
-            return too_large_for_the_form();
-        }
-        render(pane)
+        ))
     } else {
-        let body = build_body(
+        render(build_body(
             i18n,
             registry,
             rv.0,
@@ -495,11 +497,7 @@ pub async fn render_body(
             created,
             &hidden,
             &form.legend,
-        );
-        if render_items(&body.rows) > MAX_EDITOR_RENDER_ITEMS {
-            return too_large_for_the_form();
-        }
-        render(body)
+        ))
     }
 }
 
@@ -654,6 +652,8 @@ struct FormAnalysis {
     focus_path: String,
     auto_open_add: bool,
     legend: Legend,
+    /// See [`EditorBody::too_large`].
+    too_large: bool,
 }
 
 /// Validates and flattens `document` into [`FormAnalysis`]. Shared by
@@ -749,27 +749,43 @@ fn analyze(
         .collect();
     issues.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
 
+    // The budget is enforced here, where every caller meets it: the editor's
+    // own endpoint and the SQL on FHIR pages that build this panel inline.
+    // Past the node limit no row is built at all; past the render limit the
+    // rows are dropped before a template sees them. The document was still
+    // validated above, so its issue count still gates Save.
     let mut rows = Vec::new();
-    build_rows(
-        &RowCtx {
-            resolver: registry.as_ref(),
-            registry: registry.as_ref(),
-            resource_type,
-            document,
-            errors: &by_path,
-            hidden,
-        },
-        &[],
-        0,
-        &mut rows,
-    );
+    let mut too_large = node_count(document, MAX_EDITOR_NODES) > MAX_EDITOR_NODES;
+    if !too_large {
+        build_rows(
+            &RowCtx {
+                resolver: registry.as_ref(),
+                registry: registry.as_ref(),
+                resource_type,
+                document,
+                errors: &by_path,
+                hidden,
+            },
+            &[],
+            0,
+            &mut rows,
+        );
+        if render_items(&rows) > MAX_EDITOR_RENDER_ITEMS {
+            rows.clear();
+            too_large = true;
+        }
+    }
+    if too_large {
+        issues.truncate(MAX_EDITOR_LISTED_ISSUES);
+    }
 
     // Anything that did not land on a row still has to be seen.
     let claimed: std::collections::HashSet<&str> =
         rows.iter().map(|row| row.path.as_str()).collect();
     let mut orphan_errors: Vec<String> = by_path
         .iter()
-        .filter(|(path, _)| !claimed.contains(path.as_str()) && !path.is_empty())
+        // A document past the budget has no root row to carry a root issue.
+        .filter(|(path, _)| !claimed.contains(path.as_str()) && (too_large || !path.is_empty()))
         .flat_map(|(path, messages)| {
             messages.iter().map(move |message| {
                 // The validator's message usually opens with the element name
@@ -777,7 +793,9 @@ fn analyze(
                 // "priority: priority is required". Only prefix when the
                 // message doesn't already carry the leaf name.
                 let leaf = path.rsplit('.').next().unwrap_or(path);
-                if message.starts_with(leaf) {
+                // Past the budget the path is the only thing that tells two
+                // issues apart, so it is always kept.
+                if path.is_empty() || (!too_large && message.starts_with(leaf)) {
                     message.clone()
                 } else {
                     format!("{path}: {message}")
@@ -787,6 +805,9 @@ fn analyze(
         .collect();
     orphan_errors.sort();
     orphan_errors.dedup();
+    if too_large {
+        orphan_errors.truncate(MAX_EDITOR_LISTED_ISSUES);
+    }
 
     // A document with nothing beyond resourceType leaves the user nothing to
     // act on except adding elements — open the root picker for them (#547).
@@ -807,6 +828,7 @@ fn analyze(
             .unwrap_or_default(),
         auto_open_add,
         legend: Legend::resolve(legend, resource_type),
+        too_large,
     }
 }
 
@@ -855,6 +877,7 @@ fn build_body(
         auto_open_add: analysis.auto_open_add,
         legend: analysis.legend,
         needs_js: false,
+        too_large: analysis.too_large,
     }
 }
 
@@ -911,6 +934,7 @@ pub(crate) fn build_form_pane(
         auto_open_add: analysis.auto_open_add,
         legend: analysis.legend,
         needs_js,
+        too_large: analysis.too_large,
     }
 }
 

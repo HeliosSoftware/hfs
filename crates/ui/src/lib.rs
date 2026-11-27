@@ -3740,6 +3740,7 @@ fn invalid_form_pane(
         // faithful to the caller's own host nonetheless.
         legend,
         needs_js: true, // #843: every caller's own inline render, always needs-js
+        too_large: false,
     }
 }
 
