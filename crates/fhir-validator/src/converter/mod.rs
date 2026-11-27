@@ -330,7 +330,9 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
         tree::apply(&mut root, &segments, ed, &mut warnings);
     }
 
-    let mut schema = tree::finalize(root, &mut warnings).unwrap_or_default();
+    let mut schema = tree::finalize(root, &mut warnings)
+        .map(|schema| *schema)
+        .unwrap_or_default();
 
     // Extension applicability contexts (#363): element expressions only.
     let contexts: Vec<String> = sd
