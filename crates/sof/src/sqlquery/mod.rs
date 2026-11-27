@@ -1,16 +1,23 @@
-//! SQL-on-FHIR v2 `$sqlquery-run` engine.
+//! SQL-on-FHIR v2 SQL Query (`$sql-run` with a Library subject) logic.
 //!
-//! Pure execution logic: parse a SQLQuery Library, materialize its `depends-on`
-//! ViewDefinitions into an in-memory SQLite database, bind `Library.parameter`
-//! values to the SQL, run the user query, and format the rows.
+//! Parses a SQLQuery Library, binds `Library.parameter` values and formats the
+//! rows. Where the Library's SQL runs is the storage backend's business:
+//!
+//! - A backend that speaks SQL (SQLite, PostgreSQL) runs it inside the primary
+//!   database, over the compiled views. [`native`] checks and re-serializes
+//!   the SQL for that (#2902).
+//! - A backend with no SQL engine (MongoDB, S3) has its `depends-on`
+//!   ViewDefinitions read out and materialized into the embedded, per-request
+//!   SQLite of [`engine`], where the SQL then runs.
 //!
 //! The REST handler in `helios-rest` wires this to storage (resolving Library
-//! / ViewDefinition resources and supplying `RowStream`s from the wired
-//! `SofRunner`); this module contains no storage or HTTP concerns.
+//! / ViewDefinition resources and calling the wired `SofRunner`); this module
+//! contains no storage or HTTP concerns.
 
 pub mod bind;
 pub mod engine;
 pub mod library;
+pub mod native;
 pub mod output;
 pub mod params;
 pub mod projection;
@@ -18,9 +25,13 @@ pub mod pushdown;
 pub mod scan;
 pub mod terminology;
 
-pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
-pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
-pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library};
+pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, SqlValue, bind_supplied_params};
+pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema, read_query_result};
+pub use library::{
+    DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library,
+    parse_sqlquery_library_for,
+};
+pub use native::{NativeDialect, NativeSql, RESERVED_RELATION_PREFIX, prepare_native_sql};
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
 pub use projection::{project_view_definition, referenced_identifiers};
@@ -113,6 +124,18 @@ pub enum SqlQueryError {
 
     #[error("invalid parameter binding: {0}")]
     BindParameter(String),
+
+    /// The SQL uses something a SQL Query may not use when it runs inside the
+    /// primary database: a table that is not a declared label, a function
+    /// outside the allowed set, an unsupported `FROM` item. A client error.
+    #[error("{0}")]
+    Unsupported(String),
+
+    /// The primary database refused or failed the query's SQL (a syntax
+    /// error, an unknown column, a failed cast). A client error; the text is
+    /// the database's own message.
+    #[error("{0}")]
+    Database(String),
 
     #[error("invalid identifier '{0}': must not contain a double-quote")]
     InvalidIdentifier(String),

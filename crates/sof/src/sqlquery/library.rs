@@ -70,6 +70,21 @@ pub struct SqlQueryLibrary {
 ///   and a `label` matching `^[A-Za-z][A-Za-z0-9_]*$`
 /// - All `Library.parameter[use="in"]` entries declare a `type`
 pub fn parse_sqlquery_library(library_json: &Value) -> Result<SqlQueryLibrary, SqlQueryError> {
+    parse_sqlquery_library_for(library_json, None)
+}
+
+/// [`parse_sqlquery_library`] for a server whose storage backend runs the SQL
+/// itself (`native`), which decides the `content` attachment that is read.
+///
+/// - `None` (the embedded engine) and SQLite: the `dialect=sqlite`
+///   attachment, else a bare `application/sql` one, else any other.
+/// - PostgreSQL: the `dialect=postgresql` (or `postgres`) attachment, else a
+///   bare `application/sql` one. A Library that offers its SQL only under
+///   other dialects is refused: that SQL was not written for PostgreSQL.
+pub fn parse_sqlquery_library_for(
+    library_json: &Value,
+    native: Option<super::NativeDialect>,
+) -> Result<SqlQueryLibrary, SqlQueryError> {
     if library_json.get("resourceType").and_then(|v| v.as_str()) != Some("Library") {
         return Err(SqlQueryError::MalformedLibrary(
             "resourceType must be 'Library'".to_string(),
@@ -78,7 +93,7 @@ pub fn parse_sqlquery_library(library_json: &Value) -> Result<SqlQueryLibrary, S
 
     validate_library_type(library_json)?;
 
-    let sql = extract_sql(library_json)?;
+    let sql = extract_sql(library_json, native)?;
     let parameters = extract_parameters(library_json)?;
     let depends_on = extract_depends_on(library_json)?;
 
@@ -129,19 +144,27 @@ fn validate_library_type(library_json: &Value) -> Result<(), SqlQueryError> {
     Ok(())
 }
 
-/// Spec dialect-selection: prefer an `application/sql;dialect=<ENGINE_DIALECT>`
-/// attachment, fall back to bare `application/sql`, then any other
+/// Spec dialect-selection: prefer an `application/sql;dialect=<dialect>`
+/// attachment for the database that will run the SQL, fall back to bare
+/// `application/sql`, then (except on PostgreSQL) any other
 /// `application/sql*` variant.
-fn extract_sql(library_json: &Value) -> Result<String, SqlQueryError> {
+fn extract_sql(
+    library_json: &Value,
+    native: Option<super::NativeDialect>,
+) -> Result<String, SqlQueryError> {
+    let wanted: &[&str] = match native {
+        Some(dialect) => dialect.library_dialects(),
+        None => &[ENGINE_DIALECT],
+    };
     let content = library_json
         .get("content")
         .and_then(|c| c.as_array())
         .ok_or(SqlQueryError::MissingSql)?;
 
     // Bucket attachments by specificity so we can pick deterministically.
-    let mut dialect_match: Option<&Value> = None;
+    let mut dialect_match: Option<(usize, &Value)> = None;
     let mut bare: Option<&Value> = None;
-    let mut other: Option<&Value> = None;
+    let mut other: Option<(&Value, &str)> = None;
 
     for entry in content {
         let ct = entry
@@ -160,18 +183,30 @@ fn extract_sql(library_json: &Value) -> Result<String, SqlQueryError> {
                 if bare.is_none() {
                     bare = Some(entry);
                 }
-            } else if parses_dialect(rest, ENGINE_DIALECT) {
-                dialect_match = Some(entry);
+            } else if let Some(rank) = wanted.iter().position(|d| parses_dialect(rest, d)) {
+                // The most specific code wins; among equals, the last one.
+                if dialect_match.is_none_or(|(best, _)| rank <= best) {
+                    dialect_match = Some((rank, entry));
+                }
             } else if other.is_none() {
-                other = Some(entry);
+                other = Some((entry, ct));
             }
         }
     }
 
-    let chosen = dialect_match
-        .or(bare)
-        .or(other)
-        .ok_or(SqlQueryError::MissingSql)?;
+    let chosen = match (dialect_match, bare, other) {
+        (Some((_, entry)), _, _) => entry,
+        (None, Some(entry), _) => entry,
+        (None, None, Some((_, content_type))) if native == Some(super::NativeDialect::Postgres) => {
+            return Err(SqlQueryError::MalformedLibrary(format!(
+                "this server runs SQL Queries in PostgreSQL, and the Library offers its SQL \
+                 only as '{content_type}'. Add a content attachment with contentType \
+                 'application/sql;dialect=postgresql' holding the query written for PostgreSQL"
+            )));
+        }
+        (None, None, Some((entry, _))) => entry,
+        (None, None, None) => return Err(SqlQueryError::MissingSql),
+    };
     read_sql_from_attachment(chosen)
 }
 
@@ -385,6 +420,88 @@ mod tests {
         ]);
         let parsed = parse_sqlquery_library(&lib).unwrap();
         assert_eq!(parsed.sql, "SELECT sqlite_version()");
+    }
+
+    /// #2902: a server whose backend runs the SQL reads the attachment
+    /// written for that database.
+    #[test]
+    fn a_postgres_server_reads_the_postgresql_attachment() {
+        use crate::sqlquery::NativeDialect;
+
+        let content = |entries: &[(&str, &str)]| -> Value {
+            let mut lib = library_skeleton("placeholder");
+            lib["content"] = Value::Array(
+                entries
+                    .iter()
+                    .map(|(ct, sql)| json!({ "contentType": ct, "data": STANDARD.encode(sql) }))
+                    .collect(),
+            );
+            lib
+        };
+        let all = content(&[
+            ("application/sql;dialect=sqlite", "SELECT 'sqlite'"),
+            ("application/sql", "SELECT 'bare'"),
+            ("application/sql; dialect=\"PostgreSQL\"", "SELECT 'pg'"),
+        ]);
+        let sql = |lib: &Value, native| parse_sqlquery_library_for(lib, native).map(|l| l.sql);
+        assert_eq!(
+            sql(&all, Some(NativeDialect::Postgres)).unwrap(),
+            "SELECT 'pg'"
+        );
+        assert_eq!(
+            sql(&all, Some(NativeDialect::Sqlite)).unwrap(),
+            "SELECT 'sqlite'"
+        );
+        assert_eq!(sql(&all, None).unwrap(), "SELECT 'sqlite'");
+
+        // `postgres` is accepted too; `postgresql` wins over it.
+        let short = content(&[("application/sql;dialect=postgres", "SELECT 'short'")]);
+        assert_eq!(
+            sql(&short, Some(NativeDialect::Postgres)).unwrap(),
+            "SELECT 'short'"
+        );
+        let both = content(&[
+            ("application/sql;dialect=postgresql", "SELECT 'long'"),
+            ("application/sql;dialect=postgres", "SELECT 'short'"),
+        ]);
+        assert_eq!(
+            sql(&both, Some(NativeDialect::Postgres)).unwrap(),
+            "SELECT 'long'"
+        );
+
+        // No PostgreSQL attachment: the bare one.
+        let bare = content(&[
+            ("application/sql;dialect=sqlite", "SELECT 'sqlite'"),
+            ("application/sql", "SELECT 'bare'"),
+        ]);
+        assert_eq!(
+            sql(&bare, Some(NativeDialect::Postgres)).unwrap(),
+            "SELECT 'bare'"
+        );
+
+        // SQL offered only for another database is refused on PostgreSQL,
+        // naming what is needed; SQLite and the embedded engine still run it.
+        let sqlite_only = content(&[("application/sql;dialect=sqlite", "SELECT 'sqlite'")]);
+        let error = sql(&sqlite_only, Some(NativeDialect::Postgres)).unwrap_err();
+        assert!(
+            matches!(error, SqlQueryError::MalformedLibrary(_)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("application/sql;dialect=postgresql"),
+            "{message}"
+        );
+        assert!(
+            message.contains("application/sql;dialect=sqlite"),
+            "{message}"
+        );
+        let pg_only = content(&[("application/sql;dialect=postgresql", "SELECT 'pg'")]);
+        assert_eq!(
+            sql(&pg_only, Some(NativeDialect::Sqlite)).unwrap(),
+            "SELECT 'pg'"
+        );
+        assert_eq!(sql(&pg_only, None).unwrap(), "SELECT 'pg'");
     }
 
     #[test]

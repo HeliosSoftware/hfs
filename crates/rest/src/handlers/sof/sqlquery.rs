@@ -58,9 +58,9 @@ use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
 use helios_sof::sqlquery::engine::DeclaredColumn;
 use helios_sof::{
-    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    AnsiType, ColumnFhirType, ContentType, NativeDialect, QueryResult, TableRef,
     bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
-    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
+    format_fhir_parameters, parse_sqlquery_library_for, scan_sql, undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -147,10 +147,23 @@ where
         });
     }
 
-    let library = parse_sqlquery_library(&library_json).map_err(sqlquery_err_to_rest)?;
+    let runner = state
+        .sof_runner()
+        .ok_or_else(|| RestError::NotImplemented {
+            feature: "$sql-run is not available: the configured storage backend does not \
+                      provide a SOF runner"
+                .to_string(),
+        })?
+        .clone();
+    // A backend that speaks SQL runs the Library's SQL itself, so the SQL is
+    // read (and parsed) in that database's dialect.
+    let native_sql = runner.native_sql_dialect();
+
+    let library =
+        parse_sqlquery_library_for(&library_json, native_sql).map_err(sqlquery_err_to_rest)?;
 
     // SELECT-only validation of the subject's own SQL.
-    validate_select_only(&library.sql)?;
+    validate_select_only(&library.sql, native_sql)?;
 
     // #841/#842: reject a subject that reads a table no `relatedArtifact
     // [depends-on]` label declares, before spending any work resolving or
@@ -169,15 +182,6 @@ where
         }
     }
 
-    let runner = state
-        .sof_runner()
-        .ok_or_else(|| RestError::NotImplemented {
-            feature: "$sql-run is not available: the configured storage backend does not \
-                      provide a SOF runner"
-                .to_string(),
-        })?
-        .clone();
-
     // Phase 1: resolve the full dependency graph — every ViewDefinition and
     // SQLView Library it reaches, at any depth — before materializing
     // anything. `library_json` was already classified by
@@ -195,6 +199,7 @@ where
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
+        native_sql,
         depends_on: &library.depends_on,
         max_depends_on: super::input_limits::max_depends_on(max_vds),
         max_nodes: max_vds,
@@ -218,7 +223,6 @@ where
 
     // Phase 2: materialize the plan and run the subject's own SQL, with the
     // same row caps and timeout the pre-graph single-level code enforced.
-    let engine = InMemorySqlEngine::open().map_err(sqlquery_err_to_rest)?;
     let limits = super::graph::ExecLimits {
         max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
         max_rows: state.config().sof_sqlquery_max_rows,
@@ -227,7 +231,6 @@ where
     };
     let materialized = std::sync::atomic::AtomicUsize::new(0);
     let executed = super::graph::execute_plan_counting(
-        engine,
         &runner,
         tenant.context(),
         &filters,
@@ -391,14 +394,25 @@ fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
 /// Every statement anywhere in the tree (CTE bodies, parenthesised queries,
 /// either side of a set operation, subqueries) must itself be a query, so
 /// `WITH ... INSERT` and `WITH ... UPDATE` are rejected too (#1702).
-pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
+///
+/// The SQL is parsed in the dialect of the database that will run it:
+/// PostgreSQL's when the storage backend runs Library SQL in PostgreSQL
+/// (`native`), SQLite's otherwise.
+pub(crate) fn validate_select_only(
+    sql: &str,
+    native: Option<NativeDialect>,
+) -> Result<(), RestError> {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{Statement, visit_statements};
-    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
     use sqlparser::parser::Parser;
 
-    let stmts = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|e| RestError::BadRequest {
+    let parsed = match native {
+        Some(NativeDialect::Postgres) => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+        Some(NativeDialect::Sqlite) | None => Parser::parse_sql(&SQLiteDialect {}, sql),
+    };
+    let stmts = parsed.map_err(|e| RestError::BadRequest {
         message: format!("SQL parse error: {e}"),
     })?;
     if stmts.len() != 1 {
@@ -599,6 +613,16 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
         SqlQueryError::Timeout { secs } => RestError::SqlQueryTimeout { secs },
         SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
         SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
+        // SQL the query may not use when it runs in the primary database
+        // (a table that is not a declared label, a function outside the
+        // allowed set): the caller's to fix.
+        SqlQueryError::Unsupported(msg) => RestError::BadRequest { message: msg },
+        // The primary database refused or failed the SQL (syntax, an unknown
+        // column, a failed cast), with its own message.
+        SqlQueryError::Database(msg) => {
+            warn!(error = %msg, "database error during $sql-run");
+            RestError::UnprocessableEntity { message: msg }
+        }
         SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
             message: format!("invalid identifier '{name}'"),
         },
@@ -767,7 +791,9 @@ mod tests {
 
     /// The 400 message `validate_select_only` returns for `sql`.
     fn select_only_rejection(sql: &str) -> String {
-        let (status, code, message) = validate_select_only(sql).expect_err(sql).client_response();
+        let (status, code, message) = validate_select_only(sql, None)
+            .expect_err(sql)
+            .client_response();
         assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}");
         assert_eq!(code, "invalid", "{sql}");
         message
@@ -827,7 +853,7 @@ mod tests {
             "SELECT * FROM (SELECT 1 AS a) s WHERE EXISTS (SELECT 1) AND s.a IN (SELECT 1)",
             "SELECT 'INSERT INTO t VALUES (1)' AS s",
         ] {
-            assert!(validate_select_only(sql).is_ok(), "{sql}");
+            assert!(validate_select_only(sql, None).is_ok(), "{sql}");
         }
         assert_eq!(
             select_only_rejection("DELETE FROM t"),

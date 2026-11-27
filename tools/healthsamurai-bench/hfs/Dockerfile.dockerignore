@@ -1,0 +1,6 @@
+# Used instead of the context's own .dockerignore (which excludes **/*.rs because
+# HFS's regular image only copies a prebuilt binary). Here we compile from source.
+target/
+.git/
+**/node_modules/
+**/__pycache__/

@@ -36,6 +36,9 @@ pub mod reference_resolver;
 #[cfg(any(feature = "sqlite", feature = "postgres", test))]
 mod runtime;
 
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+mod native_query;
+
 #[cfg(all(test, feature = "R4"))]
 mod golden_tests;
 
@@ -44,6 +47,12 @@ pub mod sqlite;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite_udfs;
+
+#[cfg(feature = "sqlite")]
+mod sqlite_native;
+
+#[cfg(feature = "postgres")]
+mod postgres_native;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;

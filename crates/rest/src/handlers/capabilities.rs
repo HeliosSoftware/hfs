@@ -23,7 +23,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleProvider, ConditionalStorage, ResourceStorage, SearchProvider,
 };
-use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
@@ -170,12 +170,23 @@ where
     .map(|t| (t, state.storage().modifiers_for_param_type(t)))
     .collect();
 
+    // Which parameters the storage's `search` serves: a parameter it refuses
+    // is left out of `searchParam`, and a reference parameter it refuses out
+    // of `searchInclude` / `searchRevInclude` too (#2593). FHIR's
+    // `searchParam` lists the "Search parameters for implementations to
+    // support and/or make use of"
+    // (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.rest.resource.searchParam).
+    let storage = state.storage();
+    let serves = |resource_type: &str, code: &str, param_type: SearchParamType| {
+        storage.serves_search_param(resource_type, code, param_type)
+    };
+
     let registry_arc = state.storage().search_param_registry(tenant);
     let registry = registry_arc.read();
 
     // Reverse-include index (target type -> "Source:code" tokens) for advertising
     // each resource's real `searchRevInclude` targets.
-    let revinclude_by_target = build_revinclude_index(&registry);
+    let revinclude_by_target = build_revinclude_index(&registry, &serves);
 
     // The conditional interactions are the storage's to declare, not literals:
     // S3 serves only an identifier-scoped create on its own, and a composite's
@@ -194,6 +205,7 @@ where
                 supports_contained,
                 &modifier_map,
                 &revinclude_by_target,
+                &serves,
                 version,
             )
         })
@@ -429,6 +441,10 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// When it is `false` the entry carries no `search-type` interaction and no
 /// `searchParam`, `searchInclude` or `searchRevInclude`, for every type
 /// (#514); everything else is unchanged.
+///
+/// `serves` is the storage's [`SearchProvider::serves_search_param`]: the
+/// `searchParam`, `searchInclude` and `searchRevInclude` lists keep only what it
+/// serves.
 #[allow(clippy::too_many_arguments)]
 fn build_resource_capability(
     resource_type: &str,
@@ -438,6 +454,7 @@ fn build_resource_capability(
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
     version: FhirVersion,
 ) -> serde_json::Value {
     let mut interactions = if resource_type == "AuditEvent" {
@@ -478,6 +495,7 @@ fn build_resource_capability(
             registry,
             supports_contained,
             modifier_map,
+            serves,
             version,
         ));
     }
@@ -493,7 +511,7 @@ fn build_resource_capability(
     // this type. Omitted entirely when the type has no reference params, and
     // when the storage does not search (#514).
     if supports_search {
-        let search_include = build_search_includes(resource_type, registry);
+        let search_include = build_search_includes(resource_type, registry, serves);
         if !search_include.is_empty() {
             entry["searchInclude"] = serde_json::Value::Array(search_include);
         }
@@ -539,22 +557,46 @@ fn build_resource_capability(
 /// Builds the full `searchParam` list for a resource type: the seven common
 /// params plus the resource-specific params from the loaded SearchParameter
 /// registry. Control/common params (those starting with `_`) and duplicates are
-/// skipped.
+/// skipped, and so is every parameter `serves` (the storage's
+/// [`SearchProvider::serves_search_param`]) refuses, common ones included.
+/// A composite is also skipped unless each of its components resolves and is
+/// served ([`composite_components_served`]).
+///
+/// A common parameter is asked about with the type `/metadata` advertises for
+/// it, except `_list` and `_in`: REST resolves both into an `_id` filter before
+/// the storage is called (reading the List or Group itself), so they are asked
+/// about as what the storage actually receives, `_id` of type token.
 fn build_search_params(
     resource_type: &str,
     registry: &SearchParameterRegistry,
     supports_contained: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
     version: FhirVersion,
 ) -> Vec<serde_json::Value> {
     let mut params = build_common_search_params(supports_contained, version);
+    params.retain(|param| {
+        let name = param["name"].as_str().unwrap_or_default();
+        if matches!(name, "_list" | "_in") {
+            return serves(resource_type, "_id", SearchParamType::Token);
+        }
+        param["type"]
+            .as_str()
+            .and_then(|code| code.parse::<SearchParamType>().ok())
+            .is_some_and(|param_type| serves(resource_type, name, param_type))
+    });
     let mut seen: std::collections::HashSet<String> = params
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .collect();
 
     for def in registry.get_active_params(resource_type) {
-        if def.code.starts_with('_') || !seen.insert(def.code.clone()) {
+        if def.code.starts_with('_')
+            || !serves(resource_type, &def.code, def.param_type)
+            || (def.param_type == SearchParamType::Composite
+                && !composite_components_served(resource_type, &def, registry, serves))
+            || !seen.insert(def.code.clone())
+        {
             continue;
         }
         let mut param = serde_json::json!({
@@ -604,17 +646,48 @@ fn fhir_search_param_type(t: SearchParamType) -> &'static str {
     }
 }
 
+/// Whether the composite `def` can be searched: it names at least one
+/// component, each component resolves in `registry` by its definition URL (as
+/// the search query builder resolves them), and `serves` serves each one.
+///
+/// A composite is searched through its components, so a component the storage
+/// refuses makes every search for the composite fail (MongoDB refuses
+/// `Composition.section-code-text`, whose `section-text` component is
+/// `special`). A component that does not resolve leaves the composite with
+/// fewer components than it defines, which the backends refuse or match
+/// differently from the spec (some R5 and R6 composites name component
+/// definitions the spec bundles do not publish).
+fn composite_components_served(
+    resource_type: &str,
+    def: &SearchParameterDefinition,
+    registry: &SearchParameterRegistry,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
+) -> bool {
+    def.component.as_deref().is_some_and(|components| {
+        !components.is_empty()
+            && components.iter().all(|component| {
+                registry
+                    .get_by_url(&component.definition)
+                    .is_some_and(|sub| serves(resource_type, &sub.code, sub.param_type))
+            })
+    })
+}
+
 /// Builds the reverse-include index used for `searchRevInclude`: maps each target
 /// resource type to the sorted set of "SourceType:code" tokens from every active
-/// reference search param that targets it.
+/// reference search param that targets it and that `serves` serves.
 fn build_revinclude_index(
     registry: &SearchParameterRegistry,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
 ) -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
     let mut index: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
     for source_type in registry.resource_types() {
         for def in registry.get_active_params(&source_type) {
-            if def.param_type != SearchParamType::Reference || def.code.starts_with('_') {
+            if def.param_type != SearchParamType::Reference
+                || def.code.starts_with('_')
+                || !serves(&source_type, &def.code, def.param_type)
+            {
                 continue;
             }
             if let Some(targets) = &def.target {
@@ -632,14 +705,18 @@ fn build_revinclude_index(
 }
 
 /// Returns the `searchInclude` tokens ("Type:code") for a resource type: one per
-/// active reference search param defined on it.
+/// active reference search param defined on it that `serves` serves.
 fn build_search_includes(
     resource_type: &str,
     registry: &SearchParameterRegistry,
+    serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
 ) -> Vec<serde_json::Value> {
     let mut includes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for def in registry.get_active_params(resource_type) {
-        if def.param_type == SearchParamType::Reference && !def.code.starts_with('_') {
+        if def.param_type == SearchParamType::Reference
+            && !def.code.starts_with('_')
+            && serves(resource_type, &def.code, def.param_type)
+        {
             includes.insert(format!("{}:{}", resource_type, def.code));
         }
     }
@@ -652,10 +729,11 @@ fn build_search_includes(
 /// Builds common search parameters supported by all resources.
 ///
 /// `_contained` / `_containedType` are only included when `supports_contained`
-/// is set (the backend can evaluate contained search). `_list` is always
-/// advertised (resolved application-side on every backend). `_in` (List/Group
-/// membership) exists only in R5 and later, so it is advertised only there; it
-/// is likewise resolved application-side.
+/// is set (the backend can evaluate contained search). `_list` is resolved
+/// application-side into an `_id` filter, so [`build_search_params`] keeps it
+/// wherever the storage serves `_id`. `_in` (List/Group membership) exists only
+/// in R5 and later, so it is listed only there; it is likewise resolved into an
+/// `_id` filter and kept on the same terms.
 fn build_common_search_params(
     supports_contained: bool,
     version: FhirVersion,
@@ -730,6 +808,11 @@ fn build_common_search_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SearchProvider::serves_search_param`'s default.
+    fn serves_all(_: &str, _: &str, _: SearchParamType) -> bool {
+        true
+    }
 
     fn param_names(params: &[serde_json::Value]) -> Vec<String> {
         params
@@ -907,7 +990,7 @@ mod tests {
         .unwrap();
 
         // searchInclude for a type = its own reference params as "Type:code".
-        let includes: Vec<String> = build_search_includes("Patient", &reg)
+        let includes: Vec<String> = build_search_includes("Patient", &reg, &serves_all)
             .into_iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
@@ -915,7 +998,7 @@ mod tests {
 
         // searchRevInclude index: each target type maps to the "Source:code"
         // tokens that point at it.
-        let rev = build_revinclude_index(&reg);
+        let rev = build_revinclude_index(&reg, &serves_all);
         assert!(rev.get("Patient").unwrap().contains("Observation:subject"));
         assert!(
             rev.get("Practitioner")
@@ -951,6 +1034,7 @@ mod tests {
             &reg,
             false,
             &modifier_map,
+            &serves_all,
             FhirVersion::default_enabled(),
         );
         let name = params
@@ -977,6 +1061,15 @@ mod tests {
     /// (`Patient:general-practitioner`) and a `_revinclude` source
     /// (`Observation:subject`).
     fn resource_entry(resource_type: &str, supports_search: bool) -> serde_json::Value {
+        resource_entry_serving(resource_type, supports_search, &serves_all)
+    }
+
+    /// [`resource_entry`], with the storage's `serves_search_param` too.
+    fn resource_entry_serving(
+        resource_type: &str,
+        supports_search: bool,
+        serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
+    ) -> serde_json::Value {
         use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
 
         let mut reg = SearchParameterRegistry::new();
@@ -1015,7 +1108,8 @@ mod tests {
             supports_search,
             false,
             &std::collections::HashMap::new(),
-            &build_revinclude_index(&reg),
+            &build_revinclude_index(&reg, serves),
+            serves,
             FhirVersion::default_enabled(),
         )
     }
@@ -1120,6 +1214,175 @@ mod tests {
         assert_eq!(
             interaction_codes(&resource_entry("AuditEvent", false)),
             ["read", "vread", "history-instance", "history-type"]
+        );
+    }
+
+    /// Every common parameter's `type` code maps back to a type, so none is
+    /// dropped for want of one.
+    #[test]
+    fn every_common_param_type_is_known() {
+        for version in FhirVersion::enabled_versions() {
+            for param in build_common_search_params(true, *version) {
+                let code = param["type"].as_str().expect("type");
+                let param_type: SearchParamType = code.parse().expect(code);
+                assert_eq!(fhir_search_param_type(param_type), code);
+            }
+        }
+    }
+
+    /// `serves` filters `searchParam`, common parameters included, and the
+    /// include lists: a storage that serves only token, date and URI keeps
+    /// `_id` (token), `_lastUpdated` (date) and `_profile` (uri), keeps `_list`,
+    /// which REST turns into an `_id` filter, drops `name` (string) and `_text`
+    /// and `_content` (special), and lists no include, because every include
+    /// names a reference parameter.
+    #[test]
+    fn unserved_params_and_their_includes_are_left_out() {
+        fn token_date_uri(_: &str, _: &str, t: SearchParamType) -> bool {
+            matches!(
+                t,
+                SearchParamType::Token | SearchParamType::Date | SearchParamType::Uri
+            )
+        }
+        let patient = resource_entry_serving("Patient", true, &token_date_uri);
+        let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
+        for kept in [
+            "_id",
+            "_lastUpdated",
+            "_tag",
+            "_profile",
+            "_security",
+            "_list",
+        ] {
+            assert!(names.contains(&kept.to_string()), "{kept}: {names:?}");
+        }
+        for dropped in ["name", "_text", "_content"] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "{dropped}: {names:?}"
+            );
+        }
+        assert!(patient.get("searchInclude").is_none(), "{patient}");
+        assert!(patient.get("searchRevInclude").is_none(), "{patient}");
+        assert!(interaction_codes(&patient).contains(&"search-type"));
+
+        // One reference parameter refused: its include and reverse include go,
+        // the rest stays.
+        fn not_subject(_: &str, code: &str, _: SearchParamType) -> bool {
+            code != "subject"
+        }
+        let patient = resource_entry_serving("Patient", true, &not_subject);
+        assert_eq!(
+            patient["searchInclude"],
+            serde_json::json!(["Patient:general-practitioner"])
+        );
+        assert!(patient.get("searchRevInclude").is_none(), "{patient}");
+        assert!(
+            param_names(patient["searchParam"].as_array().expect("searchParam"))
+                .contains(&"name".to_string())
+        );
+
+        // `_list` reaches the storage as `_id`, so it goes with `_id`.
+        fn not_id(_: &str, code: &str, _: SearchParamType) -> bool {
+            code != "_id"
+        }
+        let patient = resource_entry_serving("Patient", true, &not_id);
+        let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
+        for dropped in ["_id", "_list"] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "{dropped}: {names:?}"
+            );
+        }
+        assert!(names.contains(&"_lastUpdated".to_string()), "{names:?}");
+    }
+
+    /// A composite is listed only when it names components, each resolves in
+    /// the registry by its definition URL, and each is served: a composite with
+    /// a component the storage refuses, or one the registry does not hold, is
+    /// refused or matched on fewer components than it defines.
+    #[test]
+    fn composites_are_listed_only_when_every_component_is_served() {
+        use helios_persistence::search::registry::CompositeComponentDef;
+
+        let mut reg = SearchParameterRegistry::new();
+        for (url, code, param_type) in [
+            (
+                "http://example.org/Obs-code",
+                "code",
+                SearchParamType::Token,
+            ),
+            (
+                "http://example.org/Obs-value",
+                "value",
+                SearchParamType::Quantity,
+            ),
+            (
+                "http://example.org/Obs-text",
+                "text",
+                SearchParamType::Special,
+            ),
+        ] {
+            reg.register(
+                SearchParameterDefinition::new(url, code, param_type, "Observation.id")
+                    .with_base(["Observation"]),
+            )
+            .unwrap();
+        }
+        for (code, components) in [
+            ("code-value", vec!["Obs-code", "Obs-value"]),
+            ("code-text", vec!["Obs-code", "Obs-text"]),
+            ("code-missing", vec!["Obs-code", "Obs-unpublished"]),
+            ("no-components", vec![]),
+        ] {
+            let mut composite = SearchParameterDefinition::new(
+                format!("http://example.org/Obs-{code}"),
+                code,
+                SearchParamType::Composite,
+                "Observation",
+            )
+            .with_base(["Observation"]);
+            composite.component = Some(
+                components
+                    .into_iter()
+                    .map(|c| CompositeComponentDef {
+                        definition: format!("http://example.org/{c}"),
+                        expression: "Observation.id".to_string(),
+                    })
+                    .collect(),
+            );
+            reg.register(composite).unwrap();
+        }
+        let listed = |serves: &dyn Fn(&str, &str, SearchParamType) -> bool| {
+            let params = build_search_params(
+                "Observation",
+                &reg,
+                false,
+                &std::collections::HashMap::new(),
+                serves,
+                FhirVersion::default(),
+            );
+            param_names(&params)
+                .into_iter()
+                .filter(|name| !name.starts_with('_'))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let all = |_: &str, _: &str, _: SearchParamType| true;
+        assert_eq!(
+            listed(&all),
+            ["code", "code-text", "code-value", "text", "value"]
+                .map(String::from)
+                .into()
+        );
+        let no_special = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Special;
+        assert_eq!(
+            listed(&no_special),
+            ["code", "code-value", "value"].map(String::from).into()
+        );
+        let no_quantity = |_: &str, _: &str, t: SearchParamType| t != SearchParamType::Quantity;
+        assert_eq!(
+            listed(&no_quantity),
+            ["code", "code-text", "text"].map(String::from).into()
         );
     }
 

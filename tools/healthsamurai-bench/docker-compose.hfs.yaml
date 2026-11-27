@@ -1,0 +1,41 @@
+# Local override: adds HFS (Helios FHIR Server) to the benchmark stack.
+# Same shape as the wso2 service: 8 CPU / 24G, shared postgres:18, own database.
+# Use with: ./runner.sh -f docker-compose.yaml -f docker-compose.hfs.yaml ...
+# Image is built locally (see hfs/Dockerfile); it is never pulled.
+services:
+  hfs:
+    container_name: perf-hfs
+    image: hfs-bench:main-c52ff36
+    pull_policy: never
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 24G
+    ports:
+      - "13130:8080"
+    environment:
+      HFS_STORAGE_BACKEND: postgres
+      HFS_DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/hfs"
+      HFS_PG_MAX_CONNECTIONS: 32
+      HFS_REQUEST_TIMEOUT: 900
+      HFS_MAX_BODY_SIZE: 209715200
+      HFS_LOG_LEVEL: info
+
+  # Sidecar healthcheck (same pattern as wso2-checker): the hfs image has no curl.
+  hfs-checker:
+    container_name: perf-hfs-hc
+    image: curlimages/curl
+    command: ["-c", "trap : TERM INT; sleep infinity & wait"]
+    depends_on:
+      hfs:
+        condition: service_started
+    entrypoint: /bin/sh
+    healthcheck:
+      test: curl -f http://hfs:8080/metadata
+      interval: 10s
+      start_period: 30s
+      retries: 10

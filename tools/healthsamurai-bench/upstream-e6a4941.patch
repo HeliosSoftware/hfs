@@ -1,0 +1,50 @@
+diff --git a/infra/postgres/init/create-database.sql b/infra/postgres/init/create-database.sql
+index f3d174b..f83a5de 100644
+--- a/infra/postgres/init/create-database.sql
++++ b/infra/postgres/init/create-database.sql
+@@ -1,5 +1,6 @@
+ CREATE DATABASE aidbox;
+ CREATE DATABASE hapi;
+ CREATE DATABASE wso2;
++CREATE DATABASE hfs;
+ CREATE DATABASE medplum;
+ ALTER DATABASE medplum SET DEFAULT_TRANSACTION_ISOLATION TO 'repeatable read';
+\ No newline at end of file
+diff --git a/runner.sh b/runner.sh
+index 255a86b..0fc8ae2 100755
+--- a/runner.sh
++++ b/runner.sh
+@@ -10,7 +10,7 @@ set -e
+ 
+ # Default values
+ DEFAULT_TEST="/k6/prewarm.js"
+-ALL_SERVERS="aidbox hapi medplum microsoft wso2 intersystems"
++ALL_SERVERS="aidbox hapi medplum microsoft wso2 intersystems hfs hfses"
+ # How long to wait for the target server to become healthy before a test (seconds)
+ WAIT_TIMEOUT=${WAIT_TIMEOUT:-600}
+ 
+@@ -94,7 +94,7 @@ validate_server() {
+ # curl sidecar for images that ship no curl (hapi, wso2, microsoft)
+ health_service() {
+     case $1 in
+-        hapi|wso2|microsoft) echo "$1-checker" ;;
++        hapi|wso2|microsoft|hfs|hfses) echo "$1-checker" ;;
+         *) echo "$1" ;;
+     esac
+ }
+@@ -163,6 +163,15 @@ run_test_on_server() {
+             run_env="${run_env}
+                 export BASE_URL=http://wso2:9090/fhir/r4"
+             ;;
++        "hfs")
++            run_env="${run_env}
++                export BASE_URL=http://hfs:8080"
++            ;;
++        "hfses")
++            run_env="${run_env}
++                export BASE_URL=http://hfses:8080
++                export K6_SETUP_TIMEOUT=1200s"
++            ;;
+         "intersystems")
+             run_env="${run_env}
+                 export BASE_URL=http://intersystems:52773/fhir/r4

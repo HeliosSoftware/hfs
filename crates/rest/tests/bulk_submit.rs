@@ -1026,6 +1026,21 @@ async fn test_replace_only_kickoff_retires_manifest_without_adding_an_empty_one(
 async fn test_kickoff_validation_shalls() {
     let (server, ..) = create_submit_server().await;
 
+    // A fileRequestHeader that would route the request → 400 naming it.
+    let body = json!({"resourceType": "Parameters", "parameter": [
+        {"name": "submitter", "valueIdentifier": {"value": "e"}},
+        {"name": "submissionId", "valueString": "x"},
+        {"name": "manifestUrl", "valueUrl": "https://p/m"},
+        {"name": "fhirBaseUrl", "valueUrl": "https://p/fhir"},
+        {"name": "fileRequestHeader", "part": [
+            {"name": "headerName", "valueString": "Host"},
+            {"name": "headerValue", "valueString": "other-tenant.internal"}
+        ]}
+    ]});
+    let refused = server.post("/$bulk-submit").json(&body).await;
+    assert_eq!(refused.status_code(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().contains("Host"), "{}", refused.text());
+
     // Missing submitter → 400.
     let body = json!({"resourceType": "Parameters", "parameter": [
         {"name": "submissionId", "valueString": "x"},

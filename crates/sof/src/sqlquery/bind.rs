@@ -1,7 +1,8 @@
 //! Bind values from a supplied `Parameters` resource to `Library.parameter`
 //! declarations, using FHIR type codes to choose the right rusqlite value.
 
-use rusqlite::types::Value as SqlValue;
+/// The value a parameter is bound as.
+pub use rusqlite::types::Value as SqlValue;
 use serde_json::Value;
 
 use super::{LibraryParameter, SqlQueryError};
@@ -45,6 +46,9 @@ pub const BINDABLE_PARAMETER_TYPES: &[&str] = &[
 pub struct BoundParam {
     pub name: String,
     pub value: SqlValue,
+    /// The `Library.parameter.type` code the value was bound under. A
+    /// database with static types casts the placeholder to it.
+    pub fhir_type: String,
 }
 
 /// Walks the supplied `parameters` Parameters resource and produces bindings
@@ -104,6 +108,7 @@ pub fn bind_supplied_params(
         out.push(BoundParam {
             name: p.name.clone(),
             value,
+            fhir_type: p.type_code.clone(),
         });
     }
     Ok(out)

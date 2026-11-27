@@ -31,7 +31,7 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 | `HFS_AUTH_PATIENT_CLAIM` | `patient` | JWT claim carrying the SMART `patient` launch context |
 | `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | JWT claim carrying the SMART `encounter` launch context |
 | `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | JWT claim carrying the SMART `fhirUser` |
-| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS fetches triggered by an unknown `kid`, counted from the attempt whether it succeeded or failed; concurrent lookups share one fetch |
+| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds (at least 1) between JWKS fetches triggered by an unknown `kid`, counted from the attempt whether it succeeded or failed; concurrent lookups share one fetch. Also the floor of the background refresh's retry backoff (exponential, up to an hour) when the identity provider fails |
 
 SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): `HFS_SMART_TOKEN_ENDPOINT`, `HFS_SMART_AUTHORIZE_ENDPOINT`, `HFS_SMART_JWKS_URL`, `HFS_SMART_INTROSPECTION_ENDPOINT`, `HFS_SMART_MANAGEMENT_ENDPOINT`, `HFS_SMART_REGISTRATION_ENDPOINT`, `HFS_SMART_REVOCATION_ENDPOINT`. Outbound calls can carry `HFS_OUTBOUND_BEARER_TOKEN`.
 
