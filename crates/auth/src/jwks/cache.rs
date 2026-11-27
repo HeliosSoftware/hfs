@@ -14,6 +14,13 @@ use crate::error::AuthError;
 /// Default cache TTL when no Cache-Control header is present.
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(3600);
 
+/// The background task never asks a failing identity provider again sooner
+/// than this, whatever `min_refresh_interval` is set to.
+const BACKGROUND_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+/// The longest wait between background retries of a failing provider.
+const BACKGROUND_RETRY_CEILING: Duration = DEFAULT_CACHE_TTL;
+
 /// Caches JWKS keys with Cache-Control awareness and background refresh.
 ///
 /// An unknown `kid` triggers at most one fetch per `min_refresh_interval`,
@@ -157,48 +164,97 @@ impl JwksCache {
         let last_attempt = Arc::clone(&self.last_attempt);
         let url = self.jwks_url.clone();
         let fetcher = self.fetcher.clone();
-        let min_interval = self.min_refresh_interval;
+        let floor = self.min_refresh_interval.max(BACKGROUND_RETRY_FLOOR);
 
         tokio::spawn(async move {
             loop {
-                // Sleep until shortly before expiry
+                // Sleep until shortly before expiry, never less than the
+                // floor: a provider answering max-age=0 would otherwise be
+                // polled in a tight loop.
                 let sleep_duration = {
                     let expires = expires_at.read().await;
                     let now = Instant::now();
                     if *expires > now {
-                        let remaining = *expires - now;
-                        // Refresh at 75% of TTL to avoid edge cases
-                        remaining.mul_f64(0.75)
+                        (*expires - now).mul_f64(0.75).max(floor)
                     } else {
-                        min_interval
+                        floor
                     }
                 };
 
                 tokio::time::sleep(sleep_duration).await;
 
                 debug!(url = %redact_url(&url), "Background JWKS refresh triggered");
-                {
-                    let mut l = last_attempt.write().await;
-                    *l = Instant::now();
-                }
-                match fetcher.fetch(&url).await {
-                    Ok(response) => {
-                        let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
-                        {
-                            let mut k = keys.write().await;
-                            *k = response.keys;
-                        }
-                        {
-                            let mut e = expires_at.write().await;
-                            *e = Instant::now() + ttl;
-                        }
-                        info!(ttl_secs = ttl.as_secs(), "Background JWKS refresh complete");
+                // A failing provider is retried with backoff from the floor,
+                // not on the shrinking time to expiry; the keys from the last
+                // good fetch are served meanwhile.
+                let mut failures: u32 = 0;
+                loop {
+                    {
+                        let mut l = last_attempt.write().await;
+                        *l = Instant::now();
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Background JWKS refresh failed, will retry");
+                    match fetcher.fetch(&url).await {
+                        Ok(response) => {
+                            let ttl = response.max_age.unwrap_or(DEFAULT_CACHE_TTL);
+                            {
+                                let mut k = keys.write().await;
+                                *k = response.keys;
+                            }
+                            {
+                                let mut e = expires_at.write().await;
+                                *e = Instant::now() + ttl;
+                            }
+                            info!(ttl_secs = ttl.as_secs(), "Background JWKS refresh complete");
+                            break;
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            let delay = background_retry_delay(floor, failures);
+                            warn!(
+                                error = %e,
+                                failures,
+                                retry_in_secs = delay.as_secs(),
+                                "Background JWKS refresh failed, will retry"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
         });
+    }
+}
+
+/// How long the background task waits before asking a failing identity
+/// provider again: `floor` doubled per consecutive failure, capped at
+/// [`BACKGROUND_RETRY_CEILING`], with a quarter of jitter either way so
+/// replicas restarted together do not retry in step.
+fn background_retry_delay(floor: Duration, failures: u32) -> Duration {
+    use rand::Rng;
+    let doubled = floor
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(BACKGROUND_RETRY_CEILING);
+    doubled
+        .mul_f64(rand::thread_rng().gen_range(0.75..=1.25))
+        .min(BACKGROUND_RETRY_CEILING)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_back_off_from_the_floor_to_the_ceiling() {
+        let floor = Duration::from_secs(1);
+        for (failures, expected_secs) in [(1, 1), (2, 2), (3, 4), (6, 32)] {
+            let delay = background_retry_delay(floor, failures);
+            let expected = Duration::from_secs(expected_secs);
+            assert!(
+                delay >= expected.mul_f64(0.75) && delay <= expected.mul_f64(1.25),
+                "{failures} failures: {delay:?}"
+            );
+        }
+        assert!(background_retry_delay(floor, 40) <= BACKGROUND_RETRY_CEILING);
+        assert!(background_retry_delay(Duration::from_secs(10), 1) >= Duration::from_millis(7500));
     }
 }

@@ -95,6 +95,28 @@ async fn lookup_unknown_system_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// A `$lookup` miss answered from the negative cache carries the message of
+/// the miss that filled it — an unknown CodeSystem is not reported as an
+/// unknown code.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_cached_lookup_miss_reads_like_a_fresh_one() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    for system in [bundles::ANATOMY_CS_URL, "http://hts.test/no-such-system"] {
+        let req = TestApp::params(&[
+            ("system", "valueUri", system),
+            ("code", "valueCode", "no-such-code"),
+        ]);
+        let (status, fresh) = app.post_fhir("/CodeSystem/$lookup", req.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, cached) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(cached, fresh, "{system}");
+    }
+}
+
 // ── $validate-code ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]

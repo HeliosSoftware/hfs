@@ -1140,7 +1140,8 @@ FHIRPath types (columns without a declared `type`): `Boolean` → `BOOLEAN`, `In
 |---|---|---|---|---|---|---|
 | Parquet / Arrow IPC (`sof-cli`, `sof-server`, pysof, `$sql-run`, `$sql-export`) | `Utf8` (was `Float64`) | `Timestamp(µs, UTC)`, offsets normalised (was `Utf8`) | `Int64` (was truncated to `Int32`) | `Binary` (was `Utf8`) | `Int32` with a checked conversion / `Boolean` | fixed |
 | JSON / NDJSON / CSV | JSON number, exact decimal digits, trailing zeros stripped | string as evaluated | JSON number (was the Rust debug string `Integer64(5, None, None)`) | string | number / boolean | `integer64` fixed; `decimal` **deliberate** |
-| `$sqlquery-run` / `$sql-run` in-memory SQLite (`sqlquery`) | `REAL` | `TEXT` | `INTEGER` (64-bit) | `TEXT` | `INTEGER` | `decimal` and `base64Binary` **deliberate** |
+| `$sql-run` SQL Query on MongoDB / S3: embedded SQLite (`sqlquery`), and on the SQLite backend: the primary database | `REAL` | `TEXT` | `INTEGER` (64-bit) | `TEXT` | `INTEGER` | `decimal` and `base64Binary` **deliberate** |
+| `$sql-run` SQL Query on the PostgreSQL backend: the primary database | `numeric` | `text` | `bigint` | `text` | `bigint` / `boolean` | `instant`, `base64Binary` **deliberate** (a FHIR date or instant stays text) |
 | In-DB compilers (SQLite, PostgreSQL) | PostgreSQL `numeric`; SQLite `REAL` | text | `integer64` now decoded as a number (was text) | text | `bigint` / `INTEGER`; boolean | `integer64` fixed; `decimal`, `instant`, `base64Binary` **deliberate** |
 | In-DB MongoDB compiler | declared types are not applied (BSON is dynamically typed) | same | same | same | same | **deliberate** (limitation); an invalid `ansi/type` is still rejected |
 | `_format=fhir` (`value[x]`) | `valueDecimal` | `valueInstant` | `valueInteger64` | `valueBase64Binary` | `valueInteger` / `valueBoolean` | conforms (the FHIR type picks the `value[x]` part) |

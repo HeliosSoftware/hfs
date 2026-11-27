@@ -1,0 +1,3 @@
+# The repository ignores *.log; the k6 logs under results/ are the evidence for
+# the numbers in README.md and must be tracked.
+!results/**/*.log

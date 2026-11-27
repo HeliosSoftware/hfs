@@ -120,6 +120,26 @@ pub fn authority_rank_for(url: &str, package_canonical: Option<&str>) -> i32 {
     }
 }
 
+/// Refuse to let a weaker-ranked source replace the content of a stored
+/// `(url, version)` row. The import upsert keeps the strongest rank ever
+/// asserted for a row, so without this check an unattributed import could
+/// put its own content on a row that stays authoritative.
+pub fn check_authority(
+    kind: &str,
+    url: &str,
+    version: Option<&str>,
+    existing_rank: i32,
+    incoming_rank: i32,
+) -> Result<(), HtsError> {
+    if existing_rank < incoming_rank {
+        return Err(HtsError::Conflict(format!(
+            "{kind} {url}|{} is owned by an authoritative source; an unattributed import cannot replace it",
+            version.unwrap_or("")
+        )));
+    }
+    Ok(())
+}
+
 /// `true` when `url` sits under the canonical `base`, respecting path
 /// boundaries: `http://hl7.org/fhir` owns `http://hl7.org/fhir/CodeSystem/x`
 /// but NOT `http://hl7.org/fhirpath/x`. A bare `starts_with` would claim the

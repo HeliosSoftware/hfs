@@ -15,12 +15,14 @@
 //! and `oauthMetadataUrl` of the kick-off, and the output URLs of the manifest
 //! fetched there. With `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS` set, a request is
 //! sent only to a listed origin, redirects included, and the failure messages
-//! the submitter reads in the manifest's `error` artifact carry the HTTP
-//! status or transport error. Unset, any origin is accepted, as a Data
-//! Provider on the same host needs, and those messages say only that the
-//! fetch failed: the status or transport detail of a request HFS made on the
-//! submitter's behalf goes to the log at `warn`, so `$bulk-submit` cannot be
-//! used to map what the network around HFS answers.
+//! the submitter reads in the manifest's `error` artifact carry the detail:
+//! the HTTP status, the transport error, or what was wrong with the body
+//! (a manifest that does not parse, a file that is not the JWE its key
+//! promises, a body above its ceiling). Unset, any origin is accepted, as a
+//! Data Provider on the same host needs, and those messages say only that the
+//! fetch failed: the detail of a request HFS made on the submitter's behalf
+//! goes to the log at `warn`, so `$bulk-submit` cannot be used to map what
+//! the network around HFS answers.
 //!
 //! NDJSON bodies are streamed to the ingestion engine rather than buffered, so a
 //! manifest referencing multi-gigabyte files costs a fixed amount of memory per
@@ -77,6 +79,32 @@ const FILE_ENCRYPTION_TYPE_JWE: &str = "jwe";
 
 /// How long establishing a connection to the provider may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether a `fileRequestHeader` name is refused on a kick-off and skipped
+/// on a stored submission: `Host` decides which backend answers on an origin
+/// that routes by it, so the trusted-provider check on the URL would not;
+/// the range and encoding headers are the fetcher's own resume and framing
+/// logic; the rest are hop-by-hop. Credentials (`Authorization`) stay
+/// allowed: carrying them is what the parameter is for.
+pub fn is_refused_file_request_header(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("range")
+        || name.eq_ignore_ascii_case("if-range")
+        || name.eq_ignore_ascii_case("accept-encoding")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("keep-alive")
+        // By bytes: a `str` slice panics when byte 6 is inside a character.
+        || name
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"proxy-"))
+}
 
 /// Default idle time allowed between two reads of a response before the read
 /// fails (`HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT`). A stalled body then surfaces
@@ -229,16 +257,16 @@ impl HttpSubmitInputFetcher {
 
     /// Confines every request, redirects included, to the listed origins
     /// (`HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`), and lets the failure messages
-    /// the submitter reads carry the HTTP status or transport error, which
-    /// without a list stay in the log.
+    /// the submitter reads carry the HTTP status, transport error or body
+    /// detail, which without a list stay in the log.
     pub fn with_trusted_providers(mut self, trusted_providers: TrustedProviders) -> Self {
         self.trusted_providers = trusted_providers;
         self.rebuild_clients();
         self
     }
 
-    /// Whether the submitter may read the status or transport detail of a
-    /// failed request: only when the operator chose the origins.
+    /// Whether the submitter may read the status, transport or body detail of
+    /// a failed request: only when the operator chose the origins.
     fn detail_to_submitter(&self) -> bool {
         !self.trusted_providers.is_empty()
     }
@@ -411,20 +439,21 @@ impl HttpSubmitInputFetcher {
     ///
     /// A `fileEncryptionKey` means the provider SHALL have encrypted the file,
     /// so a non-JWE payload is an error rather than a silent plaintext accept.
+    ///
+    /// The error is the bare reason: it describes the body a URL answered
+    /// with, so the caller words it for the submitter with [`Self::failure`].
     fn decrypt_file(
         &self,
         bytes: Vec<u8>,
         keys: Option<&DecryptionKeys>,
-    ) -> StorageResult<Vec<u8>> {
+    ) -> Result<Vec<u8>, String> {
         let Some(keys) = keys else {
             return Ok(bytes);
         };
         if !jwe::looks_like_jwe(&bytes) {
-            return Err(Self::err(
-                "fileEncryptionKey was supplied but the file is not a JWE",
-            ));
+            return Err("fileEncryptionKey was supplied but the file is not a JWE".to_string());
         }
-        jwe::decrypt(&bytes, keys).map_err(Self::err)
+        jwe::decrypt(&bytes, keys)
     }
 
     /// Downloads a whole file, re-fetching it from the start when the
@@ -463,7 +492,9 @@ impl HttpSubmitInputFetcher {
                 {
                     Ok(bytes) => return Ok(bytes),
                     // Re-fetching a file that is too large cannot help.
-                    Err(ReadCapped::TooLarge(message)) => return Err(Self::err(message)),
+                    Err(ReadCapped::TooLarge(message)) => {
+                        return Err(self.failure(shown, message));
+                    }
                     Err(ReadCapped::Broken(cause)) => cause,
                 },
             };
@@ -474,9 +505,9 @@ impl HttpSubmitInputFetcher {
                     error = %cause,
                     "bulk-submit encrypted file could not be downloaded whole"
                 );
-                return Err(Self::err(format!(
-                    "{cause} (gave up after {retries} retries)"
-                )));
+                return Err(
+                    self.failure(shown, format!("{cause} (gave up after {retries} retries)"))
+                );
             }
             retries += 1;
             tracing::warn!(
@@ -503,6 +534,11 @@ fn submitter_text(detail_to_submitter: bool, shown: &str, detail: String) -> Str
         error = %detail,
         "bulk-submit request failed; without HFS_BULK_SUBMIT_TRUSTED_PROVIDERS the detail stays in the log"
     );
+    withheld_text(shown)
+}
+
+/// The fixed sentence the submitter reads in place of a withheld detail.
+fn withheld_text(shown: &str) -> String {
     format!("fetching {shown} failed; the reason is in the server log")
 }
 
@@ -648,8 +684,14 @@ impl FileRequest {
                 })?;
             rb = rb.bearer_auth(token);
         }
-        // Provider-supplied headers take precedence (applied last).
+        // Provider-supplied headers take precedence (applied last), except
+        // the ones that would route the request or reframe it: the kick-off
+        // refuses those, and a submission stored before it did is skipped.
         for (name, value) in &self.request_headers {
+            if is_refused_file_request_header(name) {
+                tracing::warn!(header = %name, "skipping a routing or framing fileRequestHeader");
+                continue;
+            }
             rb = rb.header(name.as_str(), value.as_str());
         }
         Ok(rb)
@@ -941,7 +983,14 @@ impl ResumableBody {
             error = %message,
             "bulk-submit file stream failed mid-body; the file cannot be completed"
         );
-        std::io::Error::other(message)
+        // The cause is a status, a transport error or a property of the
+        // body, like the errors of the first request: logged above, and
+        // read by the submitter only when the operator listed the origins.
+        std::io::Error::other(if self.request.detail_to_submitter {
+            message
+        } else {
+            withheld_text(&self.request.shown_url)
+        })
     }
 
     /// Records a complete length a response stated, failing when it
@@ -1103,10 +1152,11 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         )
         .await
         .map_err(|e| match e {
-            // The ceiling is the operator's setting, not something the
-            // network around HFS answered.
-            ReadCapped::TooLarge(message) => Self::err(message),
-            ReadCapped::Broken(message) => self.failure(&shown, message),
+            // Passing the ceiling says how large a body the URL answered
+            // with, so it is worded like any other failed fetch.
+            ReadCapped::TooLarge(message) | ReadCapped::Broken(message) => {
+                self.failure(&shown, message)
+            }
         })?;
 
         // The spec has the provider encrypt the manifest as well as the files.
@@ -1116,7 +1166,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         let keys = self.resolve_keys(encryption_key)?;
         let bytes = match &keys {
             Some(keys) if jwe::looks_like_jwe(&bytes) => jwe::decrypt(&bytes, keys)
-                .map_err(|e| Self::err(format!("decrypting manifest {shown}: {e}")))?,
+                .map_err(|e| self.failure(&shown, format!("decrypting manifest {shown}: {e}")))?,
             Some(_) => {
                 tracing::warn!(
                     manifest_url = %shown,
@@ -1127,8 +1177,11 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             None => bytes,
         };
 
+        // Worded for the submitter like the status and transport errors: serde
+        // quotes scalar content, so a body that is not a manifest would
+        // otherwise be read back through the error artifact.
         serde_json::from_slice::<RemoteManifest>(&bytes)
-            .map_err(|e| Self::err(format!("parsing manifest {shown}: {e}")))
+            .map_err(|e| self.failure(&shown, format!("parsing manifest {shown}: {e}")))
     }
 
     /// Returns as soon as the response headers arrive; the body is read lazily
@@ -1159,6 +1212,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 requires_access_token,
                 oauth_metadata_urls,
             );
+            let shown = &request.shown_url;
             // Final, like a file past its byte ceiling: fetching it again
             // would only hold the worker for another budget.
             let bytes = tokio::time::timeout(
@@ -1168,15 +1222,14 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             .await
             .map_err(|_| {
                 Self::err(format!(
-                    "encrypted file {} was not downloaded within {} s \
+                    "encrypted file {shown} was not downloaded within {} s \
                      (HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT)",
-                    request.shown_url,
                     self.encrypted_file_fetch_timeout.as_secs()
                 ))
             })??;
             let bytes = self
                 .decrypt_file(bytes, Some(keys))
-                .map_err(|e| Self::err(format!("decrypting file {}: {e}", request.shown_url)))?;
+                .map_err(|e| self.failure(shown, format!("decrypting file {shown}: {e}")))?;
             let len = bytes.len() as u64;
             return Ok((
                 Box::new(tokio::io::BufReader::new(std::io::Cursor::new(bytes))),
@@ -1203,7 +1256,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             ));
         }
         let encoding = body_encoding(resp.headers())
-            .map_err(|e| Self::err(format!("file GET {shown}: {e}")))?;
+            .map_err(|e| self.failure(&shown, format!("file GET {shown}: {e}")))?;
         // The advertised size, when trustworthy: for a gzip body Content-Length
         // is the compressed size and a byte-based percentage would overshoot.
         let content_length = match encoding {
@@ -1259,6 +1312,9 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             rb = rb.bearer_auth(token);
         }
         for (name, value) in request_headers {
+            if is_refused_file_request_header(name) {
+                continue;
+            }
             rb = rb.header(name.as_str(), value.as_str());
         }
         // Strictly best-effort: providers without HEAD support (405, 4xx/5xx,
@@ -1288,6 +1344,43 @@ mod tests {
 
     const B64URL: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn routing_and_framing_headers_are_refused_whatever_their_case() {
+        for name in [
+            "Host",
+            "host",
+            "HOST",
+            " Host ",
+            "Range",
+            "If-Range",
+            "Accept-Encoding",
+            "Connection",
+            "Transfer-Encoding",
+            "Content-Length",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Keep-Alive",
+            "Proxy-Authorization",
+            "proxy-connection",
+        ] {
+            assert!(is_refused_file_request_header(name), "{name}");
+        }
+        for name in [
+            "Authorization",
+            "X-Custom",
+            "Accept",
+            "X-Proxy-Hint",
+            "Proxy",
+            // Byte 6 falls inside a character: not refused, and no panic.
+            "abcde\u{e9}",
+            "prox\u{e9}-",
+            "",
+        ] {
+            assert!(!is_refused_file_request_header(name), "{name}");
+        }
+    }
 
     fn fetcher() -> HttpSubmitInputFetcher {
         HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
@@ -1663,6 +1756,12 @@ mod tests {
         fetcher().with_retry_policy(3, Duration::from_millis(10))
     }
 
+    /// As [`quick_fetcher`], trusting `base_url`, so that a failure reads
+    /// with its detail.
+    fn quick_fetcher_at(base_url: &str) -> HttpSubmitInputFetcher {
+        trusting(base_url).with_retry_policy(3, Duration::from_millis(10))
+    }
+
     /// Reads a whole file through `open_file_stream`, bounded in time.
     async fn read_file(
         fetcher: &HttpSubmitInputFetcher,
@@ -1704,7 +1803,8 @@ mod tests {
         ])
         .await;
 
-        let (read, len) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, len) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("the resumed read completes"), full);
         assert_eq!(len, Some(full.len() as u64));
 
@@ -1730,7 +1830,8 @@ mod tests {
         let (base, requests) =
             scripted_server(vec![Scripted::ok(&full).cut(cut), Scripted::ok(&full)]).await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(
             read.expect("the re-read completes"),
             full,
@@ -1755,7 +1856,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         let err = read.expect_err("a changed file must fail, not splice");
         assert!(
             err.to_string().contains("changed between requests"),
@@ -1767,7 +1869,7 @@ mod tests {
     async fn test_a_body_that_keeps_breaking_fails_with_a_redacted_url() {
         let full = ndjson_patients(40);
         let (base, requests) = scripted_server(vec![Scripted::ok(&full).cut(full.len() / 2)]).await;
-        let fetcher = fetcher().with_retry_policy(2, Duration::from_millis(10));
+        let fetcher = trusting(&base).with_retry_policy(2, Duration::from_millis(10));
 
         let url = format!("{base}/f.ndjson?X-Amz-Signature=secret123");
         let (read, _) = read_file(&fetcher, &url, None).await;
@@ -1796,7 +1898,8 @@ mod tests {
         let (base, requests) =
             scripted_server(vec![Scripted::ok(&gz).header("Content-Encoding: gzip")]).await;
 
-        let (read, len) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, len) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("decoded"), full);
         assert_eq!(
             len, None,
@@ -1820,7 +1923,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         let err = read.expect_err("a cut gzip body fails").to_string();
         assert!(err.contains("gzip-encoded"), "{err}");
         let requests = requests.lock().unwrap();
@@ -1909,7 +2013,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("the file is completed, not truncated"), full);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
@@ -1932,7 +2037,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         let err = read
             .expect_err("a shrunken resend must not end the file")
             .to_string();
@@ -1955,7 +2061,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("the 503 is transient"), full);
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
@@ -1976,7 +2083,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("the file was complete"), full);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -1998,7 +2106,8 @@ mod tests {
         ])
         .await;
 
-        let (read, _) = read_file(&quick_fetcher(), &format!("{base}/f.ndjson"), None).await;
+        let (read, _) =
+            read_file(&quick_fetcher_at(&base), &format!("{base}/f.ndjson"), None).await;
         assert_eq!(read.expect("the re-read completes"), full);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -2130,6 +2239,35 @@ mod tests {
         assert!(shown.contains("HTTP 503"), "{shown}");
         assert!(!shown.contains("secret123"), "{shown}");
 
+        // A 200 that is not a manifest: the parse error quotes scalar
+        // content, so it is withheld the same way.
+        for body in [
+            &b"\"internal-secret-value-42\""[..],
+            b"hello plain text",
+            b"{\"status\":\"ok\"}",
+        ] {
+            let (base, _) = scripted_server(vec![Scripted::ok(body)]).await;
+            let url = format!("{base}/manifest.json?sig=secret123");
+            let withheld = fetcher()
+                .fetch_manifest(&url, &[], &[], None)
+                .await
+                .expect_err("not a manifest")
+                .to_string();
+            assert!(!withheld.contains("internal-secret-value-42"), "{withheld}");
+            assert!(!withheld.contains("parsing manifest"), "{withheld}");
+            assert!(
+                withheld.contains("the reason is in the server log"),
+                "{withheld}"
+            );
+            let shown = trusting(&base)
+                .fetch_manifest(&url, &[], &[], None)
+                .await
+                .expect_err("not a manifest")
+                .to_string();
+            assert!(shown.contains("parsing manifest"), "{shown}");
+            assert!(!shown.contains("secret123"), "{shown}");
+        }
+
         let (base, _) = scripted_server(vec![unavailable()]).await;
         let url = format!("{base}/file.ndjson");
         let withheld = stream_err(
@@ -2146,11 +2284,95 @@ mod tests {
         assert!(shown.contains("HTTP 503"), "{shown}");
     }
 
+    /// What a body was, as opposed to whether it arrived, is as much an
+    /// answer of the address as its status: each such failure reads as the
+    /// fixed sentence without trusted providers and with its detail with them.
+    #[tokio::test]
+    async fn test_what_was_wrong_with_a_body_reaches_the_submitter_only_with_trusted_providers() {
+        const WITHHELD: &str = "the reason is in the server log";
+        let key = [7u8; 32];
+        let enc_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode(key)});
+        let other_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode([9u8; 32])});
+
+        // A manifest above its ceiling.
+        for trusted in [false, true] {
+            let (base, _) = scripted_server(vec![Scripted::ok(&vec![b'x'; 4096])]).await;
+            let f = if trusted { trusting(&base) } else { fetcher() };
+            let err = f
+                .with_body_limits(1024, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
+                .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
+                .await
+                .expect_err("above the ceiling")
+                .to_string();
+            assert_eq!(err.contains("ceiling"), trusted, "{err}");
+            assert_eq!(err.contains(WITHHELD), !trusted, "{err}");
+        }
+
+        // An encrypted manifest the supplied key does not open.
+        for trusted in [false, true] {
+            let sealed = seal(&key, br#"{"output":[]}"#);
+            let (base, _) = scripted_server(vec![Scripted::ok(sealed.as_bytes())]).await;
+            let f = if trusted { trusting(&base) } else { fetcher() };
+            let err = f
+                .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], Some(&other_key))
+                .await
+                .expect_err("the wrong key")
+                .to_string();
+            assert_eq!(err.contains("decrypting manifest"), trusted, "{err}");
+            assert_eq!(err.contains(WITHHELD), !trusted, "{err}");
+        }
+
+        // A file that is not the JWE its key promises, one that is a JWE the
+        // key does not open, and one in an encoding that was not asked for.
+        let sealed = seal(&key, b"{}\n");
+        let cases: [(Scripted, Option<&Value>, &str); 3] = [
+            (
+                Scripted::ok(b"\"internal-secret-value-42\""),
+                Some(&enc_key),
+                "not a JWE",
+            ),
+            (
+                Scripted::ok(sealed.as_bytes()),
+                Some(&other_key),
+                "decrypting file",
+            ),
+            (
+                Scripted::ok(b"x").header("Content-Encoding: br"),
+                None,
+                "unsupported Content-Encoding",
+            ),
+        ];
+        for (response, file_key, detail) in cases {
+            for trusted in [false, true] {
+                let (base, _) = scripted_server(vec![response.clone()]).await;
+                let f = if trusted { trusting(&base) } else { fetcher() };
+                let err = stream_err(
+                    f.open_file_stream(&format!("{base}/f.ndjson"), &[], false, &[], file_key)
+                        .await,
+                );
+                assert_eq!(err.contains(detail), trusted, "{detail}: {err}");
+                assert_eq!(err.contains(WITHHELD), !trusted, "{detail}: {err}");
+            }
+        }
+
+        // A transfer that breaks mid-body and cannot be completed.
+        for trusted in [false, true] {
+            let full = ndjson_patients(40);
+            let (base, _) = scripted_server(vec![Scripted::ok(&full).cut(full.len() / 2)]).await;
+            let f = if trusted { trusting(&base) } else { fetcher() };
+            let f = f.with_retry_policy(1, Duration::from_millis(10));
+            let (read, _) = read_file(&f, &format!("{base}/f.ndjson"), None).await;
+            let err = read.expect_err("the file cannot be completed").to_string();
+            assert_eq!(err.contains("gave up after"), trusted, "{err}");
+            assert_eq!(err.contains(WITHHELD), !trusted, "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn test_a_manifest_above_the_ceiling_is_refused_by_its_declared_length() {
         let body = vec![b'x'; 4096];
         let (base, _) = scripted_server(vec![Scripted::ok(&body)]).await;
-        let err = fetcher()
+        let err = trusting(&base)
             .with_body_limits(1024, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
             .fetch_manifest(
                 &format!("{base}/manifest.json?sig=secret123"),
@@ -2179,7 +2401,7 @@ mod tests {
         assert!(gz.len() < 50_000, "the wire size is under the ceiling");
         let (base, _) =
             scripted_server(vec![Scripted::ok(&gz).header("Content-Encoding: gzip")]).await;
-        let err = fetcher()
+        let err = trusting(&base)
             .with_body_limits(50_000, DEFAULT_MAX_ENCRYPTED_FILE_BYTES)
             .fetch_manifest(&format!("{base}/manifest.json"), &[], &[], None)
             .await
@@ -2197,7 +2419,7 @@ mod tests {
         let enc_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode(key)});
         let (base, requests) = scripted_server(vec![Scripted::ok(&compact)]).await;
 
-        let fetcher = quick_fetcher().with_body_limits(DEFAULT_MAX_MANIFEST_BYTES, 1024);
+        let fetcher = quick_fetcher_at(&base).with_body_limits(DEFAULT_MAX_MANIFEST_BYTES, 1024);
         let err = match fetcher
             .open_file_stream(
                 &format!("{base}/f.ndjson.jwe"),

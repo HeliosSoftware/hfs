@@ -95,7 +95,8 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = AppState::new(backend)
         .with_resource_store(resource_store)
-        .with_max_expansion_size(config.max_expansion_size);
+        .with_max_expansion_size(config.max_expansion_size)
+        .with_max_expansion_size_ceiling(config.max_expansion_size_ceiling);
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -167,7 +168,8 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = helios_hts::state::AppState::new(backend)
         .with_resource_store_pg(resource_store)
-        .with_max_expansion_size(config.max_expansion_size);
+        .with_max_expansion_size(config.max_expansion_size)
+        .with_max_expansion_size_ceiling(config.max_expansion_size_ceiling);
 
     let app = helios_hts::server::create_app(&config, state);
 
@@ -897,9 +899,18 @@ async fn import_directory_files(
         );
         match dispatch_import(format, backend, ctx, entry, batch_size, dry_run, languages).await {
             Ok(file_stats) => {
+                let conflicts = file_stats.conflicts;
                 stats.merge(file_stats);
                 imported_count += 1;
-                if let (Some(tracker), Some((hash, size, mtime, langs))) =
+                if conflicts > 0 {
+                    tracing::error!(
+                        file = fname,
+                        conflicts,
+                        "bootstrap import left resources out because another owner holds \
+                         their canonical or id; the file is not recorded as imported and \
+                         will be attempted again at the next startup"
+                    );
+                } else if let (Some(tracker), Some((hash, size, mtime, langs))) =
                     (tracker, pending_signature.as_ref())
                     && !dry_run
                     && let Err(e) = tracker.record(fname, hash, *size, *mtime, langs).await
@@ -1162,6 +1173,316 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((imported, skipped), (1, 1));
+    }
+
+    /// A file whose resource was refused because a REST row owns its canonical
+    /// is not recorded in the ledger: the next sync attempts it again, and once
+    /// the REST row is gone the import lands and the file is recorded.
+    #[tokio::test]
+    async fn bootstrap_sync_retries_a_file_whose_resource_was_refused() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        let store = helios_persistence::backends::sqlite::SqliteBackend::open(db.path()).unwrap();
+        store.init_schema().unwrap();
+        let backend = SqliteTerminologyBackend::new(path).unwrap();
+        let state = helios_hts::state::AppState::new(backend.clone()).with_resource_store(store);
+        let router = helios_hts::server::create_app(&HtsConfig::default(), state);
+        let ctx = TenantContext::system();
+        let tracker = BootstrapTracker::Sqlite(&backend);
+
+        let rest = serde_json::json!({
+            "resourceType": "CodeSystem",
+            "id": "cs-rest",
+            "url": "http://example.org/cs",
+            "version": "1.0.0",
+            "status": "active",
+            "content": "complete",
+            "concept": [{ "code": "R", "display": "Rest" }]
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/CodeSystem/cs-rest")
+                    .header("content-type", "application/fhir+json")
+                    .body(Body::from(rest.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let boot = tempfile::tempdir().unwrap();
+        write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
+
+        for _ in 0..2 {
+            let (stats, imported, skipped) = import_directory_files(
+                &backend,
+                &ctx,
+                boot.path(),
+                500,
+                false,
+                &LanguageFilter::default(),
+                Some(&tracker),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (imported, skipped),
+                (1, 0),
+                "a refused file is attempted again"
+            );
+            assert_eq!(
+                (stats.conflicts, stats.code_systems),
+                (1, 0),
+                "{:?}",
+                stats.errors
+            );
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/CodeSystem/cs-rest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let (stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(
+            (stats.conflicts, stats.code_systems),
+            (0, 1),
+            "{:?}",
+            stats.errors
+        );
+
+        let (_stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (imported, skipped),
+            (0, 1),
+            "recorded once it imported cleanly"
+        );
+    }
+
+    /// Native importers write through the same ownership check, so a REST row
+    /// that holds a native terminology's canonical keeps the file out of the
+    /// ledger the same way as for a bundle.
+    #[tokio::test]
+    async fn bootstrap_sync_retries_a_native_file_whose_code_system_was_refused() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        let store = helios_persistence::backends::sqlite::SqliteBackend::open(db.path()).unwrap();
+        store.init_schema().unwrap();
+        let backend = SqliteTerminologyBackend::new(path).unwrap();
+        let state = helios_hts::state::AppState::new(backend.clone()).with_resource_store(store);
+        let router = helios_hts::server::create_app(&HtsConfig::default(), state);
+        let ctx = TenantContext::system();
+        let tracker = BootstrapTracker::Sqlite(&backend);
+
+        let rest = serde_json::json!({
+            "resourceType": "CodeSystem",
+            "id": "nucc-rest",
+            "url": "http://nucc.org/provider-taxonomy",
+            "version": "current",
+            "status": "active",
+            "content": "complete",
+            "concept": [{ "code": "R", "display": "Rest" }]
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/CodeSystem/nucc-rest")
+                    .header("content-type", "application/fhir+json")
+                    .body(Body::from(rest.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let boot = tempfile::tempdir().unwrap();
+        std::fs::write(
+            boot.path().join("nucc_taxonomy_1.csv"),
+            "Code,Grouping,Classification,Specialization,Definition,Effective Date,\
+             Deactivation Date,Last Modified Date,Notes,Display Name\n\
+             101Y00000X,Behavioral Health,Counselor,,A counselor.,20020101,,,, Counselor\n",
+        )
+        .unwrap();
+        let languages = LanguageFilter::default();
+        let sync = || {
+            import_directory_files(
+                &backend,
+                &ctx,
+                boot.path(),
+                500,
+                false,
+                &languages,
+                Some(&tracker),
+            )
+        };
+
+        for _ in 0..2 {
+            let (stats, imported, skipped) = sync().await.unwrap();
+            assert_eq!(
+                (imported, skipped),
+                (1, 0),
+                "a refused file is attempted again"
+            );
+            assert_eq!(
+                (stats.conflicts, stats.code_systems),
+                (1, 0),
+                "{:?}",
+                stats.errors
+            );
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/CodeSystem/nucc-rest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+
+        let (stats, imported, skipped) = sync().await.unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(
+            (stats.conflicts, stats.code_systems),
+            (0, 1),
+            "{:?}",
+            stats.errors
+        );
+        let (_stats, imported, skipped) = sync().await.unwrap();
+        assert_eq!(
+            (imported, skipped),
+            (0, 1),
+            "recorded once it imported cleanly"
+        );
+    }
+
+    /// A package that carries a copy of a canonical another package owns is
+    /// refused for that resource by the authority check. Importing the same
+    /// file again cannot change that, so the file is still recorded.
+    #[tokio::test]
+    async fn bootstrap_sync_records_a_file_refused_by_the_authority_check() {
+        fn write_package(dir: &std::path::Path, name: &str, canonical: &str, code: &str) {
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let entries = [
+                (
+                    "package/package.json",
+                    serde_json::json!({"name": name, "version": "1.0.0", "canonical": canonical}),
+                ),
+                (
+                    "package/CodeSystem-owned.json",
+                    serde_json::json!({
+                        "resourceType": "CodeSystem",
+                        "id": "owned",
+                        "url": "http://owner.example/fhir/CodeSystem/owned",
+                        "version": "1.0.0",
+                        "status": "active",
+                        "content": "complete",
+                        "concept": [{ "code": code, "display": code }]
+                    }),
+                ),
+            ];
+            for (path, json) in entries {
+                let bytes = serde_json::to_vec(&json).unwrap();
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, path, bytes.as_slice())
+                    .unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let backend = SqliteTerminologyBackend::new(db.path().to_str().unwrap()).unwrap();
+        let ctx = TenantContext::system();
+        let tracker = BootstrapTracker::Sqlite(&backend);
+
+        // Files are imported in name order: the owner first, then the copy.
+        let boot = tempfile::tempdir().unwrap();
+        write_package(
+            boot.path(),
+            "a-owner.tgz",
+            "http://owner.example/fhir",
+            "ORIGINAL",
+        );
+        write_package(
+            boot.path(),
+            "b-copy.tgz",
+            "http://other.example/fhir",
+            "COPY",
+        );
+        let languages = LanguageFilter::default();
+        let sync = || {
+            import_directory_files(
+                &backend,
+                &ctx,
+                boot.path(),
+                500,
+                false,
+                &languages,
+                Some(&tracker),
+            )
+        };
+
+        let (stats, imported, skipped) = sync().await.unwrap();
+        assert_eq!((imported, skipped), (2, 0));
+        assert_eq!(stats.errors.len(), 1, "{:?}", stats.errors);
+        assert!(
+            stats.errors[0].contains("authoritative source"),
+            "{:?}",
+            stats.errors
+        );
+        assert_eq!(stats.conflicts, 0);
+
+        let (_stats, imported, skipped) = sync().await.unwrap();
+        assert_eq!((imported, skipped), (0, 2), "both files are recorded");
     }
 
     /// Without a tracker (the `hts import <dir>` CLI path) every recognized file

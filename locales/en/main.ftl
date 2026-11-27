@@ -710,6 +710,7 @@ bulk-import-test-auth-ok = Authentication succeeded.
 bulk-import-create-submit = Submit
 bulk-import-advanced = Advanced options
 bulk-import-unavailable = The storage backend does not host the settings store, so submissions cannot be saved.
+bulk-import-save-failed = The submission could not be saved. The server log has the detail.
 bulk-import-submissions = Submissions
 bulk-import-records = records
 bulk-import-col-name = Name
@@ -2022,6 +2023,8 @@ hts-home-chart-hint-series-5xx = 5xx responses only
 
 ## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
 auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
+auth-admin-scope = This page manages tenants and bulk-import submissions for the whole server. Your sign-in does not carry a system-level scope with the permission it needs (system/*.r to view, system/*.c to create, system/*.d to delete), so the request was refused.
+auth-unverified-session = This server could not verify the access token behind your sign-in, so it cannot tell which tenant you may see and this page was refused. Sign out and sign in again; if it keeps happening, ask the administrator to check the server's token validation settings (issuer, audience and signing keys).
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
 batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
 batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.
