@@ -41,6 +41,10 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// buffer that much per connection.
 const MAX_INCOMING_MESSAGE_BYTES: usize = 4 * 1024;
 
+/// How long the close frame for an oversized message may take to send. The
+/// peer may be bound and not reading, so the send must not wait on it.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// WebSocket binding handler.
 ///
 /// The client connects to `/ws/subscriptions/bind` and then sends
@@ -67,6 +71,9 @@ where
     Ok(ws
         .max_message_size(MAX_INCOMING_MESSAGE_BYTES)
         .max_frame_size(MAX_INCOMING_MESSAGE_BYTES)
+        // The library reads into a 128 KiB buffer per connection by default,
+        // which no message this route accepts can fill.
+        .read_buffer_size(MAX_INCOMING_MESSAGE_BYTES)
         .on_upgrade(move |socket| {
             handle_ws_connection(socket, engine, request_tenant_id, base_url)
         }))
@@ -260,6 +267,9 @@ async fn handle_ws_connection(
                             error = %e,
                             "WebSocket error"
                         );
+                        if is_message_too_big(&e) {
+                            close_with_message_too_big(&mut socket).await;
+                        }
                         break;
                     }
                 }
@@ -325,6 +335,9 @@ async fn receive_bind_token(socket: &mut WebSocket) -> Option<String> {
         }
         Some(Err(e)) => {
             warn!(error = %e, "WebSocket error before bind");
+            if is_message_too_big(&e) {
+                close_with_message_too_big(socket).await;
+            }
             None
         }
     }
@@ -344,6 +357,25 @@ async fn close_with_policy_violation(socket: &mut WebSocket, reason: &str) {
             reason: reason.to_string().into(),
         })))
         .await;
+}
+
+/// Whether `error` is the WebSocket layer refusing a message or frame larger
+/// than [`MAX_INCOMING_MESSAGE_BYTES`].
+fn is_message_too_big(error: &axum::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|source| matches!(source, tungstenite::Error::Capacity(_)))
+}
+
+/// Tells the peer its message was refused for its size (close code 1009)
+/// rather than leaving it with a dropped connection. The oversized payload is
+/// left unread, so a peer still sending it may see a reset instead.
+async fn close_with_message_too_big(socket: &mut WebSocket) {
+    let close = Message::Close(Some(CloseFrame {
+        code: 1009,
+        reason: "message-too-big".into(),
+    }));
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.send(close)).await;
 }
 
 #[cfg(test)]

@@ -79,6 +79,9 @@ async-trait = "0.1"
 
 # Web framework
 axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
+# Names the size-limit error of axum's WebSocket, so an over-limit message is
+# answered with close code 1009. Must stay the version axum is built on.
+tungstenite = "0.29"
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full", "set-header"] }
 http = "1.0"
