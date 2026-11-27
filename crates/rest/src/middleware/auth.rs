@@ -387,14 +387,24 @@ fn patient_compartment_path_check(
         [_type, second] if is_control(second) => refuse(routed_path),
         // Instance level: the handler checks the stored payload.
         [_type, _id] => Ok(()),
-        [_type, _id, "_history"] => Ok(()),
+        // Instance history is read through a per-version filter; the
+        // trial-use history deletes would erase versions from before the
+        // resource joined the compartment, which the same token may not read,
+        // so a patient/ scope keeps the reads only.
+        [_type, _id, "_history"] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a resource's history"),
+        },
         ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
         [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
         [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
         // Compartment search: the launch patient's own compartment only.
         ["Patient", id, _target] if *id == patient_id => Ok(()),
         [_compartment, _id, _target] => refuse("a search in another compartment"),
-        [_type, _id, "_history", _vid] => Ok(()),
+        [_type, _id, "_history", _vid] => match method {
+            "GET" | "HEAD" => Ok(()),
+            _ => refuse("deleting a version of a resource"),
+        },
         _ => refuse(routed_path),
     }
 }
@@ -814,8 +824,6 @@ mod tests {
             ("/Observation/o1", "DELETE"),
             ("/Observation/o1/_history", "GET"),
             ("/Observation/o1/_history/3", "GET"),
-            ("/Observation/o1/_history", "DELETE"),
-            ("/Observation/o1/_history/3", "DELETE"),
             ("/Patient/p1/Observation", "GET"),
             ("/Patient/p1/*", "GET"),
             ("/Patient/p1/$everything", "GET"),
@@ -838,6 +846,9 @@ mod tests {
             // Type history.
             ("/Observation/_history", "GET"),
             ("/Patient/_history", "GET"),
+            // History deletes: versions the token may not read.
+            ("/Observation/o1/_history", "DELETE"),
+            ("/Observation/o1/_history/3", "DELETE"),
             // Operations other than the two that narrow themselves.
             ("/Observation/$validate", "POST"),
             ("/ValueSet/$expand", "GET"),
