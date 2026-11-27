@@ -69,6 +69,102 @@ use helios_observability::redact::redact_url;
 use helios_persistence::BackendKind;
 use helios_persistence::core::database_url::redact_database_url;
 
+/// Reads the `HFS_*` settings that are not command-line arguments (the
+/// tenancy, bulk-export, bulk-submit and validation settings), from the
+/// process environment or, in tests, from given pairs.
+///
+/// A variable that is set but is not a value of its type keeps its default
+/// and is recorded. [`ServerConfig::try_from_env`] then fails with its name and
+/// raw value, as it does for a command-line argument, rather than running on
+/// a default the operator meant to replace. An empty value is set, as it is
+/// for the command-line arguments.
+#[derive(Debug, Default)]
+struct EnvSettings {
+    vars: Option<std::collections::HashMap<String, String>>,
+    errors: Vec<String>,
+}
+
+impl EnvSettings {
+    /// Settings read from `pairs` instead of the process environment.
+    #[cfg(test)]
+    fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self {
+            vars: Some(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ),
+            errors: Vec::new(),
+        }
+    }
+
+    /// The value of `key`; `None` when it is unset. A value that is not
+    /// Unicode is recorded without its bytes, since the variable may hold a
+    /// key.
+    fn string(&mut self, key: &str) -> Option<String> {
+        if let Some(vars) = &self.vars {
+            return vars.get(key).cloned();
+        }
+        match std::env::var_os(key)?.into_string() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.errors.push(format!("{key} is not valid Unicode"));
+                None
+            }
+        }
+    }
+
+    /// `key` read by `parse`, or `default` when it is unset or `parse` refuses
+    /// it, recorded as not being `expected`.
+    fn parsed<T>(
+        &mut self,
+        key: &str,
+        default: T,
+        expected: &str,
+        parse: impl FnOnce(&str) -> Option<T>,
+    ) -> T {
+        let Some(raw) = self.string(key) else {
+            return default;
+        };
+        parse(&raw).unwrap_or_else(|| {
+            self.errors.push(format!("{key}={raw:?} is not {expected}"));
+            default
+        })
+    }
+
+    /// `true` or `1`, `false` or `0`, in any case.
+    fn flag(&mut self, key: &str, default: bool) -> bool {
+        self.parsed(
+            key,
+            default,
+            "a boolean (true, false, 1 or 0)",
+            |raw| match raw.to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            },
+        )
+    }
+
+    fn u64(&mut self, key: &str, default: u64) -> u64 {
+        self.parsed(key, default, "a non-negative integer", |raw| {
+            raw.parse().ok()
+        })
+    }
+
+    fn u32(&mut self, key: &str, default: u32) -> u32 {
+        self.parsed(key, default, "an integer from 0 to 4294967295", |raw| {
+            raw.parse().ok()
+        })
+    }
+
+    /// One message per variable that was set but could not be read.
+    fn into_errors(self) -> Vec<String> {
+        self.errors
+    }
+}
+
 /// Storage backend mode.
 ///
 /// Determines which backend configuration the server uses.
@@ -272,25 +368,27 @@ pub(crate) fn dead_tenant_claim_variable(value: Option<std::ffi::OsString>) -> O
 }
 
 impl MultitenancyConfig {
-    /// Creates a new MultitenancyConfig from environment variables.
+    /// Creates a new MultitenancyConfig from environment variables. A value
+    /// that cannot be read keeps its default; [`ServerConfig::try_from_env`]
+    /// reports it.
     pub fn from_env() -> Self {
-        let routing_mode = std::env::var("HFS_TENANT_ROUTING_MODE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        Self::read_env(&mut EnvSettings::default())
+    }
 
-        let strict_validation = std::env::var("HFS_TENANT_STRICT_VALIDATION")
-            .map(|s| s.to_lowercase() == "true" || s == "1")
-            .unwrap_or(false);
-
-        let require_provisioned_tenant = std::env::var("HFS_TENANT_REQUIRE_PROVISIONED")
-            .map(|s| s.to_lowercase() == "true" || s == "1")
-            .unwrap_or(false);
-
+    fn read_env(env: &mut EnvSettings) -> Self {
+        let d = Self::default();
         Self {
-            routing_mode,
-            strict_validation,
-            require_provisioned_tenant,
+            routing_mode: env.parsed(
+                "HFS_TENANT_ROUTING_MODE",
+                d.routing_mode,
+                "a tenant routing mode (header_only, url_path or both)",
+                |raw| raw.parse().ok(),
+            ),
+            strict_validation: env.flag("HFS_TENANT_STRICT_VALIDATION", d.strict_validation),
+            require_provisioned_tenant: env.flag(
+                "HFS_TENANT_REQUIRE_PROVISIONED",
+                d.require_provisioned_tenant,
+            ),
         }
     }
 }
@@ -365,60 +463,47 @@ impl Default for BulkExportConfig {
 }
 
 impl BulkExportConfig {
-    /// Loads bulk-export configuration from `HFS_BULK_EXPORT_*` env vars.
+    /// Loads bulk-export configuration from `HFS_BULK_EXPORT_*` env vars. A
+    /// value that cannot be read keeps its default;
+    /// [`ServerConfig::try_from_env`] reports it.
     pub fn from_env() -> Self {
-        fn env_bool(key: &str, default: bool) -> bool {
-            std::env::var(key)
-                .map(|s| {
-                    let s = s.to_lowercase();
-                    s == "true" || s == "1"
-                })
-                .unwrap_or(default)
-        }
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
-        fn env_u32(key: &str, default: u32) -> u32 {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
+        Self::read_env(&mut EnvSettings::default())
+    }
+
+    fn read_env(env: &mut EnvSettings) -> Self {
         let d = Self::default();
         Self {
-            enabled: env_bool("HFS_BULK_EXPORT_ENABLED", d.enabled),
-            output_backend: std::env::var("HFS_BULK_EXPORT_OUTPUT_BACKEND")
+            enabled: env.flag("HFS_BULK_EXPORT_ENABLED", d.enabled),
+            output_backend: env
+                .string("HFS_BULK_EXPORT_OUTPUT_BACKEND")
                 .unwrap_or(d.output_backend),
-            output_dir: std::env::var("HFS_BULK_EXPORT_OUTPUT_DIR").ok(),
-            s3_bucket: std::env::var("HFS_BULK_EXPORT_S3_BUCKET").ok(),
-            requires_access_token: std::env::var("HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN")
+            output_dir: env.string("HFS_BULK_EXPORT_OUTPUT_DIR"),
+            s3_bucket: env.string("HFS_BULK_EXPORT_S3_BUCKET"),
+            requires_access_token: env
+                .string("HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN")
                 .unwrap_or(d.requires_access_token),
-            file_url_ttl_secs: env_u64("HFS_BULK_EXPORT_FILE_URL_TTL", d.file_url_ttl_secs),
-            output_ttl_secs: env_u64("HFS_BULK_EXPORT_OUTPUT_TTL", d.output_ttl_secs),
-            worker_concurrency: env_u32("HFS_BULK_EXPORT_WORKER_CONCURRENCY", d.worker_concurrency),
-            disable_local_worker: env_bool(
+            file_url_ttl_secs: env.u64("HFS_BULK_EXPORT_FILE_URL_TTL", d.file_url_ttl_secs),
+            output_ttl_secs: env.u64("HFS_BULK_EXPORT_OUTPUT_TTL", d.output_ttl_secs),
+            worker_concurrency: env.u32("HFS_BULK_EXPORT_WORKER_CONCURRENCY", d.worker_concurrency),
+            disable_local_worker: env.flag(
                 "HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
             ),
-            max_concurrent_per_tenant: env_u32(
+            max_concurrent_per_tenant: env.u32(
                 "HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT",
                 d.max_concurrent_per_tenant,
             ),
-            max_attempts: env_u32("HFS_BULK_EXPORT_MAX_ATTEMPTS", d.max_attempts),
-            batch_size: env_u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
-            lease_duration_secs: env_u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
-            heartbeat_interval_secs: env_u64(
+            max_attempts: env.u32("HFS_BULK_EXPORT_MAX_ATTEMPTS", d.max_attempts),
+            batch_size: env.u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
+            lease_duration_secs: env.u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
+            heartbeat_interval_secs: env.u64(
                 "HFS_BULK_EXPORT_HEARTBEAT_INTERVAL",
                 d.heartbeat_interval_secs,
             ),
-            cleanup_interval_secs: env_u64(
-                "HFS_BULK_EXPORT_CLEANUP_INTERVAL",
-                d.cleanup_interval_secs,
-            ),
-            since_newly_added: std::env::var("HFS_BULK_EXPORT_SINCE_NEWLY_ADDED")
+            cleanup_interval_secs: env
+                .u64("HFS_BULK_EXPORT_CLEANUP_INTERVAL", d.cleanup_interval_secs),
+            since_newly_added: env
+                .string("HFS_BULK_EXPORT_SINCE_NEWLY_ADDED")
                 .unwrap_or(d.since_newly_added),
         }
     }
@@ -545,30 +630,24 @@ impl Default for ValidationConfig {
 }
 
 impl ValidationConfig {
-    /// Loads validation configuration from `HFS_VALIDATION_*` env vars.
+    /// Loads validation configuration from `HFS_VALIDATION_*` env vars. A
+    /// value that cannot be read keeps its default;
+    /// [`ServerConfig::try_from_env`] reports it.
     pub fn from_env() -> Self {
-        fn env_bool(key: &str, default: bool) -> bool {
-            std::env::var(key)
-                .map(|s| {
-                    let s = s.to_lowercase();
-                    s == "true" || s == "1"
-                })
-                .unwrap_or(default)
-        }
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
+        Self::read_env(&mut EnvSettings::default())
+    }
+
+    fn read_env(env: &mut EnvSettings) -> Self {
         let d = Self::default();
         Self {
-            mode: std::env::var("HFS_VALIDATION_MODE").unwrap_or(d.mode),
-            meta_profiles: env_bool("HFS_VALIDATION_META_PROFILES", d.meta_profiles),
-            unknown_profile: std::env::var("HFS_VALIDATION_UNKNOWN_PROFILE")
+            mode: env.string("HFS_VALIDATION_MODE").unwrap_or(d.mode),
+            meta_profiles: env.flag("HFS_VALIDATION_META_PROFILES", d.meta_profiles),
+            unknown_profile: env
+                .string("HFS_VALIDATION_UNKNOWN_PROFILE")
                 .unwrap_or(d.unknown_profile),
-            constraints: env_bool("HFS_VALIDATION_CONSTRAINTS", d.constraints),
-            suppress_constraints: std::env::var("HFS_VALIDATION_SUPPRESS_CONSTRAINTS")
+            constraints: env.flag("HFS_VALIDATION_CONSTRAINTS", d.constraints),
+            suppress_constraints: env
+                .string("HFS_VALIDATION_SUPPRESS_CONSTRAINTS")
                 .map(|s| {
                     s.split(',')
                         .map(str::trim)
@@ -577,14 +656,17 @@ impl ValidationConfig {
                         .collect()
                 })
                 .unwrap_or(d.suppress_constraints),
-            terminology: std::env::var("HFS_VALIDATION_TERMINOLOGY").unwrap_or(d.terminology),
-            terminology_timeout_ms: env_u64(
+            terminology: env
+                .string("HFS_VALIDATION_TERMINOLOGY")
+                .unwrap_or(d.terminology),
+            terminology_timeout_ms: env.u64(
                 "HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS",
                 d.terminology_timeout_ms,
             ),
-            terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
+            terminology_fail: env
+                .string("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
-            stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+            stored_profiles: env.flag("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
         }
     }
 
@@ -1135,103 +1217,91 @@ impl BulkSubmitConfig {
     }
 
     /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars,
-    /// taking every unset variable from `d` (see [`Self::defaults_for`]).
+    /// taking every unset variable from `d` (see [`Self::defaults_for`]). A
+    /// value that cannot be read keeps its default;
+    /// [`ServerConfig::try_from_env`] reports it.
     pub fn from_env_with_defaults(d: Self) -> Self {
-        fn env_bool(key: &str, default: bool) -> bool {
-            std::env::var(key)
-                .map(|s| {
-                    let s = s.to_lowercase();
-                    s == "true" || s == "1"
-                })
-                .unwrap_or(default)
-        }
-        fn env_u64(key: &str, default: u64) -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
-        fn env_u32(key: &str, default: u32) -> u32 {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
-        }
+        Self::read_env(&mut EnvSettings::default(), d)
+    }
+
+    fn read_env(env: &mut EnvSettings, d: Self) -> Self {
         Self {
-            enabled: env_bool("HFS_BULK_SUBMIT_ENABLED", d.enabled),
-            output_backend: std::env::var("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
+            enabled: env.flag("HFS_BULK_SUBMIT_ENABLED", d.enabled),
+            output_backend: env
+                .string("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
                 .unwrap_or(d.output_backend),
-            output_dir: std::env::var("HFS_BULK_SUBMIT_OUTPUT_DIR").ok(),
-            s3_bucket: std::env::var("HFS_BULK_SUBMIT_S3_BUCKET").ok(),
-            requires_access_token: std::env::var("HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN")
+            output_dir: env.string("HFS_BULK_SUBMIT_OUTPUT_DIR"),
+            s3_bucket: env.string("HFS_BULK_SUBMIT_S3_BUCKET"),
+            requires_access_token: env
+                .string("HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN")
                 .unwrap_or(d.requires_access_token),
-            file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
-            output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
-            worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
-            file_concurrency: env_u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
-            defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
-            bulk_index_rebuild: env_bool(
-                "HFS_BULK_SUBMIT_BULK_INDEX_REBUILD",
-                d.bulk_index_rebuild,
-            ),
-            reindex_since_margin_secs: env_u64(
+            file_url_ttl_secs: env.u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
+            output_ttl_secs: env.u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
+            worker_concurrency: env.u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            file_concurrency: env.u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
+            defer_indexing: env.flag("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
+            bulk_index_rebuild: env
+                .flag("HFS_BULK_SUBMIT_BULK_INDEX_REBUILD", d.bulk_index_rebuild),
+            reindex_since_margin_secs: env.u64(
                 "HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN",
                 d.reindex_since_margin_secs,
             ),
-            reindex_ids_max: env_u64("HFS_BULK_SUBMIT_REINDEX_IDS_MAX", d.reindex_ids_max),
-            disable_local_worker: env_bool(
+            reindex_ids_max: env.u64("HFS_BULK_SUBMIT_REINDEX_IDS_MAX", d.reindex_ids_max),
+            disable_local_worker: env.flag(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
             ),
-            max_concurrent_per_tenant: env_u32(
+            max_concurrent_per_tenant: env.u32(
                 "HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT",
                 d.max_concurrent_per_tenant,
             ),
-            batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
-            batch_writers: env_u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
-            max_line_bytes: env_u64("HFS_BULK_SUBMIT_MAX_LINE_BYTES", d.max_line_bytes),
-            fetch_read_timeout_secs: env_u64(
+            batch_size: env.u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            batch_writers: env.u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
+            max_line_bytes: env.u64("HFS_BULK_SUBMIT_MAX_LINE_BYTES", d.max_line_bytes),
+            fetch_read_timeout_secs: env.u64(
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
             ),
-            manifest_fetch_timeout_secs: env_u64(
+            manifest_fetch_timeout_secs: env.u64(
                 "HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT",
                 d.manifest_fetch_timeout_secs,
             ),
-            max_attempts: env_u32("HFS_BULK_SUBMIT_MAX_ATTEMPTS", d.max_attempts),
-            max_manifest_bytes: env_u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
-            max_encrypted_file_bytes: env_u64(
+            max_attempts: env.u32("HFS_BULK_SUBMIT_MAX_ATTEMPTS", d.max_attempts),
+            max_manifest_bytes: env.u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
+            max_encrypted_file_bytes: env.u64(
                 "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
                 d.max_encrypted_file_bytes,
             ),
-            skip_unchanged: env_bool("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
-            index_queue: env_u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
-            index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
-            index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
-            index_max_wait_secs: env_u64("HFS_BULK_SUBMIT_INDEX_MAX_WAIT", d.index_max_wait_secs),
-            index_page_bytes: env_u64("HFS_BULK_SUBMIT_INDEX_PAGE_BYTES", d.index_page_bytes),
-            lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
-            heartbeat_interval_secs: env_u64(
+            skip_unchanged: env.flag("HFS_BULK_SUBMIT_SKIP_UNCHANGED", d.skip_unchanged),
+            index_queue: env.u32("HFS_BULK_SUBMIT_INDEX_QUEUE", d.index_queue),
+            index_concurrency: env.u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
+            index_coalesce: env.u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
+            index_max_wait_secs: env.u64("HFS_BULK_SUBMIT_INDEX_MAX_WAIT", d.index_max_wait_secs),
+            index_page_bytes: env.u64("HFS_BULK_SUBMIT_INDEX_PAGE_BYTES", d.index_page_bytes),
+            lease_duration_secs: env.u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
+            heartbeat_interval_secs: env.u64(
                 "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
                 d.heartbeat_interval_secs,
             ),
-            cleanup_interval_secs: env_u64(
-                "HFS_BULK_SUBMIT_CLEANUP_INTERVAL",
-                d.cleanup_interval_secs,
-            ),
-            block_concurrent_submission: env_bool(
+            cleanup_interval_secs: env
+                .u64("HFS_BULK_SUBMIT_CLEANUP_INTERVAL", d.cleanup_interval_secs),
+            block_concurrent_submission: env.flag(
                 "HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION",
                 d.block_concurrent_submission,
             ),
-            client_id: std::env::var("HFS_BULK_SUBMIT_CLIENT_ID").ok(),
-            private_key: std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY").ok(),
-            signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
-            decryption_key: std::env::var("HFS_BULK_SUBMIT_DECRYPTION_KEY")
-                .ok()
+            client_id: env.string("HFS_BULK_SUBMIT_CLIENT_ID"),
+            private_key: env.string("HFS_BULK_SUBMIT_PRIVATE_KEY"),
+            signing_alg: env
+                .string("HFS_BULK_SUBMIT_SIGNING_ALG")
+                .unwrap_or(d.signing_alg),
+            decryption_key: env
+                .string("HFS_BULK_SUBMIT_DECRYPTION_KEY")
                 .filter(|s| !s.trim().is_empty()),
-            outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
+            outbound_scope: env
+                .string("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
-            trusted_providers: std::env::var("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS")
+            trusted_providers: env
+                .string("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS")
                 .map(|s| {
                     s.split(',')
                         .map(str::trim)
@@ -1240,17 +1310,15 @@ impl BulkSubmitConfig {
                         .collect()
                 })
                 .unwrap_or(d.trusted_providers),
-            retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
-            pre_ingest_retry_after_secs: env_u64(
+            retry_after_secs: env.u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
+            pre_ingest_retry_after_secs: env.u64(
                 "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",
                 d.pre_ingest_retry_after_secs,
             ),
-            manifest_page_size: env_u32("HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE", d.manifest_page_size),
-            poll_rate_limit: env_u32("HFS_BULK_SUBMIT_POLL_RATE_LIMIT", d.poll_rate_limit),
-            poll_rate_window_secs: env_u64(
-                "HFS_BULK_SUBMIT_POLL_RATE_WINDOW",
-                d.poll_rate_window_secs,
-            ),
+            manifest_page_size: env.u32("HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE", d.manifest_page_size),
+            poll_rate_limit: env.u32("HFS_BULK_SUBMIT_POLL_RATE_LIMIT", d.poll_rate_limit),
+            poll_rate_window_secs: env
+                .u64("HFS_BULK_SUBMIT_POLL_RATE_WINDOW", d.poll_rate_window_secs),
         }
     }
 
@@ -2298,17 +2366,31 @@ impl ServerConfig {
         Ok((Self::finish_parsed(parsed)?, version_is_implicit))
     }
 
-    fn finish_parsed(mut config: Self) -> Result<Self, clap::Error> {
-        config.multitenancy = MultitenancyConfig::from_env();
-        config.bulk_export = BulkExportConfig::from_env();
-        config.bulk_submit = BulkSubmitConfig::from_env();
-        config.validation = ValidationConfig::from_env();
+    fn finish_parsed(config: Self) -> Result<Self, clap::Error> {
+        Self::finish_parsed_with(config, EnvSettings::default())
+    }
+
+    /// Reads the settings that are not command-line arguments from `env` and
+    /// validates the whole configuration. A setting `env` could not read is
+    /// an error, reported with the validation errors.
+    fn finish_parsed_with(mut config: Self, mut env: EnvSettings) -> Result<Self, clap::Error> {
+        config.multitenancy = MultitenancyConfig::read_env(&mut env);
+        config.bulk_export = BulkExportConfig::read_env(&mut env);
+        config.bulk_submit = BulkSubmitConfig::read_env(&mut env, BulkSubmitConfig::default());
+        config.validation = ValidationConfig::read_env(&mut env);
         config.normalize_public_base_url().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
-        config.validate().map_err(|errors| {
-            clap::Error::raw(clap::error::ErrorKind::ValueValidation, errors.join("\n"))
-        })?;
+        let mut errors = env.into_errors();
+        if let Err(mut invalid) = config.validate() {
+            errors.append(&mut invalid);
+        }
+        if !errors.is_empty() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                errors.join("\n"),
+            ));
+        }
         Ok(config)
     }
 
@@ -3311,6 +3393,59 @@ mod tests {
         let error = dead_tenant_claim_variable(Some("org".into())).expect("refused");
         assert!(error.contains("HFS_JWT_TENANT_CLAIM"), "{error}");
         assert!(error.contains("HFS_AUTH_TENANT_CLAIM"), "{error}");
+    }
+
+    #[test]
+    fn an_unparsable_setting_fails_startup_naming_it_and_its_value() {
+        let env = EnvSettings::from_pairs([
+            ("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", "64MiB"),
+            ("HFS_BULK_EXPORT_WORKER_CONCURRENCY", "1_000"),
+            ("HFS_BULK_SUBMIT_BATCH_SIZE", "4294967296"),
+            ("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS", ""),
+            ("HFS_VALIDATION_CONSTRAINTS", "yes"),
+            ("HFS_TENANT_ROUTING_MODE", "path_only"),
+        ]);
+        let error = ServerConfig::finish_parsed_with(ServerConfig::default(), env)
+            .expect_err("refused")
+            .to_string();
+        for expected in [
+            r#"HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES="64MiB" is not a non-negative integer"#,
+            r#"HFS_BULK_EXPORT_WORKER_CONCURRENCY="1_000" is not an integer from 0 to 4294967295"#,
+            r#"HFS_BULK_SUBMIT_BATCH_SIZE="4294967296" is not an integer from 0 to 4294967295"#,
+            r#"HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS="" is not a non-negative integer"#,
+            r#"HFS_VALIDATION_CONSTRAINTS="yes" is not a boolean (true, false, 1 or 0)"#,
+            r#"HFS_TENANT_ROUTING_MODE="path_only" is not a tenant routing mode"#,
+        ] {
+            assert!(error.contains(expected), "{expected}\nin\n{error}");
+        }
+    }
+
+    #[test]
+    fn set_settings_are_read_and_unset_ones_keep_their_default() {
+        let env = EnvSettings::from_pairs([
+            ("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", "1048576"),
+            ("HFS_BULK_EXPORT_WORKER_CONCURRENCY", "3"),
+            ("HFS_BULK_EXPORT_ENABLED", "0"),
+            ("HFS_VALIDATION_CONSTRAINTS", "FALSE"),
+            ("HFS_TENANT_STRICT_VALIDATION", "True"),
+            ("HFS_TENANT_ROUTING_MODE", "url_path"),
+        ]);
+        let config = ServerConfig::finish_parsed_with(ServerConfig::default(), env)
+            .expect("a valid configuration");
+        assert_eq!(config.bulk_submit.max_manifest_bytes, 1_048_576);
+        assert_eq!(config.bulk_export.worker_concurrency, 3);
+        assert!(!config.bulk_export.enabled);
+        assert!(!config.validation.constraints);
+        assert!(config.multitenancy.strict_validation);
+        assert_eq!(config.multitenancy.routing_mode, TenantRoutingMode::UrlPath);
+        assert_eq!(
+            config.bulk_submit.batch_size,
+            BulkSubmitConfig::default().batch_size
+        );
+        assert_eq!(
+            config.validation.terminology_timeout_ms,
+            ValidationConfig::default().terminology_timeout_ms
+        );
     }
 
     // ── validate() – max_body_size == 0 ───────────────────────────
