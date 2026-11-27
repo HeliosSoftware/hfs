@@ -2278,6 +2278,20 @@ mod tests {
         assert_eq!(strip_enclosing_parens("(a | b).first()"), None);
         assert_eq!(strip_enclosing_parens("(a) | (b)"), None);
         assert_eq!(strip_enclosing_parens("((a) | (b))"), Some("(a) | (b)"));
+        // `(X as T)`, the commonest enclosed form in the spec bundles: it is
+        // stripped, and what is left is not a plain path.
+        assert_eq!(
+            strip_enclosing_parens("(Observation.value as dateTime)"),
+            Some("Observation.value as dateTime")
+        );
+        assert_eq!(
+            kind("(Observation.value as dateTime)", "Observation"),
+            "other"
+        );
+        // Unbalanced input is left alone.
+        assert_eq!(strip_enclosing_parens("((a)"), None);
+        assert_eq!(strip_enclosing_parens("(a))"), None);
+        assert_eq!(strip_enclosing_parens("(a"), None);
         assert_eq!(kind("Patient.birthDate", "Patient"), "other");
         // A choice without an `instant` type is not expanded.
         assert_eq!(kind("Patient.deceased", "Patient"), "other");
