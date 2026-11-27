@@ -1602,7 +1602,7 @@ impl PostgresBackend {
         &self,
         registry: Arc<RwLock<SearchParameterRegistry>>,
     ) -> SearchParameterExtractor {
-        SearchParameterExtractor::new(registry).with_fhir_version(self.config.fhir_version)
+        SearchParameterExtractor::new(registry, self.config.fhir_version)
     }
 
     /// Builds a fresh tenant registry using the caller's guarded transaction.

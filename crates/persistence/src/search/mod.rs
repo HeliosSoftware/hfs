@@ -55,7 +55,7 @@
 //! registry.load_all(&loader).await?;
 //!
 //! // Extract searchable values from a resource
-//! let extractor = SearchParameterExtractor::new(Arc::new(registry));
+//! let extractor = SearchParameterExtractor::new(Arc::new(registry), FhirVersion::R4);
 //! let values = extractor.extract(&patient_json, "Patient")?;
 //!
 //! for value in values {

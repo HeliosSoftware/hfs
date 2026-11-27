@@ -385,22 +385,18 @@ pub struct SearchParameterExtractor {
 }
 
 impl SearchParameterExtractor {
-    /// Creates a new extractor with the given registry, for resources of the
-    /// first enabled FHIR version. A backend indexes with
-    /// [`Self::with_fhir_version`] set to its configured version.
-    pub fn new(registry: Arc<RwLock<SearchParameterRegistry>>) -> Self {
+    /// Creates an extractor over `registry` for resources of `fhir_version`.
+    ///
+    /// The version is required: its element types decide which date values
+    /// are `instant`s, indexed as a point rather than one unit of their
+    /// precision (#2962), and they differ between versions (R6 makes
+    /// `DiagnosticReport.issued` a `dateTime`). A backend passes its
+    /// configured version.
+    pub fn new(registry: Arc<RwLock<SearchParameterRegistry>>, fhir_version: FhirVersion) -> Self {
         Self {
             registry,
-            fhir_version: FhirVersion::default_enabled(),
+            fhir_version,
         }
-    }
-
-    /// The same extractor for resources of `fhir_version`. The version's
-    /// element types decide which date values are `instant`s, indexed as a
-    /// point rather than one unit of their precision (#2962).
-    pub fn with_fhir_version(mut self, fhir_version: FhirVersion) -> Self {
-        self.fhir_version = fhir_version;
-        self
     }
 
     /// Extracts all searchable values from a resource.
@@ -2694,7 +2690,7 @@ mod tests {
             }
         }
 
-        SearchParameterExtractor::new(Arc::new(RwLock::new(registry))).with_fhir_version(version)
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)), version)
     }
 
     /// Same as [`create_test_extractor_for`], but also loads the custom
@@ -2729,7 +2725,7 @@ mod tests {
             }
         }
 
-        SearchParameterExtractor::new(Arc::new(RwLock::new(registry))).with_fhir_version(version)
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)), version)
     }
 
     /// Regression test for the composite `context-type-quantity` and
@@ -3607,7 +3603,7 @@ mod import_profile {
                 let _ = registry.register(p);
             }
         }
-        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)))
+        SearchParameterExtractor::new(Arc::new(RwLock::new(registry)), FhirVersion::R4)
     }
 
     #[test]

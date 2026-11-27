@@ -860,7 +860,10 @@ where
     }
 
     let tenant_registry = provider.search_param_registry(tenant);
-    let extractor = SearchParameterExtractor::new(tenant_registry.clone());
+    // Includes extract `Reference` values only, which do not depend on the
+    // FHIR version; the version decides only which dates are `instant`s.
+    let extractor =
+        SearchParameterExtractor::new(tenant_registry.clone(), FhirVersion::default_enabled());
     let key = |r: &StoredResource| format!("{}/{}", r.resource_type(), r.id());
 
     // Don't re-include primary matches, nor anything the backend already

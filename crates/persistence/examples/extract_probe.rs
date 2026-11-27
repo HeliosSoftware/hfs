@@ -150,7 +150,7 @@ fn timed<F: FnMut()>(rounds: usize, mut f: F) -> (Duration, Duration) {
 fn main() {
     let args = parse_args();
     let registry = build_registry(&args.data_dir);
-    let ex = SearchParameterExtractor::new(registry);
+    let ex = SearchParameterExtractor::new(registry, FhirVersion::R4);
 
     let mut corpus: Vec<(String, Vec<Value>)> = Vec::new();
     for f in &args.files {
