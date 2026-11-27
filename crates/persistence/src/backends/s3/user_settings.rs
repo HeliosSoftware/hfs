@@ -550,7 +550,7 @@ fn lock_failure(user_key: &str, expected: i64, actual: i64) -> StorageError {
 /// authenticated issuer and subject and is therefore personally identifying.
 /// (`OptimisticLockFailure` still carries the user key in its `id`, matching the
 /// SQLite, PostgreSQL, and MongoDB stores, whose `id` is likewise the user key.)
-fn context(operation: &str, err: StorageError) -> StorageError {
+pub(super) fn context(operation: &str, err: StorageError) -> StorageError {
     match err {
         StorageError::Backend(BackendError::Internal {
             backend_name,

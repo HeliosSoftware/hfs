@@ -38,11 +38,13 @@
 //! uses the index only for a tenant whose rows are known complete
 //! (`composite_layout`).
 //!
-//! Generation 7 (#2588) adds `idx_search_date_end`, the date rows ordered by
-//! the end of their range, so a descending date sort over more matches than
-//! the id-set cap reads its rows in sort order. It is partial on `value_date`,
-//! like `idx_search_date_v3`, so rows written before #1391 are in it too, with
-//! a null end.
+//! Generation 7 (#2588, #2601) adds `idx_search_date_end`, the date rows
+//! ordered by the end of their range. A descending date sort over more matches
+//! than the id-set cap reads its rows in sort order, an unfiltered `-date`
+//! sort walks it instead of grouping the parameter, and the date filters
+//! bounded on the range end (`gt`, one arm of `ge`/`ne`) seek on its leading
+//! key. It is partial on `value_date`, like `idx_search_date_v3`, so rows
+//! written before #1391 are in it too, with a null end.
 
 use mongodb::{
     IndexModel,
@@ -243,8 +245,8 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
         // `[value_date, value_date_end)` and a search may bound either end.
         // Partial on `value_date` only, which every date row carries.
         value_v2(SEARCH_DATE_RANGE_INDEX, &["value_date", "value_date_end"]),
-        // Generation 7 (#2588): a descending date sort orders by the range
-        // end. Partial on `value_date`, not on the end, so a row written
+        // Generation 7 (#2588, #2601): a descending date sort and the date
+        // filters bounded on the range end order or seek by it. Partial on `value_date`, not on the end, so a row written
         // before #1391 is a null-end key here rather than absent.
         SearchIndexSpec {
             name: SEARCH_DATE_END_INDEX,

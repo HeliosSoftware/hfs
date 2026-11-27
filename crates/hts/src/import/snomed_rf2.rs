@@ -318,7 +318,7 @@ pub async fn import_snomed_rf2(
     seed.defer_closure = true;
     let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let concept_list: Vec<(String, ConceptTerms)> = concept_terms.into_iter().collect();
     let total = concept_list.len();
@@ -398,7 +398,7 @@ pub async fn import_snomed_rf2(
         parsed.fresh_load = fresh_load;
         parsed.defer_closure = true;
         let chunk_stats = backend.import_parsed(ctx, parsed).await?;
-        stats.errors.extend(chunk_stats.errors);
+        stats.take_errors(chunk_stats);
         stats.concepts += chunk.len() as u32;
 
         eprintln!(
@@ -430,7 +430,7 @@ pub async fn import_snomed_rf2(
             );
             let cm_stats = backend.import_bundle(ctx, &bytes).await?;
             stats.concept_maps += cm_stats.concept_maps;
-            stats.errors.extend(cm_stats.errors);
+            stats.take_errors(cm_stats);
             eprintln!(
                 "[{FORMAT}] imported ConceptMap for refset {refset_id} ({} mappings, equivalence={equivalence})",
                 mappings.len()

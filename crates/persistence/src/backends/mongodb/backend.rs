@@ -77,9 +77,9 @@ pub(crate) async fn connect_client_with_stats(
     let mut client_options = ClientOptions::parse(&config.connection_string)
         .await
         .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
+            StorageError::Backend(BackendError::InvalidConfiguration {
                 backend_name: "mongodb".to_string(),
-                message: e.to_string(),
+                message: format!("the MongoDB connection string could not be parsed: {e}"),
             })
         })?;
 
@@ -1848,8 +1848,12 @@ impl MongoBackend {
             || self.date_end_index_ready()
     }
 
-    /// The new descending-date walk waits for the full current build. Keeping
-    /// this separate prevents the existing-index flag from enabling its hint.
+    /// Every use of `idx_search_date_end` waits for the full current build:
+    /// the descending-date walks (filtered and unfiltered) and the hint on
+    /// date filters bounded on the range end (`gt`; `ge`/`ne` leave the choice
+    /// to the planner). Until then those searches keep their previous plan,
+    /// `idx_search_date_v3` included. Keeping this separate prevents the
+    /// existing-index flag from enabling them.
     pub(super) fn date_end_index_ready(&self) -> bool {
         matches!(
             self.search_index_rx.borrow().as_ref(),

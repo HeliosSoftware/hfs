@@ -3045,16 +3045,23 @@ impl SubmitWorkerStorage for PostgresBackend {
                 return Ok(token);
             }
         }
+        // Two first calls can both read no token. `COALESCE` keeps the token
+        // the first write stored, and `RETURNING` hands it to the second
+        // caller too, so every caller returns the same status URL.
         let token = Uuid::new_v4().to_string();
-        client
-            .execute(
-                "UPDATE bulk_submissions SET poll_token = $1
-                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4",
+        let stored = client
+            .query(
+                "UPDATE bulk_submissions SET poll_token = COALESCE(poll_token, $1)
+                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
+                 RETURNING poll_token",
                 &[&token, &tenant_id, &id.submitter, &id.submission_id],
             )
             .await
             .map_err(|e| internal_error(format!("set poll token: {e}")))?;
-        Ok(token)
+        Ok(stored
+            .first()
+            .and_then(|row| row.get::<_, Option<String>>(0))
+            .unwrap_or(token))
     }
 
     async fn list_expired_submissions(

@@ -57,6 +57,12 @@ impl ChainAccess {
         Self(principal.cloned())
     }
 
+    /// The principal whose grants judge the hops, or `None` when every hop is
+    /// permitted (authentication off).
+    pub fn principal(&self) -> Option<&Principal> {
+        self.0.as_ref()
+    }
+
     /// The guard to hand the chain resolver for a search in `version`, or
     /// `None` when hops are not judged.
     pub fn guard(&self, version: FhirVersion) -> Option<ChainHopAccess<'_>> {
