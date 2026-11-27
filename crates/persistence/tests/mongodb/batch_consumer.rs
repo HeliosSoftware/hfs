@@ -23,11 +23,14 @@
 //! completed `getMore`s of a `batchSize: 4096` cursor on `search_index`.
 //!
 //! The `*_on_a_one_connection_pool` tests run the same cells on a backend
-//! whose pool has a single connection, under a bounded timeout. While the
-//! consumer awaits the cursor's `getMore`, one started batch check is not
-//! polled but holds, or is queued ahead for, the only connection; the
-//! `getMore` then waits forever. Those tests fail with `POOL DEADLOCK` when
-//! that happens, and are `#[ignore]`d until the fix lands.
+//! whose pool has a single connection, under a bounded timeout. Before the
+//! #2233 fix, while the consumer awaited the cursor's `getMore`, one started
+//! batch check was not polled but held, or was queued ahead for, the only
+//! connection, so the `getMore` never got one and the search did not end: a
+//! REST request is dropped by its timeout layer (`HFS_REQUEST_TIMEOUT`, 30 s by
+//! default), other callers wait without bound. The consumer now polls every
+//! started check while it reads; these tests fail with `POOL DEADLOCK` if that
+//! regresses.
 
 use super::*;
 use futures::TryStreamExt;
@@ -625,43 +628,37 @@ async fn mongodb_batch_consumer_missing_true_with_positive_count() {
 }
 
 // ---------------------------------------------------------------------------
-// One-connection pool: deadlocks before the fix (a `POOL DEADLOCK` failure)
+// One-connection pool: hung before the fix; a hang fails as `POOL DEADLOCK`
 // ---------------------------------------------------------------------------
 
 const ONE: Option<u32> = Some(1);
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_count_on_a_one_connection_pool() {
     check(Cell::Count, ONE).await;
 }
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_page_and_count_on_a_one_connection_pool() {
     check(Cell::PageAndCount, ONE).await;
 }
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_bounded_page_on_a_one_connection_pool() {
     check(Cell::BoundedPage, ONE).await;
 }
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_estimated_count_on_a_one_connection_pool() {
     check(Cell::EstimatedCount, ONE).await;
 }
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_estimated_page_and_count_on_a_one_connection_pool() {
     check(Cell::EstimatedPage, ONE).await;
 }
 
 #[tokio::test]
-#[ignore = "#2233: deadlocks on origin/main by design; enabled by the consume_batches pool-deadlock fix commit"]
 async fn mongodb_batch_consumer_missing_true_with_positive_count_on_a_one_connection_pool() {
     check(Cell::MissingCount, ONE).await;
 }
