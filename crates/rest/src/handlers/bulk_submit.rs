@@ -525,6 +525,12 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                 if let (Some(h), Some(v)) =
                     (part_scalar(p, "headerName"), part_scalar(p, "headerValue"))
                 {
+                    if crate::bulk_submit_fetcher::is_refused_file_request_header(&h) {
+                        return Err(bad_request(format!(
+                            "fileRequestHeader '{h}' is not accepted: a header that routes the \
+                             request or frames the transfer is set by the server"
+                        )));
+                    }
                     req.file_request_headers.push((h, v));
                 }
             }
@@ -1803,6 +1809,24 @@ mod tests {
             param("submissionStatus", "valueCoding", json!({"code": "bogus"})),
         ]});
         assert!(parse_submit_request(&body).is_err());
+    }
+
+    #[test]
+    fn test_refuses_a_routing_file_request_header() {
+        for name in ["Host", "range", "Proxy-Authorization"] {
+            let body = json!({"resourceType": "Parameters", "parameter": [
+                param("submitter", "valueIdentifier", json!({"value": "e"})),
+                param("submissionId", "valueString", json!("s")),
+                param("manifestUrl", "valueUrl", json!("https://p/m.json")),
+                param("fhirBaseUrl", "valueUrl", json!("https://p/fhir")),
+                json!({"name": "fileRequestHeader", "part": [
+                    {"name": "headerName", "valueString": name},
+                    {"name": "headerValue", "valueString": "other.internal"}
+                ]}),
+            ]});
+            let error = parse_submit_request(&body).expect_err(name);
+            assert!(error.to_string().contains(name), "{name}: {error}");
+        }
     }
 
     #[test]

@@ -147,11 +147,17 @@ impl AuthProvider for JwksBearerAuthProvider {
         }
 
         // 9. Extract tenant from configured claim. The claim is the tenant
-        // boundary: a present claim of any other type is refused, since
-        // treating it as absent would bind the caller to the default tenant
-        // (`null` is absent).
+        // boundary: a present claim of any other type, or an empty one, is
+        // refused, since treating it as absent would bind the caller to the
+        // default tenant (`null` is absent).
         let tenant_id = match claims.get(&self.tenant_claim) {
             None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(tenant)) if tenant.trim().is_empty() => {
+                return Err(AuthError::ValidationError(format!(
+                    "Tenant claim '{}' must not be empty",
+                    self.tenant_claim
+                )));
+            }
             Some(serde_json::Value::String(tenant)) => Some(tenant.clone()),
             Some(other) => {
                 return Err(AuthError::ValidationError(format!(
@@ -370,7 +376,7 @@ mod tests {
     fn roles_grant_scopes() {
         let scopes = scopes_from_claims(&serde_json::json!({ "roles": ["system/*.cruds"] }));
         assert!(scopes.is_permitted("Patient", SmartPermissions::CREATE));
-        assert!(scopes.has_system_wildcard());
+        assert!(scopes.has_system_scope(SmartPermissions::CREATE));
     }
 
     #[test]

@@ -121,6 +121,10 @@ mod sqlite_elasticsearch {
     const ES_IMAGE: (&str, &str) = ("elasticsearch", "8.15.0");
     const ES_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
     const HFS_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+    /// How long the test waits for an index creation or a refreshed write of
+    /// its own. On a busy runner a node just started can take longer than the
+    /// 30 s of [`http`] to create an index.
+    const ES_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// The warning the startup reconcile logs, once per pass, about indices
     /// whose documents predate `search_params.date.end` (#1391).
@@ -312,6 +316,7 @@ mod sqlite_elasticsearch {
     async fn create_version_1_index(es: &str, index: &str, mapping: &Value, document: Value) {
         let created = http()
             .put(format!("{es}/{index}"))
+            .timeout(ES_WRITE_TIMEOUT)
             .json(&json!({
                 "settings": {
                     "number_of_replicas": 0,
@@ -337,6 +342,7 @@ mod sqlite_elasticsearch {
         );
         let indexed = http()
             .put(format!("{es}/{index}/_doc/{id}?refresh=true"))
+            .timeout(ES_WRITE_TIMEOUT)
             .json(&document)
             .send()
             .await

@@ -3820,6 +3820,7 @@ name = "helios-subscriptions"
 version = "0.2.10"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "dashmap",
  "futures",
@@ -3873,6 +3874,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "similar",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

@@ -163,6 +163,7 @@ async fn binding_token(engine: &SubscriptionEngine) -> String {
     engine
         .ws_token_manager()
         .generate_token(TENANT_ID, SUBSCRIPTION_ID)
+        .expect("a binding token is issued")
         .0
 }
 

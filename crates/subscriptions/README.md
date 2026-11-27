@@ -415,6 +415,8 @@ The WebSocket protocol is **unidirectional** (server → client) after binding. 
 
 **Incoming message size:** the server reads only the bind message, so a client message or frame larger than 4 KiB is refused and the connection is closed with `1009 message-too-big`. Notifications the server sends are not limited by this.
 
+**Limits per subscription:** at most 16 clients are bound at a time; a further bind is closed with `1008 too-many-clients` until one disconnects. At most 16 binding tokens are outstanding (issued, unused, unexpired); a further `$get-ws-binding-token` answers `429` with `Retry-After` set to the token lifetime. Each notification is serialized once and every bound client's queue shares those bytes, so the memory a notification holds does not grow with the number of clients.
+
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 
 **Subscription deletion:** Deleting the `Subscription` resource closes all connected WebSocket clients for that subscription.
