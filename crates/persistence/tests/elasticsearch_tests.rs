@@ -2944,18 +2944,22 @@ mod es_integration {
                 .await
                 .unwrap_or_else(|e| panic!("[{label}] create through composite: {e}"));
 
-            // The asynchronous worker indexes behind the write; poll for it.
+            // The asynchronous worker indexes behind the write: wait until it
+            // has written everything queued (a no-op without a worker). As
+            // long as an index creation may queue on the shared node.
+            let drain = composite
+                .drain_sync_queue(std::time::Duration::from_millis(
+                    SHARED_NODE_REQUEST_TIMEOUT_MS,
+                ))
+                .await;
+            assert!(
+                drain.drained,
+                "[{label}] the sync queue did not reach Elasticsearch in time ({} recorded for reindex)",
+                drain.recorded
+            );
             let by_name = param_query("Patient", &[("family", Str, "Baddate")]);
-            let mut found = std::collections::BTreeSet::new();
-            for _ in 0..50 {
-                found = found_ids(&composite, &tenant, &by_name).await;
-                if !found.is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
             assert_eq!(
-                found,
+                found_ids(&composite, &tenant, &by_name).await,
                 std::collections::BTreeSet::from(["bad-birthdate".to_string()]),
                 "[{label}] a resource with one bad date must stay searchable"
             );
@@ -5812,9 +5816,12 @@ mod es_integration {
     /// `create_many` is one `_bulk` request per batch, so under
     /// `refresh=wait_for` a batch pays one refresh wait — not one per
     /// document. With a 5s refresh interval, 40 per-document writes would
-    /// take over three minutes; the batch must finish in a few seconds. This
-    /// is the shape of the startup conformance seed that stalled the
-    /// sqlite-elasticsearch server past its readiness timeout.
+    /// take over three minutes; the batch finishes in a few seconds. The
+    /// bound is 60s, not tighter: a loaded CI runner has taken 20s for the
+    /// batch path (#2961), and 60s still sits far below the ~200s that one
+    /// wait per document costs. This is the shape of the startup conformance
+    /// seed that stalled the sqlite-elasticsearch server past its readiness
+    /// timeout.
     #[tokio::test]
     async fn es_integration_create_many_pays_one_refresh_wait_per_batch() {
         use helios_persistence::core::SearchProvider;
@@ -5848,7 +5855,7 @@ mod es_integration {
             assert_eq!(stored.version_id(), "1");
         }
         assert!(
-            elapsed < std::time::Duration::from_secs(20),
+            elapsed < std::time::Duration::from_secs(60),
             "40 resources under wait_for with a 5s refresh interval took {elapsed:?}; \
              a batch must not pay one refresh wait per document"
         );

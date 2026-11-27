@@ -160,6 +160,29 @@ async fn absent_or_null_tenant_claim_leaves_the_principal_claimless() {
     assert_eq!(principal.tenant_id(), None);
 }
 
+/// A tenant claim that is present but empty names no tenant and is refused
+/// the same way: an IdP mapper such as `user.tenant || ''` must not land every
+/// unassigned user in the default tenant.
+#[tokio::test]
+async fn token_with_an_empty_tenant_claim_is_rejected() {
+    for value in ["", "   "] {
+        let mut claims = valid_claims();
+        claims["tenant_id"] = json!(value);
+        let err = authenticate(&claims)
+            .await
+            .expect_err(&format!("tenant_id = {value:?} must be rejected"));
+        match err {
+            helios_auth::AuthError::ValidationError(message) => {
+                assert!(
+                    message.contains("tenant_id") && message.contains("empty"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+}
+
 /// A tenant claim that is present with a non-string type is refused, not
 /// read as absent: absent means the default tenant, and a token that names a
 /// tenant the parser cannot read must not land there.

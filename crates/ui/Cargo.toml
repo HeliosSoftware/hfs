@@ -181,6 +181,9 @@ http-body-util = "0.1"
 # A real SQLite-backed store so the tenant-maintenance page tests exercise the
 # actual registry read/write path (the `sqlite` feature is test-only).
 helios-persistence = { path = "../persistence", version = "0.2.10", default-features = false, features = ["R4", "sqlite"] }
+# A file-backed SQLite store per tenants test, in a directory removed on drop
+# (#3030: in-memory SQLite is shared-cache and fails table-lock conflicts).
+tempfile = "3"
 # Seed a FHIR resource in tests so a data-only (unregistered) tenant appears.
 helios-fhir = { path = "../fhir", version = "0.2.10", default-features = false, features = ["R4"] }
 serde_json = "1"

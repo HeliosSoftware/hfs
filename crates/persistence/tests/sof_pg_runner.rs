@@ -30,6 +30,10 @@ mod sof_prefix_matrix;
 #[path = "common/sof_pr410_views.rs"]
 mod sof_pr410_views;
 
+#[cfg(feature = "R4")]
+#[path = "common/sof_native_sql.rs"]
+mod sof_native_sql;
+
 mod sof_pg_runner_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -151,6 +155,131 @@ mod sof_pg_runner_tests {
                 .await
                 .expect("Failed to create PostgresBackend"),
         )
+    }
+
+    /// #2902 profile: what a selective SQL Query over a large view costs when
+    /// the view must first be read out in full (the least the embedded engine
+    /// does per request, before it inserts and queries the rows) against the
+    /// same query run inside PostgreSQL.
+    ///
+    /// `cargo test -p helios-persistence --features postgres,sqlite --test sof_pg_runner \
+    ///  native_sql_profile -- --ignored --nocapture`, rows via
+    /// `HFS_TEST_NATIVE_SQL_PROFILE_ROWS` (default 50000).
+    #[cfg(feature = "R4")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "profile; needs Docker and takes minutes"]
+    async fn native_sql_profile() {
+        use helios_persistence::core::sof_runner::{
+            NativeRelation, NativeRelationSource, NativeSqlQuery,
+        };
+        use std::time::{Duration, Instant};
+
+        let rows: usize = std::env::var("HFS_TEST_NATIVE_SQL_PROFILE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000);
+        let backend = create_backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new(format!("native-profile-{}", uuid::Uuid::new_v4())),
+            TenantPermissions::full_access(),
+        );
+        let seeded = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for worker in 0..8usize {
+            let backend = Arc::clone(&backend);
+            let tenant = tenant.clone();
+            tasks.spawn(async move {
+                for i in (worker..rows).step_by(8) {
+                    // One observation in 200 is a body height.
+                    let code = if i % 200 == 0 { "8302-2" } else { "8867-4" };
+                    backend
+                        .create(
+                            &tenant,
+                            "Observation",
+                            json!({"resourceType": "Observation", "id": format!("o{i}"),
+                                "status": "final",
+                                "subject": {"reference": format!("Patient/p{}", i % 1000)},
+                                "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                                "valueQuantity": {"value": 100 + (i % 90), "unit": "cm"}}),
+                            FhirVersion::R4,
+                        )
+                        .await
+                        .expect("seed observation");
+                }
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.expect("seed worker");
+        }
+        println!("seeded {rows} observations in {:?}", seeded.elapsed());
+
+        let view = json!({
+            "resourceType": "ViewDefinition", "name": "observation_flat",
+            "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "patient_id", "path": "subject.getReferenceKey(Patient)", "type": "string"},
+                {"name": "code", "path": "code.coding.first().code", "type": "code"},
+                {"name": "value", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        });
+        let runner = backend.sof_runner().expect("runner");
+        let sql = "SELECT patient_id, max(value) AS height FROM obs \
+                   WHERE code = '8302-2' AND value > 150 GROUP BY patient_id";
+        for round in 0..3 {
+            let start = Instant::now();
+            let mut stream = runner
+                .run_view(&tenant, view.clone(), ViewFilters::default())
+                .await
+                .expect("run view");
+            let mut read = 0usize;
+            while let Some(row) = stream.next().await {
+                row.expect("row");
+                read += 1;
+            }
+            let materialize = start.elapsed();
+
+            let start = Instant::now();
+            let result = runner
+                .run_sql_query(
+                    &tenant,
+                    NativeSqlQuery {
+                        relations: vec![NativeRelation {
+                            name: "__sof_node_0".to_string(),
+                            display: "observation_flat".to_string(),
+                            labels: vec!["obs".to_string()],
+                            source: NativeRelationSource::View(view.clone()),
+                        }],
+                        sql: sql.to_string(),
+                        bindings: Vec::new(),
+                        filters: ViewFilters::default(),
+                        max_rows: 100_000,
+                        timeout: Duration::from_secs(300),
+                    },
+                )
+                .await
+                .expect("native query");
+            println!(
+                "round {round}: read the whole view ({read} rows): {materialize:?}; \
+                 query in PostgreSQL ({} rows): {:?}",
+                result.rows.len(),
+                start.elapsed()
+            );
+        }
+    }
+
+    /// #2902: a SQL Query Library runs inside the primary PostgreSQL database.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn sql_queries_run_in_the_primary_database() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("runner");
+        assert_eq!(
+            runner.native_sql_dialect(),
+            Some(helios_sof::sqlquery::NativeDialect::Postgres)
+        );
+        let prefix = format!("native-{}", uuid::Uuid::new_v4());
+        super::sof_native_sql::run_suite(backend.as_ref(), runner, &prefix).await;
     }
 
     #[cfg(all(feature = "R4", feature = "R5"))]

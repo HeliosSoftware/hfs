@@ -202,7 +202,7 @@ where
                 0,
                 patient_ref.as_deref(),
                 "8",
-                Some(&e.to_string()),
+                Some(&e.client_text()),
             )
             .await;
             Err(RestError::from(e))
@@ -265,7 +265,7 @@ where
                 0,
                 None,
                 "8",
-                Some(&e.to_string()),
+                Some(&e.client_text()),
             )
             .await;
             Err(RestError::from(e))

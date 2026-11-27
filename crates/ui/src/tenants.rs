@@ -480,7 +480,7 @@ async fn load_registry(storage: &Arc<dyn ResourceStorage>) -> Result<Vec<TenantR
     storage
         .list_tenants()
         .await
-        .map_err(|e| format!("Failed to list tenants: {e}"))
+        .map_err(|e| format!("Failed to list tenants: {}", e.client_text()))
 }
 
 /// The inventory's current snapshot for this app, without awaiting storage
@@ -1030,7 +1030,7 @@ pub async fn create(
     match storage.get_tenant(&id).await {
         Ok(Some(_)) => return load(Some(format!("Tenant '{id}' already exists."))).await,
         Ok(None) => {}
-        Err(e) => return load(Some(e.to_string())).await,
+        Err(e) => return load(Some(e.client_text())).await,
     }
 
     // Claim the id under one lock so a double submit cannot race the check
@@ -1111,7 +1111,7 @@ pub async fn create(
                     job_id.clone(),
                     Provisioning::Failed {
                         display_name: job_name,
-                        message: e.to_string(),
+                        message: e.client_text(),
                     },
                 );
             }

@@ -17,7 +17,8 @@
 //!   system-context scope (`system/*.r`) via
 //!   [`crate::middleware::auth::admin_authz_middleware`], so an ordinary
 //!   user-/patient-context token — even one with a broad wildcard — cannot read
-//!   the tenant roster or server-wide traffic.
+//!   the tenant roster or server-wide traffic. A token that carries a tenant
+//!   claim is refused there too, whatever its scopes.
 //!
 //! All three are merged into the application by `build_app` in `crate::lib`.
 

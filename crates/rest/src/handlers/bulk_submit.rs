@@ -272,9 +272,91 @@ fn not_owned(sub_id: &SubmissionId) -> RestError {
 // Status-poll rate limiting
 // ---------------------------------------------------------------------------
 
+/// Most buckets one status-poll limiter holds. A bucket is a few hundred bytes
+/// at the default limit, so a full map stays in the tens of megabytes; past it
+/// a new client or token is refused for a window rather than added.
+const POLL_LIMITER_MAX_KEYS: usize = 100_000;
+
 /// Buckets for the status-poll surface. Private to this module, so a hammering
 /// poller cannot spend another surface's budget.
-static POLL_LIMITER: RateLimiter = RateLimiter::new();
+static POLL_LIMITER: RateLimiter = RateLimiter::with_max_keys(POLL_LIMITER_MAX_KEYS);
+
+/// One bucket per client (principal, else peer address), charged for each poll
+/// that answers `404`: a token that resolves to nothing, or to a submission the
+/// client may not see. The per-token limit cannot stop a client that invents a
+/// new token per request, since each one starts a fresh bucket; this one is
+/// shared by all of a client's tokens and is checked before the lookup, so once
+/// it is spent the made-up tokens cost a `429` and no job-store work. Polls of
+/// a client's own submissions never charge it.
+static POLL_MISS_LIMITER: RateLimiter = RateLimiter::with_max_keys(POLL_LIMITER_MAX_KEYS);
+
+/// The client a poll miss is billed to: the principal, else the peer address.
+/// `None` with neither: there is no client to tell apart, and one bucket for
+/// every anonymous caller would let a few misses throttle all of them.
+fn poll_client_key(principal: Option<&Principal>, peer: Option<IpAddr>) -> Option<String> {
+    match principal {
+        Some(p) => Some(format!("sub:{}", p.subject)),
+        None => peer.map(|ip| format!("ip:{ip}")),
+    }
+}
+
+fn poll_miss_rejection(cfg: &BulkSubmitConfig, retry_after_secs: u64) -> RestError {
+    RestError::TooManyRequests {
+        message: format!(
+            "too many status polls of unknown submissions (max {} per {}s); honour the \
+             Retry-After header",
+            cfg.poll_rate_limit, cfg.poll_rate_window_secs
+        ),
+        retry_after_secs: Some(retry_after_secs),
+    }
+}
+
+/// Refuses a poll from a client that has spent its budget of `404`s, before
+/// any per-token bucket or lookup. Spends nothing.
+fn check_poll_miss_ceiling(
+    cfg: &BulkSubmitConfig,
+    principal: Option<&Principal>,
+    peer: Option<IpAddr>,
+) -> RestResult<()> {
+    let Some(client) = poll_client_key(principal, peer) else {
+        return Ok(());
+    };
+    if cfg.poll_rate_limit == 0 {
+        return Ok(());
+    }
+    POLL_MISS_LIMITER
+        .peek_window(
+            &client,
+            cfg.poll_rate_limit,
+            Duration::from_secs(cfg.poll_rate_window_secs),
+        )
+        .map_err(|limited| poll_miss_rejection(cfg, limited.retry_after_secs))
+}
+
+/// The `404` of a poll that found no submission the client may see, charged to
+/// the client's miss budget.
+fn poll_miss(
+    cfg: &BulkSubmitConfig,
+    principal: Option<&Principal>,
+    peer: Option<IpAddr>,
+    token: &str,
+) -> RestError {
+    if cfg.poll_rate_limit > 0
+        && let Some(client) = poll_client_key(principal, peer)
+    {
+        // Already over the ceiling only when another miss raced this one past
+        // the check; the answer is a 404 either way.
+        let _ = POLL_MISS_LIMITER.check_window(
+            &client,
+            cfg.poll_rate_limit,
+            Duration::from_secs(cfg.poll_rate_window_secs),
+        );
+    }
+    RestError::NotFound {
+        resource_type: "bulk-submit-status".to_string(),
+        id: token.to_string(),
+    }
+}
 
 /// Who a poll is billed to: the poll token scopes the bucket to one submission,
 /// and the principal (else the peer address) separates clients sharing it. A
@@ -525,6 +607,12 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
                 if let (Some(h), Some(v)) =
                     (part_scalar(p, "headerName"), part_scalar(p, "headerValue"))
                 {
+                    if crate::bulk_submit_fetcher::is_refused_file_request_header(&h) {
+                        return Err(bad_request(format!(
+                            "fileRequestHeader '{h}' is not accepted: a header that routes the \
+                             request or frames the transfer is set by the server"
+                        )));
+                    }
                     req.file_request_headers.push((h, v));
                 }
             }
@@ -972,34 +1060,27 @@ where
     check_submit_scope(principal.as_ref())?;
 
     // Throttle before any job-store work: a client ignoring the advertised
-    // Retry-After should cost a cheap 429, not a round trip per poll.
+    // Retry-After should cost a cheap 429, not a round trip per poll, and so
+    // should a client that has run through its budget of unknown tokens.
     let peer = peer
         .map(|ip| crate::extractors::rate_limit_peer(ip, state.config().rate_limit_ipv6_prefix));
+    check_poll_miss_ceiling(cfg, principal.as_ref(), peer)?;
     check_poll_rate_limit(cfg, &token, principal.as_ref(), peer)?;
 
-    let target = jobs
+    let Some(target) = jobs
         .resolve_poll_token(&token)
         .await
         .map_err(RestError::from)?
-        .ok_or_else(|| RestError::NotFound {
-            resource_type: "bulk-submit-status".to_string(),
-            id: token.clone(),
-        })?;
+    else {
+        return Err(poll_miss(cfg, principal.as_ref(), peer, &token));
+    };
     if !owns_submission(
         principal.as_ref(),
         target.owner_subject.as_deref(),
         SmartPermissions::READ,
-    ) {
-        return Err(RestError::NotFound {
-            resource_type: "bulk-submit-status".to_string(),
-            id: token.clone(),
-        });
-    }
-    if target.tenant.tenant_id().as_str() != tenant.tenant_id() {
-        return Err(RestError::NotFound {
-            resource_type: "bulk-submit-status".to_string(),
-            id: token.clone(),
-        });
+    ) || target.tenant.tenant_id().as_str() != tenant.tenant_id()
+    {
+        return Err(poll_miss(cfg, principal.as_ref(), peer, &token));
     }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
@@ -1808,6 +1889,24 @@ mod tests {
     }
 
     #[test]
+    fn test_refuses_a_routing_file_request_header() {
+        for name in ["Host", "range", "Proxy-Authorization"] {
+            let body = json!({"resourceType": "Parameters", "parameter": [
+                param("submitter", "valueIdentifier", json!({"value": "e"})),
+                param("submissionId", "valueString", json!("s")),
+                param("manifestUrl", "valueUrl", json!("https://p/m.json")),
+                param("fhirBaseUrl", "valueUrl", json!("https://p/fhir")),
+                json!({"name": "fileRequestHeader", "part": [
+                    {"name": "headerName", "valueString": name},
+                    {"name": "headerValue", "valueString": "other.internal"}
+                ]}),
+            ]});
+            let error = parse_submit_request(&body).expect_err(name);
+            assert!(error.to_string().contains(name), "{name}: {error}");
+        }
+    }
+
+    #[test]
     fn test_parses_structured_parts() {
         let body = json!({"resourceType": "Parameters", "parameter": [
             param("submitter", "valueIdentifier", json!({"value": "e"})),
@@ -2043,6 +2142,42 @@ mod tests {
             poll_rate_limit_key("11111111-1111-4111-8111-111111111111", None, peer),
             poll_rate_limit_key("22222222-2222-4222-8222-222222222222", None, peer)
         );
+    }
+
+    /// A client that keeps polling tokens which resolve to nothing is refused
+    /// once its misses reach the poll limit, before any lookup, whatever token
+    /// it invents next; another client is unaffected, and a caller with
+    /// neither a principal nor a peer address is never billed (#2680).
+    #[test]
+    fn invented_poll_tokens_spend_one_budget_per_client() {
+        let cfg = BulkSubmitConfig {
+            poll_rate_limit: 3,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        };
+        let peer: Option<IpAddr> = Some("198.51.100.26".parse().unwrap());
+        for i in 0..3 {
+            check_poll_miss_ceiling(&cfg, None, peer).expect("misses left");
+            assert!(matches!(
+                poll_miss(&cfg, None, peer, &format!("made-up-{i}")),
+                RestError::NotFound { .. }
+            ));
+        }
+        assert!(matches!(
+            check_poll_miss_ceiling(&cfg, None, peer),
+            Err(RestError::TooManyRequests {
+                retry_after_secs: Some(1..=60),
+                ..
+            })
+        ));
+
+        let other: Option<IpAddr> = Some("198.51.100.27".parse().unwrap());
+        check_poll_miss_ceiling(&cfg, None, other).expect("another client has its own budget");
+
+        for i in 0..5 {
+            let _ = poll_miss(&cfg, None, None, &format!("anonymous-{i}"));
+        }
+        check_poll_miss_ceiling(&cfg, None, None).expect("no client identity, no shared bucket");
     }
 
     #[test]

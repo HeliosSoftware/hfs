@@ -294,3 +294,93 @@ async fn an_unrestricted_caller_is_unchanged() {
     );
     assert_eq!(observation_count(&server).await, 1);
 }
+
+/// `system/*.cruds` seeds an Observation coded `8867-4` about `patient`.
+async fn seed_observation(server: &TestServer, id: &str, patient: &str) {
+    let response = server
+        .put(&format!("/Observation/{id}"))
+        .add_header(AUTHORIZATION, bearer(SYSTEM))
+        .json(&json!({
+            "resourceType": "Observation",
+            "id": id,
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+            "subject": {"reference": format!("Patient/{patient}")}
+        }))
+        .await;
+    assert!(
+        response.status_code().is_success(),
+        "seed Observation/{id}: {}",
+        response.text()
+    );
+}
+
+/// #2674: a `_has` or chained parameter in the reference searches a second
+/// type. A token that may search Patients but not Observations cannot learn,
+/// through `Patient?_has:Observation…`, whether a patient has an Observation
+/// with a given code: the hop is refused as `GET /Patient?_has:…` refuses it.
+#[tokio::test]
+async fn a_chain_or_has_hop_needs_a_search_grant_on_the_type_it_searches() {
+    let server = server();
+    seed_patient(&server, "p1", "12345").await;
+    seed_observation(&server, "o1", "p1").await;
+    let before = observation_count(&server).await;
+
+    for reference in [
+        "Patient?_has:Observation:subject:code=8867-4&identifier=https://example.org/mrn|12345",
+        "Patient?_has:Observation:subject:code=0000-0&identifier=https://example.org/mrn|12345",
+        "Patient?organization.name=Acme",
+    ] {
+        let response = post_transaction(&server, OBS_CREATE_PATIENT_SEARCH, reference).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
+            "{reference}: {}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("chained or _has search through"),
+            "{reference}: {}",
+            response.text()
+        );
+    }
+    assert_eq!(
+        observation_count(&server).await,
+        before,
+        "nothing was written"
+    );
+}
+
+#[tokio::test]
+async fn an_unrestricted_caller_resolves_a_has_reference() {
+    let server = server();
+    seed_patient(&server, "p1", "12345").await;
+    seed_patient(&server, "p2", "67890").await;
+    seed_observation(&server, "o1", "p1").await;
+
+    let response = post_transaction(
+        &server,
+        SYSTEM,
+        "Patient?_has:Observation:subject:code=8867-4",
+    )
+    .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    let location = response.json::<Value>()["entry"][0]["response"]["location"]
+        .as_str()
+        .expect("the created Observation's location")
+        .split("/_history")
+        .next()
+        .unwrap()
+        .to_string();
+    let created: Value = server
+        .get(&format!("/{location}"))
+        .add_header(AUTHORIZATION, bearer(SYSTEM))
+        .await
+        .json();
+    assert_eq!(created["subject"]["reference"], "Patient/p1", "{created}");
+}

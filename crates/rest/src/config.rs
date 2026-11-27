@@ -1938,12 +1938,15 @@ pub struct ServerConfig {
     pub sof_sqlquery_max_rows: usize,
 
     /// Maximum rows materialized per depends-on dependency (a ViewDefinition
-    /// or a nested SQL View) by `$sql-run` and `$sql-export`.
+    /// or a nested SQL View) by `$sql-run` and `$sql-export`, on the backends
+    /// that have no SQL engine (MongoDB, S3).
     ///
-    /// Each dependency is materialized in full before the query's own `WHERE`
-    /// runs, so a dependency that produces more rows than this fails the
-    /// request with a `422` naming the dependency. Narrow it with a
-    /// ViewDefinition `where`, or raise this limit.
+    /// There each dependency is materialized in full before the query's own
+    /// `WHERE` runs, so a dependency that produces more rows than this fails
+    /// the request with a `422` naming the dependency. Narrow it with a
+    /// ViewDefinition `where`, or raise this limit. SQLite and PostgreSQL run
+    /// the query inside the primary database and materialize nothing, so the
+    /// limit is not used there.
     #[arg(
         long,
         env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
@@ -1961,8 +1964,9 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
-    /// Hard timeout (seconds) for each SQL statement a SQL Query runs — its
-    /// own SQL and each SQL View's — in `$sql-run` and `$sql-export` alike.
+    /// Hard timeout (seconds) for a SQL Query in `$sql-run` and `$sql-export`
+    /// alike: the one statement it is on SQLite and PostgreSQL, or each
+    /// statement it runs (its own SQL and each SQL View's) on MongoDB and S3.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 
