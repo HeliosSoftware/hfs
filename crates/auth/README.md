@@ -115,7 +115,7 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS fetches triggered by an unknown `kid`, counted from the attempt whether it succeeded or failed; lookups arriving during a fetch wait for it |
+| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS fetches triggered by an unknown `kid`, counted from the attempt whether it succeeded or failed; lookups arriving during a fetch wait for it. At least `1`. Also the floor of the background refresh: a failing identity provider is retried with exponential backoff from this floor up to an hour, and the last good keys are served meanwhile |
 
 ### SMART Discovery Endpoint
 

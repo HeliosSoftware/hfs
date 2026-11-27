@@ -417,15 +417,16 @@ struct TimedCommand<'a> {
 }
 
 impl SearchCommand for TimedCommand<'_> {
-    fn search_deadline(self) -> StorageResult<Self> {
+    fn search_deadline_at(self, _site: search_deadline::CallSite) -> StorageResult<Self> {
         let budget = search_deadline::ProbeBudget::new(Duration::from_secs(60))?;
         self.seen.borrow_mut().push(budget.duration());
         Ok(self)
     }
 
-    fn search_probe_deadline(
+    fn search_probe_deadline_at(
         self,
         probe: Duration,
+        _site: search_deadline::CallSite,
     ) -> StorageResult<(Self, search_deadline::ProbeBudget)> {
         let budget = search_deadline::ProbeBudget::new(probe)?;
         self.seen.borrow_mut().push(budget.duration());
