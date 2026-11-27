@@ -1112,7 +1112,8 @@ where
     // of authentication. `admin_authz_middleware` requires a `system/*` scope
     // carrying the bit the method implies (`r` to look, `c` for POST, `d` for
     // DELETE), rejecting ordinary user-/patient-context tokens (even wildcard
-    // ones) with `403`. As with the other tiers, when auth is disabled
+    // ones) with `403`. A token that carries a tenant claim is rejected `403`
+    // whatever its scopes: it is bound to one tenant. As with the other tiers, when auth is disabled
     // server-wide there is no Principal and the middleware passes through,
     // keeping dev-mode behaviour. Tenant-maintenance API (`/admin/tenants`)
     // rides the same cross-tenant admin tier as `console/metrics/tenants`:

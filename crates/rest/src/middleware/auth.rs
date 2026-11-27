@@ -410,6 +410,11 @@ fn patient_compartment_path_check(
 /// to look, `system/*.c` to register a tenant, `system/*.d` to deregister or
 /// purge one. Anything less is rejected `403`.
 ///
+/// A token that carries a tenant claim is rejected `403` on every method,
+/// whatever its scopes: the claim confines it to one tenant on the FHIR routes,
+/// so it is not a cross-tenant administrator (#2673). Only a token without a
+/// tenant claim reaches the scope check.
+///
 /// Consistent with [`authz_middleware`], if no [`Principal`] is present (auth
 /// disabled server-wide, or an exempt path) the request passes through, so this
 /// tier stays open in the same dev-mode configurations as every other route.
@@ -427,6 +432,35 @@ pub async fn admin_authz_middleware(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
     let (permission, letter) = admin_tier_permission(&method);
+
+    // A token bound to a tenant by its claim is not a cross-tenant
+    // administrator, whatever scopes it holds: the FHIR routes confine it to
+    // its own tenant, and this tier lists, registers and purges every tenant.
+    // The test is the tenant extractor's: only an empty claim counts as no
+    // claim. A blank or unparseable one is refused on the FHIR routes, so it
+    // is refused here too rather than read as a system token.
+    if let Some(tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
+        warn!(
+            sub = %principal.subject(),
+            tenant = %tenant,
+            method = %method,
+            path = %path,
+            "Console admin authorization denied: token is bound to a tenant"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!(
+                "Forbidden: console admin access to {method} {path} refused for a token bound to tenant {tenant}"
+            ))
+            .principal(&principal)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        return forbidden_response(
+            "A token bound to a tenant cannot use the cross-tenant admin API; use a \
+             system-level token that carries no tenant claim",
+        );
+    }
 
     if principal.scopes.has_system_scope(permission) {
         debug!(
