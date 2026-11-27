@@ -14555,12 +14555,17 @@ mod bulk_submit {
         }
 
         /// Waits until this configuration has matched `additional` commands.
+        ///
+        /// The limit only stops a hung test; it is not a latency check. Callers
+        /// wait for hit after hit of a failpoint that holds each one for up to
+        /// 10 s, with backend work between hits, and a loaded CI runner
+        /// stretched one such gap past the former 10 s limit (#3029).
         pub(super) async fn wait_until_entered(&self, additional: i64) {
             self.admin
                 .run_command(doc! {
                     "waitForFailPoint": "failCommand",
                     "timesEntered": self.initial_count + additional,
-                    "maxTimeMS": 10_000_i64,
+                    "maxTimeMS": 60_000_i64,
                 })
                 .await
                 .expect("waitForFailPoint failCommand");
