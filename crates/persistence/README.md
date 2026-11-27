@@ -3000,6 +3000,13 @@ and resolves every Quantity-typed parameter from the search-parameter registry
 custom ones); a builder without a registry falls back to the spec's quantity
 names.
 
+SQLite bounds a `_filter`. A search is refused with `400` when one expression
+is longer than 64 KiB, nests `( … )` groups deeper than 32, or holds more than
+256 comparisons, and when the `_filter` expressions of the search hold more
+than 256 comparisons together (a value is split at unescaped commas, and the
+parameter can repeat). The limits are `MAX_FILTER_LEN`, `MAX_FILTER_DEPTH` and
+`MAX_FILTER_COMPARISONS` in `backends/sqlite/search/filter_parser.rs`.
+
 **Upgrading from a build before #2602.** Each backend gains a high bound on the
 quantity row (SQLite schema 49 and PostgreSQL schema 56 migrate and backfill
 `high = value`; MongoDB backfills at startup under search index generation 8, in

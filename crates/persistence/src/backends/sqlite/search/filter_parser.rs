@@ -133,6 +133,19 @@ pub enum FilterExpr {
     Not(Box<FilterExpr>),
 }
 
+impl FilterExpr {
+    /// The number of comparisons in the expression.
+    pub fn comparison_count(&self) -> usize {
+        match self {
+            FilterExpr::Comparison { .. } => 1,
+            FilterExpr::Logical { left, right, .. } => {
+                left.comparison_count() + right.comparison_count()
+            }
+            FilterExpr::Not(inner) => inner.comparison_count(),
+        }
+    }
+}
+
 /// Filter parsing error.
 #[derive(Debug, Clone)]
 pub struct FilterParseError {
@@ -140,6 +153,10 @@ pub struct FilterParseError {
     pub message: String,
     /// Byte offset within the input where the failure was detected.
     pub position: usize,
+    /// Whether the expression was refused for passing [`MAX_FILTER_LEN`],
+    /// [`MAX_FILTER_DEPTH`] or [`MAX_FILTER_COMPARISONS`], rather than for its
+    /// syntax.
+    pub limit_exceeded: bool,
 }
 
 impl std::fmt::Display for FilterParseError {
@@ -164,6 +181,10 @@ pub const MAX_FILTER_DEPTH: usize = 32;
 /// `or` builds a tree as deep as it is long, which SQL generation walks
 /// recursively, and each comparison adds bind parameters to the statement.
 pub const MAX_FILTER_COMPARISONS: usize = 256;
+
+/// Most characters of the input an error message repeats. The message is
+/// logged, and the input is the client's.
+const MAX_ERROR_ECHO_CHARS: usize = 64;
 
 /// Parser for FHIR _filter expressions.
 pub struct FilterParser<'a> {
@@ -194,6 +215,7 @@ impl<'a> FilterParser<'a> {
     pub fn parse(input: &str) -> Result<FilterExpr, FilterParseError> {
         if input.len() > MAX_FILTER_LEN {
             return Err(FilterParseError {
+                limit_exceeded: true,
                 message: format!("expression exceeds the maximum length of {MAX_FILTER_LEN} bytes"),
                 position: MAX_FILTER_LEN,
             });
@@ -203,9 +225,13 @@ impl<'a> FilterParser<'a> {
         parser.skip_whitespace();
         if parser.pos < parser.input.len() {
             return Err(FilterParseError {
+                limit_exceeded: false,
                 message: format!(
                     "Unexpected characters after expression: '{}'",
-                    &parser.input[parser.pos..]
+                    parser.input[parser.pos..]
+                        .chars()
+                        .take(MAX_ERROR_ECHO_CHARS)
+                        .collect::<String>()
                 ),
                 position: parser.pos,
             });
@@ -322,6 +348,7 @@ impl<'a> FilterParser<'a> {
         if self.peek() == Some('(') {
             if self.depth >= MAX_FILTER_DEPTH {
                 return Err(FilterParseError {
+                    limit_exceeded: true,
                     message: format!("nesting is deeper than the maximum of {MAX_FILTER_DEPTH}"),
                     position: self.pos,
                 });
@@ -333,6 +360,7 @@ impl<'a> FilterParser<'a> {
             self.skip_whitespace();
             if self.peek() != Some(')') {
                 return Err(FilterParseError {
+                    limit_exceeded: false,
                     message: "Expected closing parenthesis".to_string(),
                     position: self.pos,
                 });
@@ -350,6 +378,7 @@ impl<'a> FilterParser<'a> {
         self.comparisons += 1;
         if self.comparisons > MAX_FILTER_COMPARISONS {
             return Err(FilterParseError {
+                limit_exceeded: true,
                 message: format!(
                     "expression has more than the maximum of {MAX_FILTER_COMPARISONS} comparisons"
                 ),
@@ -361,6 +390,7 @@ impl<'a> FilterParser<'a> {
         let param = self.parse_identifier()?;
         if param.is_empty() {
             return Err(FilterParseError {
+                limit_exceeded: false,
                 message: "Expected parameter name".to_string(),
                 position: self.pos,
             });
@@ -410,6 +440,7 @@ impl<'a> FilterParser<'a> {
         }
 
         FilterOp::parse(&op_str).ok_or_else(|| FilterParseError {
+            limit_exceeded: false,
             message: format!("Unknown operator: '{}'", op_str),
             position: start,
         })
@@ -459,6 +490,7 @@ impl<'a> FilterParser<'a> {
                 }
                 None => {
                     return Err(FilterParseError {
+                        limit_exceeded: false,
                         message: "Unterminated string".to_string(),
                         position: self.pos,
                     });
@@ -488,6 +520,7 @@ impl<'a> FilterParser<'a> {
         let value = self.input[start..self.pos].to_string();
         if value.is_empty() {
             return Err(FilterParseError {
+                limit_exceeded: false,
                 message: "Expected value".to_string(),
                 position: self.pos,
             });
@@ -963,6 +996,31 @@ mod tests {
         assert!(FilterParser::parse(&value(MAX_FILTER_LEN - 8)).is_ok());
         let e = FilterParser::parse(&value(MAX_FILTER_LEN - 7)).unwrap_err();
         assert!(e.message.contains("maximum length"), "{e}");
+    }
+
+    #[test]
+    fn only_a_limit_error_is_marked_as_one() {
+        let chain = vec!["name eq x"; MAX_FILTER_COMPARISONS + 1].join(" or ");
+        let long = format!("name eq {}", "x".repeat(MAX_FILTER_LEN));
+        for refused in [nested(MAX_FILTER_DEPTH + 1), chain, long] {
+            assert!(FilterParser::parse(&refused).unwrap_err().limit_exceeded);
+        }
+        for malformed in ["name zz x", "(name eq x", "name eq", "name eq x )"] {
+            assert!(!FilterParser::parse(malformed).unwrap_err().limit_exceeded);
+        }
+    }
+
+    #[test]
+    fn an_error_repeats_only_a_prefix_of_the_input() {
+        let e = FilterParser::parse(&format!("name eq x ) {}", "A".repeat(10_000))).unwrap_err();
+        assert!(e.message.starts_with("Unexpected characters"), "{e}");
+        assert!(e.message.chars().count() < 200, "{}", e.message.len());
+    }
+
+    #[test]
+    fn comparisons_are_counted_through_groups_and_negation() {
+        let expr = FilterParser::parse("(a eq 1 or b eq 2) and not (c eq 3)").unwrap();
+        assert_eq!(expr.comparison_count(), 3);
     }
 
     #[test]

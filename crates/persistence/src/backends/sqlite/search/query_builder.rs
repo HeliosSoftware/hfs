@@ -566,6 +566,50 @@ fn unevaluable_parameter(param: &SearchParameter, resource_type: &str) -> Search
     }
 }
 
+/// Refuses a search whose `_filter` expressions pass a limit of
+/// [`super::filter_parser`].
+///
+/// The parser bounds one expression. A search can carry many: REST splits a
+/// `_filter` value at commas and the parameter can repeat, and each piece is
+/// parsed on its own. So the comparisons are also counted over the whole
+/// search, against the same [`MAX_FILTER_COMPARISONS`]. An expression that
+/// does not parse counts as one comparison, since it still adds a condition.
+///
+/// A malformed expression is not refused here: `build_filter_condition` turns
+/// it into a condition that matches nothing.
+///
+/// [`MAX_FILTER_COMPARISONS`]: super::filter_parser::MAX_FILTER_COMPARISONS
+fn check_filter_limits(query: &SearchQuery) -> Result<(), SearchError> {
+    use super::filter_parser::{FilterParser, MAX_FILTER_COMPARISONS};
+
+    let mut comparisons = 0usize;
+    let expressions = query
+        .parameters
+        .iter()
+        .filter(|param| param.name == "_filter")
+        .flat_map(|param| &param.values);
+    for value in expressions {
+        comparisons += match FilterParser::parse(&value.value) {
+            Ok(expr) => expr.comparison_count(),
+            Err(e) if e.limit_exceeded => {
+                return Err(SearchError::QueryParseError {
+                    message: format!("_filter: {}", e.message),
+                });
+            }
+            Err(_) => 1,
+        };
+        if comparisons > MAX_FILTER_COMPARISONS {
+            return Err(SearchError::QueryParseError {
+                message: format!(
+                    "_filter: the search has more than the maximum of \
+                     {MAX_FILTER_COMPARISONS} comparisons across its _filter expressions"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Builds SQL queries from FHIR search parameters.
 pub struct QueryBuilder {
     /// The tenant ID for the query.
@@ -658,6 +702,8 @@ impl QueryBuilder {
     /// Patient?_query=x` into "delete every Patient". A parameter with no values
     /// asks for nothing and constrains nothing.
     pub fn build(&self, query: &SearchQuery) -> Result<SqlFragment, SearchError> {
+        check_filter_limits(query)?;
+
         let mut conditions = Vec::new();
 
         // Base conditions: tenant and resource type
@@ -2283,6 +2329,88 @@ mod tests {
         let fragment = builder.build(&query).unwrap();
 
         assert!(fragment.sql.contains("param_name = 'name'"));
+    }
+
+    fn filter_query(expressions: Vec<Vec<String>>) -> SearchQuery {
+        let mut query = SearchQuery::new("Patient");
+        for values in expressions {
+            query.parameters.push(SearchParameter {
+                name: "_filter".to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: values.into_iter().map(SearchValue::eq).collect(),
+                chain: vec![],
+                components: vec![],
+            });
+        }
+        query
+    }
+
+    fn filter_refusal(query: &SearchQuery) -> String {
+        match QueryBuilder::new("t", "Patient").build(query) {
+            Err(SearchError::QueryParseError { message }) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// An expression past a parser limit refuses the search and names the
+    /// limit; a malformed one still matches nothing.
+    #[test]
+    fn a_filter_past_a_limit_refuses_the_search() {
+        use super::super::filter_parser::{MAX_FILTER_COMPARISONS, MAX_FILTER_DEPTH};
+
+        let chain = |n: usize| vec!["name eq x"; n].join(" or ");
+        let nested = format!(
+            "{}name eq x{}",
+            "(".repeat(MAX_FILTER_DEPTH + 1),
+            ")".repeat(MAX_FILTER_DEPTH + 1)
+        );
+        let builder = QueryBuilder::new("t", "Patient");
+
+        let at_limit = filter_query(vec![vec![chain(MAX_FILTER_COMPARISONS)]]);
+        assert!(builder.build(&at_limit).is_ok());
+
+        let message = filter_refusal(&filter_query(vec![vec![chain(MAX_FILTER_COMPARISONS + 1)]]));
+        assert!(
+            message.contains("more than the maximum of 256"),
+            "{message}"
+        );
+        let message = filter_refusal(&filter_query(vec![vec![nested]]));
+        assert!(message.contains("nesting is deeper"), "{message}");
+
+        let malformed = filter_query(vec![vec!["name zz x".to_string()]]);
+        let sql = builder.build(&malformed).unwrap().sql;
+        assert!(sql.contains("1 = 0"), "{sql}");
+    }
+
+    /// The comparison limit holds over every `_filter` expression of the
+    /// search: the comma-separated pieces of one value and repeated parameters.
+    #[test]
+    fn filter_comparisons_are_counted_across_the_search() {
+        use super::super::filter_parser::MAX_FILTER_COMPARISONS;
+
+        let half = vec!["name eq x"; MAX_FILTER_COMPARISONS / 2].join(" or ");
+        let one = "name eq x".to_string();
+        let builder = QueryBuilder::new("t", "Patient");
+
+        let at_limit = filter_query(vec![vec![half.clone(), half.clone()]]);
+        assert!(builder.build(&at_limit).is_ok());
+
+        for over in [
+            filter_query(vec![vec![half.clone(), half.clone(), one.clone()]]),
+            filter_query(vec![vec![half.clone()], vec![half.clone()], vec![one]]),
+            // Expressions that do not parse count too: each adds a condition.
+            filter_query(vec![vec![
+                "name zz x".to_string();
+                MAX_FILTER_COMPARISONS + 1
+            ]]),
+        ] {
+            let message = filter_refusal(&over);
+            assert!(
+                message.contains("across its _filter expressions"),
+                "{message}"
+            );
+        }
     }
 
     fn date_param(
