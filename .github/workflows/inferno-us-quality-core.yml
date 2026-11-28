@@ -335,10 +335,15 @@ jobs:
 
           docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
 
+          # Wait for a *writable* primary, not just rs.status().myState == 1:
+          # a freshly elected member reports PRIMARY while it is still in
+          # drain mode and refuses writes with NotWritablePrimary (10107).
+          # HFS creates its indexes at startup and exits on that error, which
+          # failed the mongodb leg of run 46106982853 within 2s of "ready".
           echo "Waiting for MongoDB replica set primary..."
           for i in {1..60}; do
-            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
-            if [ "$PRIMARY_STATE" = "1" ]; then
+            WRITABLE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { db.hello().isWritablePrimary } catch (e) { false }' | tr -d '\r\n ')
+            if [ "$WRITABLE" = "true" ]; then
               MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
               echo "MongoDB replica set is ready on port $MONGO_PORT"
               echo "MONGO_PORT=$MONGO_PORT" >> $GITHUB_ENV
@@ -461,8 +466,11 @@ jobs:
           # resource types each create their index on first write, and the
           # entries sync one after another. That is ~10s on a quiet Docker
           # host and 14-30s+ when another workflow shares it, which answered
-          # 408 at the 30s default and failed the load step. 120s leaves room
-          # for a busy host; the plain-database legs keep the default.
+          # 408 at the 30s default and failed the load step. 120s was not
+          # enough either: with two HFS CI runs and the HTS IG conformance run
+          # on the host, every ES leg of run 46106982853 hit it (the same
+          # binary loads the bundle in 11s locally). 300s leaves room for a
+          # busy host; the plain-database legs keep the default.
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
@@ -470,7 +478,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
-            HFS_REQUEST_TIMEOUT=120 \
+            HFS_REQUEST_TIMEOUT=300 \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -493,7 +501,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
-            HFS_REQUEST_TIMEOUT=120 \
+            HFS_REQUEST_TIMEOUT=300 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
             MONGO_HOST="$DOCKER_HOST_IP"
@@ -512,7 +520,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
-            HFS_REQUEST_TIMEOUT=120 \
+            HFS_REQUEST_TIMEOUT=300 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -524,7 +532,7 @@ jobs:
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
             HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
-            HFS_REQUEST_TIMEOUT=120 \
+            HFS_REQUEST_TIMEOUT=300 \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -535,8 +543,13 @@ jobs:
 
       - name: Wait for HFS to be ready
         run: |
+          # Startup seeds the 1372 spec SearchParameters into storage. On
+          # PostgreSQL with search indexing that is ~44s on an idle machine and
+          # took 50s in the last green run, so a 60s budget fell over as soon
+          # as the Docker host was busy (run 46106982853). Allow 180s; a dead
+          # process still fails fast through the kill -0 check below.
           echo "Waiting for HFS to start..."
-          for i in {1..30}; do
+          for i in {1..90}; do
             # Check if the HFS process is still alive
             if ! kill -0 $HFS_PID 2>/dev/null; then
               echo "HFS process ($HFS_PID) has exited!"
@@ -549,7 +562,7 @@ jobs:
               echo "HFS is ready"
               exit 0
             fi
-            echo "Attempt $i/30: HFS not ready yet..."
+            echo "Attempt $i/90: HFS not ready yet..."
             sleep 2
           done
           echo "HFS failed to start (process still running but not responding)"
