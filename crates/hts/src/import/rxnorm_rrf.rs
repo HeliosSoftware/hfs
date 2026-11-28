@@ -25,7 +25,7 @@ use crate::import::bundle_builder::{
 // ── RxNorm constants ──────────────────────────────────────────────────────────
 
 pub(crate) const RXNORM_URL: &str = "http://www.nlm.nih.gov/research/umls/rxnorm";
-const RXNORM_ID: &str = "rxnorm";
+pub(crate) const RXNORM_ID: &str = "rxnorm";
 const RXNORM_NAME: &str = "RxNorm";
 const RXNORM_TITLE: &str = "RxNorm — NLM Drug Terminology";
 

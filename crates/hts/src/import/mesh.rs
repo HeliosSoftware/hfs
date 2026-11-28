@@ -24,7 +24,7 @@ use crate::import::bundle_builder::{
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const MESH_URL: &str = "http://www.nlm.nih.gov/mesh";
-const MESH_ID: &str = "mesh";
+pub(crate) const MESH_ID: &str = "mesh";
 const MESH_NAME: &str = "MeSH";
 const MESH_TITLE: &str = "Medical Subject Headings (MeSH)";
 

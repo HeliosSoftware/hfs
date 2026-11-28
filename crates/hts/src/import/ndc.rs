@@ -23,7 +23,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const NDC_URL: &str = "http://hl7.org/fhir/sid/ndc";
-const NDC_ID: &str = "ndc";
+pub(crate) const NDC_ID: &str = "ndc";
 const NDC_NAME: &str = "NDC";
 const NDC_TITLE: &str = "NDC (National Drug Code Directory)";
 const NDC_VERSION: &str = "current";

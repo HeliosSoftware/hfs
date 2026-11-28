@@ -42,7 +42,7 @@ use crate::import::bundle_builder::{
 // ── LOINC constants ───────────────────────────────────────────────────────────
 
 pub(crate) const LOINC_URL: &str = "http://loinc.org";
-const LOINC_ID: &str = "loinc";
+pub(crate) const LOINC_ID: &str = "loinc";
 const LOINC_NAME: &str = "LOINC";
 const LOINC_TITLE: &str = "Logical Observation Identifiers Names and Codes (LOINC)";
 

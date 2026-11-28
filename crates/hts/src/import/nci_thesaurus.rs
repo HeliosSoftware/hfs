@@ -24,7 +24,7 @@ use crate::import::bundle_builder::{
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const NCI_URL: &str = "http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl";
-const NCI_ID: &str = "nci-thesaurus";
+pub(crate) const NCI_ID: &str = "nci-thesaurus";
 const NCI_NAME: &str = "NCIt";
 const NCI_TITLE: &str = "NCI Thesaurus (NCIt)";
 

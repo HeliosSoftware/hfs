@@ -28,7 +28,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const DICOM_URL: &str = "http://dicom.nema.org/resources/ontology/DCM";
-const DICOM_ID: &str = "dicom";
+pub(crate) const DICOM_ID: &str = "dicom";
 const DICOM_NAME: &str = "DCM";
 const DICOM_TITLE: &str = "DICOM Controlled Terminology";
 const ROOT_CODE: &str = "DCM";

@@ -39,24 +39,26 @@ pub mod snomed_rf2;
 pub mod tgz;
 pub mod ucum;
 
-/// The canonical URLs of the CodeSystems the native importers load from their
-/// publisher's own distribution, and so own: rows they write are ranked
-/// [`bundle_parser::AUTHORITY_OWNER`] (see
-/// [`BundleImportBackend::import_native_bundle`]). The HL7 v2 tables importer
+/// The CodeSystems the native importers load from their publisher's own
+/// distribution, and so own, as `(canonical URL, importer id)`: rows they
+/// write are ranked [`bundle_parser::AUTHORITY_OWNER`] (see
+/// [`BundleImportBackend::import_native_bundle`]). The id tells an importer's
+/// row from another source's row at the same URL (`hl7.fhir.r4.core` ships a
+/// copy of DICOM as `dicom-dcim`, for instance). The HL7 v2 tables importer
 /// is not listed: its URLs sit under `http://terminology.hl7.org`, which the
 /// THO package owns.
-pub(crate) const NATIVE_OWNED_SYSTEMS: [&str; 11] = [
-    snomed_rf2::SNOMED_URL,
-    loinc_csv::LOINC_URL,
-    rxnorm_rrf::RXNORM_URL,
-    ucum::UCUM_URL,
-    icd10_cm::ICD10CM_URL,
-    icd9_cm::ICD9CM_URL,
-    ndc::NDC_URL,
-    mesh::MESH_URL,
-    nci_thesaurus::NCI_URL,
-    nucc::NUCC_URL,
-    dicom::DICOM_URL,
+pub(crate) const NATIVE_OWNED_SYSTEMS: [(&str, &str); 11] = [
+    (snomed_rf2::SNOMED_URL, snomed_rf2::SNOMED_ID),
+    (loinc_csv::LOINC_URL, loinc_csv::LOINC_ID),
+    (rxnorm_rrf::RXNORM_URL, rxnorm_rrf::RXNORM_ID),
+    (ucum::UCUM_URL, ucum::UCUM_ID),
+    (icd10_cm::ICD10CM_URL, icd10_cm::ICD10CM_ID),
+    (icd9_cm::ICD9CM_URL, icd9_cm::ICD9CM_ID),
+    (ndc::NDC_URL, ndc::NDC_ID),
+    (mesh::MESH_URL, mesh::MESH_ID),
+    (nci_thesaurus::NCI_URL, nci_thesaurus::NCI_ID),
+    (nucc::NUCC_URL, nucc::NUCC_ID),
+    (dicom::DICOM_URL, dicom::DICOM_ID),
 ];
 
 use async_trait::async_trait;
