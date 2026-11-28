@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::HtsError;
 use crate::traits::ConceptMapOperations;
@@ -437,32 +437,14 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
             None => continue, // Unknown system; skip silently.
         };
 
-        // For each code that has descendants in the input set, build an element.
-        let mut elements: Vec<serde_json::Value> = Vec::new();
-
-        for ancestor_code in codes {
-            let mut targets: Vec<serde_json::Value> = Vec::new();
-
-            for descendant_code in codes {
-                if ancestor_code == descendant_code {
-                    continue;
-                }
-
-                if is_ancestor_of(conn, &system_id, ancestor_code, descendant_code)? {
-                    targets.push(json!({
-                        "code": descendant_code,
-                        "equivalence": "subsumes"
-                    }));
-                }
-            }
-
-            if !targets.is_empty() {
-                elements.push(json!({
-                    "code": ancestor_code,
-                    "target": targets
-                }));
-            }
+        // One ancestor walk per distinct input code, then pair them in memory.
+        let codes = crate::backends::closure::distinct_codes(codes);
+        let wanted: HashSet<&str> = codes.iter().copied().collect();
+        let mut ancestors = Vec::with_capacity(codes.len());
+        for code in &codes {
+            ancestors.push(input_ancestors(conn, &system_id, code, &wanted)?);
         }
+        let elements = crate::backends::closure::closure_elements(&codes, &ancestors);
 
         if !elements.is_empty() {
             groups.push(json!({
@@ -487,48 +469,61 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     })
 }
 
-/// Returns `true` if `ancestor_code` is a (possibly transitive) ancestor of
-/// `descendant_code` in the given code system.
+/// The ancestor walk of [`input_ancestors`].
 ///
-/// Uses a recursive CTE that walks *up* from `descendant_code`, collecting
-/// all ancestor codes, then checks whether `ancestor_code` appears in the set.
-fn is_ancestor_of(
+/// The join order and the index are spelled out because the planner's own
+/// choice depends on statistics a code system imported into a running server
+/// does not have: it then reads every hierarchy row of the system for each
+/// ancestor found. `CROSS JOIN` keeps the recursion row on the outside and
+/// `INDEXED BY` makes each step a lookup by child code; either alone leaves
+/// the scan.
+const INPUT_ANCESTORS_SQL: &str = "
+    WITH RECURSIVE ancestors(code) AS (
+        SELECT parent_code
+        FROM concept_hierarchy INDEXED BY idx_hierarchy_child
+        WHERE system_id = ?1 AND child_code = ?2
+        UNION
+        SELECT ch.parent_code
+        FROM ancestors a
+        CROSS JOIN concept_hierarchy ch INDEXED BY idx_hierarchy_child
+        WHERE ch.system_id = ?1 AND ch.child_code = a.code
+    )
+    SELECT code FROM ancestors
+";
+
+/// The (possibly transitive) ancestors of `code` in the given code system
+/// that are among `wanted`.
+///
+/// One recursive CTE walks *up* from `code`; `UNION` stops it at a cycle.
+fn input_ancestors(
     conn: &Connection,
     system_id: &str,
-    ancestor_code: &str,
-    descendant_code: &str,
-) -> Result<bool, HtsError> {
-    let sql = "
-        WITH RECURSIVE ancestors(code) AS (
-            SELECT parent_code
-            FROM concept_hierarchy
-            WHERE system_id = ?1 AND child_code = ?2
-            UNION
-            SELECT ch.parent_code
-            FROM concept_hierarchy ch
-            INNER JOIN ancestors a ON ch.child_code = a.code
-            WHERE ch.system_id = ?1
-        )
-        SELECT 1 FROM ancestors WHERE code = ?3
-        LIMIT 1
-    ";
-
-    let found: Option<i32> = conn
-        .query_row(
-            sql,
-            rusqlite::params![system_id, descendant_code, ancestor_code],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
-
-    Ok(found.is_some())
+    code: &str,
+    wanted: &HashSet<&str>,
+) -> Result<HashSet<String>, HtsError> {
+    let sql = INPUT_ANCESTORS_SQL;
+    let db = |e: rusqlite::Error| HtsError::StorageError(format!("DB error: {e}"));
+    let mut stmt = conn.prepare_cached(sql).map_err(db)?;
+    let rows = stmt
+        .query_map(rusqlite::params![system_id, code], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(db)?;
+    let mut found = HashSet::new();
+    for row in rows {
+        let ancestor = row.map_err(db)?;
+        if wanted.contains(ancestor.as_str()) {
+            found.insert(ancestor);
+        }
+    }
+    Ok(found)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use super::INPUT_ANCESTORS_SQL;
     use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::traits::ConceptMapOperations;
     use crate::types::{ClosureRequest, CodingConcept, TranslateRequest};
@@ -811,6 +806,40 @@ mod tests {
         assert_eq!(resp.name, "my-closure");
         let cm = resp.concept_map.unwrap();
         assert_eq!(cm["group"].as_array().unwrap().len(), 0);
+    }
+
+    /// Without planner statistics (a system imported since startup), both
+    /// steps of the ancestor walk still look hierarchy rows up by child code
+    /// rather than reading every row of the system.
+    #[test]
+    fn closure_ancestor_walk_seeks_by_child_code_without_statistics() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        seed_db(&backend);
+        let conn = backend.pool().get().unwrap();
+        let has_stats: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_stats, "the plan is checked without statistics");
+
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {INPUT_ANCESTORS_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params!["cs-src", "C"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let seeks = plan
+            .iter()
+            .filter(|step| {
+                step.contains("USING INDEX idx_hierarchy_child (system_id=? AND child_code=?)")
+            })
+            .count();
+        assert_eq!(seeks, 2, "{plan:#?}");
     }
 
     #[tokio::test]

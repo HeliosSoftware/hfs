@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use helios_persistence::tenant::TenantContext;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::HtsError;
@@ -164,31 +164,14 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
                 None => continue,
             };
 
-            let mut elements: Vec<serde_json::Value> = Vec::new();
-
-            for ancestor_code in codes {
-                let mut targets: Vec<serde_json::Value> = Vec::new();
-
-                for descendant_code in codes {
-                    if ancestor_code == descendant_code {
-                        continue;
-                    }
-
-                    if is_ancestor_of(&client, &system_id, ancestor_code, descendant_code).await? {
-                        targets.push(json!({
-                            "code": descendant_code,
-                            "equivalence": "subsumes"
-                        }));
-                    }
-                }
-
-                if !targets.is_empty() {
-                    elements.push(json!({
-                        "code": ancestor_code,
-                        "target": targets
-                    }));
-                }
+            // One ancestor walk per distinct input code, then pair them in memory.
+            let codes = crate::backends::closure::distinct_codes(codes);
+            let wanted: HashSet<&str> = codes.iter().copied().collect();
+            let mut ancestors = Vec::with_capacity(codes.len());
+            for code in &codes {
+                ancestors.push(input_ancestors(&client, &system_id, code, &wanted).await?);
             }
+            let elements = crate::backends::closure::closure_elements(&codes, &ancestors);
 
             if !elements.is_empty() {
                 groups.push(json!({
@@ -391,14 +374,14 @@ async fn query_translate_elements(
         .collect())
 }
 
-/// Returns `true` if `ancestor_code` is a (possibly transitive) ancestor of
-/// `descendant_code` in the given code system.
-async fn is_ancestor_of(
+/// The (possibly transitive) ancestors of `code` in the given code system
+/// that are among `wanted`.
+async fn input_ancestors(
     client: &tokio_postgres::Client,
     system_id: &str,
-    ancestor_code: &str,
-    descendant_code: &str,
-) -> Result<bool, HtsError> {
+    code: &str,
+    wanted: &HashSet<&str>,
+) -> Result<HashSet<String>, HtsError> {
     let rows = client
         .query(
             "WITH RECURSIVE ancestors(code) AS (
@@ -411,12 +394,15 @@ async fn is_ancestor_of(
                 INNER JOIN ancestors a ON ch.child_code = a.code
                 WHERE ch.system_id = $1
             )
-            SELECT 1 FROM ancestors WHERE code = $3
-            LIMIT 1",
-            &[&system_id, &descendant_code, &ancestor_code],
+            SELECT code FROM ancestors",
+            &[&system_id, &code],
         )
         .await
         .map_err(|e| HtsError::StorageError(format!("DB error: {}", error_chain(&e))))?;
 
-    Ok(!rows.is_empty())
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|ancestor| wanted.contains(ancestor.as_str()))
+        .collect())
 }

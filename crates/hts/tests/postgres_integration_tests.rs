@@ -2005,6 +2005,73 @@ async fn closure_unrelated_codes_produce_no_pairs() {
     );
 }
 
+/// A -> B -> C plus an unrelated D: every ancestor lists its descendants among
+/// the input codes, in input order, and a code sent twice is paired once.
+#[tokio::test]
+async fn closure_three_level_hierarchy_pairs_each_code_once() {
+    let backend = fresh_backend().await;
+    let (base, uid) = test_ctx!("cl-hier");
+    let system = format!("{base}cs");
+
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": {
+            "resourceType": "CodeSystem", "id": format!("cs-{uid}"),
+            "url": system, "name": "CLHier",
+            "status": "active", "content": "complete",
+            "hierarchyMeaning": "is-a",
+            "concept": [
+                {"code": "A", "display": "A", "concept": [
+                    {"code": "B", "display": "B", "concept": [
+                        {"code": "C", "display": "C"}
+                    ]}
+                ]},
+                {"code": "D", "display": "D"}
+            ]
+        }}]
+    });
+    backend
+        .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+        .await
+        .unwrap();
+
+    let coding = |code: &str| CodingConcept {
+        system: system.clone(),
+        code: code.into(),
+        display: None,
+    };
+    let resp = ConceptMapOperations::closure(
+        &backend,
+        &ctx(),
+        ClosureRequest {
+            name: "hierarchy-closure".into(),
+            // C first and twice; "nope" is not in the system.
+            concept: ["C", "A", "D", "B", "C", "nope"].map(coding).into(),
+            version: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let concept_map = resp.concept_map.unwrap();
+    assert_eq!(
+        concept_map["group"],
+        serde_json::json!([{
+            "source": system,
+            "target": system,
+            "element": [
+                {"code": "A", "target": [
+                    {"code": "C", "equivalence": "subsumes"},
+                    {"code": "B", "equivalence": "subsumes"}
+                ]},
+                {"code": "B", "target": [
+                    {"code": "C", "equivalence": "subsumes"}
+                ]}
+            ]
+        }])
+    );
+}
+
 #[tokio::test]
 async fn closure_unknown_system_skipped() {
     let backend = fresh_backend().await;

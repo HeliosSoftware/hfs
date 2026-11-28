@@ -29,7 +29,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 | `$subsumes` | [CodeSystem/$subsumes](https://hl7.org/fhir/codesystem-operation-subsumes.html) | Test concept hierarchy (subsumes / subsumed-by / equivalent / not-subsumed) via recursive CTE - no runtime graph traversal |
 | `$expand` | [ValueSet/$expand](https://hl7.org/fhir/valueset-operation-expand.html) | Expand a ValueSet with lazy evaluation and materialized cache (computed once, cached across requests) |
 | `$translate` | [ConceptMap/$translate](https://hl7.org/fhir/conceptmap-operation-translate.html) | Translate a code using a ConceptMap |
-| `$closure` | [ConceptMap/$closure](https://hl7.org/fhir/conceptmap-operation-closure.html) | Compute transitive closure over a concept hierarchy and ConceptMap mappings |
+| `$closure` | [ConceptMap/$closure](https://hl7.org/fhir/conceptmap-operation-closure.html) | Compute transitive closure over a concept hierarchy and ConceptMap mappings; at most 1000 `concept` parameters per request (more is 422 `too-costly`) |
 
 - [CRUD and search](https://hl7.org/fhir/http.html) for CodeSystem, ValueSet, and ConceptMap resources
 - [Batch](https://hl7.org/fhir/http.html#transaction) endpoint supporting `$validate-code` and `$translate` in a single request
