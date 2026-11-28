@@ -17,11 +17,6 @@ use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
-/// Handler for the `$status` operation on Subscription resources.
-///
-/// Returns a `SubscriptionStatus` (R4B/R5/R6) or `Parameters` (R4 backport)
-/// resource reflecting the subscription's current runtime state.
-///
 /// The three Subscription operations are mounted under a wildcard
 /// `/{resource_type}/{id}/$op` route, and the authorization middleware judges
 /// the scope on that first segment. They exist on `Subscription` only: any
@@ -39,6 +34,11 @@ fn require_subscription_route(resource_type: &str, id: &str) -> RestResult<()> {
     }
 }
 
+/// Handler for the `$status` operation on Subscription resources.
+///
+/// Returns a `SubscriptionStatus` (R4B/R5/R6) or `Parameters` (R4 backport)
+/// resource reflecting the subscription's current runtime state.
+///
 /// # HTTP Request
 ///
 /// `GET [base]/Subscription/{id}/$status`
