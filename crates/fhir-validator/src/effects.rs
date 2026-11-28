@@ -106,8 +106,12 @@ pub enum ConstraintOutcome {
     Passed,
     Failed,
     /// The expression could not be evaluated (parse error, non-boolean
-    /// result, typed-model mismatch); surfaced as a warning issue.
+    /// result, evaluation error); surfaced as a warning issue.
     NotEvaluable(String),
+    /// The resource itself could not be loaded for evaluation, so no
+    /// constraint ran. Surfaced once, as an error: a resource whose
+    /// invariants were never checked must not pass as valid.
+    ResourceNotLoaded(String),
 }
 
 /// Evaluates FHIRPath invariants against a resource. Implementations parse
@@ -208,8 +212,25 @@ fn execute_constraints(
     let outcomes = evaluator.evaluate_all(resource, version, &refs);
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
 
+    // The resource could not be loaded: one error for the resource in place
+    // of a warning per constraint. Failing closed here does not depend on the
+    // structural walk having reported whatever the evaluator tripped over.
+    if let Some(detail) = outcomes.iter().find_map(|o| match o {
+        ConstraintOutcome::ResourceNotLoaded(detail) => Some(detail),
+        _ => None,
+    }) {
+        let root = selected[0].0.split('.').next().unwrap_or_default();
+        errors.push(ValidationError::new(
+            ErrorKind::FhirpathConstraint,
+            root.to_string(),
+            messages::constraints_not_run(detail),
+        ));
+        return;
+    }
+
     for ((path, id, _, human, severity), outcome) in selected.iter().zip(outcomes) {
         match outcome {
+            ConstraintOutcome::ResourceNotLoaded(_) => {}
             ConstraintOutcome::Passed => {}
             ConstraintOutcome::Failed => {
                 errors.push(

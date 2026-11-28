@@ -187,6 +187,39 @@ async fn constraint_failure_shapes_and_severities() {
     assert_eq!(errors[1].severity, Severity::Warning);
 }
 
+/// A resource the evaluator could not load is one error, not a warning per
+/// constraint: nothing was checked, so it must not pass as valid.
+#[tokio::test]
+async fn a_resource_the_evaluator_cannot_load_is_an_error() {
+    let evaluator = ScriptedConstraints {
+        outcome: |_| ConstraintOutcome::ResourceNotLoaded("does not parse: boom".to_string()),
+        seen: Mutex::new(Vec::new()),
+    };
+    let handlers = EffectHandlers {
+        constraints: Some(&evaluator),
+        ..Default::default()
+    };
+    let resource = json!({ "resourceType": "Patient" });
+    let errors = validator()
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
+        .await;
+
+    assert_eq!(
+        serde_json::to_value(&errors).unwrap(),
+        json!([{
+            "type": "fhirpath-constraint",
+            "path": "Patient",
+            "message": "FHIRPath constraints were not evaluated: does not parse: boom"
+        }])
+    );
+    assert_eq!(errors[0].severity, Severity::Error);
+}
+
 #[tokio::test]
 async fn constraints_suppressed_and_not_evaluable() {
     let evaluator = ScriptedConstraints {

@@ -250,6 +250,24 @@ pub(crate) fn msg_primitive_type(type_name: &str, json_type: &str) -> String {
     format!("expected {type_name}, got {json_type}")
 }
 
+/// [helios] an integer-class value lies outside the type's range.
+pub(crate) fn msg_primitive_range(type_name: &str, value: i128, min: i64, max: i64) -> String {
+    format!("value {value} is outside the range of {type_name} ({min} to {max})")
+}
+
+/// [helios] as [`msg_primitive_range`], for a value too large to hold as a
+/// number: it is quoted from the resource as written.
+pub(crate) fn msg_primitive_range_text(type_name: &str, value: &str, min: i64, max: i64) -> String {
+    format!("value {value} is outside the range of {type_name} ({min} to {max})")
+}
+
+/// [helios] a `dateTime`, `instant` or `time` value has a seconds field of 60.
+pub(crate) fn msg_primitive_leap_second(type_name: &str, value: &str) -> String {
+    format!(
+        "value '{value}' is a {type_name} with a leap second (seconds of 60), which is not supported"
+    )
+}
+
 /// [helios] a primitive string value failed the type's regex.
 pub(crate) fn msg_primitive_regex(type_name: &str, value: &str) -> String {
     format!("value '{value}' is not a valid {type_name}")
@@ -278,9 +296,15 @@ pub(crate) fn msg_terminology_unavailable(value_set: &str, detail: &str) -> Stri
 }
 
 /// [helios] constraint evaluation itself failed (parse error, non-boolean
-/// result, typed-model mismatch).
+/// result, evaluation error).
 pub(crate) fn msg_constraint_not_evaluable(id: &str, detail: &str) -> String {
     format!("FHIRPath constraint {id} could not be evaluated: {detail}")
+}
+
+/// [helios] the resource could not be loaded for constraint evaluation, so
+/// none of its FHIRPath constraints ran.
+pub(crate) fn msg_constraints_not_run(detail: &str) -> String {
+    format!("FHIRPath constraints were not evaluated: {detail}")
 }
 
 /// [helios] a schema reference could not be resolved (reference validator

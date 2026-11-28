@@ -23,6 +23,7 @@ pub use path::dotted_to_fhirpath;
 pub(crate) mod messages {
     pub(crate) use super::errors::{
         msg_constraint_not_evaluable as constraint_not_evaluable,
+        msg_constraints_not_run as constraints_not_run,
         msg_fhirpath_constraint as fhirpath_constraint,
         msg_terminology_binding as terminology_binding,
         msg_terminology_unavailable as terminology_unavailable,

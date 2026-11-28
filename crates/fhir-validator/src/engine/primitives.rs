@@ -1,4 +1,4 @@
-//! Primitive value validation: JSON type-class and regex checks.
+//! Primitive value validation: JSON type-class, range and regex checks.
 //!
 //! Runs when a primitive-type schema is a member of a node's cooperative
 //! set. The type class comes from the primitive's declared `type` (falling
@@ -81,6 +81,25 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         return;
     }
 
+    if let Some((min, max)) = integer_range(type_name)
+        && let Some(value) = data
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| data.as_u64().map(i128::from))
+        && !(i128::from(min)..=i128::from(max)).contains(&value)
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            errors::msg_primitive_range(type_name, value, min, max),
+        );
+        return;
+    }
+
+    if type_name == "integer64" {
+        validate_integer64(ctx, data);
+        return;
+    }
+
     if let Some(pattern) = &schema.regex
         && let Some(s) = data.as_str()
         && let Some(re) = compiled(pattern)
@@ -90,7 +109,77 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
             ErrorKind::PrimitiveValue,
             errors::msg_primitive_regex(type_name, s),
         );
+        return;
     }
+
+    if let Some(s) = data.as_str()
+        && has_leap_second(type_name, s)
+    {
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            errors::msg_primitive_leap_second(type_name, s),
+        );
+    }
+}
+
+/// `integer64` is a signed 64-bit value. FHIR JSON carries it as a string
+/// (`[0]|[-+]?[1-9][0-9]*`); a JSON number is tolerated as well, because the
+/// typed model reads both forms and writes the number form, so a resource that
+/// went through it (an XML body, for one) arrives that way. Either form must
+/// fit an `i64`: the typed model cannot hold more.
+fn validate_integer64(ctx: &mut WalkCtx<'_>, data: &Value) {
+    const TYPE: &str = "integer64";
+    let (min, max) = (i64::MIN, i64::MAX);
+    match data {
+        Value::String(s) => {
+            let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
+            let well_formed = s == "0"
+                || (!digits.is_empty()
+                    && !digits.starts_with('0')
+                    && digits.bytes().all(|b| b.is_ascii_digit()));
+            if !well_formed {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    errors::msg_primitive_regex(TYPE, s),
+                );
+            } else if s.parse::<i64>().is_err() {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    errors::msg_primitive_range_text(TYPE, s, min, max),
+                );
+            }
+        }
+        // The class check let through an integer-class number only.
+        _ => {
+            if data.as_i64().is_none() {
+                ctx.error(
+                    ErrorKind::PrimitiveValue,
+                    errors::msg_primitive_range_text(TYPE, &data.to_string(), min, max),
+                );
+            }
+        }
+    }
+}
+
+/// Whether a `dateTime`, `instant` or `time` value has a seconds field of 60.
+///
+/// The spec regexes admit a leap second, and so does the regex check above,
+/// but the typed model refuses one. A resource carrying it cannot be parsed
+/// for FHIRPath evaluation, so it is reported here, at the value, rather than
+/// as an unparseable resource.
+fn has_leap_second(type_name: &str, value: &str) -> bool {
+    let time = match type_name {
+        "time" => value,
+        "dateTime" | "instant" => match value.split_once('T') {
+            Some((_, time)) => time,
+            None => return false,
+        },
+        _ => return false,
+    };
+    // hh:mm:ss — the seconds are the two characters after the second colon.
+    time.split(':')
+        .nth(2)
+        .is_some_and(|seconds| seconds.starts_with("60"))
 }
 
 /// The JSON type class a FHIR primitive requires.
@@ -98,6 +187,8 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
 enum JsonClass {
     Boolean,
     Integer,
+    /// `integer64`: a JSON string, or an integer-class JSON number.
+    Integer64,
     Number,
     String,
 }
@@ -107,16 +198,32 @@ impl JsonClass {
         match self {
             JsonClass::Boolean => v.is_boolean(),
             JsonClass::Integer => v.as_number().is_some_and(|n| n.is_i64() || n.is_u64()),
+            JsonClass::Integer64 => v.is_string() || JsonClass::Integer.matches(v),
             JsonClass::Number => v.is_number(),
             JsonClass::String => v.is_string(),
         }
     }
 }
 
+/// The range of the 32-bit integer primitives: `integer` is a signed 32-bit
+/// value, `positiveInt` 1 to its maximum and `unsignedInt` 0 to it. A value
+/// past it is invalid FHIR, and the typed model, which stores these as `i32`,
+/// cannot hold it.
+fn integer_range(type_name: &str) -> Option<(i64, i64)> {
+    let max = i64::from(i32::MAX);
+    Some(match type_name {
+        "integer" => (i64::from(i32::MIN), max),
+        "positiveInt" => (1, max),
+        "unsignedInt" => (0, max),
+        _ => return None,
+    })
+}
+
 fn expected_json_class(type_name: &str) -> Option<JsonClass> {
     Some(match type_name {
         "boolean" => JsonClass::Boolean,
-        "integer" | "positiveInt" | "unsignedInt" | "integer64" => JsonClass::Integer,
+        "integer" | "positiveInt" | "unsignedInt" => JsonClass::Integer,
+        "integer64" => JsonClass::Integer64,
         "decimal" => JsonClass::Number,
         // Everything else — string, uri, code, dateTime, base64Binary, ... —
         // is a JSON string. Unknown primitive names get no class check.
