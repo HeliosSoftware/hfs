@@ -27,18 +27,26 @@
 //! after the other, as the failpoint lock makes them, at about 10 s each; the
 //! server appears to wait for the command inside the failpoint before it turns
 //! the failpoint off). So a test's writer has finished, and its rows have
-//! landed, by the time `off` returns. Each test asserts that the writer has not
+//! landed, by the time `off` returns. Each test checks that the writer has not
 //! finished when the action that races it has finished. That catches a writer
 //! that was already done, not every action that outlasts the hold.
+//!
+//! An action that outlasts the hold (a purge slower than [`HOLD_MS`], as on a
+//! loaded host) leaves an attempt that proves nothing: the writer ran after it,
+//! not inside it. That attempt is thrown away and the test runs again on a
+//! fresh database ([`retrying_short_holds`]), up to [`HOLD_ATTEMPTS`] times;
+//! only a hold that ends early on every attempt fails the test. The hold stays
+//! short because `blockTimeMS` is a fixed sleep that every test pays in full.
 
 use super::*;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
-use futures::TryStreamExt;
 use futures::future::{Either, select};
+use futures::{FutureExt, TryStreamExt};
 use helios_persistence::core::{
     BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider, DefaultSubmitWorker, LeaseError,
     NdjsonEntry, RemoteFile, RemoteManifest, SubmissionId, SubmitClaimStrategy, SubmitFileRecord,
@@ -54,6 +62,37 @@ use crate::bulk_submit::FailPoint;
 
 /// How long a held command blocks (`blockTimeMS`).
 const HOLD_MS: i64 = 10_000;
+
+/// How many times a test runs when its action outlasts the hold.
+const HOLD_ATTEMPTS: usize = 3;
+
+/// Panic payload of an attempt whose action outlasted the hold.
+struct ShortHold(String);
+
+/// Runs `attempt` until it ends without a [`ShortHold`], up to
+/// [`HOLD_ATTEMPTS`] times. Every attempt builds its own backends, and so its
+/// own database. Any other panic fails the test at once.
+async fn retrying_short_holds<F, Fut>(attempt: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    for n in 1..=HOLD_ATTEMPTS {
+        let Err(payload) = AssertUnwindSafe(attempt()).catch_unwind().await else {
+            return;
+        };
+        match payload.downcast::<ShortHold>() {
+            Ok(short) if n < HOLD_ATTEMPTS => {
+                eprintln!(
+                    "attempt {n}/{HOLD_ATTEMPTS} proves nothing, running it again: {}",
+                    short.0
+                );
+            }
+            Ok(short) => panic!("{}, on each of {HOLD_ATTEMPTS} attempts", short.0),
+            Err(other) => std::panic::resume_unwind(other),
+        }
+    }
+}
 
 const RESOURCE_TYPE: &str = "MedicationRequest";
 
@@ -290,13 +329,21 @@ where
     // writer never sent `command` to `collection`.
     fail_point.wait_until_entered(1).await;
     let held = Instant::now();
-    let during = during.await;
-    assert!(
-        !writer.is_finished(),
-        "the {HOLD_MS} ms hold of `{command}` on `{collection}` ended ({:?} after it began) \
-         before the action finished, so the writer was not held while it ran",
-        held.elapsed()
-    );
+    let during = AssertUnwindSafe(during).catch_unwind().await;
+    // Checked even when the action panicked: an action that met the writer's
+    // rows (a re-create answered `AlreadyExists`) ran after the hold, and its
+    // panic says nothing about the race.
+    if writer.is_finished() {
+        let reason = format!(
+            "the {HOLD_MS} ms hold of `{command}` on `{collection}` ended ({:?} after it began) \
+             before the action finished, so the writer was not held while it ran",
+            held.elapsed()
+        );
+        fail_point.off().await;
+        eprintln!("{reason}");
+        std::panic::panic_any(ShortHold(reason));
+    }
+    let during = during.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     fail_point.off().await;
     let written = writer.await.expect("the writer task panicked");
     Some((during, written))
@@ -512,18 +559,21 @@ fn print_outcomes(outcomes: &[StorageResult<usize>]) {
 /// Its `search_index` insert is held while the whole purge runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_serial_page_insert_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("serial", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("insert", "search_index")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("serial", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("insert", "search_index")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// The page is read by id (`ReindexSource::fetch_resources_by_ids`, what the
@@ -532,60 +582,69 @@ async fn a_tenant_purge_racing_a_held_serial_page_insert_leaves_no_rows() {
 /// that is no longer there for one from another store and keeps its rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_page_read_by_id_leaves_no_rows() {
-    let Some(mut race) = ReindexRace::start("byid", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let ids: Vec<String> = (0..race.page.len()).map(resource_id).collect();
-    race.page =
-        ReindexSource::fetch_resources_by_ids(&*race.writer, &race.purged, RESOURCE_TYPE, &ids)
+    retrying_short_holds(|| async {
+        let Some(mut race) = ReindexRace::start("byid", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let ids: Vec<String> = (0..race.page.len()).map(resource_id).collect();
+        race.page =
+            ReindexSource::fetch_resources_by_ids(&*race.writer, &race.purged, RESOURCE_TYPE, &ids)
+                .await
+                .expect("read the purged tenant's page by id");
+        assert_eq!(race.page.len(), ids.len(), "every id is read");
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("insert", "search_index")
             .await
-            .expect("read the purged tenant's page by id");
-    assert_eq!(race.page.len(), ids.len(), "every id is read");
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("insert", "search_index")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// A first build: the page found no rows to replace, so it skips its
 /// verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_first_build_page_insert_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("firstbuild", 6, true, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("insert", "search_index")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("firstbuild", 6, true, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("insert", "search_index")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// The own rows are in before the purge starts and the purge removes them; the
 /// contained rows are what the held insert lands afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_contained_page_insert_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("contained", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("insert", "search_index_contained")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("contained", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("insert", "search_index_contained")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// The page's first write is its row delete. Held there, the whole purge runs
@@ -593,18 +652,21 @@ async fn a_tenant_purge_racing_a_held_contained_page_insert_leaves_no_rows() {
 /// the inserts follow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_page_delete_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("delete", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("delete", "search_index")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("delete", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("delete", "search_index")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// More than `REINDEX_SUBBATCH_FIRST` resources on the overlapped writer: the
@@ -612,111 +674,120 @@ async fn a_tenant_purge_racing_a_held_page_delete_leaves_no_rows() {
 /// the purge as well.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_overlapped_sub_batch_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("overlap", 40, false, |c| {
-        c.reindex_overlap = true;
-        c.reindex_prepare_threads = 1;
-    })
-    .await
-    else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let Some((outcomes, stats)) = race
-        .purge_while_page_is_written("insert", "search_index")
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("overlap", 40, false, |c| {
+            c.reindex_overlap = true;
+            c.reindex_prepare_threads = 1;
+        })
         .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
-    assert!(
-        stats.sub_batches >= 2,
-        "40 resources must split into at least two sub-batches on the overlapped path: {}",
-        stats.sub_batches
-    );
+        else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let Some((outcomes, stats)) = race
+            .purge_while_page_is_written("insert", "search_index")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+        assert!(
+            stats.sub_batches >= 2,
+            "40 resources must split into at least two sub-batches on the overlapped path: {}",
+            stats.sub_batches
+        );
+    })
+    .await;
 }
 
 /// A whole `$reindex` job, with the page prefetch on, whose first page insert
 /// is held. The job must end `Completed` and the tenant must leave no rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_reindex_job_leaves_no_rows_and_the_job_completes() {
-    let Some(race) = ReindexRace::start("job", 12, false, |c| {
-        c.reindex_prefetch = true;
-        c.reindex_prepare_threads = 1;
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("job", 12, false, |c| {
+            c.reindex_prefetch = true;
+            c.reindex_prepare_threads = 1;
+        })
+        .await
+        else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let writer = Arc::clone(&race.writer);
+        let tenant = race.purged.clone();
+        let Some(progress) = purge_while_held(
+            &race.app,
+            &race.db_name,
+            "insert",
+            "search_index",
+            &race.purger,
+            race.purged_id(),
+            async move {
+                let op = ReindexOperation::new(writer.clone(), writer.tenant_registries().clone())
+                    .with_prefetch(true);
+                let job = op
+                    .start(
+                        tenant,
+                        ReindexRequest::for_types([RESOURCE_TYPE]).with_batch_size(5),
+                        None,
+                    )
+                    .await
+                    .expect("start the reindex job");
+                super::reindex_id_walk::wait_for_terminal(&op, &job).await
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        eprintln!("reindex job ended: {progress:?}");
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert!(!progress.has_errors(), "{progress:?}");
     })
-    .await
-    else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let writer = Arc::clone(&race.writer);
-    let tenant = race.purged.clone();
-    let Some(progress) = purge_while_held(
-        &race.app,
-        &race.db_name,
-        "insert",
-        "search_index",
-        &race.purger,
-        race.purged_id(),
-        async move {
-            let op = ReindexOperation::new(writer.clone(), writer.tenant_registries().clone())
-                .with_prefetch(true);
-            let job = op
-                .start(
-                    tenant,
-                    ReindexRequest::for_types([RESOURCE_TYPE]).with_batch_size(5),
-                    None,
-                )
-                .await
-                .expect("start the reindex job");
-            super::reindex_id_walk::wait_for_terminal(&op, &job).await
-        },
-    )
-    .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    eprintln!("reindex job ended: {progress:?}");
-    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
-    assert!(!progress.has_errors(), "{progress:?}");
+    .await;
 }
 
 /// The metadata-only writer updates `resources`; its statement never inserts,
 /// so a purge that ran first leaves it nothing to match.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_metadata_only_page_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("metaonly", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    race.make_metadata_stale().await;
-    let writer = Arc::clone(&race.writer);
-    let tenant = race.purged.clone();
-    let page = race.page.clone();
-    let Some((results, written, failures)) = purge_while_held(
-        &race.app,
-        &race.db_name,
-        "update",
-        "resources",
-        &race.purger,
-        race.purged_id(),
-        async move {
-            writer
-                .write_search_metadata_page(&tenant, &page, false)
-                .await
-        },
-    )
-    .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    eprintln!(
-        "metadata-only page: {} results, {written} written, {} failures",
-        results.len(),
-        failures.len()
-    );
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("metaonly", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        race.make_metadata_stale().await;
+        let writer = Arc::clone(&race.writer);
+        let tenant = race.purged.clone();
+        let page = race.page.clone();
+        let Some((results, written, failures)) = purge_while_held(
+            &race.app,
+            &race.db_name,
+            "update",
+            "resources",
+            &race.purger,
+            race.purged_id(),
+            async move {
+                writer
+                    .write_search_metadata_page(&tenant, &page, false)
+                    .await
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        eprintln!(
+            "metadata-only page: {} results, {written} written, {} failures",
+            results.len(),
+            failures.len()
+        );
+    })
+    .await;
 }
 
 /// The page writer's last step is a metadata update on `resources`, after its
@@ -724,19 +795,22 @@ async fn a_tenant_purge_racing_a_held_metadata_only_page_leaves_no_rows() {
 /// the update then matches nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_page_metadata_update_leaves_no_rows() {
-    let Some(race) = ReindexRace::start("pagemeta", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    race.make_metadata_stale().await;
-    let Some((outcomes, _)) = race
-        .purge_while_page_is_written("update", "resources")
-        .await
-    else {
-        return;
-    };
-    race.assert_only_kept_rows_remain().await;
-    print_outcomes(&outcomes);
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("pagemeta", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        race.make_metadata_stale().await;
+        let Some((outcomes, _)) = race
+            .purge_while_page_is_written("update", "resources")
+            .await
+        else {
+            return;
+        };
+        race.assert_only_kept_rows_remain().await;
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// No purge here: one resource of the page is removed from `resources` while
@@ -744,72 +818,75 @@ async fn a_tenant_purge_racing_a_held_page_metadata_update_leaves_no_rows() {
 /// which still exist, keep exactly the rows they had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hard_removed_resource_during_a_held_page_loses_only_its_own_rows() {
-    let Some(race) = ReindexRace::start("hardremove", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let tenant = race.purged_id().to_string();
-    let gone = resource_id(2);
-    let mut before = HashMap::new();
-    for n in 0..race.page.len() {
-        let id = resource_id(n);
-        let rows = rows_of(&race.client, &race.db_name, &tenant, &id).await;
-        assert!(rows.0 > 0 && rows.1 > 0, "{id} has rows in both: {rows:?}");
-        before.insert(id, rows);
-    }
-
-    let writer = Arc::clone(&race.writer);
-    let page_tenant = race.purged.clone();
-    let page = race.page.clone();
-    let Some((removed, (outcomes, _))) = while_held(
-        &race.app,
-        &race.db_name,
-        "insert",
-        "search_index",
-        async {
-            race.client
-                .database(&race.db_name)
-                .collection::<Document>("resources")
-                .delete_one(doc! {
-                    "tenant_id": &tenant,
-                    "resource_type": RESOURCE_TYPE,
-                    "id": &gone,
-                })
-                .await
-                .expect("remove one resource from `resources`")
-                .deleted_count
-        },
-        async move {
-            let mut stats = ReindexPageStats::default();
-            let outcomes = writer
-                .write_search_entries_page_timed(&page_tenant, &page, &mut stats)
-                .await;
-            (outcomes, stats)
-        },
-    )
-    .await
-    else {
-        return;
-    };
-    assert_eq!(removed, 1, "one resource was removed");
-
-    let gone_rows = rows_of(&race.client, &race.db_name, &tenant, &gone).await;
-    eprintln!("rows of the removed resource {gone}: {gone_rows:?}");
-    assert_eq!(
-        gone_rows,
-        (0, 0),
-        "the removed resource still has rows (search_index, search_index_contained)"
-    );
-    for (id, rows) in &before {
-        if *id != gone {
-            assert_eq!(
-                &rows_of(&race.client, &race.db_name, &tenant, id).await,
-                rows,
-                "{id} still exists, so its rows must be what they were"
-            );
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("hardremove", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let tenant = race.purged_id().to_string();
+        let gone = resource_id(2);
+        let mut before = HashMap::new();
+        for n in 0..race.page.len() {
+            let id = resource_id(n);
+            let rows = rows_of(&race.client, &race.db_name, &tenant, &id).await;
+            assert!(rows.0 > 0 && rows.1 > 0, "{id} has rows in both: {rows:?}");
+            before.insert(id, rows);
         }
-    }
-    print_outcomes(&outcomes);
+
+        let writer = Arc::clone(&race.writer);
+        let page_tenant = race.purged.clone();
+        let page = race.page.clone();
+        let Some((removed, (outcomes, _))) = while_held(
+            &race.app,
+            &race.db_name,
+            "insert",
+            "search_index",
+            async {
+                race.client
+                    .database(&race.db_name)
+                    .collection::<Document>("resources")
+                    .delete_one(doc! {
+                        "tenant_id": &tenant,
+                        "resource_type": RESOURCE_TYPE,
+                        "id": &gone,
+                    })
+                    .await
+                    .expect("remove one resource from `resources`")
+                    .deleted_count
+            },
+            async move {
+                let mut stats = ReindexPageStats::default();
+                let outcomes = writer
+                    .write_search_entries_page_timed(&page_tenant, &page, &mut stats)
+                    .await;
+                (outcomes, stats)
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(removed, 1, "one resource was removed");
+
+        let gone_rows = rows_of(&race.client, &race.db_name, &tenant, &gone).await;
+        eprintln!("rows of the removed resource {gone}: {gone_rows:?}");
+        assert_eq!(
+            gone_rows,
+            (0, 0),
+            "the removed resource still has rows (search_index, search_index_contained)"
+        );
+        for (id, rows) in &before {
+            if *id != gone {
+                assert_eq!(
+                    &rows_of(&race.client, &race.db_name, &tenant, id).await,
+                    rows,
+                    "{id} still exists, so its rows must be what they were"
+                );
+            }
+        }
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 /// The purge is followed by a new write of a resource the page also holds, made
@@ -817,76 +894,79 @@ async fn a_hard_removed_resource_during_a_held_page_loses_only_its_own_rows() {
 /// are not the page's rows, whatever happens to the page's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_page_keeps_rows_another_writer_added_after_it() {
-    let Some(race) = ReindexRace::start("recreate", 6, false, serial).await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let tenant = race.purged_id().to_string();
-    let writer = Arc::clone(&race.writer);
-    let page_tenant = race.purged.clone();
-    let page = race.page.clone();
-    let Some((added, (outcomes, _))) = while_held(
-        &race.app,
-        &race.db_name,
-        "insert",
-        "search_index",
-        async {
-            race.purger.purge_tenant_data(&tenant).await.expect("purge");
-            race.purger
-                .seed_create(
-                    &race.purged,
-                    RESOURCE_TYPE,
-                    medication_request(&resource_id(0)),
-                    FhirVersion::default(),
+    retrying_short_holds(|| async {
+        let Some(race) = ReindexRace::start("recreate", 6, false, serial).await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let tenant = race.purged_id().to_string();
+        let writer = Arc::clone(&race.writer);
+        let page_tenant = race.purged.clone();
+        let page = race.page.clone();
+        let Some((added, (outcomes, _))) = while_held(
+            &race.app,
+            &race.db_name,
+            "insert",
+            "search_index",
+            async {
+                race.purger.purge_tenant_data(&tenant).await.expect("purge");
+                race.purger
+                    .seed_create(
+                        &race.purged,
+                        RESOURCE_TYPE,
+                        medication_request(&resource_id(0)),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .expect("create the resource again after the purge");
+                // The purge emptied both collections, so these rows are the new
+                // resource's alone.
+                let own = row_ids(&race.client, &race.db_name, "search_index", &tenant).await;
+                let contained = row_ids(
+                    &race.client,
+                    &race.db_name,
+                    "search_index_contained",
+                    &tenant,
                 )
-                .await
-                .expect("create the resource again after the purge");
-            // The purge emptied both collections, so these rows are the new
-            // resource's alone.
-            let own = row_ids(&race.client, &race.db_name, "search_index", &tenant).await;
-            let contained = row_ids(
+                .await;
+                (own, contained)
+            },
+            async move {
+                let mut stats = ReindexPageStats::default();
+                let outcomes = writer
+                    .write_search_entries_page_timed(&page_tenant, &page, &mut stats)
+                    .await;
+                (outcomes, stats)
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let (own, contained) = added;
+        assert!(
+            !own.is_empty() && !contained.is_empty(),
+            "the new resource has rows of its own"
+        );
+        assert_eq!(
+            rows_with_ids(&race.client, &race.db_name, "search_index", &own).await,
+            own.len() as u64,
+            "rows the other writer added to search_index are gone"
+        );
+        assert_eq!(
+            rows_with_ids(
                 &race.client,
                 &race.db_name,
                 "search_index_contained",
-                &tenant,
+                &contained
             )
-            .await;
-            (own, contained)
-        },
-        async move {
-            let mut stats = ReindexPageStats::default();
-            let outcomes = writer
-                .write_search_entries_page_timed(&page_tenant, &page, &mut stats)
-                .await;
-            (outcomes, stats)
-        },
-    )
-    .await
-    else {
-        return;
-    };
-    let (own, contained) = added;
-    assert!(
-        !own.is_empty() && !contained.is_empty(),
-        "the new resource has rows of its own"
-    );
-    assert_eq!(
-        rows_with_ids(&race.client, &race.db_name, "search_index", &own).await,
-        own.len() as u64,
-        "rows the other writer added to search_index are gone"
-    );
-    assert_eq!(
-        rows_with_ids(
-            &race.client,
-            &race.db_name,
-            "search_index_contained",
-            &contained
-        )
-        .await,
-        contained.len() as u64,
-        "rows the other writer added to search_index_contained are gone"
-    );
-    print_outcomes(&outcomes);
+            .await,
+            contained.len() as u64,
+            "rows the other writer added to search_index_contained are gone"
+        );
+        print_outcomes(&outcomes);
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,7 +1156,10 @@ async fn ingest_race(name: &str, command: &str, collection: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_resource_insert_leaves_no_rows() {
-    ingest_race("resins", "insert", "resources").await;
+    retrying_short_holds(|| async {
+        ingest_race("resins", "insert", "resources").await;
+    })
+    .await;
 }
 
 /// The ids exist before the batch, so it updates them; the update that is held
@@ -1084,56 +1167,74 @@ async fn a_tenant_purge_racing_a_held_ingest_resource_insert_leaves_no_rows() {
 /// landed by the time the purge runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_resource_update_leaves_no_rows() {
-    let Some(race) = BulkRace::start("resupd").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    race.ingest(entries(3, "v1"), "https://provider.example/first.ndjson")
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("resupd").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        race.ingest(entries(3, "v1"), "https://provider.example/first.ndjson")
+            .await
+            .expect("create the resources the held batch updates");
+        let Some(result) = purge_while_held(
+            &race.app,
+            &race.db_name,
+            "update",
+            "resources",
+            &race.purger,
+            race.purged_id(),
+            race.ingest(entries(3, "v2"), "https://provider.example/second.ndjson"),
+        )
         .await
-        .expect("create the resources the held batch updates");
-    let Some(result) = purge_while_held(
-        &race.app,
-        &race.db_name,
-        "update",
-        "resources",
-        &race.purger,
-        race.purged_id(),
-        race.ingest(entries(3, "v2"), "https://provider.example/second.ndjson"),
-    )
-    .await
-    else {
-        return;
-    };
-    eprintln!("the batch ended: {}", describe(&result));
-    race.assert_only_kept_rows_remain().await;
-    assert_manifest_not_found(&result);
+        else {
+            return;
+        };
+        eprintln!("the batch ended: {}", describe(&result));
+        race.assert_only_kept_rows_remain().await;
+        assert_manifest_not_found(&result);
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_history_insert_leaves_no_rows() {
-    ingest_race("histins", "insert", "resource_history").await;
+    retrying_short_holds(|| async {
+        ingest_race("histins", "insert", "resource_history").await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_search_insert_leaves_no_rows() {
-    ingest_race("srchins", "insert", "search_index").await;
+    retrying_short_holds(|| async {
+        ingest_race("srchins", "insert", "search_index").await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_contained_insert_leaves_no_rows() {
-    ingest_race("contins", "insert", "search_index_contained").await;
+    retrying_short_holds(|| async {
+        ingest_race("contins", "insert", "search_index_contained").await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_change_log_insert_leaves_no_rows() {
-    ingest_race("chgins", "insert", "bulk_submission_changes").await;
+    retrying_short_holds(|| async {
+        ingest_race("chgins", "insert", "bulk_submission_changes").await;
+    })
+    .await;
 }
 
 /// The receipts of new entries are one unordered `insert` command, the last
 /// write of a batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_receipt_insert_leaves_no_rows() {
-    ingest_race("rcptins", "insert", "bulk_entry_results").await;
+    retrying_short_holds(|| async {
+        ingest_race("rcptins", "insert", "bulk_entry_results").await;
+    })
+    .await;
 }
 
 /// The same file ingested again: its receipts exist, the `insert` reports them
@@ -1141,29 +1242,32 @@ async fn a_tenant_purge_racing_a_held_ingest_receipt_insert_leaves_no_rows() {
 /// that is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_ingest_receipt_upsert_leaves_no_rows() {
-    let Some(race) = BulkRace::start("rcptupd").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    race.ingest(entries(5, "v1"), FILE_URL)
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("rcptupd").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        race.ingest(entries(5, "v1"), FILE_URL)
+            .await
+            .expect("create the receipts the held batch upserts");
+        let Some(result) = purge_while_held(
+            &race.app,
+            &race.db_name,
+            "update",
+            "bulk_entry_results",
+            &race.purger,
+            race.purged_id(),
+            race.ingest(entries(5, "v2"), FILE_URL),
+        )
         .await
-        .expect("create the receipts the held batch upserts");
-    let Some(result) = purge_while_held(
-        &race.app,
-        &race.db_name,
-        "update",
-        "bulk_entry_results",
-        &race.purger,
-        race.purged_id(),
-        race.ingest(entries(5, "v2"), FILE_URL),
-    )
-    .await
-    else {
-        return;
-    };
-    eprintln!("the batch ended: {}", describe(&result));
-    race.assert_only_kept_rows_remain().await;
-    assert_manifest_not_found(&result);
+        else {
+            return;
+        };
+        eprintln!("the batch ended: {}", describe(&result));
+        race.assert_only_kept_rows_remain().await;
+        assert_manifest_not_found(&result);
+    })
+    .await;
 }
 
 /// `record_submit_file` reads the manifest to check its fence and then upserts
@@ -1175,66 +1279,71 @@ async fn a_tenant_purge_racing_a_held_ingest_receipt_upsert_leaves_no_rows() {
 /// with a renewal until the upsert has ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_held_submit_file_upsert_leaves_no_rows() {
-    let Some(race) = BulkRace::start("subfile").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let lease = race
-        .writer
-        .claim_next_manifest(
-            &WorkerId::new("tpr-subfile-worker"),
-            Duration::from_secs(60),
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("subfile").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let lease = race
+            .writer
+            .claim_next_manifest(
+                &WorkerId::new("tpr-subfile-worker"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim")
+            .expect("the purged tenant's manifest is claimable");
+        assert_eq!(
+            lease.tenant.tenant_id().as_str(),
+            race.purged_id(),
+            "the claimed manifest is the purged tenant's"
+        );
+        let record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/manifest.json".to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some(RESOURCE_TYPE.to_string()),
+            part_index: 0,
+            file_path: "tenant/job/output/MedicationRequest-0.ndjson".to_string(),
+            line_count: 3,
+            byte_count: 120,
+            count_severity: None,
+        };
+        let writer = Arc::clone(&race.writer);
+        let held_lease = lease.clone();
+        let Some((heartbeat, result)) = while_held(
+            &race.app,
+            &race.db_name,
+            "update",
+            "bulk_submit_files",
+            async {
+                race.purger
+                    .purge_tenant_data(race.purged_id())
+                    .await
+                    .expect("purge");
+                race.writer.heartbeat(&lease).await
+            },
+            async move { writer.record_submit_file(&held_lease, &record).await },
         )
         .await
-        .expect("claim")
-        .expect("the purged tenant's manifest is claimable");
-    assert_eq!(
-        lease.tenant.tenant_id().as_str(),
-        race.purged_id(),
-        "the claimed manifest is the purged tenant's"
-    );
-    let record = SubmitFileRecord {
-        manifest_url: Some("https://provider.example/manifest.json".to_string()),
-        file_type: "output".to_string(),
-        resource_type: Some(RESOURCE_TYPE.to_string()),
-        part_index: 0,
-        file_path: "tenant/job/output/MedicationRequest-0.ndjson".to_string(),
-        line_count: 3,
-        byte_count: 120,
-        count_severity: None,
-    };
-    let writer = Arc::clone(&race.writer);
-    let held_lease = lease.clone();
-    let Some((heartbeat, result)) = while_held(
-        &race.app,
-        &race.db_name,
-        "update",
-        "bulk_submit_files",
-        async {
-            race.purger
-                .purge_tenant_data(race.purged_id())
-                .await
-                .expect("purge");
-            race.writer.heartbeat(&lease).await
-        },
-        async move { writer.record_submit_file(&held_lease, &record).await },
-    )
-    .await
-    else {
-        return;
-    };
-    eprintln!("record_submit_file ended: {result:?}; the heartbeat during the hold: {heartbeat:?}");
-    race.assert_only_kept_rows_remain().await;
-    assert!(
-        matches!(result, Err(LeaseError::LeaseLost { .. })),
-        "a submit file recorded for a purged manifest ends as a lost lease: {result:?}"
-    );
-    assert!(
-        heartbeat.is_ok(),
-        "a heartbeat for a purged manifest, asked for while a write of that manifest is \
-         still running on this instance, must be answered with a renewal, or the worker \
-         drops the write before its check: {heartbeat:?}"
-    );
+        else {
+            return;
+        };
+        eprintln!(
+            "record_submit_file ended: {result:?}; the heartbeat during the hold: {heartbeat:?}"
+        );
+        race.assert_only_kept_rows_remain().await;
+        assert!(
+            matches!(result, Err(LeaseError::LeaseLost { .. })),
+            "a submit file recorded for a purged manifest ends as a lost lease: {result:?}"
+        );
+        assert!(
+            heartbeat.is_ok(),
+            "a heartbeat for a purged manifest, asked for while a write of that manifest is \
+             still running on this instance, must be answered with a renewal, or the worker \
+             drops the write before its check: {heartbeat:?}"
+        );
+    })
+    .await;
 }
 
 /// Serves one manifest and its files from memory (the harness's own
@@ -1312,75 +1421,78 @@ fn files_under(dir: &std::path::Path) -> Vec<String> {
 /// so that the time spent waiting for the lock is not spent from the lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_a_submit_worker_leaves_no_rows_and_the_job_ends() {
-    let Some(race) = BulkRace::start("worker").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let file = "https://provider.example/mr.ndjson";
-    let ndjson: String = entries(5, "worker")
-        .iter()
-        .map(|entry| format!("{}\n", entry.resource))
-        .collect();
-    let fetcher = Arc::new(SubmitInputFetcherOf {
-        manifest: RemoteManifest {
-            requires_access_token: false,
-            output: vec![RemoteFile {
-                resource_type: Some(RESOURCE_TYPE.to_string()),
-                url: file.to_string(),
-                count: Some(5),
-            }],
-            deleted: vec![],
-        },
-        files: HashMap::from([(file.to_string(), ndjson.into_bytes())]),
-    });
-    let output_dir = tempfile::tempdir().expect("tempdir");
-    let output = Arc::new(
-        helios_persistence::backends::local_fs::LocalFsOutputStore::new(
-            output_dir.path().to_path_buf(),
-            "http://localhost:8080",
-        ),
-    );
-    let worker_id = WorkerId::new("tpr-worker");
-    let worker =
-        DefaultSubmitWorker::new(Arc::clone(&race.writer), fetcher, output, worker_id.clone());
-    let writer = Arc::clone(&race.writer);
-    let claim_id = worker_id.clone();
-    let Some((claimed, ended)) = purge_while_held(
-        &race.app,
-        &race.db_name,
-        "insert",
-        "resources",
-        &race.purger,
-        race.purged_id(),
-        async move {
-            let lease = writer
-                .claim_next_manifest(&claim_id, Duration::from_secs(6))
-                .await
-                .expect("claim")
-                .expect("the purged tenant's manifest is claimable");
-            let claimed = lease.tenant.tenant_id().as_str().to_string();
-            (claimed, worker.run_job(lease).await)
-        },
-    )
-    .await
-    else {
-        return;
-    };
-    assert_eq!(
-        claimed,
-        race.purged_id(),
-        "the claimed manifest is the purged tenant's"
-    );
-    eprintln!("run_job ended: {ended:?}");
-    eprintln!(
-        "the worker's output directory holds: {:?}",
-        files_under(output_dir.path())
-    );
-    race.assert_only_kept_rows_remain().await;
-    assert!(
-        ended.is_ok(),
-        "the worker ends a purged manifest's run without an error: {ended:?}"
-    );
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("worker").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let file = "https://provider.example/mr.ndjson";
+        let ndjson: String = entries(5, "worker")
+            .iter()
+            .map(|entry| format!("{}\n", entry.resource))
+            .collect();
+        let fetcher = Arc::new(SubmitInputFetcherOf {
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some(RESOURCE_TYPE.to_string()),
+                    url: file.to_string(),
+                    count: Some(5),
+                }],
+                deleted: vec![],
+            },
+            files: HashMap::from([(file.to_string(), ndjson.into_bytes())]),
+        });
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        let output = Arc::new(
+            helios_persistence::backends::local_fs::LocalFsOutputStore::new(
+                output_dir.path().to_path_buf(),
+                "http://localhost:8080",
+            ),
+        );
+        let worker_id = WorkerId::new("tpr-worker");
+        let worker =
+            DefaultSubmitWorker::new(Arc::clone(&race.writer), fetcher, output, worker_id.clone());
+        let writer = Arc::clone(&race.writer);
+        let claim_id = worker_id.clone();
+        let Some((claimed, ended)) = purge_while_held(
+            &race.app,
+            &race.db_name,
+            "insert",
+            "resources",
+            &race.purger,
+            race.purged_id(),
+            async move {
+                let lease = writer
+                    .claim_next_manifest(&claim_id, Duration::from_secs(6))
+                    .await
+                    .expect("claim")
+                    .expect("the purged tenant's manifest is claimable");
+                let claimed = lease.tenant.tenant_id().as_str().to_string();
+                (claimed, worker.run_job(lease).await)
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            claimed,
+            race.purged_id(),
+            "the claimed manifest is the purged tenant's"
+        );
+        eprintln!("run_job ended: {ended:?}");
+        eprintln!(
+            "the worker's output directory holds: {:?}",
+            files_under(output_dir.path())
+        );
+        race.assert_only_kept_rows_remain().await;
+        assert!(
+            ended.is_ok(),
+            "the worker ends a purged manifest's run without an error: {ended:?}"
+        );
+    })
+    .await;
 }
 
 /// What a lost-lease answer for a purged manifest does while a batch of that
@@ -1404,101 +1516,105 @@ async fn a_tenant_purge_racing_a_submit_worker_leaves_no_rows_and_the_job_ends()
 /// is still running ends the test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_lease_answer_waits_for_the_batch_of_a_purged_manifest() {
-    let Some(race) = BulkRace::start("leasewait").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    // Long enough that no lease of its own can expire in the hold.
-    let lease = race
-        .writer
-        .claim_next_manifest(
-            &WorkerId::new("tpr-leasewait-worker"),
-            Duration::from_secs(300),
-        )
-        .await
-        .expect("claim")
-        .expect("the purged tenant's manifest is claimable");
-    assert_eq!(
-        lease.tenant.tenant_id().as_str(),
-        race.purged_id(),
-        "the claimed manifest is the purged tenant's"
-    );
-    // The lease of a worker that was passed by a newer claim.
-    let mut stale = lease.clone();
-    stale.fencing_token -= 1;
-
-    let Some(fail_point) = hold_next(&race.app, &race.db_name, "insert", "resources").await else {
-        return;
-    };
-    let batch_done = std::sync::atomic::AtomicBool::new(false);
-    let batch = race.ingest(entries(5, "v1"), FILE_URL);
-    let batch = async {
-        let result = batch.await;
-        batch_done.store(true, std::sync::atomic::Ordering::SeqCst);
-        result
-    };
-    let after = async {
-        fail_point.wait_until_entered(1).await;
-        let held = Instant::now();
-        let stale_answer = race.writer.heartbeat(&stale).await;
-        assert!(
-            matches!(stale_answer, Err(LeaseError::LeaseLost { .. })),
-            "a fence that someone else moved, on a manifest that still exists, loses at \
-             once, with a batch running or not: {stale_answer:?}"
-        );
-        race.purger
-            .purge_tenant_data(race.purged_id())
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("leasewait").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        // Long enough that no lease of its own can expire in the hold.
+        let lease = race
+            .writer
+            .claim_next_manifest(
+                &WorkerId::new("tpr-leasewait-worker"),
+                Duration::from_secs(300),
+            )
             .await
-            .expect("purge");
-        assert!(
-            !batch_done.load(std::sync::atomic::Ordering::SeqCst),
-            "the {HOLD_MS} ms hold ended ({:?} after it began) before the purge returned, \
-             so the batch was not held while it ran",
-            held.elapsed()
+            .expect("claim")
+            .expect("the purged tenant's manifest is claimable");
+        assert_eq!(
+            lease.tenant.tenant_id().as_str(),
+            race.purged_id(),
+            "the claimed manifest is the purged tenant's"
         );
-        let renewal = race.writer.heartbeat(&lease).await;
-        assert!(
-            renewal.is_ok(),
-            "a heartbeat for a purged manifest, asked for while a batch of that manifest is \
-             running on this instance, must be answered with a renewal, or the worker drops \
-             the batch before its check: {renewal:?}"
-        );
-        race.writer.add_manifest_progress(&lease, 0, 1, 0).await
-    };
-    let result = {
-        let batch = std::pin::pin!(batch);
-        let after = std::pin::pin!(after);
-        match select(batch, after).await {
-            Either::Left((result, _unfinished)) => result,
-            Either::Right((progress, _unfinished)) => panic!(
-                "the lost-lease answer of a progress write for a purged manifest came while \
-                 its batch was still running: {progress:?}"
-            ),
-        }
-    };
-    fail_point.off().await;
+        // The lease of a worker that was passed by a newer claim.
+        let mut stale = lease.clone();
+        stale.fencing_token -= 1;
 
-    // The batch has ended, so nothing of this manifest is running any more and
-    // the manifest is gone: both writes now report what the worker may act on.
-    let progress = race.writer.add_manifest_progress(&lease, 0, 1, 0).await;
-    let heartbeat = race.writer.heartbeat(&lease).await;
-    eprintln!(
-        "the batch ended: {}; afterwards the progress write answered {progress:?} and the \
-         heartbeat {heartbeat:?}",
-        describe(&result)
-    );
-    race.assert_only_kept_rows_remain().await;
-    assert!(
-        matches!(progress, Err(LeaseError::LeaseLost { .. })),
-        "once the batch has ended, a progress write for the purged manifest is a lost lease: \
-         {progress:?}"
-    );
-    assert!(
-        matches!(heartbeat, Err(LeaseError::LeaseLost { .. })),
-        "once the batch has ended, a heartbeat for the purged manifest is a lost lease: \
-         {heartbeat:?}"
-    );
-    assert_manifest_not_found(&result);
+        let Some(fail_point) = hold_next(&race.app, &race.db_name, "insert", "resources").await
+        else {
+            return;
+        };
+        let batch_done = std::sync::atomic::AtomicBool::new(false);
+        let batch = race.ingest(entries(5, "v1"), FILE_URL);
+        let batch = async {
+            let result = batch.await;
+            batch_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        };
+        let after = async {
+            fail_point.wait_until_entered(1).await;
+            let held = Instant::now();
+            let stale_answer = race.writer.heartbeat(&stale).await;
+            assert!(
+                matches!(stale_answer, Err(LeaseError::LeaseLost { .. })),
+                "a fence that someone else moved, on a manifest that still exists, loses at \
+                 once, with a batch running or not: {stale_answer:?}"
+            );
+            race.purger
+                .purge_tenant_data(race.purged_id())
+                .await
+                .expect("purge");
+            assert!(
+                !batch_done.load(std::sync::atomic::Ordering::SeqCst),
+                "the {HOLD_MS} ms hold ended ({:?} after it began) before the purge returned, \
+                 so the batch was not held while it ran",
+                held.elapsed()
+            );
+            let renewal = race.writer.heartbeat(&lease).await;
+            assert!(
+                renewal.is_ok(),
+                "a heartbeat for a purged manifest, asked for while a batch of that manifest is \
+                 running on this instance, must be answered with a renewal, or the worker drops \
+                 the batch before its check: {renewal:?}"
+            );
+            race.writer.add_manifest_progress(&lease, 0, 1, 0).await
+        };
+        let result = {
+            let batch = std::pin::pin!(batch);
+            let after = std::pin::pin!(after);
+            match select(batch, after).await {
+                Either::Left((result, _unfinished)) => result,
+                Either::Right((progress, _unfinished)) => panic!(
+                    "the lost-lease answer of a progress write for a purged manifest came while \
+                     its batch was still running: {progress:?}"
+                ),
+            }
+        };
+        fail_point.off().await;
+
+        // The batch has ended, so nothing of this manifest is running any more and
+        // the manifest is gone: both writes now report what the worker may act on.
+        let progress = race.writer.add_manifest_progress(&lease, 0, 1, 0).await;
+        let heartbeat = race.writer.heartbeat(&lease).await;
+        eprintln!(
+            "the batch ended: {}; afterwards the progress write answered {progress:?} and the \
+             heartbeat {heartbeat:?}",
+            describe(&result)
+        );
+        race.assert_only_kept_rows_remain().await;
+        assert!(
+            matches!(progress, Err(LeaseError::LeaseLost { .. })),
+            "once the batch has ended, a progress write for the purged manifest is a lost lease: \
+             {progress:?}"
+        );
+        assert!(
+            matches!(heartbeat, Err(LeaseError::LeaseLost { .. })),
+            "once the batch has ended, a heartbeat for the purged manifest is a lost lease: \
+             {heartbeat:?}"
+        );
+        assert_manifest_not_found(&result);
+    })
+    .await;
 }
 
 /// The window the purge's early delete of the manifests closes: the purge is
@@ -1515,36 +1631,39 @@ async fn a_lost_lease_answer_waits_for_the_batch_of_a_purged_manifest() {
 /// `appName`, and the purge runs in a task of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_starting_while_the_purge_is_held_past_its_resources_delete_writes_nothing() {
-    let Some(race) = BulkRace::start("purgerheld").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    // The first delete the purge sends to `search_index`: the ledger of
-    // pending rows, the manifests and `resources` come before it.
-    let Some(fail_point) =
-        hold_next(&race.purger_app(), &race.db_name, "delete", "search_index").await
-    else {
-        return;
-    };
-    let purge = tokio::spawn({
-        let purger = Arc::clone(&race.purger);
-        let tenant = race.purged_id().to_string();
-        async move { purger.purge_tenant_data(&tenant).await }
-    });
-    fail_point.wait_until_entered(1).await;
-    let result = race.ingest(entries(5, "v1"), FILE_URL).await;
-    assert!(
-        !purge.is_finished(),
-        "the purge ended before the batch did, so it was not held while the batch ran"
-    );
-    fail_point.off().await;
-    purge
-        .await
-        .expect("the purge task panicked")
-        .expect("purge");
-    eprintln!("the batch ended: {}", describe(&result));
-    race.assert_only_kept_rows_remain().await;
-    assert_manifest_not_found(&result);
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("purgerheld").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        // The first delete the purge sends to `search_index`: the ledger of
+        // pending rows, the manifests and `resources` come before it.
+        let Some(fail_point) =
+            hold_next(&race.purger_app(), &race.db_name, "delete", "search_index").await
+        else {
+            return;
+        };
+        let purge = tokio::spawn({
+            let purger = Arc::clone(&race.purger);
+            let tenant = race.purged_id().to_string();
+            async move { purger.purge_tenant_data(&tenant).await }
+        });
+        fail_point.wait_until_entered(1).await;
+        let result = race.ingest(entries(5, "v1"), FILE_URL).await;
+        assert!(
+            !purge.is_finished(),
+            "the purge ended before the batch did, so it was not held while the batch ran"
+        );
+        fail_point.off().await;
+        purge
+            .await
+            .expect("the purge task panicked")
+            .expect("purge");
+        eprintln!("the batch ended: {}", describe(&result));
+        race.assert_only_kept_rows_remain().await;
+        assert_manifest_not_found(&result);
+    })
+    .await;
 }
 
 /// The purge is followed by a new write of one of the batch's ids by another
@@ -1552,80 +1671,83 @@ async fn a_batch_starting_while_the_purge_is_held_past_its_resources_delete_writ
 /// what the other writer made stays and nothing else of the tenant does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_purge_racing_an_ingest_keeps_the_recreated_tenants_rows() {
-    let Some(race) = BulkRace::start("ingrecreate").await else {
-        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
-        return;
-    };
-    let tenant = race.purged_id().to_string();
-    let recreated_id = resource_id(0);
-    let Some((recreated, result)) = while_held(
-        &race.app,
-        &race.db_name,
-        "insert",
-        "resources",
-        async {
-            race.purger.purge_tenant_data(&tenant).await.expect("purge");
-            race.purger
-                .seed_create(
-                    &race.purged,
-                    RESOURCE_TYPE,
-                    medication_request(&recreated_id),
-                    FhirVersion::default(),
-                )
-                .await
-                .expect("create the resource again after the purge");
-            let document = race
-                .client
-                .database(&race.db_name)
-                .collection::<Document>("resources")
-                .find_one(doc! {
-                    "tenant_id": &tenant,
-                    "resource_type": RESOURCE_TYPE,
-                    "id": &recreated_id,
-                })
-                .await
-                .expect("read the re-created resource")
-                .expect("the re-created resource exists");
-            let rows = tenant_rows(&race.client, &race.db_name, &tenant).await;
-            (document, rows)
-        },
-        race.ingest(entries(5, "v1"), FILE_URL),
-    )
-    .await
-    else {
-        return;
-    };
-    eprintln!("the batch ended: {}", describe(&result));
-    let (document, rows_before) = recreated;
-    let after = race
-        .client
-        .database(&race.db_name)
-        .collection::<Document>("resources")
-        .find_one(doc! {
-            "tenant_id": &tenant,
-            "resource_type": RESOURCE_TYPE,
-            "id": &recreated_id,
-        })
+    retrying_short_holds(|| async {
+        let Some(race) = BulkRace::start("ingrecreate").await else {
+            eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+            return;
+        };
+        let tenant = race.purged_id().to_string();
+        let recreated_id = resource_id(0);
+        let Some((recreated, result)) = while_held(
+            &race.app,
+            &race.db_name,
+            "insert",
+            "resources",
+            async {
+                race.purger.purge_tenant_data(&tenant).await.expect("purge");
+                race.purger
+                    .seed_create(
+                        &race.purged,
+                        RESOURCE_TYPE,
+                        medication_request(&recreated_id),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .expect("create the resource again after the purge");
+                let document = race
+                    .client
+                    .database(&race.db_name)
+                    .collection::<Document>("resources")
+                    .find_one(doc! {
+                        "tenant_id": &tenant,
+                        "resource_type": RESOURCE_TYPE,
+                        "id": &recreated_id,
+                    })
+                    .await
+                    .expect("read the re-created resource")
+                    .expect("the re-created resource exists");
+                let rows = tenant_rows(&race.client, &race.db_name, &tenant).await;
+                (document, rows)
+            },
+            race.ingest(entries(5, "v1"), FILE_URL),
+        )
         .await
-        .expect("read the re-created resource again")
-        .expect("the re-created resource survived");
-    assert_eq!(
-        (after.get("version_id"), after.get("last_updated")),
-        (document.get("version_id"), document.get("last_updated")),
-        "the re-created resource was replaced"
-    );
-    let rows_after = tenant_rows(&race.client, &race.db_name, &tenant).await;
-    eprintln!("rows of the tenant: {rows_before:?} before the batch landed, {rows_after:?} after");
-    assert_eq!(
-        rows_after, rows_before,
-        "the tenant holds more than the re-created resource and its rows (collection: documents)"
-    );
-    assert_eq!(
-        tenant_rows(&race.client, &race.db_name, &race.kept).await,
-        race.kept_rows,
-        "the kept tenant's documents changed"
-    );
-    assert_manifest_not_found(&result);
+        else {
+            return;
+        };
+        eprintln!("the batch ended: {}", describe(&result));
+        let (document, rows_before) = recreated;
+        let after = race
+            .client
+            .database(&race.db_name)
+            .collection::<Document>("resources")
+            .find_one(doc! {
+                "tenant_id": &tenant,
+                "resource_type": RESOURCE_TYPE,
+                "id": &recreated_id,
+            })
+            .await
+            .expect("read the re-created resource again")
+            .expect("the re-created resource survived");
+        assert_eq!(
+            (after.get("version_id"), after.get("last_updated")),
+            (document.get("version_id"), document.get("last_updated")),
+            "the re-created resource was replaced"
+        );
+        let rows_after = tenant_rows(&race.client, &race.db_name, &tenant).await;
+        eprintln!("rows of the tenant: {rows_before:?} before the batch landed, {rows_after:?} after");
+        assert_eq!(
+            rows_after, rows_before,
+            "the tenant holds more than the re-created resource and its rows (collection: documents)"
+        );
+        assert_eq!(
+            tenant_rows(&race.client, &race.db_name, &race.kept).await,
+            race.kept_rows,
+            "the kept tenant's documents changed"
+        );
+        assert_manifest_not_found(&result);
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------
