@@ -890,6 +890,11 @@ pub struct BulkSubmitConfig {
     /// error and the worker moves on. Set with
     /// `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT`.
     pub manifest_fetch_timeout_secs: u64,
+    /// Claims one manifest may use. A run that crashes the worker, hangs, or
+    /// loses its lease leaves the manifest to be claimed again; the claim past
+    /// this cap fails it instead. A graceful-shutdown release does not count.
+    /// Set with `HFS_BULK_SUBMIT_MAX_ATTEMPTS`.
+    pub max_attempts: u32,
     /// Wall-clock budget, in seconds, for downloading one JWE-encrypted input
     /// file, which is buffered whole before it can be decrypted. As for the
     /// manifest, the idle read timeout cannot bound a body that keeps
@@ -1009,6 +1014,7 @@ impl fmt::Debug for BulkSubmitConfig {
             max_line_bytes,
             fetch_read_timeout_secs,
             manifest_fetch_timeout_secs,
+            max_attempts,
             encrypted_file_fetch_timeout_secs,
             max_manifest_bytes,
             max_encrypted_file_bytes,
@@ -1055,6 +1061,7 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("max_line_bytes", max_line_bytes)
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
             .field("manifest_fetch_timeout_secs", manifest_fetch_timeout_secs)
+            .field("max_attempts", max_attempts)
             .field(
                 "encrypted_file_fetch_timeout_secs",
                 encrypted_file_fetch_timeout_secs,
@@ -1112,6 +1119,8 @@ impl Default for BulkSubmitConfig {
             max_line_bytes: helios_persistence::core::bulk_submit::DEFAULT_MAX_LINE_BYTES,
             fetch_read_timeout_secs: 60,
             manifest_fetch_timeout_secs: 600,
+            max_attempts:
+                helios_persistence::core::bulk_submit_worker::DEFAULT_MAX_MANIFEST_ATTEMPTS,
             encrypted_file_fetch_timeout_secs: 600,
             max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
             max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
@@ -1270,6 +1279,7 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT",
                 d.manifest_fetch_timeout_secs,
             ),
+            max_attempts: env.u32("HFS_BULK_SUBMIT_MAX_ATTEMPTS", d.max_attempts),
             encrypted_file_fetch_timeout_secs: env.u64(
                 "HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT",
                 d.encrypted_file_fetch_timeout_secs,
@@ -1392,6 +1402,9 @@ impl BulkSubmitConfig {
         }
         if self.manifest_fetch_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT must be > 0".to_string());
+        }
+        if self.max_attempts == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_ATTEMPTS must be >= 1".to_string());
         }
         if self.encrypted_file_fetch_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT must be > 0".to_string());

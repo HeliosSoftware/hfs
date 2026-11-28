@@ -130,6 +130,10 @@ pub struct ManifestLease {
     pub lease_duration: Duration,
     /// Monotonically increasing token, bumped on every claim.
     pub fencing_token: u64,
+    /// The manifest's claims so far, this one included. A graceful-shutdown
+    /// [`SubmitClaimStrategy::release`] gives its claim back, so this counts
+    /// the runs that ended without finishing: a crash, a hang, a lost lease.
+    pub attempt: u32,
 }
 
 impl ManifestLease {
@@ -404,8 +408,10 @@ pub struct PollTokenTarget {
 #[async_trait]
 pub trait SubmitClaimStrategy: Send + Sync {
     /// Atomically transitions one eligible manifest (`pending`, or `processing` with
-    /// an expired lease) to held-by-this-worker, bumping the fencing token. Returns
-    /// `Ok(None)` when no manifest is available.
+    /// an expired lease) to held-by-this-worker, bumping the fencing token and the
+    /// manifest's attempt count in the same write, so a crash between the claim
+    /// and the run still counts. The new count is [`ManifestLease::attempt`].
+    /// Returns `Ok(None)` when no manifest is available.
     async fn claim_next_manifest(
         &self,
         worker_id: &WorkerId,
@@ -420,11 +426,12 @@ pub trait SubmitClaimStrategy: Send + Sync {
     /// claim the manifest at once instead of waiting out the lease (#1531).
     ///
     /// The manifest goes back to `pending`, fenced on `worker_id` +
-    /// `fencing_token` and on still being `processing`. A later claim then
+    /// `fencing_token` and on still being `processing`, and gets back the
+    /// attempt its claim charged: a shutdown is not a failure of the manifest,
+    /// so rolling restarts must not spend its attempts. A later claim then
     /// finds it in the same state as a manifest whose lease lapsed, and that
     /// path is already safe:
     ///
-    /// - there is no attempt counter to refund;
     /// - the next run walks every file again from the top, and entries
     ///   already committed upsert idempotently. Each line is charged to the
     ///   counters once however many runs walk it (#1127), and byte progress
@@ -1251,6 +1258,9 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// that the idle read timeout cannot bound, since a body that keeps
     /// producing bytes never idles.
     manifest_fetch_timeout: Duration,
+    /// Claims one manifest may use (`HFS_BULK_SUBMIT_MAX_ATTEMPTS`). A claim
+    /// past it fails the manifest instead of running it.
+    max_attempts: u32,
     /// Longest NDJSON line buffered before parsing
     /// (`HFS_BULK_SUBMIT_MAX_LINE_BYTES`). `None` keeps the engine's default.
     max_line_bytes: Option<u64>,
@@ -1851,6 +1861,16 @@ fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
 /// Default for [`DefaultSubmitWorker::with_manifest_fetch_timeout`].
 pub const DEFAULT_MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Default for [`DefaultSubmitWorker::with_max_attempts`].
+pub const DEFAULT_MAX_MANIFEST_ATTEMPTS: u32 = 3;
+
+/// The terminal message of a manifest claimed past the attempt cap. It is
+/// shown to the submitter, so it names no worker, host or backend.
+pub fn abandoned_manifest_message(attempts: u32) -> String {
+    let unit = if attempts == 1 { "attempt" } else { "attempts" };
+    format!("manifest abandoned after {attempts} {unit}: each run of it ended without finishing")
+}
+
 /// Logs a run abandoned because its lease is gone. A lost lease is never
 /// silent: whoever reclaims the manifest walks it again from its first file,
 /// which on a large corpus costs hours (#1127).
@@ -1898,6 +1918,7 @@ where
             owned_file_executor: None,
             batch_size: None,
             manifest_fetch_timeout: DEFAULT_MANIFEST_FETCH_TIMEOUT,
+            max_attempts: DEFAULT_MAX_MANIFEST_ATTEMPTS,
             max_line_bytes: None,
             batch_writers: None,
             skip_unchanged: false,
@@ -1934,6 +1955,19 @@ where
     /// with a fetch error and the worker moves on.
     pub fn with_manifest_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.manifest_fetch_timeout = timeout.max(Duration::from_secs(1));
+        self
+    }
+
+    /// Sets how many claims one manifest may use
+    /// (`HFS_BULK_SUBMIT_MAX_ATTEMPTS`). Values below 1 are treated as 1.
+    ///
+    /// A run that crashes the worker, hangs, or otherwise loses its lease
+    /// leaves the manifest to be claimed again. The claim past this cap fails
+    /// the manifest with an error artifact, before anything is fetched,
+    /// instead of running it again. A graceful-shutdown release does not
+    /// count (see [`SubmitClaimStrategy::release`]).
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
         self
     }
 
@@ -2120,6 +2154,25 @@ where
         // would. `wind_down` tells the two apart afterwards (#1531).
         let _shutdown_bridge = ShutdownBridge::spawn(self.shutdown.clone(), cancel.clone());
 
+        if lease.attempt > self.max_attempts {
+            let attempts = lease.attempt - 1;
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                attempts,
+                "bulk-submit manifest abandoned: every run of it ended without finishing"
+            );
+            return self
+                .fail_before_ingest(
+                    &lease,
+                    keeper,
+                    &manifest_url,
+                    &abandoned_manifest_message(attempts),
+                    abandoned_manifest_message(attempts),
+                )
+                .await;
+        }
+
         // 1. Fetch the remote Bulk Export Manifest.
         self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
             .await;
@@ -2154,40 +2207,15 @@ where
             Ok(m) => m,
             Err(e) => {
                 let failure_message = e.to_string();
-                // Whatever a prior run of this manifest already ingested must
-                // stay searchable even though this run fails outright — sync
-                // it before the manifest goes terminal, while the lease (and
-                // this heartbeat) still covers the write. Best-effort: the
-                // manifest fails either way, and a miss here is repaired by
-                // $reindex.
-                if let Err(e) = self.jobs.sync_ingested(&lease).await {
-                    tracing::warn!(
-                        submission = %lease.submission_id,
-                        manifest = %lease.manifest_id,
-                        error = %e,
-                        "bulk-submit: failed to sync ingested resources before failing the \
-                         manifest on a fetch error"
-                    );
-                }
-                let fetch_error = self
-                    .write_manifest_error(
-                        &lease,
-                        &manifest_url,
-                        MANIFEST_FETCH_ERROR_PART_INDEX,
-                        &format!("failed to fetch manifest: {failure_message}"),
-                    )
-                    .await?;
-                let _ = self
-                    .publish_collected_artifacts(
+                return self
+                    .fail_before_ingest(
                         &lease,
                         keeper,
-                        vec![fetch_error],
-                        ManifestPublicationStatus::Failed {
-                            error_message: failure_message,
-                        },
+                        &manifest_url,
+                        &format!("failed to fetch manifest: {failure_message}"),
+                        failure_message,
                     )
-                    .await?;
-                return Ok(());
+                    .await;
             }
         };
 
@@ -3170,6 +3198,49 @@ where
     }
 
     /// Writes a single manifest-level `error` OperationOutcome artifact.
+    /// Fails the manifest before this run ingested anything: one error
+    /// artifact carrying `artifact_text`, then the terminal `failed` state
+    /// with `error_message`.
+    async fn fail_before_ingest(
+        &self,
+        lease: &ManifestLease,
+        keeper: LeaseKeeper,
+        manifest_url: &str,
+        artifact_text: &str,
+        error_message: String,
+    ) -> StorageResult<()> {
+        // Whatever a prior run of this manifest already ingested must stay
+        // searchable even though this run fails outright — sync it before the
+        // manifest goes terminal, while the lease (and this heartbeat) still
+        // covers the write. Best-effort: the manifest fails either way, and a
+        // miss here is repaired by $reindex.
+        if let Err(e) = self.jobs.sync_ingested(lease).await {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                error = %e,
+                "bulk-submit: failed to sync ingested resources before failing the manifest"
+            );
+        }
+        let error_file = self
+            .write_manifest_error(
+                lease,
+                manifest_url,
+                MANIFEST_FETCH_ERROR_PART_INDEX,
+                artifact_text,
+            )
+            .await?;
+        let _ = self
+            .publish_collected_artifacts(
+                lease,
+                keeper,
+                vec![error_file],
+                ManifestPublicationStatus::Failed { error_message },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn write_manifest_error(
         &self,
         lease: &ManifestLease,
@@ -5410,6 +5481,7 @@ mod tests {
             lease_expiry: Utc::now() + chrono::Duration::seconds(60),
             lease_duration: StdDuration::from_secs(60),
             fencing_token: 1,
+            attempt: 1,
         };
 
         let spool_dir = tempfile::tempdir().unwrap();
@@ -9263,6 +9335,132 @@ mod tests {
         );
     }
 
+    /// A fetcher no run may reach: the attempt cap fails the manifest first.
+    struct UnreachableFetcher;
+    #[async_trait]
+    impl SubmitInputFetcher for UnreachableFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _h: &[(String, String)],
+            _o: &[String],
+            _k: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            unreachable!("a manifest past its attempt cap is not fetched")
+        }
+        async fn open_file_stream(
+            &self,
+            _url: &str,
+            _h: &[(String, String)],
+            _r: bool,
+            _o: &[String],
+            _k: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            unreachable!("a manifest past its attempt cap is not fetched")
+        }
+    }
+
+    /// A manifest whose every run lets its lease lapse is claimed
+    /// `max_attempts` times; the next claim fails it with an error artifact
+    /// instead of running it again, and it is not handed out after that
+    /// (#2664).
+    #[tokio::test]
+    async fn test_a_manifest_past_its_attempt_cap_fails_without_running() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+        let sub_id = seed(&backend, &tenant).await;
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            Arc::new(UnreachableFetcher),
+            output,
+            WorkerId::new("w"),
+        )
+        .with_max_attempts(2);
+
+        for expected in 1..=2 {
+            let lapsed = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_millis(1))
+                .await
+                .unwrap()
+                .expect("a manifest with attempts left is claimable");
+            assert_eq!(lapsed.attempt, expected);
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+
+        let over = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the lapsed manifest is claimable again");
+        assert_eq!(over.attempt, 3);
+        worker.run_job(over).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].status,
+            crate::core::bulk_submit::ManifestStatus::Failed
+        );
+        let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        let error_row = files
+            .iter()
+            .find(|f| f.file_type == "error")
+            .expect("an error artifact for the abandoned manifest");
+        let job_id = submission_output_job_id(&sub_id);
+        let lines = read_submit_file_lines(
+            tmp.path(),
+            tenant.tenant_id().as_str(),
+            job_id.as_str(),
+            error_row,
+        );
+        assert_eq!(lines.len(), 1);
+        let oo: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert!(
+            oo["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("manifest abandoned after 2 attempts"),
+            "{oo}"
+        );
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed manifest is not claimed again"
+        );
+    }
+
+    /// A graceful release does not spend an attempt, so restarts alone never
+    /// reach the cap (#2664).
+    #[tokio::test]
+    async fn test_a_released_claim_is_not_an_attempt() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        seed(&backend, &tenant).await;
+
+        for _ in 0..5 {
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("a released manifest is claimable");
+            assert_eq!(lease.attempt, 1);
+            assert!(
+                SubmitClaimStrategy::release(backend.as_ref(), lease)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
     /// Seeds a submission whose single manifest carries the given `import` directives.
     async fn seed_with_import(
         backend: &Arc<SqliteBackend>,
@@ -10816,6 +11014,7 @@ mod tests {
             lease_expiry: Utc::now() + chrono::Duration::seconds(2),
             lease_duration: StdDuration::from_secs(2),
             fencing_token: 1,
+            attempt: 1,
         }
     }
 

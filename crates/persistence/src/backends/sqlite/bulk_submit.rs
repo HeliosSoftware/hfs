@@ -2210,11 +2210,12 @@ impl SubmitClaimStrategy for SqliteBackend {
             String,
             Option<String>,
             Option<String>,
+            i64,
         );
         let row: Option<Candidate> = conn
             .query_row(
                 "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token,
-                        m.status, m.worker_id, m.lease_expiry
+                        m.status, m.worker_id, m.lease_expiry, m.attempts
                  FROM bulk_manifests m
                  JOIN bulk_submissions s
                    ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
@@ -2251,6 +2252,7 @@ impl SubmitClaimStrategy for SqliteBackend {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -2265,15 +2267,18 @@ impl SubmitClaimStrategy for SqliteBackend {
             previous_status,
             previous_worker,
             previous_expiry,
+            attempts,
         )) = row
         else {
             return Ok(None);
         };
         let new_token = fencing_token + 1;
+        let attempt = attempts.max(0) + 1;
 
         conn.execute(
             "UPDATE bulk_manifests
-             SET status = 'processing', worker_id = ?1, lease_expiry = ?2, fencing_token = ?3
+             SET status = 'processing', worker_id = ?1, lease_expiry = ?2, fencing_token = ?3,
+                 attempts = ?8
              WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
             params![
                 worker_id.as_str(),
@@ -2282,7 +2287,8 @@ impl SubmitClaimStrategy for SqliteBackend {
                 tenant_id,
                 submitter,
                 submission_id,
-                manifest_id
+                manifest_id,
+                attempt
             ],
         )
         .map_err(|e| internal_error(format!("Failed to claim manifest: {}", e)))?;
@@ -2309,6 +2315,7 @@ impl SubmitClaimStrategy for SqliteBackend {
             lease_expiry,
             lease_duration,
             fencing_token: new_token as u64,
+            attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
         }))
     }
 
@@ -2366,7 +2373,8 @@ impl SubmitClaimStrategy for SqliteBackend {
         let released = conn
             .execute(
                 "UPDATE bulk_manifests
-                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL,
+                     attempts = MAX(attempts - 1, 0)
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
                    AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6
                    AND status = 'processing'",
@@ -7097,6 +7105,7 @@ mod tests {
             lease_expiry: Utc::now(),
             lease_duration: StdDuration::from_secs(60),
             fencing_token: 1,
+            attempt: 1,
         };
         assert_eq!(lease_retry_budget(&lease), StdDuration::from_secs(30));
         assert!(lease_retry_budget(&lease) < lease.lease_duration);

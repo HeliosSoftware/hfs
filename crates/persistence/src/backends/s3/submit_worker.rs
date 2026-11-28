@@ -624,6 +624,7 @@ impl SubmitClaimStrategy for S3Backend {
             state.worker_id = Some(worker_id.as_str().to_string());
             state.lease_expiry = Some(lease_expiry);
             state.fencing_token = new_token;
+            state.attempts = state.attempts.saturating_add(1);
 
             // Losing here means another worker claimed it between our read and
             // our write, or a conflicting write was in flight (409, #2047):
@@ -661,6 +662,7 @@ impl SubmitClaimStrategy for S3Backend {
                 lease_expiry,
                 lease_duration,
                 fencing_token: new_token,
+                attempt: state.attempts,
             }));
         }
 
@@ -687,6 +689,7 @@ impl SubmitClaimStrategy for S3Backend {
                     state.manifest.status = ManifestStatus::Pending;
                     state.worker_id = None;
                     state.lease_expiry = None;
+                    state.attempts = state.attempts.saturating_sub(1);
                 },
             )
             .await

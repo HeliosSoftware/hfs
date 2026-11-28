@@ -15,7 +15,7 @@ use crate::error::{BackendError, StorageResult};
 ///
 /// A build refuses to start on a database that records a newer version, and
 /// never lowers the recorded one (#2367).
-pub const SCHEMA_VERSION: i32 = 56;
+pub const SCHEMA_VERSION: i32 = 57;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -599,6 +599,7 @@ async fn migrate_schema(
             54 => migrate_v54_to_v55(client).await?,
             // Same shape as v55: column, batched backfill, concurrent indexes.
             55 => migrate_v55_to_v56(client, fresh).await?,
+            56 => migrate_v56_to_v57(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -607,6 +608,21 @@ async fn migrate_schema(
         set_schema_version(client, version).await?;
     }
 
+    Ok(())
+}
+
+/// v56 -> v57 (#2664): `bulk_manifests.attempts`, the claims a manifest has
+/// used. A claim past `HFS_BULK_SUBMIT_MAX_ATTEMPTS` fails the manifest
+/// instead of running it. The default is a constant, so the `ALTER` rewrites
+/// nothing.
+async fn migrate_v56_to_v57(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .batch_execute(
+            "ALTER TABLE bulk_manifests
+                 ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v56->v57 failed: {e}")))?;
     Ok(())
 }
 
@@ -7977,7 +7993,7 @@ mod postgres_integration_migrations {
             .await
             .expect("migrate v54 to v55");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 56);
+        assert_eq!(SCHEMA_VERSION, 57);
         for (i, vector) in vectors.iter().enumerate() {
             let got: Option<String> = client
                 .query_one(
@@ -8144,7 +8160,7 @@ mod postgres_integration_migrations {
             .await
             .expect("migrate v55 to v56");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 56);
+        assert_eq!(SCHEMA_VERSION, 57);
 
         async fn assert_state(client: &deadpool_postgres::Client) {
             {
@@ -9975,7 +9991,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 56);
+        assert_eq!(SCHEMA_VERSION, 57);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
