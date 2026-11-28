@@ -381,7 +381,7 @@ Options:
 | `HTS_DATABASE_URL` | ./data/hts.db | SQLite database file path |
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` or `postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
-| `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+| `HTS_CORS_ORIGINS` | * | Allowed CORS origins. A write (`POST /import`, resource create, update or delete, `$closure`) sent by a page on another origin is refused with `403` unless its origin is listed here explicitly; `*` lists none. Reads and non-browser clients are not affected. |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. Not checked when `count` pages the response, except for a tree (`hierarchical=true`) expansion, which ignores `count` and is always checked. |
 | `HTS_MAX_EXPANSION_SIZE_CEILING` | 100000 | Largest value a request may set the limit to through the `X-TOO-COSTLY-THRESHOLD` header. The header lowers the limit for its own request or raises it up to this ceiling, never beyond. A ceiling below `HTS_MAX_EXPANSION_SIZE` is treated as `HTS_MAX_EXPANSION_SIZE`, with a warning at startup. The built-in web UI offers thresholds up to this value. |

@@ -29,7 +29,7 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_BOOTSTRAP_DIR` | none | Directory of terminology files imported on startup |
 | `HTS_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, applied after decompression |
 | `HTS_ENABLE_CORS` | `true` | Enable CORS |
-| `HTS_CORS_ORIGINS` | `*` | Allowed CORS origins |
+| `HTS_CORS_ORIGINS` | `*` | Allowed CORS origins. A write (`POST /import`, resource create, update or delete, `$closure`) sent by a page on another origin is refused with `403` unless its origin is listed here explicitly; `*` lists none. Reads and non-browser clients are not affected |
 
 ## Bootstrap Directory Sync
 

@@ -277,7 +277,16 @@ where
                 .put(update_concept_map::<B>)
                 .delete(delete_concept_map::<B>),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn({
+            let allowed = crate::cross_origin::AllowedOrigins::from_config(
+                config.enable_cors,
+                &config.cors_origins,
+            );
+            move |request, next| {
+                crate::cross_origin::refuse_foreign_writes(allowed.clone(), request, next)
+            }
+        }));
 
     // Merge the optional UI router before wrapping the whole app in the
     // observability / cors / timeout / trace layers so the UI benefits from
