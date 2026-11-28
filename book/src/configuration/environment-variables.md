@@ -2,6 +2,8 @@
 
 All server behavior is controlled through environment variables. No configuration files are required.
 
+At startup, `hfs` logs a warning for each `HFS_*` variable that is set but that no Helios component reads, naming the closest known variable when there is one (for example `HFS_AUTH_TENANT_CLAIMS is set but no Helios component reads it; did you mean HFS_AUTH_TENANT_CLAIM?`). A misspelt name otherwise leaves the setting it meant at its default. Values are never logged.
+
 ## Server
 
 | Variable | Default | Description |
