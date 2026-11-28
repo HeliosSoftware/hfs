@@ -237,8 +237,9 @@ impl TenantSourceExtractor for JwtTenantExtractor {
     /// at all, making it the one path that could put an arbitrary string into a
     /// storage key. It is now held to the same charset as every other source.
     ///
-    /// An empty claim stays `Ok(None)`: the extractor already treats "empty" as
-    /// "no claim" and has a dedicated fail-loud path for it.
+    /// An empty claim stays `Ok(None)`. The bearer provider refuses one with
+    /// 401 (#2703), so this only covers a `Principal` built some other way; the
+    /// extractor reads it as "no claim" and has a dedicated fail-loud path.
     fn extract(
         &self,
         parts: &Parts,
