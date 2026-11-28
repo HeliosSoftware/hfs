@@ -241,6 +241,7 @@ run_arm() {
   # nothing on the ingest path.
   HFS_BASE_URL="$url" \
   HFS_BULK_SUBMIT_ENABLED=true \
+  HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true \
   HFS_BULK_SUBMIT_DEFER_INDEXING="$defer" \
   HFS_BULK_SUBMIT_POLL_RATE_LIMIT=100000 \
   HFS_LOG_LEVEL=info \

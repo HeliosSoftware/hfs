@@ -3462,10 +3462,21 @@ async fn build_bulk_submit(
     // go (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS); empty permits every origin.
     let trusted_providers =
         helios_rest::bulk_submit_oauth::TrustedProviders::parse(&cfg.trusted_providers)
-            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?;
-    if trusted_providers.is_empty() {
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_TRUSTED_PROVIDERS is invalid: {e}"))?
+            .allowing_private_networks(cfg.allow_private_networks);
+    if !trusted_providers.is_empty() {
+        if cfg.allow_private_networks {
+            tracing::info!(
+                "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS has no effect: HFS_BULK_SUBMIT_TRUSTED_PROVIDERS already confines $bulk-submit to the listed origins"
+            );
+        }
+    } else if cfg.allow_private_networks {
+        tracing::warn!(
+            "HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS is set: $bulk-submit fetches from any origin a submitter names, loopback, private and link-local addresses included (local development and CI only); list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS instead"
+        );
+    } else {
         tracing::info!(
-            "$bulk-submit fetches from any origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
+            "$bulk-submit fetches from any public origin a submitter names; list the Data Providers in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS to confine it"
         );
     }
     #[cfg(feature = "ui")]

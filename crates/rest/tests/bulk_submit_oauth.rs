@@ -70,8 +70,7 @@ async fn test_outbound_client_credentials_discovery_and_cache() {
     });
 
     // --- Provider acquires + caches a read-scoped token. ---
-    let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
-        .expect("parse ES384 key");
+    let provider = loopback_provider().expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
 
     let file = format!("{base}/bulk/Patient.ndjson");
@@ -125,10 +124,21 @@ async fn test_outbound_unparseable_key_rejected() {
     assert!(JwtClientCredentialsTokenProvider::new("c", "not-a-key", "ES384").is_none());
 }
 
+/// A provider with no trusted origins listed that may reach the loopback test
+/// servers, which it would refuse by default.
+fn loopback_provider() -> Option<Arc<JwtClientCredentialsTokenProvider>> {
+    JwtClientCredentialsTokenProvider::new_with(
+        "client-1",
+        TEST_ES384_PKCS8,
+        "ES384",
+        TrustedProviders::default().allowing_private_networks(true),
+        ClientTimeouts::default(),
+    )
+}
+
 #[tokio::test]
 async fn test_outbound_discovery_failure_returns_none() {
-    let provider =
-        JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384").unwrap();
+    let provider = loopback_provider().unwrap();
     // Unreachable metadata URL → no token.
     let discovery = vec!["http://127.0.0.1:1/.well-known/smart-configuration".to_string()];
     let err = provider
@@ -194,7 +204,9 @@ fn provider(trusted: &[&str]) -> Arc<JwtClientCredentialsTokenProvider> {
         "client-1",
         TEST_ES384_PKCS8,
         "ES384",
-        TrustedProviders::parse(trusted).expect("test origins parse"),
+        TrustedProviders::parse(trusted)
+            .expect("test origins parse")
+            .allowing_private_networks(true),
     )
     .expect("parse ES384 key")
 }
@@ -383,8 +395,7 @@ async fn a_huge_expires_in_is_bounded_not_a_panic() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let provider = JwtClientCredentialsTokenProvider::new("client-1", TEST_ES384_PKCS8, "ES384")
-        .expect("parse ES384 key");
+    let provider = loopback_provider().expect("parse ES384 key");
     let discovery = vec![format!("{base}/.well-known/smart-configuration")];
     let destination = format!("{base}/file.ndjson");
     assert_eq!(
@@ -419,10 +430,11 @@ async fn a_provider_that_never_answers_is_given_up_on() {
         }
     });
 
-    let provider = JwtClientCredentialsTokenProvider::new_with_timeouts(
+    let provider = JwtClientCredentialsTokenProvider::new_with(
         "client-1",
         TEST_ES384_PKCS8,
         "ES384",
+        TrustedProviders::default().allowing_private_networks(true),
         ClientTimeouts {
             connect: Duration::from_secs(1),
             read: Duration::from_secs(1),

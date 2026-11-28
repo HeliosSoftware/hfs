@@ -137,6 +137,10 @@ const child = spawn(bin, [], {
     // 400-line fixture in bulk-submit-ingest.spec.ts to ~20 movements. Lowering
     // this is what let that fixture shrink 5x without losing a single sample.
     HFS_BULK_SUBMIT_BATCH_SIZE: "20",
+    // The Import page specs serve their manifests and NDJSON from 127.0.0.1
+    // (pages/ndjson-provider.ts, pages/bulk-submit-source.ts), which
+    // $bulk-submit refuses unless private networks are allowed.
+    HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS: "true",
     // Home dashboard cadences (#1078), tuned so dashboard.spec.ts watches the
     // figures move and settle in seconds instead of sitting through production
     // timings. pages/dashboard.ts (DASH_KNOBS) mirrors these values and sizes

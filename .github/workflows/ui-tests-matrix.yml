@@ -376,6 +376,10 @@ jobs:
           export HFS_DATA_DIR="$GITHUB_WORKSPACE/data"
           export HFS_NL_SEARCH_API_KEY="e2e-placeholder-not-a-real-key"
           export HFS_DEFAULT_FHIR_VERSION=R4
+          # The Import page specs serve their bulk-submit sources from the
+          # Playwright container, a private address $bulk-submit refuses
+          # unless private networks are allowed.
+          export HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS=true
           # The browser runs in the Playwright container and reaches HFS over
           # the runner's IP, so that is the origin HFS must advertise: every
           # Bundle paging link, fullUrl and export manifest URL is built from

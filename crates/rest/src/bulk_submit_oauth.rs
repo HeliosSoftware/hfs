@@ -67,10 +67,21 @@ fn token_ttl(expires_in: u64) -> Duration {
 /// token obtained there may be sent. Parsed from
 /// `HFS_BULK_SUBMIT_TRUSTED_PROVIDERS`.
 ///
-/// Empty (the default) lets the submitter name any origin and confines a
-/// token to the origin of the token endpoint that issued it.
+/// Empty (the default) lets the submitter name any origin except a loopback,
+/// private or link-local address (see [`crate::bulk_submit_egress`]; allowed
+/// with `HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`), and confines a token to
+/// the origin of the token endpoint that issued it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrustedProviders(Vec<String>);
+pub struct TrustedProviders {
+    origins: Vec<String>,
+    /// With no origin listed, whether requests may reach loopback, private
+    /// and link-local addresses.
+    private_networks: bool,
+}
+
+/// Why a URL outside a configured list was refused, after the URL itself.
+const NOT_LISTED: &str =
+    "is not at a trusted Data Provider origin; list it in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS";
 
 /// Redirect hops followed, as reqwest's default policy allows.
 const MAX_REDIRECTS: usize = 10;
@@ -102,58 +113,105 @@ impl TrustedProviders {
                 origins.push(origin);
             }
         }
-        Ok(Self(origins))
+        Ok(Self {
+            origins,
+            private_networks: false,
+        })
+    }
+
+    /// Lets requests reach loopback, private and link-local addresses while
+    /// no origin is listed (`HFS_BULK_SUBMIT_ALLOW_PRIVATE_NETWORKS`): local
+    /// development, CI fixtures, and providers inside the operator's network.
+    pub fn allowing_private_networks(mut self, allowed: bool) -> Self {
+        self.private_networks = allowed;
+        self
     }
 
     /// `true` when no origin is listed.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.origins.is_empty()
     }
 
     /// Whether `origin` is listed.
     pub fn contains(&self, origin: &str) -> bool {
-        self.0.iter().any(|o| o == origin)
+        self.origins.iter().any(|o| o == origin)
     }
 
-    /// Whether `$bulk-submit` may send a request to `url`: anywhere when no
-    /// origin is listed, otherwise only to a listed origin. A URL without an
-    /// origin (an opaque scheme) is never permitted by a configured list.
+    /// Whether the address rules of [`crate::bulk_submit_egress`] apply: no
+    /// origin is listed and private networks are not allowed.
+    fn guards_addresses(&self) -> bool {
+        self.is_empty() && !self.private_networks
+    }
+
+    /// Why `$bulk-submit` may not send a request to `url`, or `None` when it
+    /// may. With a list configured only a listed origin is permitted, and a
+    /// URL without an origin (an opaque scheme) never is. Without one any
+    /// origin is, except a literal loopback, private or link-local address
+    /// while private networks are not allowed; a name that resolves to one
+    /// is refused when the client connects.
+    pub fn refusal(&self, url: &str) -> Option<&'static str> {
+        if !self.is_empty() {
+            let listed = origin_of(url).is_some_and(|origin| self.contains(&origin));
+            return (!listed).then_some(NOT_LISTED);
+        }
+        let blocked = self.guards_addresses()
+            && reqwest::Url::parse(url)
+                .is_ok_and(|url| crate::bulk_submit_egress::url_is_blocked(&url));
+        blocked.then_some(crate::bulk_submit_egress::REFUSED_DESTINATION)
+    }
+
+    /// Whether `$bulk-submit` may send a request to `url` (see [`Self::refusal`]).
     pub fn permits_url(&self, url: &str) -> bool {
-        self.is_empty() || origin_of(url).is_some_and(|origin| self.contains(&origin))
+        self.refusal(url).is_none()
     }
 
-    /// The redirect policy of a client that sends `$bulk-submit` requests:
-    /// with a list configured a hop is followed only to a listed origin,
-    /// otherwise reqwest's default policy applies. Both the file fetcher and
-    /// the OAuth client use it, so neither the manifest and file GETs nor the
-    /// metadata GET and the token POST (whose body is the signed client
-    /// assertion) leave the listed origins by way of a redirect.
+    /// A client builder for `$bulk-submit` requests, with the redirect policy
+    /// below and, while the address rules apply, a resolver that drops
+    /// loopback, private and link-local addresses. Both the file fetcher and
+    /// the OAuth client start from it.
+    pub(crate) fn client_builder(&self) -> reqwest::ClientBuilder {
+        let builder = reqwest::Client::builder().redirect(self.redirect_policy());
+        if self.guards_addresses() {
+            builder.dns_resolver(Arc::new(crate::bulk_submit_egress::PublicOnlyResolver))
+        } else {
+            builder
+        }
+    }
+
+    /// The redirect policy of a client that sends `$bulk-submit` requests: a
+    /// hop is followed only to a URL [`Self::permits_url`] accepts, so neither
+    /// the manifest and file GETs nor the metadata GET and the token POST
+    /// (whose body is the signed client assertion) leave the listed origins,
+    /// or reach a literal private address, by way of a redirect. With no list
+    /// and private networks allowed, reqwest's default policy applies.
     pub(crate) fn redirect_policy(&self) -> reqwest::redirect::Policy {
-        if self.is_empty() {
+        if self.is_empty() && !self.guards_addresses() {
             return reqwest::redirect::Policy::default();
         }
         let trusted = self.clone();
         reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
-                attempt.error("too many redirects")
-            } else if trusted.permits_url(attempt.url().as_str()) {
-                attempt.follow()
-            } else {
-                attempt.error(
+                return attempt.error("too many redirects");
+            }
+            match trusted.refusal(attempt.url().as_str()) {
+                None => attempt.follow(),
+                Some(_) if !trusted.is_empty() => attempt.error(
                     "redirected to an origin not listed in HFS_BULK_SUBMIT_TRUSTED_PROVIDERS",
-                )
+                ),
+                Some(reason) => attempt.error(format!("redirected to a URL that {reason}")),
             }
         })
     }
 
-    /// With a list configured, refuses an origin outside it.
+    /// Refuses an origin outside a configured list, or, without one, a
+    /// literal private address.
     fn require(&self, origin: &str) -> Result<(), FileTokenError> {
-        if self.is_empty() || self.contains(origin) {
-            Ok(())
-        } else {
-            Err(FileTokenError::UntrustedProvider {
+        match self.refusal(origin) {
+            None => Ok(()),
+            Some(_) if !self.is_empty() => Err(FileTokenError::UntrustedProvider {
                 origin: origin.to_string(),
-            })
+            }),
+            Some(reason) => Err(FileTokenError::Unavailable(format!("{origin} {reason}"))),
         }
     }
 }
@@ -164,6 +222,19 @@ impl TrustedProviders {
 pub(crate) fn origin_of(url: &str) -> Option<String> {
     let origin = reqwest::Url::parse(url).ok()?.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// Why a request the OAuth client sent failed: the refusal when its host
+/// resolved only to private addresses, the transport error otherwise.
+fn send_failure(what: &str, shown: &str, error: &reqwest::Error) -> String {
+    if crate::bulk_submit_egress::is_blocked_resolution(error) {
+        format!(
+            "{what} {shown} refused: the host {}",
+            crate::bulk_submit_egress::REFUSED_DESTINATION
+        )
+    } else {
+        format!("{what} {shown} failed: {error}")
+    }
 }
 
 /// Acquires read-scoped bearer tokens via SMART Backend Services `client_credentials`.
@@ -248,11 +319,11 @@ impl JwtClientCredentialsTokenProvider {
         let kid = derive_public_jwk(private_key_pem, signing_alg)
             .and_then(|jwk| jwk.get("kid").and_then(|v| v.as_str()).map(String::from));
         // `Client::new()` panics the same way when the TLS backend cannot start.
-        let client = reqwest::Client::builder()
+        let client = trusted_providers
+            .client_builder()
             .connect_timeout(timeouts.connect)
             .read_timeout(timeouts.read)
             .timeout(timeouts.total)
-            .redirect(trusted_providers.redirect_policy())
             .build()
             .expect("bulk-submit OAuth HTTP client configuration is valid");
         Some(Arc::new(Self {
@@ -278,7 +349,7 @@ impl JwtClientCredentialsTokenProvider {
             .get(oauth_metadata_url)
             .send()
             .await
-            .map_err(|e| unavailable(format!("metadata GET {shown} failed: {e}")))?;
+            .map_err(|e| unavailable(send_failure("metadata GET", &shown, &e)))?;
         if !resp.status().is_success() {
             return Err(unavailable(format!(
                 "metadata GET {shown} returned HTTP {}",
@@ -337,7 +408,7 @@ impl JwtClientCredentialsTokenProvider {
             .form(&params)
             .send()
             .await
-            .map_err(|e| unavailable(format!("token POST {shown} failed: {e}")))?;
+            .map_err(|e| unavailable(send_failure("token POST", &shown, &e)))?;
         if !resp.status().is_success() {
             return Err(unavailable(format!(
                 "token POST {shown} returned HTTP {}",
@@ -510,10 +581,13 @@ gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
         .expect("origins parse");
         assert_eq!(
             trusted,
-            TrustedProviders(vec![
-                "https://auth.example.org".to_string(),
-                "https://files.example.org:8443".to_string(),
-            ])
+            TrustedProviders {
+                origins: vec![
+                    "https://auth.example.org".to_string(),
+                    "https://files.example.org:8443".to_string(),
+                ],
+                private_networks: false,
+            }
         );
         assert!(trusted.contains("https://auth.example.org"));
         assert!(!trusted.contains("http://auth.example.org"));
@@ -555,6 +629,75 @@ gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
                 origin: "https://other.example.org".to_string()
             })
         );
+    }
+
+    #[test]
+    fn without_a_list_private_addresses_are_refused_unless_allowed() {
+        let guarded = TrustedProviders::default();
+        for url in [
+            "http://127.0.0.1:9/internal-probe",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+            "https://10.0.0.5/.well-known/smart-configuration",
+        ] {
+            assert_eq!(
+                guarded.refusal(url),
+                Some(crate::bulk_submit_egress::REFUSED_DESTINATION),
+                "{url}"
+            );
+        }
+        assert_eq!(guarded.refusal("https://provider.example.org/m.json"), None);
+        assert!(matches!(
+            guarded.require("http://169.254.169.254"),
+            Err(FileTokenError::Unavailable(reason)) if reason.contains("is not a permitted destination")
+        ));
+
+        let allowed = TrustedProviders::default().allowing_private_networks(true);
+        assert_eq!(allowed.refusal("http://127.0.0.1:9/internal-probe"), None);
+        assert_eq!(allowed.require("http://169.254.169.254"), Ok(()));
+
+        // A listed private origin is the operator's choice; an unlisted one is
+        // refused as unlisted, with or without the switch.
+        for listed in [
+            TrustedProviders::parse(["http://10.0.0.5:8080"]).unwrap(),
+            TrustedProviders::parse(["http://10.0.0.5:8080"])
+                .unwrap()
+                .allowing_private_networks(true),
+        ] {
+            assert_eq!(listed.refusal("http://10.0.0.5:8080/m.json"), None);
+            assert_eq!(
+                listed.refusal("http://10.0.0.6:8080/m.json"),
+                Some(NOT_LISTED)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_list_the_oauth_client_does_not_reach_a_private_address() {
+        let server = wiremock::MockServer::start().await;
+        let provider =
+            JwtClientCredentialsTokenProvider::new("cid", TEST_ES384_PEM, "ES384").unwrap();
+        for metadata in [
+            format!("{}/.well-known/smart-configuration", server.uri()),
+            format!(
+                "http://localhost:{}/.well-known/smart-configuration",
+                server.address().port()
+            ),
+        ] {
+            let err = provider
+                .token(
+                    std::slice::from_ref(&metadata),
+                    "system/*.rs",
+                    "https://files.example.org/a.ndjson",
+                )
+                .await
+                .expect_err("no private address is reached");
+            assert!(
+                matches!(&err, FileTokenError::Unavailable(reason) if reason.contains("not a permitted destination")),
+                "{metadata}: {err}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

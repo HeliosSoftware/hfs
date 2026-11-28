@@ -416,7 +416,9 @@ fn check_poll_rate_limit(
 /// the submitter learns it now rather than from a failed manifest. With no
 /// list configured every origin is accepted.
 fn check_sources(req: &SubmitRequest, cfg: &BulkSubmitConfig) -> RestResult<()> {
-    let trusted = TrustedProviders::parse(&cfg.trusted_providers).unwrap_or_default();
+    let trusted = TrustedProviders::parse(&cfg.trusted_providers)
+        .unwrap_or_default()
+        .allowing_private_networks(cfg.allow_private_networks);
     let named = req
         .manifest_url
         .iter()
@@ -427,9 +429,9 @@ fn check_sources(req: &SubmitRequest, cfg: &BulkSubmitConfig) -> RestResult<()> 
                 .map(|url| ("oauthMetadataUrl", url)),
         );
     for (parameter, url) in named {
-        if !trusted.permits_url(url) {
+        if let Some(reason) = trusted.refusal(url) {
             return Err(bad_request(format!(
-                "`{parameter}` {} is not at a trusted Data Provider origin (HFS_BULK_SUBMIT_TRUSTED_PROVIDERS)",
+                "`{parameter}` {} {reason}",
                 redact_url(url)
             )));
         }
