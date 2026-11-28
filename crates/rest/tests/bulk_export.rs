@@ -1417,6 +1417,148 @@ async fn test_capability_statement_advertises_export() {
         cs["instantiates"][0],
         "http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"
     );
+    assert_eq!(
+        export_entries(&cs),
+        [
+            "export",
+            "patient-export",
+            "group-export",
+            "Group:export",
+            "Patient:export"
+        ]
+    );
+}
+
+/// Every Bulk Data export entry `/metadata` can carry: the system-level
+/// `rest.operation` ones, then `Type:export` for each `rest.resource` that
+/// lists `$export`.
+fn export_entries(cs: &Value) -> Vec<String> {
+    let mut entries: Vec<String> = cs["rest"][0]["operation"]
+        .as_array()
+        .expect("operation array")
+        .iter()
+        .filter_map(|o| o["name"].as_str())
+        .filter(|n| matches!(*n, "export" | "patient-export" | "group-export"))
+        .map(str::to_string)
+        .collect();
+    for resource in cs["rest"][0]["resource"].as_array().expect("resources") {
+        let lists_export = resource["operation"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|o| o["name"] == "export"));
+        if lists_export {
+            entries.push(format!("{}:export", resource["type"].as_str().unwrap()));
+        }
+    }
+    entries
+}
+
+/// What each export kick-off answers on `server`, system, Patient and Group,
+/// after storing the Group `g1` the Group kick-off names.
+async fn kickoff_statuses(server: &TestServer) -> Vec<StatusCode> {
+    let group = json!({
+        "resourceType": "Group",
+        "id": "g1",
+        "type": "person",
+        "actual": true
+    });
+    let put = server
+        .put("/Group/g1")
+        .add_header("x-tenant-id", "test-tenant")
+        .json(&group)
+        .await;
+    assert!(put.status_code().is_success(), "{}", put.text());
+    let mut statuses = Vec::new();
+    for path in ["/$export", "/Patient/$export", "/Group/g1/$export"] {
+        let resp = server
+            .get(&format!("{path}?_type=Patient"))
+            .add_header("x-tenant-id", "test-tenant")
+            .add_header("prefer", "respond-async")
+            .await;
+        statuses.push(resp.status_code());
+    }
+    statuses
+}
+
+/// A SQLite server whose `AppState` has no bulk-export job store, as `hfs`
+/// builds it on standalone S3 and on a build without the `sqlite` feature,
+/// with `bulk_export.enabled` as given.
+fn server_without_bulk_export(enabled: bool) -> TestServer {
+    let backend = SqliteBackend::with_config(":memory:", Default::default()).expect("SQLite");
+    backend.init_schema().expect("init schema");
+    let mut config = ServerConfig::for_testing();
+    config.bulk_export.enabled = enabled;
+    let state = helios_rest::AppState::new(Arc::new(backend), config);
+    TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).expect("server")
+}
+
+/// The statement and the kick-offs read the same thing (#3015). With no job
+/// store wired, every kick-off answers `501`, so no export entry is listed at
+/// any level, and `instantiates` (the bulk-data CapabilityStatement) goes
+/// with them. The wired server is the control: it lists all five entries and
+/// accepts all three kick-offs.
+#[tokio::test]
+async fn test_capability_statement_omits_export_without_a_job_store() {
+    let (wired, _backend, _output, _tmp) = create_bulk_export_server().await;
+    let cs: Value = wired
+        .get("/metadata")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(export_entries(&cs).len(), 5, "{:?}", export_entries(&cs));
+    assert_eq!(kickoff_statuses(&wired).await, [StatusCode::ACCEPTED; 3]);
+
+    let server = server_without_bulk_export(true);
+    let cs: Value = server
+        .get("/metadata")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(export_entries(&cs), Vec::<String>::new());
+    assert!(cs.get("instantiates").is_none(), "{}", cs["instantiates"]);
+    assert_eq!(
+        kickoff_statuses(&server).await,
+        [StatusCode::NOT_IMPLEMENTED; 3]
+    );
+}
+
+/// `HFS_BULK_EXPORT_ENABLED=false` with the job store wired: every kick-off
+/// answers `501`, and no export entry is listed, the per-resource ones
+/// included (they used to ignore the flag) (#3015).
+#[tokio::test]
+async fn test_capability_statement_omits_export_when_disabled() {
+    let backend = Arc::new(SqliteBackend::with_config(":memory:", Default::default()).unwrap());
+    backend.init_schema().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+    let mut config = ServerConfig::for_testing();
+    config.bulk_export.enabled = false;
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
+        backend.clone() as Arc<dyn BulkExportJobStore>,
+        output as Arc<dyn ExportOutputStore>,
+        Arc::new(BearerScopeAuth),
+    );
+    let server =
+        TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).expect("server");
+
+    let cs: Value = server
+        .get("/metadata")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(export_entries(&cs), Vec::<String>::new());
+    assert!(cs.get("instantiates").is_none(), "{}", cs["instantiates"]);
+    assert_eq!(
+        kickoff_statuses(&server).await,
+        [StatusCode::NOT_IMPLEMENTED; 3]
+    );
+
+    // A server with no job store, flag off too, says the same.
+    let cs: Value = server_without_bulk_export(false)
+        .get("/metadata")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(export_entries(&cs), Vec::<String>::new());
 }
 
 /// Downloads an export output file and parses each NDJSON line as JSON.

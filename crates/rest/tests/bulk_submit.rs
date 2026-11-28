@@ -2627,3 +2627,76 @@ async fn test_kickoff_refuses_a_manifest_outside_the_trusted_providers() {
         "the listed origin is accepted"
     );
 }
+
+/// Which of `$bulk-submit` and `$bulk-submit-status` `/metadata` lists in
+/// `rest.operation`.
+async fn submit_entries(server: &TestServer) -> Vec<String> {
+    let cs: Value = server.get("/metadata").await.json();
+    cs["rest"][0]["operation"]
+        .as_array()
+        .expect("operation array")
+        .iter()
+        .filter_map(|o| o["name"].as_str())
+        .filter(|n| n.starts_with("bulk-submit"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What a status-only `$bulk-submit` kick-off, then `$bulk-submit-status` for
+/// the same submission, answer on `server`.
+async fn submit_statuses(server: &TestServer) -> [StatusCode; 2] {
+    let kickoff = server
+        .post("/$bulk-submit")
+        .json(&status_only_body("cap-1", "in-progress"))
+        .await
+        .status_code();
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body_for("cap-1"))
+        .await
+        .status_code();
+    [kickoff, status]
+}
+
+/// The statement and both handlers read the same thing (#3015): submit is
+/// listed exactly where it is enabled and a job store is wired. The wired
+/// server is the control; with no job store (an S3 backend that cannot run
+/// the submit worker) and with `HFS_BULK_SUBMIT_ENABLED=false`, both
+/// operations answer `501` and neither is listed.
+#[tokio::test]
+async fn test_capability_statement_lists_submit_exactly_where_served() {
+    let (wired, _backend, _fetcher, _output, _tmp) = create_submit_server().await;
+    assert_eq!(
+        submit_entries(&wired).await,
+        ["bulk-submit", "bulk-submit-status"]
+    );
+    assert_eq!(
+        submit_statuses(&wired).await,
+        [StatusCode::OK, StatusCode::ACCEPTED]
+    );
+
+    let backend = SqliteBackend::with_config(":memory:", Default::default()).expect("SQLite");
+    backend.init_schema().expect("init schema");
+    let state = helios_rest::AppState::new(Arc::new(backend), ServerConfig::for_testing());
+    let no_job_store =
+        TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).expect("server");
+    assert_eq!(submit_entries(&no_job_store).await, Vec::<String>::new());
+    assert_eq!(
+        submit_statuses(&no_job_store).await,
+        [StatusCode::NOT_IMPLEMENTED; 2]
+    );
+
+    let (disabled, _backend, _fetcher, _output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            enabled: false,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(submit_entries(&disabled).await, Vec::<String>::new());
+    assert_eq!(
+        submit_statuses(&disabled).await,
+        [StatusCode::NOT_IMPLEMENTED; 2]
+    );
+}

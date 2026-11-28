@@ -285,7 +285,8 @@ compartment, so a token that pairs `user/Patient.rs` with `patient/` grants
 gets another patient's `$everything` without the types those grants cover.
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
-MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
+MongoDB, Elasticsearch, and composites); S3 standalone returns 501, and its
+`/metadata` does not list Patient `everything` (#3015).
 
 ## Configuration
 
@@ -368,7 +369,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch — when `false`, all `$export` endpoints return `501`. |
+| `HFS_BULK_EXPORT_ENABLED` | `true` | Master switch — when `false`, all `$export` endpoints return `501` and `/metadata` lists none of them. |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Output store: `local-fs` or `s3`. |
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
@@ -690,7 +691,7 @@ which subject failed without parsing the message.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). When `false`, `/metadata` lists neither. |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | MongoDB and S3 only: maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). There each dependency is materialized before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it (narrow the view with its own `where`, or raise this limit). Not used on SQLite and PostgreSQL, which run the query inside the primary database and materialize nothing |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
@@ -1059,6 +1060,21 @@ serves `_id`. A composite is listed only when each of its components is in the
 registry and served. No backend evaluates `Location.near` (or, from R5,
 `Location.contains` and `Composition.section-text`), so none lists them, and
 MongoDB, which answers `_text` and `_content` with `501`, lists neither.
+
+The operations that a deployment may not serve are listed only where it serves
+them, from the same thing each handler checks before answering `501` (#3015):
+- `export`, `patient-export`, `group-export`, the Patient and Group `export`
+  entries, and `instantiates` (the bulk-data CapabilityStatement): where
+  `HFS_BULK_EXPORT_ENABLED` is on and a bulk-export job store is wired. Standalone
+  S3 has none, and neither does a build without the `sqlite` feature on the
+  backends whose job store is a SQLite sidecar;
+- `bulk-submit` and `bulk-submit-status`: where `HFS_BULK_SUBMIT_ENABLED` is on
+  and a bulk-submit job store is wired (not on S3 in `bucket-per-tenant` mode
+  without `HFS_S3_SYSTEM_BUCKET`);
+- Patient `everything`: where the storage searches, as for `search-type`;
+- `sql-run`: where a SOF runner is wired, that is where `HFS_SOF_ENABLED` is on,
+  and `sql-export` where its export controller is; `reindex` where there is an
+  index to rebuild.
 
 ### Current Limitations
 

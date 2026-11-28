@@ -194,6 +194,13 @@ where
     // refuse with `501` from this same source.
     let conditionals = super::conditional_support::advertised(state.storage(), version);
 
+    // Bulk Data export, at every level, is listed only where a kick-off can be
+    // served: the handlers answer `501` when it is disabled by config and when
+    // no job store is wired (standalone S3, and the backends whose job store
+    // is a SQLite sidecar in a build without the `sqlite` feature), so the
+    // statement reads the same two things (#3015).
+    let serves_bulk_export = serves_bulk_export(state);
+
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
         .map(|rt| {
@@ -203,6 +210,7 @@ where
                 &registry,
                 supports_search,
                 supports_contained,
+                serves_bulk_export,
                 &modifier_map,
                 &revinclude_by_target,
                 &serves,
@@ -327,8 +335,11 @@ where
         "rest": [rest_entry]
     });
 
-    // Advertise Bulk Data Export operations when enabled.
-    if state.bulk_export_config().enabled {
+    // Advertise Bulk Data Export operations where they are served. The
+    // bulk-data CapabilityStatement goes with them: `instantiates` says the
+    // statement "must specify the full capability details"
+    // (https://hl7.org/fhir/R4/capabilitystatement-definitions.html#CapabilityStatement.instantiates).
+    if serves_bulk_export {
         operations.push(serde_json::json!({
             "name": "export",
             "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
@@ -345,8 +356,11 @@ where
             serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
     }
 
-    // Advertise Bulk Data Submit operations when enabled.
-    if state.bulk_submit_config().enabled {
+    // Advertise Bulk Data Submit operations where they are served: both
+    // handlers answer `501` when submit is disabled by config and when no job
+    // store is wired (an S3 deployment whose backend cannot run the submit
+    // worker, such as bucket-per-tenant with no system bucket) (#3015).
+    if serves_bulk_submit(state) {
         operations.push(serde_json::json!({
             "name": "bulk-submit",
             "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit"
@@ -361,11 +375,30 @@ where
     statement
 }
 
+/// Whether this deployment serves Bulk Data `$export`, at any level. It is
+/// what every export handler checks before anything else: export enabled in
+/// config, and a job store wired ([`AppState::with_bulk_export`] wires the
+/// output store and download authorizer with it).
+fn serves_bulk_export<S: ResourceStorage>(state: &AppState<S>) -> bool {
+    state.bulk_export_config().enabled && state.bulk_export_jobs().is_some()
+}
+
+/// Whether this deployment serves `$bulk-submit` and `$bulk-submit-status`:
+/// what both handlers check before anything else, submit enabled in config
+/// and a job store wired.
+fn serves_bulk_submit<S: ResourceStorage>(state: &AppState<S>) -> bool {
+    state.bulk_submit_config().enabled && state.bulk_submit_jobs().is_some()
+}
+
 /// Builds the `rest[0].operation` list, including the SQL on FHIR operations.
 ///
 /// Both data operations are invoked at the system level, so they are declared
-/// here rather than under a resource type. `$sql-run` is always declared when
-/// SOF is enabled; `$sql-export` only when an export controller is wired.
+/// here rather than under a resource type. Each is declared only when what its
+/// handler needs is wired: `$sql-run` a SOF runner, `$sql-export` an export
+/// controller. The server wires both only when SOF is enabled
+/// (`HFS_SOF_ENABLED`). Without a runner `$sql-run` answers `501` for every
+/// run over stored data, and serves only a ViewDefinition run over inline
+/// `resource` data, so it is not declared (#3015).
 ///
 /// `definition` points at *this server's* OperationDefinition rather than the
 /// guide's. Citing the guide's would assert support for every parameter it
@@ -401,11 +434,14 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
             "name": "versions",
             "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
         }),
-        serde_json::json!({
+    ];
+
+    if state.sof_runner().is_some() {
+        ops.push(serde_json::json!({
             "name": "sql-run",
             "definition": format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
-        }),
-    ];
+        }));
+    }
 
     if state.export_controller().is_some() {
         ops.push(serde_json::json!({
@@ -445,6 +481,12 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
 /// `serves` is the storage's [`SearchProvider::serves_search_param`]: the
 /// `searchParam`, `searchInclude` and `searchRevInclude` lists keep only what it
 /// serves.
+///
+/// The per-resource operations are listed only where they are served (#3015):
+/// Patient and Group `$export` when `serves_bulk_export`, and Patient
+/// `$everything` when `supports_search`, since `$everything` is composed over
+/// `search` and answers `501` where the storage cannot search. A type left with
+/// no operation carries no `operation` element.
 #[allow(clippy::too_many_arguments)]
 fn build_resource_capability(
     resource_type: &str,
@@ -452,6 +494,7 @@ fn build_resource_capability(
     registry: &SearchParameterRegistry,
     supports_search: bool,
     supports_contained: bool,
+    serves_bulk_export: bool,
     modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
     revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
@@ -529,27 +572,34 @@ fn build_resource_capability(
     }
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
-    // `rest[0].operation`.
+    // `rest[0].operation`, and Patient `$everything`. Each is listed only
+    // where it is served (#3015).
+    let mut operations = Vec::new();
     match resource_type {
         "Patient" => {
-            entry["operation"] = serde_json::json!([
-                {
+            if serves_bulk_export {
+                operations.push(serde_json::json!({
                     "name": "export",
                     "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
-                },
-                {
+                }));
+            }
+            if supports_search {
+                operations.push(serde_json::json!({
                     "name": "everything",
                     "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"
-                }
-            ]);
+                }));
+            }
         }
-        "Group" => {
-            entry["operation"] = serde_json::json!([{
+        "Group" if serves_bulk_export => {
+            operations.push(serde_json::json!({
                 "name": "export",
                 "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
-            }]);
+            }));
         }
         _ => {}
+    }
+    if !operations.is_empty() {
+        entry["operation"] = serde_json::Value::Array(operations);
     }
     entry
 }
@@ -863,6 +913,39 @@ mod tests {
         );
     }
 
+    /// `$sql-run` is advertised exactly where a SOF runner is wired: without
+    /// one (`HFS_SOF_ENABLED=false`) the handler answers 501 (#3015).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sql_run_is_advertised_only_where_a_sof_runner_is_wired() {
+        use crate::config::ServerConfig;
+        use crate::handlers::sof::capability::SQL_RUN_DEFINITION_ID;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let without = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            !operation_names(&build_rest_operations(&without)).contains(&"sql-run".to_string()),
+            "a deployment with no SOF runner must not advertise $sql-run"
+        );
+
+        let runner = backend
+            .sof_runner()
+            .expect("SQLite has an in-DB SOF runner");
+        let with = AppState::new(backend, ServerConfig::default()).with_sof_runner(runner);
+        let sql_run = build_rest_operations(&with)
+            .into_iter()
+            .find(|o| o["name"] == "sql-run")
+            .expect("a deployment with a SOF runner advertises $sql-run");
+        assert_eq!(
+            sql_run["definition"],
+            format!("/OperationDefinition/{SQL_RUN_DEFINITION_ID}")
+        );
+    }
+
     /// `CapabilityStatement.software` identifies the build for every FHIR
     /// version the server can describe: the same binary answers `/metadata`
     /// for each of them, so the version must not depend on which one was
@@ -1061,13 +1144,15 @@ mod tests {
     /// (`Patient:general-practitioner`) and a `_revinclude` source
     /// (`Observation:subject`).
     fn resource_entry(resource_type: &str, supports_search: bool) -> serde_json::Value {
-        resource_entry_serving(resource_type, supports_search, &serves_all)
+        resource_entry_serving(resource_type, supports_search, true, &serves_all)
     }
 
-    /// [`resource_entry`], with the storage's `serves_search_param` too.
+    /// [`resource_entry`], with whether Bulk Data export is served and the
+    /// storage's `serves_search_param` too.
     fn resource_entry_serving(
         resource_type: &str,
         supports_search: bool,
+        serves_bulk_export: bool,
         serves: &dyn Fn(&str, &str, SearchParamType) -> bool,
     ) -> serde_json::Value {
         use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
@@ -1107,6 +1192,7 @@ mod tests {
             &reg,
             supports_search,
             false,
+            serves_bulk_export,
             &std::collections::HashMap::new(),
             &build_revinclude_index(&reg, serves),
             serves,
@@ -1209,12 +1295,50 @@ mod tests {
         );
         assert_eq!(patient["updateCreate"], true);
         assert_eq!(patient["conditionalCreate"], true);
-        assert!(patient["operation"].is_array(), "Patient keeps `$export`");
+        assert_eq!(
+            resource_operation_names(&patient),
+            ["export"],
+            "Patient keeps `$export` and loses `$everything`"
+        );
 
         assert_eq!(
             interaction_codes(&resource_entry("AuditEvent", false)),
             ["read", "vread", "history-instance", "history-type"]
         );
+    }
+
+    fn resource_operation_names(entry: &serde_json::Value) -> Vec<&str> {
+        entry["operation"]
+            .as_array()
+            .map(|ops| ops.iter().filter_map(|o| o["name"].as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Patient and Group `$export` are listed exactly when Bulk Data export is
+    /// served, and Patient `$everything` exactly when the storage searches. A
+    /// type left with no operation carries no `operation` element, rather than
+    /// an empty array (#3015).
+    #[test]
+    fn resource_operations_follow_what_is_served() {
+        for (export, search, patient, group) in [
+            (true, true, vec!["export", "everything"], vec!["export"]),
+            (false, true, vec!["everything"], vec![]),
+            (true, false, vec!["export"], vec!["export"]),
+            (false, false, vec![], vec![]),
+        ] {
+            let case = format!("export={export} search={search}");
+            let patient_entry = resource_entry_serving("Patient", search, export, &serves_all);
+            let group_entry = resource_entry_serving("Group", search, export, &serves_all);
+            assert_eq!(resource_operation_names(&patient_entry), patient, "{case}");
+            assert_eq!(resource_operation_names(&group_entry), group, "{case}");
+            for entry in [&patient_entry, &group_entry] {
+                if resource_operation_names(entry).is_empty() {
+                    assert!(entry.get("operation").is_none(), "{case}: {entry}");
+                }
+            }
+        }
+        let observation = resource_entry_serving("Observation", true, true, &serves_all);
+        assert!(observation.get("operation").is_none(), "{observation}");
     }
 
     /// Every common parameter's `type` code maps back to a type, so none is
@@ -1244,7 +1368,7 @@ mod tests {
                 SearchParamType::Token | SearchParamType::Date | SearchParamType::Uri
             )
         }
-        let patient = resource_entry_serving("Patient", true, &token_date_uri);
+        let patient = resource_entry_serving("Patient", true, true, &token_date_uri);
         let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
         for kept in [
             "_id",
@@ -1271,7 +1395,7 @@ mod tests {
         fn not_subject(_: &str, code: &str, _: SearchParamType) -> bool {
             code != "subject"
         }
-        let patient = resource_entry_serving("Patient", true, &not_subject);
+        let patient = resource_entry_serving("Patient", true, true, &not_subject);
         assert_eq!(
             patient["searchInclude"],
             serde_json::json!(["Patient:general-practitioner"])
@@ -1286,7 +1410,7 @@ mod tests {
         fn not_id(_: &str, code: &str, _: SearchParamType) -> bool {
             code != "_id"
         }
-        let patient = resource_entry_serving("Patient", true, &not_id);
+        let patient = resource_entry_serving("Patient", true, true, &not_id);
         let names = param_names(patient["searchParam"].as_array().expect("searchParam"));
         for dropped in ["_id", "_list"] {
             assert!(

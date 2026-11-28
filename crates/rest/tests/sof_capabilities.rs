@@ -11,8 +11,9 @@ mod sof_capability_tests {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;
     use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::ResourceStorage;
     use helios_rest::ServerConfig;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
@@ -21,16 +22,63 @@ mod sof_capability_tests {
     /// must name this as its `base`.
     const GUIDE_SQL_RUN: &str = "http://hl7.org/fhir/uv/sql-on-fhir/OperationDefinition/SQLRun";
 
+    /// A server with SQL on FHIR wired as `hfs` wires it when `HFS_SOF_ENABLED`
+    /// is on: the storage's in-DB runner on the state.
     async fn create_test_server() -> TestServer {
+        create_server(true)
+    }
+
+    /// `with_runner: false` is the state `hfs` builds with `HFS_SOF_ENABLED=false`:
+    /// no SOF runner, so `$sql-run` over stored data answers `501`.
+    fn create_server(with_runner: bool) -> TestServer {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
         let backend = Arc::new(backend);
 
         let config = ServerConfig::for_testing();
-        let state = helios_rest::AppState::new(Arc::clone(&backend), config);
+        let mut state = helios_rest::AppState::new(Arc::clone(&backend), config);
+        if with_runner {
+            let runner = backend
+                .sof_runner()
+                .expect("SqliteBackend must provide an in-DB SOF runner");
+            state = state.with_sof_runner(runner);
+        }
         let app = helios_rest::routing::fhir_routes::create_routes(state);
         TestServer::new(app).expect("failed to create test server")
+    }
+
+    fn operation_names(body: &Value) -> Vec<&str> {
+        body["rest"][0]["operation"]
+            .as_array()
+            .expect("rest[0].operation must be an array")
+            .iter()
+            .filter_map(|op| op["name"].as_str())
+            .collect()
+    }
+
+    /// What `POST /$sql-run` answers for an inline Patient ViewDefinition run
+    /// over stored data.
+    async fn sql_run_status(server: &TestServer) -> StatusCode {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "name": "patients",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+                }
+            }]
+        });
+        server
+            .post("/$sql-run?_format=json")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await
+            .status_code()
     }
 
     async fn metadata(server: &TestServer) -> Value {
@@ -64,6 +112,33 @@ mod sof_capability_tests {
         assert!(
             names.contains(&"sql-run"),
             "$sql-run must be declared: {names:?}"
+        );
+    }
+
+    /// The statement and the route read the same thing: with a SOF runner,
+    /// `$sql-run` is listed and served; without one (`HFS_SOF_ENABLED=false`)
+    /// it is not listed and answers `501` (#3015). `$sql-export` is left out
+    /// in both, since neither state wires an export controller.
+    #[tokio::test]
+    async fn test_sql_run_is_declared_exactly_when_a_runner_is_wired() {
+        let with_runner = create_server(true);
+        let body = metadata(&with_runner).await;
+        let names = operation_names(&body);
+        assert!(names.contains(&"sql-run"), "{names:?}");
+        assert_eq!(sql_run_status(&with_runner).await, StatusCode::OK);
+
+        let without_runner = create_server(false);
+        let body = metadata(&without_runner).await;
+        let names = operation_names(&body);
+        assert!(!names.contains(&"sql-run"), "{names:?}");
+        assert!(!names.contains(&"sql-export"), "{names:?}");
+        // Everything that does not depend on SOF is still listed.
+        for name in ["validate", "meta", "meta-add", "meta-delete", "versions"] {
+            assert!(names.contains(&name), "{name} missing from {names:?}");
+        }
+        assert_eq!(
+            sql_run_status(&without_runner).await,
+            StatusCode::NOT_IMPLEMENTED
         );
     }
 
