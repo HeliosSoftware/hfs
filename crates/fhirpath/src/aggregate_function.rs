@@ -59,13 +59,12 @@ pub fn aggregate_function(
 
     // Iterate through the items
     for (_idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
-        // Create a new context for evaluating the aggregator expression.
-        // This context inherits variables and settings from the parent context.
-        let mut agg_context = EvaluationContext::new_empty(context.fhir_version);
-        agg_context.variables = context.variables.clone(); // Copy variables
-        agg_context.is_strict_mode = context.is_strict_mode; // Propagate strict mode
-        agg_context.check_ordered_functions = context.check_ordered_functions; // Propagate ordered check
-        agg_context.unresolved_identifier_policy = context.unresolved_identifier_policy;
+        // A child of the caller's context, as where() and select() use:
+        // it sees the caller's variables, resources and terminology server,
+        // and shares its terminology session, so the call budget, the answer
+        // cache and a rate-limit hold span every iteration.
+        let mut agg_context = context.create_child_context();
+        agg_context.current_index = None;
 
         // Set the special $total accumulator for this iteration.
         // The $this context is handled by passing `Some(item)` to `evaluate`.
