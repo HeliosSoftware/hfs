@@ -52,6 +52,7 @@ a startup warning.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size in bytes (128 MiB), applied after decompression; sized for the largest per-patient Synthea Bundle (#1662); such a bundle takes minutes, so raise `HFS_REQUEST_TIMEOUT` too |
+| `HFS_LARGE_BUNDLE_CONCURRENCY` | `2` on SQLite, off elsewhere | Most Bundle requests with bodies of 8 MiB or more parsed and executed at once; further ones queue (#2020). A SQLite setting: unset, the gate is on (2) only when the primary backend is SQLite, where it stops write-lock timeouts under concurrent large imports; other backends handle that concurrency well, so it stays off there unless set. `0` disables it. The permit is taken after the body is buffered, so it bounds parse-and-execute memory, not the buffered bodies themselves, and time spent queued counts toward `HFS_REQUEST_TIMEOUT` — queued Bundles can time out without running if that is set tightly. |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |

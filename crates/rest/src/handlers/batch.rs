@@ -179,7 +179,18 @@ where
 
     // Parse the body as JSON
     let body = read_body_within_limit(request, state.config().max_body_size).await?;
+    let body_len = body.len();
+    let _large_bundle_permit = match state.large_bundle_gate() {
+        Some(gate) if body_len >= crate::memory_trim::TRIM_AFTER_BYTES => Some(
+            Arc::clone(gate)
+                .acquire_owned()
+                .await
+                .expect("the large-Bundle gate is never closed"),
+        ),
+        _ => None,
+    };
     let bundle: Value = serde_json::from_slice(&body)?;
+    drop(body);
     // Validate it's a Bundle
     let resource_type = bundle
         .get("resourceType")
@@ -195,22 +206,22 @@ where
     }
 
     // Get Bundle type
-    let bundle_type =
-        bundle
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RestError::BadRequest {
-                message: "Bundle must have a type".to_string(),
-            })?;
+    let bundle_type = bundle
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RestError::BadRequest {
+            message: "Bundle must have a type".to_string(),
+        })?
+        .to_string();
 
-    let result = match bundle_type {
+    let result = match bundle_type.as_str() {
         "batch" => {
             process_batch(
                 &state,
                 tenant,
                 fhir_version,
                 &prefer,
-                &bundle,
+                bundle,
                 principal.as_ref(),
             )
             .await
@@ -221,7 +232,7 @@ where
                 tenant,
                 fhir_version,
                 &prefer,
-                &bundle,
+                bundle,
                 principal.as_ref(),
             )
             .await
@@ -235,10 +246,8 @@ where
     };
 
     // A large Bundle leaves gigabytes freed but kept by the allocator; hand
-    // them back once the body and its parse are gone (#2020).
-    let body_len = body.len();
-    drop(bundle);
-    drop(body);
+    // them back once the body and its parse are gone (#2020). The body was
+    // dropped right after the parse, and the parse was consumed by the arm.
     if body_len >= crate::memory_trim::TRIM_AFTER_BYTES {
         crate::memory_trim::release_free_memory();
     }
@@ -378,7 +387,7 @@ async fn process_batch<S>(
     tenant: TenantExtractor,
     fhir_version: FhirVersion,
     prefer: &PreferHeader,
-    bundle: &Value,
+    bundle: Value,
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
@@ -397,11 +406,7 @@ where
     );
     let correlation = AuditCorrelation::new("batch");
 
-    let entries = bundle
-        .get("entry")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let entries = bundle_entries(bundle);
 
     let public_base = state.public_base_url_for_request(&tenant);
     let base_url = public_base.as_str();
@@ -470,10 +475,7 @@ where
             );
 
             progress_ref.record();
-            (
-                index,
-                bundle_entry_result_to_json(&result, base_url, prefer),
-            )
+            (index, bundle_entry_result_to_json(result, base_url, prefer))
         })
         .buffered(concurrency)
         .collect()
@@ -521,7 +523,7 @@ async fn process_transaction<S>(
     tenant: TenantExtractor,
     fhir_version: FhirVersion,
     prefer: &PreferHeader,
-    bundle: &Value,
+    bundle: Value,
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
@@ -541,11 +543,7 @@ where
     );
     let correlation = AuditCorrelation::new("transaction");
 
-    let json_entries = bundle
-        .get("entry")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let json_entries = bundle_entries(bundle);
 
     // Parse entries and track their original indices for response ordering.
     // The fourth element is the GET entry to run after the commit, classified
@@ -554,7 +552,7 @@ where
     let mut parsed_entries: Vec<(usize, BundleEntry, Option<String>, Option<DeferredGet>)> =
         Vec::with_capacity(json_entries.len());
 
-    for (index, entry) in json_entries.iter().enumerate() {
+    for (index, entry) in json_entries.into_iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((mut bundle_entry, full_url)) => {
                 // A GET entry is a search, read, vread or history read by its
@@ -1085,10 +1083,22 @@ where
                 );
             }
 
+            drop(ordered_results);
+            let mut owned_results: Vec<(usize, BundleEntryResult)> = indexed_entries
+                .iter()
+                .map(|(orig_idx, _, _)| *orig_idx)
+                .zip(bundle_result.entries)
+                .collect();
+            owned_results.extend(
+                deferred_results
+                    .into_iter()
+                    .map(|(orig_idx, _, result)| (orig_idx, result)),
+            );
+            owned_results.sort_by_key(|(idx, _)| *idx);
             let public_base = state.public_base_url_for_request(&tenant);
-            let response_entries: Vec<Value> = ordered_results
+            let response_entries: Vec<Value> = owned_results
                 .into_iter()
-                .map(|(_, _, result)| bundle_entry_result_to_json(result, &public_base, prefer))
+                .map(|(_, result)| bundle_entry_result_to_json(result, &public_base, prefer))
                 .collect();
 
             let response_bundle = serde_json::json!({
@@ -3883,7 +3893,18 @@ fn rewrite_conditional_references(
     }
 }
 
-fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
+fn bundle_entries(bundle: Value) -> Vec<Value> {
+    match bundle {
+        Value::Object(mut object) => match object.remove("entry") {
+            Some(Value::Array(entries)) => entries,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn parse_bundle_entry(mut entry: Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
+    let taken_resource = entry.get_mut("resource").map(Value::take);
     let request = entry
         .get("request")
         .ok_or(EntryParseError::MissingRequest)?;
@@ -3916,7 +3937,7 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
         raw_url
     };
 
-    let mut resource = entry.get("resource").cloned();
+    let mut resource = taken_resource;
     // Per http.html#create the server ignores an id supplied on a POST — the
     // same strip create_handler applies. Bundles that repeat shared resources
     // under fixed ids (Synthea's Organizations/Practitioners) used to fail
@@ -4095,10 +4116,13 @@ fn method_processing_order(method: &BundleMethod) -> u8 {
 
 /// Converts a BundleEntryResult to JSON for the response bundle.
 fn bundle_entry_result_to_json(
-    result: &BundleEntryResult,
+    mut result: BundleEntryResult,
     base_url: &str,
     prefer: &PreferHeader,
 ) -> Value {
+    let full_url = build_full_url(&result, base_url);
+    let taken_resource = result.resource.take();
+    let result = &result;
     let mut response = serde_json::Map::new();
 
     let status_code = result.status.to_string();
@@ -4128,7 +4152,7 @@ fn bundle_entry_result_to_json(
     let mut entry = serde_json::Map::new();
 
     // Include resource based on Prefer header
-    if let Some(ref resource) = result.resource {
+    if let Some(resource) = taken_resource {
         match prefer.return_preference() {
             Some("minimal") => {
                 // Omit resource body
@@ -4149,13 +4173,13 @@ fn bundle_entry_result_to_json(
             }
             _ => {
                 // Default: return=representation — include the resource
-                entry.insert("resource".to_string(), resource.clone());
+                entry.insert("resource".to_string(), resource);
             }
         }
     }
 
     // Build fullUrl from location or resource content
-    if let Some(full_url) = build_full_url(result, base_url) {
+    if let Some(full_url) = full_url {
         entry.insert("fullUrl".to_string(), Value::String(full_url));
     }
 
@@ -6002,7 +6026,7 @@ mod tests {
             tenant,
             FhirVersion::default(),
             &PreferHeader::default(),
-            bundle,
+            bundle.clone(),
             principal,
         )
         .await
@@ -6917,7 +6941,7 @@ mod tests {
             "request": { "method": "post", "url": "Patient" },
             "resource": { "resourceType": "Patient" }
         });
-        let err = parse_bundle_entry(&entry).expect_err("must be refused");
+        let err = parse_bundle_entry(entry).expect_err("must be refused");
         assert!(matches!(
             err,
             EntryParseError::Method(EntryMethodRefusal::NotCanonical(_))
@@ -6928,10 +6952,7 @@ mod tests {
             "request": { "method": "POST", "url": "Patient" },
             "resource": { "resourceType": "Patient" }
         });
-        assert_eq!(
-            parse_bundle_entry(&ok).unwrap().0.method,
-            BundleMethod::Post
-        );
+        assert_eq!(parse_bundle_entry(ok).unwrap().0.method, BundleMethod::Post);
     }
 
     /// Refused methods are answered per-entry and never dispatch.
@@ -7412,7 +7433,7 @@ mod tests {
                 tenant(),
                 FhirVersion::default(),
                 &PreferHeader::default(),
-                &bundle,
+                bundle,
                 None,
             )
             .await
@@ -8156,6 +8177,108 @@ mod tests {
                 !message.contains(leak),
                 "500 body leaked {leak:?}: {message}"
             );
+        }
+    }
+
+    /// #2020 review: prove the admission gate actually gates. With the only
+    /// permit held from outside, a large Bundle must stay parked (and a small
+    /// one must not), then complete once the permit is released.
+    #[cfg(feature = "sqlite")]
+    mod large_bundle_gate {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use tower::ServiceExt;
+
+        use crate::config::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
+        use crate::handlers::batch::batch_handler;
+        use crate::state::AppState;
+
+        fn gated_router() -> (Router, Arc<tokio::sync::Semaphore>) {
+            let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("data"))
+                .unwrap_or_else(|| PathBuf::from("data"));
+            let backend_config = SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                ..Default::default()
+            };
+            let backend = SqliteBackend::with_config(":memory:", backend_config)
+                .expect("Failed to create SQLite backend");
+            backend.init_schema().expect("Failed to init schema");
+
+            let config = ServerConfig {
+                multitenancy: MultitenancyConfig {
+                    routing_mode: TenantRoutingMode::HeaderOnly,
+                    ..Default::default()
+                },
+                base_url: "http://localhost:8080".to_string(),
+                default_tenant: "test-tenant".to_string(),
+                large_bundle_concurrency: Some(1),
+                ..ServerConfig::default()
+            };
+            let state = AppState::new(Arc::new(backend), config);
+            let gate = Arc::clone(state.large_bundle_gate().expect("gate must be configured"));
+            let router = Router::new()
+                .route("/", axum::routing::post(batch_handler::<SqliteBackend>))
+                .with_state(state);
+            (router, gate)
+        }
+
+        fn bundle_request(id: &str, pad_past_gate_threshold: bool) -> Request<Body> {
+            let bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "resource": {"resourceType": "Patient", "id": id},
+                    "request": {"method": "PUT", "url": format!("Patient/{id}")}
+                }]
+            });
+            let mut body = serde_json::to_vec(&bundle).unwrap();
+            if pad_past_gate_threshold {
+                body.extend(std::iter::repeat_n(b' ', 9 * 1024 * 1024));
+            }
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/fhir+json")
+                .header("x-tenant-id", "test-tenant")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn held_permit_parks_large_bundles_and_releases_them() {
+            let (router, gate) = gated_router();
+            let permit = Arc::clone(&gate).acquire_owned().await.unwrap();
+
+            let small = router
+                .clone()
+                .oneshot(bundle_request("small", false))
+                .await
+                .unwrap();
+            assert_eq!(
+                small.status(),
+                StatusCode::OK,
+                "a small Bundle must bypass the gate"
+            );
+
+            let mut parked = tokio::spawn(router.clone().oneshot(bundle_request("parked", true)));
+            let elapsed = tokio::time::timeout(Duration::from_millis(300), &mut parked).await;
+            assert!(
+                elapsed.is_err(),
+                "a large Bundle ran while the only permit was held"
+            );
+
+            drop(permit);
+            let response = parked.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 }
