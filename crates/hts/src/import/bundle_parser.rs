@@ -140,6 +140,17 @@ pub fn check_authority(
     Ok(())
 }
 
+/// Whether an import of `incoming_rank` may take a ConceptMap id away from the
+/// stored map that holds it (or move the map it is replacing onto its own id).
+///
+/// Only a strictly stronger source does: between equal ranks the first holder
+/// keeps the id, so ids stay stable across re-imports. An unranked holder
+/// counts as [`AUTHORITY_UNKNOWN`] here, not as unclaimed, so an unattributed
+/// import cannot move a map stored before the column existed.
+pub fn claims_id(incoming_rank: i32, holder_rank: Option<i32>) -> bool {
+    incoming_rank < holder_rank.unwrap_or(AUTHORITY_UNKNOWN)
+}
+
 /// `true` when `url` sits under the canonical `base`, respecting path
 /// boundaries: `http://hl7.org/fhir` owns `http://hl7.org/fhir/CodeSystem/x`
 /// but NOT `http://hl7.org/fhirpath/x`. A bare `starts_with` would claim the
