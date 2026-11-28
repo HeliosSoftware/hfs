@@ -302,3 +302,82 @@ fn resolve_in_where_clause() {
     );
     assert_eq!(rows[0]["encounter_id"], serde_json::json!("enc-1"));
 }
+
+/// Two records that each contain a resource under the same local id resolve
+/// their `#id` reference to their own contained resource, not to the first
+/// record's. In the bundle every record shares one resolution pool.
+#[test]
+fn a_fragment_resolves_within_its_own_record_only() {
+    let observation = |id: &str, family: &str| {
+        serde_json::json!({
+            "resourceType": "Observation", "id": id, "status": "final",
+            "code": { "text": "x" },
+            "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": family }] }],
+            "subject": { "reference": "#p" }
+        })
+    };
+    let bundle = create_test_bundle(&[
+        observation("obs-a", "First"),
+        observation("obs-b", "Second"),
+    ])
+    .expect("bundle");
+    let view = serde_json::json!({
+        "resource": "Observation",
+        "select": [{ "column": [
+            { "name": "id", "path": "id" },
+            { "name": "family", "path": "subject.resolve().name.family.first()" }
+        ] }]
+    });
+
+    let rows = run(&view, bundle);
+    let family_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .map(|row| row["family"].clone())
+    };
+    assert_eq!(
+        family_of("obs-a"),
+        Some(serde_json::json!("First")),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        family_of("obs-b"),
+        Some(serde_json::json!("Second")),
+        "{rows:#?}"
+    );
+}
+
+/// A `Type/id` reference resolves to the top-level resource of that id, never
+/// to a resource that another record contains under the same type and id,
+/// even when that record comes first in the pool.
+#[test]
+fn a_typed_reference_never_resolves_to_another_records_contained_resource() {
+    let bundle = create_test_bundle(&[
+        serde_json::json!({
+            "resourceType": "Observation", "id": "obs-a", "status": "final",
+            "code": { "text": "x" },
+            "contained": [{ "resourceType": "Patient", "id": "other", "name": [{ "family": "Planted" }] }],
+            "performer": [{ "reference": "#other" }]
+        }),
+        serde_json::json!({
+            "resourceType": "Observation", "id": "obs-b", "status": "final",
+            "code": { "text": "x" },
+            "subject": { "reference": "Patient/other" }
+        }),
+        serde_json::json!({
+            "resourceType": "Patient", "id": "other", "name": [{ "family": "Real" }]
+        }),
+    ])
+    .expect("bundle");
+    let view = serde_json::json!({
+        "resource": "Observation",
+        "where": [{ "path": "id = 'obs-b'" }],
+        "select": [{ "column": [
+            { "name": "family", "path": "subject.resolve().name.family.first()" }
+        ] }]
+    });
+
+    let rows = run(&view, bundle);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["family"], serde_json::json!("Real"), "{rows:#?}");
+}
