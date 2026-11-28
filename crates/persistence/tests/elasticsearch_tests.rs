@@ -741,6 +741,11 @@ mod numeric_validation_suite;
 #[path = "search/token_code_system_suite.rs"]
 mod token_code_system_suite;
 
+/// The backend-agnostic `[system]|` on a system-only Identifier or Coding
+/// suite (#2965). Same `#[path]` arrangement.
+#[path = "search/token_system_only_suite.rs"]
+mod token_system_only_suite;
+
 /// The backend-agnostic empty search value suite (#1380). Same `#[path]`
 /// arrangement.
 #[path = "search/empty_value_suite.rs"]
@@ -2218,6 +2223,18 @@ mod es_integration {
         super::token_code_system_suite::system_qualified_tokens_in_chains(
             &backend,
             "token-code-system-chain-1379",
+        )
+        .await;
+    }
+
+    /// #2965: `system|` matches an Identifier with no value and a Coding with
+    /// no code.
+    #[tokio::test]
+    async fn es_system_only_tokens_match_system_pipe() {
+        let backend = create_backend().await;
+        super::token_system_only_suite::system_only_tokens_match_system_pipe(
+            &backend,
+            "token-system-only-2965",
         )
         .await;
     }
