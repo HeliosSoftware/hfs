@@ -239,6 +239,8 @@ No command-line flags. All configuration is via environment variables.
 | `SOF_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed CORS origins |
+| `SOF_SERVER_SOURCE_PREFIXES` | (none) | URL prefixes a `$sql-run` `source` may name, comma-separated (for example `file:///srv/fhir/,s3://my-bucket/exports/`). Unset, `source` is refused with 501. A source must match a prefix's scheme, user info, host and port, with a path at or below it; a `file:` source must be a regular file whose real path (symlinks resolved) is under the prefix; HTTP redirects are not followed. The server does not authenticate callers, so list only what every caller may read. |
+| `SOF_SERVER_SOURCE_MAX_BYTES` | `104857600` | Largest `source` loaded, in bytes; a larger one is refused with 400. `0` is no limit. |
 
 ### Endpoint
 

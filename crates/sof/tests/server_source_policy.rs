@@ -11,8 +11,12 @@ use serde_json::{Value, json};
 use url::Url;
 
 fn server(prefixes: &str) -> TestServer {
+    server_with(SourcePolicy::parse(prefixes).expect("prefixes"))
+}
+
+fn server_with(source_prefixes: SourcePolicy) -> TestServer {
     let config = ServerConfig {
-        source_prefixes: SourcePolicy::parse(prefixes).expect("prefixes"),
+        source_prefixes,
         ..ServerConfig::default()
     };
     TestServer::new(create_app_with_config(&config)).expect("test server")
@@ -118,4 +122,122 @@ fn prefixes_match_scheme_host_port_and_whole_path_segments() {
     assert!(!admits("s3://bucket/fhirdata/a.ndjson"));
     assert!(!admits("s3://other/fhir/a.ndjson"));
     assert!(!admits("http://169.254.169.254/latest/meta-data/"));
+}
+
+/// An `abfss` URL names its container in the user info, so a prefix for one
+/// container admits no other; and a caller cannot add credentials to a URL.
+#[test]
+fn prefixes_match_user_info() {
+    let policy = SourcePolicy::parse(
+        "abfss://c1@acct.dfs.core.windows.net/data/, https://data.example.org/exports/",
+    )
+    .unwrap();
+    let admits = |url: &str| policy.admits(&Url::parse(url).unwrap());
+    assert!(admits("abfss://c1@acct.dfs.core.windows.net/data/a.json"));
+    assert!(!admits("abfss://c2@acct.dfs.core.windows.net/data/a.json"));
+    assert!(!admits("abfss://acct.dfs.core.windows.net/data/a.json"));
+    assert!(!admits("https://user:pw@data.example.org/exports/a.json"));
+    assert!(!admits("https://user@data.example.org/exports/a.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_under_a_prefix_to_a_file_outside_it_is_refused() {
+    let dir = scratch();
+    std::os::unix::fs::symlink(
+        dir.path().join("outside.json"),
+        dir.path().join("allowed/link.json"),
+    )
+    .unwrap();
+    let server = server(&(file_url(&dir.path().join("allowed")) + "/"));
+    let response = server
+        .post("/$sql-run")
+        .json(&run_with_source(&file_url(
+            &dir.path().join("allowed/link.json"),
+        )))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert!(!response.text().contains("p1"), "{}", response.text());
+}
+
+#[tokio::test]
+async fn a_file_over_the_size_limit_is_refused() {
+    let dir = scratch();
+    let patient = std::fs::read(dir.path().join("allowed/patient.json")).unwrap();
+    let prefix = file_url(&dir.path().join("allowed")) + "/";
+    let source = run_with_source(&file_url(&dir.path().join("allowed/patient.json")));
+    let policy = |max| SourcePolicy::parse(&prefix).unwrap().with_max_bytes(max);
+
+    let at_limit = server_with(policy(patient.len() as u64))
+        .post("/$sql-run")
+        .json(&source)
+        .await;
+    assert_eq!(
+        at_limit.status_code(),
+        StatusCode::OK,
+        "{}",
+        at_limit.text()
+    );
+
+    let over = server_with(policy(patient.len() as u64 - 1))
+        .post("/$sql-run")
+        .json(&source)
+        .await;
+    assert_eq!(over.status_code(), StatusCode::BAD_REQUEST);
+    assert!(over.text().contains("SOF_SERVER_SOURCE_MAX_BYTES"));
+
+    let unlimited = server_with(policy(0)).post("/$sql-run").json(&source).await;
+    assert_eq!(unlimited.status_code(), StatusCode::OK);
+}
+
+/// An upstream on a loopback port: `/sized` declares its length, `/chunked`
+/// streams the same body with none.
+async fn upstream(body: &'static str) -> String {
+    use axum::{Router, body::Body, routing::get};
+    let app = Router::new()
+        .route("/sized", get(move || async move { body }))
+        .route(
+            "/chunked",
+            get(move || async move {
+                let halves = body.split_at(body.len() / 2);
+                Body::from_stream(futures::stream::iter(
+                    [halves.0, halves.1].map(Ok::<_, std::io::Error>),
+                ))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+#[tokio::test]
+async fn an_http_body_over_the_size_limit_is_refused_with_or_without_a_length() {
+    const BODY: &str = r#"{"resourceType":"Patient","id":"p1"}"#;
+    let base = upstream(BODY).await;
+    let policy = |max| SourcePolicy::parse(&base).unwrap().with_max_bytes(max);
+
+    for path in ["sized", "chunked"] {
+        let source = run_with_source(&format!("{base}{path}"));
+        let at_limit = server_with(policy(BODY.len() as u64))
+            .post("/$sql-run")
+            .json(&source)
+            .await;
+        assert_eq!(
+            at_limit.status_code(),
+            StatusCode::OK,
+            "{path}: {}",
+            at_limit.text()
+        );
+
+        let over = server_with(policy(BODY.len() as u64 - 1))
+            .post("/$sql-run")
+            .json(&source)
+            .await;
+        assert_eq!(over.status_code(), StatusCode::BAD_REQUEST, "{path}");
+        assert!(
+            over.text().contains("SOF_SERVER_SOURCE_MAX_BYTES"),
+            "{path}"
+        );
+    }
 }

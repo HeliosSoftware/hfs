@@ -78,6 +78,7 @@
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
 //! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
 //! - `SOF_SERVER_SOURCE_PREFIXES` / `--source-prefixes`: URL prefixes a `$sql-run` `source` may name, comma-separated; unset, `source` is refused (501)
+//! - `SOF_SERVER_SOURCE_MAX_BYTES` / `--source-max-bytes`: Largest `source` loaded, in bytes (default: 104857600; `0` is no limit)
 //! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max remote terminology calls per ViewDefinition run: each
 //!   distinct lookup, plus each identical lookup re-sent after a transient failure; a
 //!   rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own
@@ -290,6 +291,15 @@ fn parse_args() -> ServerConfig {
             value_parser = helios_sof::data_source::SourcePolicy::parse
         )]
         source_prefixes: helios_sof::data_source::SourcePolicy,
+
+        /// Largest `$sql-run` `source` loaded, in bytes; `0` is no limit. A
+        /// source is read whole into memory.
+        #[arg(
+            long,
+            env = "SOF_SERVER_SOURCE_MAX_BYTES",
+            default_value_t = helios_sof::data_source::DEFAULT_SOURCE_MAX_BYTES
+        )]
+        source_max_bytes: u64,
     }
 
     let args = Args::parse();
@@ -305,7 +315,7 @@ fn parse_args() -> ServerConfig {
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
         terminology_server: args.terminology_server,
-        source_prefixes: args.source_prefixes,
+        source_prefixes: args.source_prefixes.with_max_bytes(args.source_max_bytes),
     }
 }
 
