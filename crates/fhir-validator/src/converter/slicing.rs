@@ -65,7 +65,7 @@ pub(super) fn build_slicing(
                 order: is_ordered.then_some(position as u64),
                 reslice: None,
                 slice_is_constraining: None,
-                schema: schema.map(Arc::new),
+                schema: schema.map(Arc::from),
             },
         );
     }

@@ -19,6 +19,13 @@ pub(super) struct Segment {
     pub slice: Option<String>,
 }
 
+/// Most segments an ElementDefinition id may have below its root. The tree
+/// built from the ids, and every walk over it (finalizing it, validating
+/// against the schema, dropping it), is as deep as the longest id, and one
+/// id string is not bounded by JSON's nesting limit. The deepest element
+/// paths in the core specification have about a dozen segments.
+pub(super) const MAX_ID_SEGMENTS: usize = 64;
+
 /// Parse an ElementDefinition id into segments, dropping the root segment.
 /// `"Patient.identifier:mrn.system"` → `[identifier:mrn, system]`.
 pub(super) fn parse_segments(id: &str) -> Result<Vec<Segment>, String> {
@@ -29,6 +36,9 @@ pub(super) fn parse_segments(id: &str) -> Result<Vec<Segment>, String> {
     }
     let mut segments = Vec::new();
     for part in parts {
+        if segments.len() == MAX_ID_SEGMENTS {
+            return Err(format!("more than {MAX_ID_SEGMENTS} segments"));
+        }
         if part.is_empty() {
             return Err("empty segment".to_string());
         }
@@ -55,8 +65,10 @@ pub(super) struct Node {
     /// The element name this node sits under (used for extension-sugar
     /// detection on `extension`/`modifierExtension`).
     pub element_name: String,
-    /// Accumulated element-level keywords.
-    pub schema: FhirSchema,
+    /// Accumulated element-level keywords. Boxed so that [`finalize`], which
+    /// recurses once per id segment and twice per slice segment, moves a
+    /// pointer through each frame and not the schema itself.
+    pub schema: Box<FhirSchema>,
     pub children: IndexMap<String, Node>,
     pub slices: IndexMap<String, SliceNode>,
     /// Slicing declaration from the sliced element's own ED.
@@ -365,7 +377,12 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
 }
 
 /// Recursively turn a tree node into a schema, pruning empty nodes.
-pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSchema> {
+///
+/// The schema stays on the heap from the node to the returned box: a frame
+/// of this function is on the stack once per id segment and twice per slice
+/// segment, so [`MAX_ID_SEGMENTS`] bounds the stack only while a frame is
+/// small.
+pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<Box<FhirSchema>> {
     let Node {
         element_name: _,
         mut schema,
@@ -425,7 +442,7 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
                         schema
                             .extensions
                             .get_or_insert_with(IndexMap::new)
-                            .insert(slice_name, Arc::new(entry));
+                            .insert(slice_name, Arc::from(entry));
                     }
                     None => {
                         remaining.insert(slice_name, slice);
@@ -435,18 +452,25 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
             child.slices = remaining;
         }
         if let Some(child_schema) = finalize(child, warnings) {
-            elements.insert(name, Arc::new(child_schema));
+            elements.insert(name, Arc::from(child_schema));
         }
     }
     if !elements.is_empty() {
         schema.elements = Some(elements);
     }
 
-    if schema == FhirSchema::default() {
+    if is_empty(&schema) {
         None
     } else {
         Some(schema)
     }
+}
+
+/// Whether nothing was recorded on `schema`. Kept out of line so the default
+/// schema it compares against is not part of [`finalize`]'s frame.
+#[inline(never)]
+fn is_empty(schema: &FhirSchema) -> bool {
+    *schema == FhirSchema::default()
 }
 
 fn parse_numeric_max(max: Option<&str>) -> Option<u64> {

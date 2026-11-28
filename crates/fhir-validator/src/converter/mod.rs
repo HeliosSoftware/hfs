@@ -317,8 +317,10 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
             }
             (None, None) => &ed.path,
         };
-        let segments = tree::parse_segments(id)
-            .map_err(|e| ConvertError::Malformed(format!("element id '{id}': {e}")))?;
+        let segments = tree::parse_segments(id).map_err(|e| {
+            let shown: String = id.chars().take(200).collect();
+            ConvertError::Malformed(format!("element id '{shown}': {e}"))
+        })?;
         if segments.is_empty() {
             // Root element: constraints attach at schema level (all kept —
             // dom-* live here).
@@ -328,7 +330,9 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
         tree::apply(&mut root, &segments, ed, &mut warnings);
     }
 
-    let mut schema = tree::finalize(root, &mut warnings).unwrap_or_default();
+    let mut schema = tree::finalize(root, &mut warnings)
+        .map(|schema| *schema)
+        .unwrap_or_default();
 
     // Extension applicability contexts (#363): element expressions only.
     let contexts: Vec<String> = sd

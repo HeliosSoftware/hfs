@@ -483,6 +483,79 @@ fn converted_ordered_slicing_is_enforced_by_the_engine() {
     );
 }
 
+/// An element id with more segments than any element path is refused: the
+/// tree built from it, and every recursive walk over that tree, is as deep as
+/// the id, so a single long dotted id used to overflow the stack.
+#[test]
+fn an_element_id_past_the_segment_limit_is_refused() {
+    let profile = |segments: usize| {
+        let id = format!("Patient{}", ".a".repeat(segments));
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": "https://example.invalid/StructureDefinition/deep",
+            "name": "Deep",
+            "kind": "resource",
+            "type": "Patient",
+            "derivation": "constraint",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "differential": { "element": [
+                { "id": "Patient", "path": "Patient" },
+                { "id": id, "path": id, "min": 0, "max": "1" }
+            ]}
+        })
+    };
+    assert!(convert(&profile(64)).is_ok());
+    assert!(convert(&profile(65)).is_err());
+    let error = convert(&profile(100_000)).expect_err("refused").to_string();
+    assert!(error.contains("more than 64 segments"), "{error}");
+    assert!(
+        error.len() < 400,
+        "the id is not echoed whole: {} bytes",
+        error.len()
+    );
+}
+
+/// The longest id the converter accepts converts on half a tokio worker's
+/// stack, whatever its segments are. A slice segment nests two levels where
+/// a plain one nests one, so an id of 64 slice segments is the deepest tree
+/// the segment limit allows; it used to need more stack than a worker has.
+#[test]
+fn the_deepest_accepted_element_id_converts_on_half_a_worker_stack() {
+    let convert_id = |segment: &'static str| {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let id = format!("Patient{}", segment.repeat(64));
+                let converted = convert(&json!({
+                    "resourceType": "StructureDefinition",
+                    "url": "https://example.invalid/StructureDefinition/deep",
+                    "name": "Deep",
+                    "kind": "resource",
+                    "type": "Patient",
+                    "derivation": "constraint",
+                    "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+                    "differential": { "element": [
+                        { "id": "Patient", "path": "Patient" },
+                        {
+                            "id": id, "path": "Patient.a", "min": 1, "max": "1",
+                            "type": [{
+                                "code": "Extension",
+                                "profile": ["https://example.invalid/StructureDefinition/x"]
+                            }]
+                        }
+                    ]}
+                }));
+                assert!(converted.is_ok(), "{segment}: {:?}", converted.err());
+            })
+            .expect("thread spawns")
+            .join()
+            .expect("converts without overflowing the stack");
+    };
+    convert_id(".a");
+    convert_id(".a:s");
+    convert_id(".extension:s");
+}
+
 #[test]
 fn converts_canonical_content_reference_and_additional_resource() {
     // The SQL on FHIR ViewDefinition, trimmed: an additional resource whose
