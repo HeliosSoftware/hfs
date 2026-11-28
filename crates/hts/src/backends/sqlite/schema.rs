@@ -615,9 +615,12 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
 /// re-imported to be ranked, and treating NULL as owner on write would block
 /// the convergence `AUTHORITY_UNCLAIMED` exists for. This promotes them once.
 ///
-/// A row with `content = 'not-present'` is a package's placeholder for an
-/// external terminology (THO ships one for SNOMED CT, for instance), not the
-/// importer's, and keeps its rank. A sentinel ledger row records that the
+/// Only the importer's own row is promoted: it is matched by URL and by the
+/// id the importer assigns. Another source's row at the same URL keeps its
+/// rank, for instance the copy of DICOM `hl7.fhir.r4.core` ships as
+/// `dicom-dcim`, which the package could otherwise no longer re-import
+/// (#3160). A row with `content = 'not-present'` is a package's placeholder
+/// for an external terminology, not the importer's, and keeps its rank too. A sentinel ledger row records that the
 /// backfill ran, as [`migrate_icd9cm_reimport`] does.
 pub fn migrate_native_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     use crate::import::bundle_parser::{AUTHORITY_OWNER, AUTHORITY_UNKNOWN};
@@ -637,16 +640,18 @@ pub fn migrate_native_authority_rank(conn: &rusqlite::Connection) -> rusqlite::R
         return Ok(());
     }
 
+    // The storage id is the importer's id, alone or followed by `|<version>`
+    // (see `fhir_bundle::storage_id_for`).
     let systems = crate::import::NATIVE_OWNED_SYSTEMS;
-    let placeholders = vec!["?"; systems.len()].join(", ");
+    let owned = vec!["(url = ? AND (id = ? OR id LIKE ? || '|%'))"; systems.len()].join(" OR ");
     let promoted = conn.execute(
         &format!(
             "UPDATE code_systems SET authority_rank = {AUTHORITY_OWNER}
              WHERE (authority_rank IS NULL OR authority_rank = {AUTHORITY_UNKNOWN})
                AND content <> 'not-present'
-               AND url IN ({placeholders})"
+               AND ({owned})"
         ),
-        rusqlite::params_from_iter(systems),
+        rusqlite::params_from_iter(systems.iter().flat_map(|(url, id)| [*url, *id, *id])),
     )?;
     conn.execute(
         "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
@@ -1119,9 +1124,11 @@ mod tests {
         apply(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank) VALUES
-               ('legacy-rxnorm', 'http://www.nlm.nih.gov/research/umls/rxnorm', '2024', 'active', 'complete', 'x', 'x', NULL),
-               ('unknown-icd10', 'http://hl7.org/fhir/sid/icd-10-cm', '2026', 'active', 'complete', 'x', 'x', 1),
-               ('stub-snomed', 'http://snomed.info/sct', NULL, 'active', 'not-present', 'x', 'x', NULL),
+               ('rxnorm', 'http://www.nlm.nih.gov/research/umls/rxnorm', '2024', 'active', 'complete', 'x', 'x', NULL),
+               ('icd10cm|2026', 'http://hl7.org/fhir/sid/icd-10-cm', '2026', 'active', 'complete', 'x', 'x', 1),
+               ('snomed-ct', 'http://snomed.info/sct', NULL, 'active', 'not-present', 'x', 'x', NULL),
+               ('dicom-dcim|01', 'http://dicom.nema.org/resources/ontology/DCM', '01', 'active', 'complete', 'x', 'x', 1),
+               ('icd10cm-other', 'http://hl7.org/fhir/sid/icd-10-cm', '2025', 'active', 'complete', 'x', 'x', 1),
                ('other', 'http://example.org/cs', '1', 'active', 'complete', 'x', 'x', NULL),
                ('v2-0001', 'http://terminology.hl7.org/CodeSystem/v2-0001', 'current', 'active', 'complete', 'x', 'x', 1);",
         )
@@ -1129,12 +1136,22 @@ mod tests {
 
         migrate_native_authority_rank(&conn).unwrap();
 
-        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(0));
-        assert_eq!(rank_of(&conn, "unknown-icd10"), Some(0));
+        assert_eq!(rank_of(&conn, "rxnorm"), Some(0));
+        assert_eq!(rank_of(&conn, "icd10cm|2026"), Some(0));
         assert_eq!(
-            rank_of(&conn, "stub-snomed"),
+            rank_of(&conn, "snomed-ct"),
             None,
             "a placeholder keeps its rank"
+        );
+        assert_eq!(
+            rank_of(&conn, "dicom-dcim|01"),
+            Some(1),
+            "a package's copy at an importer's URL keeps its rank"
+        );
+        assert_eq!(
+            rank_of(&conn, "icd10cm-other"),
+            Some(1),
+            "the id must be the importer's, not merely start with it"
         );
         assert_eq!(rank_of(&conn, "other"), None);
         assert_eq!(
@@ -1146,12 +1163,12 @@ mod tests {
         // The sentinel makes it a one-time backfill: a row ranked later is
         // left as the import ranked it.
         conn.execute(
-            "UPDATE code_systems SET authority_rank = 1 WHERE id = 'legacy-rxnorm'",
+            "UPDATE code_systems SET authority_rank = 1 WHERE id = 'rxnorm'",
             [],
         )
         .unwrap();
         migrate_native_authority_rank(&conn).unwrap();
-        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(1));
+        assert_eq!(rank_of(&conn, "rxnorm"), Some(1));
     }
 
     const ICD9CM_MARKER: &str = "#migration:icd9cm-space-delimited-802";

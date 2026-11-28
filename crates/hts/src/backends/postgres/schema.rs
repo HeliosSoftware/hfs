@@ -337,9 +337,12 @@ END $$;
 -- left NULL when they predate authority_rank, and ranked 1 (unknown) by every
 -- importer but SNOMED CT and LOINC, so an unattributed bundle could replace
 -- them; their ledger entries are kept, so they are never re-imported to be
--- ranked. A 'not-present' row is a package placeholder and keeps its rank.
--- The URL list is `crate::import::NATIVE_OWNED_SYSTEMS`; a test keeps the two
--- in step. Mirrors sqlite/schema.rs::migrate_native_authority_rank.
+-- ranked. Only the importer's own row is promoted, matched by URL and by the
+-- id the importer assigns (alone or followed by '|<version>'): another
+-- source's row at the same URL keeps its rank (#3160), and so does a
+-- 'not-present' row, which is a package placeholder.
+-- The (URL, id) list is `crate::import::NATIVE_OWNED_SYSTEMS`; a test keeps
+-- the two in step. Mirrors sqlite/schema.rs::migrate_native_authority_rank.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -348,18 +351,18 @@ BEGIN
         UPDATE code_systems SET authority_rank = 0
          WHERE (authority_rank IS NULL OR authority_rank = 1)
            AND content <> 'not-present'
-           AND url IN (
-               'http://snomed.info/sct',
-               'http://loinc.org',
-               'http://www.nlm.nih.gov/research/umls/rxnorm',
-               'http://unitsofmeasure.org',
-               'http://hl7.org/fhir/sid/icd-10-cm',
-               'http://hl7.org/fhir/sid/icd-9-cm',
-               'http://hl7.org/fhir/sid/ndc',
-               'http://www.nlm.nih.gov/mesh',
-               'http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl',
-               'http://nucc.org/provider-taxonomy',
-               'http://dicom.nema.org/resources/ontology/DCM'
+           AND (
+               (url = 'http://snomed.info/sct' AND (id = 'snomed-ct' OR id LIKE 'snomed-ct|%'))
+            OR (url = 'http://loinc.org' AND (id = 'loinc' OR id LIKE 'loinc|%'))
+            OR (url = 'http://www.nlm.nih.gov/research/umls/rxnorm' AND (id = 'rxnorm' OR id LIKE 'rxnorm|%'))
+            OR (url = 'http://unitsofmeasure.org' AND (id = 'ucum' OR id LIKE 'ucum|%'))
+            OR (url = 'http://hl7.org/fhir/sid/icd-10-cm' AND (id = 'icd10cm' OR id LIKE 'icd10cm|%'))
+            OR (url = 'http://hl7.org/fhir/sid/icd-9-cm' AND (id = 'icd9cm' OR id LIKE 'icd9cm|%'))
+            OR (url = 'http://hl7.org/fhir/sid/ndc' AND (id = 'ndc' OR id LIKE 'ndc|%'))
+            OR (url = 'http://www.nlm.nih.gov/mesh' AND (id = 'mesh' OR id LIKE 'mesh|%'))
+            OR (url = 'http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl' AND (id = 'nci-thesaurus' OR id LIKE 'nci-thesaurus|%'))
+            OR (url = 'http://nucc.org/provider-taxonomy' AND (id = 'nucc' OR id LIKE 'nucc|%'))
+            OR (url = 'http://dicom.nema.org/resources/ontology/DCM' AND (id = 'dicom' OR id LIKE 'dicom|%'))
            );
         INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
         VALUES ('#migration:native-authority-rank-2899', '', 0);
@@ -380,8 +383,9 @@ mod tests {
         let block = &block[..block.find("END $$;").unwrap()];
         let listed = block.matches("'http").count();
         assert_eq!(listed, crate::import::NATIVE_OWNED_SYSTEMS.len(), "{block}");
-        for url in crate::import::NATIVE_OWNED_SYSTEMS {
-            assert!(block.contains(&format!("'{url}'")), "{url} is missing");
+        for (url, id) in crate::import::NATIVE_OWNED_SYSTEMS {
+            let condition = format!("(url = '{url}' AND (id = '{id}' OR id LIKE '{id}|%'))");
+            assert!(block.contains(&condition), "{condition} is missing");
         }
     }
 }

@@ -40,7 +40,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const UCUM_URL: &str = "http://unitsofmeasure.org";
-const UCUM_ID: &str = "ucum";
+pub(crate) const UCUM_ID: &str = "ucum";
 const UCUM_NAME: &str = "UCUM";
 const UCUM_TITLE: &str = "Unified Code for Units of Measure (UCUM)";
 const ROOT_CODE: &str = "UCUM";

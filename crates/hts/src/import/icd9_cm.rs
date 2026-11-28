@@ -32,7 +32,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const ICD9CM_URL: &str = "http://hl7.org/fhir/sid/icd-9-cm";
-const ICD9CM_ID: &str = "icd9cm";
+pub(crate) const ICD9CM_ID: &str = "icd9cm";
 const ICD9CM_NAME: &str = "ICD-9-CM";
 const ICD9CM_TITLE: &str =
     "ICD-9-CM (International Classification of Diseases, 9th Revision, Clinical Modification)";

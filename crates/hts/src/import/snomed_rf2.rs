@@ -42,7 +42,7 @@ use crate::import::bundle_builder::{
 // ── SNOMED CT constants ───────────────────────────────────────────────────────
 
 pub(crate) const SNOMED_URL: &str = "http://snomed.info/sct";
-const SNOMED_ID: &str = "snomed-ct";
+pub(crate) const SNOMED_ID: &str = "snomed-ct";
 const SNOMED_NAME: &str = "SNOMED_CT";
 const SNOMED_TITLE: &str = "SNOMED CT";
 

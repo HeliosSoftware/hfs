@@ -23,7 +23,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── ICD-10-CM constants ───────────────────────────────────────────────────────
 
 pub(crate) const ICD10CM_URL: &str = "http://hl7.org/fhir/sid/icd-10-cm";
-const ICD10CM_ID: &str = "icd10cm";
+pub(crate) const ICD10CM_ID: &str = "icd10cm";
 const ICD10CM_NAME: &str = "ICD-10-CM";
 const ICD10CM_TITLE: &str =
     "ICD-10-CM (International Classification of Diseases, 10th Revision, Clinical Modification)";

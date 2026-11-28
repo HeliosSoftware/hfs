@@ -48,7 +48,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub(crate) const NUCC_URL: &str = "http://nucc.org/provider-taxonomy";
-const NUCC_ID: &str = "nucc";
+pub(crate) const NUCC_ID: &str = "nucc";
 const NUCC_NAME: &str = "NUCC";
 const NUCC_TITLE: &str = "NUCC Provider Taxonomy";
 const ROOT_CODE: &str = "NUCC";
