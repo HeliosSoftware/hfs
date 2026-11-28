@@ -87,6 +87,11 @@ impl ChannelType {
     }
 }
 
+/// Most channel headers a Subscription may carry. Each is added to every
+/// notification request, and the HTTP client's header map has a fixed
+/// capacity it panics past.
+pub const MAX_CHANNEL_HEADERS: usize = 64;
+
 /// Channel configuration for a subscription.
 ///
 /// `Debug` redacts the endpoint and the header values, which commonly carry
@@ -515,6 +520,15 @@ impl SubscriptionManager {
         {
             return Err(SubscriptionError::UnsupportedChannel {
                 channel_type: channel.channel_type.as_fhir_str().to_string(),
+            });
+        }
+
+        if channel.headers.len() > MAX_CHANNEL_HEADERS {
+            return Err(SubscriptionError::InvalidSubscription {
+                message: format!(
+                    "a channel may carry at most {MAX_CHANNEL_HEADERS} headers, got {}",
+                    channel.headers.len()
+                ),
             });
         }
 
@@ -1764,6 +1778,36 @@ pub(crate) mod tests {
             result,
             Err(SubscriptionError::InvalidEndpoint { .. })
         ));
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn a_channel_with_more_headers_than_the_cap_is_refused() {
+        let registry = create_test_registry("t1");
+        let manager = SubscriptionManager::new(registry, vec!["rest-hook".to_string()]);
+        let with_headers = |n: usize| {
+            let mut resource = build_subscription_json(
+                "http://example.org/topic/encounter-start",
+                "rest-hook",
+                Some("https://example.org/hook"),
+            );
+            resource["channel"]["header"] =
+                json!((0..n).map(|i| format!("x-h{i}: v")).collect::<Vec<_>>());
+            resource
+        };
+
+        let at_cap = with_headers(MAX_CHANNEL_HEADERS);
+        assert!(
+            manager
+                .register("t1", "s1", &at_cap, FhirVersion::R4)
+                .is_ok()
+        );
+        let past_cap = with_headers(MAX_CHANNEL_HEADERS + 1);
+        let result = manager.register("t1", "s2", &past_cap, FhirVersion::R4);
+        assert!(
+            matches!(result, Err(SubscriptionError::InvalidSubscription { ref message }) if message.contains("at most")),
+            "{result:?}"
+        );
     }
 
     #[test]

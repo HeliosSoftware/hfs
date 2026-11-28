@@ -1,8 +1,10 @@
 //! Volatile, bounded dispatch service. Only the outer engine owns its sender.
 use super::EngineCore;
-use crate::manager::{GenerationToken, SubscriptionSnapshot};
+use crate::manager::{GenerationToken, SubscriptionSnapshot, SubscriptionStatusCode};
 use crate::{ResourceEvent, SubscriptionConfig};
+use futures::FutureExt;
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
@@ -42,6 +44,10 @@ pub struct DispatchSnapshot {
     pub dropped_tenant_full: u64,
     pub dropped_subscription_full: u64,
     pub dropped_worker_full: u64,
+    /// Deliveries that panicked. Each also counts as a failed delivery.
+    pub panicked_deliveries: u64,
+    /// Activation handshakes that panicked. Each sets its Subscription to `error`.
+    pub panicked_activations: u64,
 }
 
 struct Completion {
@@ -422,22 +428,42 @@ impl SchedulerState {
             let core = Arc::clone(core);
             let state = Arc::clone(self);
             tokio::spawn(async move {
-                let _lease = WorkerLease {
+                let mut lease = WorkerLease {
                     state: Arc::clone(&state),
                     _permit: permit,
+                    key: k.clone(),
+                    generation: generation.clone(),
+                    released: false,
                 };
                 loop {
                     let Some(job) = state.next_job(&k, &generation) else {
+                        lease.released = true;
                         break;
                     };
-                    core.dispatch_with_retry(
+                    let delivery = AssertUnwindSafe(core.dispatch_with_retry(
                         &job.snapshot,
                         &job.bundle,
                         "event-notification",
                         Some(job.event_number),
                         &state,
-                    )
+                    ))
+                    .catch_unwind()
                     .await;
+                    if delivery.is_err() {
+                        // A delivery that panics is a failed delivery, so a
+                        // Subscription that panics every time reaches the
+                        // error and off thresholds like any failing one. The
+                        // worker then ends without handing its queue back, and
+                        // the lease drops what was queued behind this job.
+                        state.lock().stats.panicked_deliveries += 1;
+                        core.handle_delivery_failure(
+                            &job.snapshot,
+                            &state,
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await;
+                        break;
+                    }
                     drop(job);
                 }
             });
@@ -492,13 +518,51 @@ impl SchedulerState {
         tokio::select! { biased; _ = self.closed() => None, _ = snapshot.generation.cancelled() => None, result = future => Some(result) }
     }
 }
+/// A queue's worker. `released` is set once [`SchedulerState::next_job`] has
+/// handed ownership of the queue back; a worker dropped before that (its task
+/// panicked or was aborted) releases it here, or the queue would keep
+/// `worker` set and every later notification for it would wait forever.
 struct WorkerLease {
     state: Arc<SchedulerState>,
     _permit: OwnedSemaphorePermit,
+    key: Key,
+    generation: GenerationToken,
+    released: bool,
 }
 impl Drop for WorkerLease {
     fn drop(&mut self) {
-        self.state.lock().stats.notification_workers -= 1;
+        let stranded = {
+            let mut inner = self.state.lock();
+            inner.stats.notification_workers -= 1;
+            if self.released {
+                VecDeque::new()
+            } else {
+                let mut stranded = VecDeque::new();
+                if let Some(queue) = inner
+                    .queues
+                    .get_mut(&self.key)
+                    .filter(|q| q.generation.same_generation(&self.generation))
+                {
+                    queue.worker = false;
+                    stranded = std::mem::take(&mut queue.pending);
+                    if queue.resident == 0 {
+                        inner.queues.remove(&self.key);
+                    }
+                }
+                stranded
+            }
+        };
+        if !self.released {
+            warn!(
+                tenant_id = %self.key.0,
+                subscription_id = %self.key.1,
+                dropped = stranded.len(),
+                "Subscription notification worker stopped unexpectedly; its queued notifications were dropped"
+            );
+        }
+        // Dropping the jobs releases their resident budget, which locks the
+        // state again, so it happens after the guard above is gone.
+        drop(stranded);
     }
 }
 pub(super) struct AttemptGuard {
@@ -510,13 +574,31 @@ impl Drop for AttemptGuard {
         self.state.lock().stats.active_attempts -= 1;
     }
 }
+/// A running activation. Dropping it removes the activation's entry, which
+/// wakes whoever waits on it, however the task ended: an entry left behind by
+/// a task that panicked or was aborted would stay `running` forever.
 struct ActivationLease {
     state: Arc<SchedulerState>,
     permit: Option<OwnedSemaphorePermit>,
+    key: Key,
+    generation: GenerationToken,
 }
 impl Drop for ActivationLease {
     fn drop(&mut self) {
-        self.state.lock().stats.active_activations -= 1;
+        let removed = {
+            let mut inner = self.state.lock();
+            inner.stats.active_activations -= 1;
+            if inner
+                .activations
+                .get(&self.key)
+                .is_some_and(|a| a.snapshot.generation.same_generation(&self.generation))
+            {
+                inner.activations.remove(&self.key)
+            } else {
+                None
+            }
+        };
+        drop(removed);
         self.permit.take();
         self.state.activation_wake.notify_one();
     }
@@ -559,6 +641,8 @@ impl SchedulerOwner {
                         dropped_tenant_full: 0,
                         dropped_subscription_full: 0,
                         dropped_worker_full: 0,
+                        panicked_deliveries: 0,
+                        panicked_activations: 0,
                     },
                     queues: HashMap::new(),
                     tenant_resident: HashMap::new(),
@@ -642,22 +726,31 @@ impl SchedulerOwner {
                         let _lease = ActivationLease {
                             state: Arc::clone(&state),
                             permit: Some(permit),
+                            key: k,
+                            generation: snapshot.generation.clone(),
                         };
                         if core.manager.is_current(&snapshot) && !snapshot.generation.is_cancelled()
                         {
-                            core.activate_subscription(&snapshot, &state).await;
-                        }
-                        let removed = {
-                            let mut inner = state.lock();
-                            if inner.activations.get(&k).is_some_and(|a| {
-                                a.snapshot.generation.same_generation(&snapshot.generation)
-                            }) {
-                                inner.activations.remove(&k)
-                            } else {
-                                None
+                            let activation =
+                                AssertUnwindSafe(core.activate_subscription(&snapshot, &state))
+                                    .catch_unwind()
+                                    .await;
+                            if activation.is_err() {
+                                // A handshake that panics is a failed handshake.
+                                state.lock().stats.panicked_activations += 1;
+                                warn!(
+                                    tenant_id = %snapshot.subscription.tenant_id,
+                                    subscription_id = %snapshot.subscription.id,
+                                    "Subscription activation stopped unexpectedly; marking it as error"
+                                );
+                                core.transition_status(
+                                    &snapshot,
+                                    SubscriptionStatusCode::Error,
+                                    &state,
+                                )
+                                .await;
                             }
-                        };
-                        drop(removed);
+                        }
                     });
                 }
                 tokio::select! { biased; _ = state.closed() => break, _ = wake => {} }
@@ -957,6 +1050,174 @@ mod tests {
         drop(replacement);
         assert_eq!(state.snapshot().resident_notifications, 0);
     }
+    /// A delivery that panics (here reqwest's header map overflowing on a
+    /// snapshot that skipped the registration cap) must not leave its queue
+    /// marked as having a worker: the next notification for the same
+    /// subscription is still delivered.
+    #[tokio::test]
+    async fn a_worker_that_panics_releases_its_queue_for_the_next_notification() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&hook)
+            .await;
+        let engine = engine(4);
+        let good = snapshot_with_endpoint(&engine, "a", &hook.uri());
+        let mut bad = good.clone();
+        bad.subscription.channel.headers = (0..40_000).map(|i| format!("x-h{i}: v")).collect();
+        let state = &engine.scheduler.state;
+
+        let resident = state.reserve(&bad).unwrap();
+        state.submit(&engine.core, bad, json!({}), 1, resident, None);
+        settle(|| {
+            let s = state.snapshot();
+            s.notification_workers == 0 && s.resident_notifications == 0
+        })
+        .await;
+        assert!(state.lock().queues.is_empty(), "the queue is released");
+
+        let resident = state.reserve(&good).unwrap();
+        state.submit(&engine.core, good, json!({}), 2, resident, None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hook
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the next notification is delivered");
+    }
+
+    /// A delivery that panics counts as a failed delivery, and the
+    /// notifications queued behind it give back their budget.
+    #[tokio::test]
+    async fn a_delivery_that_panics_is_a_failed_delivery_and_frees_what_was_queued_behind_it() {
+        let engine = SubscriptionEngine::new(
+            SubscriptionConfig {
+                max_pending_notifications: 8,
+                per_subscription_queue_capacity: 4,
+                allow_private_endpoints: true,
+                ..Default::default()
+            },
+            "http://localhost".into(),
+        );
+        engine.topic_registry().add_topic(
+            "tenant",
+            TopicDefinition {
+                canonical_url: "topic".into(),
+                title: None,
+                resource_triggers: vec![],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
+        let mut bad = snapshot_with_endpoint(&engine, "a", "http://127.0.0.1:9/hook");
+        bad.subscription.channel.headers = (0..40_000).map(|i| format!("x-h{i}: v")).collect();
+        let state = &engine.scheduler.state;
+
+        // All three are queued before the worker is first polled.
+        for n in 1..=3 {
+            let resident = state.reserve(&bad).unwrap();
+            state.submit(&engine.core, bad.clone(), json!({}), n, resident, None);
+        }
+        settle(|| {
+            let s = state.snapshot();
+            s.notification_workers == 0 && s.resident_notifications == 0
+        })
+        .await;
+
+        assert!(state.lock().queues.is_empty(), "the queue is released");
+        assert_eq!(state.snapshot().panicked_deliveries, 1);
+        assert_eq!(
+            engine
+                .manager()
+                .get_snapshot("tenant", "a")
+                .unwrap()
+                .subscription
+                .consecutive_failures,
+            1,
+            "the panic is counted as a failed delivery"
+        );
+    }
+
+    /// A handshake that panics (the same header-map overflow, on a snapshot
+    /// that skipped the registration cap) must not leave its activation
+    /// `running`: its waiter is woken, the Subscription becomes `error`, and
+    /// the handshake slot is free for the next activation.
+    #[tokio::test]
+    async fn an_activation_that_panics_releases_its_entry_and_wakes_its_waiter() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn finished(mut receipt: watch::Receiver<bool>) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !*receipt.borrow_and_update() {
+                    if receipt.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the activation's waiter is woken");
+        }
+        let hook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&hook)
+            .await;
+        let engine = engine(4); // one handshake slot
+        let register = |id: &str| {
+            let resource = crate::manager::tests::build_subscription_json(
+                "topic",
+                "rest-hook",
+                Some(&hook.uri()),
+            );
+            engine
+                .manager()
+                .register("tenant", id, &resource, FhirVersion::default())
+                .unwrap();
+            engine.manager().get_snapshot("tenant", id).unwrap()
+        };
+        let mut bad = register("a");
+        bad.subscription.channel.headers = (0..40_000).map(|i| format!("x-h{i}: v")).collect();
+        let good = register("b");
+        assert!(engine.scheduler.start(&engine.core));
+        let state = &engine.scheduler.state;
+
+        finished(state.request_activation(bad)).await;
+        settle(|| state.snapshot().active_activations == 0).await;
+        assert!(state.lock().activations.is_empty(), "the entry is released");
+        assert_eq!(state.snapshot().panicked_activations, 1);
+        assert_eq!(
+            engine
+                .manager()
+                .get_snapshot("tenant", "a")
+                .unwrap()
+                .subscription
+                .status,
+            SubscriptionStatusCode::Error
+        );
+
+        finished(state.request_activation(good)).await;
+        assert_eq!(
+            engine
+                .manager()
+                .get_snapshot("tenant", "b")
+                .unwrap()
+                .subscription
+                .status,
+            SubscriptionStatusCode::Active,
+            "the next activation gets the handshake slot"
+        );
+    }
+
     /// One tenant's resident notifications stop at its share of the global
     /// budget, so another tenant still gets a reservation.
     #[tokio::test]
