@@ -3,11 +3,18 @@
 //! `$sql-run` and `$sql-export` are mounted at the system level, so the
 //! authorization middleware cannot name the resource types a request reads:
 //! they are whatever the resolved subject names — a ViewDefinition's
-//! `resource`, or the `resource` of every leaf ViewDefinition in a Library's
-//! dependency graph. Each of those types needs the same Search grant a plain
-//! search on it would, judged by [`SmartScopePolicy`] exactly as the
+//! `resource`, the `resource` of every leaf ViewDefinition in a Library's
+//! dependency graph, and `ValueSet` or `ConceptMap` for each of its
+//! terminology dependencies. Each of those types needs the same Search grant
+//! a plain search on it would, judged by [`SmartScopePolicy`] exactly as the
 //! middleware judges `GET /{type}`. A grant that rests on a `patient/` scope
 //! is refused: a view cannot be confined to the launch patient's compartment.
+//!
+//! Which of the two a terminology dependency is, is only known once it is
+//! resolved, from the persisted table or from the terminology server. So a
+//! token that may search neither is refused before either is consulted
+//! ([`check_terminology_reachable`]), and the resolved kind is checked with
+//! the rest of the plan ([`plan_resource_types`]).
 
 use std::borrow::Cow;
 
@@ -26,12 +33,50 @@ pub(super) fn view_resource_type(view: &Value) -> Option<&str> {
     view.get("resource").and_then(|v| v.as_str())
 }
 
-/// The resource type of every leaf ViewDefinition a resolved plan reads.
+/// The resource type of every node a resolved plan reads: the `resource` of
+/// a leaf ViewDefinition, and `ValueSet` or `ConceptMap` for a terminology
+/// dependency.
 pub(super) fn plan_resource_types(plan: &GraphPlan) -> impl Iterator<Item = &str> {
     plan.nodes.iter().filter_map(|node| match node {
         PlanNode::Leaf { view, .. } => view_resource_type(view),
-        PlanNode::SqlView { .. } | PlanNode::Terminology { .. } => None,
+        PlanNode::Terminology { relation, .. } => Some(relation.kind.as_str()),
+        PlanNode::SqlView { .. } => None,
     })
+}
+
+/// The resource types a terminology dependency may turn out to be.
+const TERMINOLOGY_TYPES: [&str; 2] = ["ValueSet", "ConceptMap"];
+
+/// Refuses, before terminology dependency `url` is resolved, a token that
+/// could not read it whichever kind it turns out to be: one with no
+/// unrestricted Search grant on `ValueSet` nor on `ConceptMap`. Neither the
+/// persisted table nor the terminology server is consulted for such a token.
+/// With authentication disabled there is no principal and nothing to check.
+pub(super) fn check_terminology_reachable(
+    principal: Option<&Principal>,
+    operation: &str,
+    url: &str,
+) -> Result<(), RestError> {
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    let granted = TERMINOLOGY_TYPES.iter().any(|resource_type| {
+        matches!(
+            SmartScopePolicy::check(principal, resource_type, FhirOperation::Search),
+            Ok(AccessScope::Unrestricted)
+        )
+    });
+    if granted {
+        Ok(())
+    } else {
+        Err(RestError::Forbidden {
+            message: format!(
+                "{operation} depends on '{url}', which is not a stored ViewDefinition or Library. \
+                 Resolving it as a ValueSet or ConceptMap needs an unrestricted search grant on \
+                 one of the two, and this token has neither"
+            ),
+        })
+    }
 }
 
 /// [`check_read_scopes`] for `subject`, with the decision recorded as an
@@ -153,6 +198,7 @@ pub(super) fn check_read_scopes<'a>(
 mod tests {
     use super::*;
     use helios_auth::ScopeSet;
+    use helios_sof::sqlquery::{TerminologyKind, TerminologyRelation};
     use serde_json::json;
 
     fn principal(scopes: &str) -> Principal {
@@ -208,6 +254,84 @@ mod tests {
     fn one_ungranted_type_refuses_the_whole_set() {
         let p = principal("user/Observation.rs");
         assert!(check_read_scopes(Some(&p), "$sql-run", ["Observation", "Patient"]).is_err());
+    }
+
+    fn plan(nodes: Vec<PlanNode>) -> GraphPlan {
+        GraphPlan {
+            nodes,
+            subject_edges: Vec::new(),
+        }
+    }
+
+    fn terminology_node(kind: TerminologyKind) -> PlanNode {
+        PlanNode::Terminology {
+            internal_name: "t0".to_string(),
+            relation: TerminologyRelation {
+                kind,
+                rows: Vec::new(),
+            },
+            name: "http://example.org/terminology".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_terminology_dependency_reads_its_kind() {
+        let p = plan(vec![
+            PlanNode::Leaf {
+                internal_name: "v0".to_string(),
+                view: json!({"resourceType": "ViewDefinition", "resource": "Patient"}),
+            },
+            terminology_node(TerminologyKind::ValueSet),
+            terminology_node(TerminologyKind::ConceptMap),
+        ]);
+        assert_eq!(
+            plan_resource_types(&p).collect::<Vec<_>>(),
+            ["Patient", "ValueSet", "ConceptMap"]
+        );
+    }
+
+    #[test]
+    fn a_plan_of_terminology_alone_still_needs_a_grant() {
+        let p = plan(vec![terminology_node(TerminologyKind::ValueSet)]);
+        let openid = principal("openid");
+        let err =
+            check_read_scopes(Some(&openid), "$sql-run", plan_resource_types(&p)).unwrap_err();
+        assert!(
+            matches!(err, RestError::Forbidden { ref message } if message.contains("ValueSet"))
+        );
+        let concept_maps = principal("user/ConceptMap.rs");
+        assert!(
+            check_read_scopes(Some(&concept_maps), "$sql-run", plan_resource_types(&p)).is_err(),
+            "a ConceptMap grant does not read a ValueSet"
+        );
+        let value_sets = principal("user/ValueSet.rs");
+        assert!(check_read_scopes(Some(&value_sets), "$sql-run", plan_resource_types(&p)).is_ok());
+    }
+
+    #[test]
+    fn a_terminology_dependency_is_reached_only_with_a_grant_on_either_kind() {
+        let url = "http://example.org/vs";
+        assert!(check_terminology_reachable(None, "$sql-run", url).is_ok());
+        for scopes in ["user/ValueSet.rs", "user/ConceptMap.rs", "system/*.rs"] {
+            assert!(
+                check_terminology_reachable(Some(&principal(scopes)), "$sql-run", url).is_ok(),
+                "{scopes}"
+            );
+        }
+        for scopes in [
+            "openid",
+            "user/Observation.rs",
+            "patient/*.rs",
+            "user/ValueSet.c",
+        ] {
+            let err = check_terminology_reachable(Some(&principal(scopes)), "$sql-export", url)
+                .unwrap_err();
+            assert!(
+                matches!(err, RestError::Forbidden { ref message }
+                    if message.contains("$sql-export") && message.contains(url)),
+                "{scopes}"
+            );
+        }
     }
 
     #[test]

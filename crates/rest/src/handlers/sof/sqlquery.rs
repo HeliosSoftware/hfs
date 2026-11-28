@@ -193,7 +193,8 @@ where
         super::subject::SubjectKind::SqlView
     );
     let subject_url = library_json.get("url").and_then(|v| v.as_str());
-    let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context())
+        .reading_as(principal, "$sql-run");
     let max_vds = state.config().sof_sqlquery_max_vds;
     let subject_node = super::graph::SubjectNode {
         identity: subject_url,
@@ -210,7 +211,8 @@ where
 
     super::graph::check_max_nodes(&plan, max_vds)?;
 
-    // Every leaf ViewDefinition in the plan reads the resource type it names.
+    // Every leaf ViewDefinition in the plan reads the resource type it names,
+    // and every terminology dependency its kind.
     super::authz::authorize_reads(
         &state,
         tenant.context(),
