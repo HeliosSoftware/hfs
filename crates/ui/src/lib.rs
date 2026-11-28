@@ -9583,12 +9583,6 @@ const SERIES_COLORS: usize = 6;
 /// will chart. The default selection is smaller (the provider's three).
 const CHART_MAX_SERIES: usize = 6;
 
-/// Computes the SVG geometry for one resource type's cumulative series. `window`
-/// decides only the x-axis label format â€” a calendar date over daily buckets, a
-/// UTC clock time over intraday ones. Under a legend `focus` (#602) the y axis
-/// re-fits the focused series so a small type is legible next to a large one;
-/// the other series stay plotted at their true values, receded, and the plot
-/// clip-path cuts them where they exceed the focused scale.
 /// `value` as JSON that is safe as the raw text of a `<script>` element.
 ///
 /// serde_json escapes only quotes, backslashes and control characters, so a
@@ -9609,6 +9603,12 @@ fn json_for_script_element(value: &serde_json::Value) -> String {
     out
 }
 
+/// Computes the SVG geometry for one resource type's cumulative series. `window`
+/// decides only the x-axis label format â€” a calendar date over daily buckets, a
+/// UTC clock time over intraday ones. Under a legend `focus` (#602) the y axis
+/// re-fits the focused series so a small type is legible next to a large one;
+/// the other series stay plotted at their true values, receded, and the plot
+/// clip-path cuts them where they exceed the focused scale.
 fn build_chart(
     all: &[DashboardSeries],
     window: DashboardWindow,
