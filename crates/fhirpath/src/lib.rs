@@ -517,14 +517,95 @@ impl Level {
     }
 }
 
+/// What the token before the current one was, as far as comments go. The
+/// parser takes a comment only next to an integer, a date/time literal or a
+/// type name (`custom_padded` in `parser.rs`); after any other operand a `/`
+/// is a division.
+#[derive(Clone, Copy, PartialEq)]
+enum Prev {
+    /// An operator, an opening bracket, a separator, or nothing yet.
+    Operator,
+    /// An operand the parser takes no comment after.
+    Operand,
+    /// An integer, a date/time literal or a type name: a comment may follow.
+    Commentable,
+}
+
+/// Whether the parser ends a `//` comment at `c`: every line terminator
+/// chumsky's `text::newline` accepts, not only `\n`. A comment the scan ran
+/// past would hide the rest of the expression from it.
+fn is_line_terminator(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// How many characters after `@` the parser's date, datetime or time literal
+/// takes at most: `YYYY[-MM[-DD]][T[hh[:mm[:ss[.f{1,3}]]][tz]]]` or
+/// `Thh[:mm[:ss[.f{1,3}]]][tz]`, where `tz` is `Z` or `±hh:mm`. The scan
+/// takes no more than that, so steps and operands written right after a
+/// literal are counted like any others.
+fn temporal_literal_len(rest: &[char]) -> usize {
+    let digits = |at: usize, count: usize| {
+        rest.get(at..at + count)
+            .is_some_and(|s| s.iter().all(|c| c.is_ascii_digit()))
+    };
+    let mut n = 0;
+    if rest.first() != Some(&'T') {
+        if !digits(0, 4) {
+            return 0;
+        }
+        n = 4;
+        if rest.get(n) == Some(&'-') && digits(n + 1, 2) {
+            n += 3;
+            if rest.get(n) == Some(&'-') && digits(n + 1, 2) {
+                n += 3;
+            }
+        }
+        if rest.get(n) != Some(&'T') {
+            return n;
+        }
+    }
+    n += 1; // the `T`
+    if !digits(n, 2) {
+        return n;
+    }
+    n += 2;
+    if rest.get(n) == Some(&':') && digits(n + 1, 2) {
+        n += 3;
+        if rest.get(n) == Some(&':') && digits(n + 1, 2) {
+            n += 3;
+            if rest.get(n) == Some(&'.') && digits(n + 1, 1) {
+                n += 2;
+                let mut fraction = 1;
+                while fraction < 3 && digits(n, 1) {
+                    n += 1;
+                    fraction += 1;
+                }
+            }
+        }
+    }
+    match rest.get(n) {
+        Some('Z') => n + 1,
+        Some('+' | '-')
+            if digits(n + 1, 2) && rest.get(n + 3) == Some(&':') && digits(n + 4, 2) =>
+        {
+            n + 6
+        }
+        _ => n,
+    }
+}
+
 /// One linear pass over `expression` measuring both the deepest
 /// `(`/`[`/`{` nesting and the accumulated operator-chain depth (see
 /// [`MAX_EXPRESSION_DEPTH`]). Returns `(bracket_depth, chain_depth)`.
 ///
 /// Lexes just enough to avoid miscounting: single-quoted strings and
 /// backtick identifiers (both with `\` escapes), `//` and `/* */` comments,
-/// two-character operators, decimals, `@` date literals, and keywords after a
-/// `.` (member names, not operators). Per bracket level the chain depth is the
+/// two-character operators, decimals, `@` date literals, keywords after a
+/// `.` (member names, not operators), and `//` after an operand that takes no
+/// comment (a division, see [`Prev`]). Per bracket level the chain depth is the
 /// number of binary operators plus the longest run of postfix/prefix steps
 /// between them plus the deepest closed group inside it, so a chain wrapped in
 /// parentheses or function arguments still accumulates. A function call's
@@ -536,14 +617,23 @@ fn scan_depths(expression: &str) -> (usize, usize) {
     let mut max_bracket = 0usize;
     let mut prev_operand = false;
     let mut prev_dot = false;
+    let mut prev = Prev::Operator;
+    // `type_next`: the next name is a type name (after `is`/`as`, or after the
+    // `.` of a qualified one). `type_name`: the last token was a type name.
+    let (mut type_next, mut type_name) = (false, false);
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
         let was_dot = std::mem::replace(&mut prev_dot, false);
+        let was_type_next = std::mem::replace(&mut type_next, false);
+        let was_type_name = std::mem::replace(&mut type_name, false);
         let top = levels.last_mut().expect("level stack is never empty");
         match c {
-            c if c.is_whitespace() => prev_dot = was_dot,
+            c if c.is_whitespace() => {
+                prev_dot = was_dot;
+                (type_next, type_name) = (was_type_next, was_type_name);
+            }
             '\'' | '`' => {
                 i += 1;
                 while i < chars.len() && chars[i] != c {
@@ -553,11 +643,30 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                     i += 1;
                 }
                 prev_operand = true;
+                type_name = c == '`' && was_type_next;
+                prev = if type_name {
+                    Prev::Commentable
+                } else {
+                    Prev::Operand
+                };
+            }
+            // After an operand that takes no comments, `//*` and `///` are a
+            // division and then a comment before its right operand
+            // (`a //* c */ 1` is `a / 1`), not a line comment: count the
+            // division and lex on from the second `/`.
+            '/' if next == Some('/')
+                && prev == Prev::Operand
+                && matches!(chars.get(i + 2), Some('*' | '/')) =>
+            {
+                top.binary += 1;
+                prev_operand = false;
+                prev = Prev::Operator;
             }
             '/' if next == Some('/') => {
-                while i < chars.len() && chars[i] != '\n' {
+                while i < chars.len() && !is_line_terminator(chars[i]) {
                     i += 1;
                 }
+                type_next = was_type_next;
             }
             '/' if next == Some('*') => {
                 i += 2;
@@ -565,24 +674,28 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                     i += 1;
                 }
                 i += 1;
+                type_next = was_type_next;
             }
             '@' => {
-                while chars
-                    .get(i + 1)
-                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
-                {
-                    i += 1;
-                }
+                i += temporal_literal_len(&chars[i + 1..]);
                 prev_operand = true;
+                prev = Prev::Commentable;
             }
             c if c.is_ascii_digit() => {
+                let mut decimal = false;
                 while chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
                     || (chars.get(i + 1) == Some(&'.')
                         && chars.get(i + 2).is_some_and(|c| c.is_ascii_digit()))
                 {
                     i += 1;
+                    decimal |= chars[i] == '.';
                 }
                 prev_operand = true;
+                prev = if decimal {
+                    Prev::Operand
+                } else {
+                    Prev::Commentable
+                };
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
@@ -593,7 +706,8 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                     i += 1;
                 }
                 let word: String = chars[start..=i].iter().collect();
-                if !was_dot && KEYWORD_OPERATORS.contains(&word.as_str()) {
+                let keyword = !was_dot && KEYWORD_OPERATORS.contains(&word.as_str());
+                if keyword {
                     if matches!(word.as_str(), "is" | "as") {
                         // Postfix-style type operator: one more AST level.
                         top.step();
@@ -605,11 +719,25 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 } else {
                     prev_operand = true;
                 }
+                // For comments the word is classified as the parser reads it:
+                // a keyword is an operator only after an operand, and a name
+                // in type position is a type name whatever it spells.
+                if was_type_next {
+                    type_name = true;
+                    prev = Prev::Commentable;
+                } else if keyword && prev != Prev::Operator {
+                    type_next = matches!(word.as_str(), "is" | "as");
+                    prev = Prev::Operator;
+                } else {
+                    prev = Prev::Operand;
+                }
             }
             '.' => {
                 top.step();
                 prev_operand = false;
                 prev_dot = true;
+                type_next = was_type_name;
+                prev = Prev::Operator;
             }
             '(' | '[' | '{' => {
                 if c == '[' {
@@ -624,6 +752,7 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 });
                 max_bracket = max_bracket.max(levels.len() - 1);
                 prev_operand = false;
+                prev = Prev::Operator;
             }
             ')' | ']' | '}' => {
                 if levels.len() > 1 {
@@ -632,6 +761,7 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                     parent.child_max = parent.child_max.max(child);
                 }
                 prev_operand = true;
+                prev = Prev::Operand;
             }
             ',' => {
                 let (done, base) = (top.cost() - top.base, top.base);
@@ -641,9 +771,15 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                     ..Level::default()
                 };
                 prev_operand = false;
+                prev = Prev::Operator;
             }
+            // The `:` of an instance selector field: a value follows.
+            ':' => prev = Prev::Operator,
             // Prefix polarity: one AST level per sign.
-            '+' | '-' if !prev_operand => top.step(),
+            '+' | '-' if !prev_operand => {
+                top.step();
+                prev = Prev::Operator;
+            }
             '+' | '-' | '*' | '/' | '|' | '&' | '=' | '~' | '<' | '>' | '!' => {
                 if (matches!(c, '!' | '<' | '>') && matches!(next, Some('=' | '~')))
                     || (c == '=' && next == Some('='))
@@ -653,6 +789,7 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 top.binary += 1;
                 top.run = 0;
                 prev_operand = false;
+                prev = Prev::Operator;
             }
             _ => {}
         }

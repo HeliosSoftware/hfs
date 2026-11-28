@@ -109,6 +109,92 @@ fn comment_and_backtick_evasions_are_rejected() {
     assert_rejected_everywhere(&format!("`a\\`` + {long}"));
 }
 
+/// The scan used to take everything after `@` that looked like part of a
+/// literal (letters, digits, `.`, `-`, `:`, `+`) and to end a `//` comment
+/// only at `\n`, while the parser takes a fixed-width literal and ends a
+/// comment at any line terminator. Chains written after either were not
+/// counted, and evaluating them overflowed the stack.
+#[test]
+fn chains_after_a_temporal_literal_or_a_line_comment_are_counted() {
+    let n = MAX_EXPRESSION_DEPTH + 50;
+    assert_rejected_everywhere(&format!("@2020-01-01{}", ".a".repeat(n)));
+    assert_rejected_everywhere(&format!("@2020{}", "+1".repeat(n)));
+    assert_rejected_everywhere(&format!("@2020-01-01T10:00:00.123Z{}", "-1".repeat(n)));
+    assert_rejected_everywhere(&format!("@T10:30{}", ".a".repeat(n)));
+    for terminator in ['\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}'] {
+        assert_rejected_everywhere(&format!("1 // note{terminator} + {}", chain("1", " + ", n)));
+    }
+}
+
+/// The parser allows a comment only around an integer, a date literal or a
+/// type name. After anything else, `//*` is a division followed by a block
+/// comment, so the rest of the line is syntax. The scan used to skip it as a
+/// line comment.
+#[test]
+fn chains_after_a_division_and_a_block_comment_are_counted() {
+    let n = MAX_EXPRESSION_DEPTH + 50;
+    assert_eq!(
+        parse_expression("a //* c */ 1"),
+        parse_expression("a / 1"),
+        "the parser reads `//*` after an identifier as a division"
+    );
+    for start in ["a", "'s'", "(a)", "and", "is", "a.is", "1.5", "1 'mg'"] {
+        assert_rejected_everywhere(&format!("{start} //* c */ 1{}", " + 1".repeat(n)));
+        assert_rejected_everywhere(&format!("{start} //* c */ @2020{}", ".a".repeat(n)));
+    }
+    assert_rejected_everywhere(&format!(
+        "a //* c */ 1 + {}1{}",
+        "(".repeat(MAX_NESTING_DEPTH + 50),
+        ")".repeat(MAX_NESTING_DEPTH + 50)
+    ));
+    // Where the parser does read a line comment (after an integer, a type
+    // name, or an operator), the scan must not read a block comment instead:
+    // the quote here would then open a string over the chain.
+    assert_rejected_everywhere(&format!("1 //* */ '\n{} + 'x'", " + 1".repeat(n)));
+    assert_rejected_everywhere(&format!("- //* '\n1{} + 'x'", " + 1".repeat(n)));
+    assert_rejected_everywhere(&format!(
+        "a is /* c */ A //* */ '\n{} | 'x'",
+        " | 1".repeat(n)
+    ));
+    // `///` is a division and then a line comment: the division is counted.
+    assert_rejected_everywhere(&chain("a /// c\n1", " * ", n / 2 + 1));
+}
+
+#[test]
+fn comments_that_start_with_a_slash_or_a_star_still_parse() {
+    for expr in [
+        "1 /// c\n + 1",
+        "1 //* c\n + 1",
+        "1 + /// c\n 1",
+        "1 //// c",
+        "- //* c\n1 + 'a'",
+        "a is A //* c\n | 'a'",
+        "a /// c\n1",
+    ] {
+        assert!(parse_expression(expr).is_ok(), "{expr}");
+    }
+}
+
+#[test]
+fn temporal_literals_still_parse() {
+    for literal in [
+        "@2020",
+        "@2020-01",
+        "@2020-01-01",
+        "@2020T",
+        "@2020-01-01T10",
+        "@2020-01-01T10:30:15.123+05:30",
+        "@2020-01-01T10:30:15Z",
+        "@T10:30:15.5",
+    ] {
+        assert!(
+            parse_expression(&format!("{literal} = {literal}")).is_ok(),
+            "{literal}"
+        );
+    }
+    assert!(parse_expression(&format!("@2020-01-01{}", ".a".repeat(100))).is_ok());
+}
+
 #[test]
 fn function_chains_and_type_operators_count() {
     let n = MAX_EXPRESSION_DEPTH + 50;
