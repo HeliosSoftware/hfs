@@ -128,6 +128,7 @@ async fn kid_from_the_ui_assertion() -> Option<String> {
     );
 
     let (token_url, seen) = mock_token_endpoint().await;
+    helios_ui::set_bulk_submit_trusted_providers([&token_url]);
     let response = ui
         .oneshot(
             Request::post("/ui/bulk-import/test-auth")

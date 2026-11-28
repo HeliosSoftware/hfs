@@ -14,6 +14,9 @@
 //! so a panic inside the blocking thread reaches the consumer as an `Err`
 //! item instead of a silent end of stream.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use helios_fhir::FhirVersion;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -25,10 +28,11 @@ use tracing::{debug, trace};
 use helios_sof::arrow::record_batch::RecordBatch;
 use helios_sof::columnar::{COLUMNAR_BATCH_ROWS, ColumnarBatchBuilder};
 use helios_sof::sqlquery::engine::declared_columns;
+use helios_sof::sqlquery::{NativeDialect, QueryResult, SqlQueryError};
 
 use crate::core::sof_runner::{
-    BatchStream, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner, ViewFilters,
-    row_batch_channel, row_stream, watch_row_producer,
+    BatchStream, NativeSqlQuery, RowBatchSender, RowBatcher, RowStream, SofError, SofRunner,
+    ViewFilters, row_batch_channel, row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -40,10 +44,75 @@ use super::runtime::{RuntimeParam, prepare_sql_run};
 /// [`COLUMNAR_BATCH_ROWS`] rows, so a couple of them is plenty of read-ahead.
 const BATCH_CHANNEL_BUFFER: usize = 2;
 
+/// SQLite VM instructions between two checks of whether a view's rows are
+/// still wanted.
+const ABANDON_CHECK_OPS: std::ffi::c_int = 10_000;
+
+/// A pooled connection that interrupts its running statement once nobody
+/// reads the rows any more: the request timed out, the client went away, or
+/// the export job was cancelled.
+///
+/// A statement that yields nothing for a long time, such as the sort before
+/// the first row of a cross product of sibling `forEach` clauses, would
+/// otherwise run to completion on the pool connection, past the request
+/// timeout and past a disconnect. The progress handler is removed on drop, so
+/// the connection goes back to the pool without it.
+///
+/// With a budget ([`SofRunner::with_statement_timeout`]) it also interrupts
+/// the statement once the budget has passed, and [`Self::statement_error`]
+/// reports that as [`SofError::Timeout`].
+struct WatchedConnection {
+    conn: r2d2::PooledConnection<SqliteConnectionManager>,
+    deadline: Option<Instant>,
+}
+
+impl WatchedConnection {
+    fn new(
+        mut conn: r2d2::PooledConnection<SqliteConnectionManager>,
+        abandoned: impl Fn() -> bool + Send + 'static,
+        budget: Option<Duration>,
+    ) -> Self {
+        let deadline = budget.map(|budget| Instant::now() + budget);
+        let stop = move || abandoned() || deadline.is_some_and(|at| Instant::now() >= at);
+        if let Err(e) = conn.progress_handler(ABANDON_CHECK_OPS, Some(stop)) {
+            tracing::warn!(error = %e, "could not watch a SQL-on-FHIR statement for abandonment");
+        }
+        Self { conn, deadline }
+    }
+
+    /// An error of the running statement under `context`: a
+    /// [`SofError::Timeout`] once the budget has passed (the handler
+    /// interrupted it), else a [`SofError::Backend`].
+    fn statement_error(&self, context: &str, e: impl std::fmt::Display) -> SofError {
+        if self.deadline.is_some_and(|at| Instant::now() >= at) {
+            SofError::Timeout(format!("{context}: the statement exceeded its time budget"))
+        } else {
+            SofError::Backend(format!("{context}: {e}"))
+        }
+    }
+}
+
+impl Drop for WatchedConnection {
+    fn drop(&mut self) {
+        let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+impl std::ops::Deref for WatchedConnection {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
 /// SQL-on-FHIR runner that compiles ViewDefinitions to SQLite SQL.
 pub struct SqliteInDbRunner {
     pool: Pool<SqliteConnectionManager>,
     fhir_version: FhirVersion,
+    /// `Some(budget)`: every view statement is interrupted once it has run
+    /// for `budget` (see [`SofRunner::with_statement_timeout`]).
+    statement_timeout: Option<Duration>,
 }
 
 impl SqliteInDbRunner {
@@ -54,6 +123,7 @@ impl SqliteInDbRunner {
         Self {
             pool,
             fhir_version: FhirVersion::default_enabled(),
+            statement_timeout: None,
         }
     }
 
@@ -69,6 +139,16 @@ impl SqliteInDbRunner {
 impl SofRunner for SqliteInDbRunner {
     fn runner_name(&self) -> &'static str {
         "sqlite-indb"
+    }
+
+    /// The same runner with every view statement interrupted once it has run
+    /// for `budget`, which then ends the view as [`SofError::Timeout`].
+    fn with_statement_timeout(&self, budget: Duration) -> Option<Arc<dyn SofRunner>> {
+        Some(Arc::new(SqliteInDbRunner {
+            pool: self.pool.clone(),
+            fhir_version: self.fhir_version,
+            statement_timeout: Some(budget),
+        }))
     }
 
     async fn run_view(
@@ -105,6 +185,7 @@ impl SofRunner for SqliteInDbRunner {
             .map(SqliteParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
+        let budget = self.statement_timeout;
         let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
         let producer = tokio::task::spawn_blocking(move || {
@@ -115,11 +196,24 @@ impl SofRunner for SqliteInDbRunner {
                 &compiled.columns,
                 &compiled.column_decodes,
                 prepared.client_limit,
+                budget,
                 tx,
             );
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
         Ok(row_stream(rx))
+    }
+
+    fn native_sql_dialect(&self) -> Option<NativeDialect> {
+        Some(NativeDialect::Sqlite)
+    }
+
+    async fn run_sql_query(
+        &self,
+        tenant: &TenantContext,
+        query: NativeSqlQuery,
+    ) -> Result<QueryResult, SqlQueryError> {
+        super::sqlite_native::run_sql_query(&self.pool, self.fhir_version, tenant, query).await
     }
 
     async fn run_view_columnar(
@@ -169,6 +263,7 @@ impl SofRunner for SqliteInDbRunner {
             .map(SqliteParam::from_runtime)
             .collect();
         let pool = self.pool.clone();
+        let budget = self.statement_timeout;
         let (tx, rx) =
             tokio::sync::mpsc::channel::<Result<RecordBatch, SofError>>(BATCH_CHANNEL_BUFFER);
         let guard_tx = tx.clone();
@@ -179,6 +274,7 @@ impl SofRunner for SqliteInDbRunner {
                 params,
                 &compiled.column_decodes,
                 prepared.client_limit,
+                budget,
                 builder,
                 tx,
             );
@@ -192,7 +288,7 @@ impl SofRunner for SqliteInDbRunner {
 /// reads and JSON decoding all run outside the async runtime. A run
 /// restricted to one stored FHIR version (#2254) reads only Groups stored
 /// under it (`stored_version`, the closed MIME form `"4.0"`, `"5.0"`, …).
-async fn load_group_documents(
+pub(super) async fn load_group_documents(
     pool: Pool<SqliteConnectionManager>,
     tenant_id: String,
     stored_version: Option<&'static str>,
@@ -239,7 +335,7 @@ async fn load_group_documents(
 }
 
 #[derive(Clone, Debug)]
-enum SqliteParam {
+pub(super) enum SqliteParam {
     Text(String),
     Bool(bool),
     Int(i64),
@@ -250,7 +346,7 @@ enum SqliteParam {
 }
 
 impl SqliteParam {
-    fn from_runtime(value: RuntimeParam) -> Self {
+    pub(super) fn from_runtime(value: RuntimeParam) -> Self {
         match value {
             RuntimeParam::Text(value) => Self::Text(value),
             RuntimeParam::Literal(value) => Self::from_lit(&value),
@@ -305,6 +401,7 @@ fn stream_sqlite_rows(
     columns: &[String],
     decodes: &[ColumnDecode],
     limit: Option<usize>,
+    budget: Option<Duration>,
     tx: RowBatchSender,
 ) {
     let conn = match pool.get() {
@@ -316,6 +413,8 @@ fn stream_sqlite_rows(
             return;
         }
     };
+    let watch = tx.clone();
+    let conn = WatchedConnection::new(conn, move || watch.is_closed(), budget);
 
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
@@ -333,9 +432,7 @@ fn stream_sqlite_rows(
         }) {
             Ok(iter) => iter,
             Err(e) => {
-                let _ = tx.blocking_send(Err(SofError::Backend(format!(
-                    "query execution failed: {e}"
-                ))));
+                let _ = tx.blocking_send(Err(conn.statement_error("query execution failed", e)));
                 return;
             }
         }
@@ -359,7 +456,7 @@ fn stream_sqlite_rows(
                 }
             }
             Err(e) => {
-                batcher.blocking_error(SofError::Backend(format!("row error: {e}")));
+                batcher.blocking_error(conn.statement_error("row error", e));
                 return;
             }
         }
@@ -423,12 +520,14 @@ fn map_sqlite_row(
 /// Applies the same per-row `limit` and mirrors [`map_sqlite_row`]'s value
 /// handling (0/1 as boolean in boolean columns, NaN/Inf REAL as 0, lossy
 /// UTF-8). A row error ends the stream after reporting it.
+#[allow(clippy::too_many_arguments)]
 fn stream_sqlite_batches(
     pool: &Pool<SqliteConnectionManager>,
     sql: &str,
     params: Vec<SqliteParam>,
     decodes: &[ColumnDecode],
     limit: Option<usize>,
+    budget: Option<Duration>,
     mut builder: ColumnarBatchBuilder,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, SofError>>,
 ) {
@@ -441,6 +540,8 @@ fn stream_sqlite_batches(
             return;
         }
     };
+    let watch = tx.clone();
+    let conn = WatchedConnection::new(conn, move || watch.is_closed(), budget);
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => {
@@ -453,9 +554,7 @@ fn stream_sqlite_batches(
     let mut rows = match stmt.query(rusqlite::params_from_iter(params.iter())) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.blocking_send(Err(SofError::Backend(format!(
-                "query execution failed: {e}"
-            ))));
+            let _ = tx.blocking_send(Err(conn.statement_error("query execution failed", e)));
             return;
         }
     };
@@ -469,7 +568,7 @@ fn stream_sqlite_batches(
             Ok(Some(row)) => row,
             Ok(None) => break,
             Err(e) => {
-                let _ = tx.blocking_send(Err(SofError::Backend(format!("row error: {e}"))));
+                let _ = tx.blocking_send(Err(conn.statement_error("row error", e)));
                 return;
             }
         };
@@ -792,6 +891,75 @@ mod tests {
             )
             .unwrap();
         pool
+    }
+
+    /// A statement whose rows nobody reads any more is interrupted, and its
+    /// connection goes back to the pool without the progress handler. This
+    /// one never yields a row (an aggregate over an endless recursion), so
+    /// only the handler can notice that the receiver is gone.
+    #[tokio::test]
+    async fn an_abandoned_statement_is_interrupted_and_its_connection_returned() {
+        let pool = group_test_pool();
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking({
+            let pool = pool.clone();
+            move || {
+                stream_sqlite_rows(
+                    &pool,
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                     SELECT count(*) AS n FROM c",
+                    Vec::new(),
+                    &["n".to_string()],
+                    &[ColumnDecode::Integer],
+                    None,
+                    None,
+                    tx,
+                )
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), producer)
+            .await
+            .expect("the abandoned statement is interrupted")
+            .unwrap();
+
+        let conn = pool.get().unwrap();
+        let one: i64 = conn.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(one, 1, "the returned connection runs statements normally");
+    }
+
+    /// With a budget, a statement still running when it passes is interrupted
+    /// and reported as a timeout, as the PostgreSQL runner reports a statement
+    /// the server cancelled (#2577).
+    #[tokio::test]
+    async fn a_statement_past_its_budget_ends_as_a_timeout() {
+        let pool = group_test_pool();
+        let (tx, mut rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking({
+            let pool = pool.clone();
+            move || {
+                stream_sqlite_rows(
+                    &pool,
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                     SELECT count(*) AS n FROM c",
+                    Vec::new(),
+                    &["n".to_string()],
+                    &[ColumnDecode::Integer],
+                    None,
+                    Some(Duration::from_millis(200)),
+                    tx,
+                )
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the statement stops at its budget");
+        assert!(
+            matches!(first, Some(Err(SofError::Timeout(_)))),
+            "{first:?}"
+        );
+        producer.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

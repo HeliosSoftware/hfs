@@ -155,6 +155,7 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY` | `1024` | Resource events waiting for evaluation |
 | `HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS` | `1024` | Global queued + active notifications, including retry sleeps |
 | `HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY` | `32` | Queued + active notifications for one `(tenant, subscription_id)` |
+| `HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT` | half the global budget | Queued + active notifications for all of one tenant's subscriptions, so one tenant's slow receivers cannot shed the others'; kept between the per-subscription capacity and the global budget |
 | `HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY` | `64` | Simultaneous channel attempts, shared by notifications and activation handshakes |
 | `HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY` | `8` | Running activation flows, shared by live writes and startup rehydration |
 | `HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE` | `100` | Events remembered per subscription for `$events` (number, timestamp, focus reference only; in memory, lost on restart); `0` disables the history |
@@ -412,6 +413,10 @@ After a successful bind message, the server sends a handshake notification bundl
 The WebSocket protocol is **unidirectional** (server → client) after binding. Additional bind messages on the same connection are rejected; close frames trigger graceful cleanup.
 
 **Deadlines and queueing:** a connection that sends no bind message within 10 seconds is closed (`1008 bind-timeout`). Each bound client has a queue of 256 notifications; a client that stops reading its socket is given 30 seconds to accept a frame and is dropped once its queue is full, so a stalled client retains no further notifications in the server. It reconnects with a new binding token and replays missed events through `$events`.
+
+**Incoming message size:** the server reads only the bind message, so a client message or frame larger than 4 KiB is refused and the connection is closed with `1009 message-too-big`. Notifications the server sends are not limited by this.
+
+**Limits per subscription:** at most 16 clients are bound at a time; a further bind is closed with `1008 too-many-clients` until one disconnects. At most 16 binding tokens are outstanding (issued, unused, unexpired); a further `$get-ws-binding-token` answers `429` with `Retry-After` set to the token lifetime. Each notification is serialized once and every bound client's queue shares those bytes, so the memory a notification holds does not grow with the number of clients.
 
 **Multiple clients:** Multiple clients can bind to the same subscription simultaneously. All connected clients receive every notification.
 

@@ -42,6 +42,7 @@ pub mod reindex;
 pub mod search;
 pub mod smart_discovery;
 pub mod sof;
+pub(crate) mod subscription_authority;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub(crate) mod tenant_inventory;

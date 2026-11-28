@@ -76,7 +76,8 @@ where
     let resource = state
         .storage()
         .read(tenant.context(), &resource_type, &id)
-        .await?;
+        .await
+        .map_err(|e| RestError::gone_as_configured(e, state.return_gone()))?;
 
     match resource {
         Some(stored) => {
@@ -239,7 +240,8 @@ where
     let resource = state
         .storage()
         .read(tenant.context(), &resource_type, &id)
-        .await?;
+        .await
+        .map_err(|e| RestError::gone_as_configured(e, state.return_gone()))?;
 
     match resource {
         Some(stored) => {

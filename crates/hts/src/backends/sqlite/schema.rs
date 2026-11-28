@@ -177,6 +177,14 @@ CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url
 CREATE INDEX IF NOT EXISTS idx_implicit_expansion_cache_url_code
     ON implicit_expansion_cache(url, code);
 
+-- One row per key of implicit_expansion_cache with the time it was last used
+-- (milliseconds since the Unix epoch). The cache keeps a fixed number of keys
+-- and drops the ones used longest ago; see trim_implicit_cache_keys.
+CREATE TABLE IF NOT EXISTS implicit_expansion_cache_keys (
+    url       TEXT PRIMARY KEY,
+    last_used INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
 -- ── Concept Maps ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS concept_maps (
     id          TEXT PRIMARY KEY,
@@ -281,6 +289,11 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+-- Systems whose closure was kept across a deferred (chunked) write and no
+-- longer covers every concept; rebuilt at the next finalize or startup.
+CREATE TABLE IF NOT EXISTS concept_closure_stale (
+    system_id TEXT PRIMARY KEY
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -346,6 +359,10 @@ pub(crate) fn build_concept_closure_in_transaction(
     if concepts.is_empty() {
         conn.execute(
             "DELETE FROM concept_closure WHERE system_id = ?1",
+            rusqlite::params![system_id],
+        )?;
+        conn.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = ?1",
             rusqlite::params![system_id],
         )?;
         return Ok(());
@@ -421,6 +438,10 @@ pub(crate) fn build_concept_closure_in_transaction(
             }
         }
     }
+    conn.execute(
+        "DELETE FROM concept_closure_stale WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    )?;
     Ok(())
 }
 
@@ -448,7 +469,9 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
                         SELECT 1 FROM concept_closure c
                         WHERE  c.system_id = h.system_id
                         LIMIT  1
-                    )",
+                    )
+             UNION
+             SELECT system_id FROM concept_closure_stale",
         )?;
         stmt.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -456,6 +479,20 @@ pub fn migrate_concept_closure(conn: &rusqlite::Connection) -> rusqlite::Result<
 
     for sid in &systems_needing_closure {
         build_concept_closure(conn, sid)?;
+        // Expansions answered from the stale closure were persisted; drop
+        // them so the rebuilt closure is what the next `$expand` reads.
+        let url: Option<String> = conn
+            .query_row("SELECT url FROM code_systems WHERE id = ?1", [sid], |r| {
+                r.get(0)
+            })
+            .ok();
+        if let Some(url) = url {
+            if let Err(e) =
+                crate::import::fhir_bundle::invalidate_expansion_cache_for_system(conn, &url)
+            {
+                tracing::warn!(system_id = %sid, error = %e, "Failed to invalidate expansions after closure rebuild");
+            }
+        }
     }
 
     Ok(systems_needing_closure.len())
@@ -560,6 +597,67 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
                  re-import and record which canonical URLs they own"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// One-time backfill: rank the CodeSystem rows the native importers wrote as
+/// [`AUTHORITY_OWNER`](crate::import::bundle_parser::AUTHORITY_OWNER).
+///
+/// Those importers are authoritative for the systems in
+/// [`NATIVE_OWNED_SYSTEMS`](crate::import::NATIVE_OWNED_SYSTEMS), but their
+/// rows were not ranked so: rows written before `authority_rank` existed are
+/// NULL, and every importer but SNOMED CT and LOINC ranked its rows
+/// `AUTHORITY_UNKNOWN`, like any other bundle. Either way the import check
+/// let an unattributed bundle replace them. Their ledger entries are kept on
+/// purpose (re-importing the archives costs hours), so they are never
+/// re-imported to be ranked, and treating NULL as owner on write would block
+/// the convergence `AUTHORITY_UNCLAIMED` exists for. This promotes them once.
+///
+/// A row with `content = 'not-present'` is a package's placeholder for an
+/// external terminology (THO ships one for SNOMED CT, for instance), not the
+/// importer's, and keeps its rank. A sentinel ledger row records that the
+/// backfill ran, as [`migrate_icd9cm_reimport`] does.
+pub fn migrate_native_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use crate::import::bundle_parser::{AUTHORITY_OWNER, AUTHORITY_UNKNOWN};
+    use rusqlite::OptionalExtension;
+
+    const MARKER: &str = "#migration:native-authority-rank-2899";
+
+    let already_ran: bool = conn
+        .query_row(
+            "SELECT 1 FROM bootstrap_imports WHERE path = ?1",
+            [MARKER],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_ran {
+        return Ok(());
+    }
+
+    let systems = crate::import::NATIVE_OWNED_SYSTEMS;
+    let placeholders = vec!["?"; systems.len()].join(", ");
+    let promoted = conn.execute(
+        &format!(
+            "UPDATE code_systems SET authority_rank = {AUTHORITY_OWNER}
+             WHERE (authority_rank IS NULL OR authority_rank = {AUTHORITY_UNKNOWN})
+               AND content <> 'not-present'
+               AND url IN ({placeholders})"
+        ),
+        rusqlite::params_from_iter(systems),
+    )?;
+    conn.execute(
+        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) VALUES (?1, '', 0)",
+        [MARKER],
+    )?;
+
+    if promoted > 0 {
+        tracing::info!(
+            promoted_code_systems = promoted,
+            "Ranked natively imported CodeSystems as owned by their importer"
+        );
     }
 
     Ok(())
@@ -776,6 +874,7 @@ mod tests {
             "concept_maps",
             "concept_map_elements",
             "implicit_expansion_cache",
+            "implicit_expansion_cache_keys",
             "implicit_expansion_fts",
             "concepts_fts",
             "concepts_word_fts",
@@ -1003,6 +1102,56 @@ mod tests {
 
         assert_eq!(ledger_paths(&conn).len(), 1);
         assert!(has_authority_rank(&conn, "code_systems"));
+    }
+
+    fn rank_of(conn: &rusqlite::Connection, id: &str) -> Option<i32> {
+        conn.query_row(
+            "SELECT authority_rank FROM code_systems WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn native_authority_backfill_ranks_importer_rows_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank) VALUES
+               ('legacy-rxnorm', 'http://www.nlm.nih.gov/research/umls/rxnorm', '2024', 'active', 'complete', 'x', 'x', NULL),
+               ('unknown-icd10', 'http://hl7.org/fhir/sid/icd-10-cm', '2026', 'active', 'complete', 'x', 'x', 1),
+               ('stub-snomed', 'http://snomed.info/sct', NULL, 'active', 'not-present', 'x', 'x', NULL),
+               ('other', 'http://example.org/cs', '1', 'active', 'complete', 'x', 'x', NULL),
+               ('v2-0001', 'http://terminology.hl7.org/CodeSystem/v2-0001', 'current', 'active', 'complete', 'x', 'x', 1);",
+        )
+        .unwrap();
+
+        migrate_native_authority_rank(&conn).unwrap();
+
+        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(0));
+        assert_eq!(rank_of(&conn, "unknown-icd10"), Some(0));
+        assert_eq!(
+            rank_of(&conn, "stub-snomed"),
+            None,
+            "a placeholder keeps its rank"
+        );
+        assert_eq!(rank_of(&conn, "other"), None);
+        assert_eq!(
+            rank_of(&conn, "v2-0001"),
+            Some(1),
+            "THO owns the v2 table URLs"
+        );
+
+        // The sentinel makes it a one-time backfill: a row ranked later is
+        // left as the import ranked it.
+        conn.execute(
+            "UPDATE code_systems SET authority_rank = 1 WHERE id = 'legacy-rxnorm'",
+            [],
+        )
+        .unwrap();
+        migrate_native_authority_rank(&conn).unwrap();
+        assert_eq!(rank_of(&conn, "legacy-rxnorm"), Some(1));
     }
 
     const ICD9CM_MARKER: &str = "#migration:icd9cm-space-delimited-802";

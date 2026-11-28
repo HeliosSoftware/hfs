@@ -47,7 +47,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const NUCC_URL: &str = "http://nucc.org/provider-taxonomy";
+pub(crate) const NUCC_URL: &str = "http://nucc.org/provider-taxonomy";
 const NUCC_ID: &str = "nucc";
 const NUCC_NAME: &str = "NUCC";
 const NUCC_TITLE: &str = "NUCC Provider Taxonomy";
@@ -166,10 +166,10 @@ pub async fn import_nucc(
         &builder_concepts,
     );
 
-    let imported = backend.import_bundle(ctx, &bytes).await?;
+    let imported = backend.import_native_bundle(ctx, &bytes, false).await?;
     stats.code_systems = imported.code_systems;
     stats.concepts = concepts.len() as u32;
-    stats.errors.extend(imported.errors);
+    stats.take_errors(imported);
 
     eprintln!(
         "[nucc] imported {} codes ({} synthetic nodes)",

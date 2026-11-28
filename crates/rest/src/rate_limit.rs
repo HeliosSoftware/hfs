@@ -47,10 +47,48 @@ struct RateState {
     day_count: u32,
 }
 
-/// The bucket map and the size past which the next prune runs.
+/// How often a full map (see [`RateLimiter::with_max_keys`]) is scanned for
+/// buckets to drop. Between scans a new key is refused straight away, so a
+/// stream of new keys against a full map costs one scan per interval, not one
+/// per request.
+const FULL_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The bucket map, the size past which the next prune runs, and when the last
+/// one ran.
 struct Buckets {
     map: HashMap<String, RateState>,
     prune_at: usize,
+    last_prune: Option<Instant>,
+}
+
+impl Buckets {
+    /// Drops the buckets with nothing left to remember, then hands back the
+    /// memory they held: `retain` keeps the map's capacity, so a map that once
+    /// held a burst's buckets would otherwise stay that size.
+    fn prune(&mut self, now: Instant, window: Duration, today: u64) {
+        self.map.retain(|_, state| {
+            state
+                .window
+                .back()
+                .is_some_and(|t| now.duration_since(*t) <= window)
+                || (state.day == today && state.day_count > 0)
+        });
+        self.prune_at = self.map.len().saturating_mul(2).max(PRUNE_AT);
+        self.map.shrink_to(self.prune_at);
+        self.last_prune = Some(now);
+    }
+
+    /// Whether a prune is due: the map outgrew its threshold, or it holds more
+    /// than the floor and a whole window has passed since the last prune, so
+    /// the buckets of a burst that has lapsed go even when no new burst
+    /// pushes the map past the threshold the old one set.
+    fn prune_due(&self, now: Instant, window: Duration) -> bool {
+        self.map.len() > self.prune_at
+            || (self.map.len() > PRUNE_AT
+                && self
+                    .last_prune
+                    .is_none_or(|at| now.duration_since(at) > window))
+    }
 }
 
 /// A sliding-window rate limiter with an optional per-day ceiling.
@@ -65,6 +103,7 @@ struct Buckets {
 /// since every distinct key is a bucket until it is pruned.
 pub(crate) struct RateLimiter {
     buckets: OnceLock<Mutex<Buckets>>,
+    max_keys: Option<usize>,
 }
 
 impl RateLimiter {
@@ -72,7 +111,63 @@ impl RateLimiter {
     pub(crate) const fn new() -> Self {
         Self {
             buckets: OnceLock::new(),
+            max_keys: None,
         }
+    }
+
+    /// Creates an empty limiter that holds at most `max_keys` buckets. When
+    /// the map is full and a prune frees nothing, a request under a new key
+    /// is rejected for a window instead of adding a bucket, so a surface whose
+    /// keys a caller can invent cannot grow the map without bound.
+    pub(crate) const fn with_max_keys(max_keys: usize) -> Self {
+        Self {
+            buckets: OnceLock::new(),
+            max_keys: Some(max_keys),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Buckets> {
+        self.buckets
+            .get_or_init(|| {
+                Mutex::new(Buckets {
+                    map: HashMap::new(),
+                    prune_at: PRUNE_AT,
+                    last_prune: None,
+                })
+            })
+            .lock()
+            .expect("rate limiter lock")
+    }
+
+    /// Whether a request under `key` would be admitted by
+    /// [`RateLimiter::check_window`], without recording one or creating a
+    /// bucket. For a ceiling that is charged only after the request turns out
+    /// to deserve it.
+    pub(crate) fn peek_window(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<(), RateLimited> {
+        let buckets = self.lock();
+        let now = Instant::now();
+        let Some(state) = buckets.map.get(key) else {
+            return Ok(());
+        };
+        let live: Vec<Instant> = state
+            .window
+            .iter()
+            .copied()
+            .filter(|t| now.duration_since(*t) <= window)
+            .collect();
+        if live.len() >= limit as usize {
+            let oldest = live.first().copied().unwrap_or(now);
+            return Err(RateLimited {
+                kind: LimitKind::Window,
+                retry_after_secs: ceil_secs(window.saturating_sub(now.duration_since(oldest))),
+            });
+        }
+        Ok(())
     }
 
     /// Records a request against `key`, rejecting it when either ceiling is hit.
@@ -96,28 +191,29 @@ impl RateLimiter {
         window: Duration,
         daily_limit: Option<u32>,
     ) -> Result<(), RateLimited> {
-        let mut buckets = self
-            .buckets
-            .get_or_init(|| {
-                Mutex::new(Buckets {
-                    map: HashMap::new(),
-                    prune_at: PRUNE_AT,
-                })
-            })
-            .lock()
-            .expect("rate limiter lock");
+        let mut buckets = self.lock();
         let now = Instant::now();
         let today = current_day();
 
-        if buckets.map.len() > buckets.prune_at {
-            buckets.map.retain(|_, state| {
-                state
-                    .window
-                    .back()
-                    .is_some_and(|t| now.duration_since(*t) <= window)
-                    || (state.day == today && state.day_count > 0)
-            });
-            buckets.prune_at = buckets.map.len().saturating_mul(2).max(PRUNE_AT);
+        if buckets.prune_due(now, window) {
+            buckets.prune(now, window, today);
+        }
+        if let Some(max_keys) = self.max_keys
+            && buckets.map.len() >= max_keys
+            && !buckets.map.contains_key(key)
+        {
+            if buckets
+                .last_prune
+                .is_none_or(|at| now.duration_since(at) >= FULL_PRUNE_INTERVAL)
+            {
+                buckets.prune(now, window, today);
+            }
+            if buckets.map.len() >= max_keys {
+                return Err(RateLimited {
+                    kind: LimitKind::Window,
+                    retry_after_secs: ceil_secs(window),
+                });
+            }
         }
 
         let state = buckets
@@ -181,6 +277,13 @@ impl RateLimiter {
         self.buckets
             .get()
             .map_or(0, |b| b.lock().expect("rate limiter lock").map.len())
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.buckets
+            .get()
+            .map_or(0, |b| b.lock().expect("rate limiter lock").map.capacity())
     }
 
     #[cfg(test)]
@@ -385,6 +488,78 @@ mod tests {
             .expect("the triggering request");
         assert_eq!(limiter.len(), PRUNE_AT + 2, "nothing had lapsed");
         assert_eq!(limiter.prune_threshold(), 2 * (PRUNE_AT + 1));
+    }
+
+    /// The buckets of a burst that has lapsed are dropped, and their memory
+    /// handed back, once a window has passed, even though the map never grows
+    /// past the threshold the burst left behind (#2680).
+    #[test]
+    fn a_lapsed_burst_is_pruned_and_its_memory_returned() {
+        let limiter = RateLimiter::new();
+        let window = Duration::from_millis(500);
+        for i in 0..(2 * PRUNE_AT + 10) {
+            limiter
+                .check_window(&format!("k{i}"), 1, window)
+                .expect("first request for a fresh key");
+        }
+        let peak = limiter.capacity();
+        assert!(peak >= 2 * PRUNE_AT, "capacity {peak}");
+        assert!(limiter.prune_threshold() > 2 * PRUNE_AT);
+        std::thread::sleep(Duration::from_millis(600));
+
+        limiter
+            .check_window("after", 1, window)
+            .expect("a request after the burst");
+        assert_eq!(limiter.len(), 1, "the lapsed burst is gone");
+        assert_eq!(limiter.prune_threshold(), PRUNE_AT);
+        assert!(
+            limiter.capacity() < peak,
+            "capacity {} did not shrink from {peak}",
+            limiter.capacity()
+        );
+    }
+
+    /// A limiter with a key cap refuses a new key while it is full of live
+    /// buckets, and keeps serving the keys it holds.
+    #[test]
+    fn a_full_limiter_refuses_new_keys() {
+        let limiter = RateLimiter::with_max_keys(3);
+        let window = Duration::from_secs(60);
+        for key in ["a", "b", "c"] {
+            limiter
+                .check_window(key, 2, window)
+                .expect("room for a key");
+        }
+        let err = limiter
+            .check_window("d", 2, window)
+            .expect_err("the map is full");
+        assert_eq!(err.kind, LimitKind::Window);
+        assert!((1..=60).contains(&err.retry_after_secs));
+        assert_eq!(limiter.len(), 3, "the refused key got no bucket");
+        limiter
+            .check_window("a", 2, window)
+            .expect("a held key keeps its budget");
+    }
+
+    /// `peek_window` answers as `check_window` would, without recording a
+    /// request or creating a bucket.
+    #[test]
+    fn peek_window_records_nothing() {
+        let limiter = RateLimiter::new();
+        let window = Duration::from_secs(60);
+        for _ in 0..3 {
+            limiter
+                .peek_window("k", 2, window)
+                .expect("nothing recorded");
+        }
+        assert_eq!(limiter.len(), 0);
+        limiter.check_window("k", 2, window).expect("first");
+        limiter.peek_window("k", 2, window).expect("one left");
+        limiter.check_window("k", 2, window).expect("second");
+        let err = limiter
+            .peek_window("k", 2, window)
+            .expect_err("the budget is spent");
+        assert_eq!(err.kind, LimitKind::Window);
     }
 
     #[test]

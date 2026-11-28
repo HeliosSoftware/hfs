@@ -23,7 +23,7 @@ use crate::import::bundle_builder::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const NCI_URL: &str = "http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl";
+pub(crate) const NCI_URL: &str = "http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl";
 const NCI_ID: &str = "nci-thesaurus";
 const NCI_NAME: &str = "NCIt";
 const NCI_TITLE: &str = "NCI Thesaurus (NCIt)";
@@ -88,9 +88,9 @@ pub async fn import_nci_thesaurus(
 
     // Seed empty CodeSystem to register metadata.
     let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = concepts.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -126,8 +126,8 @@ pub async fn import_nci_thesaurus(
             .collect();
 
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
+        stats.take_errors(chunk);
 
         eprintln!(
             "[nci-thesaurus] batch {}/{total_batches} — +{} concepts (total: {})",

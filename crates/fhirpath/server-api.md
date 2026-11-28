@@ -53,7 +53,7 @@ Version-specific endpoints are useful when you want to ensure your resource is p
 | *(variables.part.name)* | The name of a variable to use | string | 1..1 | 
 | *(variables.part.value)* | The value of the variable| *(any)* | 0..1 | 
 | `resource` | The resource to execute the expression against | Resource | 1..1 |
-| `terminologyServer` | The terminology server to use for terminology lookups if not natively supported | string | 0..1 |
+| `terminologyServer` | The terminology server to use for terminology lookups if not natively supported. Accepted only when it is the server's own `FHIRPATH_TERMINOLOGY_SERVER` or listed in `FHIRPATH_SERVER_ALLOWED_TERMINOLOGY_SERVERS`; otherwise 400 | string | 0..1 |
 
 ### Output Parameters Resource:
 | Parameter Name | Description | Type | Cardinality |

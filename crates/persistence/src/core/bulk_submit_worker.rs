@@ -1854,6 +1854,11 @@ pub const DEFAULT_MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Logs a run abandoned because its lease is gone. A lost lease is never
 /// silent: whoever reclaims the manifest walks it again from its first file,
 /// which on a large corpus costs hours (#1127).
+/// The terminal message of a manifest whose run panicked; the payload is in
+/// the server log.
+const MANIFEST_PANIC_TEXT: &str =
+    "internal error while processing the manifest; the server log has the detail";
+
 fn warn_lease_lost(lease: &ManifestLease, step: &str) {
     tracing::warn!(
         submission = %lease.submission_id,
@@ -2013,7 +2018,39 @@ where
     /// Returns `Ok(())` for both successful ingestion and *recorded* manifest-level
     /// failures (a bad remote manifest fails only that manifest, not the worker).
     /// Only `LeaseError::LeaseLost` aborts early; storage errors propagate.
+    ///
+    /// A panic in the run fails the manifest, fenced, with a fixed message and
+    /// returns: an unwinding `run_job` used to end the worker loop's task for
+    /// the life of the process, and the reclaimed manifest then panicked the
+    /// next worker, until none was left.
     pub async fn run_job(&self, lease: ManifestLease) -> StorageResult<()> {
+        use futures::FutureExt;
+
+        match std::panic::AssertUnwindSafe(self.run_job_unguarded(lease.clone()))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(payload) => {
+                let _ = crate::core::bulk_export_worker::panicked_job_error(
+                    "bulk-submit",
+                    &format_args!("{}/{}", lease.submission_id, lease.manifest_id),
+                    payload.as_ref(),
+                );
+                match self.jobs.fail_manifest(&lease, MANIFEST_PANIC_TEXT).await {
+                    Ok(()) => Ok(()),
+                    Err(LeaseError::LeaseLost { .. }) => {
+                        warn_lease_lost(&lease, "failing a manifest whose run panicked");
+                        Ok(())
+                    }
+                    Err(LeaseError::Storage(e)) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The body of [`Self::run_job`], without its panic guard.
+    async fn run_job_unguarded(&self, lease: ManifestLease) -> StorageResult<()> {
         let view = match self.jobs.get_manifest_for_worker(&lease).await {
             Ok(v) => v,
             Err(LeaseError::LeaseLost { .. }) => {
@@ -9109,6 +9146,32 @@ mod tests {
         }
     }
 
+    /// A fetcher whose `fetch_manifest` panics, as a decoder fed hostile input
+    /// once did (#2622).
+    struct PanickingManifestFetcher;
+    #[async_trait]
+    impl SubmitInputFetcher for PanickingManifestFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _h: &[(String, String)],
+            _o: &[String],
+            _k: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            panic!("injected panic while fetching the manifest")
+        }
+        async fn open_file_stream(
+            &self,
+            _url: &str,
+            _h: &[(String, String)],
+            _r: bool,
+            _o: &[String],
+            _k: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            unreachable!("the manifest fetch panics first")
+        }
+    }
+
     async fn seed(backend: &Arc<SqliteBackend>, tenant: &TenantContext) -> SubmissionId {
         let sub_id = SubmissionId::generate("mock-system");
         backend
@@ -9156,6 +9219,48 @@ mod tests {
         // A manifest-level error artifact was recorded.
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(files.iter().any(|f| f.file_type == "error"));
+    }
+
+    /// A panic in the run fails that manifest and returns to the caller, so
+    /// the worker loop keeps claiming (#2663).
+    #[tokio::test]
+    async fn test_a_panicking_run_fails_the_manifest_and_returns() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+        let sub_id = seed(&backend, &tenant).await;
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            Arc::new(PanickingManifestFetcher),
+            output,
+            WorkerId::new("w"),
+        );
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].status,
+            crate::core::bulk_submit::ManifestStatus::Failed
+        );
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("w2"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none(),
+            "the failed manifest is terminal, not reclaimed by the next worker"
+        );
     }
 
     /// Seeds a submission whose single manifest carries the given `import` directives.

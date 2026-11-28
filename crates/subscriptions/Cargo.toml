@@ -55,6 +55,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 
 # Concurrent data structures
 dashmap = "6"
+bytes = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

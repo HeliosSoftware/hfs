@@ -6438,6 +6438,38 @@ async fn discover_tenants_honours_the_global_prefix() {
     assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
 }
 
+/// The bulk-provider store's errors go through the client error mapping:
+/// the operation is named, the SDK and provider detail stay in the log, and
+/// nothing is rendered with Rust `Debug` syntax.
+#[tokio::test]
+async fn bulk_provider_store_errors_carry_the_fixed_text_not_the_client_detail() {
+    use crate::core::BulkProviderStore;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let prefix = backend
+        .tenant_location(&tenant)
+        .unwrap()
+        .keyspace
+        .bulk_provider_prefix();
+    mock.fail_lists_at(
+        &prefix,
+        S3ClientError::Unavailable(
+            "connection failed: DispatchFailure { 127.0.0.1:59759 ConnectionRefused }".to_string(),
+        ),
+    );
+    let err = backend
+        .list_provider_submissions(&tenant)
+        .await
+        .expect_err("the list fails")
+        .to_string();
+    assert!(err.contains("list provider submissions"), "{err}");
+    assert!(!err.contains("DispatchFailure"), "{err}");
+    assert!(!err.contains("127.0.0.1"), "{err}");
+    assert!(!err.contains("Backend("), "{err}");
+}
+
 /// A failed delimiter page or a failed probe fails the call: never an empty
 /// or partial success.
 #[tokio::test]
@@ -7474,19 +7506,27 @@ fn access_denied_does_not_claim_the_store_is_unreachable() {
     assert!(!text.contains("ExpiredToken"), "{text}");
 }
 
-/// S3's wording for an invalid argument can quote the bucket or key; the 400
-/// carries a fixed sentence.
+/// An invalid bucket name or argument is a fault in a request the server
+/// built, not in the client's: a backend fault (500), whose text, which can
+/// quote the bucket or key, is logged rather than sent.
 #[test]
-fn invalid_input_stays_a_validation_error_without_the_provider_text() {
+fn invalid_input_is_a_backend_fault_not_a_validation_error() {
     let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
     let error = S3ClientError::InvalidInput("Bucket name hfs-prod-phi is not valid".to_string());
-    match backend.map_client_error(error) {
-        StorageError::Validation(crate::error::ValidationError::InvalidResource {
-            message,
-            ..
-        }) => assert_eq!(message, crate::error::OBJECT_STORE_INVALID_TEXT),
-        other => panic!("expected a validation error (400), got {other:?}"),
+    let mapped = backend.map_client_error(error);
+    match &mapped {
+        StorageError::Backend(BackendError::Internal { message, .. }) => {
+            assert!(
+                message.contains("hfs-prod-phi"),
+                "the log keeps the detail: {message}"
+            );
+        }
+        other => panic!("expected an internal backend error (500), got {other:?}"),
     }
+    let record = S3Backend::bulk_submit_operation_outcome(&mapped);
+    let record = record.to_string();
+    assert!(record.contains("\"exception\""), "{record}");
+    assert!(!record.contains("hfs-prod-phi"), "{record}");
 }
 
 /// The constructor's bucket check is the process's exit message: it names the

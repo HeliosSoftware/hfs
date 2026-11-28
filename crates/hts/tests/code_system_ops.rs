@@ -95,6 +95,28 @@ async fn lookup_unknown_system_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// A `$lookup` miss answered from the negative cache carries the message of
+/// the miss that filled it — an unknown CodeSystem is not reported as an
+/// unknown code.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_cached_lookup_miss_reads_like_a_fresh_one() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    for system in [bundles::ANATOMY_CS_URL, "http://hts.test/no-such-system"] {
+        let req = TestApp::params(&[
+            ("system", "valueUri", system),
+            ("code", "valueCode", "no-such-code"),
+        ]);
+        let (status, fresh) = app.post_fhir("/CodeSystem/$lookup", req.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, cached) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(cached, fresh, "{system}");
+    }
+}
+
 // ── $validate-code ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
@@ -447,6 +469,24 @@ async fn search_code_systems_pagination_count_and_offset() {
     assert_eq!(status2, StatusCode::OK, "{body2}");
     let entries2 = body2["entry"].as_array().expect("entry array");
     assert!(entries2.is_empty());
+}
+
+/// A `_count` above the page cap is lowered to it, and the links say so.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_count_above_the_page_cap_is_lowered() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem?_count=4294967295").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let links = body["link"].as_array().expect("link array");
+    let self_link = links
+        .iter()
+        .find(|l| l["relation"] == "self")
+        .and_then(|l| l["url"].as_str())
+        .expect("self link");
+    assert!(self_link.contains("_count=1000&"), "{self_link}");
 }
 
 // ── Phase 8: XML format support ───────────────────────────────────────────────

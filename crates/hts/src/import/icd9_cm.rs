@@ -31,7 +31,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ICD9CM_URL: &str = "http://hl7.org/fhir/sid/icd-9-cm";
+pub(crate) const ICD9CM_URL: &str = "http://hl7.org/fhir/sid/icd-9-cm";
 const ICD9CM_ID: &str = "icd9cm";
 const ICD9CM_NAME: &str = "ICD-9-CM";
 const ICD9CM_TITLE: &str =
@@ -156,9 +156,9 @@ pub async fn import_icd9_cm(
         ..Default::default()
     };
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = concepts.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -174,8 +174,8 @@ pub async fn import_icd9_cm(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
+        stats.take_errors(chunk);
 
         eprintln!(
             "[icd9-cm] batch {}/{total_batches} — +{} concepts (total: {})",

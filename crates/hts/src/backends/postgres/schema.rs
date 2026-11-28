@@ -231,6 +231,11 @@ CREATE TABLE IF NOT EXISTS concept_closure (
 -- Reverse lookup: all ancestors of a given descendant code.
 CREATE INDEX IF NOT EXISTS idx_closure_descendant
     ON concept_closure(system_id, descendant_code);
+-- Systems whose closure was kept across a deferred (chunked) write and no
+-- longer covers every concept; rebuilt at the next finalize or startup.
+CREATE TABLE IF NOT EXISTS concept_closure_stale (
+    system_id TEXT PRIMARY KEY REFERENCES code_systems(id) ON DELETE CASCADE
+);
 
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
@@ -326,7 +331,60 @@ BEGIN
         VALUES ('#migration:icd9cm-space-delimited-802', '', 0);
     END IF;
 END $$;
+
+-- ── Native importer rank backfill (issue #2899) ────────────────────────────────
+-- Rank the CodeSystem rows the native importers wrote as owned (0). They were
+-- left NULL when they predate authority_rank, and ranked 1 (unknown) by every
+-- importer but SNOMED CT and LOINC, so an unattributed bundle could replace
+-- them; their ledger entries are kept, so they are never re-imported to be
+-- ranked. A 'not-present' row is a package placeholder and keeps its rank.
+-- The URL list is `crate::import::NATIVE_OWNED_SYSTEMS`; a test keeps the two
+-- in step. Mirrors sqlite/schema.rs::migrate_native_authority_rank.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM bootstrap_imports WHERE path = '#migration:native-authority-rank-2899'
+    ) THEN
+        UPDATE code_systems SET authority_rank = 0
+         WHERE (authority_rank IS NULL OR authority_rank = 1)
+           AND content <> 'not-present'
+           AND url IN (
+               'http://snomed.info/sct',
+               'http://loinc.org',
+               'http://www.nlm.nih.gov/research/umls/rxnorm',
+               'http://unitsofmeasure.org',
+               'http://hl7.org/fhir/sid/icd-10-cm',
+               'http://hl7.org/fhir/sid/icd-9-cm',
+               'http://hl7.org/fhir/sid/ndc',
+               'http://www.nlm.nih.gov/mesh',
+               'http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl',
+               'http://nucc.org/provider-taxonomy',
+               'http://dicom.nema.org/resources/ontology/DCM'
+           );
+        INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+        VALUES ('#migration:native-authority-rank-2899', '', 0);
+    END IF;
+END $$;
 ";
+
+#[cfg(test)]
+mod tests {
+    /// The PostgreSQL backfill lists the native systems as SQL literals; it
+    /// must name exactly [`crate::import::NATIVE_OWNED_SYSTEMS`].
+    #[test]
+    fn native_backfill_names_every_native_owned_system() {
+        let start = super::SCHEMA
+            .find("#migration:native-authority-rank-2899")
+            .expect("the native backfill block");
+        let block = &super::SCHEMA[start..];
+        let block = &block[..block.find("END $$;").unwrap()];
+        let listed = block.matches("'http").count();
+        assert_eq!(listed, crate::import::NATIVE_OWNED_SYSTEMS.len(), "{block}");
+        for url in crate::import::NATIVE_OWNED_SYSTEMS {
+            assert!(block.contains(&format!("'{url}'")), "{url} is missing");
+        }
+    }
+}
 
 /// Shared by base schema DDL and identity migration on the same database.
 pub(super) const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484du64 as i64; // "HTS_SCHM"
@@ -417,6 +475,11 @@ pub(crate) async fn build_concept_closure_in_transaction(
             &[&system_id],
         )
         .await?;
+        tx.execute(
+            "DELETE FROM concept_closure_stale WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await?;
         return Ok(());
     }
 
@@ -453,6 +516,11 @@ pub(crate) async fn build_concept_closure_in_transaction(
 
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
+        &[&system_id],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM concept_closure_stale WHERE system_id = $1",
         &[&system_id],
     )
     .await?;
@@ -524,7 +592,7 @@ pub async fn migrate_concept_closure_pg(
     let systems_needing_closure: Vec<String> = client
         .query(
             "SELECT cs.id FROM code_systems cs
-             WHERE EXISTS (
+             WHERE (EXISTS (
                        SELECT 1 FROM concept_hierarchy h
                        WHERE  h.system_id = cs.id
                        LIMIT  1
@@ -533,6 +601,10 @@ pub async fn migrate_concept_closure_pg(
                        SELECT 1 FROM concept_closure c
                        WHERE  c.system_id = cs.id
                        LIMIT  1
+                   ))
+                OR EXISTS (
+                       SELECT 1 FROM concept_closure_stale s
+                       WHERE  s.system_id = cs.id
                    )",
             &[],
         )
@@ -543,6 +615,18 @@ pub async fn migrate_concept_closure_pg(
 
     for sid in &systems_needing_closure {
         build_concept_closure_pg(client, sid).await?;
+        // Expansions answered from the stale closure were stored; drop them
+        // so the rebuilt closure is what the next `$expand` reads.
+        client
+            .execute(
+                "DELETE FROM value_set_expansions WHERE value_set_id IN (
+                     SELECT e.value_set_id FROM value_set_expansions e
+                     JOIN code_systems cs ON cs.url = e.system_url
+                     WHERE cs.id = $1
+                 )",
+                &[sid],
+            )
+            .await?;
     }
     Ok(systems_needing_closure.len())
 }

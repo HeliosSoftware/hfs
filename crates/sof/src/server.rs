@@ -77,6 +77,7 @@
 //! - `SOF_CORS_METHODS` / `--cors-methods`: Allowed methods, comma-separated (default: *)
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
 //! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
+//! - `SOF_SERVER_SOURCE_PREFIXES` / `--source-prefixes`: URL prefixes a `$sql-run` `source` may name, comma-separated; unset, `source` is refused (501)
 //! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max remote terminology calls per ViewDefinition run: each
 //!   distinct lookup, plus each identical lookup re-sent after a transient failure; a
 //!   rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own
@@ -196,13 +197,14 @@ fn config_for_log(config: &ServerConfig) -> String {
         cors_methods,
         cors_headers,
         terminology_server,
+        source_prefixes,
     } = config;
     format!(
         "ServerConfig {{ port: {port}, host: {host:?}, log_level: {log_level:?}, \
          max_body_size: {max_body_size}, request_timeout: {request_timeout}, \
          enable_cors: {enable_cors}, cors_origins: {cors_origins:?}, \
          cors_methods: {cors_methods:?}, cors_headers: {cors_headers:?}, \
-         terminology_server: {:?} }}",
+         terminology_server: {:?}, source_prefixes: {source_prefixes:?} }}",
         terminology_server.as_deref().map(redact_url)
     )
 }
@@ -276,6 +278,18 @@ fn parse_args() -> ServerConfig {
         /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
         #[arg(long, env = "SOF_TERMINOLOGY_SERVER", hide_env_values = true)]
         terminology_server: Option<String>,
+
+        /// URL prefixes a `$sql-run` `source` may name, comma-separated
+        /// (`file:///srv/fhir/,https://data.example.org/exports/`). Unset,
+        /// `source` is refused.
+        #[arg(
+            long,
+            env = "SOF_SERVER_SOURCE_PREFIXES",
+            hide_env_values = true,
+            default_value = "",
+            value_parser = helios_sof::data_source::SourcePolicy::parse
+        )]
+        source_prefixes: helios_sof::data_source::SourcePolicy,
     }
 
     let args = Args::parse();
@@ -291,6 +305,7 @@ fn parse_args() -> ServerConfig {
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
         terminology_server: args.terminology_server,
+        source_prefixes: args.source_prefixes,
     }
 }
 

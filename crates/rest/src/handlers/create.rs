@@ -61,6 +61,7 @@ pub async fn create_handler<S>(
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     compartment: PatientCompartment,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
@@ -73,6 +74,14 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     admit_resource_type(&resource_type, &resource, fhir_version)?;
+    super::subscription_authority::admit_write(
+        &state,
+        &tenant,
+        fhir_version,
+        &resource_type,
+        &resource,
+        principal.as_ref().map(|p| &p.0),
+    )?;
 
     // A `patient/` scope creates inside the launch patient's compartment only
     // (#1618): the submitted payload must reference the launch patient through
@@ -90,6 +99,15 @@ where
             fhir_version,
             &resource,
             "create",
+        )?;
+    }
+
+    if conditional.if_none_exist().is_some() {
+        super::conditional_support::require_search_grant(
+            principal.as_ref().map(|p| &p.0),
+            &resource_type,
+            helios_persistence::core::ConditionalInteraction::Create,
+            None,
         )?;
     }
 

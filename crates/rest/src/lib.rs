@@ -1112,7 +1112,8 @@ where
     // of authentication. `admin_authz_middleware` requires a `system/*` scope
     // carrying the bit the method implies (`r` to look, `c` for POST, `d` for
     // DELETE), rejecting ordinary user-/patient-context tokens (even wildcard
-    // ones) with `403`. As with the other tiers, when auth is disabled
+    // ones) with `403`. A token that carries a tenant claim is rejected `403`
+    // whatever its scopes: it is bound to one tenant. As with the other tiers, when auth is disabled
     // server-wide there is no Principal and the middleware passes through,
     // keeping dev-mode behaviour. Tenant-maintenance API (`/admin/tenants`)
     // rides the same cross-tenant admin tier as `console/metrics/tenants`:
@@ -1388,6 +1389,16 @@ fn subscription_dispatch_config(
         ),
     ] {
         *field = subscription_dispatch_limit(name, lookup(name).as_deref(), *field);
+    }
+    // Unset keeps the engine's default, half the global budget.
+    const TENANT_SHARE: &str = "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT";
+    if let Some(raw) = lookup(TENANT_SHARE) {
+        let fallback = config.max_pending_notifications / 2;
+        config.max_pending_notifications_per_tenant = Some(subscription_dispatch_limit(
+            TENANT_SHARE,
+            Some(&raw),
+            fallback.max(1),
+        ));
     }
     // Unlike the limits above, 0 is valid here: it disables the `$events` history.
     if let Some(raw) = lookup("HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE") {
@@ -1744,6 +1755,7 @@ mod subscription_dispatch_config_tests {
                         "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY" => "9",
                         "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY" => "2",
                         "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY" => "1",
+                        "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT" => "2",
                         "HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE" => "0",
                         _ => panic!("unknown dispatch setting: {name}"),
                     }
@@ -1759,6 +1771,10 @@ mod subscription_dispatch_config_tests {
         assert_eq!(actual.event_queue_capacity, 7);
         assert_eq!(actual.max_pending_notifications, 3);
         assert_eq!(actual.per_subscription_queue_capacity, 3);
+        assert_eq!(
+            actual.max_pending_notifications_per_tenant, 3,
+            "the share is kept at least one subscription's queue"
+        );
         assert_eq!(actual.dispatch_concurrency, 2);
         assert_eq!(actual.handshake_concurrency, 1);
     }

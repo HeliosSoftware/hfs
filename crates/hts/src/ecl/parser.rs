@@ -40,6 +40,19 @@
 //! never treated as concept codes.  All other alphabetic tokens are concept
 //! codes.
 
+// ── Limits ────────────────────────────────────────────────────────────────────
+
+/// Longest accepted expression, in bytes, as for VCL.
+pub const MAX_EXPRESSION_LEN: usize = 64 * 1024;
+
+/// Deepest accepted nesting of `( … )` groups, as for VCL.
+pub const MAX_NESTING_DEPTH: usize = 32;
+
+/// Most focus concepts accepted in one expression. Each one is a query when
+/// the expression is evaluated, and a chain of `AND` or `OR` builds a tree as
+/// deep as it is long, which evaluation walks recursively.
+pub const MAX_FOCUS_CONCEPTS: usize = 1024;
+
 // ── Tokens ────────────────────────────────────────────────────────────────────
 
 /// Lexical tokens produced by [`tokenize`].
@@ -233,9 +246,21 @@ pub(super) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 /// - An unrecognised character in the input (propagated from the tokenizer).
 /// - A parse grammar error (unexpected token or unexpected end of input).
 /// - Trailing tokens after a complete expression (e.g. `<< 1 << 2`).
+/// - An expression longer than [`MAX_EXPRESSION_LEN`], nesting deeper than
+///   [`MAX_NESTING_DEPTH`], or more than [`MAX_FOCUS_CONCEPTS`] concepts.
 pub fn parse(input: &str) -> Result<EclExpr, String> {
+    if input.len() > MAX_EXPRESSION_LEN {
+        return Err(format!(
+            "expression exceeds the maximum length of {MAX_EXPRESSION_LEN} bytes"
+        ));
+    }
     let tokens = tokenize(input.trim())?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+        focus_concepts: 0,
+    };
     let expr = p.parse_or()?;
     if p.pos < p.tokens.len() {
         return Err(format!(
@@ -254,6 +279,10 @@ pub fn parse(input: &str) -> Result<EclExpr, String> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Groups open at the current position.
+    depth: usize,
+    /// Focus concepts parsed so far.
+    focus_concepts: usize,
 }
 
 impl Parser {
@@ -328,12 +357,25 @@ impl Parser {
     /// references (with or without a leading unary operator).
     fn parse_focus(&mut self) -> Result<EclExpr, String> {
         if self.peek() == Some(&Token::LParen) {
+            if self.depth >= MAX_NESTING_DEPTH {
+                return Err(format!(
+                    "nesting is deeper than the maximum of {MAX_NESTING_DEPTH}"
+                ));
+            }
             self.consume();
+            self.depth += 1;
             let inner = self.parse_or()?;
             self.expect(&Token::RParen)?;
+            self.depth -= 1;
             return Ok(inner);
         }
 
+        self.focus_concepts += 1;
+        if self.focus_concepts > MAX_FOCUS_CONCEPTS {
+            return Err(format!(
+                "expression has more than the maximum of {MAX_FOCUS_CONCEPTS} concepts"
+            ));
+        }
         let op = self.try_operator();
         let concept = self.parse_concept_ref()?;
         Ok(EclExpr::Focus { op, concept })
@@ -658,6 +700,38 @@ mod tests {
     #[test]
     fn parse_unclosed_paren_returns_error() {
         assert!(parse("(<< 1").is_err());
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}arm{}", "(".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn nesting_is_accepted_up_to_the_maximum() {
+        assert!(parse(&nested(MAX_NESTING_DEPTH)).is_ok());
+        let e = parse(&nested(MAX_NESTING_DEPTH + 1)).unwrap_err();
+        assert!(e.contains("nesting is deeper"), "{e}");
+    }
+
+    #[test]
+    fn deep_unclosed_nesting_is_refused_without_recursing_through_it() {
+        let e = parse(&"(".repeat(MAX_EXPRESSION_LEN)).unwrap_err();
+        assert!(e.contains("nesting is deeper"), "{e}");
+    }
+
+    #[test]
+    fn concepts_are_accepted_up_to_the_maximum() {
+        let chain = |n: usize| vec!["arm"; n].join(" OR ");
+        assert!(parse(&chain(MAX_FOCUS_CONCEPTS)).is_ok());
+        let e = parse(&chain(MAX_FOCUS_CONCEPTS + 1)).unwrap_err();
+        assert!(e.contains("more than the maximum"), "{e}");
+    }
+
+    #[test]
+    fn an_expression_longer_than_the_maximum_is_refused() {
+        let e = parse(&format!("arm{}", " ".repeat(MAX_EXPRESSION_LEN))).unwrap_err();
+        assert!(e.contains("maximum length"), "{e}");
+        assert!(parse(&format!("arm{}", " ".repeat(MAX_EXPRESSION_LEN - 3))).is_ok());
     }
 
     #[test]

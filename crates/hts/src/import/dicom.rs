@@ -27,7 +27,7 @@ use crate::import::bundle_builder::{BuilderConcept, CodeSystemMeta, build_code_s
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const DICOM_URL: &str = "http://dicom.nema.org/resources/ontology/DCM";
+pub(crate) const DICOM_URL: &str = "http://dicom.nema.org/resources/ontology/DCM";
 const DICOM_ID: &str = "dicom";
 const DICOM_NAME: &str = "DCM";
 const DICOM_TITLE: &str = "DICOM Controlled Terminology";
@@ -96,9 +96,9 @@ pub async fn import_dicom(
         ..Default::default()
     };
     let seed = build_code_system_bundle(&meta, std::slice::from_ref(&root));
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = concepts.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -114,8 +114,8 @@ pub async fn import_dicom(
             })
             .collect();
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
+        stats.take_errors(chunk);
 
         eprintln!(
             "[dicom] batch {}/{total_batches} — +{} codes",

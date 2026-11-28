@@ -57,6 +57,7 @@ be reviewed and changed like any other code.
 | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | `60` | Window size, in seconds. |
 | `HFS_NL_SEARCH_DAILY_LIMIT` | `200` | Requests per caller per UTC day. |
 | `HFS_NL_SEARCH_MAX_CHARS` | `500` | Longest accepted input. |
+| `HFS_RATE_LIMIT_IPV6_PREFIX` | `64` | With authentication disabled, the prefix length an IPv6 client is counted by. |
 
 There are exactly three states:
 
@@ -134,7 +135,9 @@ the response still fails validation.
 **Rate limits.** Requests are counted per authenticated user within its
 tenant. With authentication disabled they are counted per peer address alone:
 the tenant is then whatever the caller names in `X-Tenant-ID` or the URL, so
-it cannot open a fresh budget. The ceilings are:
+it cannot open a fresh budget. An IPv6 peer is counted by its /64 network
+(`HFS_RATE_LIMIT_IPV6_PREFIX`), since a client holds a whole /64 and could
+otherwise send each request from a new address. The ceilings are:
 
 - a sliding window (`RATE_LIMIT` per `RATE_WINDOW_SECS`),
 - a daily ceiling (`DAILY_LIMIT`) as a backstop against a slow-drip abuser who

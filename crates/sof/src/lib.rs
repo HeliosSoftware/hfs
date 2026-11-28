@@ -221,10 +221,10 @@ pub use remote_resolver::{
 };
 pub use sqlquery::{
     BINDABLE_PARAMETER_TYPES, BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine,
-    LibraryParameter, Placeholder, QueryResult, ScanError, ScanResult, SourcePosition,
-    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableRef, TableSchema, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
-    undeclared_tables,
+    LibraryParameter, NativeDialect, Placeholder, QueryResult, ScanError, ScanResult,
+    SourcePosition, SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableRef, TableSchema,
+    bind_supplied_params, extract_sqlquery_params_from_json, format_fhir_parameters,
+    parse_sqlquery_library, parse_sqlquery_library_for, scan_sql, undeclared_tables,
 };
 
 use chrono::{DateTime, Utc};
@@ -3850,6 +3850,17 @@ where
     Ok(new_combinations)
 }
 
+/// Deepest `repeat` traversal accepted. JSON input nests at most 128 levels,
+/// and every repeat level is at least an array and an object, so data alone
+/// never goes deeper; a path that does (`$this`, `%resource`, the resource's
+/// own type name) would otherwise recurse until the stack overflows.
+pub const MAX_REPEAT_DEPTH: usize = 64;
+
+/// Most nodes one `repeat` traversal may collect. Repeat paths that reach the
+/// same children (or one path listed twice) visit each node once per path at
+/// every level, so the list can grow exponentially with the data's depth.
+pub const MAX_REPEAT_NODES: usize = 10_000;
+
 /// Flatten a `repeat` recursive traversal into a pre-order list of descendant nodes.
 ///
 /// Mirrors the reference implementation's `recursiveTraverse`: starting from `context`'s node,
@@ -3857,12 +3868,31 @@ where
 /// then traversed in turn (the starting node itself is never included). Non-object results are
 /// ignored, matching the reference's `typeof childNode === 'object'` guard. The resulting order is
 /// what `%rowIndex` enumerates over.
+///
+/// A traversal deeper than [`MAX_REPEAT_DEPTH`] or longer than [`MAX_REPEAT_NODES`] is an
+/// [`SofError::InvalidViewDefinition`].
 fn collect_repeat_nodes(
     context: &EvaluationContext,
     repeat_paths: &[&str],
     variables: &HashMap<String, EvaluationResult>,
     out: &mut Vec<EvaluationResult>,
 ) -> Result<(), SofError> {
+    collect_repeat_nodes_at(context, repeat_paths, variables, out, 0)
+}
+
+fn collect_repeat_nodes_at(
+    context: &EvaluationContext,
+    repeat_paths: &[&str],
+    variables: &HashMap<String, EvaluationResult>,
+    out: &mut Vec<EvaluationResult>,
+    depth: usize,
+) -> Result<(), SofError> {
+    if depth >= MAX_REPEAT_DEPTH {
+        return Err(SofError::InvalidViewDefinition(format!(
+            "repeat traversal is deeper than {MAX_REPEAT_DEPTH} levels; \
+             check that its paths only descend"
+        )));
+    }
     for repeat_path in repeat_paths {
         let repeat_result = evaluate_expression(repeat_path, context).map_err(|e| {
             SofError::FhirPathError(format!(
@@ -3876,9 +3906,14 @@ fn collect_repeat_nodes(
             if !matches!(child_item, EvaluationResult::Object { .. }) {
                 continue;
             }
+            if out.len() >= MAX_REPEAT_NODES {
+                return Err(SofError::InvalidViewDefinition(format!(
+                    "repeat traversal collected more than {MAX_REPEAT_NODES} nodes"
+                )));
+            }
             let child_context = create_iteration_context(&child_item, variables, context);
             out.push(child_item);
-            collect_repeat_nodes(&child_context, repeat_paths, variables, out)?;
+            collect_repeat_nodes_at(&child_context, repeat_paths, variables, out, depth + 1)?;
         }
     }
     Ok(())

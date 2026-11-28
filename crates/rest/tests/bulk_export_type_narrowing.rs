@@ -315,3 +315,87 @@ async fn a_search_only_grant_does_not_start_an_export() {
         kickoff.text()
     );
 }
+
+// ── Chained and _has _typeFilter hops (#2668) ────────────────────────────────
+
+/// Seeds a second patient whose Observation names `p1` as its `focus`. R4's
+/// Patient compartment lists Observation by `subject` and `performer` only, so
+/// a `patient/` token for `p1` may not read it.
+async fn seed_foreign_focus(backend: &Arc<SqliteBackend>) {
+    for resource in [
+        json!({"resourceType": "Patient", "id": "p2"}),
+        json!({"resourceType": "Observation", "id": "o-p2", "status": "final",
+               "code": {"coding": [{"code": "LEAK-1"}]},
+               "subject": {"reference": "Patient/p2"},
+               "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant(), &resource_type, resource, FhirVersion::default())
+            .await
+            .expect("seed");
+    }
+}
+
+const HAS_FOCUS_FILTER: &str =
+    "_type=Patient&_typeFilter=Patient%3F_has%3AObservation%3Afocus%3Acode%3DLEAK-1";
+
+async fn kickoff_status(server: &TestServer, path: &str) -> (StatusCode, String) {
+    let kickoff = server
+        .get(path)
+        .add_header("x-tenant-id", TENANT)
+        .add_header("prefer", "respond-async")
+        .await;
+    (kickoff.status_code(), kickoff.text())
+}
+
+#[tokio::test]
+async fn a_has_type_filter_under_a_patient_scope_is_refused() {
+    let (server, backend, _output) = server_with("patient/*.rs", Some("p1")).await;
+    seed(&backend).await;
+    seed_foreign_focus(&backend).await;
+    let (status, text) =
+        kickoff_status(&server, &format!("/Patient/$export?{HAS_FOCUS_FILTER}")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert!(text.contains("through Observation"), "{text}");
+    assert!(text.contains("patient/ scope"), "{text}");
+}
+
+#[tokio::test]
+async fn a_has_type_filter_under_a_system_scope_selects_by_the_hop() {
+    let (server, backend, output) = server_for("system/*.rs").await;
+    seed(&backend).await;
+    seed_foreign_focus(&backend).await;
+    assert_eq!(
+        exported_types_at(
+            &server,
+            &backend,
+            &output,
+            &format!("/Patient/$export?{HAS_FOCUS_FILTER}")
+        )
+        .await,
+        vec!["Patient".to_string()],
+        "p1 is the focus of an Observation with code LEAK-1"
+    );
+}
+
+#[tokio::test]
+async fn a_has_type_filter_through_a_type_the_token_may_not_search_is_refused() {
+    let (server, backend, _output) = server_for("user/Patient.rs").await;
+    seed(&backend).await;
+    let (status, text) = kickoff_status(
+        &server,
+        "/$export?_type=Patient&_typeFilter=Patient%3F_has%3AObservation%3Asubject%3Acode%3Dx",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert!(text.contains("through Observation"), "{text}");
+
+    let (status, text) = kickoff_status(
+        &server,
+        "/$export?_type=Patient&_typeFilter=Patient%3Fgeneral-practitioner%3APractitioner.name%3Dx",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert!(text.contains("through Practitioner"), "{text}");
+}

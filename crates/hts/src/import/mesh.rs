@@ -23,7 +23,7 @@ use crate::import::bundle_builder::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MESH_URL: &str = "http://www.nlm.nih.gov/mesh";
+pub(crate) const MESH_URL: &str = "http://www.nlm.nih.gov/mesh";
 const MESH_ID: &str = "mesh";
 const MESH_NAME: &str = "MeSH";
 const MESH_TITLE: &str = "Medical Subject Headings (MeSH)";
@@ -106,9 +106,9 @@ pub async fn import_mesh(
 
     // Seed empty CodeSystem.
     let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
+    let seed_stats = backend.import_native_bundle(ctx, &seed, true).await?;
     stats.code_systems = seed_stats.code_systems;
-    stats.errors.extend(seed_stats.errors);
+    stats.take_errors(seed_stats);
 
     let total = descriptors.len();
     let total_batches = total.div_ceil(batch_size).max(1);
@@ -161,8 +161,8 @@ pub async fn import_mesh(
             .collect();
 
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
-        stats.errors.extend(chunk.errors);
+        let chunk = backend.import_native_bundle(ctx, &bytes, true).await?;
+        stats.take_errors(chunk);
 
         eprintln!(
             "[mesh] batch {}/{total_batches} — +{} descriptors (total: {})",
