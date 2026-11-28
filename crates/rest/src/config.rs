@@ -26,6 +26,7 @@
 //! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
 //! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
 //! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
+//! | `HFS_RATE_LIMIT_IPV6_PREFIX` | 64 | Prefix length an unauthenticated IPv6 client is rate limited by (`$nl-search`, bulk-submit status polls); IPv4 clients are limited per address |
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 (a build without R4 uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
@@ -894,6 +895,12 @@ pub struct BulkSubmitConfig {
     /// this cap fails it instead. A graceful-shutdown release does not count.
     /// Set with `HFS_BULK_SUBMIT_MAX_ATTEMPTS`.
     pub max_attempts: u32,
+    /// Wall-clock budget, in seconds, for downloading one JWE-encrypted input
+    /// file, which is buffered whole before it can be decrypted. As for the
+    /// manifest, the idle read timeout cannot bound a body that keeps
+    /// producing bytes; past this budget the file fails and is not fetched
+    /// again. Set with `HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT`.
+    pub encrypted_file_fetch_timeout_secs: u64,
     /// Ceiling, in decoded bytes, on a Bulk Export manifest the worker
     /// fetches; the manifest is read whole. Set with
     /// `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES`.
@@ -1008,6 +1015,7 @@ impl fmt::Debug for BulkSubmitConfig {
             fetch_read_timeout_secs,
             manifest_fetch_timeout_secs,
             max_attempts,
+            encrypted_file_fetch_timeout_secs,
             max_manifest_bytes,
             max_encrypted_file_bytes,
             skip_unchanged,
@@ -1054,6 +1062,10 @@ impl fmt::Debug for BulkSubmitConfig {
             .field("fetch_read_timeout_secs", fetch_read_timeout_secs)
             .field("manifest_fetch_timeout_secs", manifest_fetch_timeout_secs)
             .field("max_attempts", max_attempts)
+            .field(
+                "encrypted_file_fetch_timeout_secs",
+                encrypted_file_fetch_timeout_secs,
+            )
             .field("max_manifest_bytes", max_manifest_bytes)
             .field("max_encrypted_file_bytes", max_encrypted_file_bytes)
             .field("skip_unchanged", skip_unchanged)
@@ -1109,6 +1121,7 @@ impl Default for BulkSubmitConfig {
             manifest_fetch_timeout_secs: 600,
             max_attempts:
                 helios_persistence::core::bulk_submit_worker::DEFAULT_MAX_MANIFEST_ATTEMPTS,
+            encrypted_file_fetch_timeout_secs: 600,
             max_manifest_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_MANIFEST_BYTES,
             max_encrypted_file_bytes: crate::bulk_submit_fetcher::DEFAULT_MAX_ENCRYPTED_FILE_BYTES,
             skip_unchanged: false,
@@ -1267,6 +1280,10 @@ impl BulkSubmitConfig {
                 d.manifest_fetch_timeout_secs,
             ),
             max_attempts: env.u32("HFS_BULK_SUBMIT_MAX_ATTEMPTS", d.max_attempts),
+            encrypted_file_fetch_timeout_secs: env.u64(
+                "HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT",
+                d.encrypted_file_fetch_timeout_secs,
+            ),
             max_manifest_bytes: env.u64("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES", d.max_manifest_bytes),
             max_encrypted_file_bytes: env.u64(
                 "HFS_BULK_SUBMIT_MAX_ENCRYPTED_FILE_BYTES",
@@ -1388,6 +1405,9 @@ impl BulkSubmitConfig {
         }
         if self.max_attempts == 0 {
             errors.push("HFS_BULK_SUBMIT_MAX_ATTEMPTS must be >= 1".to_string());
+        }
+        if self.encrypted_file_fetch_timeout_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT must be > 0".to_string());
         }
         if self.max_manifest_bytes == 0 {
             errors.push("HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES must be > 0".to_string());
@@ -1920,6 +1940,19 @@ pub struct ServerConfig {
     /// Maximum accepted natural-language input length, in characters.
     #[arg(long, env = "HFS_NL_SEARCH_MAX_CHARS", default_value = "500")]
     pub nl_search_max_chars: usize,
+
+    /// Prefix length, 0 to 128, by which the per-peer rate limits bill an
+    /// unauthenticated IPv6 client (`$nl-search`, bulk-submit status polls).
+    /// A client normally holds a whole /64 and could otherwise take a fresh
+    /// budget from each of its addresses. Lower it for clients whose provider
+    /// hands out a /56 or a /48. IPv4 clients are billed per address.
+    #[arg(
+        long,
+        env = "HFS_RATE_LIMIT_IPV6_PREFIX",
+        default_value = "64",
+        value_parser = clap::value_parser!(u8).range(0..=128)
+    )]
+    pub rate_limit_ipv6_prefix: u8,
     /// Seed the spec conformance resources (SearchParameters and
     /// CompartmentDefinitions) into primary storage for every provisioned tenant
     /// — at startup and on tenant provisioning. Disable to leave storage
@@ -2151,6 +2184,7 @@ impl fmt::Debug for ServerConfig {
             nl_search_rate_window_secs,
             nl_search_daily_limit,
             nl_search_max_chars,
+            rate_limit_ipv6_prefix,
             seed_conformance,
             export_sink,
             export_dir,
@@ -2271,6 +2305,7 @@ impl fmt::Debug for ServerConfig {
             .field("nl_search_rate_window_secs", nl_search_rate_window_secs)
             .field("nl_search_daily_limit", nl_search_daily_limit)
             .field("nl_search_max_chars", nl_search_max_chars)
+            .field("rate_limit_ipv6_prefix", rate_limit_ipv6_prefix)
             .field("seed_conformance", seed_conformance)
             .field("export_sink", export_sink)
             .field("export_dir", export_dir)
@@ -2459,6 +2494,7 @@ impl Default for ServerConfig {
             nl_search_rate_window_secs: 60,
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
+            rate_limit_ipv6_prefix: 64,
             seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
@@ -2823,6 +2859,7 @@ impl ServerConfig {
             nl_search_rate_window_secs: 60,
             nl_search_daily_limit: 200,
             nl_search_max_chars: 500,
+            rate_limit_ipv6_prefix: 64,
             seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),

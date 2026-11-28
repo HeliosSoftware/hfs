@@ -12,8 +12,8 @@ use parking_lot::RwLock;
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{
     BackendError, OBJECT_STORE_ACCESS_TEXT, OBJECT_STORE_BUCKET_TEXT, OBJECT_STORE_CONFLICT_TEXT,
-    OBJECT_STORE_INVALID_TEXT, OBJECT_STORE_THROTTLED_TEXT, OBJECT_STORE_UNAVAILABLE_TEXT,
-    StorageError, StorageResult, s3_unavailable,
+    OBJECT_STORE_THROTTLED_TEXT, OBJECT_STORE_UNAVAILABLE_TEXT, StorageError, StorageResult,
+    s3_unavailable,
 };
 use crate::search::{SearchParameterDefinition, TenantSearchRegistries};
 use crate::tenant::{TenantContext, TenantId};
@@ -747,15 +747,16 @@ impl S3Backend {
                 OBJECT_STORE_ACCESS_TEXT,
                 &message,
             )),
-            // Still a 400. S3's own sentence names the argument and can quote
-            // the bucket or key, so it goes to the log like the 503 details.
-            S3ClientError::InvalidInput(message) => {
-                tracing::warn!(error = %message, "S3 rejected the request as invalid");
-                StorageError::Validation(crate::error::ValidationError::InvalidResource {
-                    message: OBJECT_STORE_INVALID_TEXT.to_string(),
-                    details: Vec::new(),
-                })
-            }
+            // `InvalidBucketName` / `InvalidArgument`: S3 refused a request
+            // the server built, from a bucket name in its configuration or an
+            // argument this provider does not accept, so the client is not at
+            // fault. A 500, whose text (S3's sentence, which can quote the
+            // bucket or key) the REST layer logs instead of sending.
+            S3ClientError::InvalidInput(message) => StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: format!("the object store rejected the request as invalid: {message}"),
+                source: None,
+            }),
             S3ClientError::Internal(message) => StorageError::Backend(BackendError::Internal {
                 backend_name: "s3".to_string(),
                 message,

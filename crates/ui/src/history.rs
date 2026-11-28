@@ -20,6 +20,13 @@
 
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+use std::time::Duration;
+
+/// Longest the line diff searches for a minimal diff. Myers' algorithm costs
+/// the product of the documents' length and their difference, so two large
+/// documents that share no lines would otherwise keep a thread busy for
+/// minutes; past the deadline it settles for a correct, coarser diff.
+pub const TEXT_DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One field-level change from the semantic layer.
 pub struct FieldChange {
@@ -192,7 +199,9 @@ fn render_operation(operation: json_patch::PatchOperation, previous: &Value) -> 
 /// whole line. `grouped_ops(3)` keeps three lines of context around each
 /// change, the way a unified diff reads.
 fn textual_lines(old: &str, new: &str) -> Vec<DiffLine> {
-    let text_diff = TextDiff::from_lines(old, new);
+    let text_diff = TextDiff::configure()
+        .timeout(TEXT_DIFF_TIMEOUT)
+        .diff_lines(old, new);
     let mut lines = Vec::new();
 
     for group in text_diff.grouped_ops(3) {
@@ -233,6 +242,28 @@ fn textual_lines(old: &str, new: &str) -> Vec<DiffLine> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Two large documents that share no lines are diffed within a bounded
+    /// time: the line diff gives up minimising at its deadline.
+    #[test]
+    fn diffing_two_large_unrelated_documents_finishes() {
+        let doc = |prefix: &str| {
+            json!({
+                "resourceType": "Basic",
+                "item": (0..20_000).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>()
+            })
+        };
+        let (old, new) = (doc("a"), doc("b"));
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = diff(&old, &new, true);
+            let _ = done.send(result.lines.len());
+        });
+        let lines = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the diff finishes");
+        assert!(lines > 0);
+    }
 
     /// The exact scenario the decision doc characterizes: v4 renames a family,
     /// front-inserts a new name, and appends a telecom. The point is not to be

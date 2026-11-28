@@ -8954,9 +8954,23 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
         });
     };
 
+    // Diffing two posted documents is CPU work sized by the caller; keep it
+    // off the runtime's worker threads.
+    let diff = tokio::task::spawn_blocking(move || history::diff(&from, &to, show_metadata)).await;
+    let Ok(diff) = diff else {
+        return render(HistoryDiffFragment {
+            i18n,
+            diff: history::diff(&serde_json::Value::Null, &serde_json::Value::Null, true),
+            from_label: form.from_label,
+            to_label: form.to_label,
+            show_metadata,
+            deleted,
+            parse_error: true,
+        });
+    };
     render(HistoryDiffFragment {
         i18n,
-        diff: history::diff(&from, &to, show_metadata),
+        diff,
         from_label: form.from_label,
         to_label: form.to_label,
         show_metadata,
@@ -9575,6 +9589,26 @@ const CHART_MAX_SERIES: usize = 6;
 /// re-fits the focused series so a small type is legible next to a large one;
 /// the other series stay plotted at their true values, receded, and the plot
 /// clip-path cuts them where they exceed the focused scale.
+/// `value` as JSON that is safe as the raw text of a `<script>` element.
+///
+/// serde_json escapes only quotes, backslashes and control characters, so a
+/// string holding `</script>` would end the element and let the rest be read
+/// as markup. `<`, `>` and `&` are written as `<`, `>` and
+/// `&`, which `JSON.parse` reads back unchanged.
+fn json_for_script_element(value: &serde_json::Value) -> String {
+    let json = value.to_string();
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn build_chart(
     all: &[DashboardSeries],
     window: DashboardWindow,
@@ -9733,7 +9767,7 @@ fn build_chart(
 
     // Everything the tooltip script needs, precomputed: it does no scaling of
     // its own beyond mapping the pointer to the nearest bucket x.
-    let tip_json = serde_json::json!({
+    let tip_json = json_for_script_element(&serde_json::json!({
         "labels": points
             .iter()
             .map(|p| axis_time_label(p.bucket_start, window))
@@ -9756,8 +9790,7 @@ fn build_chart(
                     .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
-    })
-    .to_string();
+    }));
 
     ChartView {
         has_data,
@@ -11519,6 +11552,31 @@ mod tests {
         assert!(!chart.series[0].partial);
         assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
         assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A series name cannot end the chart's `<script type="application/json">`
+    /// element: type names come from stored data, which a bulk submission can
+    /// fill with any string.
+    #[test]
+    fn a_series_name_is_escaped_for_the_script_element() {
+        let name = "</script><img src=x onerror=alert(1)>&amp;";
+        let series = DashboardSeries {
+            resource_type: name.to_string(),
+            total: 3,
+            points: vec![point_at(1_752_503_400, 0, 3), point_at(1_752_503_460, 0, 3)],
+            recorded_from: None,
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        for raw in ['<', '>', '&'] {
+            assert!(!chart.tip_json.contains(raw), "{raw} in {}", chart.tip_json);
+        }
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["type"], name);
     }
 
     /// A `recorded_from` past the last bucket (a skewed clock) still plots

@@ -211,11 +211,15 @@ where
     super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Every leaf ViewDefinition in the plan reads the resource type it names.
-    super::authz::check_read_scopes(
+    super::authz::authorize_reads(
+        &state,
+        tenant.context(),
         principal,
         "$sql-run",
+        &library_json,
         super::authz::plan_resource_types(&plan),
-    )?;
+    )
+    .await?;
 
     // Bind Library.parameter values from the supplied `parameters` Parameters.
     let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())

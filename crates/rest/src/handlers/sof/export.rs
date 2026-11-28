@@ -340,11 +340,15 @@ where
 
     // Shorthand: a bare ViewDefinition body is a single unnamed subject.
     if rt == "ViewDefinition" {
-        super::authz::check_read_scopes(
+        super::authz::authorize_reads(
+            state,
+            tenant.context(),
             principal,
             "$sql-export",
+            body,
             super::authz::view_resource_type(body),
-        )?;
+        )
+        .await?;
         work.views.push(NamedView {
             name: subject_output_name(None, body, 0),
             view: body.clone(),
@@ -434,11 +438,15 @@ where
         let output_name = subject_output_name(name.as_deref(), &subject.resource, index);
         match subject.kind {
             SubjectKind::ViewDefinition => {
-                super::authz::check_read_scopes(
+                super::authz::authorize_reads(
+                    state,
+                    tenant.context(),
                     principal,
                     "$sql-export",
+                    &subject.resource,
                     super::authz::view_resource_type(&subject.resource),
-                )?;
+                )
+                .await?;
                 work.views.push(NamedView {
                     name: output_name,
                     view: subject.resource,
@@ -532,11 +540,15 @@ where
     super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Every leaf ViewDefinition in the plan reads the resource type it names.
-    super::authz::check_read_scopes(
+    super::authz::authorize_reads(
+        state,
+        tenant.context(),
         principal,
         "$sql-export",
+        library_json,
         super::authz::plan_resource_types(&plan),
-    )?;
+    )
+    .await?;
 
     let bindings = helios_sof::sqlquery::bind_supplied_params(&library.parameters, supplied_params)
         .map_err(sqlquery_err_to_rest)?;

@@ -1390,6 +1390,16 @@ fn subscription_dispatch_config(
     ] {
         *field = subscription_dispatch_limit(name, lookup(name).as_deref(), *field);
     }
+    // Unset keeps the engine's default, half the global budget.
+    const TENANT_SHARE: &str = "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT";
+    if let Some(raw) = lookup(TENANT_SHARE) {
+        let fallback = config.max_pending_notifications / 2;
+        config.max_pending_notifications_per_tenant = Some(subscription_dispatch_limit(
+            TENANT_SHARE,
+            Some(&raw),
+            fallback.max(1),
+        ));
+    }
     // Unlike the limits above, 0 is valid here: it disables the `$events` history.
     if let Some(raw) = lookup("HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE") {
         match raw.trim().parse::<usize>() {
@@ -1745,6 +1755,7 @@ mod subscription_dispatch_config_tests {
                         "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY" => "9",
                         "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY" => "2",
                         "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY" => "1",
+                        "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS_PER_TENANT" => "2",
                         "HFS_SUBSCRIPTION_EVENT_HISTORY_SIZE" => "0",
                         _ => panic!("unknown dispatch setting: {name}"),
                     }
@@ -1760,6 +1771,10 @@ mod subscription_dispatch_config_tests {
         assert_eq!(actual.event_queue_capacity, 7);
         assert_eq!(actual.max_pending_notifications, 3);
         assert_eq!(actual.per_subscription_queue_capacity, 3);
+        assert_eq!(
+            actual.max_pending_notifications_per_tenant, 3,
+            "the share is kept at least one subscription's queue"
+        );
         assert_eq!(actual.dispatch_concurrency, 2);
         assert_eq!(actual.handshake_concurrency, 1);
     }

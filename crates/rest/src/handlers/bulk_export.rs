@@ -20,7 +20,7 @@ use helios_persistence::core::{
     ExportRequest, ExportStatus, GroupExportProvider, PatientExportProvider, RawManifestEntry,
     ResourceStorage, SearchProvider, StartExportInput, TypeFilter,
 };
-use helios_persistence::error::{BulkExportError, ResourceError, StorageError};
+use helios_persistence::error::{BulkExportError, ResourceError, SearchError, StorageError};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
@@ -447,6 +447,35 @@ where
                 .map_err(|e| RestError::Forbidden {
                     message: e.to_string(),
                 })?;
+        }
+        // A chained or `_has` `_typeFilter` also searches other types, and
+        // the worker resolves those hops later without the token (#2668).
+        // Resolve them now through a guard that admits only types the token
+        // may search unconfined; the result is discarded, the worker
+        // resolves again. Any other resolution error is left for the worker
+        // to report, as before.
+        for compiled in type_filters.iter().filter_map(|f| f.compiled.as_ref()) {
+            if !helios_persistence::search::query_has_chains(compiled) {
+                continue;
+            }
+            let guard = crate::chain_access::UnconfinedHopAccess::new(p);
+            let options = helios_persistence::search::ChainResolveOptions {
+                terminology: None,
+                hop_guard: Some(&guard),
+            };
+            let resolved = helios_persistence::search::resolve_chains_with(
+                state.storage(),
+                tenant.context(),
+                compiled,
+                options,
+            )
+            .await;
+            if let Some(message) = guard.refusal() {
+                return Err(RestError::Forbidden { message });
+            }
+            if let Err(StorageError::Search(SearchError::ChainHopRefused { message })) = resolved {
+                return Err(RestError::Forbidden { message });
+            }
         }
     }
 

@@ -648,13 +648,15 @@ where
                         }
                     })?;
                     let operation = entry_operation(&bundle_entry.method, get_target.as_ref());
-                    let scope = SmartScopePolicy::check(principal, &resource_type, operation)
-                        .map_err(|_| RestError::Forbidden {
+                    let scope_type = entry_scope_type(&resource_type, get_target.as_ref());
+                    let scope = SmartScopePolicy::check(principal, scope_type, operation).map_err(
+                        |_| RestError::Forbidden {
                             message: format!(
                                 "Insufficient scope for {} on {} (transaction entry {})",
-                                operation, resource_type, index
+                                operation, scope_type, index
                             ),
-                        })?;
+                        },
+                    )?;
                     // A grant confined to a patient compartment (#1618) is
                     // honoured for search, vread and instance history entries,
                     // which run in the REST layer after the commit through the
@@ -673,6 +675,7 @@ where
                             get_target,
                             Some(
                                 GetEntryTarget::Search { .. }
+                                    | GetEntryTarget::CompartmentSearch { .. }
                                     | GetEntryTarget::Vread { .. }
                                     | GetEntryTarget::History {
                                         level: HistoryLevel::Instance { .. },
@@ -690,6 +693,17 @@ where
                             });
                         }
                     }
+                }
+                if let Some(principal) = principal {
+                    admit_subscription_authority_entry(
+                        state,
+                        &tenant,
+                        fhir_version,
+                        index,
+                        &bundle_entry,
+                        principal,
+                    )
+                    .await?;
                 }
                 // An instance read runs inside the storage transaction on
                 // `bundle_entry.url`; it reads the address judged above and
@@ -839,10 +853,50 @@ where
                     other => other,
                 })?;
             }
+            // A typed compartment search is judged as the handler will judge
+            // it: the target must be a member of the compartment and the
+            // query must build. The all-types form skips member types a
+            // parameter does not fit, so only its execution can refuse it.
+            GetEntryTarget::CompartmentSearch {
+                compartment_type,
+                target_type,
+                pairs,
+                ..
+            } if target_type != "*" => {
+                let fhir_version = state.config().default_fhir_version;
+                if helios_fhir::get_compartment_params(fhir_version, compartment_type, target_type)
+                    .is_empty()
+                {
+                    return Err(RestError::BadRequest {
+                        message: format!(
+                            "entry {index} search '{}': resource type '{target_type}' is not a \
+                             member of the '{compartment_type}' compartment",
+                            entry.url
+                        ),
+                    });
+                }
+                let reg = state.storage().search_param_registry(tenant.context());
+                let registry = reg.read();
+                crate::extractors::build_search_query_from_pairs(
+                    target_type,
+                    &crate::extractors::drop_empty_parameters(pairs.clone()),
+                    &registry,
+                    fhir_version,
+                )
+                .map_err(|e| match e {
+                    RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                        param,
+                        message: format!("entry {} search '{}': {}", index, entry.url, message),
+                    },
+                    other => other,
+                })?;
+            }
             // Nothing to validate: a vread has no query, and the version it
             // names is looked up after the commit. (An instance read is never
             // deferred.)
-            GetEntryTarget::Vread { .. } | GetEntryTarget::Read { .. } => {}
+            GetEntryTarget::Vread { .. }
+            | GetEntryTarget::Read { .. }
+            | GetEntryTarget::CompartmentSearch { .. } => {}
         }
     }
 
@@ -1382,7 +1436,8 @@ where
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
         let operation = entry_operation(&method, get_target.as_ref());
-        match SmartScopePolicy::check(principal, &resource_type, operation) {
+        let scope_type = entry_scope_type(&resource_type, get_target.as_ref());
+        match SmartScopePolicy::check(principal, scope_type, operation) {
             Ok(AccessScope::Unrestricted) => {}
             // A grant confined to a patient compartment (#1618): a GET entry
             // is confined like its single-resource twin (the search filtered,
@@ -1407,7 +1462,7 @@ where
                 return entry_failure(RestError::Forbidden {
                     message: format!(
                         "Insufficient scope for {} on {} (batch entry {})",
-                        operation, resource_type, index
+                        operation, scope_type, index
                     ),
                 });
             }
@@ -1544,6 +1599,16 @@ where
             {
                 return entry_failure(error);
             }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
+                return entry_failure(error);
+            }
 
             // Write-path validation (per-entry outcome in batch semantics).
             //
@@ -1659,6 +1724,16 @@ where
             if let Err(error) =
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
             {
+                return entry_failure(error);
+            }
+            if let Err(error) = super::subscription_authority::admit_write(
+                state,
+                tenant,
+                fhir_version,
+                &resource_type,
+                &resource,
+                principal,
+            ) {
                 return entry_failure(error);
             }
 
@@ -1980,6 +2055,7 @@ where
                 &id,
                 criteria,
                 if_match,
+                principal,
                 audit_target,
             )
             .await
@@ -1997,6 +2073,7 @@ async fn process_batch_patch<S>(
     id: &str,
     criteria: Option<&str>,
     if_match: Option<&str>,
+    principal: Option<&Principal>,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
@@ -2081,6 +2158,17 @@ where
             };
         (current, candidate)
     };
+
+    if let Err(error) = super::subscription_authority::admit_write(
+        state,
+        tenant,
+        current.fhir_version(),
+        resource_type,
+        &candidate,
+        principal,
+    ) {
+        return entry_failure(error);
+    }
 
     let validator = RestPatchValidator {
         validation: state.validation(),
@@ -2687,6 +2775,20 @@ fn parse_bundle_request_url(
             .map(|resource_type| ((*resource_type).to_string(), String::new()))
             .ok_or_else(|| "Entry request.url is empty".to_string()),
         BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete => {
+            // A `_history` segment addresses nothing a mutation entry can act
+            // on; read as the last two segments, `Observation/o1/_history`
+            // was the instance `_history` of type `o1`, which answered 204
+            // and erased nothing. The history deletes have no Bundle form.
+            // Only the literal segment is refused: an id or a path prefix that
+            // merely starts with `_` is addressed as before (ids are #2525's
+            // decision, prefixes #2750's).
+            if segments.contains(&"_history") {
+                return Err(format!(
+                    "{method} entry request.url cannot address '_history': a Bundle entry \
+                     writes or deletes an instance ('[type]/[id]') or by criteria \
+                     ('[type]?[parameters]'); history is erased through the instance endpoint"
+                ));
+            }
             if request_url
                 .split_once('?')
                 .is_some_and(|(_, query)| !query.is_empty())
@@ -3072,6 +3174,14 @@ enum GetEntryTarget {
         level: HistoryLevel,
         pairs: Vec<(String, String)>,
     },
+    /// `[compartment-type]/[id]/[type]` or `[compartment-type]/[id]/*`: a
+    /// compartment search, judged and answered as the direct request is.
+    CompartmentSearch {
+        compartment_type: String,
+        compartment_id: String,
+        target_type: String,
+        pairs: Vec<(String, String)>,
+    },
 }
 
 /// A transaction's GET entry that runs after the commit: what it asks for and
@@ -3093,9 +3203,11 @@ struct DeferredGet {
 /// `[type]/[id]/_history/[vid]`; a path with a `_history` segment in any other
 /// place is an error, because answering it as a read of its first two segments
 /// would return different data from what the URL asks for. One segment is a
-/// search and exactly two are a read; a deeper path is an error for the same
-/// reason, since the storage layer reads the last two segments of an entry
-/// URL. A query on a read or vread is ignored.
+/// search, exactly two are a read, and three whose first and last are
+/// resource types (the last may be `*`) are a compartment search, as the
+/// router reads the direct request; any other deeper path is an error for the
+/// same reason, since the storage layer reads the last two segments of an
+/// entry URL. A query on a read or vread is ignored.
 ///
 /// The error is the message of the `400` / `value` entry (batch) or of the
 /// failed bundle (transaction).
@@ -3158,8 +3270,20 @@ fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
             resource_type: (*resource_type).to_string(),
             id: (*id).to_string(),
         }),
+        [compartment_type, compartment_id, target_type]
+            if is_valid_resource_type(compartment_type)
+                && (*target_type == "*" || is_valid_resource_type(target_type)) =>
+        {
+            Ok(GetEntryTarget::CompartmentSearch {
+                compartment_type: (*compartment_type).to_string(),
+                compartment_id: (*compartment_id).to_string(),
+                target_type: (*target_type).to_string(),
+                pairs: pairs(),
+            })
+        }
         _ => Err(format!(
-            "GET {url} is not a read, vread, history or search URL: a read is [type]/[id]"
+            "GET {url} is not a read, vread, history or search URL: a read is [type]/[id] and \
+             a compartment search [compartment-type]/[id]/[type]"
         )),
     }
 }
@@ -3178,7 +3302,7 @@ struct HistoryAudit<'a> {
 
 impl GetEntryTarget {
     /// How the audit event of this entry is named, as the audit middleware
-    /// names the direct request; `None` for a read or search, which keep their
+    /// names the direct request; `None` for a read or a (compartment) search, which keep their
     /// own action and the entity the URL and the body give.
     ///
     /// `balp::detect_interaction` calls a vread and every history read a query
@@ -3209,7 +3333,9 @@ impl GetEntryTarget {
                 ),
                 HistoryLevel::System => ("/_history".to_string(), "", None),
             },
-            Self::Search { .. } | Self::Read { .. } => return None,
+            Self::Search { .. } | Self::Read { .. } | Self::CompartmentSearch { .. } => {
+                return None;
+            }
         };
         Some(HistoryAudit {
             action: helios_audit::balp::detect_interaction(
@@ -3278,6 +3404,30 @@ where
                 // e.client_response()` — the same code-discard #504
                 // deleted everywhere else, which would have made a search
                 // entry the one path still answering `processing`.
+                Err(e) => entry_failure(e),
+            }
+        }
+        GetEntryTarget::CompartmentSearch {
+            compartment_type,
+            compartment_id,
+            target_type,
+            pairs,
+        } => {
+            match crate::handlers::compartment::execute_compartment_search_bundle(
+                state,
+                tenant,
+                state.config().default_fhir_version,
+                compartment,
+                chains,
+                &compartment_type,
+                &compartment_id,
+                &target_type,
+                pairs,
+                false,
+            )
+            .await
+            {
+                Ok(bundle) => searchset_result(bundle),
                 Err(e) => entry_failure(e),
             }
         }
@@ -3820,13 +3970,115 @@ fn bundle_method_to_fhir_operation(method: &BundleMethod) -> FhirOperation {
     }
 }
 
+/// A transaction entry that writes a Subscription or a topic is judged by the
+/// writer's authority over the resource types the topic names (see
+/// `subscription_authority`), on the document the entry will store: the
+/// submitted resource of a POST or PUT, or the patched current document of a
+/// PATCH, computed here as the batch arm computes it. An entry the
+/// transaction will refuse anyway (no resource, malformed patch, no match)
+/// is left to it.
+async fn admit_subscription_authority_entry<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    index: usize,
+    entry: &BundleEntry,
+    principal: &Principal,
+) -> RestResult<()>
+where
+    S: ResourceStorage + ConditionalStorage + Send + Sync,
+{
+    let (resource_type, id) =
+        parse_request_url(&entry.url).map_err(|e| RestError::InvalidElementValue {
+            message: format!("Entry {index}: {e}"),
+        })?;
+    if !super::subscription_authority::is_judged(&resource_type) {
+        return Ok(());
+    }
+    let document = match entry.method {
+        BundleMethod::Post | BundleMethod::Put => match &entry.resource {
+            Some(resource) => resource.clone(),
+            None => return Ok(()),
+        },
+        BundleMethod::Patch => {
+            let Some(document) = &entry.resource else {
+                return Ok(());
+            };
+            let Ok(patch) = decode_bundle_patch_resource(document, fhir_version) else {
+                return Ok(());
+            };
+            let Ok(if_match) =
+                helios_persistence::core::EntityTagPrecondition::parse(entry.if_match.as_deref())
+            else {
+                return Ok(());
+            };
+            if let Some(criteria) = conditional_criteria(&entry.url, &id) {
+                match state
+                    .storage()
+                    .prepare_conditional_patch(
+                        tenant.context(),
+                        &resource_type,
+                        criteria,
+                        &patch,
+                        &if_match,
+                    )
+                    .await
+                {
+                    Ok(ConditionalPatchPreparation::Ready { patched, .. }) => patched,
+                    _ => return Ok(()),
+                }
+            } else {
+                match state
+                    .storage()
+                    .read(tenant.context(), &resource_type, &id)
+                    .await
+                {
+                    Ok(Some(current)) => {
+                        match apply_patch_for_version(
+                            current.content(),
+                            &patch,
+                            current.fhir_version(),
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+        BundleMethod::Get | BundleMethod::Delete => return Ok(()),
+    };
+    super::subscription_authority::admit_write(
+        state,
+        tenant,
+        fhir_version,
+        &resource_type,
+        &document,
+        Some(principal),
+    )
+}
+
 /// The interaction a bundle entry is authorized for: a GET entry whose URL is
 /// a search is a `Search`, as the direct `GET [type]?query` is; every other
 /// GET (read, vread, history) is a `Read`; the writes follow the method.
 fn entry_operation(method: &BundleMethod, get_target: Option<&GetEntryTarget>) -> FhirOperation {
     match get_target {
-        Some(GetEntryTarget::Search { .. }) => FhirOperation::Search,
+        Some(GetEntryTarget::Search { .. } | GetEntryTarget::CompartmentSearch { .. }) => {
+            FhirOperation::Search
+        }
         _ => bundle_method_to_fhir_operation(method),
+    }
+}
+
+/// The resource type a bundle entry is authorized on: a compartment search's
+/// target type (`*` for every member type), as the authorization middleware
+/// judges the direct `GET [compartment]/[id]/[type]`; otherwise the first
+/// segment of the URL.
+fn entry_scope_type<'a>(resource_type: &'a str, get_target: Option<&'a GetEntryTarget>) -> &'a str {
+    match get_target {
+        Some(GetEntryTarget::CompartmentSearch { target_type, .. }) => target_type,
+        _ => resource_type,
     }
 }
 
@@ -6238,10 +6490,38 @@ mod tests {
         assert!(text.contains("'$everything'"), "{text}");
     }
 
-    /// The transaction arm's parser is the choke point for every method: a
-    /// mutation URL is canonicalized to its last one or two segments and a GET
-    /// URL is passed on as written, so each would act on part of an operation
-    /// URL if it were not refused first.
+    #[test]
+    fn a_mutation_url_with_a_control_segment_is_refused() {
+        for method in [BundleMethod::Put, BundleMethod::Patch, BundleMethod::Delete] {
+            for url in [
+                "Observation/o1/_history",
+                "Observation/o1/_history/3",
+                "http://h/fhir/Observation/o1/_history",
+                "Observation/_history",
+                "Observation/Patient/_history",
+            ] {
+                let err = parse_bundle_request_url(&method, url).expect_err(url);
+                assert!(err.contains("_history"), "{method} {url}: {err}");
+            }
+            // Only the literal `_history` segment is refused: an id or a path
+            // prefix that starts with `_` is addressed as before.
+            for (url, id) in [
+                ("Observation/_o2", "_o2"),
+                ("Observation/_history2", "_history2"),
+                ("_t/Observation/o1", "o1"),
+                ("http://h/_fhir/Observation/o1", "o1"),
+            ] {
+                assert_eq!(
+                    parse_bundle_request_url(&method, url),
+                    Ok(("Observation".to_string(), id.to_string())),
+                    "{method} {url}"
+                );
+            }
+        }
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation/o1").is_ok());
+        assert!(parse_bundle_request_url(&BundleMethod::Delete, "Observation?code=x").is_ok());
+    }
+
     #[test]
     fn a_delete_entry_needs_a_resource_type_of_the_version() {
         let version = FhirVersion::default_enabled();
@@ -6254,6 +6534,10 @@ mod tests {
         assert!(admit_bundle_mutation(&BundleMethod::Delete, "Patient", None, version).is_ok());
     }
 
+    /// The transaction arm's parser is the choke point for every method: a
+    /// mutation URL is canonicalized to its last one or two segments and a GET
+    /// URL is passed on as written, so each would act on part of an operation
+    /// URL if it were not refused first.
     #[test]
     fn parse_bundle_entry_refuses_an_operation_url_on_every_method() {
         for (method, url) in [

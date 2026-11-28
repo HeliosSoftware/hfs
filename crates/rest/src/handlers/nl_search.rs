@@ -133,6 +133,7 @@ where
         });
     }
 
+    let peer = peer.map(|ip| crate::extractors::rate_limit_peer(ip, config.rate_limit_ipv6_prefix));
     check_rate_limit(
         &rate_limit_key(tenant.tenant_id(), &user, peer),
         config.nl_search_rate_limit,

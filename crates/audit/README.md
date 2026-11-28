@@ -296,6 +296,12 @@ When `helios-persistence` is built with the `audit` feature, each module provide
 
 These functions live in their respective persistence modules (e.g., `helios_persistence::core::bulk_export::audit::record_export_event`) and are called by the application layer at the appropriate lifecycle points.
 
+`$sql-run` and `$sql-export` record their scope decision from the handler in `helios-rest`, on a grant and on a refusal:
+
+| Operation | Event Type | Action | Key Details |
+|-----------|-----------|--------|-------------|
+| `$sql-run`, `$sql-export` | `rest` | `E` | `audit-operation=sql-run` / `sql-export`, one `resource-type` per type read, `subject`; outcome `0` or `8` |
+
 ### Batch and Transaction Correlation
 
 When a batch or transaction bundle is processed, the handler can create an `AuditCorrelation` and call `AuditMiddlewareState::record_bundle_entries()` to emit one `AuditEvent` per entry. Each event carries:

@@ -421,7 +421,8 @@ them, and exposes results through a status manifest.
   poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
-  (principal, else peer address) per poll token. A poll that answers `404` (a token
+  (principal, else peer address, an IPv6 peer by its /64 network per
+  `HFS_RATE_LIMIT_IPV6_PREFIX`) per poll token. A poll that answers `404` (a token
   that resolves to nothing, or to a submission the client may not see) also spends
   one of the client's `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` misses per window, shared by
   all its tokens and checked before the lookup, so inventing tokens earns a `429`
@@ -500,6 +501,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Was `100` before #945. Honoured by the worker since #1127 (before, every run used `100` whatever this said). An older measurement (index-during-ingest on, before the Elasticsearch recipe below) found `1000` slower than `100`. The recipe below, measured later on the same 133,527-resource slice, uses `1000` as part of a combined setting and was the better combination; batch size alone was not isolated again. |
 | `HFS_BULK_SUBMIT_MAX_LINE_BYTES` | `134217728` | Longest line of an NDJSON input file the ingest buffers before parsing it (bytes). A longer line is rejected like a malformed one, its bytes are discarded up to the next newline, and the file continues or aborts under the `max_errors` rules, so one provider-served line can never take more than this much memory in the server process. The default is the REST API body ceiling, so a submitted resource may be as large as one the API accepts. |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
+| `HFS_BULK_SUBMIT_ENCRYPTED_FILE_FETCH_TIMEOUT` | `600` | Wall-clock budget, in seconds, for downloading one JWE-encrypted input file, which is buffered whole before it can be decrypted. Past it the file fails and is not fetched again. Unencrypted files stream and are bounded by the read timeout and the resume limit instead. Must be `> 0`. |
 | `HFS_BULK_SUBMIT_MANIFEST_FETCH_TIMEOUT` | `600` | Wall-clock budget, in seconds, for fetching one remote Bulk Export manifest. The read timeout above only bounds idle time, so a body that keeps producing bytes never trips it; past this budget the manifest fails with a fetch error and the worker moves on to the next claim. The claim itself prefers tenants holding no live lease, so one tenant cannot take every worker while another tenant waits. |
 | `HFS_BULK_SUBMIT_MAX_ATTEMPTS` | `3` | Claims one manifest may use. A run that crashes the worker, hangs, or loses its lease leaves the manifest to be claimed again; the claim past this cap fails it, with an error artifact saying it was abandoned after N attempts, instead of running it again. A graceful-shutdown release gives its claim back, so rolling restarts do not count. Must be at least 1. |
 | `HFS_BULK_SUBMIT_MAX_MANIFEST_BYTES` | `67108864` (64 MiB) | Ceiling, in decoded bytes, on a Bulk Export manifest the worker fetches; the manifest is read whole, and a body that passes the ceiling fails the manifest as soon as it does. |

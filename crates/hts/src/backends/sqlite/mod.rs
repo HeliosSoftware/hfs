@@ -586,6 +586,11 @@ impl SqliteTerminologyBackend {
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
             })?;
+            schema::migrate_native_authority_rank(&conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply native authority_rank backfill: {e}"
+                ))
+            })?;
 
             // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
             // false (server startup path): bootstrap re-imports run first and
@@ -766,6 +771,11 @@ impl SqliteTerminologyBackend {
             resource_identity::migrate(&mut conn)?;
             schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
+            schema::migrate_native_authority_rank(&conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply native authority_rank backfill: {e}"
+                ))
             })?;
         }
 

@@ -130,9 +130,96 @@ pub trait DataSource: Send + Sync {
     async fn load(&self, source: &str) -> Result<SofBundle, SofError>;
 }
 
+/// The `source` URLs a server lets its callers load.
+///
+/// `sof-cli` loads whatever source its operator names. `sof-server` takes
+/// `source` from requests it does not authenticate, so it loads only URLs
+/// under a prefix its operator lists (`SOF_SERVER_SOURCE_PREFIXES`), and none
+/// by default: otherwise any caller could make it read local files or send
+/// requests to hosts only the server can reach.
+#[derive(Clone, Default)]
+pub struct SourcePolicy {
+    prefixes: Vec<Url>,
+}
+
+impl SourcePolicy {
+    /// Parses a comma-separated list of URL prefixes, such as
+    /// `file:///srv/fhir/,https://data.example.org/exports/`.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let mut prefixes = Vec::new();
+        for raw in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let prefix =
+                Url::parse(raw).map_err(|e| format!("invalid source prefix '{raw}': {e}"))?;
+            prefixes.push(prefix);
+        }
+        Ok(Self { prefixes })
+    }
+
+    /// Whether no source is allowed.
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    /// The prefixes with any credentials, query or fragment removed, for logs.
+    pub fn prefixes_for_log(&self) -> Vec<String> {
+        self.prefixes
+            .iter()
+            .map(|p| helios_observability::redact::redact_url(p.as_str()))
+            .collect()
+    }
+
+    /// Whether `url` lies under one of the prefixes: the same scheme, host and
+    /// port, and a path equal to the prefix's or below it at a `/`. Parsing
+    /// has already resolved `.` and `..` segments. A `file` URL must also name
+    /// a regular file whose path, symlinks resolved, is under a prefix's
+    /// resolved path, so a link cannot lead outside it.
+    pub fn admits(&self, url: &Url) -> bool {
+        let lexical = self.prefixes.iter().any(|prefix| {
+            prefix.scheme() == url.scheme()
+                && prefix.host_str() == url.host_str()
+                && prefix.port_or_known_default() == url.port_or_known_default()
+                && path_is_under(prefix.path(), url.path())
+        });
+        lexical && (url.scheme() != "file" || self.admits_file(url))
+    }
+
+    fn admits_file(&self, url: &Url) -> bool {
+        let Some(real) = url
+            .to_file_path()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            return false;
+        };
+        real.is_file()
+            && self
+                .prefixes
+                .iter()
+                .filter(|prefix| prefix.scheme() == "file")
+                .filter_map(|prefix| prefix.to_file_path().ok())
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .any(|root| real.starts_with(&root))
+    }
+}
+
+/// Lists the prefixes without their credentials.
+impl std::fmt::Debug for SourcePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.prefixes_for_log()).finish()
+    }
+}
+
+/// Whether `path` is `prefix` or lies below it at a `/` boundary.
+fn path_is_under(prefix: &str, path: &str) -> bool {
+    let base = prefix.trim_end_matches('/');
+    path == prefix || path == base || path.starts_with(&format!("{base}/"))
+}
+
 /// Implementation for loading data from various sources based on URL scheme
 pub struct UniversalDataSource {
     client: reqwest::Client,
+    /// `Some` for a server: only URLs it admits are loaded.
+    policy: Option<SourcePolicy>,
 }
 
 impl UniversalDataSource {
@@ -142,6 +229,20 @@ impl UniversalDataSource {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            policy: None,
+        }
+    }
+
+    /// A data source that loads only URLs `policy` admits, and follows no
+    /// HTTP redirects, since a redirect could lead outside the prefixes.
+    pub fn with_policy(policy: SourcePolicy) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            policy: Some(policy),
         }
     }
 }
@@ -159,6 +260,13 @@ impl DataSource for UniversalDataSource {
         let url = Url::parse(source).map_err(|e| {
             SofError::InvalidSource(format!("Invalid source URL '{}': {}", source, e))
         })?;
+        if let Some(policy) = &self.policy
+            && !policy.admits(&url)
+        {
+            return Err(SofError::InvalidSource(
+                "source is not under a prefix this server allows".to_string(),
+            ));
+        }
 
         match url.scheme() {
             "file" => load_from_file(&url).await,

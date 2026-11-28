@@ -369,16 +369,8 @@ async fn test_run_view_definition_post_with_source_parameter() {
 
     let response = server.post("/$sql-run").json(&request_body).await;
 
-    // Note: The actual server handler now supports source parameter,
-    // but the test mock handler doesn't yet implement it.
-    // For now, we'll accept either NOT_IMPLEMENTED from the mock
-    // or a real error from attempting to fetch the URL
-    assert!(
-        response.status_code() == StatusCode::NOT_IMPLEMENTED
-            || response.status_code() == StatusCode::OK
-            || response.status_code() == StatusCode::BAD_REQUEST
-            || response.status_code() == StatusCode::UNPROCESSABLE_ENTITY
-    );
+    // Without SOF_SERVER_SOURCE_PREFIXES the server loads no source.
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]
@@ -496,16 +488,8 @@ async fn test_post_source_not_implemented() {
         .json(&body)
         .await;
 
-    // Note: The actual server handler now supports source parameter,
-    // but the test mock handler doesn't yet implement it.
-    // For now, we'll accept either NOT_IMPLEMENTED from the mock
-    // or a real error from attempting to fetch the URL
-    assert!(
-        response.status_code() == StatusCode::NOT_IMPLEMENTED
-            || response.status_code() == StatusCode::OK
-            || response.status_code() == StatusCode::BAD_REQUEST
-            || response.status_code() == StatusCode::UNPROCESSABLE_ENTITY
-    );
+    // Without SOF_SERVER_SOURCE_PREFIXES the server loads no source.
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]
