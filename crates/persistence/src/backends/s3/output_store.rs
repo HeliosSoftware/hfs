@@ -59,6 +59,9 @@ pub struct S3OutputStore {
     file_url_ttl: Duration,
     /// Local scratch directory for in-flight (pre-finalize) part files.
     scratch_dir: PathBuf,
+    /// Owns the default scratch directory, which is removed when the store
+    /// is dropped. `None` once [`Self::with_scratch_dir`] picked another.
+    _private_scratch: Option<Arc<tempfile::TempDir>>,
 }
 
 impl S3OutputStore {
@@ -70,7 +73,31 @@ impl S3OutputStore {
         access_token_mode: AccessTokenMode,
         file_url_ttl: Duration,
     ) -> Self {
-        let scratch_dir = std::env::temp_dir().join("hfs-export-scratch");
+        // The scratch files hold export output, patient data included, until
+        // it is uploaded. A fixed path under the shared temp directory could
+        // be created first by another local user, who would then read the
+        // files or plant links among them; a private directory (random name,
+        // owner-only on Unix) cannot.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("hfs-export-scratch-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let (scratch_dir, private_scratch) = match builder.tempdir() {
+            Ok(dir) => (dir.path().to_path_buf(), Some(Arc::new(dir))),
+            Err(error) => {
+                tracing::warn!(%error, "could not create a private export scratch directory");
+                (
+                    std::env::temp_dir().join(format!(
+                        "hfs-export-scratch-{}",
+                        uuid::Uuid::new_v4().simple()
+                    )),
+                    None,
+                )
+            }
+        };
         Self {
             client,
             bucket: bucket.into(),
@@ -78,14 +105,17 @@ impl S3OutputStore {
             access_token_mode,
             file_url_ttl,
             scratch_dir,
+            _private_scratch: private_scratch,
         }
     }
 
     /// Overrides the local scratch directory used for in-flight parts.
     ///
-    /// Defaults to `{temp_dir}/hfs-export-scratch`.
+    /// Defaults to a private directory created under the system temp
+    /// directory for this store, and removed with it.
     pub fn with_scratch_dir(mut self, scratch_dir: impl Into<PathBuf>) -> Self {
         self.scratch_dir = scratch_dir.into();
+        self._private_scratch = None;
         self
     }
 
@@ -514,6 +544,45 @@ mod tests {
 
         store.delete_tenant_outputs("t1/exports").await.unwrap();
         assert!(client.keys().is_empty());
+    }
+
+    /// The default scratch directory is private to the store: not a fixed
+    /// path another local user could create first, owner-only on Unix, and
+    /// removed with the store.
+    #[tokio::test]
+    async fn the_default_scratch_directory_is_private_to_the_store() {
+        let new_store = || {
+            S3OutputStore::new(
+                Arc::new(MockS3::default()) as Arc<dyn S3Api>,
+                BUCKET,
+                "http://localhost:8080",
+                AccessTokenMode::Auto,
+                Duration::from_secs(60),
+            )
+        };
+        let store = new_store();
+        let other = new_store();
+        let dir = store.scratch_dir.clone();
+        assert_ne!(dir, std::env::temp_dir().join("hfs-export-scratch"));
+        assert_ne!(dir, other.scratch_dir);
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "scratch dir mode {mode:o}");
+        }
+
+        let key = ExportPartKey::output("t1", ExportJobId::new(), "Patient", 0, 1);
+        let mut writer = store.open_writer(&key).await.unwrap();
+        writer.write_line("{}").await.unwrap();
+        store.finalize_part(&key, writer).await.unwrap();
+
+        drop(store);
+        assert!(
+            !dir.exists(),
+            "the private scratch directory outlived its store"
+        );
     }
 
     #[tokio::test]
