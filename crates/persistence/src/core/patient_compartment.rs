@@ -51,7 +51,7 @@ impl PatientCompartmentMatcher {
         Self {
             resource_type: resource_type.to_string(),
             params,
-            extractor: SearchParameterExtractor::new(registry),
+            extractor: SearchParameterExtractor::new(registry, version),
         }
     }
 

@@ -12,6 +12,8 @@
 
 use std::collections::HashSet;
 
+use helios_fhir::FhirVersion;
+
 use crate::core::SearchProvider;
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -1044,7 +1046,12 @@ where
 
     let items = search_all_pages(storage, tenant, source_query).await?;
 
-    let extractor = SearchParameterExtractor::new(storage.search_param_registry(tenant));
+    // `_has` extracts `Reference` values only, which do not depend on the
+    // FHIR version; the version decides only which dates are `instant`s.
+    let extractor = SearchParameterExtractor::new(
+        storage.search_param_registry(tenant),
+        FhirVersion::default_enabled(),
+    );
     for resource in items {
         let refs = extract_references(
             &extractor,
@@ -1908,7 +1915,8 @@ mod tests {
             chain: vec![],
             components: vec![],
         });
-        let extractor = SearchParameterExtractor::new(b.search_param_registry(&t));
+        let extractor =
+            SearchParameterExtractor::new(b.search_param_registry(&t), FhirVersion::default());
         for param in ["subject", "patient"] {
             let indexed: std::collections::BTreeSet<String> = b
                 .search_reference_values(&t, &source, param)

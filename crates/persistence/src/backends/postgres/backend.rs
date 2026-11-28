@@ -1596,6 +1596,15 @@ impl PostgresBackend {
         FROM resources \
         WHERE tenant_id = $1 AND resource_type = 'SearchParameter' AND is_deleted = FALSE";
 
+    /// An extractor over `registry` for this backend's FHIR version, whose
+    /// element types decide which date values are `instant`s (#2962).
+    fn extractor_over(
+        &self,
+        registry: Arc<RwLock<SearchParameterRegistry>>,
+    ) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(registry, self.config.fhir_version)
+    }
+
     /// Builds a fresh tenant registry using the caller's guarded transaction.
     ///
     /// The process-local overlay cache can lag writes from another HFS process.
@@ -1653,13 +1662,13 @@ impl PostgresBackend {
             .registries
             .authoritative_cached(tenant_id, &fingerprint)
         {
-            return Ok(SearchParameterExtractor::new(registry));
+            return Ok(self.extractor_over(registry));
         }
         let definitions = self.read_stored_overlay(client, tenant_id).await?;
         let registry = self.overlay_registry(&definitions);
         self.registries
             .cache_authoritative(tenant_id, fingerprint, registry.clone());
-        Ok(SearchParameterExtractor::new(registry))
+        Ok(self.extractor_over(registry))
     }
 
     /// The extractor a write hands to its index step.
@@ -1723,9 +1732,7 @@ impl PostgresBackend {
         C: GenericClient + Sync + ?Sized,
     {
         if !extracts {
-            return Ok(SearchParameterExtractor::new(
-                self.registries.base().clone(),
-            ));
+            return Ok(self.extractor_over(self.registries.base().clone()));
         }
         // Fast path: this overlay was validated moments ago and this
         // transaction has no uncommitted SearchParameter of its own, so skip
@@ -1738,7 +1745,7 @@ impl PostgresBackend {
                 self.overlay_fingerprint_ttl,
             )
         {
-            return Ok(SearchParameterExtractor::new(registry));
+            return Ok(self.extractor_over(registry));
         }
         let fingerprint = self.overlay_fingerprint(client, tenant_id).await?;
         let cached = self
@@ -1757,7 +1764,7 @@ impl PostgresBackend {
             {
                 overlay.validated_at = Some(std::time::Instant::now());
             }
-            return Ok(SearchParameterExtractor::new(registry));
+            return Ok(self.extractor_over(registry));
         }
         let definitions = self.read_stored_overlay(client, tenant_id).await?;
         let registry = self.overlay_registry(&definitions);
@@ -1775,7 +1782,7 @@ impl PostgresBackend {
             // previous overlay; drop it so it rebuilds from the fresh one.
             self.registries.invalidate(tenant_id);
         }
-        Ok(SearchParameterExtractor::new(registry))
+        Ok(self.extractor_over(registry))
     }
 
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and

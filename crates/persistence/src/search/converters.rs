@@ -112,10 +112,16 @@ pub enum IndexValue {
 /// [`super::date_value::indexed_range`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DateEnd {
-    /// A point value (`date`, `dateTime`, `instant`): the range is one unit of
-    /// its own precision, so `2020-06` ends on July 1st.
+    /// A `date` or `dateTime`: the range is one unit of its own precision, so
+    /// `2020-06` ends on July 1st.
     #[default]
     Precision,
+    /// An `instant`: a point, "an interval with an effective width of 0"
+    /// (<https://hl7.org/fhir/R4/search.html#date>), whatever precision it is
+    /// written to. The range is one unit of the backend's storage resolution,
+    /// so `10:00:00Z` ends at `10:00:00.001` on a millisecond backend, not at
+    /// `10:00:01` (#2962).
+    Point,
     /// The `end` of a `Period`, as written; the range ends where the range of
     /// that value does, so `end: "2020-06"` also ends on July 1st.
     At(String),
@@ -234,8 +240,8 @@ impl IndexValue {
         }
     }
 
-    /// Creates a date index value for a point (`date`, `dateTime`,
-    /// `instant`), whose range is one unit of its own precision.
+    /// Creates a date index value for a `date` or `dateTime`, whose range is
+    /// one unit of its own precision.
     pub fn date(value: impl Into<String>) -> Self {
         let value = value.into();
         let precision = DatePrecision::from_date_string(&value);
@@ -243,6 +249,36 @@ impl IndexValue {
             value,
             precision,
             end: DateEnd::Precision,
+        }
+    }
+
+    /// Creates a date index value for an `instant`: the point
+    /// [`DateEnd::Point`] (#2962).
+    ///
+    /// An `instant` "SHALL" be written at least to the second
+    /// (<https://hl7.org/fhir/R4/datatypes.html#instant>). A value written
+    /// more coarsely is not a valid `instant`, so it keeps the range of what
+    /// it does say, as [`Self::date`] gives it: `2020-01-01` is still the whole
+    /// day.
+    pub fn instant(value: impl Into<String>) -> Self {
+        Self::date(value).into_instant()
+    }
+
+    /// This value read as an `instant` (see [`Self::instant`]): a `date` value
+    /// with second or finer precision becomes a point. Anything else is
+    /// returned unchanged.
+    pub fn into_instant(self) -> Self {
+        match self {
+            IndexValue::Date {
+                value,
+                precision: precision @ (DatePrecision::Second | DatePrecision::Millisecond),
+                end: DateEnd::Precision,
+            } => IndexValue::Date {
+                value,
+                precision,
+                end: DateEnd::Point,
+            },
+            other => other,
         }
     }
 
@@ -1232,6 +1268,40 @@ mod tests {
         assert_eq!(
             precision_of(json!("2016-01-23T17:07-04:00")),
             vec![DatePrecision::Minute]
+        );
+    }
+
+    /// An `instant` written to the second or finer is a point (#2962); a
+    /// value too coarse to be an `instant` keeps the range it says.
+    #[test]
+    fn an_instant_value_is_a_point_from_the_second_down() {
+        for (value, precision) in [
+            ("2020-01-01T10:00:00Z", DatePrecision::Second),
+            ("2020-01-01T10:00:00.000Z", DatePrecision::Millisecond),
+            (
+                "2020-01-01T10:00:00.123456+02:00",
+                DatePrecision::Millisecond,
+            ),
+        ] {
+            assert_eq!(
+                IndexValue::instant(value),
+                date_index(value, precision, DateEnd::Point),
+                "{value}"
+            );
+        }
+        for value in ["2020", "2020-01", "2020-01-01", "2020-01-01T10:00Z"] {
+            assert_eq!(
+                IndexValue::instant(value),
+                IndexValue::date(value),
+                "{value}"
+            );
+        }
+        // Only a point's end changes: a Period and a non-date are untouched.
+        let period = IndexValue::date_range(Some("2020-01-01T10:00:00Z"), None).unwrap();
+        assert_eq!(period.clone().into_instant(), period);
+        assert_eq!(
+            IndexValue::string("x").into_instant(),
+            IndexValue::string("x")
         );
     }
 

@@ -697,6 +697,11 @@ mod date_precision_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
 /// The backend-agnostic suite for quantity `Range` targets (#2602).
 /// Same `#[path]` arrangement.
 #[path = "search/quantity_range_suite.rs"]
@@ -919,13 +924,18 @@ mod es_integration {
 
     /// Builds a search parameter registry loaded from the FHIR spec data files.
     fn build_search_registry() -> Arc<TenantSearchRegistries> {
+        build_search_registry_for(FhirVersion::default())
+    }
+
+    /// [`build_search_registry`] for `version`'s spec data files.
+    fn build_search_registry_for(version: FhirVersion) -> Arc<TenantSearchRegistries> {
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .map(|p| p.join("data"))
             .unwrap_or_else(|| PathBuf::from("data"));
 
-        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let loader = SearchParameterLoader::new(version);
         let registries = Arc::new(TenantSearchRegistries::base_only());
         let mut registry = registries.base().write();
 
@@ -2073,6 +2083,63 @@ mod es_integration {
     async fn es_date_period_targets_are_ranges() {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+    }
+
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 ms)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn es_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(&backend, "date-instant-2962").await;
+    }
+
+    /// [`create_backend`] configured for `version`, with that version's
+    /// search parameters loaded.
+    async fn create_backend_for(version: FhirVersion) -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            fhir_version: version,
+            ..Default::default()
+        };
+        let backend =
+            ElasticsearchBackend::with_shared_registry(config, build_search_registry_for(version))
+                .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
+    /// #2962: the backend's configured FHIR version decides which elements
+    /// are `instant`s; R6 makes `DiagnosticReport.issued` a `dateTime`.
+    #[cfg(feature = "R6")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r6_backend() {
+        let backend = create_backend_for(FhirVersion::R6).await;
+        super::date_instant_suite::r6_backend_types_by_r6(&backend, "date-instant-r6").await;
+    }
+
+    /// The R4 control for the R6 case.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r4_backend() {
+        let backend = create_backend_for(FhirVersion::R4).await;
+        super::date_instant_suite::r4_backend_types_by_r4(&backend, "date-instant-r4").await;
+    }
+
+    /// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn es_date_instant_types_follow_an_r5_backend() {
+        let backend = create_backend_for(FhirVersion::R5).await;
+        super::date_instant_suite::r5_backend_types_by_r5(&backend, "date-instant-r5").await;
     }
 
     /// #2602: a `Range` was not indexed for quantity parameters. It is one

@@ -134,6 +134,11 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for `instant` targets (#2962). Same `#[path]`
+/// arrangement.
+#[path = "search/date_instant_suite.rs"]
+mod date_instant_suite;
+
 /// The backend-agnostic suite for quantity `Range` targets (#2602).
 /// Same `#[path]` arrangement.
 #[path = "search/quantity_range_suite.rs"]
@@ -35776,6 +35781,66 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #2962: an `instant` written to the second was indexed as the whole
+    /// second, so `eq…:00.000Z` missed it and `gt…:00.500Z` found it. It is
+    /// the point `[t, t + 1 µs)` now; a `dateTime` keeps its range.
+    #[tokio::test]
+    async fn postgres_integration_date_instant_targets_are_points() {
+        let backend = create_backend().await;
+        super::date_instant_suite::instant_targets_are_points(
+            &backend,
+            &unique_base("date_instant"),
+        )
+        .await;
+    }
+
+    /// [`create_backend`] configured for `version`, with that version's
+    /// search parameters loaded.
+    async fn create_backend_for(version: FhirVersion) -> PostgresBackend {
+        let mut config = create_backend().await.config().clone();
+        config.fhir_version = version;
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create PostgresBackend")
+    }
+
+    /// #2962: the backend's configured FHIR version decides which elements
+    /// are `instant`s; R6 makes `DiagnosticReport.issued` a `dateTime`.
+    #[cfg(feature = "R6")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r6_backend() {
+        let backend = create_backend_for(FhirVersion::R6).await;
+        super::date_instant_suite::r6_backend_types_by_r6(
+            &backend,
+            &unique_base("date_instant_r6"),
+        )
+        .await;
+    }
+
+    /// The R4 control for the R6 case.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r4_backend() {
+        let backend = create_backend_for(FhirVersion::R4).await;
+        super::date_instant_suite::r4_backend_types_by_r4(
+            &backend,
+            &unique_base("date_instant_r4"),
+        )
+        .await;
+    }
+
+    /// R5's `ImagingSelection.issued`, an `instant` that R4 does not have.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn postgres_integration_date_instant_types_follow_an_r5_backend() {
+        let backend = create_backend_for(FhirVersion::R5).await;
+        super::date_instant_suite::r5_backend_types_by_r5(
+            &backend,
+            &unique_base("date_instant_r5"),
+        )
+        .await;
     }
 
     /// #2602: `gt`/`ge`/`eb` filter on `value_quantity_high`, so a selective

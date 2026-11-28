@@ -3140,9 +3140,24 @@ only rewritten by a reindex. MongoDB does not canonicalize and is unaffected.
 
 **Date prefix semantics (range targets, #1391):**
 
-- Every indexed date value is a range `[start, end)`. A point value such as
-  `birthDate` or `effectiveDateTime` runs to the end of its own precision
-  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+- Every indexed date value is a range `[start, end)`. A `date` or `dateTime`
+  value such as `birthDate` or `effectiveDateTime` runs to the end of its own
+  precision (`2020-03` is `[2020-03-01, 2020-04-01)`). An `instant` value such
+  as `DiagnosticReport.issued` or `Observation.effectiveInstant` is a point, "an
+  interval with an effective width of 0"
+  ([search.html#date](https://hl7.org/fhir/R4/search.html#date)): it runs for
+  one unit of the backend's storage resolution, whatever precision it is
+  written to, so `2020-01-01T10:00:00Z` is `[10:00:00.000, 10:00:00.001)` on
+  SQLite, MongoDB and Elasticsearch and `[10:00:00, 10:00:00.000001)` on
+  PostgreSQL (#2962). The element type comes from the backend's FHIR version
+  (`DiagnosticReport.issued` is a `dateTime` in R6), for a union member that
+  is a plain path to the element, including the `instant` arm of a choice
+  (`Observation.effective`, `effective.ofType(instant)`); a member of any other
+  shape, such as R5's `(start | requestedPeriod.start).first()` for
+  `Appointment.date`, keeps the range of its written precision. A value too
+  coarse to be a valid `instant` (`2020-01-01`) also keeps its range. Rows
+  indexed before #2962 keep the one-unit range until the resource is written
+  again or `$reindex` runs. A `Period`, and a `Timing`'s
   `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
   `end` at that value's precision. A missing `start` or `end` is unbounded,
   stored as the supported-range limit (year 1 / year 9999). One rule for all

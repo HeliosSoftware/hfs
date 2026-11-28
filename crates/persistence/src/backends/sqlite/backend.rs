@@ -694,7 +694,7 @@ impl SqliteBackend {
     /// A value extractor over a tenant's registry, for indexing that tenant's
     /// resources.
     pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
-        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id), self.config.fhir_version)
     }
 
     /// Configure connection settings.

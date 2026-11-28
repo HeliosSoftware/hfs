@@ -49,9 +49,13 @@
 //! wide — a year, a month, a day, a minute, a second, or `10⁻ⁿ` s for `n`
 //! fraction digits.
 //!
-//! Every indexed date is a range `[ts, te)` too (#1391). A point value — a
-//! `date`, `dateTime` or `instant` — covers one unit of its own precision, so
-//! `birthDate: "2020"` is the whole of 2020. A `Period` (and a `Timing`'s
+//! Every indexed date is a range `[ts, te)` too (#1391). A `date` or
+//! `dateTime` covers one unit of its own precision, so `birthDate: "2020"` is
+//! the whole of 2020. An `instant` is a point, "an interval with an effective
+//! width of 0" (<https://hl7.org/fhir/R4/search.html#date>): it covers one
+//! unit of the backend's [`StorageResolution`], whatever precision it is
+//! written to, so `issued: "2020-01-01T10:00:00Z"` is
+//! `[10:00:00.000, 10:00:00.001)` on a millisecond backend (#2962). A `Period` (and a `Timing`'s
 //! `repeat.boundsPeriod`) is one range from its `start` to the end of its
 //! `end`, and a missing side is open: it is stored as [`OPEN_START`] or
 //! [`open_end`], the limits of the supported years, which no search range
@@ -500,9 +504,10 @@ pub fn parse_stored_date(raw: &str) -> Option<FhirDateValue> {
 ///
 /// For a backend that read the start itself (some are more lenient than the
 /// FHIR grammar about what they index): `start` is that instant and
-/// `precision` the one the value carries. A point ends one unit of its
-/// precision later, a `Period` at the end of its own `end` (so `end: "2020-06"`
-/// ends on July 1st), and an open `Period` at [`open_end`].
+/// `precision` the one the value carries. A `date` or `dateTime` ends one
+/// unit of its precision later, an `instant` one unit of `resolution` later, a
+/// `Period` at the end of its own `end` (so `end: "2020-06"` ends on July 1st),
+/// and an open `Period` at [`open_end`].
 ///
 /// `None` when a `Period`'s `end` is not a date, and the row must be skipped
 /// like any other unparseable date: indexing it as open would over-match. The
@@ -527,6 +532,7 @@ pub fn indexed_end(
             DatePrecision::Millisecond => start.checked_add_signed(Duration::milliseconds(1)),
         }
         .unwrap_or_else(|| open_end(resolution)),
+        DateEnd::Point => start + unit,
         DateEnd::At(raw) => parse_stored_date(raw)?.range_at(resolution).1,
         DateEnd::Open => open_end(resolution),
     };
@@ -559,6 +565,10 @@ pub fn indexed_range(
         // The parsed range is exact for every precision, fraction digits
         // included, where `DatePrecision` only knows "millisecond".
         DateEnd::Precision => point_end.min(open_end(resolution)),
+        // `start` is already floored to the resolution.
+        DateEnd::Point => {
+            (start + Duration::nanoseconds(resolution.nanos())).min(open_end(resolution))
+        }
         other => indexed_end(start, *precision, other, resolution)?,
     };
     Some((start, end))
@@ -1389,6 +1399,130 @@ mod tests {
             end: DateEnd::At("2020-02-30".to_string()),
         };
         assert_eq!(indexed_range(&bad_end, res), None);
+    }
+
+    /// An `instant` is a point (#2962): one unit of the storage resolution,
+    /// whatever precision it is written to, where a `dateTime` with the same
+    /// text is the whole second.
+    #[test]
+    fn an_instant_is_indexed_as_a_point() {
+        let point = |value: &str| IndexValue::Date {
+            value: value.to_string(),
+            precision: DatePrecision::from_date_string(value),
+            end: DateEnd::Point,
+        };
+        for (value, res, start, end) in [
+            (
+                "2020-01-01T10:00:00Z",
+                StorageResolution::Millis,
+                "2020-01-01T10:00:00Z",
+                "2020-01-01T10:00:00.001Z",
+            ),
+            (
+                "2020-01-01T10:00:00Z",
+                StorageResolution::Micros,
+                "2020-01-01T10:00:00Z",
+                "2020-01-01T10:00:00.000001Z",
+            ),
+            (
+                "2020-01-01T10:00:00.000Z",
+                StorageResolution::Millis,
+                "2020-01-01T10:00:00Z",
+                "2020-01-01T10:00:00.001Z",
+            ),
+            (
+                "2020-01-01T10:00:00.123456Z",
+                StorageResolution::Micros,
+                "2020-01-01T10:00:00.123456Z",
+                "2020-01-01T10:00:00.123457Z",
+            ),
+            // Below the resolution the start is floored, as a search's is.
+            (
+                "2020-01-01T10:00:00.1239Z",
+                StorageResolution::Millis,
+                "2020-01-01T10:00:00.123Z",
+                "2020-01-01T10:00:00.124Z",
+            ),
+            (
+                "2020-01-01T12:00:00+02:00",
+                StorageResolution::Millis,
+                "2020-01-01T10:00:00Z",
+                "2020-01-01T10:00:00.001Z",
+            ),
+        ] {
+            assert_eq!(
+                indexed_range(&point(value), res),
+                Some((utc(start), utc(end))),
+                "{value} at {res:?}"
+            );
+        }
+        // The control: the same text as a `dateTime` is the whole second.
+        assert_eq!(
+            indexed_range(
+                &IndexValue::date("2020-01-01T10:00:00Z"),
+                StorageResolution::Millis
+            ),
+            Some((utc("2020-01-01T10:00:00Z"), utc("2020-01-01T10:00:01Z")))
+        );
+        // A backend that read the start itself gets the same end.
+        let start = utc("2020-01-01T10:00:00Z");
+        assert_eq!(
+            indexed_end(
+                start,
+                DatePrecision::Second,
+                &DateEnd::Point,
+                StorageResolution::Millis
+            ),
+            Some(utc("2020-01-01T10:00:00.001Z"))
+        );
+        assert_eq!(
+            indexed_end(
+                start,
+                DatePrecision::Second,
+                &DateEnd::Point,
+                StorageResolution::Micros
+            ),
+            Some(utc("2020-01-01T10:00:00.000001Z"))
+        );
+    }
+
+    /// The two searches #2962 reported, and their `dateTime` controls, through
+    /// the shared range predicate.
+    #[test]
+    fn a_millisecond_search_against_an_instant_point() {
+        let res = StorageResolution::Millis;
+        let instant = IndexValue::instant("2020-01-01T10:00:00Z");
+        let date_time = IndexValue::date("2020-01-01T10:00:00Z");
+        let matches = |value: &IndexValue, prefix, search: &str| {
+            let (ts, te) = indexed_range(value, res).expect("a readable date");
+            parsed(search).range_predicate(prefix, res).matches(ts, te)
+        };
+        assert!(matches(
+            &instant,
+            SearchPrefix::Eq,
+            "2020-01-01T10:00:00.000Z"
+        ));
+        assert!(!matches(
+            &instant,
+            SearchPrefix::Gt,
+            "2020-01-01T10:00:00.500Z"
+        ));
+        assert!(matches(&instant, SearchPrefix::Eq, "2020-01-01T10:00:00Z"));
+        assert!(!matches(
+            &date_time,
+            SearchPrefix::Eq,
+            "2020-01-01T10:00:00.000Z"
+        ));
+        assert!(matches(
+            &date_time,
+            SearchPrefix::Gt,
+            "2020-01-01T10:00:00.500Z"
+        ));
+        assert!(matches(
+            &date_time,
+            SearchPrefix::Eq,
+            "2020-01-01T10:00:00Z"
+        ));
     }
 
     /// For a backend that read the start itself, more leniently than the

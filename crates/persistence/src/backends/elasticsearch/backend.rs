@@ -793,7 +793,10 @@ impl ElasticsearchBackend {
     /// borrow an extractor from: S3 stores resources but maintains no search
     /// index, so Elasticsearch's extractor is the only one in that deployment.
     pub fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
-        SearchParameterExtractor::new(self.registries.for_tenant(tenant_id))
+        SearchParameterExtractor::new(
+            self.registries.for_tenant(tenant_id),
+            self.config.fhir_version,
+        )
     }
 
     /// The rayon pool for `$reindex` page extraction, or `None` when the
