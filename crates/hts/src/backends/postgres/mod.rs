@@ -1510,6 +1510,66 @@ async fn write_value_set(
     Ok(())
 }
 
+/// Make `id` available to an import of rank `incoming_rank`. `true` when no
+/// map holds it, or when its holder is a weaker source: that map keeps its
+/// content and moves to a fresh id. `false` when the holder ranks at least as
+/// high, so the import must take another id.
+async fn release_concept_map_id(
+    client: &impl GenericClient,
+    id: &str,
+    incoming_rank: i32,
+) -> Result<bool, HtsError> {
+    let holder = client
+        .query_opt(
+            "SELECT authority_rank FROM concept_maps WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    match holder {
+        None => Ok(true),
+        Some(row) if bundle_parser::claims_id(incoming_rank, row.get(0)) => {
+            rekey_concept_map(client, id, &uuid::Uuid::new_v4().to_string()).await?;
+            Ok(true)
+        }
+        Some(_) => Ok(false),
+    }
+}
+
+/// Move a stored map, with its elements, from `old_id` to the unused `new_id`.
+/// `concept_map_elements.map_id` has no `ON UPDATE CASCADE`, so the elements
+/// wait on a placeholder row while the map's primary key changes.
+async fn rekey_concept_map(
+    client: &impl GenericClient,
+    old_id: &str,
+    new_id: &str,
+) -> Result<(), HtsError> {
+    let parked = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let move_elements = "UPDATE concept_map_elements SET map_id = $1 WHERE map_id = $2";
+    let steps: [(&str, &[&(dyn tokio_postgres::types::ToSql + Sync)]); 5] = [
+        (
+            "INSERT INTO concept_maps (id, url, created_at) VALUES ($1, $1, '')",
+            &[&parked],
+        ),
+        (move_elements, &[&parked, &old_id]),
+        (
+            "UPDATE concept_maps SET id = $1,
+               resource_json = jsonb_set(resource_json, '{id}', to_jsonb($1::text))
+             WHERE id = $2",
+            &[&new_id, &old_id],
+        ),
+        (move_elements, &[&new_id, &parked]),
+        ("DELETE FROM concept_maps WHERE id = $1", &[&parked]),
+    ];
+    for (sql, params) in steps {
+        client
+            .execute(sql, params)
+            .await
+            .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    }
+    Ok(())
+}
+
 async fn write_concept_map(
     client: &impl GenericClient,
     cm: &ParsedConceptMap,
@@ -1519,8 +1579,8 @@ async fn write_concept_map(
 
     // `concept_maps.url` is UNIQUE: one row per canonical. Mirrors the SQLite
     // twin in `import/fhir_bundle.rs::write_concept_map`: the row is found by
-    // URL, its rank is checked, and an `id` held by a map under another URL is
-    // replaced by a fresh one instead of making the UPDATE below find no row.
+    // URL, its rank is checked, and an `id` held by a map under another URL
+    // never makes the UPDATE below find no row.
     let existing = client
         .query_opt(
             "SELECT id, authority_rank FROM concept_maps WHERE url = $1",
@@ -1540,18 +1600,26 @@ async fn write_concept_map(
             cm.authority_rank,
         )?;
     }
+    // The stored id follows the strongest source; see the SQLite twin.
     let storage_id: String = match existing {
-        Some(row) => row.get(0),
-        None => {
-            let id_taken = client
-                .query_opt("SELECT 1 FROM concept_maps WHERE id = $1", &[&cm.id])
-                .await
-                .map_err(|e| HtsError::StorageError(error_chain(&e)))?
-                .is_some();
-            if id_taken {
-                uuid::Uuid::new_v4().to_string()
-            } else {
+        Some(row) => {
+            let id: String = row.get(0);
+            if id == cm.id {
+                id
+            } else if bundle_parser::claims_id(cm.authority_rank, row.get(1))
+                && release_concept_map_id(client, &cm.id, cm.authority_rank).await?
+            {
+                rekey_concept_map(client, &id, &cm.id).await?;
                 cm.id.clone()
+            } else {
+                id
+            }
+        }
+        None => {
+            if release_concept_map_id(client, &cm.id, cm.authority_rank).await? {
+                cm.id.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
             }
         }
     };

@@ -735,7 +735,7 @@ fn write_concept_map(
 
     // `concept_maps.url` is UNIQUE: one row per canonical. The row is found by
     // URL, never by `id` alone, so a bundle that only shares a stored map's
-    // `id` cannot replace a map stored under another URL; it gets a fresh id.
+    // `id` cannot replace a map stored under another URL.
     let existing: Option<(String, Option<i32>)> = conn
         .query_row(
             "SELECT id, authority_rank FROM concept_maps WHERE url = ?1",
@@ -753,20 +753,27 @@ fn write_concept_map(
             cm.authority_rank,
         )?;
     }
+    // The stored id follows the strongest source. A map keeps the id it
+    // already has unless this import outranks whoever chose it, so an
+    // unattributed bundle that arrived first cannot keep an owning package
+    // off its own id (or leave the package's map under the bundle's id).
     let map_id = match existing {
-        Some((id, _)) => id,
-        None => {
-            let id_taken: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM concept_maps WHERE id = ?1)",
-                    [&cm.id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            if id_taken {
-                uuid::Uuid::new_v4().to_string()
-            } else {
+        Some((id, _)) if id == cm.id => id,
+        Some((id, rank)) => {
+            if bundle_parser::claims_id(cm.authority_rank, rank)
+                && release_concept_map_id(conn, &cm.id, cm.authority_rank)?
+            {
+                rekey_concept_map(conn, &id, &cm.id)?;
                 cm.id.clone()
+            } else {
+                id
+            }
+        }
+        None => {
+            if release_concept_map_id(conn, &cm.id, cm.authority_rank)? {
+                cm.id.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
             }
         }
     };
@@ -834,6 +841,67 @@ fn write_concept_map(
     }
 
     stats.concept_maps += 1;
+    Ok(())
+}
+
+/// Make `id` available to an import of rank `incoming_rank`. `true` when no
+/// map holds it, or when its holder is a weaker source: that map keeps its
+/// content and moves to a fresh id. `false` when the holder ranks at least as
+/// high, so the import must take another id.
+#[cfg(feature = "sqlite")]
+fn release_concept_map_id(
+    conn: &Connection,
+    id: &str,
+    incoming_rank: i32,
+) -> Result<bool, HtsError> {
+    let holder: Option<Option<i32>> = conn
+        .query_row(
+            "SELECT authority_rank FROM concept_maps WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    match holder {
+        None => Ok(true),
+        Some(rank) if bundle_parser::claims_id(incoming_rank, rank) => {
+            rekey_concept_map(conn, id, &uuid::Uuid::new_v4().to_string())?;
+            Ok(true)
+        }
+        Some(_) => Ok(false),
+    }
+}
+
+/// Move a stored map, with its elements, from `old_id` to the unused `new_id`.
+/// `concept_map_elements.map_id` has no `ON UPDATE CASCADE`, so the elements
+/// wait on a placeholder row while the map's primary key changes.
+#[cfg(feature = "sqlite")]
+fn rekey_concept_map(conn: &Connection, old_id: &str, new_id: &str) -> Result<(), HtsError> {
+    let parked = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let run = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        conn.execute(sql, params)
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+    };
+    run(
+        "INSERT INTO concept_maps (id, url, created_at) VALUES (?1, ?1, '')",
+        &[&parked],
+    )?;
+    run(
+        "UPDATE concept_map_elements SET map_id = ?1 WHERE map_id = ?2",
+        &[&parked, &old_id],
+    )?;
+    run(
+        "UPDATE concept_maps SET id = ?1,
+           resource_json = CASE WHEN resource_json IS NULL THEN NULL
+                                ELSE json_set(resource_json, '$.id', ?1) END
+         WHERE id = ?2",
+        &[&new_id, &old_id],
+    )?;
+    run(
+        "UPDATE concept_map_elements SET map_id = ?1 WHERE map_id = ?2",
+        &[&new_id, &parked],
+    )?;
+    run("DELETE FROM concept_maps WHERE id = ?1", &[&parked])?;
     Ok(())
 }
 
