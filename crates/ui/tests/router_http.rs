@@ -2061,6 +2061,146 @@ async fn edit(form: &str) -> String {
     body_text(response).await
 }
 
+/// Posts `pairs` as a form to `uri` and returns the status and the body.
+async fn post_form(uri: &str, pairs: &[(&str, &str)]) -> (StatusCode, String) {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in pairs {
+        serializer.append_pair(name, value);
+    }
+    let response = app()
+        .oneshot(
+            Request::post(uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(serializer.finish()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+/// A Patient with more nodes than the guided form builds rows for.
+fn patient_past_the_node_budget() -> Value {
+    serde_json::json!({
+        "resourceType": "Patient",
+        "name": (0..3_000).map(|i| serde_json::json!({"family": format!("f{i}")})).collect::<Vec<_>>()
+    })
+}
+
+/// A Patient under the node limit whose rows' add pickers (an empty object
+/// lists every element it allows) exceed the render budget.
+fn patient_past_the_render_budget() -> Value {
+    serde_json::json!({
+        "resourceType": "Patient",
+        "contact": vec![serde_json::json!({}); 4_000]
+    })
+}
+
+/// What every response for a document past the budget has in common: the
+/// notice instead of rows, and a body of bounded size. Unbounded, either
+/// document above renders tens of megabytes.
+fn assert_too_large_for_the_form(body: &str, sent: usize) {
+    assert!(body.contains("data-editor-too-large"), "no notice");
+    assert!(!body.contains(" data-path=\""), "rows were rendered");
+    assert!(!body.contains("editor-add__item"), "a picker was rendered");
+    assert!(
+        body.len() < 16 * sent + 200_000,
+        "{} bytes for a {sent}-byte document",
+        body.len()
+    );
+}
+
+/// The guided form does not render a document without bound: one with more
+/// nodes than it builds rows for, and one whose add pickers exceed the render
+/// budget, get a notice in place of the rows. The rest of the response is as
+/// usual, so the JSON view still edits and saves the document. An ordinary
+/// resource still gets its rows.
+#[tokio::test]
+async fn editor_render_replaces_the_rows_of_a_document_past_its_budget() {
+    for doc in [
+        patient_past_the_node_budget(),
+        patient_past_the_render_budget(),
+    ] {
+        let doc = doc.to_string();
+        for pane in ["", "form"] {
+            let (status, body) =
+                post_form("/ui/editor/render", &[("doc", &doc), ("pane", pane)]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_too_large_for_the_form(&body, doc.len());
+            // What the editor scripts need to mount, mirror and save.
+            assert!(body.contains("id=\"editor-form\""));
+            assert!(body.contains("data-error-count=\"0\""));
+            assert!(body.contains("id=\"editor-doc\""));
+            assert!(body.contains("id=\"editor-pretty\""));
+            assert_eq!(body.contains("id=\"editor-source\""), pane.is_empty());
+        }
+    }
+
+    for pane in ["", "form"] {
+        let (status, body) = post_form(
+            "/ui/editor/render",
+            &[
+                ("doc", r#"{"resourceType":"Patient","contact":[{}]}"#),
+                ("pane", pane),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("data-editor-too-large"));
+        assert!(body.contains(" data-path=\""));
+    }
+}
+
+/// A document past the budget is still validated: its issue count gates Save
+/// as it does for any other document, and the issues are listed under the
+/// notice, a bounded number of them, because there are no rows to carry them.
+#[tokio::test]
+async fn editor_render_still_validates_a_document_past_its_budget() {
+    let doc = serde_json::json!({
+        "resourceType": "Patient",
+        "gender": "not-a-gender",
+        "name": (0..3_000).map(|i| serde_json::json!({"nope": i})).collect::<Vec<_>>()
+    })
+    .to_string();
+    let (status, body) = post_form("/ui/editor/render", &[("doc", &doc)]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_too_large_for_the_form(&body, doc.len());
+
+    let dom = Dom::fragment(&body);
+    let count: usize = dom
+        .one("#editor-form")
+        .attr("data-error-count")
+        .and_then(|count| count.parse().ok())
+        .expect("an error count");
+    assert!(count > 3_000, "every issue is counted, got {count}");
+    assert_eq!(dom.count(".editor__orphan"), 200);
+    let issues: Value =
+        serde_json::from_str(dom.one(".editor-validity").attr("data-issues").unwrap()).unwrap();
+    assert_eq!(issues.as_array().unwrap().len(), 200);
+}
+
+/// The SQL on FHIR pages build the same guided form inline when a Save is
+/// refused, from the document that was posted. They meet the same budget.
+#[tokio::test]
+async fn sql_save_error_pages_replace_the_rows_of_a_document_past_the_budget() {
+    for doc in [
+        patient_past_the_node_budget(),
+        patient_past_the_render_budget(),
+    ] {
+        let doc = doc.to_string();
+        for uri in [
+            "/ui/sql/view-definitions",
+            "/ui/sql/queries",
+            "/ui/sql/views",
+        ] {
+            let (status, body) = post_form(uri, &[("json", &doc), ("sql", "")]).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_too_large_for_the_form(&body, doc.len());
+        }
+    }
+}
+
 /// Builds a `pane=form` request body (#843): `doc` plus any extra fields
 /// (`op`, `path`, `name`, ...), form-urlencoded the way the browser would.
 fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
