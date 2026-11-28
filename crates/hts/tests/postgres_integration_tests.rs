@@ -154,6 +154,141 @@ async fn schema_applies_idempotently() {
         .expect("Second schema application (idempotent) should also succeed");
 }
 
+/// Every pooled connection carries the terminology statement timeout, so a
+/// statement the request timeout has given up on is stopped by the server.
+#[tokio::test]
+async fn pooled_connections_carry_the_statement_timeout() {
+    let backend = fresh_backend().await;
+    let client = backend.pool().get().await.expect("connection");
+    let row = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .expect("SHOW statement_timeout");
+    assert_eq!(row.get::<_, String>(0), "30s");
+}
+
+/// The shared database URL with a 1 s statement timeout, so a test can outlast
+/// the timeout without waiting 30 s.
+async fn one_second_timeout_url() -> String {
+    format!("{}?options=-c%20statement_timeout%3D1000", db_url().await)
+}
+
+/// The statement timeout of every connection `backend`'s pool hands out when
+/// `count` are taken at once.
+async fn pooled_statement_timeouts(
+    backend: &PostgresTerminologyBackend,
+    count: usize,
+) -> Vec<String> {
+    let mut clients = Vec::new();
+    for _ in 0..count {
+        clients.push(backend.pool().get().await.expect("connection"));
+    }
+    let mut timeouts = Vec::new();
+    for client in &clients {
+        let row = client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("SHOW statement_timeout");
+        timeouts.push(row.get::<_, String>(0));
+    }
+    timeouts
+}
+
+/// Startup is not a request: it waits for another instance's migration for
+/// as long as that takes, then hands its connection back with the timeout
+/// restored.
+#[tokio::test]
+async fn startup_waits_for_the_schema_lock_past_the_statement_timeout() {
+    // `schema::HTS_SCHEMA_LOCK`.
+    const HTS_SCHEMA_LOCK: i64 = 0x4854_535f_5343_484d;
+
+    let holder_backend = fresh_backend().await;
+    let holder = holder_backend.pool().get().await.expect("connection");
+    holder
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_SCHEMA_LOCK])
+        .await
+        .expect("take the schema lock");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        holder
+            .execute("SELECT pg_advisory_unlock($1)", &[&HTS_SCHEMA_LOCK])
+            .await
+            .expect("release the schema lock");
+    });
+
+    let started = std::time::Instant::now();
+    let backend = PostgresTerminologyBackend::new(&one_second_timeout_url().await)
+        .await
+        .expect("startup should wait for the schema lock");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(2),
+        "startup did not wait for the lock: {:?}",
+        started.elapsed()
+    );
+    release.await.expect("holder task");
+
+    assert_eq!(pooled_statement_timeouts(&backend, 4).await, ["1s"; 4]);
+}
+
+/// An import during maintenance waits for a lock past the statement timeout;
+/// the same import outside maintenance (a request's) is stopped by it. Either
+/// way the pool's connections keep their timeout afterwards.
+#[tokio::test]
+async fn a_maintenance_import_is_exempt_from_the_statement_timeout() {
+    let backend = PostgresTerminologyBackend::new(&one_second_timeout_url().await)
+        .await
+        .expect("backend");
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{
+            "resource": {
+                "resourceType": "CodeSystem",
+                "id": format!("maintenance-{uid}"),
+                "url": format!("http://maintenance.{uid}/cs"),
+                "status": "active",
+                "content": "complete",
+                "concept": [{ "code": "a", "display": "A" }]
+            }
+        }]
+    });
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+
+    // Another writer holds `code_systems` for 3 s.
+    let holder_backend = fresh_backend().await;
+    let holder = holder_backend.pool().get().await.expect("connection");
+    holder
+        .batch_execute("BEGIN; LOCK TABLE code_systems IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock code_systems");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        holder.batch_execute("ROLLBACK").await.expect("rollback");
+    });
+
+    let refused = backend.import_bundle(&ctx(), &bytes).await;
+    assert!(
+        matches!(&refused, Err(HtsError::StorageError(message)) if message.contains("statement timeout")),
+        "an import outside maintenance should be stopped by the timeout: {refused:?}"
+    );
+
+    let maintenance = backend.begin_maintenance();
+    let stats = backend
+        .import_bundle(&ctx(), &bytes)
+        .await
+        .expect("a maintenance import should wait for the lock");
+    assert_eq!(stats.code_systems, 1, "errors: {:?}", stats.errors);
+    backend
+        .rebuild_missing_closures()
+        .await
+        .expect("closure rebuild during maintenance");
+    drop(maintenance);
+    release.await.expect("holder task");
+
+    assert_eq!(pooled_statement_timeouts(&backend, 4).await, ["1s"; 4]);
+}
+
 #[tokio::test]
 async fn backend_name_is_postgres() {
     let backend = fresh_backend().await;

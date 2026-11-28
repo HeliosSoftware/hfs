@@ -138,6 +138,9 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
+    // The server is not listening yet, so no request waits on the bootstrap
+    // import or its closure rebuild: run them without the statement timeout.
+    let maintenance = backend.begin_maintenance();
     bootstrap_sync_postgres(&backend, &config).await?;
 
     // Rebuild any concept closures invalidated by bootstrap re-import, matching
@@ -155,6 +158,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
             "Rebuilt concept closures after bootstrap"
         );
     }
+    drop(maintenance);
 
     let resource_store =
         PostgresBackend::from_named_connection_string(&config.database_url, "HTS_DATABASE_URL")
@@ -562,6 +566,8 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
         #[cfg(feature = "postgres")]
         {
             let backend = PostgresTerminologyBackend::new(&args.database_url).await?;
+            // No request waits on a CLI import: no statement timeout.
+            let _maintenance = backend.begin_maintenance();
             let result = run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?;
 
             // Pre-build concept closures now so server startup only needs to
