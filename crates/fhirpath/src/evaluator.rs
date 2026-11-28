@@ -782,6 +782,40 @@ impl EvaluationContext {
     }
 }
 
+/// `l + r`, or `ArithmeticOverflow` when the sum is outside the decimal range.
+fn dec_add(l: Decimal, r: Decimal) -> Result<Decimal, EvaluationError> {
+    l.checked_add(r).ok_or(EvaluationError::ArithmeticOverflow)
+}
+
+/// `l - r`, or `ArithmeticOverflow` when the difference is outside the decimal range.
+fn dec_sub(l: Decimal, r: Decimal) -> Result<Decimal, EvaluationError> {
+    l.checked_sub(r).ok_or(EvaluationError::ArithmeticOverflow)
+}
+
+/// `l * r`, or `ArithmeticOverflow` when the product is outside the decimal range.
+fn dec_mul(l: Decimal, r: Decimal) -> Result<Decimal, EvaluationError> {
+    l.checked_mul(r).ok_or(EvaluationError::ArithmeticOverflow)
+}
+
+/// `date` moved by `delta`, or `ArithmeticOverflow` when the duration or the
+/// result is outside chrono's range.
+fn shift_date(date: NaiveDate, delta: Option<Duration>) -> Result<NaiveDate, EvaluationError> {
+    delta
+        .and_then(|delta| date.checked_add_signed(delta))
+        .ok_or(EvaluationError::ArithmeticOverflow)
+}
+
+/// `dt` moved by `delta`, or `ArithmeticOverflow` when the duration or the
+/// result is outside chrono's range.
+fn shift_datetime(
+    dt: NaiveDateTime,
+    delta: Option<Duration>,
+) -> Result<NaiveDateTime, EvaluationError> {
+    delta
+        .and_then(|delta| dt.checked_add_signed(delta))
+        .ok_or(EvaluationError::ArithmeticOverflow)
+}
+
 /// Applies decimal-only multiplicative operators (div, mod) to decimal values
 ///
 /// This function implements the specialized division operators defined in the FHIRPath specification:
@@ -827,7 +861,8 @@ fn apply_decimal_multiplicative(
     match op {
         "div" => {
             // Decimal div Decimal -> Integer (truncate)
-            (left / right)
+            left.checked_div(right)
+                .ok_or(EvaluationError::ArithmeticOverflow)?
                 .trunc() // Truncate the result
                 .to_i64() // Convert to i64
                 .map(EvaluationResult::integer)
@@ -836,7 +871,10 @@ fn apply_decimal_multiplicative(
         }
         "mod" => {
             // Decimal mod Decimal -> Decimal
-            Ok(EvaluationResult::decimal(left % right))
+            Ok(EvaluationResult::decimal(
+                left.checked_rem(right)
+                    .ok_or(EvaluationError::ArithmeticOverflow)?,
+            ))
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown decimal multiplicative operator: {}",
@@ -6157,10 +6195,12 @@ fn call_function(
                     // Use exponentiation by squaring for efficiency
                     while n > 0 {
                         if n % 2 == 1 {
-                            result *= base_power;
+                            result = result.checked_mul(base_power).ok_or("Overflow")?;
                         }
-                        base_power *= base_power;
                         n /= 2;
+                        if n > 0 {
+                            base_power = base_power.checked_mul(base_power).ok_or("Overflow")?;
+                        }
                     }
 
                     return Ok(result);
@@ -7020,12 +7060,12 @@ fn add_duration_to_date(
             let day = date.day().min(max_day);
             NaiveDate::from_ymd_opt(year, month as u32, day).unwrap_or(date)
         }
-        "wk" => date + Duration::weeks(amount),
-        "d" => date + Duration::days(amount),
-        "h" => date + Duration::hours(amount),
-        "min" => date + Duration::minutes(amount),
-        "s" => date + Duration::seconds(amount),
-        "ms" => date + Duration::milliseconds(amount),
+        "wk" => shift_date(date, Duration::try_weeks(amount))?,
+        "d" => shift_date(date, Duration::try_days(amount))?,
+        "h" => shift_date(date, Duration::try_hours(amount))?,
+        "min" => shift_date(date, Duration::try_minutes(amount))?,
+        "s" => shift_date(date, Duration::try_seconds(amount))?,
+        "ms" => shift_date(date, Duration::try_milliseconds(amount))?,
         _ => {
             return Err(EvaluationError::TypeError(format!(
                 "Unsupported time unit: {}",
@@ -7088,32 +7128,33 @@ fn add_duration_to_datetime(
         // Handle fractional seconds and milliseconds
         let nanos = if ucum_unit == "ms" {
             // Convert milliseconds to nanoseconds
-            (value * Decimal::from(1_000_000))
+            dec_mul(value, Decimal::from(1_000_000))?
                 .trunc()
                 .to_string()
                 .parse::<i64>()
                 .unwrap_or(0)
         } else {
             // Convert seconds to nanoseconds
-            (value * Decimal::from(1_000_000_000))
+            dec_mul(value, Decimal::from(1_000_000_000))?
                 .trunc()
                 .to_string()
                 .parse::<i64>()
                 .unwrap_or(0)
         };
-        dt + Duration::nanoseconds(nanos)
+        shift_datetime(dt, Some(Duration::nanoseconds(nanos)))?
     } else {
         // Convert value to i64 for other duration calculations
         let amount = value.trunc().to_string().parse::<i64>().unwrap_or(0);
 
         // Calculate new datetime based on unit
         match ucum_unit.as_str() {
-            "a" => dt + Duration::days(amount * 365), // Approximate year as 365 days
-            "mo" => dt + Duration::days(amount * 30), // Approximate month as 30 days
-            "wk" => dt + Duration::weeks(amount),
-            "d" => dt + Duration::days(amount),
-            "h" => dt + Duration::hours(amount),
-            "min" => dt + Duration::minutes(amount),
+            // Approximate a year as 365 days and a month as 30.
+            "a" => shift_datetime(dt, amount.checked_mul(365).and_then(Duration::try_days))?,
+            "mo" => shift_datetime(dt, amount.checked_mul(30).and_then(Duration::try_days))?,
+            "wk" => shift_datetime(dt, Duration::try_weeks(amount))?,
+            "d" => shift_datetime(dt, Duration::try_days(amount))?,
+            "h" => shift_datetime(dt, Duration::try_hours(amount))?,
+            "min" => shift_datetime(dt, Duration::try_minutes(amount))?,
             _ => {
                 return Err(EvaluationError::TypeError(format!(
                     "Unsupported time unit: {}",
@@ -7175,22 +7216,22 @@ fn add_duration_to_time(
 
     // Calculate the duration in nanoseconds
     let duration_nanos = match ucum_unit.as_str() {
-        "h" => (value * Decimal::from(3_600_000_000_000i64))
+        "h" => dec_mul(value, Decimal::from(3_600_000_000_000i64))?
             .trunc()
             .to_string()
             .parse::<i64>()
             .unwrap_or(0),
-        "min" => (value * Decimal::from(60_000_000_000i64))
+        "min" => dec_mul(value, Decimal::from(60_000_000_000i64))?
             .trunc()
             .to_string()
             .parse::<i64>()
             .unwrap_or(0),
-        "s" => (value * Decimal::from(1_000_000_000))
+        "s" => dec_mul(value, Decimal::from(1_000_000_000))?
             .trunc()
             .to_string()
             .parse::<i64>()
             .unwrap_or(0),
-        "ms" => (value * Decimal::from(1_000_000))
+        "ms" => dec_mul(value, Decimal::from(1_000_000))?
             .trunc()
             .to_string()
             .parse::<i64>()
@@ -7199,7 +7240,9 @@ fn add_duration_to_time(
     };
 
     // Add the duration (Time wraps around midnight)
-    let new_total_nanos = total_nanos + duration_nanos;
+    let new_total_nanos = total_nanos
+        .checked_add(duration_nanos)
+        .ok_or(EvaluationError::ArithmeticOverflow)?;
 
     // Handle wrap-around (86400 seconds = 24 hours in nanoseconds)
     const DAY_NANOS: i64 = 86_400_000_000_000;
@@ -7263,9 +7306,19 @@ fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
     let mut x = value;
     let half = Decimal::from_str_exact("0.5").unwrap();
 
-    // Run iterations until we reach desired precision
-    loop {
-        let next_x = half * (x + value / x);
+    // Run iterations until we reach desired precision. Each step halves the
+    // error, so the bound is far above what any decimal needs; it only keeps
+    // a pair of values that round back and forth from looping forever.
+    const MAX_ITERATIONS: usize = 256;
+    for _ in 0..MAX_ITERATIONS {
+        let quotient = value.checked_div(x).ok_or("Overflow")?;
+        // `x + quotient` is past the decimal range for a value at the top of
+        // it (the first step adds 1 to the value itself), although the mean is
+        // not: take the halves separately then.
+        let next_x = match x.checked_add(quotient) {
+            Some(sum) => half * sum,
+            None => half * x + half * quotient,
+        };
 
         // Check if we've converged to our desired precision
         if (next_x - x).abs() < precision {
@@ -7274,6 +7327,7 @@ fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
 
         x = next_x;
     }
+    Ok(x)
 }
 
 /// Attempts to convert an EvaluationResult to Decimal
@@ -7507,7 +7561,9 @@ fn apply_multiplicative(
                     EvaluationResult::Quantity(val_l, unit_l, _, _),
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => match crate::ucum::multiply_units(unit_l, unit_r) {
-                    Ok(result_unit) => EvaluationResult::quantity(*val_l * *val_r, result_unit),
+                    Ok(result_unit) => {
+                        EvaluationResult::quantity(dec_mul(*val_l, *val_r)?, result_unit)
+                    }
                     Err(err) => {
                         return Err(EvaluationError::TypeError(format!(
                             "Cannot multiply quantities with units '{}' and '{}': {}",
@@ -7519,19 +7575,19 @@ fn apply_multiplicative(
                 (
                     EvaluationResult::Quantity(val, unit, _, _),
                     EvaluationResult::Integer(n, _, _),
-                ) => EvaluationResult::quantity(*val * Decimal::from(*n), unit.clone()),
+                ) => EvaluationResult::quantity(dec_mul(*val, Decimal::from(*n))?, unit.clone()),
                 (
                     EvaluationResult::Integer(n, _, _),
                     EvaluationResult::Quantity(val, unit, _, _),
-                ) => EvaluationResult::quantity(Decimal::from(*n) * *val, unit.clone()),
+                ) => EvaluationResult::quantity(dec_mul(Decimal::from(*n), *val)?, unit.clone()),
                 (
                     EvaluationResult::Quantity(val, unit, _, _),
                     EvaluationResult::Decimal(d, _, _),
-                ) => EvaluationResult::quantity(*val * *d, unit.clone()),
+                ) => EvaluationResult::quantity(dec_mul(*val, *d)?, unit.clone()),
                 (
                     EvaluationResult::Decimal(d, _, _),
                     EvaluationResult::Quantity(val, unit, _, _),
-                ) => EvaluationResult::quantity(*d * *val, unit.clone()),
+                ) => EvaluationResult::quantity(dec_mul(*d, *val)?, unit.clone()),
                 // Regular numeric multiplication
                 (EvaluationResult::Integer(l, _, _), EvaluationResult::Integer(r, _, _)) => {
                     // Check for potential overflow before multiplying
@@ -7540,13 +7596,13 @@ fn apply_multiplicative(
                         .ok_or(EvaluationError::ArithmeticOverflow)? // Return Err on overflow
                 }
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(*l * *r)
+                    EvaluationResult::decimal(dec_mul(*l, *r)?)
                 }
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Integer(r, _, _)) => {
-                    EvaluationResult::decimal(*l * Decimal::from(*r))
+                    EvaluationResult::decimal(dec_mul(*l, Decimal::from(*r))?)
                 }
                 (EvaluationResult::Integer(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(Decimal::from(*l) * *r)
+                    EvaluationResult::decimal(dec_mul(Decimal::from(*l), *r)?)
                 }
                 // Handle empty operands
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
@@ -7768,8 +7824,14 @@ fn apply_integer_multiplicative(
         return Ok(EvaluationResult::Empty);
     }
     match op {
-        "div" => Ok(EvaluationResult::integer(left / right)), // Integer division
-        "mod" => Ok(EvaluationResult::integer(left % right)), // Integer modulo
+        "div" => left
+            .checked_div(right)
+            .map(EvaluationResult::integer)
+            .ok_or(EvaluationError::ArithmeticOverflow),
+        "mod" => left
+            .checked_rem(right)
+            .map(EvaluationResult::integer)
+            .ok_or(EvaluationError::ArithmeticOverflow),
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown integer multiplicative operator: {}",
             op
@@ -7814,13 +7876,13 @@ fn apply_additive(
                 }
                 // If either operand is Decimal, promote and result is Decimal
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(*l + *r)
+                    EvaluationResult::decimal(dec_add(*l, *r)?)
                 }
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Integer(r, _, _)) => {
-                    EvaluationResult::decimal(*l + Decimal::from(*r))
+                    EvaluationResult::decimal(dec_add(*l, Decimal::from(*r))?)
                 }
                 (EvaluationResult::Integer(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(Decimal::from(*l) + *r)
+                    EvaluationResult::decimal(dec_add(Decimal::from(*l), *r)?)
                 }
                 // Quantity addition (requires comparable units)
                 (
@@ -7828,13 +7890,14 @@ fn apply_additive(
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => {
                     if unit_l == unit_r {
-                        EvaluationResult::quantity(*val_l + *val_r, unit_l.clone())
+                        EvaluationResult::quantity(dec_add(*val_l, *val_r)?, unit_l.clone())
                     } else if crate::ucum::units_are_comparable(unit_l, unit_r) {
                         // Convert right to left's unit and add
                         match crate::ucum::convert_units(*val_r, unit_r, unit_l) {
-                            Ok(converted_val_r) => {
-                                EvaluationResult::quantity(*val_l + converted_val_r, unit_l.clone())
-                            }
+                            Ok(converted_val_r) => EvaluationResult::quantity(
+                                dec_add(*val_l, converted_val_r)?,
+                                unit_l.clone(),
+                            ),
                             Err(_) => EvaluationResult::Empty,
                         }
                     } else {
@@ -7848,7 +7911,7 @@ fn apply_additive(
                     EvaluationResult::Integer(n, _, _),
                 ) => {
                     if crate::ucum::units_are_comparable(unit, "1") {
-                        EvaluationResult::quantity(*val + Decimal::from(*n), unit.clone())
+                        EvaluationResult::quantity(dec_add(*val, Decimal::from(*n))?, unit.clone())
                     } else {
                         EvaluationResult::Empty
                     }
@@ -8092,13 +8155,13 @@ fn apply_additive(
                 }
                 // If either operand is Decimal, promote and result is Decimal
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(*l - *r)
+                    EvaluationResult::decimal(dec_sub(*l, *r)?)
                 }
                 (EvaluationResult::Decimal(l, _, _), EvaluationResult::Integer(r, _, _)) => {
-                    EvaluationResult::decimal(*l - Decimal::from(*r))
+                    EvaluationResult::decimal(dec_sub(*l, Decimal::from(*r))?)
                 }
                 (EvaluationResult::Integer(l, _, _), EvaluationResult::Decimal(r, _, _)) => {
-                    EvaluationResult::decimal(Decimal::from(*l) - *r)
+                    EvaluationResult::decimal(dec_sub(Decimal::from(*l), *r)?)
                 }
                 // Quantity subtraction (requires same units) - Added
                 (
@@ -8106,7 +8169,7 @@ fn apply_additive(
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => {
                     if unit_l == unit_r {
-                        EvaluationResult::quantity(*val_l - *val_r, unit_l.clone())
+                        EvaluationResult::quantity(dec_sub(*val_l, *val_r)?, unit_l.clone())
                     } else {
                         // Incompatible units for now, return empty
                         // TODO: Implement UCUM conversion if needed
@@ -8119,7 +8182,7 @@ fn apply_additive(
                     EvaluationResult::Integer(n, _, _),
                 ) => {
                     if crate::ucum::units_are_comparable(unit, "1") {
-                        EvaluationResult::quantity(*val - Decimal::from(*n), unit.clone())
+                        EvaluationResult::quantity(dec_sub(*val, Decimal::from(*n))?, unit.clone())
                     } else {
                         EvaluationResult::Empty
                     }

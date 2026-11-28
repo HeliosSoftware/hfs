@@ -321,13 +321,13 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
             return truncated;
         } else if value > Decimal::ZERO {
             // Positive integer: return value - 1
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         } else if value < Decimal::ZERO && value != truncated {
             // Negative non-integer: return the next lower integer
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         } else {
             // Negative integer: return value - 1
-            return truncated - Decimal::ONE;
+            return truncated.checked_sub(Decimal::ONE).unwrap_or(truncated);
         }
     }
 
@@ -358,7 +358,10 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
             if let Some(unit) = 10_i64.checked_pow(actual_decimals + 1) {
                 let decimal_unit = Decimal::from(unit);
                 let five_at_position = Decimal::from(5) / decimal_unit;
-                result -= five_at_position; // Subtract because we're negative, this moves away from zero
+                // Subtract because we're negative, this moves away from zero.
+                // At the bottom of the decimal range there is nothing lower
+                // to move to, and the value itself is kept.
+                result = result.checked_sub(five_at_position).unwrap_or(result);
             }
             result
         } else {
@@ -370,7 +373,7 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
             if let Some(unit) = 10_i64.checked_pow(actual_decimals + 1) {
                 let decimal_unit = Decimal::from(unit);
                 let five_at_position = Decimal::from(5) / decimal_unit;
-                result -= five_at_position;
+                result = result.checked_sub(five_at_position).unwrap_or(result);
             }
             result
         }
@@ -419,7 +422,10 @@ fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
         // For integer precision
         if value >= Decimal::ZERO {
             // Positive: next integer
-            return value.trunc() + Decimal::ONE;
+            return value
+                .trunc()
+                .checked_add(Decimal::ONE)
+                .unwrap_or(value.trunc());
         } else {
             // Negative: truncate towards zero (ceiling)
             return value.trunc();
@@ -449,8 +455,15 @@ fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
             // For negative numbers: -1.587 with precision 8 should become -1.58650000
             // This moves the value towards zero (less negative)
             // We need to subtract 0.00050000 from the absolute value
-            let padding_value = Decimal::from(5) / Decimal::from(10_i64.pow(actual_decimals + 1));
-            let mut result = value + padding_value; // Adding to negative makes it less negative (towards zero)
+            // Adding to negative makes it less negative (towards zero). A half
+            // unit too small for the integer power (19 decimals or more) is
+            // left out, as on the low side.
+            let mut result = match 10_i64.checked_pow(actual_decimals + 1) {
+                Some(unit) => value
+                    .checked_add(Decimal::from(5) / Decimal::from(unit))
+                    .unwrap_or(value),
+                None => value,
+            };
             // Pad out to the requested precision: the trailing zeros are the
             // precision information these functions exist to convey, so
             // -1.587 at precision 8 must be -1.58650000, not -1.5865.

@@ -187,35 +187,47 @@ fn add_values(
     b: &EvaluationResult,
 ) -> Result<EvaluationResult, EvaluationError> {
     match (a, b) {
-        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
-            Ok(EvaluationResult::integer(a + b))
-        }
-        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
-            Ok(EvaluationResult::integer64(*a + *b))
-        }
-        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
-            Ok(EvaluationResult::decimal(*a + *b))
-        }
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => a
+            .checked_add(*b)
+            .map(EvaluationResult::integer)
+            .ok_or(EvaluationError::ArithmeticOverflow),
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => a
+            .checked_add(*b)
+            .map(EvaluationResult::integer64)
+            .ok_or(EvaluationError::ArithmeticOverflow),
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => a
+            .checked_add(*b)
+            .map(EvaluationResult::decimal)
+            .ok_or(EvaluationError::ArithmeticOverflow),
         // Mixed numeric: promote to Decimal
         (EvaluationResult::Integer(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
-            Ok(EvaluationResult::decimal(Decimal::from(*a) + *b))
+            Decimal::from(*a)
+                .checked_add(*b)
+                .map(EvaluationResult::decimal)
+                .ok_or(EvaluationError::ArithmeticOverflow)
         }
-        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Integer(b, _, _)) => {
-            Ok(EvaluationResult::decimal(*a + Decimal::from(*b)))
-        }
-        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
-            Ok(EvaluationResult::integer64(*a + *b))
-        }
-        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer(b, _, _)) => {
-            Ok(EvaluationResult::integer64(*a + *b))
-        }
+        (EvaluationResult::Decimal(a, _, _), EvaluationResult::Integer(b, _, _)) => a
+            .checked_add(Decimal::from(*b))
+            .map(EvaluationResult::decimal)
+            .ok_or(EvaluationError::ArithmeticOverflow),
+        (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer64(b, _, _)) => a
+            .checked_add(*b)
+            .map(EvaluationResult::integer64)
+            .ok_or(EvaluationError::ArithmeticOverflow),
+        (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer(b, _, _)) => a
+            .checked_add(*b)
+            .map(EvaluationResult::integer64)
+            .ok_or(EvaluationError::ArithmeticOverflow),
         // Quantity addition (same unit)
         (
             EvaluationResult::Quantity(val_a, unit_a, _, _),
             EvaluationResult::Quantity(val_b, unit_b, _, _),
         ) => {
             if unit_a == unit_b {
-                Ok(EvaluationResult::quantity(*val_a + *val_b, unit_a.clone()))
+                val_a
+                    .checked_add(*val_b)
+                    .map(|sum| EvaluationResult::quantity(sum, unit_a.clone()))
+                    .ok_or(EvaluationError::ArithmeticOverflow)
             } else {
                 Err(EvaluationError::TypeError(format!(
                     "sum() cannot add quantities with different units: '{}' and '{}'",
