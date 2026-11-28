@@ -1129,6 +1129,118 @@ async fn over_cap_version_filtered_sort_keeps_the_documented_total_boundary() {
     fixture.close().await;
 }
 
+/// The `$count` aggregations on `resources` the profiler recorded: one for
+/// the single exact-total aggregation, two for the split counts of #2233.
+async fn resource_counts(db: &mongodb::Database) -> Vec<Document> {
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let rows = collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "command.aggregate": "resources" })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    rows.into_iter()
+        .filter_map(|row| row.get_document("command").ok().cloned())
+        .filter(|command| {
+            command.get_array("pipeline").is_ok_and(|pipeline| {
+                pipeline
+                    .last()
+                    .and_then(Bson::as_document)
+                    .is_some_and(|stage| stage.contains_key("$count"))
+            })
+        })
+        .collect()
+}
+
+/// #2233: behind a `_sort=<parameter>` over the cap, the total is the
+/// unsorted query's and keeps the single aggregation, for a pure metadata
+/// `:missing=true` and for a mixed one; `search_count` of the same pure
+/// query takes the split counts. Every total equals the collected path's
+/// and the rows'.
+#[tokio::test]
+async fn over_cap_param_sort_missing_total_keeps_the_single_aggregation() {
+    let Some(mut fixture) = Fixture::new("sort-walk-missing-total", 300).await else {
+        return;
+    };
+    add_sort_rows(&fixture).await;
+    fixture.mark_deleted(1, 12).await;
+    // Every tenth resource stays unstamped (no `method` row: missing); every
+    // fourth other one is stamped as having `method`; the rest are stamped
+    // as missing it.
+    let unstamped = |n: usize| n % 10 == 3;
+    let stamped_present = |n: usize| !unstamped(n) && n % 4 == 1;
+    let resources = fixture.db.collection::<Document>("resources");
+    for (names, missing) in [(vec!["method"], true), (vec![], false)] {
+        let ids: Vec<String> = (0..fixture.rows.len())
+            .filter(|n| !unstamped(*n) && stamped_present(*n) != missing)
+            .map(|n| fixture.rows[n].id.clone())
+            .collect();
+        resources
+            .update_many(
+                doc! { "tenant_id": PLAN_TENANT, "id": { "$in": ids } },
+                doc! { "$set": { "missing_params": names } },
+            )
+            .await
+            .unwrap();
+    }
+    trust_missing_metadata(&fixture.backend, &fixture.db).await;
+    let lacks_method = |n: usize| !fixture.rows[n].deleted && !stamped_present(n);
+    let pure = (0..fixture.rows.len()).filter(|n| lacks_method(*n)).count() as u64;
+    let shapes: [(&str, Vec<SearchParameter>, u64); 2] = [
+        ("pure", vec![missing_method("true")], pure),
+        (
+            "mixed",
+            vec![missing_method("true"), not_final()],
+            (0..fixture.rows.len())
+                .filter(|n| lacks_method(*n) && fixture.rows[*n].status != "final")
+                .count() as u64,
+        ),
+    ];
+    for (label, params, expected) in shapes {
+        assert!(
+            expected as usize > CAP,
+            "{label}: the cell must cross the cap"
+        );
+        let query = filtered(params.clone(), status_sort(""), 0);
+        let collected = with_result_id_cap(WIDE, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: collected path failed: {error:?}"));
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let walked = with_result_id_cap(CAP, fixture.backend.search(&fixture.tenant, &query))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: walked path failed: {error:?}"));
+        let counts = resource_counts(&fixture.db).await;
+        assert_eq!(walked.total, Some(expected), "{label}: total over the cap");
+        assert_eq!(collected.total, Some(expected), "{label}: collected total");
+        assert_eq!(page_ids(&walked), page_ids(&collected), "{label}: page");
+        assert_eq!(
+            counts.len(),
+            1,
+            "{label}: the total over the cap is one aggregation: {counts:?}"
+        );
+        assert!(
+            format!("{:?}", counts[0]).contains("search_rows_pending")
+                && format!("{:?}", counts[0]).contains("$or"),
+            "{label}: the single aggregation's `$or` of stamped and unstamped: {counts:?}"
+        );
+    }
+    // Positive control: the same pure total, not behind the sort, splits.
+    let mut query = SearchQuery::new("Observation").with_parameter(missing_method("true"));
+    query.total = Some(TotalMode::Accurate);
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    let total = fixture
+        .backend
+        .search_count(&fixture.tenant, &query)
+        .await
+        .unwrap();
+    let counts = resource_counts(&fixture.db).await;
+    assert_eq!(total, pure);
+    assert_eq!(counts.len(), 2, "search_count splits: {counts:?}");
+    fixture.close().await;
+}
+
 // #2601: an unfiltered descending date sort walks `idx_search_date_end`
 // instead of grouping every row of the parameter.
 

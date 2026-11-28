@@ -29,7 +29,9 @@ use mongodb::{
     options::Hint,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    num::NonZeroUsize,
+    task::Poll,
     time::Duration,
 };
 
@@ -46,7 +48,11 @@ const COUNT_CANDIDATE_BATCH_ROWS: usize = 4096;
 const RESOURCE_PAGE_SCAN_BUDGET: usize = 100_000;
 // Exact counts need no ordering. Overlap two bounded validations without
 // creating a task per batch or retaining the complete candidate set.
-const COUNT_BATCH_CONCURRENCY: usize = 2;
+const COUNT_BATCH_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+// A mixed `:missing` total (#2233) runs one command at a time: its id stream
+// read, each membership check and the unstamped count never overlap, so it
+// holds at most one pooled connection, as the single aggregation it replaces.
+const MISSING_CHECK_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN;
 // Deep offsets must not grow the global top-k buffer without bound. They keep
 // the streaming page path plus a separate exact count.
 const MAX_COMBINED_PAGE_IDS: usize = 10_000;
@@ -1450,23 +1456,7 @@ impl MongoBackend {
             {
                 continue;
             }
-            stages.push(doc! { "$lookup": {
-                "from": MongoBackend::SEARCH_INDEX_COLLECTION,
-                "let": { "candidate_id": "$id" },
-                "pipeline": [
-                    { "$match": { "$and": [
-                        filter,
-                        { "$expr": { "$eq": ["$resource_id", "$$candidate_id"] } },
-                    ] } },
-                    { "$limit": 1 },
-                    { "$project": { "_id": 1 } },
-                ],
-                "as": "_hfs_search_match",
-            } });
-            stages.push(doc! { "$match": {
-                "_hfs_search_match.0": { "$exists": !exclude },
-            } });
-            stages.push(doc! { "$unset": "_hfs_search_match" });
+            stages.extend(criterion_lookup_stages(filter, exclude));
         }
         if batch_page {
             // Retain selective index-driven pages; exclusion checks need only
@@ -2893,6 +2883,274 @@ impl PageIds {
     }
 }
 
+/// The existence stages of one criterion of a driverless resource-lookup
+/// plan: a resource passes when some `search_index` row matches `filter`, or,
+/// with `exclude`, when none does.
+pub(super) fn criterion_lookup_stages(filter: Document, exclude: bool) -> Vec<Document> {
+    vec![
+        doc! { "$lookup": {
+            "from": MongoBackend::SEARCH_INDEX_COLLECTION,
+            "let": { "candidate_id": "$id" },
+            "pipeline": [
+                { "$match": { "$and": [
+                    filter,
+                    { "$expr": { "$eq": ["$resource_id", "$$candidate_id"] } },
+                ] } },
+                { "$limit": 1 },
+                { "$project": { "_id": 1 } },
+            ],
+            "as": "_hfs_search_match",
+        } },
+        doc! { "$match": {
+            "_hfs_search_match.0": { "$exists": !exclude },
+        } },
+        doc! { "$unset": "_hfs_search_match" },
+    ]
+}
+
+/// How one criterion of a mixed `:missing` total reads `search_index`: the
+/// resource passes when a row matching the criterion's filter exists
+/// (`Require`) or when none does (`Exclude`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowCheck {
+    Require,
+    Exclude,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static MISSING_CHECK_BATCH_ROWS: usize;
+}
+
+/// Ids per membership batch of a mixed `:missing` total: the count batch
+/// size, or a smaller one a test installed with
+/// `with_missing_check_batch_rows` for the duration of one future.
+fn missing_check_batch_rows() -> usize {
+    #[cfg(test)]
+    if let Ok(rows) = MISSING_CHECK_BATCH_ROWS.try_with(|rows| *rows) {
+        return rows;
+    }
+    COUNT_CANDIDATE_BATCH_ROWS
+}
+
+/// Runs `future` with membership batches of `rows` ids, so a test crosses
+/// batch boundaries with a handful of resources.
+#[cfg(test)]
+pub(super) async fn with_missing_check_batch_rows<F: Future>(rows: usize, future: F) -> F::Output {
+    MISSING_CHECK_BATCH_ROWS.scope(rows, future).await
+}
+
+/// The stamped side of a mixed `:missing` total (#2233): the resources that
+/// match `stamped_filter`, read as one stream of ids on `hint`, whose ids pass
+/// every check in `checks` (plan order).
+///
+/// The ids go through [`stream_id_batches`] in batches of
+/// [`COUNT_CANDIDATE_BATCH_ROWS`] with [`MISSING_CHECK_CONCURRENCY`]: one
+/// command in flight at a time, the next `getMore` included. Each batch is one
+/// membership command per check on `search_index` (`filter_candidates` for
+/// `Require`, `exclude_candidates` for `Exclude`), the same commands a
+/// resource page sends, so no per-resource `$lookup` runs on this side. The
+/// deadline is checked before each batch; an error or the deadline ends the
+/// count with that error, never a partial number, after the checks in flight
+/// finished.
+pub(super) async fn count_checked_stamped(
+    db: &mongodb::Database,
+    stamped_filter: Document,
+    hint: Hint,
+    checks: &[(Document, RowCheck)],
+) -> StorageResult<u64> {
+    let checks: Vec<(IndexPredicate, RowCheck)> = checks
+        .iter()
+        .map(|(filter, check)| (IndexPredicate::from(filter.clone()), *check))
+        .collect();
+    let batch_rows = missing_check_batch_rows();
+    let mut cursor = db
+        .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+        .find(stamped_filter)
+        .projection(doc! { "_id": 0, "id": 1 })
+        .hint(hint)
+        .batch_size(batch_rows as u32)
+        .search_deadline()?
+        .await
+        .or_query_error("Failed to stream stamped resources")?;
+    let mut total = 0u64;
+    let checks = &checks;
+    stream_id_batches(
+        &mut cursor,
+        "id",
+        &IdStreamText {
+            read: "Failed to read stamped resources",
+            invalid: "Invalid stamped resource",
+            missing_id: "Stamped resource has no string id",
+        },
+        batch_rows,
+        MISSING_CHECK_CONCURRENCY,
+        &mut total,
+        |_, batch| Ok(check_stamped_batch(db, batch, checks)),
+        |total, passed| *total += passed,
+    )
+    .await?;
+    Ok(total)
+}
+
+/// How many ids of `batch` pass every check.
+async fn check_stamped_batch(
+    db: &mongodb::Database,
+    batch: Vec<String>,
+    checks: &[(IndexPredicate, RowCheck)],
+) -> StorageResult<u64> {
+    search_deadline::check()?;
+    let mut ids: HashSet<String> = batch.into_iter().collect();
+    for (predicate, check) in checks {
+        match check {
+            RowCheck::Require => {
+                filter_candidates(db, &mut ids, &[predicate], CandidateSource::Unfiltered).await?
+            }
+            RowCheck::Exclude => exclude_candidates(db, &mut ids, &[predicate]).await?,
+        }
+    }
+    Ok(ids.len() as u64)
+}
+
+/// The error texts of one id stream read by [`stream_id_batches`].
+pub(super) struct IdStreamText {
+    /// The cursor failed to return its next row.
+    pub(super) read: &'static str,
+    /// A row could not be decoded.
+    pub(super) invalid: &'static str,
+    /// A row has no string id.
+    pub(super) missing_id: &'static str,
+}
+
+/// Advances `cursor` by one row while every started batch check keeps being
+/// polled, and keeps the outputs of the checks that finish meanwhile in
+/// `finished`, in completion order.
+///
+/// A started check either holds a pooled connection or is queued for one, and
+/// the pool hands the next free connection to the oldest waiter even when that
+/// waiter is not polled. A `getMore` awaited alone can then wait behind a
+/// check that only this loop would ever resume: with a pool of one, every
+/// time (#2233). The read is pinned here and polled to completion, so the
+/// driver never sees it cancelled.
+async fn advance_polling_checks<F: Future>(
+    cursor: &mut mongodb::Cursor<Document>,
+    started: &mut FuturesUnordered<F>,
+    finished: &mut VecDeque<F::Output>,
+) -> mongodb::error::Result<bool> {
+    let mut read = std::pin::pin!(cursor.advance());
+    futures::future::poll_fn(|cx| {
+        while let Poll::Ready(Some(output)) = started.poll_next_unpin(cx) {
+            finished.push_back(output);
+        }
+        read.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// Streams the string field `id_field` of every row of `cursor` into batches
+/// of at most `batch_rows` ids and [`MAX_CANDIDATE_BYTES`], starts
+/// `start(state, batch)` for each with at most `limit` checks started and
+/// not yet folded, and folds every check's output into `state` with
+/// `finish`.
+///
+/// A check is started right after a cursor read, and when `limit` checks are
+/// then started the stream waits for one before it reads again. Every wait
+/// polls every check that has started and not finished, so the stream holds
+/// at most `limit` pooled connections at once: `limit - 1` checks and the
+/// cursor's `getMore`, or `limit` checks. With a limit of 1 every check
+/// finishes before the next read, so one command is in flight at a time.
+/// Outputs are folded where a single
+/// in-flight queue would fold them (when the limit is reached, and at the
+/// end), so `start` sees the same `state` it always did. The first error
+/// (the search deadline included) stops the stream; the checks still in
+/// flight are polled to completion before it is returned, so on those exits
+/// no driver call outlives the caller's admission permit. A caller that drops
+/// this future instead (a request timeout, a closed connection) drops the
+/// checks with it: the driver closes the connections of their unanswered
+/// commands and frees those pool slots, but a command already sent may still
+/// run on the server.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_id_batches<S, T, F>(
+    cursor: &mut mongodb::Cursor<Document>,
+    id_field: &str,
+    text: &IdStreamText,
+    batch_rows: usize,
+    limit: NonZeroUsize,
+    state: &mut S,
+    mut start: impl FnMut(&S, Vec<String>) -> StorageResult<F>,
+    mut finish: impl FnMut(&mut S, T),
+) -> StorageResult<()>
+where
+    F: Future<Output = StorageResult<T>>,
+{
+    let mut started = FuturesUnordered::new();
+    let mut finished = VecDeque::new();
+    let outcome = async {
+        let mut batch = Vec::with_capacity(batch_rows);
+        let mut bytes = 0usize;
+        loop {
+            let read = advance_polling_checks(cursor, &mut started, &mut finished).await;
+            // A check that failed while the row was read ends the stream now.
+            if let Some(failed) = finished.iter().position(Result::is_err)
+                && let Some(Err(error)) = finished.remove(failed)
+            {
+                return Err(error);
+            }
+            if !read.or_query_error(text.read)? {
+                break;
+            }
+            let document = cursor.deserialize_current().or_query_error(text.invalid)?;
+            let id = document
+                .get_str(id_field)
+                .map_err(|_| internal_error(text.missing_id.to_owned()))?;
+            let size = id.len().saturating_add(16);
+            if size > MAX_CANDIDATE_BYTES {
+                return Err(internal_error(
+                    "Search candidate exceeds the BSON batch budget".to_owned(),
+                ));
+            }
+            if !batch.is_empty()
+                && (batch.len() == batch_rows || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
+            {
+                started.push(start(
+                    state,
+                    std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
+                )?);
+                if started.len() + finished.len() == limit.get() {
+                    let output = match finished.pop_front() {
+                        Some(output) => Some(output),
+                        None => started.next().await,
+                    };
+                    if let Some(output) = output {
+                        finish(state, output?);
+                    }
+                }
+                bytes = 0;
+            }
+            batch.push(id.to_owned());
+            bytes += size;
+        }
+        if !batch.is_empty() {
+            started.push(start(state, batch)?);
+        }
+        while let Some(output) = finished.pop_front() {
+            finish(state, output?);
+        }
+        while let Some(output) = started.next().await {
+            finish(state, output?);
+        }
+        Ok(())
+    }
+    .await;
+    if outcome.is_err() {
+        // Another check may already be inside a driver call. Poll it to
+        // completion before releasing the search's admission permit (error
+        // and deadline exits; a dropped future drops the checks instead).
+        while started.next().await.is_some() {}
+    }
+    outcome
+}
+
 impl BatchedIndexPlan {
     async fn new(
         db: &mongodb::Database,
@@ -3141,88 +3399,49 @@ impl BatchedIndexPlan {
         if let Some(page) = &mut page_ids {
             page.extend(validated_ids);
         }
-        let mut pending_counts = FuturesUnordered::new();
-        let mut batch = Vec::with_capacity(batch_rows);
-        let mut bytes = 0usize;
-        let outcome = async {
-            while cursor
-                .advance()
-                .await
-                .or_query_error("Failed to read candidate batch")?
-            {
-                let document = cursor
-                    .deserialize_current()
-                    .or_query_error("Invalid candidate row")?;
-                let id = document.get_str("_id").map_err(|_| {
-                    internal_error("Search candidate is missing resource_id".to_owned())
-                })?;
-                let size = id.len().saturating_add(16);
-                if size > MAX_CANDIDATE_BYTES {
-                    return Err(internal_error(
-                        "Search candidate exceeds the BSON batch budget".to_owned(),
-                    ));
-                }
-                if !batch.is_empty()
-                    && (batch.len() == batch_rows
-                        || bytes.saturating_add(size) > MAX_CANDIDATE_BYTES)
-                {
-                    pending_counts.push(self.count_batch(
-                        db,
-                        resource_filter,
-                        match &page_ids {
-                            Some(page) => page.constrain(&selection)?,
-                            None => selection.clone(),
-                        },
-                        std::mem::replace(&mut batch, Vec::with_capacity(batch_rows)),
-                    ));
-                    if pending_counts.len() == COUNT_BATCH_CONCURRENCY
-                        && let Some(matches) = pending_counts.try_next().await?
-                    {
-                        result.count += matches.count;
-                        if let Some(page) = &mut page_ids {
-                            page.extend(matches.ids);
-                        }
-                    }
-                    bytes = 0;
-                }
-                batch.push(id.to_owned());
-                bytes += size;
-            }
-            if !batch.is_empty() {
-                pending_counts.push(self.count_batch(
+        let mut state = (0u64, page_ids);
+        stream_id_batches(
+            &mut cursor,
+            "_id",
+            &IdStreamText {
+                read: "Failed to read candidate batch",
+                invalid: "Invalid candidate row",
+                missing_id: "Search candidate is missing resource_id",
+            },
+            batch_rows,
+            COUNT_BATCH_CONCURRENCY,
+            &mut state,
+            |(_, page_ids), batch| {
+                Ok(self.count_batch(
                     db,
                     resource_filter,
-                    match &page_ids {
+                    match page_ids {
                         Some(page) => page.constrain(&selection)?,
                         None => selection.clone(),
                     },
                     batch,
-                ));
-            }
-            while let Some(matches) = pending_counts.try_next().await? {
-                result.count += matches.count;
-                if let Some(page) = &mut page_ids {
+                ))
+            },
+            |(count, page_ids), matches: BatchMatches| {
+                *count += matches.count;
+                if let Some(page) = page_ids {
                     page.extend(matches.ids);
                 }
-            }
-            if let Some(page) = page_ids {
-                let offset = match selection {
-                    BatchSelection::PageAndCount { offset, .. }
-                    | BatchSelection::BoundedPage { offset, .. }
-                    | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
-                    _ => 0,
-                };
-                result.ids = page.into_ids().into_iter().skip(offset).collect();
-            }
-            Ok(result)
+            },
+        )
+        .await?;
+        let (count, page_ids) = state;
+        result.count = count;
+        if let Some(page) = page_ids {
+            let offset = match selection {
+                BatchSelection::PageAndCount { offset, .. }
+                | BatchSelection::BoundedPage { offset, .. }
+                | BatchSelection::EstimatedPageAndCount { offset, .. } => offset as usize,
+                _ => 0,
+            };
+            result.ids = page.into_ids().into_iter().skip(offset).collect();
         }
-        .await;
-        if outcome.is_err() {
-            // Another batch may already be inside a driver call. Poll it to
-            // completion before releasing the search's admission permit.
-            while pending_counts.next().await.is_some() {}
-        }
-        outcome
+        Ok(result)
     }
 
     fn record_page_decision(

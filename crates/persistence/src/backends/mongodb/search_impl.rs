@@ -9,7 +9,7 @@ use mongodb::action::Action;
 use mongodb::{
     Cursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
-    options::Hint,
+    options::{Hint, ReadPreference, SelectionCriteria},
 };
 use regex::escape as regex_escape;
 use serde_json::Value;
@@ -1356,6 +1356,269 @@ fn missing_fallback_stages(presence: Document) -> Vec<Document> {
     ]
 }
 
+/// The fallback stages of a total that the stamped/unstamped split can
+/// answer, or `None` when it cannot and today's single aggregation runs.
+///
+/// The split applies only when the plan scans the type with no index driver,
+/// no id set was materialized, and every search criterion is a
+/// metadata-answered `:missing=true` (`_id` and `_lastUpdated` are resource
+/// conditions both counts carry). Then the plan's stages are exactly
+/// `missing_fallback_stages`, which read only `id` and index rows, so they
+/// apply to the unstamped side alone. A `:not`, `:missing=false`, unsupported
+/// `:missing` or positive criterion adds lookups the stamped side would need
+/// too, so such a query is left to [`split_missing_checks`] or the single
+/// aggregation.
+fn split_missing_stages<'a>(
+    plan: Option<&'a SearchFilterPlan>,
+    matched_ids: Option<&HashSet<String>>,
+    query: &SearchQuery,
+    missing_support: &MissingSupport,
+) -> Option<&'a [Document]> {
+    let Some(SearchFilterPlan::ResourceLookups {
+        index_filter: None,
+        stages,
+    }) = plan
+    else {
+        return None;
+    };
+    if matched_ids.is_some() {
+        return None;
+    }
+    let mut metadata_missing = 0usize;
+    for param in &query.parameters {
+        if missing_support.is_resource_parameter(param) {
+            metadata_missing += 1;
+        } else if !matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+            return None;
+        }
+    }
+    // The unstamped side runs the plan's stages as-is, so they must be exactly
+    // one set of fallback stages per metadata `:missing=true` parameter and
+    // nothing else (a `:not` or `:missing=false` stage would be skipped by the
+    // stamped count).
+    if metadata_missing == 0 {
+        return None;
+    }
+    debug_assert_eq!(
+        stages.len(),
+        metadata_missing * missing_fallback_stages(Document::new()).len(),
+        "split totals expect only missing fallback stages"
+    );
+    Some(stages.as_slice())
+}
+
+/// What an exact total counts: the request's own query, or the unsorted copy
+/// that stands in for a `_sort=<search parameter>` query whose matches exceed
+/// the id cap (#2588). The caller says which, because the copy no longer
+/// carries the sort that distinguishes the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountOrigin {
+    /// `_summary=count`, `_total` next to a page, or `search_count`.
+    Query,
+    /// The total behind a parameter sort over the id cap. It keeps the
+    /// single aggregation it has always run; the split counts of #2233 are
+    /// not taken for it.
+    ParamSortOverCap,
+}
+
+/// Whether every command a split total issues is read from the primary: the
+/// database handle carries no read preference, or `primary`. A split total is
+/// several commands; with any other read preference each of them could reach
+/// a different member at a different point of replication, so such a
+/// deployment keeps today's single command instead (#2233).
+fn reads_from_primary(criteria: Option<&SelectionCriteria>) -> bool {
+    matches!(
+        criteria,
+        None | Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+    )
+}
+
+/// The hint both split counts carry: the index is fixed, so neither count can
+/// fall back to a full scan. The unstamped count and a single-name stamped
+/// count have fixed bounds; with several names the stamped count is bounded
+/// on one name and filters the others after the fetch, as the single
+/// aggregation did.
+fn missing_split_hint() -> Hint {
+    Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned())
+}
+
+/// `(stamped, unstamped)` count pipelines. The stamped side is a bare
+/// `$match` and `$count`; the unstamped side keeps the plan's stages.
+fn split_missing_pipelines(
+    stamped_filter: Document,
+    unstamped_filter: Document,
+    fallback_stages: Vec<Document>,
+) -> (Vec<Document>, Vec<Document>) {
+    let stamped = vec![
+        doc! { "$match": stamped_filter },
+        doc! { "$count": "total" },
+    ];
+    (
+        stamped,
+        unstamped_pipeline(unstamped_filter, fallback_stages),
+    )
+}
+
+/// The unstamped count: the unstamped `$match`, the plan's `stages` as-is,
+/// and `$count`.
+fn unstamped_pipeline(unstamped_filter: Document, stages: Vec<Document>) -> Vec<Document> {
+    let mut unstamped = vec![doc! { "$match": unstamped_filter }];
+    unstamped.extend(stages);
+    unstamped.push(doc! { "$count": "total" });
+    unstamped
+}
+
+/// One split count: `pipeline` on `resources`, hinted onto the missing-params
+/// index.
+async fn count_split_side(db: &mongodb::Database, pipeline: Vec<Document>) -> StorageResult<u64> {
+    let source = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+    let cursor = with_hint_fallback(Some(missing_split_hint()), |hint| {
+        let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+        match hint {
+            Some(hint) => aggregate.hint(hint),
+            None => aggregate,
+        }
+    })
+    .await?
+    .or_query_error("Failed to count resource-filtered search results")?;
+    let documents = collect_documents(cursor).await?;
+    match documents.first() {
+        None => Ok(0),
+        Some(document) => search_plan::parse_total(document, "total"),
+    }
+}
+
+/// A mixed `:missing` total the split counts can answer (#2233 Stage 2): a
+/// metadata `:missing=true` with `:not`, a metadata-supported
+/// `:missing=false` or an unsupported `:missing=true`, and no other criterion.
+struct MissingChecks {
+    /// Each criterion's row filter and check, in plan order, taken from the
+    /// plan's own stages.
+    checks: Vec<(Document, search_plan::RowCheck)>,
+    /// Every stage of the plan, which the unstamped count runs as-is.
+    stages: Vec<Document>,
+}
+
+/// The criteria of a total the stamped/unstamped split with row checks can
+/// answer, or `None` when it cannot and today's single aggregation runs.
+///
+/// The query must be a driverless resource-lookup plan with no materialized
+/// id set, at least one metadata `:missing=true`, at least one other
+/// criterion, and every other criterion one of: `:not` (not composite),
+/// `:missing=false` that `missing_params` supports (a stage, not a driver),
+/// `:missing=true` it does not answer (not composite). `_id` and
+/// `_lastUpdated` are resource conditions both sides carry. Anything else
+/// (positive criteria, chains, other `_` parameters, a stored-version filter,
+/// a compartment, `_has`, `_list`) keeps the single aggregation.
+///
+/// The plan's stages are then checked to be exactly what the planner builds
+/// for these parameters, in query order: [`missing_fallback_stages`] for each
+/// metadata `:missing=true` and [`search_plan::criterion_lookup_stages`] for
+/// each criterion, with the expected `$exists` direction. The row checks read
+/// their filters from those stages, so the stamped side evaluates the
+/// planner's own filters. Any difference fails closed.
+fn split_missing_checks(
+    plan: Option<&SearchFilterPlan>,
+    matched_ids: Option<&HashSet<String>>,
+    query: &SearchQuery,
+    missing_support: &MissingSupport,
+) -> Option<MissingChecks> {
+    use search_plan::RowCheck;
+    let Some(SearchFilterPlan::ResourceLookups {
+        index_filter: None,
+        stages,
+    }) = plan
+    else {
+        return None;
+    };
+    if matched_ids.is_some()
+        || query.fhir_version.is_some()
+        || query.compartment.is_some()
+        || !query.reverse_chains.is_empty()
+        || !query.list.is_empty()
+    {
+        return None;
+    }
+    // Per indexed parameter, in query order: `None` for a metadata
+    // `:missing=true`, the check of a criterion otherwise.
+    let mut expected = Vec::new();
+    for param in &query.parameters {
+        if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
+            continue;
+        }
+        if param.name.starts_with('_')
+            || !param.chain.is_empty()
+            || !param.components.is_empty()
+            || matches!(
+                param.param_type,
+                SearchParamType::Composite | SearchParamType::Special
+            )
+        {
+            return None;
+        }
+        if missing_support.is_resource_parameter(param) {
+            expected.push(None);
+            continue;
+        }
+        let value = match param.values.as_slice() {
+            [value] => Some(value.value.as_str()),
+            _ => None,
+        };
+        expected.push(Some(match (&param.modifier, value) {
+            (Some(SearchModifier::Not), _) => RowCheck::Exclude,
+            (Some(SearchModifier::Missing), Some("false")) if missing_support.supports(param) => {
+                RowCheck::Require
+            }
+            (Some(SearchModifier::Missing), Some("true")) => RowCheck::Exclude,
+            _ => return None,
+        }));
+    }
+    if !expected.iter().any(Option::is_none)
+        || !expected.iter().any(Option::is_some)
+        || stages.len() != expected.len() * 3
+    {
+        return None;
+    }
+    let mut checks = Vec::new();
+    for (triplet, check) in stages.chunks(3).zip(expected) {
+        let filter = triplet[0]
+            .get_document("$lookup")
+            .ok()?
+            .get_array("pipeline")
+            .ok()?
+            .first()?
+            .as_document()?
+            .get_document("$match")
+            .ok()?
+            .get_array("$and")
+            .ok()?
+            .first()?
+            .as_document()?
+            .clone();
+        match check {
+            None => {
+                if triplet != missing_fallback_stages(filter).as_slice() {
+                    return None;
+                }
+            }
+            Some(check) => {
+                let built = search_plan::criterion_lookup_stages(
+                    filter.clone(),
+                    check == RowCheck::Exclude,
+                );
+                if triplet != built.as_slice() {
+                    return None;
+                }
+                checks.push((filter, check));
+            }
+        }
+    }
+    Some(MissingChecks {
+        checks,
+        stages: stages.clone(),
+    })
+}
+
 #[cfg(test)]
 mod missing_metadata_hint_tests {
     use super::*;
@@ -2002,6 +2265,7 @@ impl MongoBackend {
                     query,
                     &missing_support,
                     facts.count_selection(),
+                    CountOrigin::Query,
                     &mut probe_facts,
                 )
                 .await?;
@@ -2303,6 +2567,7 @@ impl MongoBackend {
                     query,
                     &missing_support,
                     facts.count_selection(),
+                    CountOrigin::Query,
                     &mut probe_facts,
                 )
                 .await?,
@@ -2386,7 +2651,7 @@ impl MongoBackend {
         }
 
         let _permit = self.admit_broad_search_for(query, true).await?;
-        self.count_standard(tenant, query).await
+        self.count_standard(tenant, query, CountOrigin::Query).await
     }
 }
 
@@ -2743,7 +3008,28 @@ pub(super) struct MissingSupport {
     indexed: HashSet<(String, SearchParamType)>,
 }
 
+/// Which side of the `missing_params` split a resource filter selects for
+/// each metadata-answered `:missing=true` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingCondition {
+    /// Stamped with the name, or unstamped and not pending: the disjunction
+    /// every existing caller uses ([`missing_resource_condition`]).
+    Either,
+    /// Stamped with the name: `{missing_params: name}`, once per distinct name.
+    Stamped,
+    /// No `missing_params` array and no pending marker, added once.
+    Unstamped,
+}
+
 impl MissingSupport {
+    /// A support set answering exactly `indexed` from `missing_params`.
+    #[cfg(test)]
+    pub(super) fn for_tests(indexed: impl IntoIterator<Item = (String, SearchParamType)>) -> Self {
+        Self {
+            indexed: indexed.into_iter().collect(),
+        }
+    }
+
     /// For a query with no `:missing` parameter, or one whose parameters are
     /// all `_id` / `_lastUpdated`: nothing is answered from `missing_params`.
     pub(super) fn none() -> Self {
@@ -3045,6 +3331,7 @@ impl MongoBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        origin: CountOrigin,
     ) -> StorageResult<u64> {
         let selection = self.execution_facts(query).count_selection();
         let mut facts = ProbeFacts::default();
@@ -3052,13 +3339,23 @@ impl MongoBackend {
         let missing_support =
             self.classify_missing(tenant.tenant_id().as_str(), &query.resource_type, query);
         let result = self
-            .count_standard_with_facts(tenant, &db, query, &missing_support, selection, &mut facts)
+            .count_standard_with_facts(
+                tenant,
+                &db,
+                query,
+                &missing_support,
+                selection,
+                origin,
+                &mut facts,
+            )
             .await;
         facts.record();
         result
     }
 
-    /// `selection` is the batched count the request's execution facts allow.
+    /// `selection` is the batched count the request's execution facts allow;
+    /// `origin` says whether the split counts of #2233 may serve it.
+    #[allow(clippy::too_many_arguments)]
     async fn count_standard_with_facts(
         &self,
         tenant: &TenantContext,
@@ -3066,6 +3363,7 @@ impl MongoBackend {
         query: &SearchQuery,
         missing_support: &MissingSupport,
         selection: BatchSelection,
+        origin: CountOrigin,
         facts: &mut ProbeFacts,
     ) -> StorageResult<u64> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
@@ -3110,6 +3408,41 @@ impl MongoBackend {
             });
             return Ok(plan.execute(db, filter, None, selection).await?.count);
         }
+        // The split counts serve only the request's own query, and only when
+        // all of their commands read from the primary.
+        let split = origin == CountOrigin::Query && reads_from_primary(db.selection_criteria());
+        if split
+            && let Some(fallback_stages) = split_missing_stages(
+                filter_plan.as_ref(),
+                matched_ids.as_ref(),
+                query,
+                missing_support,
+            )
+        {
+            record_total_strategy("exact_missing_split");
+            return self
+                .count_missing_split(
+                    db,
+                    tenant_id,
+                    query,
+                    missing_support,
+                    fallback_stages.to_vec(),
+                )
+                .await;
+        }
+        if split
+            && let Some(checks) = split_missing_checks(
+                filter_plan.as_ref(),
+                matched_ids.as_ref(),
+                query,
+                missing_support,
+            )
+        {
+            record_total_strategy("exact_missing_checks");
+            return self
+                .count_missing_checks(db, tenant_id, query, missing_support, checks)
+                .await;
+        }
         if let Some(plan) = filter_plan {
             record_total_strategy("exact_aggregation");
             let SearchPipeline {
@@ -3141,6 +3474,99 @@ impl MongoBackend {
             .search_deadline()?
             .await
             .or_query_error("Failed to count MongoDB search results")
+    }
+
+    /// Exact total of a pure metadata `:missing=true` search, as two counts
+    /// over disjoint sets: resources stamped with every name (equality on
+    /// `missing_params`, no per-resource lookup), and resources with no
+    /// `missing_params` and no pending marker, which keep today's value-index
+    /// check (`fallback_stages`) over the few unstamped resources.
+    ///
+    /// The two counts are separate commands read one after the other. A
+    /// resource that gains or loses `missing_params` between them can be
+    /// missed or counted twice in that request; the single aggregation this
+    /// replaces runs for seconds and is not a snapshot either. It runs only
+    /// when the database handle reads from the primary (no read preference,
+    /// or `primary`), so both commands are read from the primary; any other
+    /// read preference, `primaryPreferred` included, keeps the single
+    /// aggregation. No session is added.
+    async fn count_missing_split(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        fallback_stages: Vec<Document>,
+    ) -> StorageResult<u64> {
+        let filter_for = |missing| {
+            self.build_resource_filter_with(
+                tenant_id,
+                &query.resource_type,
+                query,
+                missing_support,
+                None,
+                None,
+                missing,
+            )
+        };
+        let (stamped, unstamped) = split_missing_pipelines(
+            filter_for(MissingCondition::Stamped)?,
+            filter_for(MissingCondition::Unstamped)?,
+            fallback_stages,
+        );
+        let mut total = 0u64;
+        for pipeline in [stamped, unstamped] {
+            total += count_split_side(db, pipeline).await?;
+        }
+        Ok(total)
+    }
+
+    /// Exact total of a mixed `:missing` search ([`split_missing_checks`]),
+    /// over the same two disjoint sets as [`Self::count_missing_split`]:
+    ///
+    /// * stamped resources are streamed as ids on the `missing_params` index
+    ///   and checked in batches against `search_index`, one membership command
+    ///   per criterion and batch ([`search_plan::count_checked_stamped`]); the
+    ///   fallback stages are not needed there;
+    /// * unstamped, not pending resources keep every stage of the plan in one
+    ///   aggregation, as the single aggregation ran them.
+    ///
+    /// The commands are read one after the other and are not a snapshot: a
+    /// row or a stamp that changes between the stream and a check is judged
+    /// when it is checked, as the single aggregation judged each lookup when
+    /// it ran.
+    async fn count_missing_checks(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        checks: MissingChecks,
+    ) -> StorageResult<u64> {
+        let filter_for = |missing| {
+            self.build_resource_filter_with(
+                tenant_id,
+                &query.resource_type,
+                query,
+                missing_support,
+                None,
+                None,
+                missing,
+            )
+        };
+        let stamped = search_plan::count_checked_stamped(
+            db,
+            filter_for(MissingCondition::Stamped)?,
+            missing_split_hint(),
+            &checks.checks,
+        )
+        .await?;
+        let unstamped = count_split_side(
+            db,
+            unstamped_pipeline(filter_for(MissingCondition::Unstamped)?, checks.stages),
+        )
+        .await?;
+        Ok(stamped + unstamped)
     }
 
     /// Builds every component's scoped `search_index_contained` filter for a
@@ -4046,7 +4472,10 @@ impl MongoBackend {
                 if query.wants_total() {
                     let mut unsorted = query.clone();
                     unsorted.sort.clear();
-                    total = Some(self.count_standard(tenant, &unsorted).await?);
+                    total = Some(
+                        self.count_standard(tenant, &unsorted, CountOrigin::ParamSortOverCap)
+                            .await?,
+                    );
                 }
                 self.param_sorted_filtered_window(
                     db,
@@ -7925,6 +8354,34 @@ impl MongoBackend {
         matched_ids: Option<&HashSet<String>>,
         cursor: Option<(&PageCursor, &CursorKeyset)>,
     ) -> StorageResult<Document> {
+        self.build_resource_filter_with(
+            tenant_id,
+            resource_type,
+            query,
+            missing_support,
+            matched_ids,
+            cursor,
+            MissingCondition::Either,
+        )
+    }
+
+    /// [`Self::build_resource_filter`] with the `:missing=true` condition
+    /// chosen by the caller. `MissingCondition::Either` is what every page,
+    /// cursor and candidate check uses and yields the same document as before
+    /// this parameter existed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_resource_filter_with(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+        missing_support: &MissingSupport,
+        matched_ids: Option<&HashSet<String>>,
+        cursor: Option<(&PageCursor, &CursorKeyset)>,
+        missing: MissingCondition,
+    ) -> StorageResult<Document> {
+        let mut stamped_seen: HashSet<&str> = HashSet::new();
+        let mut unstamped_pushed = false;
         let mut conditions = vec![doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
@@ -7955,7 +8412,25 @@ impl MongoBackend {
 
         for param in &query.parameters {
             if missing_support.is_resource_parameter(param) {
-                conditions.push(missing_resource_condition(&param.name));
+                match missing {
+                    MissingCondition::Either => {
+                        conditions.push(missing_resource_condition(&param.name));
+                    }
+                    MissingCondition::Stamped => {
+                        if stamped_seen.insert(param.name.as_str()) {
+                            conditions.push(doc! { "missing_params": param.name.as_str() });
+                        }
+                    }
+                    MissingCondition::Unstamped => {
+                        if !unstamped_pushed {
+                            unstamped_pushed = true;
+                            conditions.push(doc! {
+                                "missing_params": { "$exists": false },
+                                SEARCH_ROWS_PENDING_FIELD: { "$exists": false },
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             match param.name.as_str() {
@@ -12495,6 +12970,531 @@ mod revinclude_reference_filter_tests {
                 1,
                 "{id} must appear in exactly one chunk"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_resource_filter_identity_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::CursorValue;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn support() -> MissingSupport {
+        MissingSupport::for_tests(
+            ["specimen", "value-quantity", "value-concept"]
+                .map(|n| (n.to_string(), SearchParamType::Reference)),
+        )
+    }
+
+    fn missing_param(name: &str) -> SearchParameter {
+        plain(
+            name,
+            SearchParamType::Reference,
+            Some(SearchModifier::Missing),
+            &["true"],
+        )
+    }
+
+    fn plain(
+        name: &str,
+        ty: SearchParamType,
+        modifier: Option<SearchModifier>,
+        values: &[&str],
+    ) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: ty,
+            modifier,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn either(name: &str) -> Document {
+        doc! { "$or": [
+            { "missing_params": name },
+            { "missing_params": { "$exists": false }, "search_rows_pending": { "$exists": false } },
+        ] }
+    }
+
+    fn scope() -> Document {
+        doc! { "tenant_id": "t", "resource_type": "Observation", "is_deleted": false }
+    }
+
+    fn and(conditions: Vec<Document>) -> Document {
+        doc! { "$and": Bson::Array(conditions.into_iter().map(Bson::Document).collect()) }
+    }
+
+    fn build(query: &SearchQuery, ids: Option<&HashSet<String>>) -> Document {
+        backend()
+            .build_resource_filter("t", "Observation", query, &support(), ids, None)
+            .expect("filter builds")
+    }
+
+    /// `build_resource_filter` is pinned to literal BSON for the shapes every
+    /// existing caller produces, so the `MissingCondition` refactor cannot
+    /// change a page, cursor or candidate-check filter.
+    #[test]
+    fn wrapper_output_is_byte_identical() {
+        let mut q = SearchQuery::new("Observation");
+        assert_eq!(build(&q, None), scope());
+
+        q = q.with_parameter(missing_param("specimen"));
+        assert_eq!(build(&q, None), and(vec![scope(), either("specimen")]));
+
+        q = q.with_parameter(missing_param("value-quantity"));
+        q = q.with_parameter(missing_param("value-concept"));
+        assert_eq!(
+            build(&q, None),
+            and(vec![
+                scope(),
+                either("specimen"),
+                either("value-quantity"),
+                either("value-concept")
+            ])
+        );
+
+        // Repeated names stay repeated.
+        let rep = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(missing_param("specimen"));
+        assert_eq!(
+            build(&rep, None),
+            and(vec![scope(), either("specimen"), either("specimen")])
+        );
+
+        // `_id`: :not with one and several values, plain, :missing both ways.
+        let tok = SearchParamType::Token;
+        let ids = SearchQuery::new("Observation")
+            .with_parameter(plain("_id", tok, Some(SearchModifier::Not), &["a"]))
+            .with_parameter(plain("_id", tok, Some(SearchModifier::Not), &["a", "b"]))
+            .with_parameter(plain("_id", tok, None, &["c"]))
+            .with_parameter(plain("_id", tok, Some(SearchModifier::Missing), &["true"]))
+            .with_parameter(plain("_id", tok, Some(SearchModifier::Missing), &["false"]));
+        assert_eq!(
+            build(&ids, None),
+            and(vec![
+                scope(),
+                doc! { "id": { "$ne": "a" } },
+                doc! { "id": { "$nin": ["a", "b"] } },
+                doc! { "id": "c" },
+                doc! { "id": Bson::Null },
+                doc! { "id": { "$ne": Bson::Null } },
+            ])
+        );
+
+        // `_lastUpdated`: range and list, mixed with a missing parameter.
+        let date = SearchParamType::Date;
+        let lu = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(plain("_lastUpdated", date, None, &["ge2019"]))
+            .with_parameter(plain("_lastUpdated", date, None, &["2019", "2021"]));
+        let b = backend();
+        let mut expected = vec![scope(), either("specimen")];
+        for p in &lu.parameters[1..] {
+            expected.extend(b.build_resource_last_updated_conditions(p).unwrap());
+        }
+        assert_eq!(expected.len(), 4);
+        assert!(expected[3].contains_key("$or"));
+        assert_eq!(build(&lu, None), and(expected));
+
+        // Matched ids sit right after the scope, before the parameters.
+        let set: HashSet<String> = ["x".to_string()].into();
+        let with_ids = SearchQuery::new("Observation").with_parameter(missing_param("specimen"));
+        assert_eq!(
+            build(&with_ids, Some(&set)),
+            and(vec![
+                scope(),
+                doc! { "id": { "$in": ["x"] } },
+                either("specimen")
+            ])
+        );
+    }
+
+    #[test]
+    fn wrapper_output_with_cursor_is_byte_identical() {
+        let query = SearchQuery::new("Observation").with_parameter(missing_param("specimen"));
+        let keyset = CursorKeyset::for_query(
+            &SearchQuery::new("Observation").with_sort(crate::types::SortDirective::parse("_id")),
+        )
+        .unwrap();
+        let cursor = PageCursor::new(vec![CursorValue::String("p-5".to_string())], "p-5");
+        let filter = backend()
+            .build_resource_filter(
+                "t",
+                "Observation",
+                &query,
+                &support(),
+                None,
+                Some((&cursor, &keyset)),
+            )
+            .unwrap();
+        assert_eq!(
+            filter,
+            and(vec![
+                scope(),
+                either("specimen"),
+                doc! { "id": { "$gt": "p-5" } }
+            ])
+        );
+    }
+
+    /// The new variants differ from `Either` only in the missing condition.
+    #[test]
+    fn stamped_and_unstamped_variants() {
+        let q = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(missing_param("value-quantity"))
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(plain(
+                "_id",
+                SearchParamType::Token,
+                Some(SearchModifier::Not),
+                &["a"],
+            ));
+        let with = |m| {
+            backend()
+                .build_resource_filter_with("t", "Observation", &q, &support(), None, None, m)
+                .unwrap()
+        };
+        assert_eq!(
+            with(MissingCondition::Stamped),
+            and(vec![
+                scope(),
+                doc! { "missing_params": "specimen" },
+                doc! { "missing_params": "value-quantity" },
+                doc! { "id": { "$ne": "a" } },
+            ])
+        );
+        assert_eq!(
+            with(MissingCondition::Unstamped),
+            and(vec![
+                scope(),
+                doc! { "missing_params": { "$exists": false }, "search_rows_pending": { "$exists": false } },
+                doc! { "id": { "$ne": "a" } },
+            ])
+        );
+        assert_eq!(with(MissingCondition::Either), build(&q, None));
+    }
+
+    fn lookups(stages: Vec<Document>) -> SearchFilterPlan {
+        SearchFilterPlan::ResourceLookups {
+            index_filter: None,
+            stages,
+        }
+    }
+
+    fn fallback() -> Vec<Document> {
+        missing_fallback_stages(doc! { "param_name": "specimen" })
+    }
+
+    #[test]
+    fn missing_split_gate_accepts_only_pure_metadata_missing_true() {
+        let sup = support();
+        let tok = SearchParamType::Token;
+        let pure = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(plain(
+                "_lastUpdated",
+                SearchParamType::Date,
+                None,
+                &["ge2019"],
+            ))
+            .with_parameter(plain("_id", tok, Some(SearchModifier::Not), &["a"]));
+        let plan = lookups(fallback());
+        assert_eq!(
+            split_missing_stages(Some(&plan), None, &pure, &sup),
+            Some(fallback().as_slice())
+        );
+
+        // No metadata `:missing=true` at all.
+        let none = SearchQuery::new("Observation");
+        assert!(split_missing_stages(Some(&plan), None, &none, &sup).is_none());
+
+        // Mixed criteria keep the single aggregation.
+        let not =
+            pure.clone()
+                .with_parameter(plain("code", tok, Some(SearchModifier::Not), &["c1"]));
+        assert!(split_missing_stages(Some(&plan), None, &not, &sup).is_none());
+        let absent_false = pure.clone().with_parameter(plain(
+            "value-quantity",
+            SearchParamType::Reference,
+            Some(SearchModifier::Missing),
+            &["false"],
+        ));
+        assert!(split_missing_stages(Some(&plan), None, &absent_false, &sup).is_none());
+        let unsupported = pure.clone().with_parameter(plain(
+            "encounter",
+            SearchParamType::Reference,
+            Some(SearchModifier::Missing),
+            &["true"],
+        ));
+        assert!(split_missing_stages(Some(&plan), None, &unsupported, &sup).is_none());
+
+        // Other plans, a driver, or a materialized id set.
+        assert!(split_missing_stages(None, None, &pure, &sup).is_none());
+        let ids_plan = SearchFilterPlan::CandidateIds(vec!["a".into()]);
+        assert!(split_missing_stages(Some(&ids_plan), None, &pure, &sup).is_none());
+        let set: HashSet<String> = ["x".to_string()].into();
+        assert!(split_missing_stages(Some(&plan), Some(&set), &pure, &sup).is_none());
+    }
+
+    #[test]
+    fn missing_split_pipelines_have_the_two_shapes() {
+        let q = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(missing_param("specimen"));
+        let with = |m| {
+            backend()
+                .build_resource_filter_with("t", "Observation", &q, &support(), None, None, m)
+                .unwrap()
+        };
+        let (stamped, unstamped) = split_missing_pipelines(
+            with(MissingCondition::Stamped),
+            with(MissingCondition::Unstamped),
+            fallback(),
+        );
+
+        // Stamped: bare match and count; equality once, no `$or`, no pending
+        // marker, no lookup.
+        assert_eq!(
+            stamped,
+            vec![
+                doc! { "$match": and(vec![scope(), doc! { "missing_params": "specimen" }]) },
+                doc! { "$count": "total" },
+            ]
+        );
+        let text = format!("{stamped:?}");
+        assert!(!text.contains("$or") && !text.contains("search_rows_pending"));
+        assert!(!text.contains("$lookup"));
+
+        // Unstamped: absence and no pending marker, the plan's stages
+        // unchanged, then the count.
+        let mut expected = vec![doc! { "$match": and(vec![scope(), doc! {
+            "missing_params": { "$exists": false },
+            "search_rows_pending": { "$exists": false },
+        }]) }];
+        expected.extend(fallback());
+        expected.push(doc! { "$count": "total" });
+        assert_eq!(unstamped, expected);
+    }
+
+    /// Stage 2: the gate accepts a metadata `:missing=true` with `:not`, a
+    /// supported `:missing=false` and an unsupported `:missing=true`, reads
+    /// each criterion's filter from the planner's own stages in query order,
+    /// and fails closed on any other parameter or any stage it does not
+    /// recognise.
+    #[test]
+    fn missing_checks_gate_parses_only_the_planner_stages() {
+        use search_plan::{RowCheck, criterion_lookup_stages};
+        let sup = support();
+        let tok = SearchParamType::Token;
+        let reference = SearchParamType::Reference;
+        let not_code = plain("code", tok, Some(SearchModifier::Not), &["c1"]);
+        let present = plain(
+            "value-quantity",
+            reference,
+            Some(SearchModifier::Missing),
+            &["false"],
+        );
+        let unsupported = plain(
+            "encounter",
+            reference,
+            Some(SearchModifier::Missing),
+            &["true"],
+        );
+        let not_filter = doc! { "param_name": "code", "value_token_code": "c1" };
+        let present_filter = doc! { "param_name": "value-quantity" };
+        let unsupported_filter = doc! { "param_name": "encounter" };
+        let query = SearchQuery::new("Observation")
+            .with_parameter(missing_param("specimen"))
+            .with_parameter(not_code.clone())
+            .with_parameter(plain(
+                "_lastUpdated",
+                SearchParamType::Date,
+                None,
+                &["ge2019"],
+            ))
+            .with_parameter(present.clone())
+            .with_parameter(unsupported.clone());
+        let mut stages = fallback();
+        stages.extend(criterion_lookup_stages(not_filter.clone(), true));
+        stages.extend(criterion_lookup_stages(present_filter.clone(), false));
+        stages.extend(criterion_lookup_stages(unsupported_filter.clone(), true));
+        let parsed = split_missing_checks(Some(&lookups(stages.clone())), None, &query, &sup)
+            .expect("mixed total accepted");
+        assert_eq!(
+            parsed.checks,
+            vec![
+                (not_filter.clone(), RowCheck::Exclude),
+                (present_filter.clone(), RowCheck::Require),
+                (unsupported_filter.clone(), RowCheck::Exclude),
+            ]
+        );
+        assert_eq!(parsed.stages, stages);
+        let accepted = |query: &SearchQuery, stages: Vec<Document>| {
+            split_missing_checks(Some(&lookups(stages)), None, query, &sup).is_some()
+        };
+        let mixed = |param: SearchParameter| {
+            SearchQuery::new("Observation")
+                .with_parameter(missing_param("specimen"))
+                .with_parameter(param)
+        };
+        let with = |filter: &Document, exclude: bool| {
+            let mut stages = fallback();
+            stages.extend(criterion_lookup_stages(filter.clone(), exclude));
+            stages
+        };
+        assert!(accepted(&mixed(not_code.clone()), with(&not_filter, true)));
+
+        // Pure Stage 1 shape, and criteria without a metadata `:missing=true`.
+        let pure = SearchQuery::new("Observation").with_parameter(missing_param("specimen"));
+        assert!(!accepted(&pure, fallback()));
+        let only_not = SearchQuery::new("Observation").with_parameter(not_code.clone());
+        assert!(!accepted(
+            &only_not,
+            criterion_lookup_stages(not_filter.clone(), true)
+        ));
+        // Other parameters keep the single aggregation.
+        let positive = plain("code", tok, None, &["c1"]);
+        assert!(!accepted(&mixed(positive), with(&not_filter, false)));
+        let mut composite = plain(
+            "code-value-quantity",
+            SearchParamType::Composite,
+            Some(SearchModifier::Missing),
+            &["true"],
+        );
+        assert!(!accepted(
+            &mixed(composite.clone()),
+            with(&not_filter, true)
+        ));
+        composite.modifier = Some(SearchModifier::Not);
+        assert!(!accepted(&mixed(composite), with(&not_filter, true)));
+        let mut chained = not_code.clone();
+        chained.chain = vec![crate::types::ChainedParameter {
+            reference_param: "subject".into(),
+            target_type: None,
+            target_param: "name".into(),
+            has: None,
+        }];
+        assert!(!accepted(&mixed(chained), with(&not_filter, true)));
+        let tag = plain("_tag", tok, Some(SearchModifier::Not), &["c1"]);
+        assert!(!accepted(&mixed(tag), with(&not_filter, true)));
+        let two_values = plain(
+            "value-quantity",
+            reference,
+            Some(SearchModifier::Missing),
+            &["false", "true"],
+        );
+        assert!(!accepted(&mixed(two_values), with(&present_filter, false)));
+        let mut versioned = mixed(not_code.clone());
+        versioned.fhir_version = Some(helios_fhir::FhirVersion::default());
+        assert!(!accepted(&versioned, with(&not_filter, true)));
+        // A driver, a materialized id set.
+        let driven = SearchFilterPlan::ResourceLookups {
+            index_filter: Some(not_filter.clone().into()),
+            stages: with(&not_filter, true),
+        };
+        assert!(
+            split_missing_checks(Some(&driven), None, &mixed(not_code.clone()), &sup).is_none()
+        );
+        let set: HashSet<String> = ["x".to_string()].into();
+        assert!(
+            split_missing_checks(
+                Some(&lookups(with(&not_filter, true))),
+                Some(&set),
+                &mixed(not_code.clone()),
+                &sup
+            )
+            .is_none()
+        );
+        // Stages that are not exactly the planner's, in query order.
+        assert!(!accepted(
+            &mixed(not_code.clone()),
+            with(&not_filter, false)
+        ));
+        assert!(!accepted(&mixed(not_code.clone()), fallback()));
+        let mut reordered = criterion_lookup_stages(not_filter.clone(), true);
+        reordered.extend(fallback());
+        assert!(!accepted(&mixed(not_code.clone()), reordered));
+        let mut extra = with(&not_filter, true);
+        extra[3]
+            .get_document_mut("$lookup")
+            .unwrap()
+            .insert("localField", "id");
+        assert!(!accepted(&mixed(not_code.clone()), extra));
+        let mut doubled = with(&not_filter, true);
+        doubled.extend(criterion_lookup_stages(not_filter.clone(), true));
+        assert!(!accepted(&mixed(not_code), doubled));
+    }
+
+    /// Both counts carry the hint, and it is the missing-params index.
+    #[test]
+    fn missing_split_hint_is_the_missing_params_index() {
+        assert!(matches!(
+            missing_split_hint(),
+            Hint::Name(name) if name == "idx_resources_missing_params"
+        ));
+    }
+
+    /// The split counts read only from the primary: no read preference or
+    /// `primary` splits; every other mode (with or without options) and a
+    /// predicate keep the single command.
+    #[test]
+    fn split_counts_read_only_from_the_primary() {
+        use mongodb::options::ReadPreferenceOptions;
+        let options = || {
+            Some(
+                ReadPreferenceOptions::builder()
+                    .max_staleness(std::time::Duration::from_secs(90))
+                    .build(),
+            )
+        };
+        let read = |preference| Some(SelectionCriteria::ReadPreference(preference));
+        assert!(reads_from_primary(None));
+        assert!(reads_from_primary(read(ReadPreference::Primary).as_ref()));
+        for (label, criteria) in [
+            (
+                "primaryPreferred",
+                read(ReadPreference::PrimaryPreferred { options: None }),
+            ),
+            (
+                "primaryPreferred+options",
+                read(ReadPreference::PrimaryPreferred { options: options() }),
+            ),
+            (
+                "secondary",
+                read(ReadPreference::Secondary { options: None }),
+            ),
+            (
+                "secondary+options",
+                read(ReadPreference::Secondary { options: options() }),
+            ),
+            (
+                "secondaryPreferred",
+                read(ReadPreference::SecondaryPreferred { options: None }),
+            ),
+            (
+                "secondaryPreferred+options",
+                read(ReadPreference::SecondaryPreferred { options: options() }),
+            ),
+            ("nearest", read(ReadPreference::Nearest { options: None })),
+            (
+                "nearest+options",
+                read(ReadPreference::Nearest { options: options() }),
+            ),
+            (
+                "predicate",
+                Some(SelectionCriteria::Predicate(std::sync::Arc::new(|_| true))),
+            ),
+        ] {
+            assert!(!reads_from_primary(criteria.as_ref()), "{label}");
         }
     }
 }
