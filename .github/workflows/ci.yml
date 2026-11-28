@@ -119,6 +119,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           clean: false
+          # The merge commit and its two parents, so "Select tests" can diff
+          # a pull request against its base.
+          fetch-depth: 2
 
       # With `clean: false` a reused workspace keeps files materialized under
       # whatever line-ending rules held when they were first checked out, so
@@ -168,6 +171,21 @@ jobs:
           #     links too (e.g. serde_derive), so it fails the build outright.
           # The main-thread stack already defaults to 8 MB on macOS, matching
           # the Linux `-zstack-size=8388608`, so no override is needed.
+
+      # A pull request runs the integration tests of the crates its diff can
+      # reach, and takes a Docker host slot only if one of those starts a
+      # container; a push to `main`, a tag, the nightly and a manual run test
+      # everything. So `main` gets the full suite after each merge instead of
+      # every pull request getting it before. The build below is not narrowed.
+      # The `full-ci` label on a pull request (then re-run this job) asks for
+      # the full run here. See .github/scripts/select-tests.py; it never fails
+      # the job, and falls back to the full run when unsure.
+      - name: Select tests
+        id: plan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/select-tests.py --out "$RUNNER_TEMP/test-plan.txt"
 
       # Guard against the #306 failure mode: a `tests/<dir>/mod.rs` that declares
       # submodules but is never compiled because no top-level `tests/*.rs` file
@@ -247,6 +265,9 @@ jobs:
       # needs no containers, so a waiting job has already done that work.
       # `vars.DOCKER_HOST_TEST_SLOTS` overrides the default of 2 (0 = no cap).
       - name: Wait for a Docker host slot
+        # Not when "Select tests" found no selected test that starts a
+        # container. `!= 'false'` so a missing output still takes a slot.
+        if: steps.plan.outputs.docker != 'false'
         shell: bash
         env:
           DOCKER_HOST_TEST_SLOTS: ${{ vars.DOCKER_HOST_TEST_SLOTS }}
@@ -290,6 +311,7 @@ jobs:
           # Keep this unconditional. Re-gating it to one OS is what let the
           # suite pass vacuously for its entire existence (#390).
           RUN_MINIO_S3_ES_TESTS: "1"
+          HFS_TEST_PLAN: ${{ runner.temp }}/test-plan.txt
         run: bash .github/scripts/test-rust.sh run
 
       # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
@@ -319,6 +341,9 @@ jobs:
       # typo'd variable would leave a green step that verified nothing at all.
       # Assert the expected number of tests actually ran.
       - name: Verify S3 conditional writes against MinIO (per-user settings)
+        # `minio_s3_tests` is helios-persistence's; skipped on a pull request
+        # that cannot affect that crate (see "Select tests").
+        if: steps.plan.outputs.persistence != 'false'
         shell: bash
         timeout-minutes: 15
         env:

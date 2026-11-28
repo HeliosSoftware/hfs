@@ -4,7 +4,9 @@
 #
 #   test-rust.sh build   compile every test target (`--no-run`), with
 #                        `--timings` and a memory sampler
-#   test-rust.sh run     run the tests in two lanes
+#   test-rust.sh run     run the tests in two lanes: all of them, or the ones
+#                        HFS_TEST_PLAN selects (a pull request; see
+#                        select-tests.py)
 #
 # Both keep `--workspace --all-features`. Target selection doesn't change
 # feature resolution, but package selection does (see the MinIO step in
@@ -165,6 +167,12 @@ build() {
 		{ grep -vE $'^(\x1b\\[[0-9;]*m)* +(Running|Fresh)(\x1b\\[[0-9;]*m)* ' || true; }
 }
 
+# One value from the test plan select-tests.py wrote; empty without a plan.
+plan_value() {
+	[ -n "${HFS_TEST_PLAN:-}" ] && [ -f "$HFS_TEST_PLAN" ] || return 0
+	sed -n "s/^$1=//p" "$HFS_TEST_PLAN"
+}
+
 run() {
 	# `cargo test` runs test binaries one at a time, and `mongodb_tests` alone
 	# took 13-17 of the ~28-35 test minutes, holding up the other ~390
@@ -195,19 +203,59 @@ run() {
 	fi
 	others=$(sort -u <<<"$names" | grep -vx mongodb_tests | sed 's/^/--test /' | tr '\n' ' ')
 
-	cargo test "${features[@]}" --test mongodb_tests >mongodb-tests.log 2>&1 &
-	local lane_a=$!
+	# A pull request runs the integration tests of the crates it can affect
+	# (select-tests.py writes the plan); everything else runs them all. Only
+	# `--test` targets are narrowed: unit tests and doc-tests always cover the
+	# whole workspace. No plan, or one that does not say `selected`, is the
+	# full run.
+	local mongo=true skips=""
+	if [ "$(plan_value mode)" = selected ]; then
+		mongo=$(plan_value mongo)
+		skips=$(plan_value skips | tr ' ' '\n' | sed '/^$/d; s/^/--skip /' | tr '\n' ' ')
+		local planned unknown
+		planned=$(plan_value tests | tr ' ' '\n' | sed '/^$/d')
+		# A name the plan has and cargo does not would fail cargo with "no test
+		# target named"; say why instead.
+		unknown=$(grep -vxFf <(sort -u <<<"$names") <<<"$planned" || true)
+		if [ -n "$unknown" ]; then
+			echo "::error::The test plan names targets cargo does not have: $(tr '\n' ' ' <<<"$unknown")"
+			exit 1
+		fi
+		others=$(sed '/^$/d; s/^/--test /' <<<"$planned" | tr '\n' ' ')
+		echo "Test plan: $(wc -w <<<"$(plan_value tests)") integration test targets, mongodb_tests: $mongo"
+	fi
+
+	local lane_a=""
+	if [ "$mongo" = true ]; then
+		cargo test "${features[@]}" --test mongodb_tests >mongodb-tests.log 2>&1 &
+		lane_a=$!
+	fi
 
 	local lane_b_status=0
-	# shellcheck disable=SC2086 # $others is a list of `--test NAME` args
-	cargo test "${features[@]}" --lib --bins $others || lane_b_status=$?
+	if [ -n "$skips" ]; then
+		# No selected target starts a container, so the library modules that do
+		# are skipped. The filter goes to the unit tests only: a `--skip` is a
+		# substring match and would also drop integration tests whose names
+		# happen to contain it.
+		# shellcheck disable=SC2086 # $skips is a list of `--skip PATH` args
+		cargo test "${features[@]}" --lib --bins -- $skips || lane_b_status=$?
+		if [ -n "$others" ]; then
+			# shellcheck disable=SC2086 # $others is a list of `--test NAME` args
+			cargo test "${features[@]}" $others || lane_b_status=$?
+		fi
+	else
+		# shellcheck disable=SC2086 # $others is a list of `--test NAME` args
+		cargo test "${features[@]}" --lib --bins $others || lane_b_status=$?
+	fi
 	cargo test "${features[@]}" --doc || lane_b_status=$?
 
 	local lane_a_status=0
-	wait "$lane_a" || lane_a_status=$?
-	echo "::group::mongodb_tests (lane A)"
-	cat mongodb-tests.log
-	echo "::endgroup::"
+	if [ -n "$lane_a" ]; then
+		wait "$lane_a" || lane_a_status=$?
+		echo "::group::mongodb_tests (lane A)"
+		cat mongodb-tests.log
+		echo "::endgroup::"
+	fi
 
 	if [ "$lane_a_status" -ne 0 ] || [ "$lane_b_status" -ne 0 ]; then
 		echo "::error::Tests failed (mongodb_tests lane: $lane_a_status, other tests lane: $lane_b_status)"
